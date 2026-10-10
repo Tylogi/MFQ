@@ -185,11 +185,46 @@ struct BlockLoader : weight_loader::Loader {
                 c.hidden, c.streams, c.eps};
     }
     static auto final_mixer(Gr weights) { return std::make_unique<Gr>(std::move(weights)); }
+    auto gdn_weights(const std::string &p) const {
+        const bool independent = has(p + ".query.weight") || has(p + ".key.weight") || has(p + ".value.weight");
+        MFQ_RUNTIME_CHECK(!independent || !has(p + ".qkv.weight"), "ambiguous Qwen4 GDN input projections");
+        GdnWeights w{independent ? Linear{} : linear(p + ".qkv.weight"), linear(p + ".gate.weight"),
+            linear(p + ".alpha.weight"), linear(p + ".beta.weight"), linear(p + ".output.weight"),
+            dense(p + ".conv.weight"), dense(p + ".dt_bias"), dense(p + ".a"), dense(p + ".norm.weight")};
+        if (independent)
+            for (const auto* name : {"query", "key", "value"})
+                w.split_qkv.push_back(linear(p + "." + name + ".weight"));
+        return w;
+    }
+    auto qsa_weights(const std::string &p) const {
+        QsaWeights w{linear(p + ".query.weight"), linear(p + ".key.weight"), linear(p + ".value.weight"),
+            linear(p + ".output.weight"), linear(p + ".indexer.query_key.weight"), dense(p + ".query_norm.weight"),
+            dense(p + ".key_norm.weight"), dense(p + ".indexer.query_norm.weight"), dense(p + ".indexer.key_norm.weight")};
+        if (has(p + ".gate.weight")) w.gate = linear(p + ".gate.weight");
+        return w;
+    }
     auto gdn(GdnWeights weights, const Config &c) const {
-        std::vector<Linear> projections{weights.qkv,weights.gate,weights.alpha,weights.beta};
-        weights.input_projection=weight_loader::grouped_linear(execution,projections);
-        weights.qkv=std::move(projections[0]);weights.gate=std::move(projections[1]);
-        weights.alpha=std::move(projections[2]);weights.beta=std::move(projections[3]);
+        std::vector<Linear> projections = weights.split_qkv.empty()
+            ? std::vector<Linear>{weights.qkv} : weights.split_qkv;
+        const bool independent = !weights.split_qkv.empty();
+        projections.insert(projections.end(), {weights.gate,weights.alpha,weights.beta});
+        auto group = weight_loader::grouped_linear(execution,projections);
+        if (independent) {
+            if (group)
+                weights.input_projection = [group](CudaExecutionContext &e, const Tensor &x) {
+                    auto p = group(e,x);
+                    return std::vector<Tensor>{tb::cat({p[0],p[1],p[2]},-1),p[3],p[4],p[5]};
+                };
+            weights.qkv = [q=projections[0],k=projections[1],v=projections[2]](CudaExecutionContext &e, const Tensor &x) {
+                return tb::cat({q(e,x),k(e,x),v(e,x)},-1);
+            };
+        } else {
+            weights.input_projection = std::move(group);
+            weights.qkv = std::move(projections[0]);
+        }
+        const auto start = independent ? 3 : 1;
+        weights.gate=std::move(projections[start]);weights.alpha=std::move(projections[start+1]);
+        weights.beta=std::move(projections[start+2]);
         return std::make_unique<Gdn>(std::move(weights), c.key_heads, c.value_heads, c.linear_width,
                                      c.kernel, c.eps, c.silu_gate,true,execution.config.gdn_transposed_state,
                                      execution.config.gdn_fused_output,true,execution.config.gdn_fused_preparation,
@@ -197,7 +232,23 @@ struct BlockLoader : weight_loader::Loader {
     }
     auto qsa(QsaWeights weights, const Config &c) const {
         std::vector<Linear> projections{weights.query,weights.key,weights.value,weights.index_query_key};
-        weights.input_projection=weight_loader::grouped_linear(execution,projections);
+        if (weights.gate) projections.push_back(weights.gate);
+        auto group = weight_loader::grouped_linear(execution,projections);
+        if (weights.gate) {
+            const auto heads = c.heads, width = c.width;
+            const auto combine = [heads,width](const Tensor &q,const Tensor &g) {
+                const auto b=q.size(0),t=q.size(1);
+                return tb::cat({q.reshape({b,t,heads,width}),g.reshape({b,t,heads,width})},-1)
+                    .reshape({b,t,2*heads*width});
+            };
+            if (group)
+                weights.input_projection = [group,combine](CudaExecutionContext &e,const Tensor &x) {
+                    auto p=group(e,x);p[0]=combine(p[0],p[4]);p.resize(4);return p;
+                };
+            projections[0] = [q=projections[0],g=projections[4],combine](CudaExecutionContext &e,const Tensor &x) {
+                return combine(q(e,x),g(e,x));
+            };
+        } else weights.input_projection=std::move(group);
         weights.query=std::move(projections[0]);weights.key=std::move(projections[1]);
         weights.value=std::move(projections[2]);weights.index_query_key=std::move(projections[3]);
         QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,

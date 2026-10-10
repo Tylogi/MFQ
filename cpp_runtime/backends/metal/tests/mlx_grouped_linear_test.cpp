@@ -1196,6 +1196,31 @@ int main() {
                 !nint_projection_batch.projections_share_group(0, 4) &&
                 !nint_projection_batch.projections_share_group(2, 2),
             "NINT projection batch retained a graph-only pseudo-group");
+        const mfq::metal::MlxLinear middle_dense(
+            ones(Shape{5, kInputSize}, float32));
+        const mfq::metal::MlxProjectionBatch interleaved_batch(
+            {&nint_linears[0], &middle_dense, &nint_linears[6]});
+        require(interleaved_batch.grouped_projection_count() == 2 &&
+            !interleaved_batch.projections_share_group(0, 2),
+            "interleaved compatible projections were left unfused");
+        for (int rows : {1, 2, 3, 4, 5, 6, 16, 64}) {
+            auto input = ones(Shape{rows, kInputSize}, float32) / array(64.0f);
+            auto actual = interleaved_batch(input);
+            const std::array<const mfq::metal::MlxLinear*, 3> sources{
+                &nint_linears[0], &middle_dense, &nint_linears[6]};
+            for (std::size_t index = 0; index < sources.size(); ++index) {
+                auto expected = (*sources[index])(input);
+                require(actual[index].shape() == expected.shape(),
+                    "interleaved projection output order changed");
+                auto difference = max(abs(astype(actual[index], float32) -
+                    astype(expected, float32)));
+                difference.eval();
+                require(difference.item<float>() < 1e-5f,
+                    "interleaved projection result changed rows=" + std::to_string(rows) +
+                    " index=" + std::to_string(index) + " diff=" +
+                    std::to_string(difference.item<float>()));
+            }
+        }
         fixtures.push_back(make_q8_fixture(5));
         const auto q8_weight =
             mfq::metal::MlxNint8ZeroWeight::from_blob(

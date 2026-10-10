@@ -994,8 +994,7 @@ std::optional<MlxGroupedLinear> mlx_group_linears(
 
 struct MlxProjectionBatch::Impl {
     struct Segment {
-        std::size_t begin = 0;
-        std::size_t count = 0;
+        std::vector<std::size_t> indices;
         std::optional<MlxGroupedLinear> grouped;
     };
 
@@ -1043,15 +1042,34 @@ struct MlxProjectionBatch::Impl {
             }
 
             const std::size_t count = selected ? selected_count : 1;
+            std::vector<std::size_t> indices;
+            indices.reserve(count);
+            for (std::size_t offset = 0; offset < count; ++offset)
+                indices.push_back(begin + offset);
             segments.push_back(Segment{
-                .begin = begin,
-                .count = count,
+                .indices = std::move(indices),
                 .grouped = std::move(selected),
             });
             if (segments.back().grouped) {
                 grouped_projection_count += count;
             }
             begin += count;
+        }
+        for (std::size_t first = 0; first < segments.size(); ++first) {
+            if (segments[first].grouped) continue;
+            for (std::size_t second = first + 1; second < segments.size(); ++second) {
+                if (segments[second].grouped) continue;
+                const std::array<const MlxLinear*, 2> pair{
+                    references[segments[first].indices.front()],
+                    references[segments[second].indices.front()]};
+                auto candidate = mlx_group_linears(pair);
+                if (!candidate || !candidate->has_projection_fusion()) continue;
+                segments[first].indices.push_back(segments[second].indices.front());
+                segments[first].grouped = std::move(candidate);
+                grouped_projection_count += 2;
+                segments.erase(segments.begin() + second);
+                break;
+            }
         }
     }
 
@@ -1086,8 +1104,7 @@ std::vector<array> MlxProjectionBatch::operator()(
         ? 0
         : input.size() /
             static_cast<std::size_t>(input.shape(-1));
-    std::vector<array> outputs;
-    outputs.reserve(impl_->linears.size());
+    std::vector<array> outputs(impl_->linears.size(), input);
     for (const auto& segment : impl_->segments) {
         const bool use_grouped = segment.grouped &&
             segment.grouped->supports(input) &&
@@ -1096,18 +1113,12 @@ std::vector<array> MlxProjectionBatch::operator()(
                  ->supports_single_row_projection_fusion());
         if (use_grouped) {
             auto values = segment.grouped->matmul(input);
-            outputs.insert(
-                outputs.end(),
-                std::make_move_iterator(values.begin()),
-                std::make_move_iterator(values.end()));
+            for (std::size_t offset = 0; offset < segment.indices.size(); ++offset)
+                outputs[segment.indices[offset]] = std::move(values[offset]);
             continue;
         }
-        for (std::size_t offset = 0;
-             offset < segment.count;
-             ++offset) {
-            outputs.push_back(
-                impl_->linears[segment.begin + offset](input));
-        }
+        for (const auto index : segment.indices)
+            outputs[index] = impl_->linears[index](input);
     }
     return outputs;
 }
@@ -1126,7 +1137,7 @@ array MlxProjectionBatch::swiglu(
             "SwiGLU projection limit must be finite and non-negative");
     }
     if (impl_->segments.size() == 1 &&
-        impl_->segments.front().count == 2 &&
+        impl_->segments.front().indices.size() == 2 &&
         impl_->segments.front().grouped) {
         const auto& grouped = *impl_->segments.front().grouped;
         if (grouped.supports_single_row_swiglu(input)) {
@@ -1153,7 +1164,7 @@ bool MlxProjectionBatch::supports_fused_swiglu(
     const array& input) const noexcept {
     if (impl_->linears.size() != 2 ||
         impl_->segments.size() != 1 ||
-        impl_->segments.front().count != 2 ||
+        impl_->segments.front().indices.size() != 2 ||
         !impl_->segments.front().grouped) {
         return false;
     }
@@ -1182,9 +1193,11 @@ bool MlxProjectionBatch::projections_share_group(
         impl_->segments.begin(),
         impl_->segments.end(),
         [begin, count](const Impl::Segment& segment) {
-            return segment.grouped.has_value() &&
-                segment.begin <= begin &&
-                begin + count <= segment.begin + segment.count;
+            if (!segment.grouped) return false;
+            for (std::size_t index = begin; index < begin + count; ++index)
+                if (std::find(segment.indices.begin(), segment.indices.end(), index)
+                    == segment.indices.end()) return false;
+            return true;
         });
 }
 

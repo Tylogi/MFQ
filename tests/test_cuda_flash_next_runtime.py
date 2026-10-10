@@ -805,6 +805,24 @@ def qwen_model_reference(config,w,positions=None,mtp=None,return_hidden=False):
     return (sample,x) if mtp is not None or return_hidden else lin(sample,"model.output")
 
 
+def independent_qwen_attention(config, weights):
+    result = dict(weights)
+    c = config['text_config']
+    kw = c['linear_num_key_heads'] * c['linear_key_head_dim']
+    heads, width = c['num_attention_heads'], c['head_dim']
+    for name, value in weights.items():
+        if name.endswith('.linear_attention.qkv.weight'):
+            prefix = name.removesuffix('.qkv.weight')
+            for key, matrix in zip(('query','key','value'), np.split(value, [kw, 2*kw], axis=0)):
+                result[prefix+f'.{key}.weight'] = matrix.copy()
+            del result[name]
+        elif name.endswith('.attention.query.weight'):
+            pair = value.reshape(heads, 2*width, -1)
+            result[name] = pair[:, :width].reshape(heads*width, -1).copy()
+            result[name.removesuffix('.query.weight')+'.gate.weight'] = pair[:, width:].reshape(heads*width, -1).copy()
+    return result
+
+
 def write_qwen_fixture(path,config,weights,predictor=False):
     from mfq.formats.io import save
     from mfq.formats.header import FileHeader
@@ -822,11 +840,12 @@ def write_qwen_fixture(path,config,weights,predictor=False):
 
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,False),(2,True),(3,True)])
 @pytest.mark.parametrize("silu_gate",[False,True])
-def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate):
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent):
     c,w=qwen_model_fixture(interval,silu_gate,ple);expected=qwen_model_reference(c,w)
     positions=np.stack((np.arange(7),np.arange(7)+2,np.arange(7)+4))
     axis_expected=qwen_model_reference(c,w,positions)
-    path=tmp_path/"qwen-graph.mfq";write_qwen_fixture(path,c,w)
+    path=tmp_path/"qwen-graph.mfq";write_qwen_fixture(path,c,independent_qwen_attention(c,w) if independent else w)
     process=run_glm_fixture(path);assert process.returncode==0,process.stdout+process.stderr
     raw=json.loads(next(line.removeprefix("flash_next_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_check ")))
     assert raw.pop("architecture")=="qwen4_exp"
@@ -902,8 +921,12 @@ def run_mtp_fixture(path):
 
 @pytest.mark.parametrize("family",["qwen","glm"])
 @pytest.mark.parametrize("layers",[1,2])
-def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers):
+@pytest.mark.parametrize('independent', [False, True])
+def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent):
+    if independent and family != 'qwen': pytest.skip('independent Qwen projections')
     config,w=mtp_fixture(family,layers);path=tmp_path/"predictor.mfq"
+    reference_weights = w
+    if independent: w = independent_qwen_attention(config, w)
     (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
     process=run_mtp_fixture(path);assert process.returncode==0,process.stdout+process.stderr
     raw=json.loads(next(line.removeprefix("flash_next_mtp_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_mtp_check ")))
@@ -911,7 +934,7 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     previous=array(raw["previous"]);ids=np.arange(1,8,dtype=np.int64)[None]
     reference=qwen_model_reference if family=="qwen" else glm_model_reference
     for i,row in enumerate(raw["layers"]):
-        expected=reference(config,w,mtp=(ids,previous,i,None))
+        expected=reference(config,reference_weights,mtp=(ids,previous,i,None))
         for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
         np.testing.assert_allclose(array(row["logits"]),expected[0]@w["model.output.weight"].T,atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
@@ -920,10 +943,10 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
         positions=np.arange(7)+3
         if family=="qwen":
             positions=np.stack((positions,positions+2,positions+4))
-            axis=reference(config,w,positions=positions,mtp=(ids,previous,i,None))[0]
+            axis=reference(config,reference_weights,positions=positions,mtp=(ids,previous,i,None))[0]
         else:axis=reference(config,w,mtp=(ids,previous,i,positions))[0]
         np.testing.assert_allclose(array(row["axis"]),axis,atol=2e-3,rtol=2e-3)
-    target=reference(config,w,return_hidden=True)
+    target=reference(config,reference_weights,return_hidden=True)
     np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
     np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
     assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0

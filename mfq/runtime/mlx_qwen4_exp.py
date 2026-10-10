@@ -284,14 +284,13 @@ class MlxQwen4ExpGdn:
         prefix: str,
     ) -> None:
         self.config = config
-        self.qkv = model.linear(prefix + ".qkv.weight")
-        self.zab = MlxLinearGroup(
-            (
-                model.linear(prefix + ".gate.weight"),
-                model.linear(prefix + ".alpha.weight"),
-                model.linear(prefix + ".beta.weight"),
-            )
-        )
+        names = tuple(prefix + f'.{name}.weight' for name in ('query', 'key', 'value'))
+        self.independent_qkv = any(name in model.tensors for name in names)
+        if self.independent_qkv and prefix + '.qkv.weight' in model.tensors:
+            raise ValueError('ambiguous Qwen4 GDN input projections')
+        inputs = names if self.independent_qkv else (prefix + '.qkv.weight',)
+        self.input_projections = MlxLinearGroup(tuple(model.linear(name) for name in (
+            *inputs, prefix + '.gate.weight', prefix + '.alpha.weight', prefix + '.beta.weight')))
         self.conv_weight = _dense_array(model, prefix + ".conv.weight")
         self.dt_bias = _dense_vector(model, prefix + ".dt_bias")
         self.a_log = _dense_vector(model, prefix + ".a")
@@ -362,9 +361,13 @@ class MlxQwen4ExpGdn:
                 use_cache=True,
             )
             return mx.concatenate((accepted, speculative), axis=1)
-        projected = self.qkv(hidden_states)
-        qk, value_input = mx.split(projected, [2 * self.key_width], axis=-1)
-        z, alpha, beta = self.zab(hidden_states)
+        projections = self.input_projections(hidden_states)
+        if self.independent_qkv:
+            query, key, value_input, z, alpha, beta = projections
+            qk = mx.concatenate((query, key), axis=-1)
+        else:
+            projected, z, alpha, beta = projections
+            qk, value_input = mx.split(projected, [2 * self.key_width], axis=-1)
         beta = mx.sigmoid(beta.astype(mx.float32)).reshape(
             batch,
             tokens,
@@ -454,11 +457,13 @@ class MlxQwen4ExpQsa:
         max_context: int,
     ) -> None:
         self.config = config
+        self.independent_gate = prefix + '.gate.weight' in model.tensors
         self.qkv = MlxLinearGroup(
             (
                 model.linear(prefix + ".query.weight"),
                 model.linear(prefix + ".key.weight"),
                 model.linear(prefix + ".value.weight"),
+                *((model.linear(prefix + '.gate.weight'),) if self.independent_gate else ()),
             )
         )
         self.q_norm = MlxRMSNorm(
@@ -623,14 +628,14 @@ class MlxQwen4ExpQsa:
     ) -> mx.array:
         config = self.config
         batch, tokens = (int(item) for item in hidden_states.shape[:2])
-        query_full, key_full, value_full = self.qkv(hidden_states)
-        query_pair = query_full.reshape(
-            batch,
-            tokens,
-            config.num_attention_heads,
-            2 * config.head_dim,
-        )
-        query, output_gate = mx.split(query_pair, 2, axis=-1)
+        projections = self.qkv(hidden_states)
+        query_full, key_full, value_full = projections[:3]
+        if self.independent_gate:
+            shape = (batch, tokens, config.num_attention_heads, config.head_dim)
+            query, output_gate = query_full.reshape(shape), projections[3].reshape(shape)
+        else:
+            query_pair = query_full.reshape(batch, tokens, config.num_attention_heads, 2 * config.head_dim)
+            query, output_gate = mx.split(query_pair, 2, axis=-1)
         query = mx.transpose(self.q_norm(query), (0, 2, 1, 3))
         key = mx.transpose(
             self.k_norm(

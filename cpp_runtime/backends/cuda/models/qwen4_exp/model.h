@@ -33,6 +33,7 @@ struct GdnWeights {
     Linear qkv, gate, alpha, beta, output;
     Tensor conv, dt_bias, a_log, norm;
     LinearGroup input_projection;
+    std::vector<Linear> split_qkv;
 };
 
 class Gdn {
@@ -494,6 +495,7 @@ struct QsaWeights {
     Linear query, key, value, output, index_query_key;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
     LinearGroup input_projection;
+    Linear gate;
 };
 struct QsaConfig {
     int64_t heads, kv_heads, width, index_heads, index_width, pool, budget, maximum;

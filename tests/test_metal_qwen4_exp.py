@@ -66,7 +66,8 @@ def _canonical_tensors(tensors: dict, *, text_layers: int = 1) -> dict:
     return tensors.__class__(mapped)
 
 
-def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen4_gdn_cached_chunks_match_full_sequence(independent) -> None:
     rng = np.random.default_rng(3801)
     hidden = dimension = 128
     key_heads, value_heads = 1, 2
@@ -103,6 +104,11 @@ def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
 
     full = MlxQwen4ExpGdn(MlxNintModel(tensors), config, prefix)
     expected = full(source, use_cache=False)
+    if independent:
+        tensors = dict(tensors)
+        q, k, v = np.split(tensors.pop(prefix + '.qkv.weight'), [key_width, 2*key_width], axis=0)
+        for name, matrix in zip(('query', 'key', 'value'), (q, k, v)):
+            tensors[prefix + f'.{name}.weight'] = matrix.copy()
 
     cached = MlxQwen4ExpGdn(MlxNintModel(tensors), config, prefix)
     cached.reset_cache(1)
@@ -491,7 +497,8 @@ def test_qwen4_ple_reject_rollback_restores_convolution_and_ngram_history() -> N
     )
 
 
-def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence(independent) -> None:
     rng = np.random.default_rng(3802)
     hidden = dimension = 128
     heads, kv_heads, index_heads = 2, 1, 2
@@ -537,6 +544,11 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         positions,
         use_cache=False,
     )
+    if independent:
+        tensors = dict(tensors)
+        pair = tensors[prefix + '.query.weight'].reshape(heads, 2*dimension, hidden)
+        tensors[prefix + '.query.weight'] = pair[:, :dimension].reshape(heads*dimension, hidden).copy()
+        tensors[prefix + '.gate.weight'] = pair[:, dimension:].reshape(heads*dimension, hidden).copy()
 
     cached = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 64)
     cached.reset_cache(1)

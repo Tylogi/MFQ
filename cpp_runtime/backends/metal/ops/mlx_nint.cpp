@@ -1618,7 +1618,7 @@ MlxNintWeight MlxNintWeight::from_blob(
     const int input_size = cursor.scalar<std::int32_t>("input size");
     const auto dimensions = cursor.scalar<std::uint32_t>("dimension count");
     if (bits <= 0 || bits > 8 || sub_bits <= 0 || sub_bits > 8 ||
-        group_size <= 0 || input_size <= 0 || dimensions != 2 || axis != 0) {
+        group_size <= 0 || input_size <= 0 || (dimensions != 2 && dimensions != 3) || axis != 0) {
         throw std::runtime_error("unsupported NINT Metal dimensions");
     }
 
@@ -1628,7 +1628,14 @@ MlxNintWeight MlxNintWeight::from_blob(
     }
     const auto output_size = cursor.scalar<std::uint32_t>("output size");
     const auto groups = cursor.scalar<std::uint32_t>("group count");
-    if (shape[0] != output_size || shape[1] != input_size || groups == 0 ||
+    std::uint64_t rows = 1;
+    for (std::size_t i = 0; i + 1 < shape.size(); ++i) {
+        if (shape[i] <= 0 || static_cast<std::uint64_t>(shape[i]) >
+            std::numeric_limits<std::uint32_t>::max() / rows)
+            throw std::runtime_error("inconsistent NINT Metal row dimensions");
+        rows *= static_cast<std::uint64_t>(shape[i]);
+    }
+    if (rows != output_size || shape.back() != input_size || groups == 0 ||
         static_cast<std::uint64_t>(input_size) >
             static_cast<std::uint64_t>(groups) * group_size) {
         throw std::runtime_error("inconsistent NINT Metal dimensions");

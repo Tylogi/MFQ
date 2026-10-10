@@ -694,9 +694,13 @@ NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
     }
     const int64_t expected_groups =
         (static_cast<int64_t>(t.neuron_len) + t.gs - 1) / t.gs;
+    const bool routed_shape = ndim == 3 && t.axis == 0 &&
+        t.shape[0] <= std::numeric_limits<int>::max() &&
+        t.shape[1] <= std::numeric_limits<int>::max() &&
+        t.shape[0] * t.shape[1] == t.out && t.shape[2] == t.neuron_len;
     if (t.out <= 0 || t.ng <= 0 ||
-            t.shape[static_cast<size_t>(t.axis)] != t.out ||
-            flattened_neuron_len != t.neuron_len ||
+            (!routed_shape && (t.shape[static_cast<size_t>(t.axis)] != t.out ||
+             flattened_neuron_len != t.neuron_len)) ||
             expected_groups != t.ng) {
         throw std::runtime_error("inconsistent NINT tensor dimensions");
     }
