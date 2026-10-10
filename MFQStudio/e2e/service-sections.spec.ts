@@ -14,7 +14,7 @@ for (const language of ['zh-CN', 'en'] as const) {
       : ['API parameters', 'Memory plan', 'Context management', 'Persistent prefix cache', 'Automation']);
     const contexts = page.locator('.server-context-panel');
     await expect(contexts.locator('.model-context-settings')).toHaveCount(1);
-    await expect(contexts.getByRole('spinbutton')).toHaveValue('8192');
+    await expect(contexts.locator('.model-context-entry').getByRole('spinbutton')).toHaveValue('');
     await expect(page.locator('.server-memory-panel .model-context-settings')).toHaveCount(0);
     await expect(page.locator('.server-memory-panel')).not.toContainText(language === 'zh-CN' ? '前缀块大小' : 'Prefix block size');
     await expect(page.locator('.server-prefix-panel')).toContainText(language === 'zh-CN' ? '前缀块大小' : 'Prefix block size');

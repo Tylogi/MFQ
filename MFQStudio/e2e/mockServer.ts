@@ -42,7 +42,9 @@ const catalogConfiguration = {
 };
 export const officialCatalog: OfficialModelList = {
   system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
-    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },
+    cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40,
+    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30,
+    memory_pools: [{ kind: 'uma', capacity_bytes: 128 * 2 ** 30, bandwidth_bytes_per_second: 614e9 }] },
   data: ['Studio Long-Context Mixture Model', 'Studio Compact Model'].map((name, index) => ({
     id: `catalog-${index}`, name, family: 'Layout fixture', architecture: 'studio_test',
     description: 'Deterministic catalog fixture for browser layout and memory-pressure checks.',
@@ -91,6 +93,25 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
+    if (path === '/api/v1/quantization/workspace' && method === 'GET')
+      return json({ import_directory: '/models', export_directory: '/outputs',
+        candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
+        candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
+    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
+    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
+      cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
+      memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });
+    if (path === '/api/v1/runtime/cache/entries') return json({ directory: '/data/mfq/prefix-cache',
+      total_bytes: 0, total_blocks: 0, can_clear: true, offset: 0, limit: 100, data: [], blocks: [] });
+    if (path === '/api/v1/runtime/context-policy') return json({ max_context_size: null,
+      model_overrides: {}, model_yarn_enabled: {}, model_qsa_kv_offload: {}, model_kv_quantization: {}, fallback_context_size: 32768 });
+    if (path.startsWith('/api/v1/runtime/yarn/')) return json({ supported: false,
+      native_context: 262144, maximum_context: 262144, maximum_factor: 1, enabled: false, effective_factor: 1 });
+    if (/^\/api\/v1\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
+    if (path === '/api/v1/evaluations/tools')
+      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
+        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',
@@ -271,6 +292,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',
         '/api/v1/datasets',
+        '/api/v1/datasets/catalog',
         '/api/v1/evaluations',
         '/api/v1/cluster/nodes',
       ].includes(path)
