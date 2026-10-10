@@ -280,7 +280,7 @@ def _run(args: argparse.Namespace) -> int:
             ModelLoadRequest(
                 model=initial_artifact.resource.name,
                 artifact_uri=f"mfq://{initial_artifact.resource.id}",
-                context_size=args.context_size or 32768,
+                context_size=args.context_size or None,
                 prefill_chunk_size=args.prefill_chunk_size,
                 moe_gpu_cache_gb=args.moe_gpu_cache_gb,
                 prefix_cache_enabled=not args.no_prefix_cache,
@@ -357,7 +357,9 @@ def _run(args: argparse.Namespace) -> int:
         port=args.port if args.port is not None else saved_service_port(listener_settings),
         log_level=args.log_level,
         access_log=args.access_log,
-    ), listener_settings).run()
+    ), listener_settings, anthropic_port=(
+        args.anthropic_port if args.anthropic_port is not None else saved_service_port(listener_settings, "anthropic")
+    )).run()
     return 0
 
 
@@ -388,7 +390,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--port",
         type=_port,
         default=None,
-        help="public API bind port (default: saved listener port or 8090)",
+        help="OpenAI API bind port (default: saved listener port or 8090)",
+    )
+    parser.add_argument(
+        "--anthropic-port", type=_port, default=None,
+        help="Anthropic Messages API bind port (default: saved listener port or 8091)",
     )
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
     parser.add_argument("--prefill-chunk-size", type=_positive_int, default=2048)

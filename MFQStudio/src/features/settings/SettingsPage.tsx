@@ -18,14 +18,12 @@ interface SettingsPageProps {
   setSettingsDraft: Dispatch<SetStateAction<GenerationSettings>>;
   mtpAvailable: boolean;
   presetManager: ReactNode;
-  contextControls?: ReactNode;
   busy: boolean;
   hasStudio: boolean;
-  updateManager?: ReactNode;
   actions: SettingsActions;
 }
 
-export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextControls, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
+export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, busy, hasStudio, actions }: SettingsPageProps) {
   const { setModelDefaultInheritance, applyPreset, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
   return (
     <div className="settings-page">
@@ -110,29 +108,20 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
         </div>
       </fieldset>
 
-      <div className="settings-page-grid">
-        <div className="settings-page-section">
-          <SectionLabel title={tr("上下文", "Context")} />
-          <TMPanel className="settings-page-panel">
-            {contextControls}
-          </TMPanel>
-        </div>
-
-        <div className="settings-page-section">
-          <SectionLabel title={tr("外观", "Appearance")} />
-          <TMPanel className="settings-page-panel">
-            <SettingRow
-              title={tr("界面语言", "Interface language")}
-              detail={tr("选择 MFQ Studio 的显示语言。", "Choose the display language for MFQ Studio.")}
-              trailing={<select aria-label={tr("界面语言", "Interface language")} onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
-            />
-            <SettingRow
-              title={tr("主题", "Theme")}
-              detail={tr("跟随系统，或固定使用浅色或深色外观。", "Follow the system or use a fixed light or dark appearance.")}
-              trailing={<select aria-label={tr("主题", "Theme")} onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
-            />
-          </TMPanel>
-        </div>
+      <div className="settings-page-section">
+        <SectionLabel title={tr("外观", "Appearance")} />
+        <TMPanel className="settings-page-panel">
+          <SettingRow
+            title={tr("界面语言", "Interface language")}
+            detail={tr("选择 MFQ Studio 的显示语言。", "Choose the display language for MFQ Studio.")}
+            trailing={<select aria-label={tr("界面语言", "Interface language")} onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
+          />
+          <SettingRow
+            title={tr("主题", "Theme")}
+            detail={tr("跟随系统，或固定使用浅色或深色外观。", "Follow the system or use a fixed light or dark appearance.")}
+            trailing={<select aria-label={tr("主题", "Theme")} onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
+          />
+        </TMPanel>
       </div>
 
       <SectionLabel title={tr("数据与连接", "Data and connection")} />
@@ -144,15 +133,6 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
         />
         {hasStudio && <SettingRow title={tr("服务器连接", "Server connection")} detail={tr("配置本地或远程 MFQ Server。", "Configure a local or remote MFQ Server.")} trailing={<button className="secondary" onClick={openServerPage} type="button">{tr("打开服务器设置", "Open server settings")}</button>} />}
       </TMPanel>
-
-      {updateManager && (
-        <>
-          <SectionLabel title={tr('版本', 'Version')} />
-          <TMPanel className="settings-page-panel settings-update-panel">
-            {updateManager}
-          </TMPanel>
-        </>
-      )}
 
       <div className="settings-page-actions">
         <button onClick={resetSettingsDraft} type="button">{tr("恢复默认", "Reset")}</button>

@@ -74,17 +74,6 @@ vi.mock('../../shared/api/resources/sessions', async (importOriginal) => {
     },
   };
 });
-vi.mock('../../shared/api/resources/connections', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../shared/api/resources/connections')>();
-  return {
-    ...actual,
-    connectionsApi: {
-      ...actual.connectionsApi,
-      mcpTools: vi.fn().mockResolvedValue({ data: [] }),
-    },
-  };
-});
-
 vi.mock('../../studio', () => ({
   studioConfirm: vi.fn().mockResolvedValue(true),
 }));
@@ -110,12 +99,11 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
         <SavedMessageList
           messages={messages}
           responses={{}}
-          mcpTools={[]}
           busy={busy}
           tr={mockTr}
           editDraft={null}
           setEditDraft={vi.fn()}
-          actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }}
+          actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn() }}
         />
       );
     }

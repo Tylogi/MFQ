@@ -58,11 +58,33 @@
 }
 .server-wide-input { width: min(32vw, 360px); }
 .server-number-input { width: 96px; text-align: right; }
-.model-context-heading { border-top: 1px solid var(--line-soft); padding: 18px 0 14px; color: var(--ink-soft); font-size: 11px; font-weight: 610; line-height: 1.5; }
-.model-context-heading + .setting-row { border-top: 0; padding-top: 0; }
+.model-context-settings { container-type: inline-size; margin-top: 18px; padding-top: 22px; border-top: 1px solid var(--line-soft); }
+.model-context-settings .setting-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px 24px; }
+.model-context-settings > .setting-row { border: 0; padding: 0; }
 .model-context-settings .setting-row > div:first-child { min-width: 0; }
 .model-context-settings .setting-row > div:first-child > strong { display: block; overflow-wrap: anywhere; }
-.model-context-settings .setting-row-trailing { flex-shrink: 0; }
+.model-context-settings .setting-row > div:first-child > small { margin-top: 7px; line-height: 1.6; }
+.model-context-settings .setting-row-trailing { max-width: none; justify-self: end; }
+.model-context-settings .server-number-input { width: 132px; }
+.model-context-settings .server-row-actions > button { min-width: 62px; }
+.model-context-global-control { display: grid; justify-items: end; gap: 7px; }
+.model-context-save-state { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.model-context-models { margin-top: 22px; }
+.model-context-note { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.model-context-list { padding-inline: 16px; border: 1px solid var(--line-soft); border-radius: 12px; }
+.model-context-entry + .model-context-entry { border-top: 1px solid var(--line-soft); }
+.model-context-entry > .setting-row { border: 0; padding-block: 18px; }
+.model-context-entry > p { margin: 0 0 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.model-context-settings [role="alert"] { color: var(--danger); font-size: 11px; }
+.model-context-progress { display: grid; gap: 10px; padding: 0 0 18px; color: var(--ink-soft); font-size: 11px; }
+.model-context-progress progress { width: 100%; height: 5px; border: 0; border-radius: 3px; overflow: hidden; accent-color: var(--accent); }
+.model-context-progress progress::-webkit-progress-bar { background: var(--line-soft); }
+.model-context-progress progress::-webkit-progress-value { background: var(--accent); }
+@container (max-width: 560px) {
+  .model-context-settings .setting-row { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .model-context-settings .setting-row-trailing { justify-self: start; }
+  .model-context-global-control { justify-items: start; }
+}
 .server-managed-value { color: var(--muted); font-size: 11px; }
 .server-unit-value,
 .server-input-unit { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
@@ -77,6 +99,9 @@
 .server-page-footer > span { color: var(--muted-light); font-size: 11px; }
 .server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .memory-budget-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 14px 0; color: var(--muted); font-size: 11px; }
+.memory-budget-available { margin-inline-start: 16px; color: var(--muted-light); font-size: 11.5px; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.memory-budget-actions > button { min-height: 36px; border: 1px solid var(--line); border-radius: 9px; padding: 8px 15px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 12px; font-weight: 500; }
+.memory-budget-actions > button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
 .prefix-directory-controls { flex-wrap: wrap; }
 .prefix-directory-controls input { width: 100%; min-width: 180px; }
 .studio-dialog.model-alias-dialog { width: min(760px, calc(100vw - 40px)); max-width: 760px; padding: 24px; }

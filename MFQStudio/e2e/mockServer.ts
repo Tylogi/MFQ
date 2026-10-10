@@ -42,9 +42,7 @@ const catalogConfiguration = {
 };
 export const officialCatalog: OfficialModelList = {
   system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
-    cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40,
-    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30,
-    memory_pools: [{ kind: 'uma', capacity_bytes: 128 * 2 ** 30, bandwidth_bytes_per_second: 614e9 }] },
+    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },
   data: ['Studio Long-Context Mixture Model', 'Studio Compact Model'].map((name, index) => ({
     id: `catalog-${index}`, name, family: 'Layout fixture', architecture: 'studio_test',
     description: 'Deterministic catalog fixture for browser layout and memory-pressure checks.',
@@ -93,10 +91,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
-    if (path === '/api/v1/quantization/workspace' && method === 'GET')
-      return json({ import_directory: '/models', export_directory: '/outputs',
-        candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
-        candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',
@@ -119,9 +113,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         duplex_available: false,
       });
     if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
-    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, configurable: true });
-    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
-    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
     if (path === '/api/v1/runtime/instances')
       return json({
         data: [
@@ -255,18 +247,19 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
       });
-    if (path === '/api/v1/evaluations/tools')
-      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
-        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
-    if (path === '/api/v1/models/directories')
+    if (path === '/api/v1/models/directories') {
+      const query = new URL(route.request().url()).searchParams;
+      const directory = query.get('path') || ({ 'root-dir': '/', 'models-dir': '/models', 'empty-dir': '/models/empty' }[query.get('directory_id') || ''] ?? '/');
+      const root = directory === '/';
       return json({
-        current_id: 'models-dir',
-        current_name: 'Models',
-        current_path: '/models',
-        parent_id: null,
+        current_id: root ? 'root-dir' : directory === '/models' ? 'models-dir' : 'empty-dir',
+        current_name: root ? '/' : 'Models',
+        current_path: directory,
+        parent_id: root ? null : directory === '/models' ? 'root-dir' : 'models-dir',
         model_file_count: 0,
-        data: [{ id: 'empty-dir', name: 'Empty directory', model_file_count: 0 }],
+        data: root ? [{ id: 'models-dir', name: 'Models', model_file_count: 0 }] : [{ id: 'empty-dir', name: 'Empty directory', model_file_count: 0 }],
       });
+    }
     if (
       [
         '/api/v1/models',
@@ -274,13 +267,10 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/runtime/metrics',
         '/api/v1/runtime/logs',
         '/api/v1/jobs/kinds',
-        '/api/v1/mcp/servers',
-        '/api/v1/mcp/tools',
         '/api/v1/presets',
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',
         '/api/v1/datasets',
-        '/api/v1/datasets/catalog',
         '/api/v1/evaluations',
         '/api/v1/cluster/nodes',
       ].includes(path)

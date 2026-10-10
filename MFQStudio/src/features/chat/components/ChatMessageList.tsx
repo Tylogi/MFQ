@@ -1,7 +1,6 @@
 /** 聊天消息区组合欢迎状态、历史、语音和流式回复。 */
 import { lazy, Suspense } from 'react';
 import { useSettings } from '../../settings/SettingsProvider';
-import { useChatTools } from '../ChatToolsProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
 import { AudioClip } from '../../voice/AudioClip';
@@ -16,7 +15,6 @@ const SavedMessageList = lazy(() =>
 /** 展示当前会话消息并维持历史消息组件的按需加载。 */
 export function ChatMessageList({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
-  const { mcpTools } = useChatTools();
   const messages = useConversationSelector((state) => state.messages);
   const responses = useConversationSelector((state) => state.responses);
   const {
@@ -66,13 +64,12 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
           <SavedMessageList
             messages={messages}
             responses={responses}
-            mcpTools={mcpTools}
             busy={busy}
             tr={tr}
             editDraft={editDraft}
             setEditDraft={setEditDraft}
             actions={{ saveEdit: saveCurrentEdit, copyMessage: messageActions.copyMessage,
-              regenerate: messageActions.regenerate, executeToolCalls: messageActions.executeToolCalls }}
+              regenerate: messageActions.regenerate }}
           />
         </Suspense>
         {currentVoiceMessages.map((message) => (

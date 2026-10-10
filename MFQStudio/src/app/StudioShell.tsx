@@ -35,7 +35,7 @@ export function StudioShell() {
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const pageAvailable = ready || view === 'not-found' ||
-    location.pathname === '/runtime' || location.pathname === '/settings';
+    location.pathname === '/runtime' || location.pathname === '/settings' || view === 'versions';
   const connectionProblem = ready ? connectionError : connectionError ?? refreshError;
   const hasAlerts = pageAvailable && Boolean(
     connectionProblem || (ready && (refreshError || Object.keys(jobStreamErrors).length)),

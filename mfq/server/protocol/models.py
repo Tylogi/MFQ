@@ -68,11 +68,6 @@ class JobStatus(str, Enum):
     INTERRUPTED = "interrupted"
 
 
-class McpTransport(str, Enum):
-    STDIO = "stdio"
-    STREAMABLE_HTTP = "streamable_http"
-
-
 class JobEventType(str, Enum):
     STATE = "state"
     PROGRESS = "progress"
@@ -465,7 +460,7 @@ class CreateGenerationPresetRequest(ProtocolModel):
     model: str | None = Field(default=None, min_length=1, max_length=255)
     mode: SessionMode | None = None
     settings: ResponseRequestSettings
-    context_size: int = Field(default=32768, ge=512)
+    context_size: int | None = Field(default=None, ge=512)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -479,7 +474,7 @@ class GenerationPresetResource(ProtocolModel):
     model: str | None = None
     mode: SessionMode | None = None
     settings: ResponseRequestSettings
-    context_size: int = Field(ge=512)
+    context_size: int | None = Field(default=None, ge=512)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: AwareDatetime
     updated_at: AwareDatetime
@@ -528,83 +523,28 @@ class DocumentResource(ProtocolModel):
     created_at: AwareDatetime
 
 
-class CreateMcpServerRequest(ProtocolModel):
-    name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
-    transport: McpTransport
-    enabled: bool = False
-    url: str | None = Field(default=None, max_length=2048)
-    command: str | None = Field(default=None, max_length=1024)
-    args: list[str] = Field(default_factory=list, max_length=128)
-    header_env: dict[str, str] = Field(default_factory=dict)
-    timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
-
-    @model_validator(mode="after")
-    def validate_transport(self) -> CreateMcpServerRequest:
-        if self.transport == McpTransport.STREAMABLE_HTTP:
-            if not self.url or self.command is not None or self.args:
-                raise ValueError("streamable_http needs a URL and no command")
-            if not self.url.startswith(("http://", "https://")):
-                raise ValueError("MCP URL must use HTTP or HTTPS")
-        elif not self.command or self.url is not None or self.header_env:
-            raise ValueError("stdio needs a command and cannot use URL headers")
-        for header, variable in self.header_env.items():
-            if not header.strip() or not variable.isidentifier():
-                raise ValueError("MCP headers must map to environment variable names")
-        return self
-
-
-class UpdateMcpServerRequest(ProtocolModel):
-    enabled: bool
-
-
-class McpServerResource(ProtocolModel):
-    id: UUID
-    name: str
-    transport: McpTransport
-    enabled: bool
-    url: str | None = None
-    command: str | None = None
-    args: list[str] = Field(default_factory=list)
-    header_env: dict[str, str] = Field(default_factory=dict)
-    timeout_seconds: float
-    created_at: AwareDatetime
-    updated_at: AwareDatetime
-
-
-class McpServerList(ProtocolModel):
-    data: list[McpServerResource]
-
-
-class McpToolResource(ProtocolModel):
-    server_id: UUID
-    server: str
-    name: str
-    qualified_name: str
-    description: str | None = None
-    input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
-
-
-class McpToolList(ProtocolModel):
-    data: list[McpToolResource]
-    errors: dict[str, str] = Field(default_factory=dict)
-
-
-class McpToolCallRequest(ProtocolModel):
-    name: str = Field(min_length=1, max_length=255)
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    confirm: bool = False
-
-
-class McpToolCallResult(ProtocolModel):
-    server: str
-    name: str
-    content: list[dict[str, Any]] = Field(default_factory=list)
-    structured_content: dict[str, Any] | None = None
-    is_error: bool = False
-
-
 class RuntimeInferencePolicy(ProtocolModel):
     mtp_enabled: bool = Field(default=True, strict=True)
+
+
+class QsaKvStorageSettings(ProtocolModel):
+    enabled: bool = False
+    budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+
+
+class KvQuantizationSettings(ProtocolModel):
+    enabled: bool = Field(default=False, strict=True)
+    bits: Literal[2, 2.5, 3, 3.5, 4, 6, 8] = 4
+    algorithm: Literal["turboquant"] = "turboquant"
+
+
+class RuntimeContextPolicy(ProtocolModel):
+    fallback_context_size: int = Field(default=32768, ge=512, le=2147483647)
+    max_context_size: int | None = Field(default=None, ge=512, le=2147483647)
+    model_overrides: dict[str, Annotated[int, Field(ge=512, le=2147483647)]] = Field(default_factory=dict)
+    model_yarn_enabled: dict[str, bool] = Field(default_factory=dict)
+    model_qsa_kv_offload: dict[str, QsaKvStorageSettings] = Field(default_factory=dict)
+    model_kv_quantization: dict[str, KvQuantizationSettings] = Field(default_factory=dict)
 
 
 class RuntimeMemoryPolicy(ProtocolModel):
@@ -619,13 +559,26 @@ class RuntimeModelAliases(ProtocolModel):
     aliases: dict[str, str] = Field(default_factory=dict, max_length=128)
 
 
+class QsaKvOffloadPolicy(ProtocolModel):
+    enabled: bool = False
+    budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+    target_context: int = Field(default=262144, ge=512, le=2147483647)
+
+
+class ConfigureQsaKvOffloadRequest(ProtocolModel):
+    instance_id: UUID
+    enabled: bool = False
+    budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+
+
 class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
     device_ids: list[str] = Field(default_factory=list)
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
     pin: bool = False
-    context_size: int = Field(default=32768, ge=512)
+    context_size: int | None = Field(default=None, ge=512, le=2147483647)
+    yarn_enabled: bool | None = Field(default=None, strict=True)
     prefill_chunk_size: int = Field(default=2048, ge=1)
     moe_gpu_cache_gb: float | None = Field(
         default=None,
@@ -641,6 +594,9 @@ class ModelLoadRequest(ProtocolModel):
     prefix_cache_block_tokens: int | None = Field(default=None, ge=1, le=65536)
     prefix_cache_pending_bytes: int | None = Field(default=None, ge=0)
     sampling_defaults: SamplingParams | None = None
+
+    qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
+    kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
 
 class CreateRuntimeProfileRequest(ProtocolModel):
     name: str = Field(min_length=1, max_length=64)
@@ -771,6 +727,8 @@ class RuntimeWeightTraffic(ProtocolModel):
     expert_read_bytes_per_second: float | None = Field(default=None, ge=0)
     ple_read_bytes_per_second: float | None = Field(default=None, ge=0)
     engram_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    kv_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    kv_write_bytes_per_second: float | None = Field(default=None, ge=0)
 
 
 class RuntimeResourceSnapshot(ProtocolModel):
@@ -781,6 +739,9 @@ class RuntimeResourceSnapshot(ProtocolModel):
     cpu_utilization_percent: float | None = Field(default=None, ge=0, le=100)
     gpus: list[RuntimeGpuUtilization]
     disks: list[RuntimeDiskTraffic]
+    memory_total_bytes: int | None = Field(default=None, ge=0)
+    memory_used_bytes: int | None = Field(default=None, ge=0)
+    memory_available_bytes: int | None = Field(default=None, ge=0)
     memory_bandwidth_bytes_per_second: float | None = Field(default=None, ge=0)
     memory_bandwidth_limit_bytes_per_second: int | None = Field(default=None, gt=0)
     memory_bandwidth_utilization_percent: float | None = Field(default=None, ge=0, le=100)
@@ -809,6 +770,16 @@ class RuntimeMemoryResources(ProtocolModel):
     ssd_ple: bool | None = None
     ssd_ple_bytes: int | None = Field(default=None, ge=0)
 
+    ssd_kv: bool | None = None
+    ssd_kv_bytes: int | None = Field(default=None, ge=0)
+    streaming_kv_resident_bytes: int | None = Field(default=None, ge=0)
+    streaming_kv_budget_bytes: int | None = Field(default=None, ge=0)
+    streaming_kv_pending_bytes: int | None = Field(default=None, ge=0)
+    ssd_kv_read_bytes: int | None = Field(default=None, ge=0)
+    ssd_kv_written_bytes: int | None = Field(default=None, ge=0)
+    ssd_kv_reads: int | None = Field(default=None, ge=0)
+    ssd_kv_hits: int | None = Field(default=None, ge=0)
+
 
 class RuntimeInstanceResource(ProtocolModel):
     id: UUID
@@ -828,6 +799,10 @@ class RuntimeInstanceResource(ProtocolModel):
     pinned: bool = False
     mtp_supported: bool = False
     mtp_available: bool = False
+    qsa_kv_offload_supported: bool = False
+    kv_quantization_supported: bool = False
+    kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
+    qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     identity: RuntimeIdentity | None = None
     error: ErrorDetail | None = None
 
@@ -891,6 +866,9 @@ class ModelArtifactResource(ProtocolModel):
     total_bytes: int = Field(ge=0)
     estimated_resident_weight_bytes: int | None = Field(default=None, ge=0)
     ssd_ple_bytes: int | None = Field(default=None, ge=0)
+    context_capacity: int | None = Field(default=None, ge=1)
+    yarn_context_capacity: int | None = Field(default=None, ge=1)
+    yarn_max_factor: float | None = Field(default=None, gt=1)
     tensor_count: int = Field(ge=0)
     record_count: int = Field(ge=0)
     dtypes: list[str] = Field(default_factory=list)
@@ -1038,6 +1016,9 @@ class ModelCacheComponent(ProtocolModel):
     minimum_rows: int = Field(default=0, ge=0)
     row_rounding: Literal['ceil', 'floor'] = 'ceil'
     active_after: int = Field(default=0, ge=0)
+    max_read_rows_per_token: int | None = Field(default=None, ge=1)
+    head_dimension: int | None = Field(default=None, ge=1)
+    kv_heads: int | None = Field(default=None, ge=1)
 
 
 class ModelCacheFixedComponent(ProtocolModel):
@@ -1342,12 +1323,16 @@ class JobEventList(ProtocolModel):
 
 
 class RuntimeListenerRequest(ProtocolModel):
-    port: int = Field(ge=1, le=65535)
+    port: int = Field(strict=True, ge=1, le=65535)
+    protocol: Literal["openai", "anthropic"] = "openai"
 
 
 class RuntimeReloadRequest(ProtocolModel):
-    context_size: int = Field(ge=512)
+    context_size: int | None = Field(default=None, ge=512, le=2147483647)
     instance_id: UUID | None = None
+    yarn_enabled: bool | None = Field(default=None, strict=True)
+    qsa_kv_offload: QsaKvStorageSettings | None = None
+    kv_quantization: KvQuantizationSettings | None = None
 
 
 class RuntimeCacheClearRequest(ProtocolModel):

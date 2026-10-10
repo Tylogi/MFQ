@@ -11,6 +11,9 @@
 #include "mlx_inference_warmup.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_platform.h"
+#include "mlx_ane_matmul.h"
+#include "mlx_paged_session_codec.h"
+#include "nlohmann/json.hpp"
 
 #include "nvq_codebooks.generated.h"
 
@@ -36,6 +39,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -6395,7 +6399,7 @@ void test_streamed_mixed_mfe_residency() {
         "mixed streamed MFE record discard mismatch");
 }
 
-void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
+void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt = false) {
     constexpr int hidden = 96, intermediate = 48, experts = 4;
     std::string config = R"JSON({"model_type":"qwen4_exp_text","vocab_size":32,"hidden_size":96,
         "num_hidden_layers":1,"max_position_embeddings":128,"num_attention_heads":6,
@@ -6412,6 +6416,7 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
         const std::string field = "\"mtp_num_hidden_layers\":0";
         config.replace(config.find(field), field.size(), "\"mtp_num_hidden_layers\":1");
     }
+    if (ttt) config.replace(config.find("\"eos_token_id\":31"), 17, "\"eos_token_id\":0");
     std::vector<MappedRecordFixture> records{{"__mfq_asset__/model_config.json", "BLOB", {config.begin(), config.end()}}};
     const auto dense = [&](const std::string& name, std::vector<int> shape, bool norm = false) {
         std::vector<std::uint8_t> blob;
@@ -6419,7 +6424,8 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
         std::size_t count = 1;
         for (const auto dimension : shape) { append<std::int64_t>(blob, dimension); count *= dimension; }
         for (std::size_t index = 0; index < count; ++index)
-            append<std::uint16_t>(blob, norm ? 0x3c00 : ((index % 5) ? 0x1800 : 0x9800));
+            append<std::uint16_t>(blob, norm ? 0x3c00 :
+                (ttt ? ((index % 5) ? 0x2c00 : 0xac00) : ((index % 5) ? 0x1800 : 0x9800)));
         records.push_back({name, "F16", std::move(blob)});
     };
     const auto mhc = [&](const std::string& root, bool injection) {
@@ -6465,8 +6471,13 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
     if (mtp) {
         const auto target = records;
         const std::string root = "model.block.0.";
-        for (const auto& record : target) if (record.name.starts_with(root))
-            records.push_back({"predictor.block.0." + record.name.substr(root.size()), record.dtype, record.payload});
+        for (const auto& record : target) if (record.name.starts_with(root)) {
+            const auto name = "predictor.block.0." + record.name.substr(root.size());
+            if (ttt && record.dtype == "MFE") {
+                const bool down = name.ends_with("down.weight");
+                dense(name, {experts, down ? hidden : intermediate, down ? intermediate : hidden});
+            } else records.push_back({name, record.dtype, record.payload});
+        }
         dense("predictor.embedding_norm.weight", {hidden}, true);
         dense("predictor.hidden_norm.weight", {hidden * 2}, true);
         dense("predictor.fusion.embedding.weight", {hidden, hidden});
@@ -6475,6 +6486,140 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
     }
     const TemporaryMfq file(records, "qwen4_exp");
     const mfq::metal::MfqContainer container(file.path());
+    if (ttt) {
+        const auto original_fp16 = mfq::metal::mlx_predequantize_fp16_enabled();
+        {
+            mfq::metal::MlxFp16WeightScope fp16(true);
+            bool other_thread = !original_fp16;
+            std::thread([&] { other_thread = mfq::metal::mlx_predequantize_fp16_enabled(); }).join();
+            require(mfq::metal::mlx_predequantize_fp16_enabled() && other_thread == original_fp16,
+                "FP16 predictor loading changed another loading thread");
+        }
+        require(mfq::metal::mlx_predequantize_fp16_enabled() == original_fp16, "FP16 weight scope leaked");
+        setenv("MFQ_MTP_TTT", "1", 1);
+        struct ResetTtt { ~ResetTtt() { unsetenv("MFQ_MTP_TTT"); unsetenv("MFQ_MTP_SOURCE"); } } reset_ttt;
+        auto packed_records = records;
+        for (auto& record : packed_records) if (record.name == "predictor.fusion.hidden.weight") record.dtype = "NINTv2";
+        const TemporaryMfq packed_file(packed_records, "qwen4_exp");
+        const mfq::metal::MfqContainer packed_container(packed_file.path());
+        auto bf16_records = records;
+        for (auto& record : bf16_records) if (record.name.starts_with("predictor.") && record.dtype == "F16") {
+            record.dtype = "BF16";
+            std::uint32_t dimensions;
+            std::memcpy(&dimensions, record.payload.data(), sizeof(dimensions));
+            for (std::size_t offset = 4 + dimensions * 8; offset < record.payload.size(); offset += 2) {
+                std::uint16_t value;
+                std::memcpy(&value, record.payload.data() + offset, 2);
+                value = value == 0x3c00 ? 0x3f80 : (value == 0x2c00 ? 0x3d80 : 0xbd80);
+                std::memcpy(record.payload.data() + offset, &value, 2);
+            }
+        }
+        const TemporaryMfq bf16_file(bf16_records, "qwen4_exp");
+        const mfq::metal::MfqContainer bf16_container(bf16_file.path());
+        {
+            mfq::metal::MlxFp16WeightScope fp16(true);
+            const auto linear = mfq::metal::MlxLinear::load(bf16_container, "predictor.fusion.hidden.weight");
+            require(linear.dense_weight_ref()->dtype() == mlx::core::float16, "BF16 predictor was not kept as FP16");
+        }
+        bool rejected = false;
+        try { (void)mfq::metal::MlxQwen4CausalLm::load(packed_container, 128); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "TTT silently treated a quantized predictor as original FP16");
+        setenv("MFQ_MTP_SOURCE", bf16_file.path().c_str(), 1);
+        auto runtime = mfq::metal::MlxQwen4CausalLm::load(packed_container, 128);
+        unsetenv("MFQ_MTP_SOURCE");
+        require(!runtime.mtp_cache_fingerprint().empty(), "TTT predictor cache has no fingerprint");
+        char directory[] = "/tmp/mfq-qwen4-ttt-test-XXXXXX";
+        require(mkdtemp(directory) != nullptr, "TTT fixture directory creation failed");
+        struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+        const auto hf_directory = std::filesystem::path(directory) / "original-hf";
+        std::filesystem::create_directories(hf_directory / ".mfq-assets" / "hf");
+        std::ofstream(hf_directory / "config.json") << config;
+        auto header = nlohmann::json::object(), aliases = nlohmann::json::object();
+        std::vector<std::uint8_t> payload;
+        const auto add_tensor = [&](const std::string& name, const std::string& dtype,
+            const std::vector<std::int64_t>& shape, std::span<const std::uint8_t> data) {
+            const auto offset = payload.size();
+            payload.insert(payload.end(), data.begin(), data.end());
+            const auto source_name = name.starts_with("predictor.") ? "mtp." + name.substr(10) : name;
+            header[source_name] = {{"dtype", dtype}, {"shape", shape}, {"data_offsets", {offset, payload.size()}}};
+            aliases[name] = source_name;
+        };
+        for (const auto& record : bf16_records) {
+            if (record.dtype != "F16" && record.dtype != "BF16") continue;
+            std::uint32_t dimensions;
+            std::memcpy(&dimensions, record.payload.data(), 4);
+            std::vector<std::int64_t> shape(dimensions);
+            std::memcpy(shape.data(), record.payload.data() + 4, dimensions * 8);
+            const auto data = std::span(record.payload).subspan(4 + dimensions * 8);
+            if (record.name.starts_with("predictor.") && dimensions == 3) {
+                const auto dot = record.name.rfind('.', record.name.size() - 8);
+                const auto size = std::size_t(shape[1] * shape[2]) * 2;
+                for (int expert = 0; expert < shape[0]; ++expert)
+                    add_tensor(record.name.substr(0, dot + 1) + std::to_string(expert) + record.name.substr(dot),
+                        record.dtype, {shape[1], shape[2]}, data.subspan(expert * size, size));
+            } else add_tensor(record.name, record.dtype, shape, data);
+        }
+        std::ofstream(hf_directory / ".mfq-assets" / "hf" / "source_tensor_map.json")
+            << nlohmann::json({{"schema", "mfq.hf-source-map"}, {"version", 1}, {"canonical_to_source", aliases}}).dump();
+        const auto header_text = header.dump();
+        std::vector<std::uint8_t> safetensors;
+        append<std::uint64_t>(safetensors, header_text.size());
+        safetensors.insert(safetensors.end(), header_text.begin(), header_text.end());
+        safetensors.insert(safetensors.end(), payload.begin(), payload.end());
+        std::ofstream weights(hf_directory / "model.safetensors", std::ios::binary);
+        weights.write(reinterpret_cast<const char*>(safetensors.data()), safetensors.size());
+        weights.close();
+        setenv("MFQ_MTP_SOURCE", hf_directory.c_str(), 1);
+        {
+            auto hf_runtime = mfq::metal::MlxQwen4CausalLm::load(packed_container, 128);
+            mfq::metal::MlxSamplingParams sampling;
+            sampling.temperature = 0;
+            sampling.mtp_max_draft_tokens = 2;
+            require(hf_runtime.generate({1, 2, 3}, sampling, 8) > 0, "native HF floating experts could not draft");
+        }
+        unsetenv("MFQ_MTP_SOURCE");
+        runtime.prepare_mtp_ttt(directory);
+        const auto metric = [&](const char* name) {
+            for (const auto& [key, value] : runtime.mtp_session_metrics()) if (key == name) return value;
+            throw std::runtime_error("missing TTT model metric");
+        };
+        mfq::metal::MlxSamplingParams sampling;
+        sampling.temperature = 0;
+        sampling.top_k = 1;
+        sampling.mtp_max_draft_tokens = 2;
+        const auto original = evaluated_floats(runtime.forward(mlx::core::array({1, 2, 3}, mlx::core::Shape{1, 3}), false));
+        for (int request = 0; request < 12 && metric("mtp_ttt_submitted") == 0; ++request) {
+            runtime.reset_generation_state();
+            runtime.begin_mtp_session("a");
+            require(runtime.generate({1, 2, 3}, sampling, 16) > 0, "TTT fixture could not generate");
+            runtime.end_mtp_session();
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (metric("mtp_ttt_completed") < metric("mtp_ttt_submitted")) {
+            require(std::chrono::steady_clock::now() < deadline, "TTT model worker timeout");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (const auto& [key, value] : runtime.mtp_session_metrics()) std::cout << key << '=' << value << '\n';
+        require(metric("mtp_ttt_submitted") > 0 && metric("mtp_ttt_updates") > 0 &&
+            metric("mtp_ttt_failed") == 0, "real MTP verification did not train the adapter");
+        runtime.begin_mtp_session("a");
+        runtime.generate({1, 2, 3}, sampling, 8);
+        require(metric("mtp_ttt_active_version") > 0, "trained adapter did not enter draft inference");
+        runtime.end_mtp_session();
+        runtime.clear_cache();
+        const auto after = evaluated_floats(runtime.forward(mlx::core::array({1, 2, 3}, mlx::core::Shape{1, 3}), false));
+        require(after == original, "TTT changed the main model forward");
+        runtime.set_expert_cache_limit(0);
+        runtime.begin_mtp_session("a");
+        require(runtime.generate({1, 2, 3}, sampling, 8) > 0 && runtime.reclaimable_expert_bytes() == 0,
+            "expert paging attempted to offload the frozen FP16 predictor");
+        runtime.end_mtp_session();
+        runtime.close_mtp_session("a");
+        runtime.clear_mtp_sessions();
+        std::cout << "Qwen4 MTP -> ANE KL -> next-round LoRA integration passed\n";
+        return;
+    }
     auto reference = mfq::metal::MlxQwen4CausalLm::load(container, 128);
     std::optional<mfq::metal::MlxKernelPreparation> preparation;
     if (prepare) {
@@ -7494,6 +7639,152 @@ void test_kernel_preparation() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string_view(argv[1]) == "--probe-mtp-cache") {
+        try {
+            using namespace mlx::core;
+            set_default_device(Device::gpu);
+            set_cache_limit(128ULL << 20);
+            const auto read = [](const std::filesystem::path& path) {
+                std::ifstream stream(path, std::ios::binary | std::ios::ate);
+                require(bool(stream), "MTP probe cannot open checkpoint");
+                const auto size = stream.tellg();
+                require(size > 0 && size < (1ULL << 30), "MTP probe checkpoint size is invalid");
+                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+                stream.seekg(0); stream.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+                require(bool(stream), "MTP probe checkpoint is truncated");
+                return bytes;
+            };
+            const auto bytes = read(argv[4]);
+            const auto text = read(std::string(argv[4]) + ".tokens");
+            require(bytes.size() >= 156 && text.size() >= 108 &&
+                std::memcmp(bytes.data(), "MFQKVB1\0", 8) == 0 &&
+                std::memcmp(text.data(), "MFQTXT1\0", 8) == 0,
+                "MTP probe requires a native prefix block and token sidecar");
+            std::uint32_t block_size = 0, count = 0, text_count = 0;
+            std::uint64_t payload_size = 0;
+            std::memcpy(&block_size, bytes.data() + 108, 4);
+            std::memcpy(&count, bytes.data() + 112, 4);
+            std::memcpy(&payload_size, bytes.data() + 116, 8);
+            std::memcpy(&text_count, text.data() + 72, 4);
+            require(count > 0 && count <= block_size && count == text_count &&
+                bytes.size() == 156 + payload_size && text.size() == 108 + count * 8 &&
+                std::memcmp(bytes.data() + 12, text.data() + 8, 64) == 0,
+                "MTP probe block metadata mismatch");
+            const auto payload_hash = mfq::cache::sha256(bytes.data() + 156, payload_size);
+            const auto token_hash = mfq::cache::sha256(text.data() + 108, count * 8);
+            require(std::memcmp(payload_hash.data(), bytes.data() + 124, 32) == 0 &&
+                std::memcmp(token_hash.data(), text.data() + 76, 32) == 0,
+                "MTP probe checkpoint checksum mismatch");
+            std::vector<std::int64_t> tokens(count);
+            std::memcpy(tokens.data(), text.data() + 108, count * 8);
+            auto payload = std::make_shared<const std::vector<std::uint8_t>>(bytes.begin() + 156, bytes.end());
+            auto state = mfq::metal::MlxPagedSessionCodec<mfq::metal::MlxQwen4TextSessionState>::decode(
+                {payload}, tokens, block_size);
+            const mfq::metal::MfqContainer model(argv[2]), original(argv[3], "mtp.");
+            std::vector<std::pair<std::string, array>> results;
+            for (const auto& name : {std::string("BF16"), std::string("FP16"), std::string("quantized")}) {
+                const auto [pending, logits] = mfq::metal::qwen4_mtp_logits_from_state(
+                    model, name == "quantized" ? model : original, state, name == "FP16");
+                std::cout << "mtp_probe source=" << name << " context=" << count << " pending=" << pending
+                    << " top1=" << argmax(logits).item<std::int32_t>() << std::endl;
+                results.emplace_back(name, logits);
+                clear_cache();
+            }
+            const auto log_softmax = [](const array& x) { return x - logsumexp(x, -1, true); };
+            for (const auto [left, right] : {std::pair{0, 1}, std::pair{0, 2}, std::pair{1, 2}}) {
+                const auto reference = log_softmax(results[left].second);
+                const auto difference = results[right].second - results[left].second;
+                auto maximum = max(abs(difference));
+                auto rms = sqrt(mean(square(difference)));
+                auto kl = sum(exp(reference) * (reference - log_softmax(results[right].second)));
+                eval(maximum, rms, kl);
+                std::cout << "mtp_probe compare=" << results[left].first << '/' << results[right].first
+                    << " max_logit_diff=" << maximum.item<float>() << " rms_logit_diff=" << rms.item<float>()
+                    << " kl=" << kl.item<float>() << std::endl;
+            }
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--test-ane-production") {
+        try {
+            auto engine = std::make_shared<mfq::metal::MlxAneMatmul>();
+            for (const auto [inner, columns] : {std::pair{2560, 6144}, std::pair{6144, 2560}, std::pair{10240, 320}}) {
+                std::vector<float> x(inner), w(std::size_t(inner) * columns);
+                for (int i = 0; i < inner; ++i) x[i] = std::sin(float(i)) * 0.1f;
+                for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::cos(float(i)) * 0.01f;
+                engine->prepare(1, inner, columns);
+                const auto y = engine->evaluate(1, inner, columns, x, w);
+                for (int column : {0, 1, 31, columns / 2, columns - 1}) {
+                    float expected = 0;
+                    for (int k = 0; k < inner; ++k) expected += x[k] * w[k * columns + column];
+                    require(std::isfinite(y[column]) && std::abs(y[column] - expected) < 0.005f,
+                        "production ANE tiled matrix differs from CPU reference");
+                }
+                std::cout << "ANE shape=1x" << inner << "x" << columns << " passed\n";
+            }
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--check-mtp-source") {
+        try {
+            const mfq::metal::MfqContainer source(argv[2], "mtp.");
+            std::uint64_t bytes = 0;
+            std::size_t tensors = 0;
+            for (const auto& [name, record] : source.records()) {
+                if (record.dtype == "BLOB") continue;
+                require(name.starts_with("predictor."), "MTP source exposed backbone weights");
+                require(record.dtype == "BF16" || record.dtype == "F16" || record.dtype == "F32",
+                    "MTP source contains quantized weights");
+                bytes += record.nbytes;
+                ++tensors;
+            }
+            require(source.contains("predictor.embedding_norm.weight") && tensors > 0, "empty MTP source");
+            std::cout << "mtp_tensors=" << tensors << " bytes=" << bytes << '\n';
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--test-ane-autograd") {
+        try {
+            auto engine = std::make_shared<mfq::metal::MlxAneMatmul>();
+            const auto cpu = mlx::core::default_stream(mlx::core::Device(mlx::core::Device::cpu));
+            const auto x = mlx::core::array({0.2f, -0.3f, 0.4f, 0.1f, 0.7f, -0.2f}, mlx::core::Shape{2, 3});
+            const auto w = mlx::core::array({0.1f, 0.2f, -0.4f, 0.3f, 0.5f, -0.1f}, mlx::core::Shape{3, 2});
+            auto actual = mlx::core::value_and_grad([&](const std::vector<mlx::core::array>& args) {
+                auto y = (*engine)(args[0], args[1]);
+                return std::vector<mlx::core::array>{mlx::core::sum(mlx::core::square(y, cpu), cpu)};
+            }, std::vector<int>{0, 1})({x, w});
+            auto reference = mlx::core::value_and_grad([&](const std::vector<mlx::core::array>& args) {
+                return std::vector<mlx::core::array>{mlx::core::sum(
+                    mlx::core::square(mlx::core::matmul(args[0], args[1], cpu), cpu), cpu)};
+            }, std::vector<int>{0, 1})({x, w});
+            const auto close = [&](const mlx::core::array& a, const mlx::core::array& b) {
+                return mlx::core::max(mlx::core::abs(mlx::core::subtract(a, b, cpu), cpu), cpu).item<float>() < 0.002f;
+            };
+            require(close(actual.first[0], reference.first[0]), "ANE forward differs");
+            for (std::size_t i = 0; i < actual.second.size(); ++i)
+                require(close(actual.second[i], reference.second[i]), "ANE VJP differs");
+            const auto storage_x = mlx::core::reshape(mlx::core::arange(35, mlx::core::float32, cpu), {5, 7}) * 0.01f;
+            const auto storage_w = mlx::core::reshape(mlx::core::arange(42, mlx::core::float32, cpu), {6, 7}) * 0.01f;
+            const auto views = [&](const std::vector<mlx::core::array>& args) {
+                return std::pair{mlx::core::slice(args[0], {1, 1}, {5, 5}, {2, 1}, cpu),
+                    mlx::core::transpose(mlx::core::slice(args[1], {1, 1}, {4, 5}, cpu), cpu)};
+            };
+            auto strided = mlx::core::value_and_grad([&](const std::vector<mlx::core::array>& args) {
+                auto [left, right] = views(args);
+                return std::vector<mlx::core::array>{mlx::core::sum(mlx::core::square((*engine)(left, right), cpu), cpu)};
+            }, std::vector<int>{0, 1})({storage_x, storage_w});
+            auto strided_reference = mlx::core::value_and_grad([&](const std::vector<mlx::core::array>& args) {
+                auto [left, right] = views(args);
+                return std::vector<mlx::core::array>{mlx::core::sum(
+                    mlx::core::square(mlx::core::matmul(left, right, cpu), cpu), cpu)};
+            }, std::vector<int>{0, 1})({storage_x, storage_w});
+            require(close(strided.first[0], strided_reference.first[0]), "strided ANE forward differs");
+            for (std::size_t i = 0; i < strided.second.size(); ++i)
+                require(close(strided.second[i], strided_reference.second[i]), "strided ANE VJP differs");
+            std::cout << "ANE CPU-stream forward and backward passed\n";
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--test-portable-prefill") {
             test_portable_mmq_row_buckets();
@@ -7533,6 +7824,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--test-shared-rotation") {
             test_shared_rotated_input();
             std::cout << "MFQ shared HSG1 rotation tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-mtp-ttt") {
+            test_qwen4_online_expert_offload(true, false, true);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-prepare") {

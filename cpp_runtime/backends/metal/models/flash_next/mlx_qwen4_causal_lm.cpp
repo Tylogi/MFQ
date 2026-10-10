@@ -12,6 +12,9 @@
 #include "mlx_sparse_attention.h"
 #include "mlx_tensor.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_mtp_lora.h"
+#include "runtime_config.h"
+#include "mfq_paged_prefix_cache.h"
 #include "mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
@@ -35,6 +38,8 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <sstream>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -56,6 +61,23 @@ constexpr std::string_view kModelConfigAsset =
 // Qwen4/Flash-Next recursively reuses its single predictor layer to form a
 // draft chain. Predictor layer count and maximum draft depth are independent.
 constexpr int kQwen4MtpMaximumDraftDepth = 5;
+
+std::string mtp_source_identity(const MfqContainer& model) {
+    std::ostringstream identity;
+    identity << model.header().architecture << '\n' << model.read_text(std::string(kModelConfigAsset));
+    for (const auto& path : model.source_paths()) {
+        identity << '\n' << path.string() << ':' << std::filesystem::file_size(path) << ':' <<
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::filesystem::last_write_time(path).time_since_epoch()).count();
+    }
+    return mfq::cache::block_hash_hex(mfq::cache::sha256(identity.str()));
+}
+
+bool mtp_ttt_requested() { return mfq::engine::environment_enabled("MFQ_MTP_TTT", false); }
+bool mtp_fp16_requested() {
+    const auto* source = std::getenv("MFQ_MTP_SOURCE");
+    return mtp_ttt_requested() || (source && *source);
+}
 
 bool decode_async_enabled() noexcept {
     static const bool enabled = [] {
@@ -134,6 +156,8 @@ array dense(
     }
     const auto mapped = model.map_record(name);
     auto result = load_dense_array(record.dtype, mapped.view());
+    if (!dtype && name.starts_with("predictor.") && mtp_fp16_requested() &&
+        (result.dtype() == mlx::core::bfloat16 || result.dtype() == mlx::core::float32)) dtype = mlx::core::float16;
     if (dtype && result.dtype() != *dtype) {
         result = mlx::core::astype(result, *dtype);
     }
@@ -206,11 +230,31 @@ MlxMfeWeight moe_weight(
 // must dispatch by record representation rather than by architecture role.
 class Qwen4RoutedWeight {
 public:
+    const array& training_weight() const {
+        if (!dense_) throw std::invalid_argument("MTP training requires floating expert weights");
+        return *dense_;
+    }
     std::size_t packed_bytes() const noexcept { return packed_ ? packed_->packed_nbytes() : dense_->nbytes(); }
     static Qwen4RoutedWeight load(
         const MfqContainer& model,
         const std::string& name) {
         if (model.record(name).dtype == "MFE") {
+            if (model.is_hf_source() && name.starts_with("predictor.") && mtp_fp16_requested()) {
+                const auto projection = name.rfind('.', name.size() - 8);
+                if (projection == std::string::npos) throw std::invalid_argument("invalid predictor expert name");
+                const auto root = name.substr(0, projection + 1);
+                const auto suffix = name.substr(projection + 1);
+                std::vector<array> experts;
+                for (std::size_t expert = 0;; ++expert) {
+                    const auto key = root + std::to_string(expert) + "." + suffix;
+                    if (!model.contains(key)) break;
+                    experts.push_back(dense(model, key, mlx::core::float16));
+                }
+                if (experts.empty()) throw std::invalid_argument("floating predictor experts are missing");
+                auto values = mlx::core::stack(experts, 0);
+                values.eval();
+                return Qwen4RoutedWeight(std::move(values));
+            }
             return Qwen4RoutedWeight(moe_weight(model, name));
         }
         auto values = dense(model, name);
@@ -230,13 +274,14 @@ public:
         if (model.contains(combined)) return load(model, combined);
         const auto gate = prefix + ".experts.gate.weight";
         const auto up = prefix + ".experts.up.weight";
+        const bool floating_hf = model.is_hf_source() && prefix.starts_with("predictor.") && mtp_fp16_requested();
         if (model.record(gate).dtype == "MFE" &&
-            model.record(up).dtype == "MFE") {
+            model.record(up).dtype == "MFE" && !floating_hf) {
             return Qwen4RoutedWeight(
                 load_routed_gate_up_weight(model, prefix));
         }
-        auto gate_values = dense(model, gate);
-        auto up_values = dense(model, up);
+        auto gate_values = floating_hf ? *load(model, gate).dense_ : dense(model, gate);
+        auto up_values = floating_hf ? *load(model, up).dense_ : dense(model, up);
         if (gate_values.ndim() != 3 ||
             gate_values.shape() != up_values.shape()) {
             throw std::runtime_error(
@@ -408,6 +453,40 @@ private:
 
 class GatedResidual {
 public:
+    MlxQwen4GatedResidualPre training_pre(const array& input, const MlxMtpLoraParameters& p) const {
+        const auto cpu = p.cpu();
+        const int h = config_.hidden_size, hc = config_.hc_count;
+        auto source = mlx::core::reshape(input, {-1, hc, h}, cpu);
+        auto normalized = mlx::core::divide(source, mlx::core::sqrt(mlx::core::add(
+            mlx::core::mean(mlx::core::square(source, cpu), -1, true, cpu),
+            array(float(config_.rms_norm_eps)), cpu), cpu), cpu);
+        normalized = mlx::core::multiply(mlx::core::reshape(normalized, input.shape(), cpu),
+            mlx::core::add(mlx::core::astype(norm_, mlx::core::float32, cpu), array(1.0f), cpu), cpu);
+        auto low = mlx::core::divide(p.linear(normalized, *down_.dense_weight_ref()), array(float(hc)), cpu);
+        low = mlx::core::multiply(low, mlx::core::sigmoid(low, cpu), cpu);
+        auto mixing = mlx::core::sigmoid(p.linear(low, *up_.dense_weight_ref()), cpu);
+        auto branch = mlx::core::mean(mlx::core::multiply(
+            mlx::core::reshape(mixing, {-1, hc, h}, cpu),
+            mlx::core::reshape(normalized, {-1, hc, h}, cpu), cpu), -2, false, cpu);
+        auto shape = input.shape(); shape.back() = h;
+        std::optional<array> injection;
+        if (injection_) injection = mlx::core::multiply(array(2.0f), mlx::core::sigmoid(
+            mlx::core::divide(p.linear(normalized, *injection_->dense_weight_ref()), array(float(hc)), cpu), cpu), cpu);
+        return {mlx::core::reshape(branch, shape, cpu), input, std::move(injection)};
+    }
+    array training_post(const array& branch, const MlxQwen4GatedResidualPre& values,
+        const MlxMtpLoraParameters& p) const {
+        const auto cpu = p.cpu();
+        auto update = mlx::core::multiply(mlx::core::expand_dims(branch, -2, cpu),
+            mlx::core::expand_dims(*values.injection, -1, cpu), cpu);
+        return mlx::core::add(values.residual, mlx::core::reshape(update, values.residual.shape(), cpu), cpu);
+    }
+    void prepare_training(MlxMtpLora& lora) const {
+        mlx::core::eval(norm_);
+        lora.prepare_linear(*down_.dense_weight_ref());
+        lora.prepare_linear(*up_.dense_weight_ref());
+        if (injection_) lora.prepare_linear(*injection_->dense_weight_ref());
+    }
     static GatedResidual load(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -520,6 +599,16 @@ private:
 
 class DenseFfn {
 public:
+    array training(const array& value, const MlxMtpLoraParameters& p) const {
+        const auto cpu = p.cpu();
+        auto gate = mlx::core::add(p.linear(value, *gate_.dense_weight_ref()), p.delta("shared.gate", value), cpu);
+        auto up = mlx::core::add(p.linear(value, *up_.dense_weight_ref()), p.delta("shared.up", value), cpu);
+        auto intermediate = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, cpu), cpu), up, cpu);
+        return mlx::core::add(p.linear(intermediate, *down_.dense_weight_ref()), p.delta("shared.down", intermediate), cpu);
+    }
+    void prepare_training(MlxMtpLora& lora) const {
+        for (const auto* weight : {&gate_, &up_, &down_}) lora.prepare_linear(*weight->dense_weight_ref());
+    }
     static DenseFfn load(
         const MfqContainer& model,
         const std::string& prefix) {
@@ -530,6 +619,12 @@ public:
     }
 
     array operator()(const array& value) const {
+        if (auto* lora = MlxMtpLora::current(); lora && lora->active()) {
+            auto gate = lora->apply("shared.gate", value, gate_(value));
+            auto up = lora->apply("shared.up", value, up_(value));
+            auto intermediate = gate * mlx::core::sigmoid(gate) * up;
+            return lora->apply("shared.down", intermediate, down_(intermediate));
+        }
         return down_(gate_up_.swiglu(value));
     }
 
@@ -575,6 +670,55 @@ private:
 
 class Qwen4Moe {
 public:
+    const std::optional<array>& training_routes() const { return training_routes_; }
+    array training(const array& value, const array& ids, const MlxMtpLoraParameters& p) const {
+        const auto cpu = p.cpu();
+        const int h = config_.hidden_size, intermediate = config_.moe_intermediate_size;
+        auto source = mlx::core::reshape(value, {1, h}, cpu);
+        auto probabilities = mlx::core::softmax(p.linear(source, *router_.dense_weight_ref()), -1, cpu);
+        auto route_weights = mlx::core::take(probabilities, mlx::core::astype(mlx::core::reshape(ids, {-1}, cpu),
+            mlx::core::int32, cpu), -1, cpu);
+        if (config_.norm_topk_prob) route_weights = mlx::core::divide(route_weights,
+            mlx::core::sum(route_weights, -1, true, cpu), cpu);
+        std::vector<array> outputs;
+        const auto& gate_up = gate_up_->training_weight();
+        const auto& down = down_->training_weight();
+        for (int route = 0; route < ids.size(); ++route) {
+            const int expert = static_cast<int>(ids.data<float>()[route]);
+            if (expert < 0 || expert >= config_.num_experts) throw std::invalid_argument("invalid MTP training route");
+            auto gate_weight = mlx::core::reshape(mlx::core::slice(gate_up,
+                {expert, 0, 0}, {expert + 1, intermediate, h}, cpu), {intermediate, h}, cpu);
+            auto up_weight = mlx::core::reshape(mlx::core::slice(gate_up,
+                {expert, intermediate, 0}, {expert + 1, 2 * intermediate, h}, cpu), {intermediate, h}, cpu);
+            const auto prefix = "expert." + std::to_string(expert) + ".";
+            auto gate = mlx::core::add(p.linear(source, gate_weight), p.delta(prefix + "gate", source), cpu);
+            auto up = mlx::core::add(p.linear(source, up_weight), p.delta(prefix + "up", source), cpu);
+            auto act = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, cpu), cpu), up, cpu);
+            auto down_weight = mlx::core::reshape(mlx::core::slice(down,
+                {expert, 0, 0}, {expert + 1, h, intermediate}, cpu), {h, intermediate}, cpu);
+            outputs.push_back(mlx::core::add(p.linear(act, down_weight), p.delta(prefix + "down", act), cpu));
+        }
+        auto pairs = mlx::core::concatenate(outputs, 0, cpu);
+        auto routed = mlx::core::sum(mlx::core::multiply(pairs,
+            mlx::core::transpose(route_weights, cpu), cpu), 0, true, cpu);
+        auto shared = mlx::core::multiply(shared_.training(source, p),
+            mlx::core::sigmoid(p.linear(source, *shared_gate_.dense_weight_ref()), cpu), cpu);
+        return mlx::core::reshape(mlx::core::add(routed, shared, cpu), value.shape(), cpu);
+    }
+    void prepare_training(MlxMtpLora& lora) const {
+        if (!gate_up_ || !down_) throw std::invalid_argument("MTP training does not support paged base experts");
+        mlx::core::eval(gate_up_->training_weight(), down_->training_weight());
+        const auto cpu = mlx::core::default_stream(mlx::core::Device(mlx::core::Device::cpu));
+        lora.prepare_linear(mlx::core::reshape(mlx::core::slice(gate_up_->training_weight(),
+            {0, 0, 0}, {1, int(config_.moe_intermediate_size), int(config_.hidden_size)}, cpu),
+            {int(config_.moe_intermediate_size), int(config_.hidden_size)}, cpu));
+        lora.prepare_linear(mlx::core::reshape(mlx::core::slice(down_->training_weight(),
+            {0, 0, 0}, {1, int(config_.hidden_size), int(config_.moe_intermediate_size)}, cpu),
+            {int(config_.hidden_size), int(config_.moe_intermediate_size)}, cpu));
+        lora.prepare_linear(*router_.dense_weight_ref());
+        lora.prepare_linear(*shared_gate_.dense_weight_ref());
+        shared_.prepare_training(lora);
+    }
     std::size_t resident_routed_bytes() const noexcept {
         return gate_up_ ? gate_up_->packed_bytes() + down_->packed_bytes() : 0;
     }
@@ -669,6 +813,20 @@ public:
             static_cast<int>(config_.num_experts_per_tok),
             false, false, config_.norm_topk_prob);
         const auto* route_groups = routes.groups ? &*routes.groups : nullptr;
+        if (auto* lora = MlxMtpLora::current()) {
+            if (lora->collecting()) training_routes_ = routes.ids;
+            if (lora->active()) {
+                auto pair = gate_up_->routed_matmul(source, routes.ids, route_groups);
+                auto parts = mlx::core::split(pair, 2, -1);
+                auto gate = lora->routed_apply("gate", source, parts[0], routes.ids);
+                auto up = lora->routed_apply("up", source, parts[1], routes.ids);
+                auto intermediate = gate * mlx::core::sigmoid(gate) * up;
+                auto pairs = lora->routed_apply("down", intermediate,
+                    down_->routed_matmul(intermediate, routes.ids, route_groups), routes.ids);
+                return mlx::core::reshape(moe_weighted_reduce_shared_gate(pairs, routes.weights,
+                    shared_(source), shared_gate_(source)), value.shape());
+            }
+        }
         if (detail::component_profile_active()) {
             detail::profile_eval(
                 "qwen4.moe.topk",
@@ -1023,6 +1181,7 @@ private:
     Qwen4Config config_;
     std::optional<Qwen4RoutedWeight> gate_up_;
     std::optional<Qwen4RoutedWeight> down_;
+    mutable std::optional<array> training_routes_;
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
@@ -2173,15 +2332,72 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    const std::vector<array>& training_context() const { return training_context_; }
+    void prepare_training(MlxMtpLora& lora) const {
+        lora.prepare_linear(*query_.dense_weight_ref());
+        lora.prepare_linear(*output_.dense_weight_ref());
+        lora.prepare_attention(config_.head_dim, ((config_.indexer_budget + config_.indexer_compress_ratio + 30) / 32) * 32);
+        mlx::core::eval(query_norm_.weight());
+    }
+    array training(const array& hidden, const array& keys, const array& values, const array& position,
+        const MlxMtpLoraParameters& p) const {
+        const auto cpu = p.cpu();
+        const int heads = config_.num_attention_heads, dimension = config_.head_dim;
+        const int width = heads * dimension, rotary = config_.rotary_dim, half = rotary / 2;
+        const int attention_width = ((config_.indexer_budget + config_.indexer_compress_ratio + 30) / 32) * 32;
+        if (keys.shape(2) > attention_width) throw std::invalid_argument("MTP sparse training cache exceeds its budget");
+        auto padded_keys = mlx::core::pad(keys, {{0, 0}, {0, 0}, {0, attention_width - keys.shape(2)}, {0, 0}}, array(0.0f), "constant", cpu);
+        auto padded_values = mlx::core::pad(values, {{0, 0}, {0, 0}, {0, attention_width - values.shape(2)}, {0, 0}}, array(0.0f), "constant", cpu);
+        auto query_full = mlx::core::reshape(p.linear(hidden, *query_.dense_weight_ref()), {heads, 2 * dimension}, cpu);
+        auto parts = mlx::core::split(query_full, 2, -1, cpu);
+        auto raw_query = mlx::core::add(mlx::core::reshape(parts[0], {1, width}, cpu), p.delta("attention.q", hidden), cpu);
+        auto output_gate = mlx::core::add(mlx::core::reshape(parts[1], {1, width}, cpu), p.delta("attention.gate", hidden), cpu);
+        auto query = mlx::core::reshape(raw_query, {heads, dimension}, cpu);
+        query = mlx::core::multiply(mlx::core::divide(query, mlx::core::sqrt(mlx::core::add(
+            mlx::core::mean(mlx::core::square(query, cpu), -1, true, cpu), array(query_norm_.eps()), cpu), cpu), cpu),
+            mlx::core::astype(query_norm_.weight(), mlx::core::float32, cpu), cpu);
+        std::vector<float> cosine(half), sine(half);
+        const auto absolute = position.data<float>()[0];
+        for (int i = 0; i < half; ++i) {
+            const auto angle = absolute * float(yarn_frequency(i, rotary, config_.rope_theta, config_.yarn));
+            cosine[i] = std::cos(angle) * config_.yarn.attention_factor;
+            sine[i] = std::sin(angle) * config_.yarn.attention_factor;
+        }
+        const auto c = array(cosine.begin(), Shape{1, half}, mlx::core::float32);
+        const auto s = array(sine.begin(), Shape{1, half}, mlx::core::float32);
+        auto first = mlx::core::slice(query, {0, 0}, {heads, half}, cpu);
+        auto second = mlx::core::slice(query, {0, half}, {heads, rotary}, cpu);
+        query = mlx::core::concatenate({
+            mlx::core::subtract(mlx::core::multiply(first, c, cpu), mlx::core::multiply(second, s, cpu), cpu),
+            mlx::core::add(mlx::core::multiply(first, s, cpu), mlx::core::multiply(second, c, cpu), cpu),
+            mlx::core::slice(query, {0, rotary}, {heads, dimension}, cpu)}, -1, cpu);
+        std::vector<array> attended;
+        for (int head = 0; head < heads; ++head) {
+            const int kv_head = head / (heads / config_.num_key_value_heads);
+            auto key = mlx::core::reshape(mlx::core::slice(padded_keys, {0, kv_head, 0, 0},
+                {1, kv_head + 1, attention_width, dimension}, cpu), {attention_width, dimension}, cpu);
+            auto value = mlx::core::reshape(mlx::core::slice(padded_values, {0, kv_head, 0, 0},
+                {1, kv_head + 1, attention_width, dimension}, cpu), {attention_width, dimension}, cpu);
+            auto scores = mlx::core::divide(p.linear(mlx::core::slice(query, {head, 0}, {head + 1, dimension}, cpu), key),
+                array(std::sqrt(float(dimension))), cpu);
+            scores = mlx::core::where(mlx::core::less(mlx::core::arange(attention_width, mlx::core::int32, cpu),
+                array(keys.shape(2), mlx::core::int32), cpu), scores, array(-1e30f), cpu);
+            attended.push_back(p.linear(mlx::core::softmax(scores, -1, cpu), mlx::core::transpose(value, cpu)));
+        }
+        auto gathered = mlx::core::reshape(mlx::core::concatenate(attended, -1, cpu), {1, width}, cpu);
+        auto gated = mlx::core::multiply(gathered, mlx::core::sigmoid(output_gate, cpu), cpu);
+        return mlx::core::reshape(mlx::core::add(p.linear(gated, *output_.dense_weight_ref()),
+            p.delta("attention.o", gated), cpu), hidden.shape(), cpu);
+    }
     array append_history(
         const array& hidden,
         const array& positions_current,
-        const array&) override {
+        const array& positions_full) override {
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
         if (speculative_trim_ != 0)
             throw std::runtime_error("QSA history append requires committed cache");
-        if (!cache_ || batch_ != batch) reset(batch);
+        if ((!cache_ && !offloaded_kv_) || batch_ != batch) reset(batch);
         auto projected = cache_projections_(hidden);
         auto key = mlx::core::transpose(
             key_norm_(mlx::core::reshape(projected.at(0),
@@ -2190,7 +2406,7 @@ public:
         key = apply_rope(key, positions_current,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_theta),
-            config_.rope_sections, config_.mrope_interleaved);
+            config_.rope_sections, config_.mrope_interleaved, config_.yarn);
         auto value = mlx::core::transpose(
             mlx::core::reshape(projected.at(1),
                 Shape{batch, tokens, static_cast<int>(config_.num_key_value_heads),
@@ -2199,25 +2415,38 @@ public:
         auto raw_key = mlx::core::slice(projected.at(2),
             Shape{0, 0, index_begin},
             Shape{batch, tokens, index_begin + static_cast<int>(config_.indexer_head_dim)});
+        if (offloaded_kv_) {
+            offloaded_kv_->append(mlx::core::astype(key, mlx::core::float16),
+                mlx::core::astype(value, mlx::core::float16));
+            append_index_keys(raw_key, positions_full);
+            return *index_tail_;
+        }
         const int position = cache_->position();
-        auto cache = cache_->append(key, value);
-        auto index = index_cache_.append(raw_key);
-        if (index.second != position)
+        cache_->append_only(key, value);
+        if (index_position() != position)
             throw std::runtime_error("QSA history caches diverged");
-        return mlx::core::depends({cache.first}, {cache.second, index.first}).at(0);
+        append_index_keys(raw_key, positions_full);
+        return mlx::core::depends({cache_->key_storage()}, {cache_->value_storage(), *index_tail_, pooled_index_cache_.view()}).at(0);
     }
 
     MlxQwen4LayerCacheSnapshot snapshot(bool detached) const override {
-        if (!cache_ || speculative_trim_ || index_cache_.position() != cache_->position())
+        if ((!cache_ && !offloaded_kv_) || speculative_trim_ || index_position() != cache_position())
             throw std::runtime_error("QSA checkpoint is not committed");
         MlxQwen4LayerCacheSnapshot state;
-        state.position = cache_->position();
+        state.position = cache_position();
         state.batch = batch_;
-        state.kv = cache_->snapshot(detached);
-        state.index_keys = detached ? detached_copy(index_cache_.view()) : index_cache_.view();
-        if (pooled_index_cache_.position() > 0)
-            state.pooled_keys = detached ? detached_copy(pooled_index_cache_.view()) : pooled_index_cache_.view();
-        state.index_keys->eval();
+        state.index_start = index_tail_start_;
+        state.index_ratio = static_cast<int>(config_.indexer_compress_ratio);
+        state.index_keys = detached ? detached_copy(*index_tail_) : *index_tail_;
+        if (offloaded_kv_) {
+            state.offloaded_kv = offloaded_kv_->snapshot();
+            if (offloaded_pool_->position()) state.offloaded_pooled_keys = offloaded_pool_->snapshot();
+        } else {
+            state.kv = cache_->snapshot(detached);
+            if (pooled_index_cache_.position() > 0)
+                state.pooled_keys = detached ? detached_copy(pooled_index_cache_.view()) : pooled_index_cache_.view();
+        }
+        if (state.index_keys) state.index_keys->eval();
         if (state.pooled_keys) state.pooled_keys->eval();
         return state;
     }
@@ -2225,22 +2454,42 @@ public:
     void restore(const MlxQwen4LayerCacheSnapshot& state) override {
         const int width = static_cast<int>(config_.indexer_head_dim);
         const int pooled = state.position / static_cast<int>(config_.indexer_compress_ratio);
-        if (!state.kv || !state.index_keys || state.batch != 1 || state.position <= 0 ||
-            state.position > maximum_ || state.kv->position != state.position ||
-            state.index_keys->shape() != Shape{state.batch, state.position, width} ||
+        if ((!state.kv && !state.offloaded_kv) || !state.index_keys || state.batch != 1 || state.position <= 0 ||
+            state.position > maximum_ || (state.kv && state.kv->position != state.position) ||
+            (state.offloaded_kv && state.offloaded_kv->rows.position != static_cast<std::size_t>(state.position)) ||
+            state.index_ratio != config_.indexer_compress_ratio || state.index_start < 0 ||
+            state.index_start % state.index_ratio || state.index_start > state.position ||
+            state.index_keys->shape() != Shape{state.batch, state.position - state.index_start, width} ||
+            state.position - state.index_start > state.index_ratio + kMlxMtpEngineMaximumDraftDepth + 1 ||
+            (state.offloaded_pooled_keys && (state.offloaded_pooled_keys->width != width ||
+                state.offloaded_pooled_keys->dtype != mlx::core::float32 ||
+                state.offloaded_pooled_keys->rows.position != static_cast<std::size_t>(pooled))) ||
             (state.pooled_keys && (state.pooled_keys->ndim() != 3 ||
-                state.pooled_keys->shape(0) != state.batch || state.pooled_keys->shape(1) <= 0 ||
-                state.pooled_keys->shape(1) > pooled || state.pooled_keys->shape(2) != width)))
+                state.pooled_keys->shape(0) != state.batch || state.pooled_keys->shape(1) != pooled ||
+                state.pooled_keys->dtype() != mlx::core::float32 || state.pooled_keys->shape(2) != width)) ||
+            (pooled && !state.pooled_keys && !state.offloaded_pooled_keys))
             throw std::runtime_error("QSA checkpoint topology mismatch");
         reset(state.batch);
-        cache_->restore_snapshot(*state.kv);
-        index_cache_.append(*state.index_keys);
-        if (state.pooled_keys) pooled_index_cache_.append(*state.pooled_keys);
+        index_tail_ = detached_copy(*state.index_keys);
+        index_tail_start_ = state.index_start;
+        index_position_ = state.position;
+        index_resources_.set({index_tail_->nbytes() + index_tail_->dtype().size(), static_cast<std::size_t>(state.batch)});
+        if (offloaded_kv_) {
+            if (state.offloaded_kv) offloaded_kv_->restore(*state.offloaded_kv);
+            else offloaded_kv_->append_snapshot(*state.kv);
+            if (state.offloaded_pooled_keys) offloaded_pool_->restore(*state.offloaded_pooled_keys);
+            else if (state.pooled_keys) offloaded_pool_->append(*state.pooled_keys);
+        } else {
+            if (!state.kv) throw std::runtime_error("offloaded QSA checkpoint requires KV offload enabled");
+            cache_->restore_snapshot(*state.kv);
+            if (state.pooled_keys) pooled_index_cache_.append(*state.pooled_keys);
+        }
     }
     std::size_t cache_bytes() const noexcept override {
         return (cache_ ? cache_->key_storage().nbytes() +
             cache_->value_storage().nbytes() : 0) +
-            index_cache_.storage_bytes() + pooled_index_cache_.storage_bytes();
+            (index_tail_ ? index_tail_->nbytes() + index_tail_->dtype().size() : 0) + pooled_index_cache_.storage_bytes() +
+            (offloaded_kv_ ? offloaded_kv_->resident_bytes() : 0);
     }
     std::string_view profile_name() const noexcept override {
         return "qwen4.full_attention";
@@ -2274,20 +2523,37 @@ public:
     }
 
     void reset(int batch) override {
-        cache_ = std::make_unique<MlxKvCache>(
+        if (kv_store_ && batch != 1) throw std::runtime_error("QSA KV offload requires batch one");
+        if (kv_store_) {
+            offloaded_kv_ = std::make_unique<MlxQsaKvOffload>(kv_store_,
+                static_cast<int>(config_.num_key_value_heads), static_cast<int>(config_.head_dim),
+                maximum_, static_cast<int>(config_.indexer_compress_ratio));
+            offloaded_pool_ = std::make_unique<MlxQsaIndexOffload>(kv_store_,
+                static_cast<int>(config_.indexer_head_dim), mlx::core::float32, 2);
+        } else cache_ = std::make_unique<MlxKvCache>(
             batch,
             static_cast<int>(config_.num_key_value_heads),
             maximum_,
-            static_cast<int>(config_.head_dim));
-        index_cache_.reset(batch);
-        pooled_index_cache_.reset(batch);
+            static_cast<int>(config_.head_dim), 16, mlx::core::float16, true);
+        if (!kv_store_) {
+            pooled_index_cache_.reset(batch);
+        }
+        index_tail_.reset();
+        index_tail_start_ = 0;
+        index_position_ = 0;
+        index_resources_.set({});
         speculative_trim_ = 0;
         batch_ = batch;
     }
 
     void clear() noexcept override {
         cache_.reset();
-        index_cache_.clear();
+        offloaded_kv_.reset();
+        offloaded_pool_.reset();
+        index_tail_.reset();
+        index_tail_start_ = 0;
+        index_position_ = 0;
+        index_resources_.set({});
         pooled_index_cache_.clear();
         speculative_trim_ = 0;
         batch_ = 0;
@@ -2314,6 +2580,15 @@ public:
                 "Qwen4 QSA projection group output mismatch");
         }
         auto query_full = std::move(input_projections[0]);
+        if (auto* lora = MlxMtpLora::current(); lora && lora->active()) {
+            auto parts = mlx::core::split(mlx::core::reshape(query_full,
+                {batch, tokens, int(config_.num_attention_heads), 2 * int(config_.head_dim)}), 2, -1);
+            auto q = lora->apply("attention.q", hidden, mlx::core::reshape(parts[0],
+                {batch, tokens, int(config_.num_attention_heads * config_.head_dim)}));
+            auto gate = lora->apply("attention.gate", hidden, mlx::core::reshape(parts[1], q.shape()));
+            query_full = mlx::core::reshape(mlx::core::concatenate({
+                mlx::core::reshape(q, parts[0].shape()), mlx::core::reshape(gate, parts[1].shape())}, -1), query_full.shape());
+        }
         auto key_full = std::move(input_projections[1]);
         auto value_full = std::move(input_projections[2]);
         auto index_query_key = std::move(input_projections[3]);
@@ -2323,7 +2598,7 @@ public:
                 config_.indexer_n_heads * config_.indexer_head_dim)},
             -1);
         auto prologue = [&]() -> MlxQwen4QsaDecodePrologue {
-            if (qsa_decode_prologue_enabled() &&
+            if (!config_.yarn.enabled && qsa_decode_prologue_enabled() &&
                 batch == 1 && tokens >= 1 && tokens <= 6 &&
                 positions_current.dtype() == mlx::core::int32 &&
                 positions_current.shape() == Shape{tokens} &&
@@ -2375,14 +2650,14 @@ public:
                 static_cast<int>(config_.rotary_dim),
                 static_cast<float>(config_.rope_theta),
                 config_.rope_sections,
-                config_.mrope_interleaved);
+                config_.mrope_interleaved, config_.yarn);
             key = apply_rope(
                 key,
                 positions_current,
                 static_cast<int>(config_.rotary_dim),
                 static_cast<float>(config_.rope_theta),
                 config_.rope_sections,
-                config_.mrope_interleaved);
+                config_.mrope_interleaved, config_.yarn);
             auto index_query = index_query_norm_(mlx::core::reshape(
                 index_parts.at(0),
                 Shape{
@@ -2398,7 +2673,7 @@ public:
                     static_cast<int>(config_.rotary_dim),
                     static_cast<float>(config_.rope_theta),
                     config_.rope_sections,
-                    config_.mrope_interleaved),
+                    config_.mrope_interleaved, config_.yarn),
                 {0, 2, 1, 3});
             return {
                 std::move(query),
@@ -2427,47 +2702,67 @@ public:
 
         array key_cache = key;
         array value_cache = value;
-        array raw_cache = raw_key;
         int query_offset = 0;
         if (use_cache) {
-            if (!cache_ || batch_ != batch) reset(batch);
-            query_offset = cache_->position();
-            auto cache = cache_->append(key, value);
-            key_cache = std::move(cache.first);
-            value_cache = std::move(cache.second);
-            auto index = index_cache_.append(raw_key);
-            raw_cache = std::move(index.first);
-            if (index.second != query_offset) {
-                throw std::runtime_error("Qwen4 QSA caches diverged");
+            if ((!cache_ && !offloaded_kv_) || batch_ != batch) reset(batch);
+            query_offset = cache_position();
+            if (offloaded_kv_) {
+                offloaded_kv_->append(mlx::core::astype(key, mlx::core::float16),
+                    mlx::core::astype(value, mlx::core::float16));
+            } else {
+                cache_->append_only(key, value);
+                if (!cache_->quantized()) {
+                    auto cache = cache_->view();
+                    key_cache = std::move(cache.first);
+                    value_cache = std::move(cache.second);
+                }
             }
+            if (index_position() != query_offset)
+                throw std::runtime_error("Qwen4 QSA caches diverged");
+            append_index_keys(raw_key, positions_full);
             speculative_trim_ = speculative_confirmed > 0
                 ? tokens - speculative_confirmed
                 : 0;
         }
+        const int ratio = static_cast<int>(config_.indexer_compress_ratio);
+        const auto pooled_keys = [&]() -> array {
+            return use_cache ? pooled_index_cache_.view() : pool_index_keys(
+                raw_key, positions_full, 0, tokens / ratio);
+        };
+        if (auto* lora = MlxMtpLora::current(); lora && lora->collecting()) {
+            if (offloaded_kv_) throw std::invalid_argument("MTP LoRA training does not support QSA KV offload");
+            if (use_cache && cache_->quantized()) throw std::invalid_argument("MTP LoRA training does not support quantized QSA KV");
+            if (batch != 1 || tokens != 1) throw std::invalid_argument("MTP training requires one-token draft steps");
+            array selected = mlx::core::arange(query_offset + 1, mlx::core::int32);
+            if (key_cache.shape(2) > config_.indexer_budget) {
+                const int complete = key_cache.shape(2) / ratio;
+                auto blocks = selected_blocks(index_query, pooled_keys(), query_offset);
+                selected = mlx::core::reshape(mlx::core::reshape(blocks, {-1, 1}) * array(ratio, mlx::core::int32) +
+                    mlx::core::arange(ratio, mlx::core::int32), {-1});
+                if ((query_offset + 1) % ratio) selected = mlx::core::concatenate({selected,
+                    mlx::core::arange(complete * ratio, query_offset + 1, 1, mlx::core::int32)}, 0);
+            }
+            training_context_ = {mlx::core::take(key_cache, selected, 2),
+                mlx::core::take(value_cache, selected, 2), positions_current};
+        }
         array attended = [&]() {
+            if (use_cache && cache_ && cache_->quantized()) {
+                std::optional<array> blocks;
+                if (cache_->position() > config_.indexer_budget) blocks = selected_blocks(index_query, pooled_keys(), query_offset);
+                return cache_->sparse_attention(query, blocks, query_offset, ratio, static_cast<int>(config_.indexer_budget));
+            }
+            if (use_cache && offloaded_kv_) {
+                std::optional<array> blocks;
+                if (offloaded_kv_->position() > config_.indexer_budget) {
+                    blocks = offloaded_pool_->select(index_query, query_offset,
+                        static_cast<int>(config_.indexer_compress_ratio), static_cast<int>(config_.indexer_budget));
+                }
+                return offloaded_kv_->attention(query, blocks, query_offset, static_cast<int>(config_.indexer_budget));
+            }
             if (key_cache.shape(2) <= config_.indexer_budget) {
                 return qwen4_dense_gqa_attention(
                     query, key_cache, value_cache, query_offset);
             }
-            const int ratio = static_cast<int>(
-                config_.indexer_compress_ratio);
-            const int complete = raw_cache.shape(1) / ratio;
-            const auto pooled_keys = [&]() -> array {
-                if (!use_cache) {
-                    return pool_index_keys(
-                        raw_cache, positions_full, 0, complete);
-                }
-                const int cached = pooled_index_cache_.position();
-                if (cached > complete) {
-                    throw std::runtime_error(
-                        "Qwen4 pooled index cache is ahead of raw keys");
-                }
-                if (cached < complete) {
-                    pooled_index_cache_.append(pool_index_keys(
-                        raw_cache, positions_full, cached, complete));
-                }
-                return pooled_index_cache_.view();
-            };
             if (tokens >= 32 && batch == 1 && query.shape(1) == 24 &&
                 key_cache.shape(1) == 2 && query.shape(3) == 256 &&
                 config_.indexer_n_heads == 4 && config_.indexer_head_dim == 128 &&
@@ -2513,6 +2808,8 @@ public:
                 ? mlx::core::concatenate({*dense_prefix, sparse}, 1)
                 : sparse;
         }();
+        if (use_cache) attended = offloaded_kv_ ? mlx::core::depends({attended}, {*index_tail_}).at(0)
+            : mlx::core::depends({attended}, {*index_tail_, pooled_index_cache_.view()}).at(0);
         if (tokens >= 32 && attended.ndim() == 4 &&
             attended.shape() == output_gate.shape() &&
             attended.dtype() == hidden.dtype() && output_gate.dtype() == hidden.dtype()) {
@@ -2530,7 +2827,10 @@ public:
         auto gated = mlx::core::astype(attended, mlx::core::float32) *
             mlx::core::sigmoid(
                 mlx::core::astype(output_gate, mlx::core::float32));
-        return output_(mlx::core::astype(gated, hidden.dtype()));
+        auto output_input = mlx::core::astype(gated, hidden.dtype());
+        auto output = output_(output_input);
+        if (auto* lora = MlxMtpLora::current()) output = lora->apply("attention.o", output_input, output);
+        return output;
     }
 
     void commit_speculative() noexcept override {
@@ -2538,7 +2838,7 @@ public:
     }
 
     void rollback_speculative(int accepted_tokens) override {
-        if (!cache_ || speculative_trim_ <= 0) {
+        if ((!cache_ && !offloaded_kv_) || speculative_trim_ <= 0) {
             throw std::runtime_error(
                 "Qwen4 QSA has no speculative rollback state");
         }
@@ -2547,28 +2847,68 @@ public:
                 "Qwen4 QSA accepted prefix is outside the draft window");
         }
         const int rejected = speculative_trim_ - accepted_tokens;
-        cache_->trim(rejected);
-        index_cache_.trim(rejected);
+        if (index_position() - rejected < index_tail_start_)
+            throw std::runtime_error("QSA rollback exceeds the uncommitted index tail");
+        if (offloaded_kv_) offloaded_kv_->trim(cache_position() - rejected);
+        else cache_->trim(rejected);
+        trim_index_keys(index_position() - rejected);
         trim_pooled_index_cache();
         speculative_trim_ = 0;
     }
 
     void trim_cache_to(int position) override {
-        if (!cache_ || position < 0 || position > cache_->position() ||
-            index_cache_.position() != cache_->position()) {
+        if ((!cache_ && !offloaded_kv_) || position < 0 || position > cache_position() ||
+            index_position() != cache_position() || position < index_tail_start_) {
             throw std::runtime_error(
                 "Qwen4 QSA cache trim position is invalid");
         }
-        const int count = cache_->position() - position;
+        const int count = cache_position() - position;
         if (count > 0) {
-            cache_->trim(count);
-            index_cache_.trim(count);
+            if (offloaded_kv_) offloaded_kv_->trim(position);
+            else cache_->trim(count);
+            trim_index_keys(position);
             trim_pooled_index_cache();
         }
         speculative_trim_ = 0;
     }
 
 private:
+    int cache_position() const noexcept {
+        return offloaded_kv_ ? offloaded_kv_->position() : cache_ ? cache_->position() : 0;
+    }
+    int index_position() const noexcept {
+        return index_position_;
+    }
+    void append_index_keys(const array& keys, const array& positions_full) {
+        const int ratio = static_cast<int>(config_.indexer_compress_ratio);
+        const int end = index_position_ + keys.shape(1);
+        auto raw = mlx::core::astype(keys, mlx::core::float16);
+        if (index_tail_) raw = mlx::core::concatenate({*index_tail_, raw}, 1);
+        const int cached = offloaded_pool_ ? offloaded_pool_->position() : pooled_index_cache_.position();
+        const int begin = cached - index_tail_start_ / ratio;
+        const int complete = end / ratio - index_tail_start_ / ratio;
+        if (begin < complete) {
+            auto pooled = pool_index_keys(raw, positions_full, begin, complete, index_tail_start_);
+            if (offloaded_pool_) offloaded_pool_->append(pooled);
+            else pooled_index_cache_.append(pooled);
+        }
+        const int keep = std::max(index_tail_start_, std::max(0, end - kMlxMtpEngineMaximumDraftDepth - 1) / ratio * ratio);
+        index_tail_ = detached_copy(mlx::core::slice(raw, Shape{0, keep - index_tail_start_, 0},
+            Shape{keys.shape(0), raw.shape(1), keys.shape(2)}));
+        index_tail_start_ = keep;
+        index_position_ = end;
+        index_resources_.set({index_tail_->nbytes() + index_tail_->dtype().size(), static_cast<std::size_t>(keys.shape(0))});
+    }
+    void trim_index_keys(int position) {
+        if (position < index_tail_start_ || position > index_position_)
+            throw std::runtime_error("QSA rollback exceeds the uncommitted index tail");
+        if (position == 0) index_tail_.reset();
+        else index_tail_ = detached_copy(mlx::core::slice(*index_tail_, Shape{0, 0, 0},
+            Shape{batch_, position - index_tail_start_, static_cast<int>(config_.indexer_head_dim)}));
+        index_position_ = position;
+        index_resources_.set({index_tail_ ? index_tail_->nbytes() + index_tail_->dtype().size() : 0,
+            index_tail_ ? static_cast<std::size_t>(batch_) : 0});
+    }
     Qwen4Qsa(
         Qwen4Config config,
         int maximum,
@@ -2601,7 +2941,6 @@ private:
           }),
           index_query_norm_(std::move(index_query_norm)),
           index_key_norm_(std::move(index_key_norm)),
-          index_cache_(maximum, static_cast<int>(config_.indexer_head_dim)),
           pooled_index_cache_(
               (maximum +
                static_cast<int>(config_.indexer_compress_ratio) - 1) /
@@ -2655,14 +2994,15 @@ private:
         const array& raw_keys,
         const array& positions_full,
         int begin,
-        int end) const {
+        int end,
+        int position_offset = 0) const {
         const int ratio = static_cast<int>(config_.indexer_compress_ratio);
         const int width = static_cast<int>(config_.indexer_head_dim);
         if (raw_keys.ndim() != 3 || raw_keys.shape(0) <= 0 ||
             begin < 0 || end <= begin ||
             end * ratio > raw_keys.shape(1) ||
             raw_keys.shape(2) != width ||
-            positions_full.shape(-1) < end * ratio) {
+            positions_full.shape(-1) < position_offset + end * ratio) {
             throw std::runtime_error(
                 "Qwen4 index pool range disagrees with raw keys");
         }
@@ -2677,7 +3017,7 @@ private:
             -2);
         pooled = index_key_norm_(pooled);
         auto starts = mlx::core::arange(
-            begin * ratio, end * ratio, ratio, mlx::core::int32);
+            position_offset + begin * ratio, position_offset + end * ratio, ratio, mlx::core::int32);
         auto block_positions = mlx::core::take(
             positions_full, starts, -1);
         return mlx::core::reshape(
@@ -2687,7 +3027,7 @@ private:
                 static_cast<int>(config_.rotary_dim),
                 static_cast<float>(config_.rope_theta),
                 config_.rope_sections,
-                config_.mrope_interleaved),
+                config_.mrope_interleaved, config_.yarn),
             Shape{batch, end - begin, width});
     }
 
@@ -2776,7 +3116,11 @@ private:
 
     void trim_pooled_index_cache() {
         const int ratio = static_cast<int>(config_.indexer_compress_ratio);
-        const int target = index_cache_.position() / ratio;
+        const int target = index_position() / ratio;
+        if (offloaded_pool_) {
+            if (offloaded_pool_->position() > target) offloaded_pool_->trim(target);
+            return;
+        }
         if (pooled_index_cache_.position() > target) {
             pooled_index_cache_.trim(
                 pooled_index_cache_.position() - target);
@@ -2785,6 +3129,7 @@ private:
 
     Qwen4Config config_;
     int maximum_;
+    std::vector<array> training_context_;
     MlxLinear query_;
     MlxLinear key_;
     MlxLinear value_;
@@ -2796,8 +3141,14 @@ private:
     MlxProjectionBatch cache_projections_;
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
+    std::shared_ptr<QsaKvStore> kv_store_ = mlx_qsa_kv_offload_store();
+    std::unique_ptr<MlxQsaKvOffload> offloaded_kv_;
+    std::unique_ptr<MlxQsaIndexOffload> offloaded_pool_;
     std::unique_ptr<MlxKvCache> cache_;
-    MlxSequenceCache index_cache_;
+    std::optional<array> index_tail_;
+    int index_tail_start_ = 0;
+    int index_position_ = 0;
+    MlxResourceTelemetry index_resources_;
     MlxSequenceCache pooled_index_cache_;
     int speculative_trim_ = 0;
     int batch_ = 0;
@@ -2805,6 +3156,14 @@ private:
 
 class Qwen4Layer {
 public:
+    void prepare_training(MlxMtpLora& lora) const {
+        const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
+        if (!qsa || ple_) throw std::invalid_argument("MTP LoRA requires a QSA predictor without PLE");
+        attention_gr_.prepare_training(lora);
+        ffn_gr_.prepare_training(lora);
+        qsa->prepare_training(lora);
+        moe_.prepare_training(lora);
+    }
     std::size_t resident_routed_bytes() const noexcept { return moe_.resident_routed_bytes(); }
     void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const { moe_.validate_offload(cache); }
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) { moe_.use_offload(cache); }
@@ -2950,6 +3309,9 @@ public:
         int speculative_confirmed = 0,
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
         Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr) {
+        auto* lora = MlxMtpLora::current();
+        std::optional<array> training_root;
+        if (lora && lora->collecting()) training_root = hidden_streams;
         if (ple_) {
             hidden_streams = hidden_streams +
                 ple_->forward(
@@ -2979,6 +3341,22 @@ public:
         branch = moe_(ffn_values.branch, prefetched);
         detail::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
+        if (lora) {
+            if (lora->collecting()) {
+                const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
+                if (!qsa || qsa->training_context().size() != 3 || !moe_.training_routes())
+                    throw std::logic_error("missing internal MTP training context");
+                std::vector<array> constants{*training_root};
+                constants.insert(constants.end(), qsa->training_context().begin(), qsa->training_context().end());
+                constants.push_back(*moe_.training_routes());
+                lora->capture(std::move(constants), [this, qsa](const MlxMtpLoraParameters& p, const std::vector<array>& c) {
+                    auto av = attention_gr_.training_pre(c.at(0), p);
+                    auto attention = qsa->training(av.branch, c.at(1), c.at(2), c.at(3), p);
+                    auto fv = ffn_gr_.training_pre(attention_gr_.training_post(attention, av, p), p);
+                    return ffn_gr_.training_post(moe_.training(fv.branch, c.at(4), p), fv, p);
+                });
+            } else lora->capture({}, {});
+        }
         detail::profile_eval("qwen4.ffn_mhc_post", output);
         return output;
     }
@@ -3010,6 +3388,11 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    void prepare_training(MlxMtpLora& lora) const {
+        if (layers_.size() != 1) throw std::invalid_argument("MTP LoRA currently requires one recurrent predictor layer");
+        layers_.front().prepare_training(lora);
+        final_mixer_.prepare_training(lora);
+    }
     std::vector<MlxQwen4LayerCacheSnapshot> snapshot(int position) const {
         std::vector<MlxQwen4LayerCacheSnapshot> result;
         if (position == 0) return result;
@@ -3017,14 +3400,25 @@ public:
         for (const auto& layer : layers_) {
             auto state = layer.snapshot();
             state.position = position;
-            state.kv->position = position;
-            const Shape begin{0, 0, 0, 0};
-            const Shape end{state.batch, state.kv->heads, position, state.kv->head_dimension};
-            state.kv->key = mlx::core::slice(state.kv->key, begin, end);
-            state.kv->value = mlx::core::slice(state.kv->value, begin, end);
-            state.index_keys = mlx::core::slice(*state.index_keys, Shape{0, 0, 0},
-                Shape{state.batch, position, state.index_keys->shape(2)});
+            if (state.offloaded_kv) state.offloaded_kv = state.offloaded_kv->prefix(position);
+            else {
+                state.kv->position = position;
+                const Shape begin{0, 0, 0, 0};
+                const Shape end{state.batch, state.kv->heads, position, state.kv->key.shape(3)};
+                state.kv->key = mlx::core::slice(state.kv->key, begin, end);
+                state.kv->value = mlx::core::slice(state.kv->value, begin,
+                    Shape{state.batch, state.kv->heads, position, state.kv->value.shape(3)});
+            }
+            if (position < state.index_start)
+                throw std::runtime_error("MTP checkpoint exceeds the uncommitted index tail");
+            state.index_keys = detached_copy(mlx::core::slice(*state.index_keys, Shape{0, 0, 0},
+                Shape{state.batch, position - state.index_start, state.index_keys->shape(2)}));
             const int pooled = position / static_cast<int>(config_.indexer_compress_ratio);
+            if (state.offloaded_pooled_keys) {
+                if (!pooled) state.offloaded_pooled_keys.reset();
+                else state.offloaded_pooled_keys->rows = state.offloaded_pooled_keys->rows.prefix(
+                    std::min<std::size_t>(pooled, state.offloaded_pooled_keys->rows.position));
+            }
             if (pooled == 0 || !state.pooled_keys) state.pooled_keys.reset();
             else state.pooled_keys = mlx::core::slice(*state.pooled_keys, Shape{0, 0, 0},
                 Shape{state.batch, std::min(pooled, state.pooled_keys->shape(1)), state.pooled_keys->shape(2)});
@@ -3141,7 +3535,9 @@ public:
         const array& previous_hidden,
         const array& token_ids,
         const MlxEmbedding& embedding,
-        bool use_cache) {
+        bool use_cache,
+        MlxMtpLora* lora = nullptr) {
+        MlxMtpLoraScope scope(lora);
         auto input = fuse_inputs(previous_hidden, token_ids, embedding, use_cache);
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
@@ -3154,6 +3550,9 @@ public:
             std::move(input.streams), input.ids,
             current_positions, full_positions, use_cache);
         auto sample_hidden = final_mixer_.mix(streams);
+        if (lora) lora->set_final_graph([this](const MlxMtpLoraParameters& p, const std::vector<array>& c) {
+            return final_mixer_.training_pre(c.at(0), p).branch;
+        });
         if (use_cache) {
             batch_ = batch;
             position_ = start + tokens;
@@ -3290,6 +3689,30 @@ private:
 
 } // namespace
 
+std::pair<std::int32_t, array> qwen4_mtp_logits_from_state(
+    const MfqContainer& model, const MfqContainer& predictor_source,
+    const MlxQwen4TextSessionState& state, bool fp16) {
+    if (!state.last_hidden || state.tokens.empty() || state.mtp_layers.empty())
+        throw std::invalid_argument("MTP probe requires a committed predictor checkpoint");
+    const auto config = Qwen4Config::from_mfq(model);
+    auto embedding = MlxEmbedding::load(model, "model.token_embedding.weight");
+    auto head = MlxLinear::load(model, "model.output.weight");
+    auto mixer = GatedResidual::load(model, config, "model.mhc.pre", false);
+    auto pending_logits = head(mixer.mix(*state.last_hidden));
+    const auto pending = mlx::core::argmax(mlx::core::reshape(pending_logits, {-1})).item<std::int32_t>();
+    auto predictor = [&] {
+        MlxFp16WeightScope precision(fp16);
+        return Qwen4Mtp::load_if_present(predictor_source, config, state.mtp_layers.front().kv->maximum_sequence);
+    }();
+    if (!predictor) throw std::invalid_argument("MTP probe source has no predictor");
+    predictor->restore(state.mtp_layers);
+    const array token({pending}, Shape{1, 1}, mlx::core::int32);
+    auto result = predictor->forward(*state.last_hidden, token, embedding, true);
+    auto logits = mlx::core::astype(mlx::core::reshape(head(result.sample_hidden), {-1}), mlx::core::float32);
+    logits.eval();
+    return {pending, std::move(logits)};
+}
+
 Qwen4Config Qwen4Config::from_json(std::string_view payload) {
     const auto outer = json::parse(payload);
     const auto& text = text_config(outer);
@@ -3345,6 +3768,12 @@ Qwen4Config Qwen4Config::from_json(std::string_view payload) {
     config.rope_sections = rope.value(
         "mrope_section", std::vector<std::int64_t>{});
     config.rope_theta = rope.value("rope_theta", 1e7);
+    const auto rope_type = rope.value("rope_type", rope.value("type", std::string("default")));
+    config.yarn_max_factor = rope_type == "default" || rope_type == "yarn" ? rope.value("factor", 4.0) : 1.0;
+    config.yarn.beta_fast = rope.value("beta_fast", 32.0);
+    config.yarn.beta_slow = rope.value("beta_slow", 1.0);
+    if (rope_type == "yarn") config.max_position_embeddings = rope.value("original_max_position_embeddings", config.max_position_embeddings);
+    (void)qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
     config.mrope_interleaved = rope.value("mrope_interleaved", false);
     const auto section_sum = std::accumulate(
         config.rope_sections.begin(), config.rope_sections.end(),
@@ -3458,6 +3887,33 @@ struct MlxQwen4CausalLm::Impl {
                 "model graph does not describe a Qwen4-Exp causal runtime");
         }
         auto config = Qwen4Config::from_mfq(model);
+        config.yarn = qwen_yarn_scaling(config.yarn, config.max_position_embeddings, requested_context, config.yarn_max_factor);
+        config.max_position_embeddings = requested_context;
+        const auto* mtp_source_path = std::getenv("MFQ_MTP_SOURCE");
+        const bool full_precision_mtp = mtp_fp16_requested();
+        std::unique_ptr<MfqContainer> mtp_source;
+        std::string mtp_identity;
+        if (full_precision_mtp) {
+            if (mtp_source_path && *mtp_source_path)
+                mtp_source = std::make_unique<MfqContainer>(std::filesystem::path(mtp_source_path), "mtp.");
+            const auto& source = mtp_source ? *mtp_source : model;
+            const auto other = Qwen4Config::from_mfq(source);
+            const auto shape = [](const Qwen4Config& c) { return std::tuple{
+                c.hidden_size, c.vocab_size, c.num_hidden_layers, c.hc_count, c.hc_lowrank,
+                c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rotary_dim,
+                c.num_experts, c.num_experts_per_tok, c.moe_intermediate_size, c.shared_expert_intermediate_size,
+                c.indexer_n_heads, c.indexer_head_dim, c.indexer_compress_ratio, c.indexer_budget,
+                c.mtp_num_hidden_layers, c.rms_norm_eps, c.rope_theta, c.rope_sections,
+                c.mrope_interleaved, c.norm_topk_prob, c.mtp_use_dedicated_embeddings}; };
+            if (shape(config) != shape(other) || config.mtp_num_hidden_layers <= 0)
+                throw std::invalid_argument("TTT FP16 predictor source does not match model topology");
+            for (const auto& [name, record] : source.records()) if (name.starts_with("predictor.")) {
+                if (record.dtype == "MFE" && source.is_hf_source()) continue;
+                if (record.dtype != "F16" && record.dtype != "BF16" && record.dtype != "F32")
+                    throw std::invalid_argument("FP16 MTP requires original floating predictor weights; set MFQ_MTP_SOURCE to the original checkpoint");
+            }
+            mtp_identity = "mtp-fp16-output-lora-v1:" + mtp_source_identity(model) + ':' + mtp_source_identity(source);
+        }
         const auto* predictor = graph.component("predictor");
         if (predictor != nullptr &&
             (predictor->implementation != "next_token_prediction" ||
@@ -3468,6 +3924,11 @@ struct MlxQwen4CausalLm::Impl {
         const int maximum = std::min(
             checked_int(config.max_position_embeddings, "context"),
             requested_context);
+        auto kv_offload = mlx_configure_qsa_kv_offload(maximum,
+            static_cast<int>(std::count(config.layer_types.begin(), config.layer_types.end(), "full_attention")) +
+                (predictor ? static_cast<int>(config.mtp_num_hidden_layers) : 0),
+            static_cast<int>(config.num_key_value_heads), static_cast<int>(config.head_dim),
+            static_cast<int>(config.indexer_head_dim), static_cast<int>(config.indexer_compress_ratio));
         auto embedding = MlxEmbedding::load(
             model, "model.token_embedding.weight");
         std::optional<MlxLinear> output;
@@ -3485,7 +3946,7 @@ struct MlxQwen4CausalLm::Impl {
                 prefixes.push_back(
                     "model.block." + std::to_string(index));
             }
-            if (predictor != nullptr) {
+            if (predictor != nullptr && !full_precision_mtp) {
                 for (std::int64_t index = 0;
                      index < config.mtp_num_hidden_layers; ++index) {
                     prefixes.push_back(
@@ -3526,12 +3987,13 @@ struct MlxQwen4CausalLm::Impl {
         }
         auto mixer = GatedResidual::load(
             model, config, "model.mhc.pre", false);
+        MlxFp16WeightScope fp16_mtp(full_precision_mtp);
         auto mtp = Qwen4Mtp::load_if_present(
-            model,
+            mtp_source ? *mtp_source : model,
             config,
             maximum,
-            ssd_expert_cache,
-            mfe_offload_cache,
+            full_precision_mtp ? nullptr : ssd_expert_cache,
+            full_precision_mtp ? nullptr : mfe_offload_cache,
             static_cast<std::size_t>(config.num_hidden_layers));
         if ((predictor != nullptr) != mtp.has_value()) {
             throw std::runtime_error(
@@ -3555,6 +4017,8 @@ struct MlxQwen4CausalLm::Impl {
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache)));
         result->source = std::make_unique<MfqContainer>(model);
+        result->mtp_base_key = std::move(mtp_identity);
+        result->mtp_full_precision = full_precision_mtp;
         // Count backing payloads once at load time, not on every UI refresh.
         for (const auto layer : result->config.ple_layer_ids) {
             const auto prefix = "model.block." + std::to_string(layer - 1) +
@@ -3566,7 +4030,7 @@ struct MlxQwen4CausalLm::Impl {
         }
         for (const auto& root : {std::string("model"), std::string("predictor")}) {
             const auto count = root == "model" ? result->config.num_hidden_layers :
-                (result->mtp ? result->config.mtp_num_hidden_layers : 0);
+                (result->mtp && !full_precision_mtp ? result->config.mtp_num_hidden_layers : 0);
             for (std::int64_t layer = 0; layer < count; ++layer) {
                 const auto prefix = root + ".block." + std::to_string(layer) + ".mlp.experts.";
                 for (const auto* projection : {"gate", "up", "gate_up", "down"}) {
@@ -3779,6 +4243,9 @@ private:
 public:
     Qwen4Config config;
     std::unique_ptr<MfqContainer> source;
+    std::string mtp_base_key;
+    bool mtp_full_precision = false;
+    std::unique_ptr<MlxMtpLora> mtp_lora;
     int maximum;
     MlxEmbedding embedding;
     std::optional<MlxLinear> output;
@@ -3800,7 +4267,7 @@ public:
 };
 
 MlxQwen4CausalLm::MlxQwen4CausalLm(std::unique_ptr<Impl> impl)
-    : impl_(std::move(impl)) {}
+    : impl_(std::move(impl)), kv_offload_store_(mlx_qsa_kv_offload_store()) {}
 
 MlxQwen4CausalLm::~MlxQwen4CausalLm() = default;
 MlxQwen4CausalLm::MlxQwen4CausalLm(MlxQwen4CausalLm&&) noexcept = default;
@@ -3845,7 +4312,16 @@ std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
     std::size_t bytes = 0;
     for (const auto& layer : impl_->layers) bytes += layer.cache_bytes();
     if (impl_->mtp) bytes += impl_->mtp->cache_bytes();
+    if (kv_offload_store_) {
+        const auto stats = kv_offload_store_->stats();
+        bytes += stats.hot_bytes + stats.pending_bytes;
+    }
     return bytes;
+}
+
+std::optional<QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
+    if (kv_offload_store_) return kv_offload_store_->stats();
+    return std::nullopt;
 }
 
 std::size_t MlxQwen4CausalLm::kv_cache_contexts() const noexcept {
@@ -3864,25 +4340,25 @@ std::size_t MlxQwen4CausalLm::set_expert_cache_limit(std::size_t bytes) {
         auto cache = std::make_shared<MlxMfeOffloadCache>(*impl_->source, bytes,
             static_cast<int>(impl_->config.num_experts));
         for (const auto& layer : impl_->layers) layer.validate_offload(cache);
-        if (impl_->mtp) impl_->mtp->validate_offload(cache);
+        if (impl_->mtp && !impl_->mtp_full_precision) impl_->mtp->validate_offload(cache);
         if (impl_->ssd_expert_cache) impl_->ssd_expert_cache->release_deferred();
         if (impl_->ssd_expert_cache) {
             for (auto& layer : impl_->layers) layer.use_offload(cache);
-            if (impl_->mtp) impl_->mtp->use_offload(cache);
+            if (impl_->mtp && !impl_->mtp_full_precision) impl_->mtp->use_offload(cache);
             impl_->ssd_expert_cache.reset();
         }
         impl_->mfe_offload_cache = std::move(cache);
     }
     auto resident = resident_full_expert_bytes();
     impl_->mfe_offload_cache->set_cache_limit(bytes > resident ? bytes - resident : 0);
-    if (impl_->mtp && !impl_->last_mtp_stats.used)
+    if (impl_->mtp && !impl_->mtp_full_precision && !impl_->last_mtp_stats.used)
         impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
     for (auto& layer : impl_->layers) {
         if (resident <= bytes) break;
         const auto released = layer.resident_routed_bytes();
         if (released) { layer.use_offload(impl_->mfe_offload_cache); resident -= released; }
     }
-    if (impl_->mtp) impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
+    if (impl_->mtp && !impl_->mtp_full_precision) impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
     impl_->mfe_offload_cache->set_cache_limit(bytes > resident ? bytes - resident : 0);
     const auto after = mlx::core::get_active_memory();
     return before > after ? before - after : 0;
@@ -3894,7 +4370,7 @@ std::size_t MlxQwen4CausalLm::reclaimable_expert_bytes() const noexcept {
 }
 
 std::size_t MlxQwen4CausalLm::resident_full_expert_bytes() const noexcept {
-    std::size_t bytes = impl_->mtp ? impl_->mtp->resident_routed_bytes() : 0;
+    std::size_t bytes = impl_->mtp && !impl_->mtp_full_precision ? impl_->mtp->resident_routed_bytes() : 0;
     for (const auto& layer : impl_->layers) bytes += layer.resident_routed_bytes();
     return bytes;
 }
@@ -4120,6 +4596,9 @@ std::int32_t MlxQwen4CausalLm::generate(
             MlxMtpEngineCallbacks mtp_callbacks;
             mtp_callbacks.predictor = impl_->mtp->mtp_descriptor();
             mtp_callbacks.policy_state = &impl_->mtp_policy_state;
+            if (impl_->mtp_lora) mtp_callbacks.verified_round = [&](const array& teacher, int accepted, double ms) {
+                impl_->mtp_lora->verified(teacher, accepted, ms);
+            };
             mtp_callbacks.decode_target = [&](std::int32_t token) {
                 const array ids({token}, Shape{1, 1}, mlx::core::int32);
                 auto step = impl_->forward_with_hidden(ids, true, false);
@@ -4144,6 +4623,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 [&, initial_hidden](
                     const MlxMtpDraftContext& context,
                     const MlxMtpTokenSelector& select_token) {
+                    if (impl_->mtp_lora && context.requested_depth > 0) impl_->mtp_lora->begin_round();
                     array hidden_rows = initial_hidden;
                     std::vector<std::int32_t> next_ids{
                         context.pending_token};
@@ -4208,7 +4688,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                         mlx::core::slice(committed_ids, Shape{0, committed - 1},
                             Shape{1, committed}),
                         impl_->embedding,
-                        true);
+                        true, impl_->mtp_lora.get());
                     predictor_history_position += committed;
                     auto head_hidden = std::move(predictor.sample_hidden);
                     auto chain_streams = std::move(predictor.hidden_streams);
@@ -4227,7 +4707,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                             chain_streams,
                             mlx::core::reshape(token, Shape{1, 1}),
                             impl_->embedding,
-                            true);
+                            true, impl_->mtp_lora.get());
                         head_hidden = std::move(predictor.sample_hidden);
                         chain_streams = std::move(predictor.hidden_streams);
                     }
@@ -4434,6 +4914,51 @@ void MlxQwen4CausalLm::clear_expert_cache() {
     }
 }
 
+const std::string& MlxQwen4CausalLm::mtp_cache_fingerprint() const noexcept { return impl_->mtp_base_key; }
+
+void MlxQwen4CausalLm::prepare_mtp_ttt(const std::filesystem::path& directory) {
+    if (!mtp_ttt_requested() || !impl_->mtp_full_precision || impl_->mtp_lora) return;
+    const auto hot = mfq::engine::environment_uint64("MFQ_MTP_TTT_RAM_BYTES", 12ULL << 30);
+    const auto disk = mfq::engine::environment_uint64("MFQ_MTP_TTT_DISK_BYTES", 16ULL << 30);
+    const auto key = mfq::cache::block_hash_hex(mfq::cache::sha256(impl_->mtp_base_key));
+    const auto& config = impl_->config;
+    const int h = config.hidden_size, q = config.num_attention_heads * config.head_dim;
+    std::vector<MlxMtpLoraProjection> layout{{"attention.q", h, q}, {"attention.gate", h, q}, {"attention.o", q, h}};
+    for (const auto& role : {std::string("gate"), std::string("up"), std::string("down")}) {
+        layout.push_back({"shared." + role, role == "down" ? int(config.shared_expert_intermediate_size) : h,
+            role == "down" ? h : int(config.shared_expert_intermediate_size)});
+        for (int expert = 0; expert < config.num_experts; ++expert)
+            layout.push_back({"expert." + std::to_string(expert) + "." + role,
+                role == "down" ? int(config.moe_intermediate_size) : h,
+                role == "down" ? h : int(config.moe_intermediate_size)});
+    }
+    if (!impl_->output) throw std::invalid_argument("MTP LoRA currently requires an untied frozen LM Head");
+    auto head = *impl_->output;
+    { MlxFp16WeightScope fp16(true); head.materialize_fp16(); }
+    impl_->mtp_lora = std::make_unique<MlxMtpLora>(std::move(layout), *head.dense_weight_ref(),
+        impl_->mtp_base_key, directory / "mtp-lora" / key, hot, disk, 16, config.num_experts_per_tok);
+    impl_->mtp->prepare_training(*impl_->mtp_lora);
+}
+
+void MlxQwen4CausalLm::begin_mtp_session(const std::string& session) {
+    if (impl_->mtp_lora) impl_->mtp_lora->begin(session);
+}
+void MlxQwen4CausalLm::end_mtp_session() { if (impl_->mtp_lora) impl_->mtp_lora->end(); }
+bool MlxQwen4CausalLm::close_mtp_session(const std::string& session) {
+    return impl_->mtp_lora && impl_->mtp_lora->close(session);
+}
+bool MlxQwen4CausalLm::fork_mtp_session(const std::string& source, const std::string& target) {
+    return impl_->mtp_lora && impl_->mtp_lora->fork(source, target);
+}
+void MlxQwen4CausalLm::clear_mtp_sessions() { if (impl_->mtp_lora) impl_->mtp_lora->clear(); }
+std::size_t MlxQwen4CausalLm::trim_mtp_sessions(std::size_t bytes) {
+    return impl_->mtp_lora ? impl_->mtp_lora->trim(bytes) : 0;
+}
+std::size_t MlxQwen4CausalLm::mtp_session_bytes() const { return impl_->mtp_lora ? impl_->mtp_lora->bytes() : 0; }
+std::vector<std::pair<std::string, double>> MlxQwen4CausalLm::mtp_session_metrics() const {
+    return impl_->mtp_lora ? impl_->mtp_lora->metrics() : std::vector<std::pair<std::string, double>>{{"mtp_ttt_enabled", 0}};
+}
+
 MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(
     const std::vector<std::int64_t>& tokens, bool detached) const {
     if (impl_->cache_batch != 1 || impl_->cache_position <= 0 || impl_->speculative_pending ||
@@ -4451,6 +4976,10 @@ MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(
     }
     const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
         if (layer.kv) state.bytes += layer.kv->nbytes();
+        if (layer.offloaded_kv) state.bytes += layer.offloaded_kv->rows.tail.size() +
+            layer.offloaded_kv->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+        if (layer.offloaded_pooled_keys) state.bytes += layer.offloaded_pooled_keys->rows.tail.size() +
+            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
         for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
             &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
         state.bytes += layer.ple_context.size() * sizeof(std::int64_t);

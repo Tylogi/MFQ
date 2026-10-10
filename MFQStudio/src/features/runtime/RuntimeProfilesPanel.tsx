@@ -174,7 +174,7 @@ export function RuntimeProfilesPanel() {
                 <div>
                   <strong className="model-identity-label">{profile.name}<ModelVendorMark name={profile.load.model} architecture={artifacts.find((item) => item.id === profile.artifact_id)?.architecture} size={20} /></strong>
                   <small>
-                    {profile.load.context_size.toLocaleString()} ctx ·{' '}
+                    {profile.load.context_size?.toLocaleString() ?? tr('自动', 'Auto')} ctx ·{' '}
                     {profile.load.prefill_chunk_size.toLocaleString()} chunk
                     {profile.drifted ? ` · ${tr('模型已变化', 'artifact changed')}` : ''}
                   </small>

@@ -228,7 +228,7 @@ MFQ 为应用与工具提供多种接口：
 - 用于音频与全双工 Session 的 **WebSocket 实时 API**；
 - 由受管 C++ worker 和运行时适配器提供的
   **OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions` 接口**；
-- 通过服务器工具注册表提供的 **MCP 与函数工具执行**。
+- 通过推理 API 提供**函数工具调用**；工具由客户端执行并回传结果。
 
 可以从 [HTTP API](./docs/api/http.md)、
 [WebSocket API](./docs/api/websocket.md) 或

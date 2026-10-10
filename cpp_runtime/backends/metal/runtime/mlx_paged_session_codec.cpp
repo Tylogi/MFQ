@@ -22,7 +22,7 @@ using mlx::core::array;
 
 constexpr std::array<std::uint8_t, 8> kMagic{
     'M', 'F', 'Q', 'M', 'L', 'X', '1', 0};
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 4;
 constexpr std::uint8_t kKvLayer = 1;
 constexpr std::uint8_t kRecurrentLayer = 2;
 constexpr std::uint8_t kRecurrentUnavailableLayer = 3;
@@ -70,6 +70,45 @@ public:
         }
         scalar<std::uint64_t>(value.nbytes());
         raw(value.data<std::uint8_t>(), value.nbytes());
+    }
+
+    std::uint8_t* tensor_storage(const Shape& shape, Dtype dtype) {
+        std::size_t bytes = dtype.size();
+        scalar<std::uint8_t>(static_cast<std::uint8_t>(dtype.val()));
+        scalar<std::uint8_t>(static_cast<std::uint8_t>(shape.size()));
+        scalar<std::uint16_t>(0);
+        for (const int dimension : shape) {
+            if (dimension <= 0 || bytes > std::numeric_limits<std::size_t>::max() / dimension)
+                throw std::runtime_error("invalid offloaded cache tensor shape");
+            scalar<std::int32_t>(dimension);
+            bytes *= dimension;
+        }
+        scalar<std::uint64_t>(bytes);
+        const auto offset = bytes_.size();
+        ensure_capacity(offset + bytes);
+        bytes_.resize(offset + bytes);
+        return bytes_.data() + offset;
+    }
+
+    void offloaded_kv_tensor(const MlxQsaKvSnapshot& state, int start, int count, bool value) {
+        const int key_width = state.quantization.enabled() ? mlx_kv_packed_width(state.dimension, state.quantization.key_bits()) : state.dimension;
+        const int value_width = state.quantization.enabled() ? mlx_kv_packed_width(state.dimension, state.quantization.value_bits()) : state.dimension;
+        const int width = value ? value_width : key_width;
+        auto* destination = tensor_storage(Shape{1, state.heads, count, width}, state.dtype);
+        const auto lane = static_cast<std::size_t>(width) * state.dtype.size();
+        const auto key_bytes = static_cast<std::size_t>(key_width) * state.dtype.size() * state.heads;
+        std::vector<std::uint8_t> row(static_cast<std::size_t>(key_width + value_width) * state.dtype.size() * state.heads);
+        for (int i = 0; i < count; ++i) {
+            state.rows.read_rows(start + i, 1, row.data());
+            for (int head = 0; head < state.heads; ++head)
+                std::memcpy(destination + (head * static_cast<std::size_t>(count) + i) * lane,
+                    row.data() + (value ? key_bytes : 0) + head * lane, lane);
+        }
+    }
+
+    void offloaded_index_tensor(const MlxQsaIndexSnapshot& state, int start, int count) {
+        auto* destination = tensor_storage(Shape{1, count, state.width}, state.dtype);
+        state.rows.read_rows(start, count, destination);
     }
 
     std::shared_ptr<const std::vector<std::uint8_t>> finish() && {
@@ -211,7 +250,10 @@ struct DecodedLayer {
     int head_dimension = 0;
     int capacity = 0;
     int position = 0;
+    int index_start = 0;
+    int index_ratio = 0;
     Dtype dtype = mlx::core::float16;
+    MlxKvQuantization quantization;
     SerializedTensor first;
     SerializedTensor second;
     std::optional<SerializedTensor> index;
@@ -256,7 +298,8 @@ void write_kv_layer(
     writer.scalar<std::uint8_t>(kind);
     writer.scalar<std::uint8_t>(
         static_cast<std::uint8_t>(snapshot.dtype.val()));
-    writer.scalar<std::uint16_t>(exact ? 1 : 0);
+    writer.scalar<std::uint16_t>((exact ? 1 : 0) | (snapshot.quantization.enabled()
+        ? 2 | (static_cast<int>(snapshot.quantization.bits * 2) << 8) : 0));
     writer.scalar<std::int32_t>(snapshot.batch);
     writer.scalar<std::int32_t>(snapshot.heads);
     writer.scalar<std::int32_t>(snapshot.maximum_sequence);
@@ -268,10 +311,10 @@ void write_kv_layer(
         snapshot.batch,
         snapshot.heads,
         start + count,
-        snapshot.head_dimension,
+        snapshot.key.shape(3),
     };
     writer.tensor(mlx::core::slice(snapshot.key, begin, end));
-    writer.tensor(mlx::core::slice(snapshot.value, begin, end));
+    writer.tensor(mlx::core::slice(snapshot.value, begin, Shape{snapshot.batch, snapshot.heads, start + count, snapshot.value.shape(3)}));
 }
 
 void write_recurrent_layer(
@@ -323,13 +366,43 @@ void write_flash_layer(Writer& writer, const MlxQwen4LayerCacheSnapshot& layer,
     std::size_t start, std::size_t count, bool exact) {
     const int boundary = static_cast<int>(start + count);
     if (layer.batch != 1 || layer.position < boundary ||
-        (layer.kv ? !layer.index_keys : (!layer.convolution || !layer.recurrent)))
+        ((layer.kv || layer.offloaded_kv) ? !layer.index_keys : (!layer.convolution || !layer.recurrent)))
         throw std::runtime_error("invalid Flash-Next cache layer");
-    if (layer.kv) {
-        write_kv_layer(writer, *layer.kv, static_cast<int>(start), static_cast<int>(count), kQsaLayer, exact);
-        writer.tensor(mlx::core::slice(*layer.index_keys, Shape{0, static_cast<int>(start), 0},
-            Shape{layer.batch, boundary, layer.index_keys->shape(2)}));
-        write_optional_tensor(writer, exact ? layer.pooled_keys : std::nullopt);
+    if (layer.kv || layer.offloaded_kv) {
+        if (layer.offloaded_kv) {
+            const auto& kv = *layer.offloaded_kv;
+            writer.scalar<std::uint8_t>(kQsaLayer);
+            writer.scalar<std::uint8_t>(static_cast<std::uint8_t>(kv.dtype.val()));
+            writer.scalar<std::uint16_t>((exact ? 1 : 0) | (kv.quantization.enabled()
+                ? 2 | (static_cast<int>(kv.quantization.bits * 2) << 8) : 0));
+            writer.scalar<std::int32_t>(1);
+            writer.scalar<std::int32_t>(kv.heads);
+            writer.scalar<std::int32_t>(kv.maximum);
+            writer.scalar<std::int32_t>(kv.dimension);
+            writer.scalar<std::int32_t>(boundary);
+            writer.scalar<std::int32_t>(boundary);
+            writer.offloaded_kv_tensor(kv, start, count, false);
+            writer.offloaded_kv_tensor(kv, start, count, true);
+        } else write_kv_layer(writer, *layer.kv, static_cast<int>(start), static_cast<int>(count), kQsaLayer, exact);
+        const int ratio = layer.index_ratio;
+        if (ratio <= 0 || layer.index_start < 0 || layer.index_start % ratio ||
+            layer.index_keys->shape() != Shape{1, layer.position - layer.index_start, layer.index_keys->shape(2)})
+            throw std::runtime_error("invalid QSA index tail");
+        writer.scalar<std::int32_t>(ratio);
+        writer.scalar<std::int32_t>(exact ? layer.index_start : boundary);
+        write_optional_tensor(writer, exact ? layer.index_keys : std::nullopt);
+        const int pool_start = static_cast<int>(start) / ratio;
+        const int pool_end = boundary / ratio;
+        if (pool_end > pool_start && layer.offloaded_pooled_keys) {
+            writer.scalar<std::uint8_t>(1);
+            writer.offloaded_index_tensor(*layer.offloaded_pooled_keys, pool_start, pool_end - pool_start);
+        } else if (pool_end > pool_start && layer.pooled_keys) {
+            write_optional_tensor(writer, mlx::core::slice(*layer.pooled_keys, Shape{0, pool_start, 0},
+                Shape{1, pool_end, layer.pooled_keys->shape(2)}));
+        } else {
+            if (pool_end > pool_start) throw std::runtime_error("missing QSA block keys");
+            write_optional_tensor(writer, std::nullopt);
+        }
     } else {
         MlxQwen35LinearAttentionCacheSnapshot state{*layer.convolution, *layer.recurrent,
             layer.position, layer.batch};
@@ -345,7 +418,13 @@ DecodedLayer read_layer(Reader& reader) {
     DecodedLayer layer;
     layer.kind = reader.scalar<std::uint8_t>("layer kind");
     const auto dtype_value = reader.scalar<std::uint8_t>("layer dtype");
-    layer.exact = (reader.scalar<std::uint16_t>("layer flags") & 1) != 0;
+    const auto flags = reader.scalar<std::uint16_t>("layer flags");
+    layer.exact = (flags & 1) != 0;
+    if (flags & 2) {
+        layer.quantization.bits = (flags >> 8) / 2.0;
+        if (!layer.quantization.enabled() || !mlx_kv_bits_valid(layer.quantization.bits))
+            throw std::runtime_error("invalid TurboQuant KV checkpoint bit width");
+    } else if (flags & 0xff00) throw std::runtime_error("invalid KV checkpoint quantization flags");
     layer.batch = reader.scalar<std::int32_t>("batch");
     layer.heads = reader.scalar<std::int32_t>("heads");
     layer.maximum_sequence = reader.scalar<std::int32_t>("maximum sequence");
@@ -356,6 +435,8 @@ DecodedLayer read_layer(Reader& reader) {
     if (!unavailable) { layer.first = reader.tensor(); layer.second = reader.tensor(); }
     if (layer.kind == kKvLayer || layer.kind == kQsaLayer) {
         layer.dtype = layer.first.dtype;
+        if (layer.quantization.enabled() && layer.dtype != mlx::core::uint32)
+            throw std::runtime_error("invalid TurboQuant KV checkpoint dtype");
         if (dtype_value > static_cast<std::uint8_t>(Dtype::Val::complex64) ||
             layer.dtype.val() != static_cast<Dtype::Val>(dtype_value))
             throw std::runtime_error("MLX KV layer dtype mismatch");
@@ -366,7 +447,11 @@ DecodedLayer read_layer(Reader& reader) {
             throw std::runtime_error("invalid recurrent cache checkpoint");
     } else throw std::runtime_error("unknown MLX cache layer kind");
     if (layer.kind == kQsaLayer) {
-        layer.index = reader.tensor();
+        layer.index_ratio = reader.scalar<std::int32_t>("index ratio");
+        layer.index_start = reader.scalar<std::int32_t>("index tail start");
+        if (layer.index_ratio <= 0 || layer.index_start < 0 || layer.index_start > layer.position)
+            throw std::runtime_error("invalid QSA index tail geometry");
+        if (reader.scalar<std::uint8_t>("index tail presence")) layer.index = reader.tensor();
         if (reader.scalar<std::uint8_t>("pooled presence")) layer.pooled = reader.tensor();
     }
     if (layer.kind == kQsaLayer || layer.kind == kGdnLayer || layer.kind == kGdnUnavailableLayer) {
@@ -384,11 +469,13 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
     std::array<std::uint8_t, 8> magic{};
     reader.raw(magic.data(), magic.size(), "magic");
     const auto version = reader.scalar<std::uint32_t>("version");
-    if (magic != kMagic || (version != 1 && version != kVersion)) {
+    if (magic != kMagic || version < 1 || version > kVersion) {
         throw std::runtime_error("unsupported MLX cache payload");
     }
     DecodedBlock block;
     block.runtime = reader.scalar<std::uint32_t>("runtime");
+    if (block.runtime == kQwen4Runtime && version < 3)
+        throw std::runtime_error("obsolete Flash-Next index history cache");
     block.start = reader.scalar<std::uint32_t>("start");
     block.count = reader.scalar<std::uint32_t>("count");
     const auto layer_count = reader.scalar<std::uint32_t>("layer count");
@@ -466,12 +553,13 @@ MlxKvCacheSnapshot rebuild_kv(
         final.head_dimension <= 0) {
         throw std::runtime_error("invalid MLX KV cache topology");
     }
-    const auto expected_shape = [&](std::size_t count) {
+    const auto expected_shape = [&](std::size_t count, bool key) {
         return Shape{
             final.batch,
             final.heads,
             static_cast<int>(count),
-            final.head_dimension,
+            final.quantization.enabled() ? mlx_kv_packed_width(final.head_dimension,
+                key ? final.quantization.key_bits() : final.quantization.value_bits()) : final.head_dimension,
         };
     };
     for (const auto& block : blocks) {
@@ -481,10 +569,11 @@ MlxKvCacheSnapshot rebuild_kv(
             layer.maximum_sequence != final.maximum_sequence ||
             layer.head_dimension != final.head_dimension ||
             layer.dtype != final.dtype ||
+            layer.quantization != final.quantization ||
             layer.first.dtype != final.dtype ||
             layer.second.dtype != final.dtype ||
-            layer.first.shape != expected_shape(block.count) ||
-            layer.second.shape != expected_shape(block.count) ||
+            layer.first.shape != expected_shape(block.count, true) ||
+            layer.second.shape != expected_shape(block.count, false) ||
             layer.first.data == nullptr || layer.second.data == nullptr ||
             static_cast<std::size_t>(block.start) + block.count > token_count) {
             throw std::runtime_error("inconsistent MLX KV cache block topology");
@@ -494,7 +583,7 @@ MlxKvCacheSnapshot rebuild_kv(
     const auto element_bytes = final.dtype.size();
     const auto batch = static_cast<std::size_t>(final.batch);
     const auto heads = static_cast<std::size_t>(final.heads);
-    const auto dimension = static_cast<std::size_t>(final.head_dimension);
+    const auto dimension = static_cast<std::size_t>(std::max(expected_shape(1, true)[3], expected_shape(1, false)[3]));
     if (batch > std::numeric_limits<std::size_t>::max() / heads ||
         token_count > std::numeric_limits<std::size_t>::max() / dimension ||
         token_count * dimension >
@@ -508,9 +597,11 @@ MlxKvCacheSnapshot rebuild_kv(
         lanes > std::numeric_limits<std::size_t>::max() / target_lane_bytes) {
         throw std::runtime_error("MLX KV cache allocation size overflow");
     }
-    const auto total_bytes = lanes * target_lane_bytes;
-    const auto target_shape = expected_shape(token_count);
     auto rebuild = [&](bool key) {
+        const auto target_shape = expected_shape(token_count, key);
+        const auto dimension = static_cast<std::size_t>(target_shape[3]);
+        const auto target_lane_bytes = token_count * dimension * element_bytes;
+        const auto total_bytes = lanes * target_lane_bytes;
         MlxResidentBudgetScope::reserve(total_bytes);
         auto result = array(
             mlx::core::allocator::malloc(total_bytes),
@@ -553,6 +644,7 @@ MlxKvCacheSnapshot rebuild_kv(
         final.dtype,
         std::move(key),
         std::move(value),
+        final.quantization,
     };
 }
 
@@ -571,27 +663,87 @@ MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks
     state.batch = final.batch;
     state.position = static_cast<int>(count);
     if (final.kind == kQsaLayer) {
-        state.kv = rebuild_kv(blocks, index, count);
+        if (auto store = mlx_qsa_kv_offload_store()) {
+            if (final.batch != 1 || final.heads <= 0 || final.head_dimension <= 0 ||
+                (final.quantization.enabled() ? final.dtype != mlx::core::uint32 :
+                    (final.dtype != mlx::core::float16 && final.dtype != mlx::core::bfloat16)))
+                throw std::runtime_error("invalid offloaded QSA checkpoint geometry");
+            const int key_width = final.quantization.enabled() ? mlx_kv_packed_width(final.head_dimension, final.quantization.key_bits()) : final.head_dimension;
+            const int value_width = final.quantization.enabled() ? mlx_kv_packed_width(final.head_dimension, final.quantization.value_bits()) : final.head_dimension;
+            const auto key_lane = static_cast<std::size_t>(key_width) * final.dtype.size();
+            const auto value_lane = static_cast<std::size_t>(value_width) * final.dtype.size();
+            const auto key_bytes = key_lane * final.heads, value_bytes = value_lane * final.heads;
+            QsaKvSequence rows(store, key_bytes + value_bytes, store->config().microblock_rows, 1);
+            std::vector<std::uint8_t> row(key_bytes + value_bytes);
+            for (const auto& block : blocks) {
+                const auto& layer = block.layers.at(index);
+                if (block.start != rows.position() || block.start + block.count > count ||
+                    layer.kind != kQsaLayer || layer.heads != final.heads ||
+                    layer.head_dimension != final.head_dimension || layer.maximum_sequence != final.maximum_sequence ||
+                    layer.quantization != final.quantization ||
+                    layer.first.shape != Shape{1, final.heads, static_cast<int>(block.count), key_width} ||
+                    layer.second.shape != Shape{1, final.heads, static_cast<int>(block.count), value_width} ||
+                    layer.first.dtype != final.dtype || layer.second.dtype != final.dtype ||
+                    layer.first.bytes != block.count * key_bytes || layer.second.bytes != block.count * value_bytes ||
+                    !layer.first.data || !layer.second.data)
+                    throw std::runtime_error("offloaded QSA checkpoint block topology mismatch");
+                for (std::size_t token = 0; token < block.count; ++token) {
+                    for (int head = 0; head < final.heads; ++head) {
+                        std::memcpy(row.data() + head * key_lane, layer.first.data + (head * block.count + token) * key_lane, key_lane);
+                        std::memcpy(row.data() + key_bytes + head * value_lane, layer.second.data + (head * block.count + token) * value_lane, value_lane);
+                    }
+                    rows.append(row.data(), 1);
+                }
+            }
+            if (rows.position() != count) throw std::runtime_error("incomplete offloaded QSA checkpoint");
+            rows.seal_tail();
+            state.offloaded_kv = MlxQsaKvSnapshot{rows.snapshot(), final.heads, final.head_dimension,
+                final.maximum_sequence, final.dtype, final.quantization};
+        } else state.kv = rebuild_kv(blocks, index, count);
         if (!final.index || final.index->shape.size() != 3)
             throw std::runtime_error("missing QSA index checkpoint");
         const int width = final.index->shape[2];
-        const auto dtype = final.index->dtype;
-        if (count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width) / dtype.size())
-            throw std::runtime_error("QSA index checkpoint size overflow");
-        MlxResidentBudgetScope::reserve(count * width * dtype.size());
-        auto keys = array(mlx::core::allocator::malloc(count * width * dtype.size()),
-            Shape{1, static_cast<int>(count), width}, dtype);
-        auto* destination = keys.data<std::uint8_t>();
+        const int ratio = final.index_ratio;
+        if (width <= 0 || ratio <= 0 || final.index_start < 0 || final.index_start % ratio ||
+            final.index_start > static_cast<int>(count) ||
+            final.index->shape != Shape{1, static_cast<int>(count) - final.index_start, width} ||
+            final.index->dtype != mlx::core::float16 ||
+            count - final.index_start > static_cast<std::size_t>(ratio + kMlxMtpEngineMaximumDraftDepth + 1))
+            throw std::runtime_error("QSA index tail checkpoint mismatch");
+        state.index_start = final.index_start;
+        state.index_ratio = ratio;
+        state.index_keys = copy_tensor(*final.index);
+        const auto pool_count = count / ratio;
+        if (pool_count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width) / 4)
+            throw std::runtime_error("QSA block index checkpoint size overflow");
+        std::optional<array> pooled;
+        std::unique_ptr<QsaKvSequence> pool_rows;
+        if (auto store = mlx_qsa_kv_offload_store())
+            pool_rows = std::make_unique<QsaKvSequence>(store, width * 4, 16, 2);
+        else if (pool_count) {
+            MlxResidentBudgetScope::reserve(pool_count * width * 4);
+            pooled = array(mlx::core::allocator::malloc(pool_count * width * 4),
+                Shape{1, static_cast<int>(pool_count), width}, mlx::core::float32);
+        }
         for (const auto& block : blocks) {
             const auto& layer = block.layers.at(index);
-            if (!layer.index || layer.index->dtype != dtype ||
-                layer.index->shape != Shape{1, static_cast<int>(block.count), width})
-                throw std::runtime_error("QSA index block topology mismatch");
-            std::memcpy(destination + block.start * width * dtype.size(),
-                layer.index->data, layer.index->bytes);
+            const auto begin = block.start / ratio;
+            const auto rows = (block.start + block.count) / ratio - begin;
+            if (layer.index_ratio != ratio || (rows && (!layer.pooled ||
+                layer.pooled->dtype != mlx::core::float32 ||
+                layer.pooled->shape != Shape{1, static_cast<int>(rows), width})))
+                throw std::runtime_error("QSA pooled index block topology mismatch");
+            if (!rows) continue;
+            if (pool_rows) {
+                if (pool_rows->position() != begin) throw std::runtime_error("QSA block index chain mismatch");
+                pool_rows->append(layer.pooled->data, rows);
+            } else std::memcpy(pooled->data<std::uint8_t>() + begin * width * 4,
+                layer.pooled->data, layer.pooled->bytes);
         }
-        state.index_keys = std::move(keys);
-        if (final.pooled) state.pooled_keys = copy_tensor(*final.pooled);
+        if (pool_rows && pool_count) {
+            pool_rows->seal_tail();
+            state.offloaded_pooled_keys = MlxQsaIndexSnapshot{pool_rows->snapshot(), width, mlx::core::float32};
+        } else state.pooled_keys = std::move(pooled);
     } else if (final.kind == kGdnLayer) {
         state.convolution = copy_tensor(final.first);
         state.recurrent = copy_tensor(final.second);
@@ -931,6 +1083,10 @@ MlxQwen4TextSessionState MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
     }
     const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
         if (layer.kv) state.bytes += layer.kv->nbytes();
+        if (layer.offloaded_kv) state.bytes += layer.offloaded_kv->rows.tail.size() +
+            layer.offloaded_kv->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+        if (layer.offloaded_pooled_keys) state.bytes += layer.offloaded_pooled_keys->rows.tail.size() +
+            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
         for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
             &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
         state.bytes += layer.ple_context.size() * sizeof(std::int64_t);

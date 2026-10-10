@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import type { BenchmarkParameters, DatasetResource, ModelArtifact, OfficialBenchmarkReadiness, RuntimeInstance } from '../../shared/api/types';
 import type { TaskBenchmark } from './benchmarkTasks';
 import { Wt2ReferenceGenerator, type GeneratedWt2Reference } from './Wt2ReferenceGenerator';
+import { CompactSelect } from '../../shared/ui/CompactSelect';
 
 type Translate = (zh: string, en: string) => string;
 type Submit = (kind: string, payload: Record<string, unknown>) => Promise<void>;
@@ -33,15 +34,15 @@ export function QualityForm({ models, datasets, instances, available, referenceA
       reference_manifest: manifest.trim(), context_size: context, chunks, parallel });
   }
   return <form className="evaluation-form" onSubmit={(event) => void run(event)}>
-    <fieldset className="evaluation-fieldset"><legend>{tr('模型与集合', 'Model & collection')}</legend><div className="evaluation-fields evaluation-fields-pair">
-      <label className="evaluation-wide">{tr('待测模型', 'Candidate model')}<select className="evaluation-primary-select" value={model} onChange={(event) => setModel(event.target.value)} required>
+    <fieldset className="evaluation-fieldset"><legend>{tr('模型与集合', 'Model & collection')}</legend><div className="evaluation-fields evaluation-fields-pair evaluation-model-fields">
+      <label>{tr('待测模型', 'Candidate model')}<CompactSelect aria-label={tr('待测模型', 'Candidate model')} value={model} onChange={(event) => setModel(event.target.value)} required>
         {!models.length && <option value="">{tr('没有完整模型资产', 'No complete model assets')}</option>}
         {models.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}
-      </select></label>
-      <label className="evaluation-wide">{tr('WT2 测试集', 'WT2 test dataset')}<select className="evaluation-primary-select" value={dataset} onChange={(event) => setDataset(event.target.value)} required>
+      </CompactSelect></label>
+      <label>{tr('WT2 测试集', 'WT2 test dataset')}<CompactSelect aria-label={tr('WT2 测试集', 'WT2 test dataset')} value={dataset} onChange={(event) => setDataset(event.target.value)} required>
         {!wt2.length && <option value="">{tr('请先下载官方 WT2 集合', 'Download the official WT2 collection first')}</option>}
         {wt2.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.sha256.slice(0, 12)}</option>)}
-      </select></label>
+      </CompactSelect></label>
     </div></fieldset>
     <fieldset className="evaluation-fieldset"><legend>{tr('参考分布', 'Reference distribution')}</legend><div className="evaluation-fields evaluation-fields-pair">
       <label>{tr('参考 logits 文件', 'Reference logits file')}<input value={reference} onChange={(event) => setReference(event.target.value)} placeholder="datasets/wt2-reference.logits" required /></label>
@@ -94,10 +95,10 @@ export function PerformanceForm({ instances, available, busy, submit, tr }: {
   }
   return <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); if (validLengths && !exceedsContext) void submit('benchmark.inference', { ...draft, prompt_tokens: lengths[0], prompt_token_lengths: lengths, instance_id: instanceId }); }}>
     <fieldset className="evaluation-fieldset"><legend>{tr('待测模型', 'Candidate model')}</legend><div className="evaluation-fields">
-      <label className="evaluation-wide">{tr('已加载模型', 'Loaded model')}<select className="evaluation-primary-select" value={instanceId} onChange={(event) => setInstanceId(event.target.value)} required>
+      <label className="evaluation-wide">{tr('已加载模型', 'Loaded model')}<CompactSelect aria-label={tr('已加载模型', 'Loaded model')} value={instanceId} onChange={(event) => setInstanceId(event.target.value)} required>
         {!loaded.length && <option value="">{tr('请先加载一个模型', 'Load a model first')}</option>}
         {loaded.map((item) => <option key={item.id} value={item.id}>{item.model} · ctx {item.context_size?.toLocaleString()} · {item.mtp_available ? 'MTP' : tr('无 MTP', 'No MTP')}</option>)}
-      </select></label>
+      </CompactSelect></label>
     </div></fieldset>
     <fieldset className="evaluation-fieldset"><legend>{tr('测试条件', 'Test conditions')}</legend><div className="evaluation-fields evaluation-fields-mode">
       <label>{tr('测试模式', 'Test mode')}<select value={draft.mode} onChange={(event) => setDraft({ ...draft, mode: event.target.value })}>
@@ -156,9 +157,9 @@ export function AccuracyForm({ task, instances, datasets, available, readiness, 
     : readiness?.reason === 'official_dependencies_missing' ? tr('官方评分依赖尚未安装。', 'Official scoring dependencies are not installed.')
     : tr('此任务的官方执行器尚未接齐，暂不能运行；不使用近似评分。', 'This task’s official runner is not fully integrated and cannot run yet; approximate scoring is disabled.');
   return <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); if (!missingDefaults) void submit('evaluate.accuracy', { ...settings, official_defaults: officialDefaults, ...(task.protocol === 'likelihood' ? { max_tokens: 1, enable_thinking: false, enable_mtp: false } : {}), instance_id: instanceId, dataset_id: datasetId }); }}>
-    <fieldset className="evaluation-fieldset"><legend>{tr('模型与集合', 'Model & collection')}</legend><div className="evaluation-fields">
-      <label className="evaluation-wide">{tr('已加载模型', 'Loaded model')}<select className="evaluation-primary-select" value={instanceId} onChange={(event) => setInstanceId(event.target.value)} required>{!loaded.length && <option value="">{tr('请先加载一个模型', 'Load a model first')}</option>}{loaded.map((item) => <option key={item.id} value={item.id}>{item.model}</option>)}</select></label>
-      <label className="evaluation-wide">{tr('官方测试集', 'Official test dataset')}<select className="evaluation-primary-select" value={datasetId} onChange={(event) => setDatasetId(event.target.value)} required>{!custom.length && <option value="">{tr('请先从官方集合下载此任务的数据', 'Download this task from Official collections first')}</option>}{custom.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+    <fieldset className="evaluation-fieldset"><legend>{tr('模型与集合', 'Model & collection')}</legend><div className="evaluation-fields evaluation-fields-pair evaluation-model-fields">
+      <label>{tr('已加载模型', 'Loaded model')}<CompactSelect aria-label={tr('已加载模型', 'Loaded model')} value={instanceId} onChange={(event) => setInstanceId(event.target.value)} required>{!loaded.length && <option value="">{tr('请先加载一个模型', 'Load a model first')}</option>}{loaded.map((item) => <option key={item.id} value={item.id}>{item.model}</option>)}</CompactSelect></label>
+      <label>{tr('官方测试集', 'Official test dataset')}<CompactSelect aria-label={tr('官方测试集', 'Official test dataset')} value={datasetId} onChange={(event) => setDatasetId(event.target.value)} required>{!custom.length && <option value="">{tr('请先从官方集合下载此任务的数据', 'Download this task from Official collections first')}</option>}{custom.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</CompactSelect></label>
     </div></fieldset>
     <div className="evaluation-default-toggle"><label><input type="checkbox" checked={officialDefaults} onChange={(event) => setOfficialDefaults(event.target.checked)} />{tr('官方默认', 'Official defaults')}</label><small>{officialDefaults ? tr('采用固定版本官方仓库配置', 'Uses the pinned official repository configuration') : tr('自定义参数', 'Custom parameters')}</small></div>
     <fieldset className="evaluation-fieldset" disabled={officialDefaults}><legend>{tr('测试条件', 'Test conditions')}</legend><div className="evaluation-fields">

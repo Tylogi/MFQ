@@ -1168,6 +1168,11 @@ std::int32_t run_mlx_mtp_generation(
         }
         const auto resolve_started = std::chrono::steady_clock::now();
         callbacks.resolve_target(emitted_accepted, draft_count);
+        if (callbacks.verified_round && draft_count > 0) {
+            callbacks.verified_round(target.logits, emitted_accepted,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cycle_started).count());
+        }
         if (callbacks.committed_target) {
             callbacks.committed_target(MlxMtpDraftContext{
                 false, pending, 0, cycle_cache_start, emitted_accepted,

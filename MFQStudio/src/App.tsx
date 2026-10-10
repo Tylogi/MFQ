@@ -50,6 +50,12 @@ const QuantizationPage = lazy(() =>
 const AnalysisPage = lazy(() =>
   import('./features/analysis/AnalysisPage').then((module) => ({ default: module.AnalysisPage })),
 );
+const ApplicationsPage = lazy(() =>
+  import('./features/applications/ApplicationsPage').then((module) => ({ default: module.ApplicationsPage })),
+);
+const VersionsPage = lazy(() =>
+  import('./features/settings/VersionsPage').then(module => ({ default: module.VersionsPage })),
+);
 
 /** 挂载共享服务与独立业务页面，未知地址显示 404。 */
 export default function App() {
@@ -63,11 +69,13 @@ export default function App() {
                 <Route element={<StudioShell />}>
                   <Route index element={<OverviewPage />} />
                   <Route path="chat" element={<ChatPage />} />
+                  <Route path="applications" element={<ApplicationsPage />} />
                   <Route path="models" element={<ModelsPage />} />
                   <Route path="runtime" element={<ConnectionsPage />} />
                   <Route path="resources" element={<CachePage />} />
                   <Route path="logs" element={<LogsPage />} />
                   <Route path="settings" element={<SettingsRoute />} />
+                  <Route path="versions" element={<VersionsPage />} />
                   <Route element={<LabLayout />}>
                     <Route path="analysis" element={<AnalysisPage />} />
                     <Route path="model-hub" element={<ModelHubPage />} />

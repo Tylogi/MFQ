@@ -3,14 +3,12 @@ import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
 import {
-  UpdateAvailableBanner,
   useStudioUpdateContext,
 } from '../features/settings/UpdateManager';
 import { useUiStore } from '../stores/uiStore';
 import { Icon } from './display';
-import { ModelVendorMark, modelVendor } from './ModelVendorMark';
 import { formatNumber } from './formatters';
-import { runtimeModelNames } from '../features/runtime/modelSelection';
+import { studioBuild } from '../features/settings/releases';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
   type DashboardPage, type LabPage } from '../navigation';
 
@@ -28,15 +26,16 @@ export function StudioSidebar() {
   const navigate = useNavigate();
   const { tr } = useSettings();
   const studioUpdates = useStudioUpdateContext();
-  const { runtime, selectedModel: model, models, instances, loading: selectedModelLoading } = useRuntime();
+  const version = studioUpdates.status?.current_version || studioBuild.version;
+  const releaseBuild = studioUpdates.status?.current_release ?? studioBuild.release;
+  const revision = version.split('+dev.')[1]?.split('.')[0];
+  const { runtime } = useRuntime();
   const sidebarOpen = useUiStore((state) => state.sidebarOpen);
   const closeSidebar = useUiStore((state) => state.closeSidebar);
   const openSidebar = useUiStore((state) => state.openSidebar);
   const currentLocation = resolveStudioLocation(location.pathname);
   const { dashboardPage, labPage } = currentLocation;
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
-  const availableModelNames = runtimeModelNames(models, instances);
-  const selectedModelAvailable = availableModelNames.includes(model);
   const activeRequests = Number(runtime?.active_requests || 0);
 
   useEffect(() => { closeSidebar(); }, [location.pathname, closeSidebar]);
@@ -68,6 +67,7 @@ export function StudioSidebar() {
     ] },
     { label: ['交互', 'Playground'], items: [
       { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
+      { label: ['应用', 'Applications'], icon: 'link', path: '/applications', active: view === 'applications' },
     ] },
     { label: ['工具', 'Tools'], items: [
       { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
@@ -121,29 +121,17 @@ export function StudioSidebar() {
             ))}
           </nav>
         </div>
-        <UpdateAvailableBanner
-          onOpen={() => open('/settings')}
-          status={studioUpdates.status}
-          tr={tr}
-        />
-        <button className="sidebar-runtime-card" onClick={() => open(dashboard('overview'))} type="button">
-          <span className={`runtime-dot ${activeRequests > 0 ? 'busy' : selectedModelAvailable
-            ? 'ready' : selectedModelLoading ? 'busy' : 'idle'}`} />
+        <button className={`sidebar-version-card ${location.pathname === '/versions' ? 'active' : ''}`}
+          aria-current={location.pathname === '/versions' ? 'page' : undefined}
+          aria-label={tr('打开版本管理', 'Open version manager')}
+          onClick={() => open('/versions')} type="button">
           <span>
-            <strong>{model || tr('服务空闲', 'Server idle')}</strong>
-            <small>{availableModelNames.length > 1
-              ? tr(`${availableModelNames.length} 个模型已加载`,
-                `${availableModelNames.length} models loaded`)
-              : selectedModelAvailable
-                ? `${formatNumber(activeRequests)} ${tr('个活动请求', 'active requests')}`
-                : selectedModelLoading
-                  ? tr('模型加载中', 'Model loading')
-                  : tr('选择模型以开始', 'Choose a model to begin')}</small>
+            <strong title={version}>v{version.split('+')[0]}</strong>
+            <small>{studioUpdates.busy?.startsWith('download:') ? tr('正在下载更新', 'Downloading update')
+              : studioUpdates.status?.update_available ? tr('有新 Release', 'New Release available')
+              : releaseBuild ? tr('Release · 版本管理', 'Release · Versions')
+                : `${tr('开发版', 'Dev')} · ${revision || tr('版本管理', 'Versions')}`}</small>
           </span>
-          {modelVendor(model, model === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined)
-            ? <ModelVendorMark name={model} size={20}
-              architecture={model === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
-            : <Icon name="activity" size={14} />}
         </button>
       </aside>
       <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen}

@@ -539,6 +539,10 @@ fn studio_open_external(url: String) -> Result<(), String> {
                 | "www.huggingface.co"
                 | "modelscope.cn"
                 | "www.modelscope.cn"
+                | "www.deepseek.com"
+                | "opencode.ai"
+                | "code.claude.com"
+                | "openclaw.ai"
         )
     {
         return Err("external links are limited to trusted MFQ model and release hosts".into());
@@ -579,6 +583,7 @@ fn main() {
             updater::studio_update_status,
             updater::studio_update_progress,
             updater::studio_update_set_automatic,
+            updater::studio_update_set_download,
             updater::studio_update_download,
             updater::studio_update_install,
             updater::studio_update_delete

@@ -1,8 +1,10 @@
 #include "mlx_transformer.h"
 #include "mlx_resident_budget.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -33,13 +35,16 @@ void require_array_close(
         throw std::runtime_error(
             "transformer array shape mismatch");
     }
-    auto actual_f32 = astype(actual, float32);
-    auto expected_f32 = astype(expected, float32);
+    auto actual_f32 = contiguous(astype(actual, float32));
+    auto expected_f32 = contiguous(astype(expected, float32));
     actual_f32.eval();
     expected_f32.eval();
     const auto* actual_values = actual_f32.data<float>();
     const auto* expected_values = expected_f32.data<float>();
     for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (std::fabs(actual_values[index] - expected_values[index]) > tolerance)
+            throw std::runtime_error("transformer array mismatch at " + std::to_string(index) +
+                ": actual=" + std::to_string(actual_values[index]) + " expected=" + std::to_string(expected_values[index]));
         require_close(
             actual_values[index],
             expected_values[index],
@@ -182,6 +187,42 @@ int main() {
     try {
         using namespace mlx::core;
         test_runtime_rope_length_reuse();
+        for (const double factor : {2.0, 4.0}) {
+            auto scaling = mfq::metal::qwen_yarn_scaling({}, 262144, static_cast<int>(262144 * factor), 4.0);
+            require_close(scaling.attention_factor, 1.0 + 0.1 * std::log(factor));
+            for (const int tokens : {1, 2, 6, 17}) {
+                constexpr int dimension = 96, rotary = 64;
+                std::vector<float> source(tokens * dimension, 0.5f);
+                std::vector<std::int32_t> positions(3 * tokens);
+                for (int axis = 0; axis < 3; ++axis) for (int token = 0; token < tokens; ++token)
+                    positions[axis * tokens + token] = static_cast<int>(262144 * factor) - 32 + token - axis * 37;
+                for (const bool interleaved : {false, true}) {
+                    auto actual = mfq::metal::apply_rope(array(source.begin(), Shape{1, 1, tokens, dimension}),
+                        array(positions.begin(), Shape{3, tokens}), rotary, 1e7f, {11, 11, 10}, interleaved, scaling);
+                    actual.eval();
+                    const auto* values = actual.data<float>();
+                    const double low = std::max(0.0, std::floor(rotary * std::log(262144.0 / (32 * 2 * std::acos(-1.0))) / (2 * std::log(1e7))));
+                    const double high = std::min(double(rotary - 1), std::ceil(rotary * std::log(262144.0 / (2 * std::acos(-1.0))) / (2 * std::log(1e7))));
+                    for (int token = 0; token < tokens; ++token) for (int pair = 0; pair < rotary / 2; ++pair) {
+                        const auto ramp = std::clamp((pair - low) / (high - low), 0.0, 1.0);
+                        const float frequency = std::pow(1e7, -2.0 * pair / rotary) * (1 - ramp + ramp / factor);
+                        const float angle = positions[reference_mrope_axis(pair, {11, 11, 10}, interleaved) * tokens + token] * frequency;
+                        const auto cosine = std::cos(angle) * scaling.attention_factor;
+                        const auto sine = std::sin(angle) * scaling.attention_factor;
+                        require_close(values[token * dimension + pair], 0.5 * (cosine - sine), 5e-4f);
+                        require_close(values[token * dimension + pair + rotary / 2], 0.5 * (cosine + sine), 5e-4f);
+                    }
+                    for (int token = 0; token < tokens; ++token) for (int column = rotary; column < dimension; ++column)
+                        require_close(values[token * dimension + column], 0.5f, 0.0f);
+                }
+            }
+        }
+        if (mfq::metal::qwen_yarn_scaling({}, 262144, 262144, 4).enabled)
+            throw std::runtime_error("native context unexpectedly enabled YaRN");
+        bool limit_rejected = false;
+        try { (void)mfq::metal::qwen_yarn_scaling({}, 262144, 1048577, 4); }
+        catch (const std::invalid_argument&) { limit_rejected = true; }
+        if (!limit_rejected) throw std::runtime_error("YaRN context limit was not enforced");
         const auto empty_resources = mfq::metal::MlxResourceTelemetry::snapshot();
         {
             mfq::metal::MlxKvCache first(1, 2, 16, 4, 2, float16);
@@ -627,6 +668,38 @@ int main() {
         require_close(attention_values[2], 4.0f);
         require_close(attention_values[3], 6.0f);
 
+        for (const double bits : {2.0, 2.5, 3.0, 3.5, 4.0, 6.0, 8.0}) {
+            const auto setting = std::to_string(bits);
+            setenv("MFQ_KV_TURBOQUANT_BITS", setting.c_str(), 1);
+            mfq::metal::MlxKvCache quantized(1, 2, 64, 256, 2, float16, true);
+            std::vector<float> data(2 * 9 * 256);
+            for (std::size_t i = 0; i < data.size(); ++i) data[i] = std::sin(i * 1.71f) + std::cos(i * 0.53f);
+            const array original(data.begin(), Shape{1, 2, 9, 256});
+            quantized.append_only(original, original * 2);
+            auto snapshot = quantized.snapshot();
+            if (snapshot.dtype != uint32 || snapshot.quantization.bits != bits || snapshot.nbytes() >= original.nbytes() ||
+                snapshot.key.shape(3) != mfq::metal::mlx_kv_packed_width(256, std::floor(bits)) ||
+                snapshot.value.shape(3) != mfq::metal::mlx_kv_packed_width(256, std::ceil(bits)))
+                throw std::runtime_error("TurboQuant packed storage mismatch");
+            auto decoded = quantized.view();
+            const float error = mean(square(astype(decoded.first, float32) - original)).item<float>();
+            const float limit = bits < 3 ? 0.20f : bits < 4 ? 0.08f : bits < 6 ? 0.025f : bits < 8 ? 0.002f : 0.0003f;
+            if (!std::isfinite(error) || error > limit) throw std::runtime_error("TurboQuant KV reconstruction error: " + std::to_string(error));
+            mfq::metal::MlxKvCache restored(1, 2, 64, 256, 1, float16, true);
+            restored.restore_snapshot(snapshot);
+            require_array_close(restored.view().first, decoded.first, 0);
+            quantized.trim(3); quantized.append_only(slice(original, {0, 0, 6, 0}, {1, 2, 9, 256}),
+                slice(original * 2, {0, 0, 6, 0}, {1, 2, 9, 256}));
+            require_array_close(quantized.view().first, restored.view().first, 0);
+            const auto q = zeros(Shape{1, 4, 2, 256}, float16);
+            auto sparse = restored.sparse_attention(q, std::nullopt, 7, 4, 16);
+            auto reference = mfq::metal::scaled_dot_product_attention(q, decoded.first, decoded.second, true);
+            require_array_close(sparse, transpose(reference, {0, 2, 1, 3}), 0.002f);
+            require_array_close(restored.attention(q), reference, 0.002f);
+            require_array_close(mfq::metal::mlx_kv_decode(mfq::metal::mlx_kv_encode(zeros(Shape{2, 256}), std::floor(bits), false),
+                256, std::floor(bits), false, float32), zeros(Shape{2, 256}), 0);
+        }
+        unsetenv("MFQ_KV_TURBOQUANT_BITS");
         std::cout
             << "MFQ C++ Transformer primitives Metal tests passed\n";
         return 0;

@@ -191,16 +191,18 @@ export function MetricTile({
 /** 排列设置项的标题、说明和尾部控件。 */
 export function SettingRow({
   title,
+  titleHint,
   detail,
   trailing,
 }: {
   title: string;
+  titleHint?: string;
   detail: string;
   trailing: ReactNode;
 }) {
   return (
     <div className="setting-row">
-      <div><strong>{title}</strong><small>{detail}</small></div>
+      <div><strong title={titleHint}>{title}</strong><small>{detail}</small></div>
       <div className="setting-row-trailing">{trailing}</div>
     </div>
   );

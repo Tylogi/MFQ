@@ -16,7 +16,7 @@ use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 use url::Url;
 
-const RELEASES_URL: &str = "https://api.github.com/repos/Tylogi/TyloQuant/releases?per_page=30";
+const RELEASES_URL: &str = "https://api.github.com/repos/Tylogi/TyloQuant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/Tylogi/TyloQuant/releases";
 const CACHE_SECONDS: u64 = 6 * 60 * 60;
 const PREFERENCES_FILE: &str = "update-preferences.json";
@@ -45,12 +45,15 @@ impl Default for UpdateState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct UpdatePreferences {
     automatic_check: bool,
+    #[serde(default)]
+    automatic_download: bool,
 }
 
 impl Default for UpdatePreferences {
     fn default() -> Self {
         Self {
             automatic_check: true,
+            automatic_download: false,
         }
     }
 }
@@ -93,7 +96,7 @@ pub struct StudioRelease {
     published_at: Option<String>,
     page_url: String,
     prerelease: bool,
-    asset: StudioReleaseAsset,
+    asset: Option<StudioReleaseAsset>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -104,12 +107,16 @@ pub struct InstalledVersion {
     ready: bool,
     byte_size: u64,
     installed_at_epoch_seconds: u64,
+    notes: String,
+    prerelease: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UpdateStatus {
     current_version: String,
+    current_release: bool,
     automatic_check: bool,
+    automatic_download: bool,
     checked_at_epoch_seconds: Option<u64>,
     update_available: bool,
     platform_supported: bool,
@@ -197,6 +204,16 @@ fn extract_version(value: &str) -> Option<String> {
     Some(components[..3].join("."))
 }
 
+fn is_release_tag(tag: &str) -> bool {
+    let Some(version) = extract_version(tag) else { return false; };
+    let normalized = tag.to_ascii_lowercase();
+    let numeric = normalized.strip_prefix('v').unwrap_or(&normalized);
+    if numeric == version { return true; }
+    let prefix = format!("studio-v{version}-multimodal-");
+    normalized.strip_prefix(&prefix).is_some_and(|date|
+        date.len() == 8 && date.chars().all(|item| item.is_ascii_digit()))
+}
+
 fn version_components(value: &str) -> Option<[u64; 3]> {
     let version = extract_version(value)?;
     let values: Vec<u64> = version
@@ -233,20 +250,27 @@ fn normalized_release(release: GitHubRelease) -> Option<StudioRelease> {
     let normalized_tag = release.tag_name.to_ascii_lowercase();
     if release.draft
         || release.prerelease
-        || ["alpha", "beta", "dev", "rc"]
+        || ["alpha", "beta", "dev", "rc", "nightly"]
             .iter()
             .any(|value| normalized_tag.contains(value))
     {
         return None;
     }
     let version = extract_version(&release.tag_name)?;
-    let asset = asset_for_platform(&release)?.clone();
-    let sha256 = asset
-        .digest
-        .as_deref()
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .filter(|value| value.len() == 64 && value.chars().all(|item| item.is_ascii_hexdigit()))
-        .map(str::to_ascii_lowercase)?;
+    if !is_release_tag(&release.tag_name) {
+        return None;
+    }
+    let asset = asset_for_platform(&release).and_then(|asset| {
+        let sha256 = asset.digest.as_deref()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .filter(|value| value.len() == 64 && value.chars().all(|item| item.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)?;
+        validate_download_url(&asset.browser_download_url).ok()?;
+        Some(StudioReleaseAsset {
+            name: asset.name.clone(), byte_size: asset.size,
+            sha256: Some(sha256), download_url: asset.browser_download_url.clone(),
+        })
+    });
     Some(StudioRelease {
         version,
         tag: release.tag_name.clone(),
@@ -255,12 +279,7 @@ fn normalized_release(release: GitHubRelease) -> Option<StudioRelease> {
         published_at: release.published_at,
         page_url: release.html_url,
         prerelease: release.prerelease,
-        asset: StudioReleaseAsset {
-            name: asset.name,
-            byte_size: asset.size,
-            sha256: Some(sha256),
-            download_url: asset.browser_download_url,
-        },
+        asset,
     })
 }
 
@@ -289,7 +308,10 @@ fn fetch_releases() -> Result<Vec<StudioRelease>, String> {
 
 fn releases(root: &Path, force: bool, automatic: bool) -> (ReleasesCache, Option<String>) {
     let path = root.join(RELEASES_FILE);
-    let cached: Option<ReleasesCache> = read_json(&path);
+    let cached: Option<ReleasesCache> = read_json(&path).map(|mut cache: ReleasesCache| {
+        cache.releases.retain(|release| !release.prerelease && is_release_tag(&release.tag));
+        cache
+    });
     let fresh = cached.as_ref().is_some_and(|value| {
         now_epoch_seconds().saturating_sub(value.checked_at_epoch_seconds) < CACHE_SECONDS
     });
@@ -329,10 +351,12 @@ fn releases(root: &Path, force: bool, automatic: bool) -> (ReleasesCache, Option
 fn safe_version_directory(version: &str) -> Result<String, String> {
     let normalized =
         extract_version(version).ok_or_else(|| "invalid release version".to_string())?;
-    if normalized != version {
+    let development_suffix = version.strip_prefix(&format!("{normalized}+dev."));
+    if normalized != version && !development_suffix.is_some_and(|suffix|
+        !suffix.is_empty() && suffix.chars().all(|item| item.is_ascii_alphanumeric() || item == '.')) {
         return Err("release version is not normalized".into());
     }
-    Ok(normalized)
+    Ok(version.to_string())
 }
 
 fn directory_size(path: &Path) -> u64 {
@@ -358,7 +382,7 @@ fn directory_size(path: &Path) -> u64 {
 }
 
 fn installed_versions(root: &Path) -> Vec<InstalledVersion> {
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current_version = env!("MFQ_STUDIO_VERSION").to_string();
     let mut values = vec![InstalledVersion {
         version: current_version.clone(),
         tag: format!("v{current_version}"),
@@ -366,6 +390,8 @@ fn installed_versions(root: &Path) -> Vec<InstalledVersion> {
         ready: true,
         byte_size: 0,
         installed_at_epoch_seconds: 0,
+        notes: String::new(),
+        prerelease: env!("MFQ_STUDIO_RELEASE") != "true",
     }];
     let versions_root = root.join("versions");
     if let Ok(entries) = fs::read_dir(&versions_root) {
@@ -381,6 +407,7 @@ fn installed_versions(root: &Path) -> Vec<InstalledVersion> {
                 if let Some(current) = values.first_mut() {
                     current.byte_size = directory_size(&directory);
                     current.installed_at_epoch_seconds = metadata.installed_at_epoch_seconds;
+                    current.notes = metadata.release.notes.clone();
                 }
                 continue;
             }
@@ -391,6 +418,8 @@ fn installed_versions(root: &Path) -> Vec<InstalledVersion> {
                 ready,
                 byte_size: directory_size(&directory),
                 installed_at_epoch_seconds: metadata.installed_at_epoch_seconds,
+                notes: metadata.release.notes,
+                prerelease: metadata.release.prerelease,
             });
         }
     }
@@ -428,14 +457,16 @@ fn cached_installable(directory: &Path) -> Option<PathBuf> {
 fn update_status(root: &Path, force: bool) -> UpdateStatus {
     let preferences = preferences(root);
     let (cache, error) = releases(root, force, preferences.automatic_check);
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current_version = env!("MFQ_STUDIO_VERSION").to_string();
     let latest = cache.releases.first().cloned();
     let update_available = latest
         .as_ref()
         .is_some_and(|value| compare_versions(&value.version, &current_version).is_gt());
     UpdateStatus {
         current_version,
+        current_release: env!("MFQ_STUDIO_RELEASE") == "true",
         automatic_check: preferences.automatic_check,
+        automatic_download: preferences.automatic_download,
         checked_at_epoch_seconds: (cache.checked_at_epoch_seconds > 0)
             .then_some(cache.checked_at_epoch_seconds),
         update_available,
@@ -492,11 +523,14 @@ fn download_asset<F>(
 where
     F: FnMut(u64, u64),
 {
-    validate_download_url(&release.asset.download_url)?;
+    let asset = release.asset.as_ref().ok_or_else(|| "this release has no verified installer for this platform".to_string())?;
+    validate_download_url(&asset.download_url)?;
     let version = safe_version_directory(&release.version)?;
-    let name = safe_asset_name(&release.asset.name)?;
-    let expected_sha256 = release
-        .asset
+    if version != extract_version(&version).unwrap_or_default() {
+        return Err("experimental versions cannot use Release downloads".into());
+    }
+    let name = safe_asset_name(&asset.name)?;
+    let expected_sha256 = asset
         .sha256
         .as_deref()
         .ok_or_else(|| "release asset does not publish a SHA-256 digest".to_string())?;
@@ -508,10 +542,10 @@ where
     let destination = downloads.join(name);
     if destination.is_file() && verify_sha256(&destination, expected_sha256)? {
         let bytes = fs::metadata(&destination).map_err(|error| error.to_string())?.len();
-        if release.asset.byte_size > 0 && bytes != release.asset.byte_size {
+        if asset.byte_size > 0 && bytes != asset.byte_size {
             return Err("cached release download size mismatch".into());
         }
-        report_progress(bytes, release.asset.byte_size);
+        report_progress(bytes, asset.byte_size);
         return Ok(destination);
     }
     let temporary = destination.with_extension("download.partial");
@@ -524,7 +558,7 @@ where
         .build()
         .map_err(|error| error.to_string())?;
     let mut response = client
-        .get(&release.asset.download_url)
+        .get(&asset.download_url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|error| format!("release download failed: {error}"))?;
@@ -539,24 +573,19 @@ where
         if count == 0 {
             break;
         }
-        total = total.saturating_add(count as u64);
-        if release.asset.byte_size > 0 && total > release.asset.byte_size {
-            drop(output);
-            let _ = fs::remove_file(&temporary);
-            return Err("release download exceeds its published size".into());
-        }
         output
             .write_all(&buffer[..count])
             .map_err(|error| error.to_string())?;
         digest.update(&buffer[..count]);
-        report_progress(total, release.asset.byte_size);
+        total = total.saturating_add(count as u64);
+        report_progress(total, asset.byte_size);
     }
     output.sync_all().map_err(|error| error.to_string())?;
-    if release.asset.byte_size > 0 && total != release.asset.byte_size {
+    if asset.byte_size > 0 && total != asset.byte_size {
         let _ = fs::remove_file(&temporary);
         return Err(format!(
             "release download size mismatch: expected {}, received {total}",
-            release.asset.byte_size
+            asset.byte_size
         ));
     }
     let actual = format!("{:x}", digest.finalize());
@@ -838,7 +867,7 @@ fn ensure_bundle_parent_writable(bundle: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn snapshot_current_bundle(root: &Path, current: &Path) -> Result<(), String> {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("MFQ_STUDIO_VERSION");
     let directory = root.join("versions").join(safe_version_directory(version)?);
     let destination = directory.join("MFQ Studio.app");
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
@@ -862,13 +891,13 @@ fn snapshot_current_bundle(root: &Path, current: &Path) -> Result<(), String> {
         notes: "Snapshot retained before an application update.".into(),
         published_at: None,
         page_url: RELEASES_PAGE.into(),
-        prerelease: false,
-        asset: StudioReleaseAsset {
+        prerelease: env!("MFQ_STUDIO_RELEASE") != "true",
+        asset: Some(StudioReleaseAsset {
             name: "local-snapshot".into(),
             byte_size: 0,
             sha256: None,
             download_url: RELEASES_PAGE.into(),
-        },
+        }),
     };
     write_json(
         &directory.join(INSTALL_METADATA_FILE),
@@ -1050,12 +1079,29 @@ pub async fn studio_update_set_automatic(
             &root.join(PREFERENCES_FILE),
             &UpdatePreferences {
                 automatic_check: enabled,
+                ..preferences(&root)
             },
         )?;
         Ok(update_status(&root, false))
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn studio_update_set_download(
+    app: AppHandle,
+    state: State<'_, UpdateState>,
+    enabled: bool,
+) -> Result<UpdateStatus, String> {
+    let _guard = state.lock.lock().await;
+    let root = update_root(&app)?;
+    tokio::task::spawn_blocking(move || {
+        write_json(&root.join(PREFERENCES_FILE), &UpdatePreferences {
+            automatic_download: enabled, ..preferences(&root)
+        })?;
+        Ok(update_status(&root, false))
+    }).await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1076,12 +1122,16 @@ pub async fn studio_update_download(
             .into_iter()
             .find(|value| value.tag == tag)
             .ok_or_else(|| "release is not present in the verified GitHub catalog".to_string())?;
+        if release.prerelease {
+            return Err("experimental versions cannot be downloaded by the Release updater".into());
+        }
+        let byte_size = release.asset.as_ref().ok_or_else(|| "this release has no verified installer for this platform".to_string())?.byte_size;
         set_progress(
             &progress_for_task,
             &release.tag,
             "downloading",
             0,
-            release.asset.byte_size,
+            byte_size,
         );
         let progress_for_download = Arc::clone(&progress_for_task);
         let progress_tag = release.tag.clone();
@@ -1098,8 +1148,8 @@ pub async fn studio_update_download(
             &progress_for_task,
             &release.tag,
             "preparing",
-            release.asset.byte_size,
-            release.asset.byte_size,
+            byte_size,
+            byte_size,
         );
         #[cfg(target_os = "macos")]
         stage_macos_release(&root, &release, &asset)?;
@@ -1109,7 +1159,7 @@ pub async fn studio_update_download(
                 .join("versions")
                 .join(safe_version_directory(&release.version)?);
             fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-            let destination = directory.join(&release.asset.name);
+            let destination = directory.join(&release.asset.as_ref().unwrap().name);
             fs::copy(&asset, destination).map_err(|error| error.to_string())?;
             write_json(
                 &directory.join(INSTALL_METADATA_FILE),
@@ -1189,7 +1239,7 @@ pub async fn studio_update_delete(
     version: String,
 ) -> Result<UpdateStatus, String> {
     let _guard = state.lock.lock().await;
-    if version == env!("CARGO_PKG_VERSION") {
+    if version == env!("MFQ_STUDIO_VERSION") {
         return Err("the running version cannot be removed".into());
     }
     let root = update_root(&app)?;
@@ -1225,17 +1275,54 @@ mod tests {
     }
 
     impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
     }
 
     fn fixture_release() -> StudioRelease {
         StudioRelease { version: "0.3.2".into(), tag: "v0.3.2".into(), name: "MFQ".into(),
             notes: String::new(), published_at: None, page_url: RELEASES_PAGE.into(), prerelease: false,
-            asset: StudioReleaseAsset { name: "MFQ.dmg".into(), byte_size: 3,
+            asset: Some(StudioReleaseAsset { name: "MFQ.dmg".into(), byte_size: 3,
                 sha256: Some(format!("{:x}", Sha256::digest(b"abc"))),
-                download_url: "https://github.com/Tylogi/MFQ/releases/download/v0.3.2/MFQ.dmg".into() } }
+                download_url: "https://github.com/Tylogi/MFQ/releases/download/v0.3.2/MFQ.dmg".into() }) }
+    }
+
+    #[test]
+    fn corrupted_release_cache_is_rejected_before_any_download_or_directory_creation() {
+        let root = TestDirectory::new();
+        for version in ["../outside", "../../outside", "/outside", "v0.3.2", "0.3.2/extra", "0.3.2+dev.1234"] {
+            let mut release = fixture_release();
+            release.version = version.into();
+            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        }
+        for name in ["../outside", "..\\outside", "C:outside"] {
+            let mut release = fixture_release();
+            release.asset.as_mut().unwrap().name = name.into();
+            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        }
+        let mut release = fixture_release();
+        release.asset.as_mut().unwrap().sha256 = Some("invalid".into());
+        assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn verified_cached_download_is_reused_without_network_or_rewriting() {
+        let root = TestDirectory::new();
+        let release = fixture_release();
+        let asset = release.asset.as_ref().unwrap();
+        let directory = root.0.join("downloads").join(&release.version);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(&asset.name);
+        fs::write(&path, b"abc").unwrap();
+        let mut progress = Vec::new();
+        assert_eq!(download_asset(&root.0, &release, |bytes, total| progress.push((bytes, total))).unwrap(), path);
+        assert_eq!(progress, vec![(3, 3)]);
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        let mut corrupt = release.clone();
+        corrupt.asset.as_mut().unwrap().byte_size = 4;
+        assert!(download_asset(&root.0, &corrupt, |_, _| {}).unwrap_err().contains("size mismatch"));
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        assert!(!verify_sha256(&path, &"0".repeat(64)).unwrap());
     }
 
     #[test]
@@ -1272,48 +1359,6 @@ mod tests {
             "MFQ.Studio_0.3.2_aarch64.dmg"
         );
         assert!(safe_asset_name("../MFQ.dmg").is_err());
-        assert!(safe_asset_name("..\\MFQ.dmg").is_err());
-        assert!(safe_asset_name("C:MFQ.dmg").is_err());
-        assert!(safe_asset_name(".").is_err());
-        assert!(safe_asset_name("").is_err());
-    }
-
-    #[test]
-    fn corrupted_release_cache_is_rejected_before_any_download_or_directory_creation() {
-        let root = TestDirectory::new();
-        for version in ["../outside", "../../outside", "/outside", "v0.3.2", "0.3.2/extra"] {
-            let mut release = fixture_release();
-            release.version = version.into();
-            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
-        }
-        for name in ["../outside", "..\\outside", "C:outside"] {
-            let mut release = fixture_release();
-            release.asset.name = name.into();
-            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
-        }
-        let mut release = fixture_release();
-        release.asset.sha256 = Some("invalid".into());
-        assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
-        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn verified_cached_download_is_reused_without_network_or_rewriting() {
-        let root = TestDirectory::new();
-        let release = fixture_release();
-        let directory = root.0.join("downloads").join(&release.version);
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(&release.asset.name);
-        fs::write(&path, b"abc").unwrap();
-        let mut progress = Vec::new();
-        assert_eq!(download_asset(&root.0, &release, |bytes, total| progress.push((bytes, total))).unwrap(), path);
-        assert_eq!(progress, vec![(3, 3)]);
-        assert_eq!(fs::read(&path).unwrap(), b"abc");
-        let mut corrupt = release.clone();
-        corrupt.asset.byte_size = 4;
-        assert!(download_asset(&root.0, &corrupt, |_, _| {}).unwrap_err().contains("size mismatch"));
-        assert_eq!(fs::read(&path).unwrap(), b"abc");
-        assert!(!verify_sha256(&path, &"0".repeat(64)).unwrap());
     }
 
     #[test]
@@ -1337,8 +1382,38 @@ mod tests {
         };
         let mut unsigned = release.clone();
         unsigned.assets[0].digest = None;
-        assert!(normalized_release(unsigned).is_none());
+        assert!(normalized_release(unsigned).unwrap().asset.is_none());
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(normalized_release(release).unwrap().version, "0.3.2");
+    }
+
+    #[test]
+    fn release_channel_rejects_experimental_tags_and_drafts() {
+        for tag in ["v0.4.0rc1", "v0.4.0a1", "v0.4.0b1", "v0.4.0-dev.1", "nightly", "0.4.0+test"] {
+            assert!(!is_release_tag(tag), "{tag}");
+        }
+        assert!(is_release_tag("v0.4.0"));
+        assert!(is_release_tag("studio-v0.1.0-multimodal-20260828"));
+        let mut release = GitHubRelease { tag_name: "v0.4.0".into(), name: None, body: Some("notes".into()),
+            html_url: RELEASES_PAGE.into(), published_at: None, draft: true, prerelease: false, assets: vec![] };
+        assert!(normalized_release(release.clone()).is_none());
+        release.draft = false;
+        release.prerelease = true;
+        assert!(normalized_release(release.clone()).is_none());
+        release.prerelease = false;
+        let visible = normalized_release(release).unwrap();
+        assert_eq!(visible.notes, "notes");
+        assert!(visible.asset.is_none());
+    }
+
+    #[test]
+    fn migrates_preferences_and_keeps_development_snapshots_separate() {
+        let preferences: UpdatePreferences = serde_json::from_str(r#"{"automatic_check":false}"#).unwrap();
+        assert!(!preferences.automatic_download);
+        assert_eq!(safe_version_directory("0.3.2+dev.1234abcd.modified").unwrap(), "0.3.2+dev.1234abcd.modified");
+        assert!(safe_version_directory("0.3.2+dev.../elsewhere").is_err());
+        assert!(safe_version_directory("../0.3.2").is_err());
+        assert!(safe_version_directory("0.3.2+dev.").is_err());
+        assert!(compare_versions("0.3.3", "0.3.2+dev.1234abcd.modified").is_gt());
     }
 }

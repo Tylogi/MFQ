@@ -26,7 +26,7 @@ describe('业务职责边界', () => {
   it('业务模块不能依赖App，运行时启动不请求页面专属资源', () => {
     for (const file of files(join(root, 'features'))) expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"][^'"]*\/App['"]/);
     const runtime = source('app/RuntimeProvider.tsx');
-    for (const request of ['datasets', 'evaluations', 'modelArtifacts', 'runtimeProfiles', 'runtimeLogs', 'generationPresets', 'mcpServers', 'artifactLineage']) {
+    for (const request of ['datasets', 'evaluations', 'modelArtifacts', 'runtimeProfiles', 'runtimeLogs', 'generationPresets', 'artifactLineage']) {
       expect(runtime).not.toContain(`.${request}(`);
     }
   });
@@ -35,7 +35,7 @@ describe('业务职责边界', () => {
       const relative = file.replace(`${root}${sep}`, '').replaceAll(sep, '/');
       expect(relative).not.toBe('api.ts');
       expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"][^'"]*\/api['"]/);
-      expect(readFileSync(file, 'utf8')).not.toMatch(/\bapi\.[A-Za-z]/);
+      expect(readFileSync(file, 'utf8')).not.toMatch(/(?<![:/])\bapi\.[A-Za-z]/);
     }
   });
   it('全局样式入口只保留有序导入，各业务规则在独立样式中', () => {

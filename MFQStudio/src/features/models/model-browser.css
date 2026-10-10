@@ -132,9 +132,9 @@
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
-.variant-memory-pressure > strong { min-width: 39px; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
+.variant-memory-pressure > strong { min-width: 39px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
 .variant-memory-track { overflow: hidden; height: 6px; border-radius: 99px; background: var(--panel-line); }
-.variant-memory-track span { display: block; height: 100%; border-radius: inherit; transition: width 180ms ease, background-color 180ms ease; }
+.variant-memory-track span { display: block; height: 100%; border-radius: inherit; background: var(--muted); transition: width 180ms ease; }
 .community-model-search { display: grid; grid-template-columns: auto minmax(220px, 1fr) auto; gap: 6px; }
 .community-model-search button { border-radius: 7px; padding-block: 8px; }
 .community-search-hint { margin: -7px 0 0; color: var(--muted); font-size: 11px; }

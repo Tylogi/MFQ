@@ -2409,10 +2409,10 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         assert first.context_size == 4096
         assert second.context_capacity == 32768
         assert pool._load_requests["second"].context_size == 8192
-        with pytest.raises(BackendError) as over_capacity:
-            await pool.reload_runtime(65536, second.id)
-        assert over_capacity.value.code == "context_size_exceeded"
-        assert second_backend.reloads == [8192]
+        over_capacity = await pool.reload_runtime(65536, second.id)
+        assert over_capacity['warning'] == "context_size_exceeded"
+        assert over_capacity['max_context'] == 32768
+        assert second_backend.reloads == [8192, 32768]
         with pytest.raises(BackendError) as missing:
             await pool.clear_runtime_cache(uuid4())
         assert missing.value.code == "runtime_instance_not_found"

@@ -69,14 +69,14 @@ describe('RuntimeProvider 故障状态', () => {
   });
 
   it('点击立即请求 ctx 重载并持有状态直到服务完成', async () => {
-    let finish!: (status: RuntimeStatus) => void;
-    const reload = vi.spyOn(runtimeApi, 'reloadRuntime').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    let finish!: (status: JobResource) => void;
+    const reload = vi.spyOn(runtimeApi, 'configureContext').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
     fireEvent.click(screen.getByRole('button', { name: 'Reload model' }));
-    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a');
+    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a', undefined, undefined, undefined);
     expect(screen.getByTestId('reloading')).toHaveTextContent('"instance-a":8192');
-    await act(async () => { finish({ max_context: 8192 }); });
+    await act(async () => { finish({ ...activeJob, id: 'context-reload', kind: 'runtime.context' }); });
     await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));
   });
 
@@ -135,8 +135,8 @@ describe('RuntimeProvider 故障状态', () => {
   });
 
   it('clears old ctx reload state without refreshing the new server when the old request completes', async () => {
-    let finish!: (status: RuntimeStatus) => void;
-    vi.spyOn(runtimeApi, 'reloadRuntime').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    let finish!: (status: JobResource) => void;
+    vi.spyOn(runtimeApi, 'configureContext').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
     fireEvent.click(screen.getByRole('button', { name: 'Reload model' }));
@@ -145,7 +145,7 @@ describe('RuntimeProvider 故障状态', () => {
     await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
     expect(screen.getByTestId('reloading')).toHaveTextContent('{}');
     const calls = vi.mocked(runtimeApi.runtimeInstances).mock.calls.length;
-    await act(async () => { finish({ max_context: 8192 }); });
+    await act(async () => { finish({ ...activeJob, id: 'old-context-reload', kind: 'runtime.context' }); });
     expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(calls);
   });
 

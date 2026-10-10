@@ -68,7 +68,7 @@ struct MfqHeader {
 
 class MfqContainer {
 public:
-    explicit MfqContainer(std::filesystem::path path);
+    explicit MfqContainer(std::filesystem::path path, std::string hf_source_prefix = {});
 
     const MfqHeader& header() const noexcept {
         return header_;
@@ -133,7 +133,7 @@ private:
     struct RandomAccessFiles;
     struct LoadProgress;
 
-    void load_hf_directory(const std::filesystem::path& path);
+    void load_hf_directory(const std::filesystem::path& path, const std::string& source_prefix);
 
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;

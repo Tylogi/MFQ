@@ -6,7 +6,6 @@ import type { SessionArchive } from '../../shared/api/types';
 import { ScreenHeader } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
-import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
@@ -15,13 +14,11 @@ import { presetResourceBody, storedPresetFromResource, type StoredPreset } from 
 import { SettingsPage } from './SettingsPage';
 import { useSettings } from './SettingsProvider';
 import { useGenerationPresets } from './useGenerationPresets';
-import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { toast } from '../../stores/toastStore';
 
 export function SettingsRoute() {
   const { settings, replaceSettings, tr } = useSettings();
   const connectionScope = useConnectionScope();
-  const studioUpdates = useStudioUpdateContext();
   const {
     runtime,
     realtime,
@@ -118,7 +115,7 @@ export function SettingsRoute() {
         throw new Error(tr('不是有效的 MFQ Studio 导出文件。', 'Not a valid MFQ Studio export.'));
       for (const preset of payload.presets) {
         if (!current()) return;
-        if (!preset?.name || !preset.settings || !Number.isFinite(preset.contextSize)) continue;
+        if (!preset?.name || !preset.settings || (preset.contextSize != null && !Number.isFinite(preset.contextSize))) continue;
         const existing = presets.find((item) => item.name === preset.name);
         const body = presetResourceBody(
           {
@@ -185,12 +182,8 @@ export function SettingsRoute() {
         setSettingsDraft={setDraft}
         mtpAvailable={mtpAvailable}
         presetManager={manager}
-        contextControls={<ModelContextSettings />}
         busy={busy}
         hasStudio={Boolean(studio)}
-        updateManager={
-          studio ? <UpdateManager {...studioUpdates} tr={tr} /> : undefined
-        }
         actions={{
           setModelDefaultInheritance,
           applyPreset,

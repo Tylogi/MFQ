@@ -47,7 +47,7 @@
 .evaluation-fields-mode { grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)); }
 .evaluation-fields label { display: grid; min-width: 0; gap: 9px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .evaluation-fields input, .evaluation-fields select, .evaluation-fields textarea { box-sizing: border-box; width: 100%; min-width: 0; min-height: 40px; border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 13px; }
-.evaluation-fields select.evaluation-primary-select { min-height: 48px; padding: 12px 14px; }
+.evaluation-model-fields { max-width: 660px; }
 .evaluation-fields input[readonly] { border-color: var(--line-soft); color: var(--muted); background: var(--panel-control); }
 .evaluation-fields textarea { resize: vertical; line-height: 1.6; }
 .evaluation-wide { grid-column: 1 / -1; }
@@ -64,7 +64,11 @@
 .evaluation-workbench button:disabled { opacity: .45; cursor: default; }
 .evaluation-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .evaluation-job-list { display: grid; margin-top: 20px; border: 1px solid var(--line); border-radius: 10px; padding: 0 18px; }
-.evaluation-job-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; color: var(--ink-soft); font-size: 13px; font-weight: 550; cursor: pointer; }
+.evaluation-job-heading { display: flex; align-items: center; gap: 10px; color: var(--ink-soft); font-size: 13px; font-weight: 550; cursor: pointer; list-style: none; }
+.evaluation-job-heading::-webkit-details-marker { display: none; }
+.evaluation-job-heading > small { margin-left: auto; }
+.evaluation-disclosure-arrow { flex-shrink: 0; color: var(--muted); transition: transform .15s; }
+details[open] > .evaluation-job-heading .evaluation-disclosure-arrow { transform: rotate(90deg); }
 .evaluation-job-heading small { color: var(--muted); font-size: 12px; font-weight: 400; }
 .evaluation-job-list > div { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(100px, 2fr) auto; align-items: center; gap: 20px; padding: 18px 0; border-top: 1px solid var(--line-soft); }
 .evaluation-job-list > div:first-child { border-top: 0; }

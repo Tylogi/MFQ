@@ -1,9 +1,9 @@
 .analysis-page { display: grid; min-width: 0; gap: 22px; }
-.analysis-checkpoint-bar { display: flex; min-width: 0; align-items: center; gap: 18px; border: 1px solid var(--panel-line); border-radius: 12px; padding: 18px 20px; background: var(--panel-surface); }
-.analysis-checkpoint-bar > label { display: grid; flex: 1; min-width: 0; gap: 9px; }
+.analysis-checkpoint-bar { display: flex; min-width: 0; align-items: flex-end; gap: 14px; }
+.analysis-checkpoint-bar > label { display: grid; width: min(360px, 100%); min-width: 0; gap: 9px; }
 .analysis-checkpoint-bar > label > span { color: var(--muted); font-size: 11px; }
-.analysis-checkpoint-bar select { width: 100%; min-width: 0; min-height: 38px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 32px 7px 11px; color: var(--ink-soft); background: var(--surface-control); font-size: 12px; }
-.analysis-checkpoint-bar > button { display: grid; flex: none; width: 32px; height: 32px; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: transparent; }
+.analysis-checkpoint-bar > button { display: grid; flex: none; width: 48px; height: 48px; place-items: center; border: 1px solid var(--line); border-radius: 11px; color: var(--muted); background: var(--surface-control); }
+.analysis-checkpoint-bar > .model-vendor-mark { align-self: center; margin-top: 23px; }
 .analysis-layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); align-items: start; gap: 20px; }
 .analysis-main { display: grid; min-width: 0; gap: 20px; }
 .analysis-panel { min-width: 0; overflow: hidden; border: 1px solid var(--panel-line); border-radius: 12px; padding: 20px; background: var(--panel-surface); }
@@ -164,7 +164,7 @@
   .analysis-architecture .architecture-flow { max-width: 360px; margin: 0 auto; }
 }
 @media (max-width: 540px) {
-  .analysis-checkpoint-bar { padding: 15px; gap: 10px; }
+  .analysis-checkpoint-bar { gap: 10px; }
   .analysis-checkpoint-bar .model-vendor-mark { display: none; }
   .analysis-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .analysis-advanced-body dl { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px 15px; }

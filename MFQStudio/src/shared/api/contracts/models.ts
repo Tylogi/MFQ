@@ -10,6 +10,7 @@ export interface ModelArtifact {
   total_bytes: number;
   estimated_resident_weight_bytes?: number | null;
   ssd_ple_bytes?: number | null;
+  context_capacity?: number | null;
   tensor_count: number;
   record_count: number;
   dtypes: string[];
@@ -239,6 +240,9 @@ export interface ModelCacheProfile {
     minimum_rows: number;
     row_rounding?: 'ceil' | 'floor';
     active_after?: number;
+    max_read_rows_per_token?: number | null;
+    head_dimension?: number | null;
+    kv_heads?: number | null;
   }>;
 }
 

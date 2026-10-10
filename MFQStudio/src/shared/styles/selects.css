@@ -1,0 +1,42 @@
+select:not([multiple]):not([size]) {
+  appearance: none;
+  max-width: 320px;
+  min-height: 44px;
+  border-radius: 10px;
+  padding: 10px 36px 10px 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='m3.5 5.25 3.5 3.5 3.5-3.5' fill='none' stroke='%237c8085' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 13px center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+select:disabled { cursor: default; }
+.server-page .setting-row-trailing select:not([multiple]):not([size]),
+.setting-row-trailing > select:not([multiple]):not([size]) { width: auto; min-width: 78px; max-width: 240px; height: 34px; min-height: 34px; border-radius: 8px; padding: 6px 30px 6px 12px; background-position: right 10px center; field-sizing: content; }
+.compact-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  width: min(320px, 100%);
+  min-width: 0;
+  max-width: 100%;
+  height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 0 14px;
+  color: var(--ink-soft);
+  background: var(--surface-control);
+  transition: border-color 130ms ease, background-color 130ms ease;
+}
+.compact-select-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compact-select > svg { flex: none; color: var(--muted); }
+.compact-select:hover:not(:has(select:disabled)) { border-color: var(--line-strong); background: var(--surface-hover); }
+.compact-select:has(select:focus-visible) { outline: 2px solid var(--accent-border); outline-offset: 3px; }
+.compact-select:has(select:disabled) { opacity: .5; }
+.compact-select > select:not([multiple]):not([size]) { position: absolute; z-index: 1; inset: 0; width: 100%; max-width: none; height: 100%; min-height: 0; margin: 0; opacity: 0; }
+.analysis-checkpoint-bar .compact-select { width: min(360px, 100%); font-size: 12px; }
+.evaluation-fields .compact-select { font-size: 13px; }
+.chat-model-summary { width: min(320px, 100%); min-width: 0; }
+.chat-model-summary select:not([multiple]):not([size]) { min-height: 22px; border: 0; border-radius: 0; padding: 0 25px 0 0; background-color: transparent; background-position: right center; }

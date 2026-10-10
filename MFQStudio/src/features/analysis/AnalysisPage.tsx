@@ -12,6 +12,7 @@ import { AdvancedDetails } from './AdvancedDetails';
 import { KvCachePlanner } from '../models/KvCachePlanner';
 import { ExpertHeatmap, LayerBudget, PrecisionLegend, ProjectionBars } from './PrecisionCharts';
 import { categoryLabel, parameterLabel, precisionRange } from './analysisData';
+import { CompactSelect } from '../../shared/ui/CompactSelect';
 
 export function AnalysisPage() {
   const { tr } = useSettings();
@@ -66,10 +67,10 @@ export function AnalysisPage() {
   const pleParameters = analysis?.tensors.filter(item => item.category === 'ple').reduce((sum, item) => sum + item.parameters, 0) ?? 0;
   return <div className="analysis-page">
     <section className="analysis-checkpoint-bar">
-      <label><span>{tr('模型', 'Model')}</span><select aria-label={tr('选择模型', 'Select model')} disabled={listing || !models.length}
+      <label><span>{tr('模型', 'Model')}</span><CompactSelect aria-label={tr('选择模型', 'Select model')} disabled={listing || !models.length}
         value={selected} onChange={event => { setSelected(event.target.value); setSearch({ checkpoint: event.target.value }, { replace: true }); }}>
         {!models.length && <option value="">{listing ? tr('正在读取…', 'Reading…') : tr('没有本地模型', 'No local models')}</option>}
-        {models.map(item => <option key={item.id} value={item.id}>{item.name}{!item.complete ? ` · ${tr('分片不全', 'Incomplete shards')}` : ''}</option>)}</select></label>
+        {models.map(item => <option key={item.id} value={item.id}>{item.name}{!item.complete ? ` · ${tr('分片不全', 'Incomplete shards')}` : ''}</option>)}</CompactSelect></label>
       {selectedArtifact && <ModelVendorMark name={selectedArtifact.name} architecture={selectedArtifact.architecture} size={25} />}
       <button aria-label={tr('刷新模型', 'Refresh models')} disabled={listing} onClick={() => setRevision(value => value + 1)} type="button"><Icon name="refresh" size={15} /></button>
     </section>

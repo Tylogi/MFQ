@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { useSettings } from '../settings/SettingsProvider';
+import { ListToolbar } from '../../shared/ui/ListToolbar';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
@@ -9,7 +11,19 @@ import { ModelMemoryPressure } from './ModelMemoryPressure';
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
-    filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles } = catalog;
+    setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles } = catalog;
+  const [status, setStatus] = useState('all');
+  const [architecture, setArchitecture] = useState('all');
+  const [format, setFormat] = useState('all');
+  const [sort, setSort] = useState('recent');
+  const isLoaded = (name: string) => instances.some(item => item.model === name && item.state !== 'failed') || name === runtime?.model;
+  const visibleArtifacts = filteredArtifacts.filter(item =>
+    (architecture === 'all' || item.architecture === architecture) && (format === 'all' || item.format === format) &&
+    (status === 'all' || status === 'loaded' && isLoaded(item.name) || status === 'loadable' && item.loadable ||
+      status === 'incomplete' && !item.complete || status === 'unavailable' && !item.loadable))
+    .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
+      ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
+  const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
   const available = runtime?.runtime_memory_headroom_bytes;
   const gib = (bytes?: number | null) => bytes == null ? '—' : `${formatNumber(bytes / 2 ** 30, 1)} GiB`;
   return (
@@ -18,10 +32,27 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
         title={tr('本地检查点', 'Local checkpoints')}
         subtitle={`${artifacts.length} ${tr('个本地模型', 'local models')}`}
       />
-      {filteredArtifacts.length > 0 ? (
+      <ListToolbar label={tr('搜索本地检查点', 'Search local checkpoints')} placeholder={tr('按模型名称搜索', 'Search model names')}
+        query={modelFilter} onQueryChange={setModelFilter} count={visibleArtifacts.length} total={artifacts.length}
+        activeFilters={filterCount} onReset={() => { setModelFilter(''); setStatus('all'); setArchitecture('all'); setFormat('all'); setSort('recent'); }}>
+        <label>{tr('模型状态', 'Model status')}<select aria-label={tr('模型状态', 'Model status')} value={status} onChange={event => setStatus(event.target.value)}>
+          <option value="all">{tr('全部', 'All')}</option><option value="loaded">{tr('已加载', 'Loaded')}</option>
+          <option value="loadable">{tr('可直接加载', 'Loadable')}</option><option value="incomplete">{tr('分片不全', 'Incomplete shards')}</option><option value="unavailable">{tr('不可直接加载', 'Not loadable')}</option>
+        </select></label>
+        <label>{tr('架构', 'Architecture')}<select aria-label={tr('筛选架构', 'Filter architecture')} value={architecture} onChange={event => setArchitecture(event.target.value)}>
+          <option value="all">{tr('全部', 'All')}</option>{[...new Set(artifacts.map(item => item.architecture).filter(Boolean))].sort().map(value => <option key={value} value={value}>{value}</option>)}
+        </select></label>
+        <label>{tr('格式', 'Format')}<select aria-label={tr('筛选格式', 'Filter format')} value={format} onChange={event => setFormat(event.target.value)}>
+          <option value="all">{tr('全部', 'All')}</option><option value="mfq">MFQ</option><option value="hf">HuggingFace</option>
+        </select></label>
+        <label>{tr('排序', 'Sort')}<select aria-label={tr('检查点排序', 'Checkpoint sort')} value={sort} onChange={event => setSort(event.target.value)}>
+          <option value="recent">{tr('最近修改', 'Recently modified')}</option><option value="name">{tr('模型名称', 'Model name')}</option><option value="size">{tr('文件大小', 'File size')}</option>
+        </select></label>
+      </ListToolbar>
+      {visibleArtifacts.length > 0 ? (
         <TMPanel className="model-catalog-panel model-library-panel">
           <div className="model-list">
-            {filteredArtifacts.map((item) => {
+            {visibleArtifacts.map((item) => {
               const instance = instances.find(
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
@@ -71,8 +102,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
       ) : (
         <EmptyPanel
           icon="folder"
-          title={tr(modelFilter ? '没有匹配的本地模型' : '还没有本地模型',
-            modelFilter ? 'No local model matches' : 'No local models yet')}
+          title={tr(modelFilter || filterCount ? '没有匹配的本地模型' : '还没有本地模型',
+            modelFilter || filterCount ? 'No local model matches' : 'No local models yet')}
           message={tr('添加一个模型文件夹即可开始。', 'Add a model folder to get started.')}
           action={
             <button className="primary screen-header-action" disabled={busy}
