@@ -1,4 +1,5 @@
 #include "nvq_group.h"
+#include "nvq_dense_group.h"
 
 #include <algorithm>
 #include <cstring>
@@ -32,7 +33,7 @@ inline float reduce(__m256 value) {
 #else
 #define MFQ_NVQ_INLINE inline __attribute__((always_inline))
 #endif
-template<int Format>
+template<int Format,bool Dense=false>
 MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int group,
         std::uint32_t state,int valid,float scale,__m256 decoded[3]) {
     constexpr bool d4=Format==3 || Format==10 || Format==11 || Format==12 || Format==15;
@@ -41,6 +42,8 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
         (Format==8 || Format==12) ? 9 : Format==9 ? 6 :
         (Format==13 || Format==15) ? 10 : Format==14 ? 12 : 8;
     const auto* bank=w.banks[state];
+    DenseNvqRecord record;
+    if constexpr(Dense)record=load_dense_nvq_group<Format>(w,row,group);
     int delta=1;
     if constexpr (delta_format) {
         const bool negative=bits_at(w.aux,w.aux_bytes,row*w.groups+group,1)!=0;
@@ -48,11 +51,11 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
         if constexpr (Format==8) bank+=int(negative)*512*8;
     }
     std::uint32_t group_signs=0;
-    if constexpr(!delta_format && Format!=7 && Format!=9) {
+    if constexpr(!Dense && !delta_format && Format!=7 && Format!=9) {
         group_signs=bits_at(w.aux,w.aux_bytes,(row*w.nsign+group*3)*7,21);
     }
     std::uint64_t group_indices=0;
-    if constexpr(bits!=8 && Format!=7) {
+    if constexpr(!Dense && bits!=8 && Format!=7) {
         const auto first=(row*w.nvec+(d4?group*6:group*3))*bits;
         const auto byte=first>>3;
         const int shift=static_cast<int>(first&7);
@@ -71,7 +74,7 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
         const int vector8=group*3+chunk;
         const int vector=d4 ? vector8*2 : vector8;
         const auto linear=row*w.nvec+vector;
-        const std::uint32_t code=bits==8 ? w.indices[linear] :
+        const std::uint32_t code=Dense ? record.field(4+chunk*((d4?2:1)*bits+7),bits) : bits==8 ? w.indices[linear] :
             Format==7 ? bits_at(w.indices,w.index_bytes,linear*bits,bits) :
             static_cast<std::uint32_t>((group_indices>>(bits*chunk*(d4?2:1)))&((1u<<bits)-1u));
         __m128i values;
@@ -84,7 +87,7 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
             } else {
                 std::memcpy(&word,bank+std::int64_t(code)*4,4);
                 if (vector+1<w.nvec) {
-                    const std::uint32_t second=bits==8 ? w.indices[linear+1] :
+                    const std::uint32_t second=Dense ? record.field(4+chunk*(2*bits+7)+bits,bits) : bits==8 ? w.indices[linear+1] :
                         static_cast<std::uint32_t>((group_indices>>(bits*(chunk*2+1)))&((1u<<bits)-1u));
                     std::memcpy(reinterpret_cast<char*>(&word)+4,bank+std::int64_t(second)*4,4);
                 }
@@ -99,7 +102,8 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
             values=_mm_and_si128(_mm_slli_epi16(values,shift),mask);
             values=_mm_add_epi8(values,_mm_set1_epi8(static_cast<char>(delta*(Format==1 ? 1 : 5))));
         } else if constexpr (Format!=7 && Format!=9) {
-            const auto mask7=(group_signs>>(chunk*7))&127u;
+            const auto mask7=Dense ? record.field(4+chunk*((d4?2:1)*bits+7)+(d4?2:1)*bits,7) :
+                (group_signs>>(chunk*7))&127u;
             const auto last=parity7(mask7)^((Format==2 && w.sign_mode!=0) ? ((code>>7)&1u) : 0u);
             const auto mask8=mask7|(last<<7);
             const auto selected=_mm_and_si128(_mm_set1_epi8(static_cast<char>(mask8)),
@@ -137,7 +141,7 @@ void group_dot(const NvqDecodeView& w,std::int64_t row,int group,std::uint32_t s
     }
 }
 
-template<int Format>
+template<int Format,bool Dense=false>
 void rows_dot(const NvqDecodeView& w,const float* input,std::int64_t batch,
         std::int64_t input_stride,float* output,std::int64_t output_stride,
         std::int64_t begin,std::int64_t end) {
@@ -147,12 +151,12 @@ void rows_dot(const NvqDecodeView& w,const float* input,std::int64_t batch,
             __m256 sums[4];
             for (int sample=0; sample<count; ++sample) sums[sample]=_mm256_setzero_ps();
             for (int group=0; group<w.groups; ++group) {
-                const auto state=bits_at(w.states,w.state_bytes,
-                    (neuron*w.groups+group)*w.state_bits,w.state_bits);
+                const auto state=Dense ? dense_nvq_state<Format>(w,neuron,group) :
+                    bits_at(w.states,w.state_bytes,(neuron*w.groups+group)*w.state_bits,w.state_bits);
                 const auto start=std::int64_t(group)*24;
                 const int valid=static_cast<int>(std::min<std::int64_t>(24,w.width-start));
                 __m256 decoded[3];
-                decode_group<Format>(w,neuron,group,state,valid,
+                decode_group<Format,Dense>(w,neuron,group,state,valid,
                     w.anchors[neuron]*w.multipliers[state],decoded);
                 for (int chunk=0; chunk<(valid+7)/8; ++chunk) {
                     const int remaining=valid-chunk*8;
@@ -171,12 +175,12 @@ void rows_dot(const NvqDecodeView& w,const float* input,std::int64_t batch,
     }
 }
 
-template<int Format>
+template<int Format,bool Dense=false>
 void rows_dot_single(const NvqDecodeView& w,const float* input,std::int64_t batch,
         std::int64_t input_stride,float* output,std::int64_t output_stride,
         std::int64_t begin,std::int64_t end) {
     if(batch!=1) {
-        rows_dot<Format>(w,input,batch,input_stride,output,output_stride,begin,end);return;
+        rows_dot<Format,Dense>(w,input,batch,input_stride,output,output_stride,begin,end);return;
     }
     const auto full_groups=static_cast<int>(w.width/24);
     const int tail=static_cast<int>(w.width%24);
@@ -185,10 +189,10 @@ void rows_dot_single(const NvqDecodeView& w,const float* input,std::int64_t batc
         // Keep one accumulator in a register. Full groups have three fixed
         // vectors; the final partial group retains the original masked reads.
         for(int group=0;group<full_groups;++group) {
-            const auto state=bits_at(w.states,w.state_bytes,
-                (neuron*w.groups+group)*w.state_bits,w.state_bits);
+            const auto state=Dense ? dense_nvq_state<Format>(w,neuron,group) :
+                bits_at(w.states,w.state_bytes,(neuron*w.groups+group)*w.state_bits,w.state_bits);
             __m256 decoded[3];
-            decode_group<Format>(w,neuron,group,state,24,
+            decode_group<Format,Dense>(w,neuron,group,state,24,
                 w.anchors[neuron]*w.multipliers[state],decoded);
             const auto* x=input+std::int64_t(group)*24;
             sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[0],_mm256_loadu_ps(x)));
@@ -196,10 +200,10 @@ void rows_dot_single(const NvqDecodeView& w,const float* input,std::int64_t batc
             sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[2],_mm256_loadu_ps(x+16)));
         }
         if(tail) {
-            const auto state=bits_at(w.states,w.state_bytes,
-                (neuron*w.groups+full_groups)*w.state_bits,w.state_bits);
+            const auto state=Dense ? dense_nvq_state<Format>(w,neuron,full_groups) :
+                bits_at(w.states,w.state_bytes,(neuron*w.groups+full_groups)*w.state_bits,w.state_bits);
             __m256 decoded[3];
-            decode_group<Format>(w,neuron,full_groups,state,tail,
+            decode_group<Format,Dense>(w,neuron,full_groups,state,tail,
                 w.anchors[neuron]*w.multipliers[state],decoded);
             for(int chunk=0;chunk<(tail+7)/8;++chunk) {
                 const int remaining=tail-chunk*8;
@@ -248,6 +252,16 @@ NvqRowsDot nvq_rows_dot_single_avx2(int format) noexcept {
         MFQ_NVQ_CPU_SINGLE_CASE(12) MFQ_NVQ_CPU_SINGLE_CASE(13) MFQ_NVQ_CPU_SINGLE_CASE(14)
         MFQ_NVQ_CPU_SINGLE_CASE(15)
 #undef MFQ_NVQ_CPU_SINGLE_CASE
+        default:return nullptr;
+    }
+}
+NvqRowsDot nvq_dense_rows_dot_avx2(int format) noexcept {
+    switch(format) {
+#define MFQ_NVQ_DENSE_CASE(F) case F: return rows_dot_single<F,true>;
+        MFQ_NVQ_DENSE_CASE(5) MFQ_NVQ_DENSE_CASE(10) MFQ_NVQ_DENSE_CASE(11)
+        MFQ_NVQ_DENSE_CASE(12) MFQ_NVQ_DENSE_CASE(13) MFQ_NVQ_DENSE_CASE(14)
+        MFQ_NVQ_DENSE_CASE(15)
+#undef MFQ_NVQ_DENSE_CASE
         default:return nullptr;
     }
 }

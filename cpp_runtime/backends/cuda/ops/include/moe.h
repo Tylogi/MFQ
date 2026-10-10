@@ -114,6 +114,7 @@ struct MixedNvqDispatch {
     MixedNvqF16FormatGroup f16_format_group =
         MixedNvqF16FormatGroup::All;
     bool masked_experts = false;
+    bool dense_groups = false;
 };
 
 struct MixedNintDispatch {
@@ -122,6 +123,7 @@ struct MixedNintDispatch {
 };
 struct MixedNintInputPlan {
     mfq_tensor_backend::Tensor weight_ptrs,quantize_descriptors;
+    mfq_tensor_backend::Tensor row_metadata_workspace;
     int total_groups=0;
 };
 
@@ -130,6 +132,9 @@ struct MixedMoeRuntime {
     int out_per_expert = 0;
     int neuron_len = 0;
     bool partial_experts = false;
+    // A streamed prompt group is still prefill when a rare expert has <=8
+    // rows. Its workspaces are shared by capacity, not cached per row count.
+    bool prefill_only = false;
     std::vector<MixedMoePool> pools;
     std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
     std::shared_ptr<MixedNintDispatch> nint_dispatch;
@@ -141,6 +146,9 @@ struct MixedMoeRuntime {
 
     bool nint_only() const;
     MoeActivationWorkspace & activation_workspace(
+            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
+            MixedMoeTransformKey transform) const;
+    MoeActivationWorkspace prefill_activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const;
 
@@ -186,7 +194,7 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
     bool cuda,
     const CudaExecutionConfig& config = {});
 int64_t mixed_moe_storage_bytes(const MixedMoeRuntime& runtime);
-void initialize_mixed_nvq_dispatch(MixedMoeRuntime& runtime,const CudaExecutionConfig& config);
+void initialize_mixed_nvq_dispatch(MixedMoeRuntime& runtime,const CudaExecutionConfig& config,bool dense_prefill=false);
 mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
     const mfq_tensor_backend::Tensor& source);
 MfeWeight to_gpu_mixed_moe(

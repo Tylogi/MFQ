@@ -22,6 +22,8 @@
 
 #include "packed_backward.cuh"
 #include "packed_nvq.cuh"
+#include "nvq_dense_group.cuh"
+#include "nvq_routed_reuse.cuh"
 #include "async_copy.cuh"
 
 using namespace nvcuda;
@@ -48,36 +50,42 @@ __global__ void nvq_dequant_kernel(
     int nsign,
     int sub_bits,
     int sign_mode) {
-    const int segments = (K + 7) / 8;
-    const int64_t total = static_cast<int64_t>(N) * segments;
-    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         linear < total;
-         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int row = static_cast<int>(linear / segments);
-        const int segment = static_cast<int>(linear - static_cast<int64_t>(row) * segments);
+    const int segment = blockIdx.x * blockDim.x + threadIdx.x;
+    if (segment >= (K + 7) / 8) return;
+    for (int row = blockIdx.y; row < N; row += gridDim.y) {
         const int k0 = segment * 8;
         const int group = k0 / kGroupSize;
-        const int chunk0 = (k0 - group * kGroupSize) / 4;
         const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+        const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
         const float scale = format_scale<FORMAT>(neuron_scale[row], sub, codebook);
-        const int lo = decode_chunk4<FORMAT>(
+        auto decoded = load_nvq_vec8<FORMAT>(
             indices, indices_nbytes, aux, aux_nbytes, codebook,
-            row, group, chunk0, nvec, nsign, ng, sign_mode, sub);
-        const int hi = decode_chunk4<FORMAT>(
-            indices, indices_nbytes, aux, aux_nbytes, codebook,
-            row, group, chunk0 + 1, nvec, nsign, ng, sign_mode, sub);
+            row, segment, group, ng, nvec, nsign, sign_mode, sub);
+        if constexpr (FORMAT == kNvq1L) {
+            decoded.values.x = nvq1_l_scale_delta4(decoded.values.x, decoded.delta);
+            decoded.values.y = nvq1_l_scale_delta4(decoded.values.y, decoded.delta);
+        } else if constexpr (FORMAT == kNvq1S) {
+            decoded.values.x = nvq1_s_scale_delta4(decoded.values.x, decoded.delta);
+            decoded.values.y = nvq1_s_scale_delta4(decoded.values.y, decoded.delta);
+        }
+        half values[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int k = k0 + i;
-            if (k < K) {
-                const int packed = i < 4 ? lo : hi;
-                const int byte = (packed >> (8 * (i & 3))) & 0xff;
-                const int value = static_cast<int>(static_cast<int8_t>(byte));
-                weight[static_cast<int64_t>(row) * K + k] =
-                    __float2half(scale * static_cast<float>(value));
-            }
+            const int packed = i < 4 ? decoded.values.x : decoded.values.y;
+            const int value = int(int8_t((packed >> (8 * (i & 3))) & 0xff));
+            values[i] = __float2half(scale * float(value));
+        }
+        if ((K & 7) == 0) {
+            reinterpret_cast<uint4*>(weight + int64_t(row) * K)[segment] = make_uint4(
+                (uint32_t(__half_as_ushort(values[0])) | (uint32_t(__half_as_ushort(values[1])) << 16)),
+                (uint32_t(__half_as_ushort(values[2])) | (uint32_t(__half_as_ushort(values[3])) << 16)),
+                (uint32_t(__half_as_ushort(values[4])) | (uint32_t(__half_as_ushort(values[5])) << 16)),
+                (uint32_t(__half_as_ushort(values[6])) | (uint32_t(__half_as_ushort(values[7])) << 16)));
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (k0 + i < K) weight[int64_t(row) * K + k0 + i] = values[i];
         }
     }
 }
@@ -188,9 +196,8 @@ __device__ __forceinline__ float nvq_vec8_scaled_fma(
     const int group = segment / 3;
     const int k = group * kGroupSize + (segment - group * 3) * 8;
     const int64_t sub_linear = static_cast<int64_t>(row) * weight.ng + group;
-    const uint32_t sub = load_packed_bits(
-        weight.sub_scale, sub_linear * weight.sub_bits,
-        weight.sub_bits, weight.sub_scale_nbytes);
+    const uint32_t sub = load_nvq_state<FORMAT>(weight.indices,weight.indices_nbytes,
+        weight.sub_scale,weight.sub_scale_nbytes,sub_linear,weight.sub_bits,weight.ng);
     const float dot = nvq_vec8_dot<FORMAT>(
         weight.indices, weight.indices_nbytes,
         weight.aux, weight.aux_nbytes,
@@ -458,8 +465,8 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq_gemv_m1_vec8_kernel(
             const int segment_in_group = segment - group * 3;
             const int k = group * kGroupSize + segment_in_group * 8;
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            const uint32_t sub = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             const float dot = nvq_vec8_dot<FORMAT>(
                 indices, indices_nbytes, aux, aux_nbytes, codebook, qx + k,
                 row, segment, group, ng, nvec, nsign, sign_mode, sub);
@@ -1356,6 +1363,99 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) aligned_group_swiglu_pair_kern
     }
 }
 
+// Decode a group once; its three integer segment dots share the scale/state.
+// Four warps cover a long projection, while short rows use independent warps.
+template<int FORMAT, int Rows, int Warps>
+__global__ void __launch_bounds__(128) nvq_gemv_group_kernel(
+    NvqDeviceWeight w, const int8_t* qx, const float* xscale,
+    half* output, int M) {
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int row = blockIdx.x * (4 / Warps) + warp / Warps;
+    const bool valid_row = row < w.N;
+    float acc[Rows] = {};
+    const float anchor = valid_row ? w.neuron_scale[row] : 0.0f;
+    for (int group = valid_row ? (warp % Warps) * 32 + lane : w.ng;
+         group < w.ng; group += Warps * 32) {
+        const int64_t state_index = int64_t(row) * w.ng + group;
+        const uint32_t state = load_nvq_state<FORMAT>(w.indices,w.indices_nbytes,w.sub_scale,
+            w.sub_scale_nbytes,state_index,w.sub_bits,w.ng);
+        const float scale = (FORMAT == kNvq1L || FORMAT == kNvq1S)
+            ? anchor * float(state) : format_scale<FORMAT>(anchor, state, w.codebook);
+        uint64_t group_indices = 0;
+        uint32_t group_signs = 0;
+        bool group_words = false;
+        if constexpr (FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
+            constexpr int bits = format_index_bits(FORMAT);
+            const int64_t bit = (int64_t(row) * w.nvec + group * 3) * bits;
+            const int64_t byte = (bit >> 3) & ~int64_t(3);
+            // Three 10/12-bit indices always fit these two aligned words.
+            // The final unpadded bytes retain the checked scalar decoder.
+            group_words = (reinterpret_cast<uintptr_t>(w.indices) & 3u) == 0 && byte + 8 <= w.indices_nbytes;
+            if (group_words) {
+                const auto* words = reinterpret_cast<const uint32_t*>(w.indices + byte);
+                group_indices = (uint64_t(words[0]) | (uint64_t(words[1]) << 32)) >> (bit & 31);
+                group_signs = load_packed_sign_group3(w.aux,
+                    (int64_t(row) * w.nsign + group * 3) * 7, w.aux_nbytes);
+            }
+        }
+        float dot[Rows] = {};
+#pragma unroll
+        for (int segment = 0; segment < 3; ++segment) {
+            const int vector = group * 3 + segment;
+            NvqVec8Values<FORMAT> weight;
+            if ((FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) && group_words) {
+                constexpr int bits = format_index_bits(FORMAT);
+                const uint32_t index = (group_indices >> (segment * bits)) & ((1u << bits) - 1u);
+                const uint32_t mask7 = (group_signs >> (segment * 7)) & 127u;
+                const uint32_t last = parity7(mask7) ^ (w.sign_mode ? ((index >> 7) & 1u) : 0u);
+                const uint32_t mask8 = mask7 | (last << 7);
+                const auto* bank = active_codebook<FORMAT>(w.codebook, state);
+                weight = {apply_sign8(reinterpret_cast<const int2*>(bank)[index], mask8), 0, vector < w.nvec};
+            } else {
+                weight = load_nvq_vec8<FORMAT>(
+                    w.indices, w.indices_nbytes, w.aux, w.aux_nbytes, w.codebook,
+                    row, vector, group, w.ng, w.nvec, w.nsign, w.sign_mode, state);
+            }
+#pragma unroll
+            for (int m = 0; m < Rows; ++m)
+                if (m < M) dot[m] += dot_nvq_vec8<FORMAT>(weight,
+                    qx + (int64_t(m) * w.ng + group) * kGroupSize + segment * 8);
+        }
+#pragma unroll
+        for (int m = 0; m < Rows; ++m)
+            if (m < M) acc[m] = fmaf(scale * xscale[int64_t(m) * w.ng + group], dot[m], acc[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < Rows; ++m) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], offset);
+    }
+    if constexpr (Warps == 1) {
+#pragma unroll
+        for (int m = 0; m < Rows; ++m)
+            if (lane == 0 && valid_row && m < M)
+                output[int64_t(m) * w.N + row] = __float2half(acc[m]);
+    } else {
+        __shared__ float partial[Rows][4];
+#pragma unroll
+        for (int m = 0; m < Rows; ++m)
+            if (lane == 0) partial[m][warp] = acc[m];
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll
+            for (int m = 0; m < Rows; ++m) {
+                float value = lane < Warps ? partial[m][lane] : 0.0f;
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    value += __shfl_xor_sync(0xffffffffu, value, offset);
+                if (lane == 0 && valid_row && m < M)
+                    output[int64_t(m) * w.N + row] = __float2half(value);
+            }
+        }
+    }
+}
+
 template <int FORMAT, int NWARPS, int MAX_M>
 __global__ void __launch_bounds__(NWARPS * 32, 1) nvq_gemv_batch_vec8_kernel(
     const uint8_t * indices,
@@ -1389,8 +1489,8 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq_gemv_batch_vec8_kernel(
         const int segment_in_group = segment - group * 3;
         const int k = group * kGroupSize + segment_in_group * 8;
         const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+        const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
         const auto weight = load_nvq_vec8<FORMAT>(
             indices, indices_nbytes, aux, aux_nbytes, codebook,
             row, segment, group, ng, nvec, nsign, sign_mode, sub);
@@ -1873,8 +1973,8 @@ __global__ void nvq_embedding_kernel(
         const int group = k0 / kGroupSize;
         const int chunk0 = (k0 - group * kGroupSize) / 4;
         const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+        const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
         const float scale = format_scale<FORMAT>(neuron_scale[row], sub, codebook);
         const int lo = decode_chunk4<FORMAT>(
             indices, indices_nbytes, aux, aux_nbytes, codebook,
@@ -2003,8 +2103,8 @@ __global__ void __launch_bounds__(256) nvq_mmq_mma24_kernel(
             uint32_t sub = 0;
             if (valid) {
                 const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-                sub = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+                sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             }
 #pragma unroll
             for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
@@ -2157,8 +2257,8 @@ __global__ void __launch_bounds__(256) nvq_gemm_f16_gs24_kernel(
         float scale = 0.0f;
         if (valid_weight) {
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            state = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             scale = format_scale<FORMAT>(neuron_scale[row], state, codebook);
         }
 #pragma unroll
@@ -2301,8 +2401,8 @@ __global__ void nepq_dequant_kernel(
         const int segment_in_group = segment - group * 3;
         const int k0 = group * kGroupSize + segment_in_group * 8;
         const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+        const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
         const int8_t * table = nepq_active_table(
             table_pool, bank_ids, row, group, nsuper, table_stride);
         const auto values = load_nepq_vec8<FORMAT>(
@@ -2368,8 +2468,8 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nepq_gemv_batch_vec8_kernel(
         const int segment_in_group = segment - group * 3;
         const int k = group * kGroupSize + segment_in_group * 8;
         const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+        const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
         const int8_t * table = nepq_active_table(
             table_pool, bank_ids, row, group, nsuper, table_stride);
         const auto weight = load_nepq_vec8<FORMAT>(
@@ -2499,8 +2599,8 @@ __global__ void __launch_bounds__(256) nepq_mmq_mma24_kernel(
             const int8_t * table = table_pool;
             if (valid) {
                 const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-                sub = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+                sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
                 table = nepq_active_table(
                     table_pool, bank_ids, row, group, nsuper, table_stride);
             }
@@ -2653,8 +2753,8 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
         const int8_t * table = table_pool;
         if (valid_weight) {
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            state = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             table = nepq_active_table(
                 table_pool, bank_ids, row, group, nsuper, table_stride);
             scale = format_scale<FORMAT>(neuron_scale[row], state, table);
@@ -2763,6 +2863,130 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
     }
 }
 
+template<int Format>
+__device__ __forceinline__ float nvq_dense_routed_group_dot(
+        const NvqDeviceWeight& w,int row,const int8_t* input,const float* scales) {
+    float sum=0.f;
+    for(int group=threadIdx.x;group<w.ng;group+=32) {
+        const auto record=load_dense_nvq_group<Format>(w.indices,w.indices_nbytes,row,group,w.nsign,w.ng);
+        const auto state=record.state();
+        const auto* bank=active_codebook<Format>(w.codebook,state);
+        int dot=0;
+#pragma unroll
+        for(int segment=0;segment<3;++segment)if(group*3+segment<w.nsign) {
+            const auto values=decode_dense_nvq_vector<Format>(record,bank,segment,w.sign_mode);
+            const auto x=*reinterpret_cast<const int2*>(input+group*24+segment*8);
+            dot=__dp4a(values.y,x.y,__dp4a(values.x,x.x,dot));
+        }
+        sum=fmaf(format_scale<Format>(w.neuron_scale[row],state,w.codebook)*scales[group],float(dot),sum);
+    }
+#pragma unroll
+    for(int offset=16;offset>0;offset>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+    return sum;
+}
+
+template<int Format>
+__device__ __forceinline__ float nvq_routed_group_dot(
+        const NvqDeviceWeight& w,int row,const int8_t* input,const float* scales) {
+    if constexpr(dense_nvq_format(Format))if(w.aux_nbytes==0)
+        return nvq_dense_routed_group_dot<Format>(w,row,input,scales);
+    float sum=0.f;
+    for(int group=threadIdx.x;group<w.ng;group+=32) {
+        const int64_t state_index=int64_t(row)*w.ng+group;
+        const uint32_t state=load_nvq_state<Format>(w.indices,w.indices_nbytes,w.sub_scale,
+            w.sub_scale_nbytes,state_index,w.sub_bits,w.ng);
+        const float scale=(Format==kNvq1L || Format==kNvq1S) ? w.neuron_scale[row]*float(state) :
+            format_scale<Format>(w.neuron_scale[row],state,w.codebook);
+        const int8_t* bank=active_codebook<Format>(w.codebook,state);
+        uint64_t packed=0;uint32_t signs=0,exec96[3]{};int delta=0;
+        if constexpr(Format==kNvq1L || Format==kNvq1S) {
+            if(w.aux_nbytes==0)packed=load_nvq1_record64<Format>(w.indices,w.indices_nbytes,row,group,w.ng);
+            const int negative=w.aux_nbytes==0?int((packed>>(Format==kNvq1S?31:36))&1u):
+                load_packed_bits(w.aux,state_index,1,w.aux_nbytes);
+            delta=negative?-1:1;
+            if constexpr(Format==kNvq1S)bank=w.codebook+negative*kNvq1SBankBytes;
+        }else if constexpr(Format==kNvq2JscXLGroupExec) {
+            packed=load_group_exec64(w.indices,row,group,w.ng);
+        }else if constexpr(Format==kNvq3JscLGroupExec) {
+            load_group_exec96_words(w.indices,row,group,w.ng,exec96);
+        }else if constexpr(Format!=kNvq2Exec && Format!=kNvq2JscExec && Format!=kNpq0L && Format!=kNpq0S) {
+            const int64_t sign_bit=(int64_t(row)*w.nsign+group*3)*7;
+            signs=w.ng>32 ? load_packed_sign_group3_words(w.aux,sign_bit,w.aux_nbytes) :
+                load_packed_sign_group3(w.aux,sign_bit,w.aux_nbytes);
+        }
+        if constexpr(Format!=kNvq2Exec && Format!=kNvq2JscExec && Format!=kNpq0L && Format!=kNpq0S &&
+                     Format!=kNvq2JscXLGroupExec && Format!=kNvq3JscLGroupExec) {
+            constexpr int bits=format_index_bits(Format),vectors=is_d4_format(Format)?6:3;
+            if(!((Format==kNvq1L || Format==kNvq1S) && w.aux_nbytes==0))
+                packed=load_packed_group_window<bits*vectors>(w.indices,(int64_t(row)*w.nvec+group*vectors)*bits,w.indices_nbytes);
+        }
+        int dot=0,activation_sum=0;
+#pragma unroll
+        for(int segment=0;segment<3;++segment) {
+            const auto weight=load_nvq_group_vec8<Format,true>(w.indices,w.indices_nbytes,w.aux,w.aux_nbytes,
+                w.codebook,bank,row,group,segment,w.ng,w.nvec,w.nsign,w.sign_mode,state,signs,packed,exec96,delta);
+            const int2 activation=*reinterpret_cast<const int2*>(input+group*24+segment*8);
+            if(weight.valid) {
+                dot=__dp4a(weight.values.y,activation.y,__dp4a(weight.values.x,activation.x,dot));
+                if constexpr(Format==kNvq1L || Format==kNvq1S)
+                    activation_sum=__dp4a(0x01010101,activation.y,__dp4a(0x01010101,activation.x,activation_sum));
+            }
+        }
+        float value=float(dot);
+        if constexpr(Format==kNvq1L)value+=0.125f*float(delta*activation_sum);
+        if constexpr(Format==kNvq1S)value+=0.15625f*float(delta*activation_sum);
+        sum=fmaf(scale*scales[group],value,sum);
+    }
+#pragma unroll
+    for(int offset=16;offset>0;offset>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+    return sum;
+}
+
+template<int Format>
+__global__ void __launch_bounds__(128) nvq_moe_groups_kernel(
+        NvqDeviceWeight w,const int8_t* input,const float* scales,const int32_t* ids,
+        const int32_t* local_map,half* output,int experts,int local_experts,int rows,int routes,bool down) {
+    const int pair=blockIdx.y,row=blockIdx.x*4+threadIdx.y;
+    if(row>=rows)return;
+    const int expert=ids[pair];
+    if(unsigned(expert)>=unsigned(experts))return;
+    const int local=local_map[expert];if(unsigned(local)>=unsigned(local_experts))return;
+    const int source=down?pair:pair/routes;
+    const float value=nvq_routed_group_dot<Format>(w,local*rows+row,input+int64_t(source)*w.ng*24,scales+int64_t(source)*w.ng);
+    if(threadIdx.x==0)output[int64_t(pair)*rows+row]=__float2half(value);
+}
+
+__global__ void __launch_bounds__(128) nvq_moe_groups_hetero_kernel(
+        const int64_t* pointers,const int64_t* sizes,const int32_t* params,
+        const int32_t* expert_pool,const int32_t* expert_local,const int32_t* ids,
+        const int8_t* input,const float* scales,half* output,const int32_t* active,
+        int experts,int pools,int rows,int routes,int pairs,bool down) {
+    const int pair=blockIdx.y,row=blockIdx.x*4+threadIdx.y;
+    if(row>=rows)return;
+    const int expert=ids[pair];if(unsigned(expert)>=unsigned(experts))return;
+    const int pool=active?active[1+pair]:expert_pool[expert];
+    const int local=active?active[1+pairs+pair]:expert_local[expert];
+    if(unsigned(pool)>=unsigned(pools) || local<0)return;
+    const auto* p=pointers+int64_t(pool)*5;const auto* s=sizes+int64_t(pool)*3;
+    const auto* g=params+int64_t(pool)*7;if(local>=g[0])return;
+    const NvqDeviceWeight w{reinterpret_cast<const uint8_t*>(p[0]),s[0],reinterpret_cast<const uint8_t*>(p[1]),s[1],
+        reinterpret_cast<const uint8_t*>(p[2]),s[2],reinterpret_cast<const float*>(p[3]),reinterpret_cast<const int8_t*>(p[4]),
+        0,g[0]*rows,g[1],g[2],g[3],g[4],g[5]};
+    const int source=down?pair:pair/routes;float value=0.f;
+#define MFQ_NVQ_ROUTED_GROUP_CASE(F) case F: value=nvq_routed_group_dot<F>(w,local*rows+row, \
+        input+int64_t(source)*w.ng*24,scales+int64_t(source)*w.ng);break
+    switch(g[6]) {
+        MFQ_NVQ_ROUTED_GROUP_CASE(1);MFQ_NVQ_ROUTED_GROUP_CASE(2);MFQ_NVQ_ROUTED_GROUP_CASE(3);
+        MFQ_NVQ_ROUTED_GROUP_CASE(4);MFQ_NVQ_ROUTED_GROUP_CASE(5);MFQ_NVQ_ROUTED_GROUP_CASE(6);
+        MFQ_NVQ_ROUTED_GROUP_CASE(7);MFQ_NVQ_ROUTED_GROUP_CASE(8);MFQ_NVQ_ROUTED_GROUP_CASE(9);
+        MFQ_NVQ_ROUTED_GROUP_CASE(10);MFQ_NVQ_ROUTED_GROUP_CASE(11);MFQ_NVQ_ROUTED_GROUP_CASE(12);
+        MFQ_NVQ_ROUTED_GROUP_CASE(13);MFQ_NVQ_ROUTED_GROUP_CASE(14);MFQ_NVQ_ROUTED_GROUP_CASE(15);
+        MFQ_NVQ_ROUTED_GROUP_CASE(16);MFQ_NVQ_ROUTED_GROUP_CASE(17);
+    }
+#undef MFQ_NVQ_ROUTED_GROUP_CASE
+    if(threadIdx.x==0)output[int64_t(pair)*rows+row]=__float2half(value);
+}
+
 template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
 __device__ __forceinline__ void nvq_moe_mmvq_task(
     const uint8_t * indices,
@@ -2833,9 +3057,8 @@ __device__ __forceinline__ void nvq_moe_mmvq_task(
                 SHARE_GROUP_STATE &&
                 (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec)) {
                 const uint32_t loaded_sub = lane == source_lane
-                    ? load_packed_bits(
-                        sub_scale, sub_linear * sub_bits, sub_bits,
-                        sub_scale_nbytes)
+                    ? load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng)
                     : 0;
                 sub = __shfl_sync(active_mask, loaded_sub, source_lane);
                 const float loaded_weight_scale = lane == source_lane
@@ -2845,9 +3068,8 @@ __device__ __forceinline__ void nvq_moe_mmvq_task(
                 weight_scale = __shfl_sync(
                     active_mask, loaded_weight_scale, source_lane);
             } else {
-                sub = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits, sub_bits,
-                    sub_scale_nbytes);
+                sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
                 weight_scale = (FORMAT == kNvq1L || FORMAT == kNvq1S)
                     ? neuron_scale[row] * static_cast<float>(sub)
                     : format_scale<FORMAT>(neuron_scale[row], sub, codebook);
@@ -3128,8 +3350,8 @@ nvq_moe_mmvq_exact_reduction_kernel(
                 const int row = local_expert * out_per_expert + local_row;
                 const int64_t sub_linear =
                     static_cast<int64_t>(row) * ng + group;
-                const uint32_t sub = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+                const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
                 const auto weight = load_nvq_vec8<FORMAT>(
                     indices, indices_nbytes, aux, aux_nbytes, codebook,
                     row, segment, group, ng, nvec, nsign, sign_mode, sub);
@@ -3246,8 +3468,8 @@ __global__ void __launch_bounds__(128) nvq_moe_grouped_tile_kernel(
             const int segment_in_group = segment - group * 3;
             const int k = group * kGroupSize + segment_in_group * 8;
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            const uint32_t sub = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             const auto weight = load_nvq_vec8<FORMAT>(
                 indices, indices_nbytes, aux, aux_nbytes, codebook,
                 row, segment, group, ng, nvec, nsign, sign_mode, sub);
@@ -3350,8 +3572,8 @@ __global__ void __launch_bounds__(NWARPS * 32) nepq_moe_mmvq_kernel(
             if (local_row >= out_per_expert) continue;
             const int row = local_expert * out_per_expert + local_row;
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            const uint32_t sub = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             const int8_t * table = nepq_active_table(
                 table_pool, bank_ids, row, group, nsuper, table_stride);
             const auto weight = load_nepq_vec8<FORMAT>(
@@ -3460,8 +3682,8 @@ __global__ void __launch_bounds__(128) nepq_moe_grouped_tile_kernel(
             const int segment_in_group = segment - group * 3;
             const int k = group * kGroupSize + segment_in_group * 8;
             const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-            const uint32_t sub = load_packed_bits(
-                sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
+            const uint32_t sub = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
             const int8_t * table = nepq_active_table(
                 table_pool, bank_ids, row, group, nsuper, table_stride);
             const auto weight = load_nvq_vec8<FORMAT>(
@@ -3563,7 +3785,7 @@ void check_common(
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
-    int64_t sign_mode) {
+    int64_t sign_mode,bool allow_dense=false) {
     MFQ_RUNTIME_CHECK(format >= kNvq1L && format <= kNvq3JscLGroupExec,
                 "NVQ format must be in [1,17]");
     MFQ_RUNTIME_CHECK(gs == kGroupSize, "NVQ CUDA kernels currently require gs=24");
@@ -3657,7 +3879,17 @@ void check_common(
     const bool group_exec_layout =
         format == kNvq2JscXLGroupExec || format == kNvq3JscLGroupExec;
     const int index_bits = format_index_bits(format);
-    const int64_t index_bytes = group_exec_layout
+    const bool dense=allow_dense && dense_nvq_format(int(format)) && aux.numel()==0 && sub_scale.numel()==0;
+    if(dense) {
+        MFQ_RUNTIME_CHECK(sub_bits==4 && (!is_d4_format(int(format)) || nvec==2*nsign),
+            "compact NVQ requires complete D4 index pairs and 4-bit state");
+        const int64_t bytes=(N*(nvec*index_bits+nsign*7+ng*4)+7)/8;
+        MFQ_RUNTIME_CHECK(indices.numel()==bytes,"compact NVQ stream length mismatch");
+        return;
+    }
+    const bool nvq1_records=(format==kNvq1L || format==kNvq1S) && aux.numel()==0;
+    if(nvq1_records)MFQ_RUNTIME_CHECK(sub_bits==(format==kNvq1S?4:3),"NVQ1 record state width mismatch");
+    const int64_t index_bytes = nvq1_records ? N*ng*(format==kNvq1S?4:5) : group_exec_layout
         ? N * ng * (format == kNvq2JscXLGroupExec ? 8 : 12)
         : (N * nvec * index_bits + 7) / 8;
     const bool delta_format = format == kNvq1L || format == kNvq1S;
@@ -3665,10 +3897,11 @@ void check_common(
     const int aux_bits = delta_format ? 1 : (no_aux_format ? 0 : 7);
     const int64_t aux_count = delta_format ? N * ng :
         (no_aux_format ? 0 : N * nsign);
-    const int64_t aux_bytes = exec_layout || group_exec_layout
+    const int64_t aux_bytes = exec_layout || group_exec_layout || nvq1_records
         ? 0
         : (aux_count * aux_bits + 7) / 8;
-    const int64_t sub_bytes = (N * ng * sub_bits + 7) / 8;
+    const int64_t sub_bytes = nvq1_records || (group_exec_layout && sub_scale.numel()==0)?
+        0:(N * ng * sub_bits + 7) / 8;
     MFQ_RUNTIME_CHECK(indices.numel() == index_bytes, "NVQ index stream length mismatch");
     MFQ_RUNTIME_CHECK(aux.numel() == aux_bytes, "NVQ aux stream length mismatch");
     MFQ_RUNTIME_CHECK(sub_scale.numel() == sub_bytes, "NVQ sub-scale stream length mismatch");
@@ -4062,6 +4295,40 @@ void launch_batch_vec8_by_format(
     });
 }
 
+bool launch_group_vec8(
+    int format, const mfq_tensor_backend::Tensor& indices,
+    const mfq_tensor_backend::Tensor& aux, const mfq_tensor_backend::Tensor& sub_scale,
+    const mfq_tensor_backend::Tensor& neuron_scale, const mfq_tensor_backend::Tensor& codebook,
+    const mfq_tensor_backend::Tensor& qx, const mfq_tensor_backend::Tensor& xscale,
+    mfq_tensor_backend::Tensor& output,
+    int M, int N, int ng, int nvec, int nsign, int sub_bits, int sign_mode, cudaStream_t stream) {
+    if (M > 4 || ng > 128 || N < 128 || N > 4096 ||
+        (sub_bits != 4 && format != kNvq1L) || std::getenv("MFQ_NVQ_DENSE_REFERENCE")) return false;
+    if (M == 1 && ng > 32 &&
+        (format == kNvq2Jsc || format == kNvq3Jsc || format == kNvq3JscL)) return false;
+    const NvqDeviceWeight weight{indices.data_ptr<uint8_t>(), indices.numel(),
+        aux.data_ptr<uint8_t>(), aux.numel(), sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
+        neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(), int(codebook.numel()),
+        N, ng, nvec, nsign, sub_bits, sign_mode};
+    launch_by_format(format, [&](auto tag) {
+        const auto launch = [&](auto rows, auto warps) {
+            constexpr int rows_per_block = 4 / decltype(warps)::value;
+            nvq_gemv_group_kernel<decltype(tag)::value, decltype(rows)::value, decltype(warps)::value><<<
+                (N + rows_per_block - 1) / rows_per_block, dim3(32, 4), 0, stream>>>(
+                weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                reinterpret_cast<half*>(output.data_ptr<mfq_half>()), M);
+        };
+        const auto select_warps = [&](auto rows) {
+            if (ng <= 32) launch(rows, std::integral_constant<int, 1>{});
+            else launch(rows, std::integral_constant<int, 4>{});
+        };
+        if (M == 1) select_warps(std::integral_constant<int, 1>{});
+        else if (M <= 2) select_warps(std::integral_constant<int, 2>{});
+        else select_warps(std::integral_constant<int, 4>{});
+    });
+    return true;
+}
+
 void launch_selected_batch_vec8(
     int format,
     const mfq_tensor_backend::Tensor & indices,
@@ -4084,6 +4351,8 @@ void launch_selected_batch_vec8(
     launch_batch_vec8_by_format<NW, MAX_M>(                                            \
         format, indices, aux, sub_scale, neuron_scale, codebook, qx, xscale, output,  \
         M, N, ng, nvec, nsign, sub_bits, sign_mode, stream)
+    if (launch_group_vec8(format, indices, aux, sub_scale, neuron_scale, codebook,
+            qx, xscale, output, M, N, ng, nvec, nsign, sub_bits, sign_mode, stream)) return;
     const bool compact_s = format == kNvq1S || format == kNpq0S;
     const bool compact_s_small = compact_s && N <= 1024;
     if (M <= 2) {
@@ -4175,6 +4444,8 @@ void launch_selected_m1_vec8(
     int sub_bits,
     int sign_mode,
     cudaStream_t stream) {
+    if (launch_group_vec8(format, indices, aux, sub_scale, neuron_scale, codebook,
+            qx, xscale, output, 1, N, ng, nvec, nsign, sub_bits, sign_mode, stream)) return;
     if (format == kNvq1S && N <= 2048) {
         launch_m1_vec8_by_format<8>(
             format, indices, aux, sub_scale, neuron_scale, codebook, qx, xscale,
@@ -4788,7 +5059,7 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
 }
 
 // Route-compacted online-dequant FP16 Tensor Core path for mixed NVQ pools.
-// Each task reuses one 64/128-row weight tile across 16 to 128 routed rows.
+// Each task reuses one 64/128-column weight tile across 16 to 256 routed rows.
 // Keep the format switch outside the inner K loop so one launch can serve
 // every NVQ cohort without a runtime branch per decoded value.
 constexpr int kNvqMoeF16PoolTileN = 64;
@@ -4811,8 +5082,8 @@ struct __align__(16) NvqMoeF16SharedStorage {
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
     static constexpr int kOperandBytes =
         (BN + BM) * kStrideK * sizeof(__half);
-    static constexpr int kOutputBytes = BM == 128
-        ? 2 * BN * 16 * sizeof(float)
+    static constexpr int kOutputBytes = BM >= 128
+        ? (BM / 64) * BN * 16 * sizeof(float)
         : (BN / 16) * BM * 16 * sizeof(float);
     static constexpr int kBytes =
         kOperandBytes > kOutputBytes ? kOperandBytes : kOutputBytes;
@@ -4919,17 +5190,16 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                                      __half, wmma::col_major>;
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
-    static_assert(BM == 16 || BM == 32 || BM == 64 || BM == 128);
+    static_assert(BM == 16 || BM == 32 || BM == 64 || BM == 128 || BM == 256);
     static_assert(BN == 64 || BN == 128);
     static_assert(GROUPS_PER_CHUNK == 2 || GROUPS_PER_CHUNK == 4);
     constexpr int kMFragments = BM / 16;
     constexpr int kNFragments = BN / 16;
     constexpr int kWarps = THREAD_WARPS;
-    constexpr int kComputeWarps = BM == 128
-        ? 2 * kNFragments : kNFragments;
+    constexpr int kRowTeams = BM >= 128 ? BM / 64 : 1;
+    constexpr int kComputeWarps = kRowTeams * kNFragments;
     static_assert(kWarps >= kComputeWarps);
-    constexpr int kAccumulatorFragments = BM == 128
-        ? kMFragments / 2 : kMFragments;
+    constexpr int kAccumulatorFragments = kMFragments / kRowTeams;
     constexpr int kThreads = kWarps * 32;
     constexpr int kTileK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
@@ -4962,10 +5232,15 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             mfq::cuda_detail::copy_async_commit();
         }
         constexpr int kWeightStates = BN * GROUPS_PER_CHUNK;
+        // BM256 doubles the activation readers. Keep both warp teams useful
+        // during dequantization by sharing the three vectors of each group.
+        constexpr int kDecodeLanes = BM == 256 ? 2 : 1;
+        constexpr int kWeightThreads = kThreads / kDecodeLanes;
+        const int segment_lane = BM == 256 ? tid / kWeightThreads : 0;
 #pragma unroll
-        for (int weight_index = tid;
+        for (int weight_index = BM == 256 ? tid % kWeightThreads : tid;
              weight_index < kWeightStates;
-            weight_index += kThreads) {
+            weight_index += kWeightThreads) {
             const int row_local =
                 weight_index / GROUPS_PER_CHUNK;
             const int group_local = weight_index -
@@ -4975,6 +5250,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             const int group = group_base + group_local;
             const bool valid_weight =
                 local_row < out_per_expert && group < ng;
+            DenseNvqGroup dense_record;
+            const bool dense=dense_nvq_format(FORMAT) && aux_nbytes==0;
             uint32_t state = 0;
             float scale = 0.0f;
             uint32_t packed_signs = 0;
@@ -4985,9 +5262,14 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             if (valid_weight) {
                 const int64_t sub_linear =
                     static_cast<int64_t>(row) * ng + group;
-                state = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits,
-                    sub_bits, sub_scale_nbytes);
+                if constexpr(dense_nvq_format(FORMAT)) {
+                    if(dense) {
+                        dense_record=load_dense_nvq_group<FORMAT>(indices,indices_nbytes,row,group,nsign,ng);
+                        state=dense_record.state();
+                    }else state=load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                        sub_linear,sub_bits,ng);
+                }else state=load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
                 scale = format_scale<FORMAT>(
                     neuron_scale[row], state, codebook);
                 if constexpr (is_e8_format(FORMAT) || is_d4_format(FORMAT)) {
@@ -5007,7 +5289,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                     FORMAT == kNvq3JscL) {
                     const int64_t sign_linear =
                         static_cast<int64_t>(row) * nsign + group * 3;
-                    packed_signs = load_packed_sign_group3(
+                    if(!dense)packed_signs = load_packed_sign_group3(
                         aux, sign_linear * 7, aux_nbytes);
                 } else if constexpr (
                     FORMAT == kNvq1S || FORMAT == kNvq1L) {
@@ -5023,8 +5305,13 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             for (int segment_local = 0;
                  segment_local < kChunksPerGroup / 2;
                  ++segment_local) {
+                if constexpr (BM == 256) {
+                    if (segment_local % kDecodeLanes != segment_lane) continue;
+                }
                 int2 packed = make_int2(0, 0);
-                if (valid_weight) {
+                if constexpr(dense_nvq_format(FORMAT))if(valid_weight && dense && group*3+segment_local<nsign)
+                    packed=decode_dense_nvq_vector<FORMAT>(dense_record,bank,segment_local,sign_mode);
+                if (valid_weight && !dense) {
                     const auto decoded = load_nvq_group_vec8<FORMAT>(
                         indices, indices_nbytes, aux, aux_nbytes,
                         codebook, bank, row, group, segment_local,
@@ -5076,8 +5363,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         __syncthreads();
 
         if (warp < kComputeWarps) {
-            const int warp_n = BM == 128 ? warp % kNFragments : warp;
-            const int m_fragment_base = BM == 128
+            const int warp_n = BM >= 128 ? warp % kNFragments : warp;
+            const int m_fragment_base = BM >= 128
                 ? warp / kNFragments : 0;
 #pragma unroll
             for (int k_local = 0;
@@ -5094,7 +5381,12 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                          fragment < kAccumulatorFragments;
                          ++fragment) {
                         const int m_fragment = m_fragment_base +
-                            fragment * (BM == 128 ? 2 : 1);
+                            fragment * kRowTeams;
+                        if constexpr (BM == 256) {
+                            // Uniform within the warp; empty fragments have no
+                            // output rows, and need no Tensor Core work.
+                            if (m_fragment * 16 >= last - first) continue;
+                        }
                         FragmentA activation_fragment;
                         wmma::load_matrix_sync(
                             activation_fragment,
@@ -5111,7 +5403,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         __syncthreads();
     }
 
-    if constexpr (BM == 128) {
+    if constexpr (BM >= 128) {
         if (warp < kComputeWarps) {
             const int warp_n = warp % kNFragments;
             const int m_fragment_base = warp / kNFragments;
@@ -5120,7 +5412,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                  fragment < kAccumulatorFragments;
                  ++fragment) {
                 const int m_fragment =
-                    m_fragment_base + fragment * 2;
+                    m_fragment_base + fragment * kRowTeams;
                 wmma::store_matrix_sync(
                     output_tile + warp * 16 * 16,
                     accumulators[fragment],
@@ -5247,10 +5539,12 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
 template <int BM, int BN, int ROUTE_TILE_M, int GROUPS_PER_CHUNK,
           int FORMAT_GROUP, bool ASYNC_ACTIVATION = false>
 __global__ void __launch_bounds__(
-    (BM == 128 ? 2 : 1) * (BN / 16) * 32,
-    BN == 64 ||
+    (BM >= 128 ? BM / 64 : 1) * (BN / 16) * 32,
+    BM == 128 && BN == 64 && GROUPS_PER_CHUNK == 2 &&
+        FORMAT_GROUP != kNvqMoeF16AllFormats ? 3 :
+    BM < 256 && (BN == 64 ||
         (FORMAT_GROUP != kNvqMoeF16AllFormats && GROUPS_PER_CHUNK == 2)
-        ? 2 : 1)
+        ) ? 2 : 1)
 nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
     const int64_t * weight_sizes,
@@ -5327,7 +5621,7 @@ nvq_moe_grouped_hetero_f16_kernel(
         case FORMAT_VALUE:                                                      \
             nvq_moe_grouped_f16_task<                                           \
                 FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK,                         \
-                (BM == 128 ? 2 : 1) * (BN / 16), ASYNC_ACTIVATION>(             \
+                (BM >= 128 ? BM / 64 : 1) * (BN / 16), ASYNC_ACTIVATION>(        \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
                 weight_tile, activation_tile, output_tile,                     \
@@ -5477,9 +5771,8 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
             if (valid_weight) {
                 const int64_t sub_linear =
                     static_cast<int64_t>(row) * ng + group;
-                state = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits,
-                    sub_bits, sub_scale_nbytes);
+                state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    sub_linear,sub_bits,ng);
                 table = nepq_active_table(
                     table_pool, bank_ids, row, group,
                     nsuper, table_stride);
@@ -5587,7 +5880,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
     mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
-                 neuron_len, gs, sub_bits, format, sign_mode);
+                 neuron_len, gs, sub_bits, format, sign_mode,true);
     MFQ_RUNTIME_CHECK(gs == kGroupSize, "NVQ routed FP16 requires gs24");
     MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
                 x.scalar_type() == mfq_tensor_backend::kFloat16 &&
@@ -5811,7 +6104,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         nvq_moe_grouped_hetero_f16_kernel<                                      \
             BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE,                       \
             FORMAT_GROUP_VALUE, true><<<                                        \
-            blocks, dim3(32, (BM_VALUE == 128 ? 2 : 1) *                       \
+            blocks, dim3(32, (BM_VALUE >= 128 ? BM_VALUE / 64 : 1) *            \
                 (BN_VALUE / 16)), kSharedBytes,                                 \
             mfq_current_cuda_stream()>>>(                                       \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
@@ -5828,7 +6121,51 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     // A bounded format switch fits the wide G2 task in 64 registers, so two
     // BM128 CTAs can reside together.  Cross-group mixtures keep the full
     // switch, G4 path, and its wider K reuse.
-    if (tile_m == 128 && use_narrow_tile &&
+    const char* wide_rows_option = std::getenv("MFQ_NVQ_PREFILL_M256");
+    const bool wide_rows = wide_rows_option && std::atoi(wide_rows_option) != 0;
+    const char* narrow_g2_option = std::getenv("MFQ_NVQ_PREFILL_NARROW_G2");
+    const bool narrow_g2 = narrow_g2_option && std::atoi(narrow_g2_option) != 0;
+    const char* cohorts_option = std::getenv("MFQ_NVQ_PREFILL_COHORTS");
+    const bool cohorts = !cohorts_option || std::atoi(cohorts_option) != 0;
+    // Keep the M/N geometry and Tensor Core sum order. A shorter K tile
+    // lowers decode liveness and shared storage, allowing three narrow CTAs.
+    if (cohorts && tile_m == 128 && format_group == kNvqMoeF16AllFormats) {
+        // Disjoint format switches write disjoint expert rows. Every task
+        // retains the canonical Tensor Core K sequence, with no new maps
+        // or weight buffers. Keep G4 for narrow tiles and the legacy decoder.
+        if (use_narrow_tile) {
+            NVQ_MOE_HETERO_F16_LAUNCH(128,64,128,4,kNvqMoeF16StandardFormats);
+            NVQ_MOE_HETERO_F16_LAUNCH(128,64,128,4,kNvqMoeF16ExtendedFormats);
+            NVQ_MOE_HETERO_F16_LAUNCH(128,64,128,4,kNvqMoeF16LegacyFormats);
+        } else {
+            NVQ_MOE_HETERO_F16_LAUNCH(128,128,128,2,kNvqMoeF16StandardFormats);
+            NVQ_MOE_HETERO_F16_LAUNCH(128,128,128,2,kNvqMoeF16ExtendedFormats);
+            NVQ_MOE_HETERO_F16_LAUNCH(128,128,128,4,kNvqMoeF16LegacyFormats);
+        }
+    } else if (narrow_g2 && tile_m == 128 && use_narrow_tile &&
+            format_group == kNvqMoeF16StandardFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 64, 128, 2, kNvqMoeF16StandardFormats);
+    } else if (narrow_g2 && tile_m == 128 && use_narrow_tile &&
+            format_group == kNvqMoeF16ExtendedFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 64, 128, 2, kNvqMoeF16ExtendedFormats);
+    } else if (wide_rows && tile_m == 128 && use_narrow_tile && rows_per_expert >= 128 &&
+            out_per_expert <= neuron_len) {
+        if (format_group == kNvqMoeF16StandardFormats) {
+            NVQ_MOE_HETERO_F16_LAUNCH(
+                256, 64, 128, 4, kNvqMoeF16StandardFormats);
+        } else if (format_group == kNvqMoeF16ExtendedFormats) {
+            NVQ_MOE_HETERO_F16_LAUNCH(
+                256, 64, 128, 4, kNvqMoeF16ExtendedFormats);
+        } else if (format_group == kNvqMoeF16LegacyFormats) {
+            NVQ_MOE_HETERO_F16_LAUNCH(
+                256, 64, 128, 4, kNvqMoeF16LegacyFormats);
+        } else {
+            NVQ_MOE_HETERO_F16_LAUNCH(
+                256, 64, 128, 4, kNvqMoeF16AllFormats);
+        }
+    } else if (tile_m == 128 && use_narrow_tile &&
             format_group == kNvqMoeF16StandardFormats) {
         NVQ_MOE_HETERO_F16_LAUNCH(
             128, 64, 128, 4, kNvqMoeF16StandardFormats);
@@ -5988,7 +6325,25 @@ static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
         reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), pairs, routes,   \
         static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
         routed_input)
-    if(active_plan.defined()) {
+    const char* grouped=std::getenv("MFQ_NVQ_MOE_GROUP_DOT");
+    if(ng<=128 && out_per_expert<=4096 && (!grouped || grouped[0]!='0')) {
+        mfq::cuda::NvqRoutedReuseParams reuse;
+        reuse.pointers=weight_ptrs.data_ptr<int64_t>();reuse.sizes=weight_sizes.data_ptr<int64_t>();
+        reuse.params=pool_params.data_ptr<int32_t>();reuse.expert_pool=expert_pool.data_ptr<int32_t>();
+        reuse.expert_local=expert_local.data_ptr<int32_t>();reuse.ids=ids.data_ptr<int32_t>();
+        reuse.active=active_plan.defined()?active_plan.data_ptr<int32_t>():nullptr;
+        reuse.input=qx.data_ptr<int8_t>();reuse.scales=xscale.data_ptr<float>();
+        reuse.output=reinterpret_cast<half*>(out.data_ptr<mfq_half>());
+        reuse.experts=int(n_experts);reuse.pools=pools;reuse.rows=int(out_per_expert);
+        reuse.routes=routes;reuse.pairs=pairs;reuse.down=routed_input;
+        if(!mfq::cuda::nvq_launch_routed_reuse(reuse,stream))
+            nvq_moe_groups_hetero_kernel<<<dim3((out_per_expert+3)/4,pairs),dim3(32,4),0,stream>>>(
+            weight_ptrs.data_ptr<int64_t>(),weight_sizes.data_ptr<int64_t>(),pool_params.data_ptr<int32_t>(),
+            expert_pool.data_ptr<int32_t>(),expert_local.data_ptr<int32_t>(),ids.data_ptr<int32_t>(),
+            qx.data_ptr<int8_t>(),xscale.data_ptr<float>(),reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
+            active_plan.defined()?active_plan.data_ptr<int32_t>():nullptr,
+            int(n_experts),pools,int(out_per_expert),routes,pairs,routed_input);
+    }else if(active_plan.defined()) {
         const auto launch=[&](auto warp_tag) {
             constexpr int warps=decltype(warp_tag)::value;
             const int blocks=int(std::min<int64_t>(nvq_active_resident_blocks<warps>(),
@@ -6123,7 +6478,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor tile_experts) {
     check_common(
         indices, aux, sub_scale, neuron_scale, codebook,
-        neuron_len, gs, sub_bits, format, sign_mode);
+        neuron_len, gs, sub_bits, format, sign_mode,true);
     MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NVQ global expert count must be in [1,4096]");
     MFQ_RUNTIME_CHECK(
@@ -6179,6 +6534,21 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
         nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
+    }
+
+    if(dense_nvq_format(int(format)) && aux.numel()==0) {
+        const NvqDeviceWeight w{indices.data_ptr<uint8_t>(),indices.numel(),nullptr,0,nullptr,0,
+            neuron_scale.data_ptr<float>(),codebook.data_ptr<int8_t>(),int(codebook.numel()),
+            int(pool_experts*out_per_expert),ng,nvec,nsign,int(sub_bits),int(sign_mode)};
+        launch_by_format(int(format),[&](auto tag) {
+            constexpr int F=decltype(tag)::value;
+            if constexpr(dense_nvq_format(F))
+                nvq_moe_groups_kernel<F><<<dim3((out_per_expert+3)/4,pairs),dim3(32,4),0,stream>>>(
+                    w,qx.data_ptr<int8_t>(),xscale.data_ptr<float>(),ids.data_ptr<int32_t>(),
+                    expert_local.data_ptr<int32_t>(),reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
+                    int(n_experts),int(pool_experts),int(out_per_expert),routes,routed_input);
+        });
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return out;
     }
 
     if (tokens <= 8) {
@@ -6256,6 +6626,23 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
             static_cast<int>(sign_mode), routed_input)
         launch_by_format(static_cast<int>(format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
+            const char* grouped=std::getenv("MFQ_NVQ_MOE_GROUP_DOT");
+            if(!exact_reduction && ng<=128 && out_per_expert<=4096 && (!grouped || grouped[0]!='0')) {
+                const NvqDeviceWeight w{indices.data_ptr<uint8_t>(),indices.numel(),aux.data_ptr<uint8_t>(),aux.numel(),
+                    sub_scale.data_ptr<uint8_t>(),sub_scale.numel(),neuron_scale.data_ptr<float>(),codebook.data_ptr<int8_t>(),
+                    int(codebook.numel()),int(pool_experts*out_per_expert),ng,nvec,nsign,int(sub_bits),int(sign_mode)};
+                mfq::cuda::NvqRoutedReuseParams reuse;
+                reuse.weight=w;reuse.format=F;reuse.expert_local=expert_local.data_ptr<int32_t>();
+                reuse.ids=ids.data_ptr<int32_t>();reuse.input=qx.data_ptr<int8_t>();reuse.scales=xscale.data_ptr<float>();
+                reuse.output=reinterpret_cast<half*>(out.data_ptr<mfq_half>());
+                reuse.experts=int(n_experts);reuse.local_experts=int(pool_experts);reuse.rows=int(out_per_expert);
+                reuse.routes=routes;reuse.pairs=pairs;reuse.down=routed_input;
+                if(!mfq::cuda::nvq_launch_routed_reuse(reuse,stream))
+                    nvq_moe_groups_kernel<F><<<dim3((out_per_expert+3)/4,pairs),dim3(32,4),0,stream>>>(
+                    w,qx.data_ptr<int8_t>(),xscale.data_ptr<float>(),ids.data_ptr<int32_t>(),expert_local.data_ptr<int32_t>(),
+                    reinterpret_cast<half*>(out.data_ptr<mfq_half>()),int(n_experts),int(pool_experts),int(out_per_expert),routes,routed_input);
+                return;
+            }
             if (exact_reduction) {
                 if (K >= 4096) {
                     if (exact_physical_warps == 4) {
@@ -6547,9 +6934,8 @@ mfq_tensor_backend::Tensor nvq_dequant_cuda(
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
     auto output = mfq_tensor_backend::empty({N, K}, neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
-    const int64_t total = static_cast<int64_t>(N) * nsign;
-    const int block = 256;
-    const int grid = static_cast<int>(std::min<int64_t>((total + block - 1) / block, 65535));
+    const int block = 128;
+    const dim3 grid((nsign + block - 1) / block, std::min(N, 65535));
     cudaStream_t stream = mfq_current_cuda_stream();
     launch_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
@@ -6614,9 +7000,8 @@ __global__ void __launch_bounds__(32) nvq_backward_quad_partial_kernel(
         if (valid) {
             const int64_t state_index =
                 static_cast<int64_t>(output) * ng + group;
-            state = load_packed_bits(
-                sub_scale, state_index * sub_bits,
-                sub_bits, sub_scale_nbytes);
+            state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    state_index,sub_bits,ng);
             packed = decode_chunk4<FORMAT>(
                 indices, indices_nbytes, aux, aux_nbytes, codebook,
                 output, group, chunk, nvec, nsign, ng,
@@ -6741,9 +7126,8 @@ __global__ void __launch_bounds__(32) nvq_backward_vec8_partial_kernel(
         if (valid) {
             const int64_t state_index =
                 static_cast<int64_t>(output) * ng + group;
-            state = load_packed_bits(
-                sub_scale, state_index * sub_bits,
-                sub_bits, sub_scale_nbytes);
+            state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    state_index,sub_bits,ng);
             decoded = load_nvq_vec8<FORMAT>(
                 indices, indices_nbytes, aux, aux_nbytes, codebook,
                 output, segment, group, ng, nvec, nsign,
@@ -6882,11 +7266,8 @@ __global__ void __launch_bounds__(256) nvq_backward_mma_m8_kernel(
             float weight_scale = 0.0f;
             if (output < N && k0 < K) {
                 const int group = k0 / kGroupSize;
-                const uint32_t state = load_packed_bits(
-                    sub_scale,
-                    (static_cast<int64_t>(output) * ng + group) * sub_bits,
-                    sub_bits,
-                    sub_scale_nbytes);
+                const uint32_t state = load_nvq_state<FORMAT>(indices,indices_nbytes,sub_scale,sub_scale_nbytes,
+                    static_cast<int64_t>(output)*ng+group,sub_bits,ng);
                 decoded = load_nvq_vec8<FORMAT>(
                     indices, indices_nbytes, aux, aux_nbytes, codebook,
                     output, k0 >> 3, group, ng, nvec, nsign,

@@ -1,4 +1,6 @@
+#include "../../runtime/execution_options.h"
 #pragma once
+#include "cuda_execution.h"
 #include "mfq_cuda_linear_attention_ops.h"
 #include "mfq_cuda_norm_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
@@ -8,6 +10,7 @@
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "runtime/nint_row_pipeline.h"
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -96,6 +99,9 @@ class Gdn {
             cache && conv_.defined() ? conv_ : tb::zeros({b, kernel_ - 1, channels}, options);
         std::vector<Tensor> projections;
         std::array<Tensor,2> prepared_gates;
+        const auto prefill_option=mfq::cuda::runtime_options::gdn_prefill_fused();
+        const bool prefill_fused=t>1 && fused_preparation_ && d_<=256 && kernel_<=8 &&
+            (!prefill_option || *prefill_option!=0);
         if(cache && conv_.defined() && state_.defined() && fused_core_ && fused_decode_ &&
             fused_preparation_ && fused_output_ && transposed_state_ && t==1 &&
             (d_==32 || d_==64 || d_==128) &&
@@ -115,9 +121,12 @@ class Gdn {
                     projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
                     weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
                     w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
-                    x.scalar_type()==tb::kFloat16,true,core_workspace_);
+                    x.scalar_type()==tb::kFloat16,true,core_workspace_,
+                    [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
                 auto output=w_.output(execution,decoded[0]);
-                conv_.copy_(decoded[1]);state_.copy_(decoded[2]);return output;
+                conv_.copy_(decoded[1]);
+                if(state_.data_ptr()!=decoded[2].data_ptr())state_.copy_(decoded[2]);
+                return output;
             }
         }
         return mfq::models::gated_delta_attention(
@@ -135,6 +144,18 @@ class Gdn {
                 return projected;
             },
             [&](Tensor projected) {
+                if(prefill_fused && projected.scalar_type()==tb::kFloat16) {
+                    return execution.profiler.measure("prefill.gdn_conv_qkv",[&] {
+                        auto weight=w_.conv.to(tb::kFloat32).contiguous();
+                        if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
+                            weight=weight.reshape({channels,1,kernel_});
+                        auto qkv=linear_conv_qkv_prefill_cuda(previous,
+                            projected.narrow(-1,0,2*kw).contiguous(),
+                            projected.narrow(-1,2*kw,vw).contiguous(),weight,
+                            tb::empty({0},options),nk_,nv_,d_,d_,1e-6);
+                        return std::array<Tensor,4>{qkv[0],qkv[1],qkv[2],qkv[3]};
+                    });
+                }
                 if (fused_decode_ && t == 1 && d_ <= 256 && projected.scalar_type() == tb::kFloat16) {
                     auto weight = w_.conv.to(tb::kFloat32).contiguous();
                     if (weight.dim() == 2 && weight.size(0) == channels && weight.size(1) == kernel_)
@@ -179,7 +200,7 @@ class Gdn {
                 if(prepared_gates[0].defined())return prepared_gates;
                 auto alpha=projections.empty()?w_.alpha(execution,x):projections[2];
                 auto raw_beta=projections.empty()?w_.beta(execution,x):projections[3];
-                if (fused_decode_ && t == 1) {
+                if ((fused_decode_ && t == 1) || prefill_fused) {
                     auto gates = linear_gate_beta_cuda(
                         alpha.to(tb::kFloat32).reshape({b, t, nv_}),
                         raw_beta.to(tb::kFloat32).reshape({b, t, nv_}),
@@ -205,8 +226,10 @@ class Gdn {
                 auto initial = cache && state_.defined() ? state_ : Tensor{};
                 Tensor attended, next_state;
                 if (d_ == 32 || d_ == 64 || d_ == 128) {
-                    auto result = (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
-                        q, k, v, decay, beta,initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
+                    auto result = execution.profiler.measure("prefill.gdn_recurrence",[&] {
+                        return (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
+                            q, k, v, decay, beta,initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
+                    });
                     attended = result[0];
                     next_state = result[1];
                 } else {
@@ -572,10 +595,15 @@ class Qsa {
         auto ranked=tb::where(visible,scores.to(tb::kFloat32),tb::full_like(scores,-1e30).to(tb::kFloat32));
         const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
         auto indices=std::get<1>(tb::topk(ranked,count,-1,true,false));
+        Tensor selected;
+        const auto fused_selection=mfq::cuda::runtime_options::qsa_select_fused();
+        if(!fused_selection || *fused_selection) {
+            selected=mfq_qwen4_exp::qsa_selected_tokens(indices,cache_positions,c_.pool,c_.budget);
+        } else {
         auto valid=visible.expand({1,t,pools}).gather(-1,indices).unsqueeze(-1).expand({1,t,count,c_.pool});
         auto expanded=indices.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,indices.options());
         expanded=tb::where(valid,expanded,tb::full_like(expanded,-1));
-        auto selected=tb::full({1,t,columns},-1,cache_positions.options());
+        selected=tb::full({1,t,columns},-1,cache_positions.options());
         selected.narrow(-1,0,count*c_.pool).copy_(expanded.reshape({1,t,count*c_.pool}));
         if(c_.pool>1) {
             auto tail_count=(absolute+1).remainder(c_.pool);
@@ -588,12 +616,21 @@ class Qsa {
         auto dense=tb::arange(columns,cache_positions.options()).reshape({1,1,columns}).expand({1,t,columns});
         dense=tb::where(dense<=absolute,dense,tb::full_like(dense,-1));
         selected=tb::where(absolute+1<=c_.budget,dense,selected).to(tb::kInt32).contiguous();
-        auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected);
+        }
         Tensor gated;
         if(fused_projection_ && rotary_->fused() &&
-            (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32))
-            gated=mfq_qwen4_exp::attention_gate(attended,p.gate,hidden.scalar_type()==tb::kFloat16);
-        else gated=(attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
+            (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
+            const auto sparse_gate=mfq::cuda::runtime_options::qsa_sparse_gate_fused();
+            if(!sparse_gate || *sparse_gate)
+                gated=mfq_qwen4_exp::sparse_gqa_attention_gate(p.query,graph_keys_,graph_values_,selected,
+                    p.gate,hidden.scalar_type()==tb::kFloat16);
+            else gated=mfq_qwen4_exp::attention_gate(
+                mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected),
+                p.gate,hidden.scalar_type()==tb::kFloat16);
+        } else {
+            auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected);
+            gated=(attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
+        }
         return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
     }
     void advance_graph(int64_t tokens) {keys_.advance_fixed(tokens);values_.advance_fixed(tokens);index_.advance_fixed(tokens);}
@@ -612,6 +649,8 @@ class Qsa {
                               hidden.size(1) > 0,
                           "Qwen4 QSA requires nonempty [B,T,H] input");
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
+        const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
+        const bool fused_prefill=t>8 && (!prefill_option || *prefill_option!=0);
         MFQ_RUNTIME_CHECK(
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),
@@ -619,6 +658,8 @@ class Qsa {
         return mfq::models::qwen4_exp::sparse_attention(
             offset + t, c_.budget, use_cache,
             [&] {
+                if(fused_prefill)
+                    return project(execution,hidden,current_positions,offset+t>c_.budget);
                 auto pair = w_.query(execution, hidden).reshape({b, t, c_.heads, 2 * c_.width});
                 auto gate = pair.narrow(-1, c_.width, c_.width);
                 auto query = rms_norm(pair.narrow(-1, 0, c_.width),

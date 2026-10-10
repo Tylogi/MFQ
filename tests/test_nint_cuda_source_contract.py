@@ -235,11 +235,17 @@ def test_cpp_runtime_accepts_canonical_and_legacy_mfe_delta_magics():
 
 
 def test_metal_nint_uses_one_metadata_driven_compute_kernel():
-    assert METAL_NINT.count('"mfq_cpp_nint_runtime_"') == 1
-    assert "row_metadata[row_metadata_base]" in METAL_NINT
-    assert "row_metadata[row_metadata_base + 1u]" in METAL_NINT
+    assert METAL_NINT.count('"mfq_native_nint_matmul_v2_"') == 1
+    assert METAL_NINT.count("result += kNintMatmul;") == 1
+    metadata = (ROOT / "cpp_runtime/backends/metal/ops/mlx_nint_metadata.h").read_text()
+    assert "metadata.x & 15u" in metadata
+    assert "metadata.y," in metadata
+    assert "metadata + row * 4u" in metadata
+    assert "detail::kNintMetadataSource" in METAL_NINT
+    assert "mfq_nint_row(row_metadata," in METAL_NINT
     assert "auto output = routed_matmul(" in METAL_NINT
-    assert METAL_GROUPED.count("mfq_cpp_nint_metadata_grouped_p") == 1
+    assert METAL_GROUPED.count("class NintProjectionPrimitive final") == 1
+    assert METAL_GROUPED.count("source += detail::nint_matmul_metal_body();") == 1
     assert "mfq_grouped_nint_read_row_value4" in METAL_GROUPED
     for retired in (
         "mfq_cpp_single_row_grouped_nint",
@@ -285,8 +291,9 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert "grouped_nint4_group24" not in METAL_MOE
     assert "nint_profile_mask" not in METAL_MOE
     assert METAL_NINT.count("constexpr const char* kNintMatmul =") == 1
-    assert METAL_NINT.count("kNintMatmul,") == 1
-    assert METAL_NINT.count("compiled_nint_matmul_kernel({") == 2
+    assert METAL_NINT.count("result += kNintMatmul;") == 1
+    assert METAL_NINT.count("const auto& plan = compiled_nint_matmul_plan(config);") == 1
+    assert METAL_NINT.count("auto result = native_nint_matmul(") == 2
     assert "? kNintStoreOutputAdd" in METAL_NINT
     assert ": kNintStoreOutput" in METAL_NINT
     assert "make_nint_matmul_kernel" not in METAL_NINT

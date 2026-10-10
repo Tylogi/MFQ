@@ -95,6 +95,12 @@ int generate_diagnostic_tokens(
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
             std::atoi(cuda_profiler_env) != 0;
         auto decode_replay_t0 = t2;
+        auto first_decode_done=t2;
+        bool measured_first_decode=false;
+        auto halfway_done=t2;
+        bool measured_halfway=false;
+        auto last_window_done=t2;
+        bool measured_last_window=false;
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
         if (use_cuda_graph) {
             auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
@@ -178,11 +184,24 @@ int generate_diagnostic_tokens(
                         cudaMemcpyDeviceToDevice, stream));
                     return 0;
                 });
+                if(i==1 && model.metadata.flash_next) {
+                    mfq_cuda_synchronize();first_decode_done=std::chrono::steady_clock::now();
+                    measured_first_decode=true;
+                }
+                if(gen>=4 && i==gen/2 && model.metadata.flash_next) {
+                    mfq_cuda_synchronize();halfway_done=std::chrono::steady_clock::now();
+                    measured_halfway=true;
+                }
+                if(gen>256 && i==gen-1-128 && model.metadata.flash_next) {
+                    mfq_cuda_synchronize();last_window_done=std::chrono::steady_clock::now();
+                    measured_last_window=true;
+                }
             }
         }
         mfq_cuda_synchronize();
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStop());
         auto t3 = std::chrono::steady_clock::now();
+        report_cuda_memory(execution.config, "decode_complete");
         profiler.report("decode");
         auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
         auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
@@ -195,6 +214,31 @@ int generate_diagnostic_tokens(
         std::cout << "decode_tokens=" << std::max(0, gen - 1) << "\n";
         std::cout << "decode_setup_sec=" << (decode_s - decode_replay_s) << "\n";
         std::cout << "decode_replay_sec=" << decode_replay_s << "\n";
+        if(measured_first_decode) {
+            const double first_sec=std::chrono::duration<double>(first_decode_done-t2).count();
+            const double after_first_sec=std::chrono::duration<double>(t3-first_decode_done).count();
+            std::cout<<"decode_first_step_sec="<<first_sec<<"\n"
+                <<"decode_after_first_tokens="<<std::max(0,gen-2)<<"\n"
+                <<"decode_after_first_sec="<<after_first_sec<<"\n";
+            if(gen>2)std::cout<<"decode_after_first_tok_per_s="<<double(gen-2)/after_first_sec<<"\n";
+        }
+        if(measured_halfway) {
+            const int head_tokens=gen/2,tail_tokens=gen-1-head_tokens;
+            const double head_sec=std::chrono::duration<double>(halfway_done-t2).count();
+            const double tail_sec=std::chrono::duration<double>(t3-halfway_done).count();
+            std::cout<<"decode_head_tokens="<<head_tokens<<"\n"
+                <<"decode_head_sec="<<head_sec<<"\n"
+                <<"decode_tail_tokens="<<tail_tokens<<"\n"
+                <<"decode_tail_sec="<<tail_sec<<"\n"
+                <<"decode_tail_tok_per_s="<<double(tail_tokens)/tail_sec<<"\n";
+        }
+        if(measured_last_window) {
+            const double seconds=std::chrono::duration<double>(t3-last_window_done).count();
+            std::cout<<"decode_last_128_tokens=128\n"
+                <<"decode_last_128_begin_cache_position="<<ids.size(1)+gen-1-128<<"\n"
+                <<"decode_last_128_sec="<<seconds<<"\n"
+                <<"decode_last_128_tok_per_s="<<128./seconds<<"\n";
+        }
         std::cout << "decode_sec=" << decode_s << "\n";
         if (gen > 1) std::cout << "decode_tok_per_s=" << (double)(gen - 1) / decode_s << "\n";
         if (gen > 1) std::cout << "decode_steady_tok_per_s=" << (double)(gen - 1) / decode_replay_s << "\n";

@@ -29,6 +29,10 @@ Tensor dense_gqa_attention(
     const Tensor&, const Tensor&, const Tensor&, int64_t offset);
 Tensor sparse_gqa_attention(
     const Tensor&, const Tensor&, const Tensor&, const Tensor& indices);
+Tensor sparse_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
+    const Tensor& indices, const Tensor& gate, bool half_output);
+Tensor qsa_selected_tokens(const Tensor& blocks, const Tensor& positions,
+    int64_t pool, int64_t budget);
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output);
 Tensor causal_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
     const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output);

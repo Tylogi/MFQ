@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "moe_cache_transfer.h"
+#include "moe_copy_bytes.cuh"
 #include "glu.cuh"
 
 
@@ -118,24 +119,7 @@ __global__ void moe_cache_mapped_gather_kernel(
         static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::uint64_t workers =
         static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    if ((((reinterpret_cast<std::uintptr_t>(destination) |
-            reinterpret_cast<std::uintptr_t>(source) |
-            static_cast<std::uintptr_t>(nbytes)) & 15u) == 0u)) {
-        auto * output = reinterpret_cast<uint4 *>(destination);
-        const auto * input = reinterpret_cast<const uint4 *>(source);
-        const std::uint64_t count = nbytes / sizeof(uint4);
-        for (std::uint64_t index = worker;
-             index < count;
-             index += workers) {
-            output[index] = input[index];
-        }
-        return;
-    }
-    for (std::uint64_t index = worker;
-         index < nbytes;
-         index += workers) {
-        destination[index] = source[index];
-    }
+    mfq_moe_copy_bytes(destination, source, nbytes, worker, workers);
 }
 
 __device__ __forceinline__ float warp_sum(float value) {
@@ -168,6 +152,8 @@ __device__ __forceinline__ float moe_sqrt_softplus(float value) {
     const float softplus = value > 20.0f ? value : log1pf(expf(value));
     return sqrtf(softplus);
 }
+
+#include "moe_topk512.cuh"
 
 template <typename scalar_t>
 __global__ void __launch_bounds__(128) moe_topk_kernel(
@@ -835,6 +821,48 @@ __global__ void __launch_bounds__(64) quantize_shared_moe_input_kernel(const __h
     const int groups=int(item[2]),gs=int(item[3]);
     quantize_moe_input_group(x,reinterpret_cast<int8_t*>(item[0]),reinterpret_cast<float*>(item[1]),
         rows,width,groups*gs,gs,blockIdx.y,group,groups);
+}
+
+// Prepare only routed slots; the original row arrays remain the weight layout.
+// The first occurrence of a slot owns all its row writes, including aliases.
+__global__ void __launch_bounds__(64) quantize_shared_nint_rows_kernel(const __half* x,
+        const int64_t* descriptors,int rows,int width,int total_groups,bool quantize,
+        const int64_t* offsets,const float* scales,const float* minima,uint4* metadata,
+        const int32_t* expert_local,const int32_t* ids,int pairs,int experts,
+        int output_rows,int local_experts) {
+    const int blocks_per_pair=(output_rows+63)/64;
+    const int pair=int(blockIdx.x)/blocks_per_pair;
+    const int row=(int(blockIdx.x)%blocks_per_pair)*64+int(threadIdx.x);
+    int local=-1;
+    if((threadIdx.x&31)==0 && pair<pairs) {
+        const int expert=ids[pair];
+        if(unsigned(expert)<unsigned(experts)) {
+            local=expert_local[expert];
+            if(unsigned(local)>=unsigned(local_experts))local=-1;
+            if(local>=0)for(int prior=0;prior<pair;++prior) {
+                const int earlier=ids[prior];
+                if(unsigned(earlier)<unsigned(experts) && expert_local[earlier]==local) {
+                    local=-1;break;
+                }
+            }
+        }
+    }
+    local=__shfl_sync(0xffffffffu,local,0);
+    if(local>=0 && row<output_rows) {
+        const int neuron=local*output_rows+row;
+        const uint64_t bit=uint64_t(offsets[neuron]);
+        metadata[neuron]=make_uint4(uint32_t(bit),uint32_t(bit>>32),
+            __float_as_uint(scales[neuron]),__float_as_uint(minima[neuron]));
+    }
+    if(quantize && int64_t(blockIdx.x)<int64_t(rows)*total_groups) {
+        const int source=int(blockIdx.x)/total_groups;
+        int group=int(blockIdx.x)%total_groups;
+        const int64_t* item=descriptors;
+        while(group>=item[2]) {group-=int(item[2]);item+=4;}
+        const int groups=int(item[2]),gs=int(item[3]);
+        quantize_moe_input_group(x,reinterpret_cast<int8_t*>(item[0]),reinterpret_cast<float*>(item[1]),
+            rows,width,groups*gs,gs,source,group,groups);
+    }
 }
 
 __device__ __forceinline__ int load_i8x4(const int8_t * values) {
@@ -1881,6 +1909,22 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
     }
+    const char* topk512_flag = std::getenv("MFQ_MOE_TOPK_512");
+    if (rows == 1 && experts == 512 && top_k == 10 && bias_ptr == nullptr &&
+            !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax &&
+            (topk512_flag == nullptr || std::atoi(topk512_flag) != 0)) {
+        if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+            topk512_specialized_kernel<mfq_half, true, true><<<1, 32, 0, stream>>>(
+                logits.data_ptr<mfq_half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+                static_cast<float>(norm_floor), static_cast<float>(scale));
+        } else {
+            topk512_specialized_kernel<float, true, true><<<1, 32, 0, stream>>>(
+                logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+                static_cast<float>(norm_floor), static_cast<float>(scale));
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return {ids, weights};
+    }
     const dim3 block(32, 4);
     const int grid = (rows + 3) / 4;
     // Capacity is a register-cache bound; all routing parameters remain runtime values.
@@ -2045,6 +2089,47 @@ void moe_quantize_shared_input_cuda(mfq_tensor_backend::Tensor input,
     quantize_shared_moe_input_kernel<<<dim3(unsigned(total_groups),unsigned(input.size(0))),64,0,
         mfq_current_cuda_stream()>>>(reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
         descriptors.data_ptr<int64_t>(),int(input.size(0)),int(input.size(1)));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_quantize_shared_nint_rows_cuda(mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor descriptors,int64_t total_groups,bool quantize,
+        mfq_tensor_backend::Tensor offsets,mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor minima,mfq_tensor_backend::Tensor row_metadata,
+        mfq_tensor_backend::Tensor expert_local,mfq_tensor_backend::Tensor ids,
+        int64_t output_rows,int64_t local_experts) {
+    namespace tb=mfq_tensor_backend;
+    const int64_t count=output_rows*local_experts;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat16 &&
+        input.dim()==2 && input.size(0)>0 && input.size(0)<=65535 && input.size(1)>0 && input.size(1)<=INT_MAX &&
+        output_rows>0 && output_rows<=INT_MAX-63 && local_experts>0 && count>0 && count<=INT_MAX,
+        "NINT row workspace input/geometry disagree");
+    MFQ_RUNTIME_CHECK(offsets.is_cuda() && offsets.is_contiguous() && offsets.scalar_type()==tb::kInt64 && offsets.numel()==count &&
+        scales.is_cuda() && scales.is_contiguous() && scales.scalar_type()==tb::kFloat32 && scales.numel()==count &&
+        minima.is_cuda() && minima.is_contiguous() && minima.scalar_type()==tb::kFloat32 && minima.numel()==count &&
+        row_metadata.is_cuda() && row_metadata.is_contiguous() && row_metadata.scalar_type()==tb::kInt32 &&
+        row_metadata.dim()==2 && row_metadata.size(0)==count && row_metadata.size(1)==4 &&
+        offsets.device()==input.device() && scales.device()==input.device() && minima.device()==input.device() &&
+        row_metadata.device()==input.device(),"NINT row workspace storage/device disagree");
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() && expert_local.scalar_type()==tb::kInt32 &&
+        expert_local.dim()==1 && expert_local.numel()>0 && expert_local.numel()<=4096 &&
+        ids.is_cuda() && ids.is_contiguous() && ids.scalar_type()==tb::kInt32 && ids.dim()==2 &&
+        ids.numel()>0 && ids.numel()<=65535 && ids.device()==input.device() && expert_local.device()==input.device(),
+        "NINT row workspace route/device disagree");
+    MFQ_RUNTIME_CHECK(!quantize || (descriptors.is_cuda() && descriptors.device()==input.device() &&
+        descriptors.is_contiguous() && descriptors.scalar_type()==tb::kInt64 && descriptors.dim()==2 &&
+        descriptors.size(0)>0 && descriptors.size(1)==4 && total_groups>0 && total_groups<=INT_MAX/input.size(0)),
+        "NINT fused quantization descriptors disagree");
+    const int64_t metadata_blocks=((output_rows+63)/64)*ids.numel();
+    const int64_t quantize_blocks=quantize?input.size(0)*total_groups:0;
+    MFQ_RUNTIME_CHECK(metadata_blocks<=INT_MAX,"NINT row workspace grid is too large");
+    const MfqCudaGuard guard(input.device());
+    quantize_shared_nint_rows_kernel<<<unsigned(std::max(metadata_blocks,quantize_blocks)),64,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),quantize?descriptors.data_ptr<int64_t>():nullptr,
+        int(input.size(0)),int(input.size(1)),quantize?int(total_groups):0,quantize,
+        offsets.data_ptr<int64_t>(),scales.data_ptr<float>(),minima.data_ptr<float>(),
+        reinterpret_cast<uint4*>(row_metadata.data_ptr()),expert_local.data_ptr<int32_t>(),ids.data_ptr<int32_t>(),
+        int(ids.numel()),int(expert_local.numel()),int(output_rows),int(local_experts));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

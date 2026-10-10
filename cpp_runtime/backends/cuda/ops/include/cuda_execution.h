@@ -227,7 +227,7 @@ struct CudaExecutionConfig {
     bool decode_branch_parallel = true;
     bool tensor_parallel_shard_native_float = false;
     bool nvq_fusion = true;
-    bool nvq2_exec = true;
+    bool nvq2_exec = false;
     bool nvq_extended_group_exec = false;
     bool moe_nvq_heterogeneous = true;
     bool moe_nvq_heterogeneous_decode = true;

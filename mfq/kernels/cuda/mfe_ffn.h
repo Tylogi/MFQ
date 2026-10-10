@@ -12,6 +12,21 @@ struct MfePackedProjection {
     int local_experts=0,output_rows=0,input_width=0,groups=0,group_size=0;
     int format=0,sub_bits=0,sign_mode=0,nvec=0,nsign=0;
     int q_expert_stride=0,fallback=-1;
+    int nint_late_bits=0; // Checked routed width; -1 uses ordinary chunk math, 0 retains existing math.
+    // Shared NINT: -1 dense q8 chunk order, 1/4 dense grouped order, 0 routed.
+    int dense_reduction_warps=0;
+    int nvq_word_signs=0;
+    // E8 stream replaces index/sign/state payloads without padding. Enabled
+    // by the sealed-preload loader after lossless conversion.
+    bool e8_dense_groups=false;
+    // D4 uses paired indices per sign mask.
+    bool d4_dense_groups=false;
+    // Experimental probes: proven expert-local bit offsets. Production keeps
+    // the verified wide compact reader; this field only reuses padding.
+    bool dense_narrow=false;
+    // Checked fixed-width NINT group decoder; reuses existing descriptor padding.
+    bool nint_whole=false;
+    std::int64_t decode_record_bytes=0;
 };
 struct MfeInputQuantization {
     std::int8_t* values=nullptr;
@@ -47,10 +62,22 @@ struct MfeFfnBatch {
     void* output=nullptr;
     int tokens=0,routes=0,experts=0,input_width=0,output_width=0;
     int intermediate=0,shared_intermediate=0;
+    // Immutable family metadata across resident/transfer views. Raw callers
+    // default to the complete decoder; the runtime computes its actual mask.
+    std::uint32_t nvq_format_mask=0x3fffeu;
     int hidden_stride=0,quantized_stride=0,scale_stride=0;
     bool shared_product_half=false,shared_gate_bfloat=false,output_float=false;
     bool output_pairs=false;
+    bool shared_dense_math=false;
     bool resident_plan_overlap=false;
+    bool warp_multi_sum=false;
+    // Immutable descriptor contract, including shared and transfer prototypes.
+    // Raw callers retain all arithmetic branches unless they establish it.
+    bool default_math=false;
+    // All E8 resident views and transfer prototypes permit narrow metadata.
+    bool e8_narrow=false;
+    // All compact E8/D4 resident and transfer views prove local decoder bounds.
+    bool compact_nvq=false;
 };
 void mfe_ffn_prepare(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,cudaStream_t);
 void mfe_ffn_gate_up(const MfeFfnBatch&,cudaStream_t);

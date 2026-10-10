@@ -7,6 +7,8 @@
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <sstream>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -16,6 +18,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+
+#if defined(MFQ_NATIVE_CUDA_RUNTIME) && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#endif
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -87,7 +98,11 @@ bool first_nonzero(const char* name, bool fallback) {
 }
 bool resident_plan_overlap() {
     const auto* value = std::getenv("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
-    return value && std::atoi(value) == 1;
+    if(value)return std::atoi(value)==1;
+    // The GPU-only RAM/VRAM path has exact ordinary-generation coverage. Its
+    // small early-window gain is retained; steady-tail gain is not established.
+    // Keep mixed CPU scheduling explicit until it has the same coverage.
+    return exact_one("MFQ_MOE_RAM_PCIE_FRACTION");
 }
 std::optional<bool> rotary_fusion() {
     const auto* value = std::getenv("MFQ_ROTARY_FUSED");
@@ -97,6 +112,28 @@ bool mhc_timings() { return exact_one("MFQ_TRACE_MHC_TIMINGS"); }
 bool layer_timings() {
     const auto* value = std::getenv("MFQ_TRACE_LAYER_TIMINGS");
     return value && std::string_view(value) != "0";
+}
+int route_poll_interval_us() {
+    return environment_int("MFQ_MOE_ROUTE_POLL_US", 2000, 0, 1'000'000);
+}
+bool single_window_flush() { return exact_one("MFQ_MOE_SINGLE_WINDOW_FLUSH",true); }
+bool early_no_cpu_ready() { return exact_one("MFQ_MOE_EARLY_NO_CPU_READY",true); }
+bool skip_gpu_only_cpu_wait() { return exact_one("MFQ_MOE_SKIP_GPU_ONLY_CPU_WAIT",true); }
+bool skip_fixed_gpu_timing() { return exact_one("MFQ_MOE_SKIP_FIXED_GPU_TIMING",true); }
+bool window_input_views() { return exact_one("MFQ_MFE_WINDOW_INPUT_VIEWS",true); }
+bool decode_host_pin() { return exact_one("MFQ_MOE_DECODE_HOST_PIN"); }
+bool dma_graph_batch() { return exact_one("MFQ_MOE_DMA_GRAPH_BATCH"); }
+bool warp_multi_sum() { return exact_one("MFQ_CUDA_WARP_MULTI_SUM"); }
+float residency_heat_retention() {
+    const auto* setting=std::getenv("MFQ_MOE_RESIDENCY_HEAT_RETENTION");
+    if(!setting)return 0.7f;
+    char* end=nullptr;const float value=std::strtof(setting,&end);
+    if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
+        throw std::invalid_argument("MFQ_MOE_RESIDENCY_HEAT_RETENTION must be between zero and one");
+    return value;
+}
+int residency_interval() {
+    return environment_int("MFQ_MOE_RESIDENCY_INTERVAL",1,1,1024);
 }
 bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
 std::size_t workspace_reserve_bytes() {
@@ -131,6 +168,198 @@ MoeDiagnostics moe_diagnostics() {
     if (const auto* path = std::getenv("MFQ_MOE_MISS_RECORD")) result.miss_record = path;
     if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
     return result;
+}
+std::optional<int> embedding_mapped() {
+    const auto* value=std::getenv("MFQ_EMBEDDING_MAPPED");
+    return value ? std::optional<int>(value[0] - '0') : std::nullopt;
+}
+std::optional<bool> gdn_inplace_state() {
+    const auto* value=std::getenv("MFQ_GDN_INPLACE_STATE");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> gdn_prefill_fused() {
+    const auto* value=std::getenv("MFQ_GDN_PREFILL_FUSED");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> gr_dense_vector() {
+    const auto* value=std::getenv("MFQ_GR_DENSE_VECTOR");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> mfe_group_dot() {
+    const auto* value=std::getenv("MFQ_MFE_GROUP_DOT");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> mfe_nint_late_scale() {
+    const auto* value=std::getenv("MFQ_MFE_NINT_LATE_SCALE");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+std::optional<bool> mfe_nvq_word_signs() {
+    const auto* value=std::getenv("MFQ_MFE_NVQ_WORD_SIGNS");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> mfe_shared_dense_math() {
+    const auto* value=std::getenv("MFQ_MFE_SHARED_DENSE_MATH");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+std::optional<bool> moe_assert_resident() {
+    const auto* value=std::getenv("MFQ_MOE_ASSERT_RESIDENT");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+std::optional<bool> moe_nvq_dense() {
+    const auto* value=std::getenv("MFQ_MOE_NVQ_DENSE");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+std::optional<bool> moe_plan_reuse() {
+    const auto* value=std::getenv("MFQ_MOE_PLAN_REUSE");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_plan_reuse_check() {
+    const auto* value=std::getenv("MFQ_MOE_PLAN_REUSE_CHECK");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_compact_mma() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_COMPACT_MMA");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_direct_ram() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_DIRECT_RAM");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_expert_batch() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<std::int64_t> moe_prefill_expert_batch_tokens() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH_TOKENS");
+    return value ? std::optional<std::int64_t>(std::atoll(value)) : std::nullopt;
+}
+std::optional<bool> moe_prefill_graph() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_GRAPH");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_groups() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_GROUPS");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_async() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_ASYNC");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_flush() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_FLUSH");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_major() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_MAJOR");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_overlap() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_OVERLAP");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_phased() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_PHASED");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_layer_reuse_async() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_REUSE_ASYNC");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_prefill_pool_retain() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_POOL_RETAIN");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> moe_preload_all() {
+    const auto* value=std::getenv("MFQ_MOE_PRELOAD_ALL");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+bool nint_dense_reference() {
+    const auto* value=std::getenv("MFQ_NINT_DENSE_REFERENCE");
+    return value != nullptr;
+}
+std::optional<bool> nint_direct_pool() {
+    const auto* value=std::getenv("MFQ_NINT_DIRECT_POOL");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> nint_group_dot() {
+    const auto* value=std::getenv("MFQ_NINT_GROUP_DOT");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> nint_route_hint() {
+    const auto* value=std::getenv("MFQ_NINT_ROUTE_HINT");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> nint_route_row_workspace() {
+    const auto* value=std::getenv("MFQ_NINT_ROUTE_ROW_WORKSPACE");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<int> nint_route_warps() {
+    const auto* value=std::getenv("MFQ_NINT_ROUTE_WARPS");
+    return value ? std::optional<int>(std::atoi(value)) : std::nullopt;
+}
+std::optional<bool> nvq1_group_records() {
+    const auto* value=std::getenv("MFQ_NVQ1_GROUP_RECORDS");
+    return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
+}
+std::optional<bool> nvq1_integer_delta() {
+    const auto* value=std::getenv("MFQ_NVQ1_INTEGER_DELTA");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+bool nvq_dense_reference() {
+    const auto* value=std::getenv("MFQ_NVQ_DENSE_REFERENCE");
+    return value != nullptr;
+}
+std::optional<bool> ple_file_map() {
+    const auto* value=std::getenv("MFQ_PLE_FILE_MAP");
+    return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
+}
+std::optional<bool> prefill_expert_batch_audit() {
+    const auto* value=std::getenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> prefill_layer_major_trace() {
+    const auto* value=std::getenv("MFQ_PREFILL_LAYER_MAJOR_TRACE");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> qsa_prefill_fused() {
+    const auto* value=std::getenv("MFQ_QSA_PREFILL_FUSED");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> qsa_select_fused() {
+    const auto* value=std::getenv("MFQ_QSA_SELECT_FUSED");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> qsa_sparse_gate_fused() {
+    const auto* value=std::getenv("MFQ_QSA_SPARSE_GATE_FUSED");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> shared_gate_fused() {
+    const auto* value=std::getenv("MFQ_SHARED_GATE_FUSED");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> trace_mfe_dispatch() {
+    const auto* value=std::getenv("MFQ_TRACE_MFE_DISPATCH");
+    return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
+}
+std::optional<bool> trace_mfe_dispatch_requested() {
+    const auto* value=std::getenv("MFQ_TRACE_MFE_DISPATCH");
+    return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
+}
+std::optional<bool> trace_moe_serve() {
+    const auto* value=std::getenv("MFQ_TRACE_MOE_SERVE");
+    return value ? std::optional<bool>(value[0] != '\0' && value[0] != '0') : std::nullopt;
+}
+std::optional<bool> trace_ple_timings() {
+    const auto* value=std::getenv("MFQ_TRACE_PLE_TIMINGS");
+    return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
+}
+int moe_prefill_group_size() {
+    const auto* value=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE");
+    return value ? std::atoi(value) : 16;
 }
 } // namespace mfq::cuda::runtime_options
 
@@ -182,9 +411,10 @@ CudaExecutionConfig load_cuda_execution_config() {
     result.nvq_fusion = environment("MFQ_DISABLE_NVQ_FUSION")
         ? enabled_unless_disabled("MFQ_DISABLE_NVQ_FUSION")
         : enabled_unless_disabled("MFQ_DISABLE_NIQ_FUSION");
-    result.nvq2_exec = environment("MFQ_DISABLE_NVQ2_EXEC")
-        ? enabled_unless_disabled("MFQ_DISABLE_NVQ2_EXEC")
-        : enabled_unless_disabled("MFQ_DISABLE_NIQ2_EXEC");
+    result.nvq2_exec = environment_flag("MFQ_NVQ2_EXEC", false) &&
+        (environment("MFQ_DISABLE_NVQ2_EXEC")
+            ? enabled_unless_disabled("MFQ_DISABLE_NVQ2_EXEC")
+            : enabled_unless_disabled("MFQ_DISABLE_NIQ2_EXEC"));
     result.nvq_extended_group_exec = environment_flag(
         "MFQ_NVQ_EXTENDED_GROUP_EXEC", false);
     result.moe_nvq_heterogeneous = enabled_unless_disabled(
@@ -383,6 +613,18 @@ void CudaProfiler::reset() {
 void CudaProfiler::report(const std::string& title) {
     if (!enabled) return;
     if (!pending.empty()) cudaEventSynchronize(pending.back().stop);
+    const auto* timeline_setting=std::getenv("MFQ_PREFILL_LAYER_TIMELINE");
+    if(!pending.empty() && timeline_setting && std::atoi(timeline_setting)!=0) {
+        std::ostringstream trace;
+        trace<<"profile_timeline_begin "<<title<<'\n';
+        for(const auto& event:pending)if(event.name.starts_with("prefill.")) {
+            float begin=0,end=0;
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&begin,pending.front().start,event.start));
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&end,pending.front().start,event.stop));
+            trace<<"profile_timeline name="<<event.name<<" start_ms="<<begin<<" end_ms="<<end<<'\n';
+        }
+        const auto output=trace.str();std::fwrite(output.data(),1,output.size(),stderr);
+    }
     for (auto& event : pending) {
         float ms = 0.0f;
         cudaEventElapsedTime(&ms, event.start, event.stop);
@@ -795,4 +1037,39 @@ void report_cuda_memory(
               << " segments=" << stats.segments
               << " retries=" << stats.retries
               << " ooms=" << stats.ooms << "\n";
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    // cudaMemGetInfo does not describe this process's allocation ownership or
+    // WDDM budget. Report those separately when diagnosing residency pressure.
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto native=context->memory_stats();
+    std::uint64_t pool_used=0,pool_reserved=0;
+    cudaMemPool_t pool=nullptr;
+    if(cudaDeviceGetDefaultMemPool(&pool,mfq_current_cuda_device())==cudaSuccess) {
+        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&pool_used));
+        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&pool_reserved));
+    } else (void)cudaGetLastError();
+    std::cout<<"native_memory_stage="<<stage<<" owned_mib="<<native.allocated/mib
+             <<" peak_mib="<<native.peak/mib<<" limit_mib="<<native.limit/mib
+             <<" local_usage_mib="<<context->local_memory_usage()/mib
+             <<" pool_used_mib="<<pool_used/mib<<" pool_reserved_mib="<<pool_reserved/mib<<"\n";
+#ifdef _WIN32
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    cudaDeviceProp properties{};MFQ_CUDA_CHECK(cudaGetDeviceProperties(&properties,mfq_current_cuda_device()));
+    if(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))for(UINT index=0;;++index) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> item;
+        if(factory->EnumAdapters1(index,&item)==DXGI_ERROR_NOT_FOUND)break;
+        DXGI_ADAPTER_DESC1 description{};
+        if(FAILED(item->GetDesc1(&description)) || std::memcmp(properties.luid,&description.AdapterLuid,8))continue;
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+        if(SUCCEEDED(item.As(&adapter)))for(auto segment:{DXGI_MEMORY_SEGMENT_GROUP_LOCAL,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL}) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+            if(SUCCEEDED(adapter->QueryVideoMemoryInfo(0,segment,&memory)))
+                std::cout<<"wddm_memory_stage="<<stage<<" segment="<<(segment==DXGI_MEMORY_SEGMENT_GROUP_LOCAL?"local":"nonlocal")
+                         <<" budget_mib="<<memory.Budget/mib<<" usage_mib="<<memory.CurrentUsage/mib
+                         <<" reservation_mib="<<memory.CurrentReservation/mib<<"\n";
+        }
+        break;
+    }
+#endif
+#endif
 }

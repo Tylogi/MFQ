@@ -1,0 +1,86 @@
+#pragma once
+
+// Transient half high/residual tiles. Residuals are scaled by 4096 before
+// half conversion; two/three Tensor Core products retain FP32 accuracy.
+#include <mma.h>
+namespace {
+template<class Input,bool AlignedQ8,bool Zero>
+__global__ void gr_prefill_half2_kernel(const Input* input,
+        const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
+        const uint8_t* scales,const uint8_t* minima,const float* row_scales,
+        const float* row_minima,const __half* zero_scales,float* output,
+        int rows,int width,int outputs,int groups,int gs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__>=700
+    using namespace nvcuda;
+    constexpr int BM=64,BN=32,BK=32,Pad=40;
+    __shared__ __align__(32) __half ah[BM][Pad],al[BM][Pad],bh[BN][Pad],bl[BN][Pad];
+    __shared__ __align__(32) float result[BM][BN];
+    const int tid=threadIdx.x,warp=tid/32,wm=(warp/2)*16,wn=(warp%2)*16;
+    const int row0=int(blockIdx.y)*BM,out0=int(blockIdx.x)*BN;
+    wmma::fragment<wmma::accumulator,16,16,16,float> total;
+    wmma::fill_fragment(total,0.0f);
+    for(int k0=0;k0<width;k0+=BK) {
+        for(int i=tid;i<BM*BK;i+=256) {
+            const int r=i/BK,c=i%BK;
+            const float value=row0+r<rows && k0+c<width?
+                float(input[int64_t(row0+r)*width+k0+c]):0;
+            const auto top=__float2half_rn(value);
+            ah[r][c]=top;
+            if constexpr(!std::is_same_v<Input,__half>)
+                al[r][c]=__float2half_rn(__fsub_rn(value,__half2float(top))*4096.0f);
+        }
+        for(int i=tid;i<BN*BK;i+=256) {
+            const int r=i/BK,c=i%BK,neuron=out0+r,column=k0+c;
+            float value=0;
+            if(neuron<outputs && column<width) {
+                const int64_t meta=int64_t(neuron)*groups+column/gs;
+                float q,scale,minimum;
+                if constexpr(Zero) {
+                    q=float(static_cast<int8_t>(packed[meta*gs+column%gs]));
+                    scale=__half2float(zero_scales[meta]);minimum=0;
+                } else {
+                    const int bits=AlignedQ8?8:row_bits[neuron];
+                    const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+                    unsigned word=packed[bit>>3];const int shift=int(bit&7);
+                    if(shift+bits>8)word|=unsigned(packed[(bit>>3)+1])<<8;
+                    q=float((word>>shift)&((1u<<bits)-1));
+                    scale=row_scales[neuron]*float(scales[meta]);
+                    minimum=row_minima[neuron]*float(minima[meta]);
+                }
+                value=__fsub_rn(__fmul_rn(scale,q),minimum);
+            }
+            const auto top=__float2half_rn(value);
+            bh[r][c]=top;bl[r][c]=__float2half_rn(__fsub_rn(value,__half2float(top))*4096.0f);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::accumulator,16,16,16,float> high,low;
+        wmma::fill_fragment(high,0.0f);wmma::fill_fragment(low,0.0f);
+        #pragma unroll
+        for(int k=0;k<BK;k+=16) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> a_hi,a_lo;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> b_hi,b_lo;
+            wmma::load_matrix_sync(a_hi,&ah[wm][k],Pad);
+            wmma::load_matrix_sync(b_hi,&bh[wn][k],Pad);
+            wmma::load_matrix_sync(b_lo,&bl[wn][k],Pad);
+            wmma::mma_sync(high,a_hi,b_hi,high);
+            wmma::mma_sync(low,a_hi,b_lo,low);
+            if constexpr(!std::is_same_v<Input,__half>) {
+                wmma::load_matrix_sync(a_lo,&al[wm][k],Pad);
+                wmma::mma_sync(low,a_lo,b_hi,low);
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<total.num_elements;++i)
+            total.x[i]+=high.x[i]+low.x[i]*(1.0f/4096.0f);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&result[wm][wn],total,BN,wmma::mem_row_major);
+    __syncthreads();
+    for(int i=tid;i<BM*BN;i+=256) {
+        const int m=i/BN,n=i%BN;
+        if(row0+m<rows && out0+n<outputs)
+            output[int64_t(row0+m)*outputs+out0+n]=result[m][n];
+    }
+#endif
+}
+} // namespace

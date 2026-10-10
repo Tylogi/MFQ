@@ -19,6 +19,12 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     int64_t secondary_tile_m, int64_t tertiary_tile_m);
 void moe_quantize_shared_input_cuda(mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor descriptors,int64_t total_groups);
+void moe_quantize_shared_nint_rows_cuda(mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor descriptors,int64_t total_groups,bool quantize,
+    mfq_tensor_backend::Tensor offsets,mfq_tensor_backend::Tensor scales,
+    mfq_tensor_backend::Tensor minima,mfq_tensor_backend::Tensor row_metadata,
+    mfq_tensor_backend::Tensor expert_local,mfq_tensor_backend::Tensor ids,
+    int64_t output_rows,int64_t local_experts);
 mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,

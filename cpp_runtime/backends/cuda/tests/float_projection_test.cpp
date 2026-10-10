@@ -3,6 +3,7 @@
 #include "gated_residual_fused.h"
 #include "cuda_execution.h"
 #include "storage/weight_loader.h"
+#include "storage/mapped_embedding.h"
 #include "selected_attention.h"
 #include "qwen4_exp.h"
 #include "runtime/decode_window.h"
@@ -17,6 +18,74 @@
 
 namespace tb = mfq_tensor_backend;
 namespace {
+void mapped_embedding_latency() {
+    constexpr int rows=248320,width=2560,lookups=256,replays=12;
+    const auto stream=mfq_current_cuda_stream();
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    auto host=tb::empty({rows,width},tb::TensorOptions().device(tb::kCPU).dtype(tb::kBFloat16));
+    std::memset(host.data_ptr(),0x3f,host.numel()*host.element_size());
+    std::vector<int64_t> values(lookups);
+    for(int i=0;i<lookups;++i)values[i]=(997*i+571)%rows;
+    auto ids=tb::tensor(values).to(tb::kCUDA);
+    for(int mode:{0,1,2,1,0}) {
+        QuantLinear table;
+        if(mode) table=map_dense_embedding(host,mfq_current_cuda_device(),mode==2);
+        else {table.kind=QuantLinearKind::Dense;table.dense=host.to(tb::kCUDA);}
+        tb::Tensor output;
+        const auto body=[&] {
+            for(int i=0;i<lookups;++i)output=quant_embedding_lookup(table,ids.narrow(0,i,1));
+        };
+        {
+            mfq::cuda::GraphWarmupScope warm(context,stream);
+            body();mfq_cuda_synchronize();output={};
+        }
+        mfq::cuda::Graph graph;
+        graph.capture_begin_shared();body();graph.capture_end();
+        for(int i=0;i<3;++i)graph.replay();
+        mfq_cuda_synchronize();
+        cudaEvent_t first,last;
+        MFQ_CUDA_CHECK(cudaEventCreate(&first));MFQ_CUDA_CHECK(cudaEventCreate(&last));
+        MFQ_CUDA_CHECK(cudaEventRecord(first,stream));
+        for(int i=0;i<replays;++i)graph.replay();
+        MFQ_CUDA_CHECK(cudaEventRecord(last,stream));MFQ_CUDA_CHECK(cudaEventSynchronize(last));
+        float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,first,last));
+        MFQ_CUDA_CHECK(cudaEventDestroy(first));MFQ_CUDA_CHECK(cudaEventDestroy(last));
+        std::cout<<"embedding_latency mode="<<mode<<" rows="<<rows<<" width="<<width
+                 <<" graph_lookups="<<lookups<<" replays="<<replays
+                 <<" us_per_lookup="<<ms*1000/(lookups*replays)<<std::endl;
+    }
+}
+void mapped_embedding() {
+    int cases=0;
+    const auto before=mfq::cuda::tensor_host_bytes.load();
+    for(bool device_control:{false,true})for(auto dtype:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})for(int width:{57,2560}) {
+        auto host=tb::empty({257,width},tb::TensorOptions().device(tb::kCPU).dtype(dtype));
+        auto* bytes=host.data_ptr<uint8_t>();
+        for(std::size_t i=0;i<host.numel()*host.element_size();++i)bytes[i]=uint8_t(i*37+i/13);
+        QuantLinear reference;reference.kind=QuantLinearKind::Dense;reference.dense=host.to(tb::kCUDA);
+        auto original=map_dense_embedding(host,mfq_current_cuda_device(),device_control);
+        auto mapped=original;original={}; // copied QuantLinear must retain the mapped allocation
+        for(int count:{1,7,257})for(auto id_type:{tb::kInt32,tb::kInt64}) {
+            auto ids=tb::zeros({1,count},tb::TensorOptions().device(tb::kCUDA).dtype(id_type));
+            tb::Tensor actual;
+            mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+            window.capture([&]{actual=quant_embedding_lookup(mapped,ids);},[]{},[&]{actual={};});
+            for(int step=0;step<3;++step) {
+                std::vector<int64_t> next(count);
+                for(int i=0;i<count;++i)next[i]=i%3==0?256:i%3==1?0:(i*19+step*53)%257;
+                ids.copy_(tb::tensor(next).reshape({1,count}).to(id_type).to(tb::kCUDA));
+                window.run();
+                auto a=actual.cpu().contiguous(),b=quant_embedding_lookup(reference,ids).cpu().contiguous();
+                if(a.sizes().vec()!=b.sizes().vec() || a.scalar_type()!=b.scalar_type() ||
+                        std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size()))
+                    throw std::runtime_error("mapped embedding changed stored output bytes");
+                ++cases;
+            }
+        }
+    }
+    if(mfq::cuda::tensor_host_bytes.load()!=before)throw std::runtime_error("mapped embedding host ownership leaked");
+    std::cout<<"mapped_embedding_cases="<<cases<<" mapped/device-control, F16/BF16/F32, int32/int64 IDs, duplicate/boundary rows, changing graph and ownership exact PASS"<<std::endl;
+}
 template<class T> tb::Tensor upload(const std::vector<T>& values, tb::ScalarType dtype,
         const std::vector<int64_t>& shape) {
     auto host = tb::empty({int64_t(values.size())}, tb::TensorOptions().device(tb::kCPU).dtype(dtype));
@@ -217,7 +286,8 @@ void compare(const tb::Tensor& actual,const std::vector<float>& expected,const s
     for (size_t i=0; i<expected.size(); ++i) {
         const double value=host.data_ptr<float>()[i], ref=expected[i];
         if (!std::isfinite(value) || std::abs(value-ref)>1e-5+1e-4*std::abs(ref))
-            throw std::runtime_error(name+" FP32 projection differs from FP64 oracle at "+std::to_string(i));
+            throw std::runtime_error(name+" FP32 projection differs from FP64 oracle at "+std::to_string(i)+
+                " actual="+std::to_string(value)+" expected="+std::to_string(ref));
     }
 }
 
@@ -233,6 +303,233 @@ void synthetic(int outputs,int width,int group,int batch,bool zero) {
     auto x=upload(input,tb::kFloat32,{batch,width});
     compare(nint_float_projection_cuda(fixture.weight,x),expected,"synthetic");
     compare(nint_float_projection_cuda(fixture.weight,x,false),expected,"original unsplit projection");
+}
+
+class PrefillProjectionScope {
+    std::string old_;
+    bool present_;
+    static void set(const char* value) {
+#ifdef _WIN32
+        _putenv_s("MFQ_GR_PREFILL_MATMUL",value);
+#else
+        if(*value)setenv("MFQ_GR_PREFILL_MATMUL",value,1);else unsetenv("MFQ_GR_PREFILL_MATMUL");
+#endif
+    }
+public:
+    explicit PrefillProjectionScope(int mode):present_(std::getenv("MFQ_GR_PREFILL_MATMUL")!=nullptr) {
+        if(present_)old_=std::getenv("MFQ_GR_PREFILL_MATMUL");set(mode<0?"":std::to_string(mode).c_str());
+    }
+    ~PrefillProjectionScope(){set(present_?old_.c_str():"");}
+};
+class PrefillMixScope {
+    std::string old_;
+    bool present_;
+    static void set(const char* value) {
+#ifdef _WIN32
+        _putenv_s("MFQ_GR_PREFILL_FUSED_MIX",value);
+#else
+        if(*value)setenv("MFQ_GR_PREFILL_FUSED_MIX",value,1);else unsetenv("MFQ_GR_PREFILL_FUSED_MIX");
+#endif
+    }
+public:
+    explicit PrefillMixScope(int mode):present_(std::getenv("MFQ_GR_PREFILL_FUSED_MIX")!=nullptr) {
+        if(present_)old_=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");set(std::to_string(mode).c_str());
+    }
+    ~PrefillMixScope(){set(present_?old_.c_str():"");}
+};
+void prefill_projection_check(bool benchmark,bool k_tiles=false,int paired_trial=12,int paired_baseline=6) {
+    int cases=0;
+    for(int kernel:{-1,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20})for(const auto shape:std::vector<std::array<int,3>>{{17,77,5},{128,263,24},{129,320,48},{65,515,64},{320,77,24},{260,77,5}})
+    for(int rows:{65,129})
+    for(int mode:{0,1,2})for(auto dtype:{tb::kFloat16,tb::kFloat32}) {
+        const int out=shape[0],width=shape[1],gs=shape[2];
+        auto fixture=make_weight(out,width,gs,mode==2,mode==1);
+        std::vector<float> source(rows*width),expected(rows*out);
+        for(std::size_t i=0;i<source.size();++i) {
+            source[i]=std::sin(float(i)*.031f)*.13f;
+            if(dtype==tb::kFloat16)source[i]=float(mfq_half(source[i]));
+        }
+        for(int m=0;m<rows;++m)for(int n=0;n<out;++n) {
+            double sum=0;for(int k=0;k<width;++k)sum+=double(source[m*width+k])*fixture.dense[n*width+k];
+            expected[m*out+n]=float(sum);
+        }
+        auto x=upload(source,tb::kFloat32,{rows,width}).to(dtype);
+        PrefillProjectionScope enabled(kernel);
+        if(kernel>=4 || kernel==-1) {
+            auto actual=nint_float_projection_cuda(fixture.weight,x).cpu().contiguous();
+            PrefillProjectionScope original(1);
+            auto reference=nint_float_projection_cuda(fixture.weight,x).cpu().contiguous();
+            if(std::memcmp(actual.data_ptr(),reference.data_ptr(),actual.numel()*sizeof(float))!=0)
+                throw std::runtime_error("GR tile variant changed FP32 output bits");
+        }
+        compare(nint_float_projection_cuda(fixture.weight,x),expected,"batched GR compressed projection out="+std::to_string(out)+
+            " K="+std::to_string(width)+" mode="+std::to_string(mode)+" half="+std::to_string(dtype==tb::kFloat16)+
+            " kernel="+std::to_string(kernel));++cases;
+        auto projected=upload(expected,tb::kFloat32,{rows,out});
+        if(dtype==tb::kFloat16)projected=projected.to(dtype);
+        for(bool injection:{false,true}) {
+            auto actual=nint_float_projection_activation_cuda(fixture.weight,x,4,injection);
+            auto reference=injection?mfq_qwen4_exp::gated_residual_injection(projected,4):mfq_qwen4_exp::gated_residual_bottleneck(projected,4);
+            auto a=actual.to(tb::kFloat32).cpu().contiguous(),b=reference.to(tb::kFloat32).cpu().contiguous();
+            double squared_error=0,squared_norm=0;
+            for(int64_t i=0;i<a.numel();++i) {
+                const double delta=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
+                squared_error+=delta*delta;squared_norm+=double(b.data_ptr<float>()[i])*b.data_ptr<float>()[i];
+                // A changed accumulation order can move a projection across one
+                // Half rounding boundary before sigmoid. Keep Float checks strict.
+                if(!std::isfinite(a.data_ptr<float>()[i]) || std::abs(a.data_ptr<float>()[i]-b.data_ptr<float>()[i])>
+                        2e-5+(dtype==tb::kFloat16?4e-3:1e-4)*std::abs(b.data_ptr<float>()[i]))
+                    throw std::runtime_error("GR batched projection activation differs from FP64 oracle out="+std::to_string(out)+
+                        " K="+std::to_string(width)+" mode="+std::to_string(mode)+" half="+std::to_string(dtype==tb::kFloat16)+
+                        " injection="+std::to_string(injection)+" index="+std::to_string(i)+" actual="+std::to_string(a.data_ptr<float>()[i])+
+                        " expected="+std::to_string(b.data_ptr<float>()[i]));
+            }
+            if(std::sqrt(squared_error/std::max(squared_norm,1e-20))>(dtype==tb::kFloat16?1e-3:1e-5))
+                throw std::runtime_error("GR batched activation relative RMS exceeds precision budget");
+            ++cases;
+        }
+        const int streams=out%4==0?4:1;
+        auto values=x.narrow(-1,0,1).expand({rows,out}).contiguous();
+        auto actual=nint_float_projection_mix_cuda(fixture.weight,x,values,streams);
+        auto reference=mfq_qwen4_exp::gated_residual_mix(projected,values,streams);
+        auto a=actual.to(tb::kFloat32).cpu().contiguous(),b=reference.to(tb::kFloat32).cpu().contiguous();
+        if((kernel>=4 || kernel==-1) && streams==4) {
+            auto fused=actual.cpu().contiguous();
+            PrefillMixScope old(false);
+            auto original=nint_float_projection_mix_cuda(fixture.weight,x,values,streams).cpu().contiguous();
+            if(std::memcmp(fused.data_ptr(),original.data_ptr(),fused.nbytes())!=0)
+                throw std::runtime_error("GR prefill fused mix changed original output bits");
+        }
+        double error=0,norm=0;
+        for(int64_t i=0;i<a.numel();++i) {
+            const double delta=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
+            if(!std::isfinite(delta))throw std::runtime_error("GR batched mix produced a nonfinite value");
+            error+=delta*delta;norm+=double(b.data_ptr<float>()[i])*b.data_ptr<float>()[i];
+        }
+        if(std::sqrt(error/std::max(norm,1e-20))>(dtype==tb::kFloat16?1e-3:1e-5))
+            throw std::runtime_error("GR batched mix differs from FP64 projection oracle");
+        ++cases;
+    }
+    std::cout<<"gr_prefill_projection_cases="<<cases<<" FP64 oracle, adaptive q1..8, aligned/signed q8, groups5/24/48/64, K/N/M tails, Half/Float, activation and mix PASS\n";
+    if(!benchmark)return;
+    if(k_tiles) {
+        const auto shapes=paired_trial>12?std::vector<std::pair<int,int>>{{320,10240},{10240,320}}:
+            std::vector<std::pair<int,int>>{{320,10240}};
+        for(const auto shape:shapes)
+        for(auto dtype:{tb::kFloat32,tb::kFloat16})for(int packing:{0,1,2}) {
+            const int rows=1024,out=shape.first,width=shape.second;
+            auto fixture=make_weight(out,width,48,packing==2,packing==1);
+            std::vector<float> values(rows*width);
+            for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.13f;
+            auto x=upload(values,tb::kFloat32,{rows,width}).to(dtype);
+            std::vector<float> old_times,new_times;
+            tb::Tensor original;
+            for(int repeat=0;repeat<12;++repeat)for(int order=0;order<2;++order) {
+                const bool candidate=(order^(repeat&1))!=0;
+                PrefillProjectionScope option(candidate?paired_trial:paired_baseline);
+                tb::Tensor output;
+                for(int i=0;i<2;++i)output=nint_float_projection_cuda(fixture.weight,x);
+                mfq_cuda_synchronize();
+                cudaEvent_t start,stop;MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+                MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
+                for(int i=0;i<10;++i)output=nint_float_projection_cuda(fixture.weight,x);
+                MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+                float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));cudaEventDestroy(start);cudaEventDestroy(stop);
+                if(!candidate && !original.defined())original=output.cpu().contiguous();
+                auto checked=output.cpu().contiguous();
+                if(std::memcmp(checked.data_ptr(),original.data_ptr(),checked.numel()*sizeof(float))!=0)
+                    throw std::runtime_error("paired GR K tile changed FP32 output bits");
+                if(repeat>=2)(candidate?new_times:old_times).push_back(ms/10);
+            }
+            std::sort(old_times.begin(),old_times.end());std::sort(new_times.begin(),new_times.end());
+            std::cout<<"gr_prefill_k_tile_pair half="<<(dtype==tb::kFloat16)<<" packing="<<packing
+                <<" tokens="<<rows<<" out="<<out<<" K="<<width<<" original_ms="<<old_times[old_times.size()/2]
+                <<" candidate_ms="<<new_times[new_times.size()/2]<<" original_mode="<<paired_baseline
+                <<" candidate_mode="<<paired_trial<<" output_bits_equal=1"<<std::endl;
+        }
+        return;
+    }
+    for(int rows:{1024,8192})for(auto dtype:{tb::kFloat32,tb::kFloat16})for(const auto shape:std::vector<std::pair<int,int>>{{320,10240},{10240,320}}) {
+        auto fixture=make_weight(shape.first,shape.second,48,false,true);
+        std::vector<float> values(rows*shape.second);
+        for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.13f;
+        auto x=upload(values,tb::kFloat32,{rows,shape.second}).to(dtype);
+        tb::Tensor reference,exact_reference;
+        const std::vector<int> kernels=k_tiles?std::vector<int>{1,6,10,11,12}:std::vector<int>{0,1,2,3,4,5,6,7,8,9,10,11,12};
+        for(int batched:kernels) {
+            PrefillProjectionScope option(batched);tb::Tensor output;
+            for(int i=0;i<2;++i)output=nint_float_projection_cuda(fixture.weight,x);
+            mfq_cuda_synchronize();cudaEvent_t start,stop;MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+            MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
+            for(int i=0;i<5;++i)output=nint_float_projection_cuda(fixture.weight,x);
+            MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+            float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));cudaEventDestroy(start);cudaEventDestroy(stop);
+            if(batched==1)exact_reference=output.cpu().contiguous();
+            if(batched>=4) {
+                auto checked=output.cpu().contiguous();
+                if(std::memcmp(checked.data_ptr(),exact_reference.data_ptr(),checked.numel()*sizeof(float))!=0)
+                    throw std::runtime_error("real-shape GR tile changed FP32 output bits");
+            }
+            if(batched==(k_tiles?1:0))reference=output.cpu().contiguous();
+            else {
+                auto checked=output.cpu().contiguous();
+                double squared_error=0,norm=0;
+                for(int64_t i=0;i<checked.numel();++i) {
+                    const double expected=reference.data_ptr<float>()[i];
+                    const double delta=double(checked.data_ptr<float>()[i])-expected;
+                    squared_error+=delta*delta;norm+=expected*expected;
+                }
+                const double relative_rms=std::sqrt(squared_error/std::max(norm,1e-20));
+                if(!std::isfinite(squared_error) || relative_rms>1e-4)
+                    throw std::runtime_error("real-shape batched GR differs from original projection");
+                std::cout<<"gr_prefill_numeric kernel="<<batched<<" half="<<(dtype==tb::kFloat16)
+                    <<" out="<<shape.first<<" K="<<shape.second<<" relative_rms="<<relative_rms<<std::endl;
+            }
+            std::cout<<"gr_prefill_bench batched="<<batched<<" half="<<(dtype==tb::kFloat16)<<" tokens="<<rows<<" out="<<shape.first
+                <<" K="<<shape.second<<" milliseconds="<<ms/5<<std::endl;
+        }
+    }
+}
+
+void prefill_mix_fusion_check(int mode=1,int baseline=0) {
+    PrefillMixScope fused(mode);
+    prefill_projection_check(false);
+    constexpr int rows=1024,out=10240,width=320;
+    for(int packing:{0,1,2})for(auto input_dtype:{tb::kFloat32,tb::kFloat16})
+    for(auto value_dtype:{tb::kFloat32,tb::kFloat16}) {
+        auto fixture=make_weight(out,width,48,packing==2,packing==1);
+        std::vector<float> inputs(rows*width),values(rows*out);
+        for(std::size_t i=0;i<inputs.size();++i)inputs[i]=std::sin(float(i)*.017f)*.13f;
+        for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.023f)*.19f;
+        auto x=upload(inputs,tb::kFloat32,{rows,width}).to(input_dtype);
+        auto normalized=upload(values,tb::kFloat32,{rows,out}).to(value_dtype);
+        PrefillProjectionScope exact(17);
+        std::vector<float> old_times,new_times;
+        tb::Tensor original;
+        for(int repeat=0;repeat<10;++repeat)for(int order=0;order<2;++order) {
+            const bool candidate=(order^(repeat&1))!=0;
+            PrefillMixScope option(candidate?mode:baseline);
+            tb::Tensor output;
+            for(int i=0;i<2;++i)output=nint_float_projection_mix_cuda(fixture.weight,x,normalized,4);
+            mfq_cuda_synchronize();cudaEvent_t start,stop;
+            MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+            MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
+            for(int i=0;i<5;++i)output=nint_float_projection_mix_cuda(fixture.weight,x,normalized,4);
+            MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+            float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));cudaEventDestroy(start);cudaEventDestroy(stop);
+            if(!candidate && !original.defined())original=output.cpu().contiguous();
+            auto checked=output.cpu().contiguous();
+            if(std::memcmp(checked.data_ptr(),original.data_ptr(),checked.nbytes())!=0)
+                throw std::runtime_error("real-shape fused GR mix changed output bits");
+            if(repeat>=2)(candidate?new_times:old_times).push_back(ms/5);
+        }
+        std::sort(old_times.begin(),old_times.end());std::sort(new_times.begin(),new_times.end());
+        std::cout<<"gr_prefill_mix_pair input_half="<<(input_dtype==tb::kFloat16)
+            <<" value_half="<<(value_dtype==tb::kFloat16)<<" packing="<<packing<<" tokens="<<rows
+            <<" baseline_mode="<<baseline<<" candidate_mode="<<mode
+            <<" original_ms="<<old_times[old_times.size()/2]<<" candidate_ms="<<new_times[new_times.size()/2]
+            <<" output_bits_equal=1"<<std::endl;
+    }
 }
 
 std::vector<float> read(const std::filesystem::path& path,size_t count) {
@@ -481,13 +778,75 @@ void residual_model() {
 }
 
 namespace {
+int dense_vector_residual() {
+    int cases=0,checks=0;
+    for(int streams:{1,3,4})for(int hidden:{4,44,2560})for(int group:{5,48}) {
+        const int width=streams*hidden,rank=hidden==2560 && streams>=3?320:17;
+        auto down=make_weight(rank,width,group,false,group==48);
+        auto up=make_weight(width,rank,rank==17?32:group,false,group==48);
+        std::vector<float> weight(streams*width),input(2*width),branch_data(2*hidden),gamma(width);
+        for(size_t i=0;i<weight.size();++i)weight[i]=std::sin(float(i)*.137f)*.05f;
+        for(size_t i=0;i<input.size();++i)input[i]=std::cos(float(i)*.047f)*.73f;
+        for(size_t i=0;i<branch_data.size();++i)branch_data[i]=std::sin(float(i)*.017f)*.21f;
+        for(int i=0;i<width;++i)gamma[i]=std::sin(i*.03f)*.13f;
+        auto dense=upload(weight,tb::kFloat32,{streams,width}).to(tb::kBFloat16);
+        auto right=dense.transpose(0,1).to(tb::kFloat32);
+        auto packed=prepare_gr_dense_vector_right(right);
+        exact(packed.transpose(1,2).reshape({width,streams}),right,"vector injection weight roundtrip");
+        if(packed.numel()!=right.numel() || packed.element_size()!=right.element_size())
+            throw std::runtime_error("vector injection expanded weight storage");
+        auto norm=upload(gamma,tb::kFloat32,{width});
+        for(int batch:{1,2})for(bool half:{false,true})for(bool after:{false,true}) {
+            auto source=upload(input,tb::kFloat32,{2,1,width}).narrow(0,0,batch).contiguous();
+            auto residual=source.to(half?tb::kFloat16:tb::kFloat32).clone();
+            auto branch=upload(branch_data,tb::kFloat32,{2,1,hidden}).narrow(0,0,batch).to(tb::kFloat16).contiguous();
+            auto prior=upload(std::vector<float>(batch*streams,.37f),tb::kFloat32,{batch,1,streams});
+            const auto run=[&](const tb::Tensor& prepared) {
+                return gated_residual_two_stage_cuda(branch,residual,prior,norm,down.weight,up.weight,
+                    nullptr,streams,1e-6,after,dense,prepared);
+            };
+            auto actual=run(packed),expected=run(right);
+            for(int j=0;j<3;++j){exact(actual[j],expected[j],"vector dense residual eager");++checks;}
+            mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+            window.capture([&]{actual=run(packed);},[]{},[&]{actual.clear();});
+            for(int step=0;step<3;++step) {
+                residual.copy_((source*(.25+.5*step)).to(residual.scalar_type()));
+                window.run();expected=run(right);
+                for(int j=0;j<3;++j){exact(actual[j],expected[j],"vector dense residual changing graph");++checks;}
+            }
+            ++cases;
+        }
+        auto shifted=tb::empty({packed.numel()+1},packed.options()).narrow(0,1,packed.numel()).reshape(packed.sizes().vec());
+        shifted.copy_(packed);
+        bool rejected=false;
+        try {
+            auto residual=upload(input,tb::kFloat32,{2,1,width}).narrow(0,0,1).contiguous();
+            gated_residual_two_stage_cuda({},residual,{},norm,down.weight,up.weight,nullptr,streams,1e-6,false,dense,shifted);
+        }catch(const std::exception&){rejected=true;}
+        if(!rejected)throw std::runtime_error("misaligned vector injection accepted");
+    }
+    std::cout<<"dense_vector_residual cases="<<cases<<" output_checks="<<checks
+        <<" exact; streams1/3/4, hidden4/44/2560, group5/48, Half/Float, batch1/2, pre/after, graph replay and alignment rejection PASS\n"<<std::flush;
+    return checks;
+}
+
 void complete_two_stage_residual() {
     int ordinary=0,graphs=0;
-    for(int group:{5,24,28,32,48,64})for(int profile:{0,1,2})for(int streams:{1,3,4}) {
-        const int hidden=4096/streams,width=hidden*streams,rank=17;
+    for(int group:{5,24,28,32,48,64})for(int profile:{0,1,2})for(int streams:{1,3,4})for(int rank:{17,320})for(bool column_tail:{false,true}) {
+        if(column_tail && !(group==64 && profile==1 && streams==4 && rank==320))continue;
+        const int hidden=column_tail?1025:4096/streams,width=hidden*streams;
         auto down=make_weight(rank,width,group,profile==2,profile==1);
         auto up=make_weight(width,rank,group,profile==2,profile==1);
         auto inject=make_weight(streams,width,group==5?24:5,profile==2,profile==1);
+        if(rank==320 && profile==1) {
+            const auto shifted=[](const tb::Tensor& values) {
+                auto storage=tb::empty({values.numel()+1},values.options());
+                auto view=storage.narrow(0,1,values.numel()).reshape(values.sizes().vec());
+                view.copy_(values);return view;
+            };
+            up.weight.sub_scale=shifted(up.weight.sub_scale);
+            up.weight.sub_min=shifted(up.weight.sub_min);
+        }
         std::vector<float> data(width),gamma(width),gate(streams),branch_data(hidden);
         for(int j=0;j<width;++j) {data[j]=std::sin(j*.047f)*.73f;gamma[j]=std::cos(j*.023f)*.19f;}
         for(int j=0;j<hidden;++j)branch_data[j]=std::sin(j*.017f)*.21f;
@@ -536,15 +895,40 @@ void complete_two_stage_residual() {
         }
     }
     std::cout<<"complete_two_stage_residual ordinary="<<ordinary<<" changing_graph="<<graphs
-        <<" exact; runtime groups5/24/28/32/48/64, variable/aligned/signed q8, differing injection group, streams1/3/4, tails and pre/after PASS\n";
+        <<" exact; runtime groups5/24/28/32/48/64, rank17/320, variable/aligned/signed q8, unaligned metadata, differing injection group, streams1/3/4, 1025-column tails and pre/after PASS\n";
 }
 }
 
 int main(int argc,char** argv) try {
-    if (argc>2) throw std::runtime_error("expected optional canonical fixture directory");
+    if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-check") {prefill_mix_fusion_check(4,3);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-compact-check") {prefill_mix_fusion_check(5,3);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-mix-m256-check") {prefill_mix_fusion_check(3);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-mix-swizzle-check") {prefill_mix_fusion_check(2);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-mix-fusion-check") {prefill_mix_fusion_check();return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-compact-k-check") {prefill_projection_check(true,true,20,17);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-compact-baseline-check") {prefill_projection_check(true,true,19,6);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-register-adaptive-check") {prefill_projection_check(true,true,17,6);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-register-tile-check") {prefill_projection_check(true,true,18,12);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-k-tile-check") {prefill_projection_check(true,true);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-check") {prefill_projection_check(true);return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefill-oracle-only") {prefill_projection_check(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--mapped-embedding-latency") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+        mapped_embedding_latency();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--mapped-embedding") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+        mapped_embedding();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
+    }
+    const bool vector_only=argc>=2 && std::string(argv[1])=="--dense-vector";
+    if (argc>(vector_only?3:2)) throw std::runtime_error("expected fixture directory, or --dense-vector [completion report]");
+    int vector_checks=0;
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
-    if (argc==2) canonical(argv[1]);
+    if (vector_only)vector_checks=dense_vector_residual();
+    else if (argc==2) canonical(argv[1]);
     else {
         for (int group : {32,48,64}) for (int batch : {1,3,11}) synthetic(17,77,group,batch,false);
         for (int batch : {1,3,11}) synthetic(17,77,32,batch,true);
@@ -554,6 +938,7 @@ int main(int argc,char** argv) try {
         residual_model();
         residual_post_norm();
         complete_two_stage_residual();
+        dense_vector_residual();
         native_projection_inputs();
         fixed_group_projections();
         projection_activations();
@@ -567,6 +952,12 @@ int main(int argc,char** argv) try {
     }
     mfq_cuda_synchronize();
     context->end_graph_pool(stream);
+    if(vector_only && argc==3) {
+        std::ofstream report(argv[2]);
+        report<<"{\"output_checks\":"<<vector_checks<<",\"completed\":true}\n";
+        report.flush();
+        if(!report)throw std::runtime_error("cannot write vector check completion report");
+    }
     return 0;
 } catch (const std::exception& error) {
     std::cerr<<"float projection: "<<error.what()<<'\n';

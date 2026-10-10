@@ -11,6 +11,7 @@
 #include "minicpmo45.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
+#include "runtime/execution_options.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
 
 #include <algorithm>
@@ -88,13 +89,37 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool compare_mhc_fusion = false;
     bool compare_mhc_shared_norm = false;
     bool compare_mhc_dense_fusion = false;
+    bool compare_mhc_packed_groups = false;
+    bool compare_mhc_fixed_formats = false;
+    bool compare_mhc_async_normalized = false;
+    bool compare_gdn_fixed_geometry = false;
+    bool compare_gdn_inplace_state = false;
+    bool compare_qsa_fusion = false;
     bool compare_mfe_parallel_gu = false;
     bool compare_mfe_gpu_bundle = false;
+    bool compare_mfe_default_math = false;
+    bool compare_mfe_e8_narrow = false;
     bool compare_mfe_shared_first = false;
     bool compare_mfe_early_gu = false;
     bool compare_cpu_transfer_budget = false;
     bool compare_cpu_background_calibration = false;
     bool compare_router_topk = false;
+    bool compare_route_poll = false;
+    bool compare_window_flush = false;
+    bool compare_early_no_cpu_ready = false;
+    bool compare_gpu_only_cpu_wait = false;
+    bool compare_fixed_gpu_timing = false;
+    bool compare_window_input_views = false;
+    bool compare_route_spin = false;
+    bool compare_moe_plan_reuse = false;
+    bool compare_shared_gate_fusion = false;
+    bool compare_graph_optimizations = false;
+    int comparison_rounds = 1;
+    bool comparison_phase_timings = false;
+    bool compare_host_pin = false;
+    bool compare_resident_overlap = false;
+    bool compare_dma_graph_batch = false;
+    bool compare_warp_multi_sum = false;
     int warmup_prefill = -1;
     std::string router_lookahead_audit;
     std::string decode_inputs_file;
@@ -127,14 +152,36 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
 
     int runtime_comparison_modes() const {
         return int(compare_ffn_transfer_phases) + int(compare_router_lookahead) +
-               int(compare_rotary_fusion) + int(compare_attention_grouping) + int(compare_mhc_fusion) + int(compare_mhc_shared_norm) + int(compare_mhc_dense_fusion) + int(compare_mfe_parallel_gu) + int(compare_mfe_gpu_bundle) + int(compare_mfe_shared_first) + int(compare_mfe_early_gu) + int(compare_cpu_transfer_budget) + int(compare_cpu_background_calibration) +
-               int(compare_router_topk);
+               int(compare_rotary_fusion) + int(compare_attention_grouping) + int(compare_mhc_fusion) + int(compare_mhc_shared_norm) + int(compare_mhc_dense_fusion) + int(compare_mhc_packed_groups) + int(compare_mhc_fixed_formats) + int(compare_mhc_async_normalized) + int(compare_gdn_fixed_geometry) + int(compare_gdn_inplace_state) + int(compare_qsa_fusion) + int(compare_mfe_parallel_gu) + int(compare_mfe_gpu_bundle) + int(compare_mfe_default_math) + int(compare_mfe_e8_narrow) + int(compare_mfe_shared_first) + int(compare_mfe_early_gu) + int(compare_cpu_transfer_budget) + int(compare_cpu_background_calibration) +
+               int(compare_router_topk) + int(compare_route_poll) + int(compare_window_flush) + int(compare_early_no_cpu_ready) + int(compare_gpu_only_cpu_wait) + int(compare_fixed_gpu_timing) + int(compare_window_input_views) + int(compare_route_spin) + int(compare_moe_plan_reuse) + int(compare_shared_gate_fusion) + int(compare_graph_optimizations) + int(compare_host_pin) + int(compare_resident_overlap) + int(compare_dma_graph_batch) + int(compare_warp_multi_sum);
     }
     const char* runtime_comparison_name() const {
+        if (compare_route_poll) return "route_poll_comparison";
+        if (compare_window_flush) return "window_flush_comparison";
+        if (compare_early_no_cpu_ready) return "early_no_cpu_ready_comparison";
+        if (compare_gpu_only_cpu_wait) return "gpu_only_cpu_wait_comparison";
+        if (compare_fixed_gpu_timing) return "fixed_gpu_timing_comparison";
+        if (compare_window_input_views) return "window_input_views_comparison";
+        if (compare_route_spin) return "route_spin_comparison";
+        if (compare_moe_plan_reuse) return "moe_plan_reuse_comparison";
+        if (compare_mfe_default_math) return "mfe_default_math_comparison";
+        if (compare_mfe_e8_narrow) return "mfe_e8_narrow_comparison";
+        if (compare_shared_gate_fusion) return "shared_gate_fusion_comparison";
+        if (compare_graph_optimizations) return "graph_optimizations_comparison";
+        if (compare_host_pin) return "host_pin_comparison";
+        if (compare_resident_overlap) return "resident_overlap_comparison";
+        if (compare_dma_graph_batch) return "dma_graph_batch_comparison";
+        if (compare_warp_multi_sum) return "warp_multi_sum_comparison";
         if (compare_router_topk) return "router_topk_comparison";
         if (compare_mhc_fusion) return "mhc_fusion_comparison";
         if (compare_mhc_shared_norm) return "mhc_shared_norm_comparison";
         if (compare_mhc_dense_fusion) return "mhc_dense_fusion_comparison";
+        if (compare_mhc_packed_groups) return "mhc_packed_groups_comparison";
+        if (compare_mhc_fixed_formats) return "mhc_fixed_formats_comparison";
+        if (compare_mhc_async_normalized) return "mhc_async_normalized_comparison";
+        if (compare_gdn_fixed_geometry) return "gdn_fixed_geometry_comparison";
+        if (compare_gdn_inplace_state) return "gdn_inplace_state_comparison";
+        if (compare_qsa_fusion) return "qsa_fusion_comparison";
         if (compare_mfe_parallel_gu) return "mfe_parallel_gu_comparison";
         if (compare_mfe_gpu_bundle) return "mfe_gpu_bundle_comparison";
         if (compare_mfe_shared_first) return "mfe_shared_first_comparison";
@@ -198,18 +245,29 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         // Operator-only checks do not require loading a model.
         if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
         if (check_backend_argmax) return run_backend_argmax_check(151748, 2000);
+        MFQ_RUNTIME_CHECK(!comparison_phase_timings || runtime_comparison_modes(),
+            "comparison phase timings require a runtime comparison");
         if(runtime_comparison_modes()) {
-            MFQ_RUNTIME_CHECK(gen>1 && !decode_inputs.empty() && !profile &&
+            MFQ_RUNTIME_CHECK(mfq::cuda::runtime_options::transfer_cache() &&
+                !mfq::cuda::runtime_options::mapped_copy(),
+                "runtime comparison requires MFQ_MOE_TRANSFER_CACHE=1 and MFQ_MOE_MAPPED_COPY=0");
+            const bool free_gpu_comparison=decode_inputs.empty() &&
+                (compare_route_spin || compare_moe_plan_reuse || compare_shared_gate_fusion || compare_graph_optimizations || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion) &&
+                execution.config.moe_ram_pcie_fraction && *execution.config.moe_ram_pcie_fraction==1.0;
+            MFQ_RUNTIME_CHECK(gen>1 && (!decode_inputs.empty() || free_gpu_comparison) && !profile &&
                 runtime_comparison_modes() == 1 && router_lookahead_audit.empty() &&
                 !execution.config.moe_mapped_gather && execution.config.moe_preload_all &&
                 execution.config.moe_two_stage_ffn && moe_gpu_cache_gb>0,
-                "runtime comparison requires fixed decode inputs, complete expert preload, two-stage FFN and profiling disabled");
+                "runtime comparison requires fixed inputs or an eligible GPU-only free-decode comparison, complete preload, two-stage FFN and profiling disabled");
             MFQ_RUNTIME_CHECK(!compare_attention_grouping ||
                 execution.config.diagnostic_nint_group,
                 "attention-grouping comparison requires grouped NINT enabled");
             MFQ_RUNTIME_CHECK(!compare_mhc_fusion || (execution.config.gr_fused_projections &&
                 execution.config.gr_native_projection_input),
                 "residual fusion comparison requires native packed projections");
+            MFQ_RUNTIME_CHECK(!(compare_gpu_only_cpu_wait || compare_fixed_gpu_timing || compare_graph_optimizations) || (execution.config.moe_ram_pcie_fraction &&
+                *execution.config.moe_ram_pcie_fraction==1.0),
+                "fixed GPU comparison requires MFQ_MOE_RAM_PCIE_FRACTION=1");
             execution.config.moe_residency_adapt=false;
             std::cout<<std::unitbuf;
         }
@@ -578,8 +636,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "--bench-qwen35-mtp requires Qwen35CausalLm");
         }
         if (!prefill_sweep_sizes.empty()) {
+            execution.profiler.enabled=profile;
             const int status = run_prefill_sweep(
-                model, prefill_sweep_sizes, prefill_sweep_reps);
+                model, prefill_sweep_sizes, prefill_sweep_reps,execution);
             if (execution.moe_expert_cache) {
                 print_moe_expert_cache_stats(
                     execution.moe_expert_cache, std::cout);
@@ -626,23 +685,98 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             ScopedDiagnosticEnvironment topk_cache("MFQ_MOE_TOPK_CACHE");
             ScopedDiagnosticEnvironment shared_norm("MFQ_GR_SHARE_NORM");
             ScopedDiagnosticEnvironment dense_fusion("MFQ_GR_DENSE_FUSION");
+            ScopedDiagnosticEnvironment gr_groups("MFQ_GR_FIXED_GROUPS");
+            ScopedDiagnosticEnvironment gr_threads("MFQ_GR_UP_THREADS");
+            ScopedDiagnosticEnvironment gr_formats("MFQ_GR_FIXED_FORMATS");
+            ScopedDiagnosticEnvironment gr_async("MFQ_GR_ASYNC_NORMALIZED");
+            ScopedDiagnosticEnvironment gdn_geometry("MFQ_GDN_FIXED_GEOMETRY");
+            ScopedDiagnosticEnvironment gdn_inplace("MFQ_GDN_INPLACE_STATE");
+            ScopedDiagnosticEnvironment qsa_selection("MFQ_QSA_SELECT_FUSED");
+            ScopedDiagnosticEnvironment qsa_gate("MFQ_QSA_SPARSE_GATE_FUSED");
+            ScopedDiagnosticEnvironment qsa_reduce("MFQ_QSA_PARALLEL_REDUCE");
+            ScopedDiagnosticEnvironment qsa_query("MFQ_QSA_SPARSE_QUERY_FUSED");
             ScopedDiagnosticEnvironment parallel_gu("MFQ_MFE_PARALLEL_GU");
             ScopedDiagnosticEnvironment gpu_bundle("MFQ_MFE_GPU_BUNDLE");
+            ScopedDiagnosticEnvironment default_math("MFQ_MFE_DEFAULT_MATH");
+            ScopedDiagnosticEnvironment e8_narrow("MFQ_MFE_E8_NARROW");
             ScopedDiagnosticEnvironment shared_first("MFQ_MFE_SHARED_FIRST");
             ScopedDiagnosticEnvironment early_gu("MFQ_MFE_EARLY_GU");
             ScopedDiagnosticEnvironment cpu_background("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
-            MFQ_RUNTIME_CHECK(!(compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_two_stage_ffn,
+            ScopedDiagnosticEnvironment route_poll("MFQ_MOE_ROUTE_POLL_US");
+            ScopedDiagnosticEnvironment window_flush("MFQ_MOE_SINGLE_WINDOW_FLUSH");
+            ScopedDiagnosticEnvironment early_no_cpu_ready("MFQ_MOE_EARLY_NO_CPU_READY");
+            ScopedDiagnosticEnvironment gpu_only_cpu_wait("MFQ_MOE_SKIP_GPU_ONLY_CPU_WAIT");
+            ScopedDiagnosticEnvironment fixed_gpu_timing("MFQ_MOE_SKIP_FIXED_GPU_TIMING");
+            ScopedDiagnosticEnvironment window_input_views("MFQ_MFE_WINDOW_INPUT_VIEWS");
+            ScopedDiagnosticEnvironment route_spin("MFQ_MOE_ROUTE_SPIN");
+            ScopedDiagnosticEnvironment plan_reuse("MFQ_MOE_PLAN_REUSE");
+            ScopedDiagnosticEnvironment shared_gate_fusion("MFQ_SHARED_GATE_FUSED");
+            ScopedDiagnosticEnvironment layer_timings("MFQ_TRACE_LAYER_TIMINGS");
+            ScopedDiagnosticEnvironment mhc_timings("MFQ_TRACE_MHC_TIMINGS");
+            ScopedDiagnosticEnvironment host_pin("MFQ_MOE_DECODE_HOST_PIN");
+            ScopedDiagnosticEnvironment resident_overlap("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+            ScopedDiagnosticEnvironment dma_graph_batch("MFQ_MOE_DMA_GRAPH_BATCH");
+            ScopedDiagnosticEnvironment warp_multi_sum("MFQ_CUDA_WARP_MULTI_SUM");
+            MFQ_RUNTIME_CHECK(!(compare_mfe_e8_narrow || compare_mfe_default_math || compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_two_stage_ffn,
                 "MFE parallel Gate/Up comparison requires two-stage FFN");
             MFQ_RUNTIME_CHECK(!compare_mhc_shared_norm || execution.config.gr_two_stage,
                 "MHC norm comparison requires fused residual projection");
             MFQ_RUNTIME_CHECK(!compare_mhc_dense_fusion || (execution.config.gr_two_stage && execution.config.gr_two_stage_dense_injection),
                 "MHC dense fusion comparison requires fused residual BF16 injection");
-            for(int pass=0;pass<3;++pass) {
-                const bool phased=pass==1;
+            MFQ_RUNTIME_CHECK(!(compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_graph_optimizations) || execution.config.gr_two_stage,
+                "MHC packed group comparison requires fused residual projection");
+            MFQ_RUNTIME_CHECK(!(compare_gdn_fixed_geometry || compare_gdn_inplace_state) ||
+                (execution.config.gdn_fused_core && execution.config.gdn_fused_preparation &&
+                 execution.config.gdn_fused_output && execution.config.gdn_transposed_state),
+                "GDN comparison requires the complete fused transposed core");
+            const int performance_passes=3*comparison_rounds;
+            for(int pass=0;pass<performance_passes+(comparison_phase_timings?3:0);++pass) {
+                const bool phased=pass%3==1;
+                const bool phase_timings=comparison_phase_timings && pass>=performance_passes;
+                if(comparison_phase_timings) {
+                    layer_timings.set(phase_timings?"2":"0");mhc_timings.set("0");
+                }
+                if (compare_route_poll) route_poll.set(phased ? "0" : "2000");
+                if (compare_window_flush) window_flush.set(phased ? "1" : "0");
+                if (compare_early_no_cpu_ready) early_no_cpu_ready.set(phased ? "1" : "0");
+                if (compare_gpu_only_cpu_wait) gpu_only_cpu_wait.set(phased ? "1" : "0");
+                if (compare_fixed_gpu_timing) fixed_gpu_timing.set(phased ? "1" : "0");
+                if (compare_window_input_views) window_input_views.set(phased ? "1" : "0");
+                if (compare_route_spin) route_spin.set(phased ? "1" : "0");
+                if (compare_moe_plan_reuse) plan_reuse.set(phased ? "1" : "0");
+                if (compare_mfe_default_math) default_math.set(phased ? "1" : "0");
+                if (compare_mfe_e8_narrow) e8_narrow.set(phased ? "1" : "0");
+                if (compare_shared_gate_fusion) shared_gate_fusion.set(phased ? "1" : "0");
+                if (compare_graph_optimizations) {
+                    window_flush.set(phased ? "1" : "0");
+                    early_no_cpu_ready.set(phased ? "1" : "0");
+                    gpu_only_cpu_wait.set(phased ? "1" : "0");
+                    window_input_views.set(phased ? "1" : "0");
+                    route_spin.set(phased ? "1" : "0");
+                    shared_gate_fusion.set(phased ? "1" : "0");
+                    gr_groups.set(phased ? "1" : "0");
+                    gr_threads.set(phased ? "512" : "256");
+                }
+                if (compare_host_pin) host_pin.set(phased ? "1" : "0");
+                if (compare_resident_overlap) resident_overlap.set(phased ? "1" : "0");
+                if (compare_dma_graph_batch) dma_graph_batch.set(phased ? "1" : "0");
+                if (compare_warp_multi_sum) warp_multi_sum.set(phased ? "1" : "0");
                 if (compare_cpu_background_calibration) cpu_background.set(phased ? "1" : "0");
                 if (compare_router_topk) topk_cache.set(phased ? "1" : "0");
                 if (compare_mhc_shared_norm) shared_norm.set(phased ? "1" : "0");
                 if (compare_mhc_dense_fusion) {shared_norm.set("1");dense_fusion.set(phased ? "1" : "0");}
+                if (compare_mhc_packed_groups) {
+                    gr_groups.set(phased?"1":"0");gr_threads.set(phased?"512":"256");
+                }
+                if (compare_mhc_fixed_formats)gr_formats.set(phased?"1":"0");
+                if (compare_mhc_async_normalized)gr_async.set(phased?"1":"0");
+                if (compare_gdn_fixed_geometry)gdn_geometry.set(phased?"1":"0");
+                if (compare_gdn_inplace_state)gdn_inplace.set(phased?"1":"0");
+                if (compare_qsa_fusion) {
+                    qsa_selection.set(phased?"1":"0");qsa_gate.set(phased?"1":"0");
+                    qsa_reduce.set(phased?"1":"0");
+                    qsa_query.set(phased?"1":"0");
+                }
                 if (compare_mfe_parallel_gu) parallel_gu.set(phased ? "1" : "0");
                 if (compare_mfe_gpu_bundle) {
                     parallel_gu.set("1");gpu_bundle.set(phased ? "1" : "0");
@@ -677,7 +811,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 else if(compare_cpu_transfer_budget)
                     prepare_moe_cpu_budget_comparison(execution.moe_expert_cache,pass>0,phased);
                 else prepare_moe_pipeline_comparison(execution.moe_expert_cache,pass>0);
-                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1\n";
+                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1";
+                if(comparison_phase_timings)std::cout<<" mfe_phase_timings="<<phase_timings;
+                std::cout<<'\n';
                 const auto warm_start=std::chrono::steady_clock::now();
                 for(int round=0;round<rounds;++round) {
                     model.reset(1);(void)model.next_token(ids);mfq_cuda_synchronize();
@@ -692,7 +828,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     pass_start,pass_start,decode_inputs);
                 if(status)return status;
                 const auto records=finish_moe_pipeline_comparison(execution.moe_expert_cache);
-                if(compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mfe_early_gu)
+                if(compare_moe_plan_reuse || compare_mfe_e8_narrow || compare_mfe_default_math || compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion || compare_mfe_early_gu)
                     print_moe_expert_cache_stats(execution.moe_expert_cache,std::cout);
                 std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased
                     <<" end=1 dispatch_records="<<records<<"\n";
@@ -1018,6 +1154,7 @@ void print_diagnostics_help() {
         << "  --compare-mhc-fusion             one load, fixed primary tiers and CPU routes; original/fused/original; honors MFQ_GR_TWO_STAGE_DENSE_INJECTION\n"
         << "  --compare-mhc-shared-norm        one load, fixed primary tiers and CPU routes; fused/shared-norm/fused\n"
         << "  --compare-mhc-dense-fusion       one load, fixed primary tiers and CPU routes; original/fused/original BF16 injection\n"
+        << "  --compare-mhc-packed-groups      one load, fixed routes; original/warp-cached metadata and 512-thread Up/original\n"
         << "  --compare-mfe-parallel-gu        one load, fixed primary tiers and CPU routes; serial/parallel/serial Gate-Up\n"
         << "  --compare-mfe-gpu-bundle         one load, fixed primary tiers and CPU routes; current/bundle/current FFN\n"
         << "  --compare-mfe-shared-first       one load, fixed primary tiers and CPU routes; off/on/off shared expert CTA order\n"
@@ -1027,6 +1164,28 @@ void print_diagnostics_help() {
         << "  --compare-router-topk            one load, fixed primary tiers and CPU routes; original/cached/original\n"
         << "  --decode-inputs-file FILE        fixed decode input ids, raw int32, gen-1 entries\n"
         << "  --gen N                         generated tokens\n"
+        << "  --compare-route-poll            compare route notification polling, 2000/0/2000 us\n"
+        << "  --compare-window-flush          compare per-layer / one token / per-layer WDDM submission flush\n"
+        << "  --compare-early-no-cpu-ready     compare late / early / late GPU-only CPU completion\n"
+        << "  --compare-gpu-only-cpu-wait      compare kept / skipped / kept CPU wait with a full GPU quota\n"
+        << "  --compare-fixed-gpu-timing      compare kept / skipped / kept rate events with a full GPU quota\n"
+        << "  --compare-window-input-views    compare staged / producer / staged graph input addresses\n"
+        << "  --compare-route-spin           compare yielding / Strata pause / yielding route waits\n"
+        << "  --compare-moe-plan-reuse       one load, fixed primary tiers; allocating/reused/allocating host plans\n"
+        << "  --compare-graph-optimizations  compare graph, shared-gate and residual optimizations off / on / off\n"
+        << "  --compare-mhc-fixed-formats     compare generic / specialized / generic GR Down formats\n"
+        << "  --compare-mhc-async-normalized  compare sync / async / sync GR Float activation copies\n"
+        << "  --compare-gdn-fixed-geometry   compare generic / fixed / generic GDN geometry\n"
+        << "  --compare-gdn-inplace-state    compare copied / inplace / copied GDN state\n"
+        << "  --compare-shared-gate-fusion    compare cuBLAS / fused / cuBLAS shared scalar gates\n"
+        << "  --compare-mfe-default-math      compare complete / default-only / complete MFE arithmetic kernels\n"
+        << "  --compare-mfe-e8-narrow         compare wide / proven narrow / wide MFE E8 metadata kernels\n"
+        << "  --comparison-rounds N           repeat the off/on/off runtime comparison (1..8)\n"
+        << "  --comparison-phase-timings      append a separate off/on/off MFE timing round after performance passes\n"
+        << "  --compare-host-pin              compare decode host placement, free/pinned/free\n"
+        << "  --compare-resident-overlap      compare resident GPU work before host planning, off/on/off\n"
+        << "  --compare-dma-graph-batch       compare ordinary/batched/ordinary weight DMA submissions\n"
+        << "  --compare-warp-multi-sum       compare original / Strata multi-row reduction / original\n"
         << "  --warmup-prefill N              prefill warmups, 0-100; default profile=1, otherwise=0\n"
         << "  --ctx-size N                    context size; 0 selects a default\n"
         << "  -t, --threads N                 positive CPU thread count\n"
@@ -1067,6 +1226,10 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
     while (!args.empty()) {
         const std::string_view option = args.next();
+        if(option == "--compare-qsa-fusion") {result.compare_qsa_fusion=true;continue;}
+        if(option == "--compare-moe-plan-reuse") {result.compare_moe_plan_reuse=true;continue;}
+        if(option == "--compare-mfe-default-math") {result.compare_mfe_default_math=true;continue;}
+        if(option == "--compare-mfe-e8-narrow") {result.compare_mfe_e8_narrow=true;continue;}
         if (option == "--help" || option == "-h") {
             print_diagnostics_help();
             throw HelpRequested{};
@@ -1179,12 +1342,36 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);
         else if (option == "--router-lookahead-audit") result.router_lookahead_audit = args.value(option);
         else if (option == "--compare-ffn-transfer-phases") result.compare_ffn_transfer_phases = true;
+        else if (option == "--compare-route-poll") result.compare_route_poll = true;
+        else if (option == "--compare-window-flush") result.compare_window_flush = true;
+        else if (option == "--compare-early-no-cpu-ready") result.compare_early_no_cpu_ready = true;
+        else if (option == "--compare-gpu-only-cpu-wait") result.compare_gpu_only_cpu_wait = true;
+        else if (option == "--compare-fixed-gpu-timing") result.compare_fixed_gpu_timing = true;
+        else if (option == "--compare-window-input-views") result.compare_window_input_views = true;
+        else if (option == "--compare-route-spin") result.compare_route_spin = true;
+        else if (option == "--compare-shared-gate-fusion") result.compare_shared_gate_fusion = true;
+        else if (option == "--compare-graph-optimizations") result.compare_graph_optimizations = true;
+        else if (option == "--comparison-phase-timings") result.comparison_phase_timings = true;
+        else if (option == "--comparison-rounds") {
+            result.comparison_rounds=integer<int>(args.value(option),option);
+            if(result.comparison_rounds<1 || result.comparison_rounds>8)
+                throw std::invalid_argument("comparison rounds must be between one and eight");
+        }
+        else if (option == "--compare-host-pin") result.compare_host_pin = true;
+        else if (option == "--compare-resident-overlap") result.compare_resident_overlap = true;
+        else if (option == "--compare-dma-graph-batch") result.compare_dma_graph_batch = true;
+        else if (option == "--compare-warp-multi-sum") result.compare_warp_multi_sum = true;
         else if (option == "--compare-router-lookahead") result.compare_router_lookahead = true;
         else if (option == "--compare-rotary-fusion") result.compare_rotary_fusion = true;
         else if (option == "--compare-attention-grouping") result.compare_attention_grouping = true;
         else if (option == "--compare-mhc-fusion") result.compare_mhc_fusion = true;
         else if (option == "--compare-mhc-shared-norm") result.compare_mhc_shared_norm = true;
         else if (option == "--compare-mhc-dense-fusion") result.compare_mhc_dense_fusion = true;
+        else if (option == "--compare-mhc-packed-groups") result.compare_mhc_packed_groups = true;
+        else if (option == "--compare-mhc-fixed-formats") result.compare_mhc_fixed_formats = true;
+        else if (option == "--compare-mhc-async-normalized") result.compare_mhc_async_normalized = true;
+        else if (option == "--compare-gdn-fixed-geometry") result.compare_gdn_fixed_geometry = true;
+        else if (option == "--compare-gdn-inplace-state") result.compare_gdn_inplace_state = true;
         else if (option == "--compare-mfe-parallel-gu") result.compare_mfe_parallel_gu = true;
         else if (option == "--compare-mfe-gpu-bundle") result.compare_mfe_gpu_bundle = true;
         else if (option == "--compare-mfe-shared-first") result.compare_mfe_shared_first = true;

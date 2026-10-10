@@ -19,6 +19,31 @@ void set_option(const char* name, const char* value) {
 
 int main() {
     using namespace mfq::cuda::runtime_options;
+    // Presence, first-character and exact-value controls have distinct meanings.
+    set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", nullptr);
+    if (nint_route_row_workspace()) return 1;
+    set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", "0");
+    if (nint_route_row_workspace().value_or(true)) return 1;
+    set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", "10");
+    if (!nint_route_row_workspace().value_or(false)) return 1;
+    set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", nullptr);
+    set_option("MFQ_MFE_NINT_LATE_SCALE", "10");
+    if (mfe_nint_late_scale().value_or(true)) return 1;
+    set_option("MFQ_MFE_NINT_LATE_SCALE", "1");
+    if (!mfe_nint_late_scale().value_or(false)) return 1;
+    set_option("MFQ_MFE_NINT_LATE_SCALE", nullptr);
+    set_option("MFQ_EMBEDDING_MAPPED", nullptr);
+    if (embedding_mapped()) return 1;
+    set_option("MFQ_EMBEDDING_MAPPED", "2");
+    if (embedding_mapped().value_or(0) != 2) return 1;
+    set_option("MFQ_EMBEDDING_MAPPED", nullptr);
+    set_option("MFQ_MOE_PREFILL_EXPERT_BATCH_TOKENS", "8192");
+    if (moe_prefill_expert_batch_tokens().value_or(0) != 8192) return 1;
+    set_option("MFQ_MOE_PREFILL_EXPERT_BATCH_TOKENS", nullptr);
+    set_option("MFQ_NVQ_DENSE_REFERENCE", "0");
+    if (!nvq_dense_reference()) return 1;
+    set_option("MFQ_NVQ_DENSE_REFERENCE", nullptr);
+    if (nvq_dense_reference()) return 1;
     // Ablation switches must remain live between calls; ordinary generation
     // must honor the same explicit residency override as benchmark modes.
     set_option("MFQ_MFE_RESIDENT_PLAN_OVERLAP", "1");

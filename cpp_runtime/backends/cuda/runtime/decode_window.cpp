@@ -1,17 +1,52 @@
 #include "decode_window.h"
+#include "execution_options.h"
 #include "mfq_cuda_context.h"
+#include "mfq/cpu_expert_pool.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
 #include <stdexcept>
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <exception>
 #include <iostream>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 namespace mfq::cuda {
+namespace {
+thread_local cudaStream_t flushed_window_stream=nullptr;
+thread_local bool has_flushed_window=false;
+struct WindowSubmission {
+    cudaStream_t previous=flushed_window_stream;
+    bool previously_flushed=has_flushed_window;
+    ~WindowSubmission(){flushed_window_stream=previous;has_flushed_window=previously_flushed;}
+};
+void report_window_error(const char* operation,const char* phase) noexcept {
+    try {
+        std::rethrow_exception(std::current_exception());
+    } catch(const std::exception& error) {
+        std::fprintf(stderr,"decode_window_error operation=%s phase=%s error=%s\n",operation,phase,error.what());
+    } catch(...) {
+        std::fprintf(stderr,"decode_window_error operation=%s phase=%s error=unknown\n",operation,phase);
+    }
+    std::fflush(stderr);
+}
+}
 void check_stream_progress(cudaStream_t stream) {
     const auto status=cudaStreamQuery(stream);
     if(status!=cudaSuccess && status!=cudaErrorNotReady)MFQ_NATIVE_CUDA_CHECK(status);
+}
+// Adapted from Strata's session_run_token (src/core/session.cpp).
+// Copyright (c) 2026 Niko1221 and the Strata contributors.
+// MIT license: ../../../third_party/strata.LICENSE
+// One WDDM flush submits the complete token graph. Layer waits keep their
+// bounded fallback polling; standalone publications still flush immediately.
+void check_route_submission(cudaStream_t stream) {
+    if(!has_flushed_window || stream!=flushed_window_stream)check_stream_progress(stream);
 }
 void publish_mapped_flag(uint32_t* flag) noexcept {
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -21,10 +56,24 @@ void publish_mapped_flag(uint32_t* flag) noexcept {
 void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout_ms) {
     using Clock=std::chrono::steady_clock;
     const auto start=Clock::now();auto flush=start;
-    if(*static_cast<const volatile uint32_t*>(flag)<1)check_stream_progress(stream);
+    const auto poll_interval=std::chrono::microseconds(runtime_options::route_poll_interval_us());
+    const auto* option=std::getenv("MFQ_MOE_ROUTE_SPIN");
+    const bool spin=!option || option[0]!='0';
+    uint32_t spins=0;
+    if(*static_cast<const volatile uint32_t*>(flag)<1)check_route_submission(stream);
     while(*static_cast<const volatile uint32_t*>(flag)<1) {
+        if(spin) {
+            // Strata checks its mapped doorbell after pause and consults the
+            // clock every 1024 spins (src/core/session.cpp, MIT license above).
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            _mm_pause();
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+            if((++spins&1023u)!=0)continue;
+        }
         const auto now=Clock::now();
-        if(now-flush>=std::chrono::microseconds(2000)) {
+        if(now-flush>=poll_interval) {
             flush=now;const auto q=cudaStreamQuery(stream);
             if(q!=cudaSuccess && q!=cudaErrorNotReady)MFQ_NATIVE_CUDA_CHECK(q);
             if(q==cudaSuccess && *static_cast<const volatile uint32_t*>(flag)<1)
@@ -32,7 +81,7 @@ void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout
         }
         if(now-start>std::chrono::milliseconds(timeout_ms))
             throw std::runtime_error("MFQ graph route publication stalled");
-        std::this_thread::yield();
+        if(!spin)std::this_thread::yield();
     }
     std::atomic_thread_fence(std::memory_order_acquire);
 }
@@ -50,6 +99,22 @@ DecodeWindow* DecodeWindow::recording() noexcept { return active; }
 DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile):stream_(stream),graphs_(stream),layer_profile_(layer_profile) {}
 void DecodeWindow::mark(int layer,const char* phase) {
     if(!layer_profile_)return;
+    // Scope 2 keeps the MFE phase boundaries. Timing every small operation
+    // measurably perturbs Windows graph replay; ordinary execution adds none.
+    if(const auto* scope=std::getenv("MFQ_TRACE_LAYER_TIMINGS");scope &&
+            (std::strcmp(scope,"2")==0 || std::strcmp(scope,"3")==0)) {
+        constexpr const char* phases[]={"window_begin","window_end","hot_begin","hot_end",
+            "dma_end","transfer_gate_up_end","cpu_wait_begin","transfer_end"};
+        // Scope 3 separates the attention/residual work, route publication and
+        // input preparation (including the mapped host-plan wait). Scope 2
+        // retains its existing event count for historical comparisons.
+        constexpr const char* boundaries[]={"attention_core_begin","attention_core_end",
+            "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end"};
+        if(std::none_of(std::begin(phases),std::end(phases),
+                [&](const char* allowed){return std::strcmp(phase,allowed)==0;}) &&
+            (std::strcmp(scope,"3")!=0 || std::none_of(std::begin(boundaries),std::end(boundaries),
+                [&](const char* allowed){return std::strcmp(phase,allowed)==0;})))return;
+    }
     if(active!=this)throw std::logic_error("MFQ layer timing outside window recording");
     const auto key=std::make_pair(layer,std::string(phase));
     auto found=layer_point_index_.find(key);
@@ -112,6 +177,16 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         ~Recording(){active=nullptr;}
     } recording(this);
     const auto capture_started=std::chrono::steady_clock::now();
+    const auto* trace_option=std::getenv("MFQ_TRACE_MOE_SERVE");
+    const bool trace=trace_option && trace_option[0] && trace_option[0]!='0';
+    const char* phase="prepare";
+    const auto checkpoint=[&](const char* next) {
+        phase=next;
+        if(trace) {
+            std::fprintf(stderr,"decode_window operation=capture phase=%s tasks=%zu\n",phase,tasks_.size());
+            std::fflush(stderr);
+        }
+    };
     const auto release_warm_outputs=[&] {
         if(release_output)release_output();
         for(auto& task:tasks_)if(task.release_warm_output)task.release_warm_output();
@@ -119,50 +194,83 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
     // Preparation allocates every persistent cell and warms CUDA workspaces.
     // Warmup/capture may overwrite recurrent state, so both restore it.
     try {
+        checkpoint("prepare");
         body();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
         release_warm_outputs();
         tasks_.clear();
+        checkpoint("warmup");
         {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
             GraphWarmupScope warmup(default_context(device),stream_);body();}
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
         release_warm_outputs();
         const auto warm_tasks=tasks_.size();tasks_.clear();
+        checkpoint("record");
         std::string error;
         if(!graphs_.record(0,1,body,error))throw std::runtime_error(error);
         if(tasks_.size()!=warm_tasks)throw std::logic_error("MFQ window task order changed during capture");
+        checkpoint("restore");
         restore();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
         capture_ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()-capture_started).count();
+        checkpoint("complete");
     } catch(...) {
+        report_window_error("capture",phase);
         for(auto& task:tasks_)if(task.cancel)task.cancel();
         (void)cudaStreamSynchronize(stream_);restore();failed_=true;throw;
     }
 }
 void DecodeWindow::run() {
     if(failed_ || !valid())throw std::runtime_error("MFQ window is unavailable after a failed execution");
+    const mfq::cpu::ScopedHostAffinity placement(runtime_options::decode_host_pin()
+        ?mfq::cpu::planned_host_core():-1);
+    const auto* trace_option=std::getenv("MFQ_TRACE_MOE_SERVE");
+    const bool trace=trace_option && trace_option[0] && trace_option[0]!='0' && (replays_<2 || replays_%64==0);
+    const char* phase="reset";
+    const auto checkpoint=[&](const char* next) {
+        phase=next;
+        if(trace) {
+            std::fprintf(stderr,"decode_window operation=replay replay=%llu phase=%s tasks=%zu\n",
+                static_cast<unsigned long long>(replays_),phase,tasks_.size());
+            std::fflush(stderr);
+        }
+    };
     try {
+        WindowSubmission submission;
         using Clock=std::chrono::steady_clock;
         auto previous=Clock::now();const auto started=previous;
         const auto sample=[&](int64_t& total) {
             const auto now=Clock::now();
             total+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-previous).count();previous=now;
         };
+        checkpoint("reset");
         for(auto& task:tasks_)task.reset();
         sample(reset_ns_);
         std::string error;
         const auto* graph=graphs_.find(0,1);
+        checkpoint("launch");
         if(!graph->launch(stream_,error))throw std::runtime_error(error);
+        checkpoint("submit");
+        if(runtime_options::single_window_flush()) {
+            check_stream_progress(stream_);
+            flushed_window_stream=stream_;
+            has_flushed_window=true;
+        }
         sample(launch_ns_);
+        checkpoint("serve");
         for(auto& task:tasks_)task.serve();
         sample(serve_ns_);
+        checkpoint("wait");
         if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");
         sample(wait_ns_);
         // Only after all GPU consumers finish may adaptation overwrite L1.
+        checkpoint("finish");
         for(auto& task:tasks_)if(task.finish)task.finish();
         sample(finish_ns_);
         observe_layers();sample(profile_ns_);
         replay_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(previous-started).count();++replays_;
+        checkpoint("complete");
     } catch(...) {
+        report_window_error("replay",phase);
         failed_=true;
         for(auto& task:tasks_)if(task.cancel)task.cancel();
         (void)cudaStreamSynchronize(stream_);throw;

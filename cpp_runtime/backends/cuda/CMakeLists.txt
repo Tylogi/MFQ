@@ -84,6 +84,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.cpp
     ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
@@ -93,6 +94,8 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
@@ -102,6 +105,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_KERNEL_SOURCES}
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
+    ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
     ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
@@ -110,9 +114,11 @@ add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
 # Keep the shared packed math in incremental builds even when nvcc's depfile
 # omits headers from a heavily inlined translation unit on Windows.
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu PROPERTIES
@@ -394,6 +400,125 @@ add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
 
 if(BUILD_TESTING)
+    add_executable(mfq-cuda-format-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_format_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-format-bench)
+    target_compile_definitions(mfq-cuda-format-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-format-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-e8-dense-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/e8_dense_group_probe.cpp
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/e8_dense_group_probe.cu
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/d4_dense_group_probe.cu)
+    mfq_configure_cuda_runtime_target(mfq-cuda-e8-dense-probe)
+    target_include_directories(mfq-cuda-e8-dense-probe PRIVATE ${MFQ_REPOSITORY_ROOT})
+    target_compile_definitions(mfq-cuda-e8-dense-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-e8-dense-probe PRIVATE mfq-cuda-runtime)
+    set_target_properties(mfq-cuda-e8-dense-probe PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}" CUDA_RUNTIME_LIBRARY Shared
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    add_executable(mfq-mfe-e8-local-bounds-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_e8_local_bounds_test.cpp)
+    target_include_directories(mfq-mfe-e8-local-bounds-test PRIVATE ${MFQ_REPOSITORY_ROOT})
+    target_link_libraries(mfq-mfe-e8-local-bounds-test PRIVATE CUDA::cudart)
+    target_compile_features(mfq-mfe-e8-local-bounds-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-mfe-e8-local-bounds-test COMMAND mfq-mfe-e8-local-bounds-test)
+    add_executable(mfq-mfe-e8-default-dispatch-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_e8_default_dispatch_test.cpp)
+    target_include_directories(mfq-mfe-e8-default-dispatch-test PRIVATE ${MFQ_REPOSITORY_ROOT})
+    target_link_libraries(mfq-mfe-e8-default-dispatch-test PRIVATE mfq-cuda-native-kernels)
+    target_compile_features(mfq-mfe-e8-default-dispatch-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-mfe-e8-default-dispatch-test COMMAND mfq-mfe-e8-default-dispatch-test)
+    add_executable(mfq-cuda-format-moe-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_moe_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-format-moe-bench)
+    target_compile_definitions(mfq-cuda-format-moe-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-format-moe-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-real-mfe-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_mfe_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-real-mfe-bench)
+    target_compile_definitions(mfq-cuda-real-mfe-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-real-mfe-bench PRIVATE mfq-cuda-runtime)
+    # Generated device snapshot keeps occupancy experiments out of the runtime.
+    # Refresh with bench/cuda_format_comparison/generate_mfe_gu_register_probe.py.
+    if(EXISTS "${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_gu_register_probe_body.inc")
+        add_executable(mfq-cuda-mfe-gu-register-probe
+            ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_gu_register_probe.cpp
+            ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_gu_register_probe.cu)
+        mfq_configure_cuda_runtime_target(mfq-cuda-mfe-gu-register-probe)
+        target_include_directories(mfq-cuda-mfe-gu-register-probe PRIVATE ${MFQ_REPOSITORY_ROOT})
+        target_compile_definitions(mfq-cuda-mfe-gu-register-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+        target_link_libraries(mfq-cuda-mfe-gu-register-probe PRIVATE mfq-cuda-runtime)
+        target_compile_options(mfq-cuda-mfe-gu-register-probe PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        set_target_properties(mfq-cuda-mfe-gu-register-probe PROPERTIES
+            CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}" CUDA_RUNTIME_LIBRARY Shared
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    endif()
+    add_executable(mfq-cuda-nvq-byte-signs-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_byte_signs_test.cu)
+    target_link_libraries(mfq-cuda-nvq-byte-signs-test PRIVATE CUDA::cudart)
+    set_target_properties(mfq-cuda-nvq-byte-signs-test PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}" CUDA_STANDARD 17 CUDA_RUNTIME_LIBRARY Shared)
+    add_test(NAME mfq-cuda-nvq-byte-signs-test COMMAND mfq-cuda-nvq-byte-signs-test)
+    add_executable(mfq-cuda-real-gr-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_gr_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-real-gr-bench)
+    target_compile_definitions(mfq-cuda-real-gr-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-real-gr-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-shared-gate-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_shared_gate_bench.cu)
+    mfq_configure_cuda_runtime_target(mfq-cuda-shared-gate-bench)
+    set_target_properties(mfq-cuda-shared-gate-bench PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(mfq-cuda-shared-gate-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-shared-gate-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-bf16-mmvf-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_bf16_mmvf_bench.cu)
+    mfq_configure_cuda_runtime_target(mfq-cuda-bf16-mmvf-bench)
+    set_target_properties(mfq-cuda-bf16-mmvf-bench PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(mfq-cuda-bf16-mmvf-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-bf16-mmvf-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-nvq-pair-indices-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_pair_indices_probe.cu)
+    target_include_directories(mfq-cuda-nvq-pair-indices-probe PRIVATE ${MFQ_REPOSITORY_ROOT})
+    set_target_properties(mfq-cuda-nvq-pair-indices-probe PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    add_executable(mfq-cuda-nvq-compressed-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_compressed_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-nvq-compressed-test)
+    target_compile_definitions(mfq-cuda-nvq-compressed-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-nvq-compressed-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-nvq-compressed-test COMMAND mfq-cuda-nvq-compressed-test)
+    set_tests_properties(mfq-cuda-nvq-compressed-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-cuda-format-nint-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nint_dense_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-format-nint-test)
+    target_compile_definitions(mfq-cuda-format-nint-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-format-nint-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-format-nint-test COMMAND mfq-cuda-format-nint-test)
+    set_tests_properties(mfq-cuda-format-nint-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-cuda-routed-nint-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nint_routed_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-routed-nint-test)
+    target_compile_definitions(mfq-cuda-routed-nint-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-routed-nint-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-routed-nint-test COMMAND mfq-cuda-routed-nint-test)
+    set_tests_properties(mfq-cuda-routed-nint-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-cuda-routed-nvq1-test
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq1_routed_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-routed-nvq1-test)
+    target_compile_definitions(mfq-cuda-routed-nvq1-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-routed-nvq1-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-routed-nvq1-test COMMAND mfq-cuda-routed-nvq1-test)
+    set_tests_properties(mfq-cuda-routed-nvq1-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME mfq-cuda-routed-nint-occupancy-test COMMAND mfq-cuda-routed-nint-test)
+    set_tests_properties(mfq-cuda-routed-nint-occupancy-test PROPERTIES
+        SKIP_RETURN_CODE 77 ENVIRONMENT "MFQ_NINT_ROUTE_BLOCKS=8;MFQ_NINT_ROUTE_LANES=32")
+
     add_executable(mfq-cuda-nvq-moe-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_nvq_moe_bench.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-nvq-moe-bench)
     target_compile_definitions(mfq-cuda-nvq-moe-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -439,6 +564,18 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-moe-ffn-pipeline-test PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-dma-batch-test ${MFQ_CUDA_ROOT}/tests/dma_copy_batch_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-dma-batch-test)
+    target_compile_definitions(mfq-cuda-dma-batch-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-dma-batch-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-dma-batch-test COMMAND mfq-cuda-dma-batch-test)
+    add_executable(mfq-cuda-warp-multi-sum-test ${MFQ_CUDA_ROOT}/tests/warp_multi_sum_test.cu)
+    target_include_directories(mfq-cuda-warp-multi-sum-test PRIVATE ${MFQ_CUDA_KERNEL_ROOT})
+    target_link_libraries(mfq-cuda-warp-multi-sum-test PRIVATE CUDA::cudart)
+    set_target_properties(mfq-cuda-warp-multi-sum-test PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Shared)
+    add_test(NAME mfq-cuda-warp-multi-sum-test COMMAND mfq-cuda-warp-multi-sum-test)
     add_executable(mfq-window-attention-test ${MFQ_CUDA_ROOT}/tests/decode_window_attention_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-window-attention-test)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

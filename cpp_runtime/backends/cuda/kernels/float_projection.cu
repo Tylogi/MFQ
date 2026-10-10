@@ -7,6 +7,11 @@
 #include <map>
 #include <mutex>
 #include <type_traits>
+#include <cstdlib>
+#include "gr_prefill_tf32.cuh"
+#include "gr_prefill_half2.cuh"
+#include "gr_prefill_matmul.cuh"
+#include "gr_prefill_mix.cuh"
 
 namespace {
 template<bool AlignedQ8=false,int FixedGroup=0,class Input>
@@ -306,6 +311,7 @@ mfq_tensor_backend::Tensor float_projection_impl(
 
 mfq_tensor_backend::Tensor nint_float_projection_cuda(const NintWeight& weight,
         const mfq_tensor_backend::Tensor& input,bool parallel_groups,bool native_input,bool fixed_groups) {
+    if(gr_prefill_selected(input))return gr_prefill_matmul(weight,input);
     return float_projection_impl(weight,input,parallel_groups,native_input,fixed_groups,0,1);
 }
 
@@ -317,6 +323,12 @@ mfq_tensor_backend::Tensor nint_float_projection_activation_cuda(const NintWeigh
         const mfq_tensor_backend::Tensor& input,int64_t streams,bool injection,
         bool parallel_groups,bool native_input,bool fixed_groups) {
     MFQ_RUNTIME_CHECK(streams>0,"packed residual activation requires positive stream count");
+    if(gr_prefill_selected(input)) {
+        auto projected=gr_prefill_matmul(weight,input);
+        if(input.scalar_type()==mfq_tensor_backend::kFloat16)projected=projected.to(mfq_tensor_backend::kFloat16);
+        return injection ? mfq_qwen4_exp::gated_residual_injection(projected,streams)
+                         : mfq_qwen4_exp::gated_residual_bottleneck(projected,streams);
+    }
     return float_projection_impl(weight,input,parallel_groups,native_input,fixed_groups,injection?2:1,streams);
 }
 
@@ -332,6 +344,12 @@ mfq_tensor_backend::Tensor nint_float_projection_mix_cuda(const NintWeight& weig
         input.size(-1)==weight.neuron_len && weight.ng>0 && weight.gs>0 && weight.gs<=64 &&
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,"packed residual mixing geometry/device disagree");
     const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/streams;
+    if(gr_prefill_selected(input)) {
+        if(gr_prefill_mix_selected(weight,input,normalized,streams))return gr_prefill_fused_mix(weight,input,normalized);
+        auto projected=gr_prefill_matmul(weight,input);
+        if(input.scalar_type()==tb::kFloat16)projected=projected.to(tb::kFloat16);
+        return mfq_qwen4_exp::gated_residual_mix(projected,normalized,streams);
+    }
     const auto ordinary_blocks=((weight.out+3)/4)*rows;
     MfqCudaGuard guard(input.device());
     // Retain the original group partition whenever the ordinary projection splits.

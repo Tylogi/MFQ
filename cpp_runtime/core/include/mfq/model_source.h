@@ -80,6 +80,10 @@ public:
     }
     virtual TensorBatchReader tensor_batch_reader(std::string_view) const { return {}; }
 
+    // An optional retained, bounded, concurrently readable mapping.
+    // An empty reader means this source does not offer mapped access.
+    virtual TensorReader mapped_tensor_reader(std::string_view) const { return {}; }
+
     virtual const std::vector<std::string>& assets() const noexcept = 0;
     virtual bool has_asset(std::string_view name) const noexcept = 0;
     virtual std::vector<std::byte> read_asset(std::string_view name) const = 0;

@@ -1,8 +1,10 @@
 #include "storage/moe_ffn_pipeline.h"
 #include "runtime/decode_window.h"
+#include "runtime/execution_options.h"
 #include "runtime/moe_pipeline.h"
 #include "runtime/router_lookahead_audit.h"
 #include "mfq_cuda_moe_ops.h"
+#include "moe_cache_transfer.h"
 #include "runtime/moe_residency.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_expert_cache.h"
@@ -38,6 +40,50 @@ QuantLinear linear(const MixedMoePool& pool,int output,int width) {
     else {l.kind=QuantLinearKind::Nvq;l.nvq=pool.nvq;}return l;
 }
 
+void verify_nvq_dense_default(const std::filesystem::path& root) {
+    struct Environment {
+        const char* names[3]={"MFQ_MOE_NVQ_DENSE","MFQ_MOE_PRELOAD_ALL","MFQ_MOE_ASSERT_RESIDENT"};
+        std::string previous[3];
+        Environment(){for(int i=0;i<3;++i)if(const auto* value=std::getenv(names[i]))previous[i]=value;}
+        void set(int i,const char* value)const {
+#ifdef _WIN32
+            _putenv_s(names[i],value);
+#else
+            if(*value)setenv(names[i],value,1);else unsetenv(names[i]);
+#endif
+        }
+        ~Environment(){for(int i=0;i<3;++i)set(i,previous[i].c_str());}
+    } env;
+    int cases=0,guards=0,converted=0;
+    for(const auto* format:{"nvq2j-xl","nvq3j-l"}) {
+        env.set(0,"0");env.set(1,"0");env.set(2,"0");
+        const auto path=root/(std::string(format)+"-640-2560.mfq");
+        const auto canonical=source(path);
+        const auto canonical_bytes=bytes(canonical->metadata()->pools[0]);
+        for(const auto* option:{"","0","1"})for(int preload:{0,1})for(int sealed:{0,1}) {
+            env.set(0,option);env.set(1,preload?"1":"0");env.set(2,sealed?"1":"0");
+            const bool complete=preload && sealed;
+            const bool reject=*option=='1' && !complete;
+            std::shared_ptr<MoeQuantRangeSource> value;
+            try{value=source(path);}catch(const std::invalid_argument&){if(!reject)throw;++guards;}
+            if(reject) {
+                if(value)throw std::runtime_error("compact default omitted sealed-preload guard");
+            }else {
+                const bool expected=complete && *option!='0';
+                const auto& weight=value->metadata()->pools[0];
+                if(weight.nvq.dense_groups!=expected || bytes(weight)!=canonical_bytes ||
+                   bool(value->dense_materializations())!=expected)
+                    throw std::runtime_error("compact default selected wrong layout or changed bytes");
+                converted+=expected;
+            }
+            ++cases;
+        }
+    }
+    if(cases!=24 || guards!=6 || converted!=4)throw std::runtime_error("compact default coverage incomplete");
+    std::cout<<"nvq_dense_default_cases="<<cases<<" sealed_preload_guards="<<guards
+        <<" compact_sources="<<converted<<" payload_bytes_unchanged=1 PASS\n";
+}
+
 int verify_shared_input(const std::filesystem::path& root) {
     CudaExecutionContext execution;
     auto load=[&](const std::array<std::string,4>& formats) {
@@ -64,9 +110,19 @@ int verify_shared_input(const std::filesystem::path& root) {
     if(geometries.size()<=gate_geometries.size())throw std::runtime_error("shared-input fixture lacks Up-only geometry");
     const auto same=[](const tb::Tensor& a,const tb::Tensor& b,const char* label) {
         auto x=a.to(tb::kCPU).contiguous(),y=b.to(tb::kCPU).contiguous();
-        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
-            std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size()))
-            throw std::runtime_error(std::string("shared-input ")+label+" is not byte exact");
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type())
+            throw std::runtime_error(std::string("shared-input ")+label+" shape or dtype mismatch");
+        if(std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size())) {
+            auto actual=x.to(tb::kFloat32),expected=y.to(tb::kFloat32);
+            const auto* aa=static_cast<const uint8_t*>(x.data_ptr());
+            const auto* bb=static_cast<const uint8_t*>(y.data_ptr());
+            std::size_t byte=0;while(aa[byte]==bb[byte])++byte;
+            const auto index=byte/x.element_size();
+            std::ostringstream message;message<<"shared-input "<<label<<" is not byte exact"
+                <<" index="<<index<<" actual="<<actual.data_ptr<float>()[index]
+                <<" expected="<<expected.data_ptr<float>()[index];
+            throw std::runtime_error(message.str());
+        }
     };
     const auto forward=[&](MixedMoeRuntime& runtime,const tb::Tensor& x,const MoeRoutePlan& route,bool prepared) {
         return runtime.forward(execution.config,execution.kl_mmq,false,false,x,route,prepared);
@@ -103,13 +159,14 @@ int verify_shared_input(const std::filesystem::path& root) {
             execution.config.moe_nint_heterogeneous_decode=false;
             auto expected_gate=forward(reference_gate,x,route,false),expected_up=forward(reference_up,x,route,false);
             execution.config.moe_nint_heterogeneous_decode=true;
-            window.run();same(actual_gate,expected_gate,"mixed Gate output");same(actual_up,expected_up,"mixed Up output");
+            window.run();
             for(const auto& geometry:geometries) {
                 const bool in_gate=std::find(gate_geometries.begin(),gate_geometries.end(),geometry)!=gate_geometries.end();
                 auto& expected=(in_gate?reference_gate:reference_up).activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
                 auto& actual=gate.activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
                 same(actual.qx,expected.qx,"quantized bytes/tail padding");same(actual.xscale,expected.xscale,"group scales");
             }
+            same(actual_gate,expected_gate,"mixed Gate output");same(actual_up,expected_up,"mixed Up output");
             ++cases;
         }
     }
@@ -304,8 +361,145 @@ int verify_wire_bytes() {
     return 3;
 }
 }
-int verify_warm_residency(const std::filesystem::path& root) {
-    int cases=0,phase_cases=0,async_cases=0,window_cases=0;
+void verify_copy_kernel_overlap() {
+    for(bool use_kernel:{true,false})for(bool allocate_during_tail:{false,true}) {
+        const auto compute=mfq_current_cuda_stream();
+        const auto copy=mfq_get_stream_from_pool();
+        auto source=tb::tensor(std::vector<uint8_t>(64,0x79)).to(tb::kCUDA);
+        auto destination=tb::zeros({64},source.options());
+        mfq::MoeCacheMappedCopyDescriptor descriptor{reinterpret_cast<uint64_t>(destination.data_ptr()),
+            reinterpret_cast<uint64_t>(source.data_ptr()),64};
+        auto descriptors=tb::empty({int64_t(sizeof(descriptor))},source.options());
+        MFQ_CUDA_CHECK(cudaMemcpy(descriptors.data_ptr(),&descriptor,sizeof(descriptor),cudaMemcpyHostToDevice));
+        mfq::cuda::HostBuffer flags(128,true),result(64);
+        uint32_t* alias=nullptr;std::memset(flags.data(),0,flags.size());
+        MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&alias),flags.data(),0));
+        const auto gather=[&] {mfq::moe_cache_mapped_gather_cuda(
+            reinterpret_cast<const mfq::MoeCacheMappedCopyDescriptor*>(descriptors.data_ptr()),1,1,copy.stream());};
+        gather();mfq_cuda_synchronize(); // load the kernel before blocking the model stream
+        cudaEvent_t done;MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));
+        cudaGraph_t graph=nullptr;cudaGraphExec_t executable=nullptr;
+        MFQ_CUDA_CHECK(cudaStreamBeginCapture(compute,cudaStreamCaptureModeThreadLocal));
+        mfq::cuda::wait_mapped_flag(alias,compute);
+        MFQ_CUDA_CHECK(cudaStreamEndCapture(compute,&graph));
+        MFQ_CUDA_CHECK(cudaGraphInstantiate(&executable,graph,0));
+        MFQ_CUDA_CHECK(cudaGraphLaunch(executable,compute));mfq::cuda::check_stream_progress(compute);
+        std::atomic_bool finished=false,rescued=false;
+        std::jthread watchdog([&] {
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(750);
+            while(!finished && std::chrono::steady_clock::now()<deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if(!finished){rescued=true;mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(flags.data()));}
+        });
+        tb::Tensor new_allocation;
+        {MfqCudaStreamGuard selected(copy);
+            if(allocate_during_tail)new_allocation=tb::empty({32*1024*1024},source.options());
+            if(use_kernel)gather();
+            else MFQ_CUDA_CHECK(cudaMemcpyAsync(destination.data_ptr(),source.data_ptr(),64,cudaMemcpyDeviceToDevice,copy.stream()));
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(result.data(),destination.data_ptr(),64,cudaMemcpyDeviceToHost,copy.stream()));
+            MFQ_CUDA_CHECK(cudaEventRecord(done,copy.stream()));
+            MFQ_CUDA_CHECK(cudaEventSynchronize(done));
+        }
+        finished=true;mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(flags.data()));
+        watchdog.join();mfq_cuda_synchronize();
+        for(int i=0;i<64;++i)if(static_cast<uint8_t*>(result.data())[i]!=0x79)
+            throw std::runtime_error("overlap probe copy bytes differ");
+        std::cout<<"copy_kernel_overlap use_kernel="<<use_kernel<<" allocate_during_tail="<<allocate_during_tail
+                 <<" completed_before_tail="<<!rescued.load()<<" bytes_exact=1"<<std::endl;
+        cudaGraphExecDestroy(executable);cudaGraphDestroy(graph);cudaEventDestroy(done);
+    }
+}
+void verify_mapped_refill_descriptors() {
+    constexpr int fields=8;
+    constexpr int64_t stride=65536;
+    std::vector<uint8_t> source_bytes(fields*stride),expected(fields*stride),actual(fields*stride);
+    auto input=tb::empty({fields*stride},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+    auto output=tb::empty({fields*stride},input.options());
+    mfq::cuda::HostBuffer mapped(fields*sizeof(mfq::MoeCacheMappedCopyDescriptor),true);
+    auto* host=static_cast<mfq::MoeCacheMappedCopyDescriptor*>(mapped.data());
+    mfq::MoeCacheMappedCopyDescriptor* device=nullptr;
+    MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device),mapped.data(),0));
+    const auto stream=mfq_current_cuda_stream();int cases=0;
+    for(int round=0;round<96;++round) {
+        const int count=1+round%fields;
+        for(std::size_t i=0;i<source_bytes.size();++i)source_bytes[i]=uint8_t(i*29+round*17);
+        std::fill(expected.begin(),expected.end(),uint8_t(0xa7));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(input.data_ptr(),source_bytes.data(),source_bytes.size(),cudaMemcpyHostToDevice,stream));
+        MFQ_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(),0xa7,expected.size(),stream));
+        for(int f=0;f<count;++f) {
+            const int64_t prefixes[]={16,8,4,2,3,1};
+            const auto prefix=prefixes[round%6];
+            const int64_t bytes=round%8?4096*(1+f)+round%16:1+f;
+            const auto from=(fields-1-f)*stride+prefix+(round%12>=6?1:0),to=f*stride+prefix;
+            host[f]={reinterpret_cast<uint64_t>(output.data_ptr<uint8_t>()+to),
+                reinterpret_cast<uint64_t>(input.data_ptr<uint8_t>()+from),uint64_t(bytes)};
+            std::memcpy(expected.data()+to,source_bytes.data()+from,std::size_t(bytes));
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        mfq::moe_cache_mapped_gather_cuda(device,count,round%2?1:8,stream);
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(actual.data(),output.data_ptr(),actual.size(),cudaMemcpyDeviceToHost,stream));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+        if(actual!=expected)throw std::runtime_error("mapped refill descriptor changed payload or guard bytes");
+        ++cases;
+    }
+    std::cout<<"mapped_refill_descriptor_cases="<<cases<<" changing pointers/counts/unaligned tails/guards exact PASS\n";
+}
+int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=true) {
+    int cases=0,phase_cases=0,async_cases=0,window_cases=0,fence_cases=0;
+    struct TailGate {
+        MoeResidencyManager& manager;
+        mfq::cuda::HostBuffer flags{128,true};
+        uint32_t* alias=nullptr;
+        cudaStream_t stream=mfq_current_cuda_stream();
+        cudaGraph_t graph=nullptr;
+        cudaGraphExec_t executable=nullptr;
+        std::atomic_bool waiting=false,rescued=false;
+        std::atomic<int64_t> started_ms=0;
+        std::jthread watchdog;
+        static int64_t now_ms() {return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();}
+        TailGate(MoeResidencyManager& owner,int last):manager(owner) {
+            std::memset(flags.data(),0,flags.size());
+            MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&alias),flags.data(),0));
+            manager.record_window_expert_fence(last,stream);
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+            MFQ_CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+            mfq::cuda::wait_mapped_flag(alias,stream);
+            manager.record_window_expert_fence(last,stream);
+            mfq::cuda::wait_mapped_flag(alias+16,stream);
+            MFQ_CUDA_CHECK(cudaStreamEndCapture(stream,&graph));
+            MFQ_CUDA_CHECK(cudaGraphInstantiate(&executable,graph,0));
+            watchdog=std::jthread([this](std::stop_token stop) {
+                while(!stop.stop_requested()) {
+                    if(waiting.load() && now_ms()-started_ms.load()>750) {
+                        rescued=true;before_done();tail_done();
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+        }
+        void before_done(){mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(flags.data()));}
+        void tail_done(){mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(flags.data())+16);waiting=false;}
+        void start(bool hold_before=false) {
+            manager.before_layer(0);
+            std::memset(flags.data(),0,flags.size());if(!hold_before)before_done();
+            rescued=false;started_ms=now_ms();waiting=true;
+            MFQ_CUDA_CHECK(cudaGraphLaunch(executable,stream));mfq::cuda::check_stream_progress(stream);
+        }
+        ~TailGate() {
+            watchdog.request_stop();if(watchdog.joinable())watchdog.join();
+            before_done();tail_done();(void)cudaStreamSynchronize(stream);
+            if(executable)cudaGraphExecDestroy(executable);if(graph)cudaGraphDestroy(graph);
+        }
+    };
+    const auto wait_copies=[](const std::atomic_bool& complete) {
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(750);
+        while(!complete.load(std::memory_order_acquire)) {
+            if(std::chrono::steady_clock::now()>deadline)
+                throw std::runtime_error("expert copies still wait for the blocked output tail");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
     const auto wait_preparation=[](const std::atomic_bool& prepared) {
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
         while(!prepared.load(std::memory_order_acquire)) {
@@ -317,6 +511,9 @@ int verify_warm_residency(const std::filesystem::path& root) {
     for(const std::string format:{"nint5","nvq3j-512"})for(int mode:{0,1,2}) {
         CudaExecutionContext execution;execution.config.moe_residency_warm=true;
         const bool limited=mode==1,shared=mode==2;
+        if(shared && !shared_cases)continue;
+        if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))
+            std::cerr<<"fence_fixture format="<<format<<" mode="<<mode<<std::endl;
         if(shared && !execution.config.moe_direct_ram)continue;
         execution.config.moe_host_physical_bytes=limited?1024:0;
         const int count=mode?2:33;
@@ -338,11 +535,13 @@ int verify_warm_residency(const std::filesystem::path& root) {
         }
         finalize_moe_expert_cache(cache);
         if(shared) {
+            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared before_forward"<<std::endl;
             std::vector<float> values(2560);for(int j=0;j<2560;++j)values[j]=std::sin(float(j)*.013f);
             auto x=tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA);
             auto ids=tb::zeros({1,1},x.options().dtype(tb::kInt32));
             auto route_weights=tb::ones({1,1},x.options());
             auto reference=forwards[0](execution,x,ids,route_weights).cpu().contiguous();
+            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared after_forward"<<std::endl;
             MoeResidencyManager failed(cache.get(),[](const char* phase,std::size_t) {
                 if(std::string(phase)=="publish")throw std::runtime_error("shared backup publication failure");
             });
@@ -387,20 +586,38 @@ int verify_warm_residency(const std::filesystem::path& root) {
         }
         auto memory=limited?MoeResidencyManager::MemoryProbe([]{return MoeResidencyManager::MemorySample{1000,1ull<<30};})
             :MoeResidencyManager::MemoryProbe{};
-        std::atomic_bool prepared=false;
+        std::atomic_bool prepared=false,copies_complete=false;
+        const auto observation_start=std::chrono::steady_clock::now();
         MoeResidencyManager manager(cache.get(),[&](const char* phase,std::size_t index) {
+            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE") && (index==0 || std::string(phase)=="copies_complete"))
+                std::cerr<<"fence_probe phase="<<phase<<" ms="<<std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-observation_start).count()<<std::endl;
+            if(std::string(phase)=="copies_complete")copies_complete.store(true,std::memory_order_release);
             if(std::string(phase)=="upload" && index==std::size_t(count*3-1))
                 prepared.store(true,std::memory_order_release);
         },std::move(memory));
         const bool in_window=manager.prepare_during_window() && !limited;
+        const char* fence_option=std::getenv("MFQ_MOE_RESIDENCY_EXPERT_FENCE");
+        std::unique_ptr<TailGate> tail;
+        if(in_window && fence_option && fence_option[0]=='1') {
+            tail=std::make_unique<TailGate>(manager,count-1);tail->start();
+        }
         for(int layer=0;layer<count;++layer)manager.after_layer(layer,std::vector<int32_t>(35,1),35,in_window);
         if(in_window) {
             wait_preparation(prepared);
+            if(tail) {
+                wait_copies(copies_complete);
+                if(tail->rescued || manager.stats().expert_fence_waits!=1 || cudaStreamQuery(mfq_current_cuda_stream())!=cudaErrorNotReady)
+                    throw std::runtime_error("expert-fence test did not copy beside the blocked output tail; rescued="+
+                        std::to_string(tail->rescued.load())+" fence_waits="+std::to_string(manager.stats().expert_fence_waits));
+                ++fence_cases;
+            }
             if(manager.stats().committed_projections || manager.stats().window_prepares!=1)
                 throw std::runtime_error("window preparation crossed its publication barrier");
             for(int layer=0;layer<count;++layer)for(int p=0;p<3;++p)
                 if(!sources[layer][p]->gpu_resident(0) || sources[layer][p]->gpu_resident(1))
                     throw std::runtime_error("window preparation changed expert ownership before graph finish");
+            if(tail){tail->tail_done();MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));}
             manager.finish_window(count-1);++window_cases;
         }
         if(manager.stats().async_publish && !limited) {
@@ -415,7 +632,7 @@ int verify_warm_residency(const std::filesystem::path& root) {
             ++async_cases;
         }
         manager.apply_pending();const auto stats=manager.stats();
-        if(stats.batched && !limited && (stats.backup_copies!=1 || stats.batch_descriptor_copies!=1 ||
+        if(stats.batched && !limited && !tail && (stats.backup_copies!=1 || stats.batch_descriptor_copies!=1 ||
                 !stats.batch_device_bytes || !stats.upload_copies))
             throw std::runtime_error("warm residency did not batch the complete backup and field descriptors");
         if(stats.observed_routes!=std::uint64_t(count*35) || stats.scheduled_rounds!=1)
@@ -445,10 +662,24 @@ int verify_warm_residency(const std::filesystem::path& root) {
         if(!limited && execution.config.moe_direct_ram && (stats.host_pack_bytes || !stats.direct_upload_bytes))
             throw std::runtime_error("warm residency did not use registered RAM directly");
         if(stats.batched && !limited) {
+            if(tail) {prepared=false;copies_complete=false;tail->start(true);}
             for(int layer=0;layer<count;++layer)
-                manager.after_layer(layer,layer?std::vector<int32_t>{}:std::vector<int32_t>(35,2),1);
+                manager.after_layer(layer,layer?std::vector<int32_t>{}:std::vector<int32_t>(35,2),1,bool(tail));
+            if(tail) {
+                // The mapped completion was published by the previous replay.
+                // The new transaction must wait for this replay's boundary.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if(copies_complete.load(std::memory_order_acquire))
+                    throw std::runtime_error("expert fence reused the previous graph replay's completion");
+                tail->before_done();wait_copies(copies_complete);
+                if(tail->rescued)throw std::runtime_error("expert fence needed the output tail watchdog");
+                if(manager.stats().committed_bundles!=stats.committed_bundles)
+                    throw std::runtime_error("expert fence published RAM ownership before window finish");
+                tail->tail_done();MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+                manager.finish_window(count-1);++fence_cases;
+            }
             manager.apply_pending();const auto next=manager.stats();
-            if(!next.batch_device_bytes || next.batch_device_bytes>=stats.batch_device_bytes)
+            if(!tail && (!next.batch_device_bytes || next.batch_device_bytes>=stats.batch_device_bytes))
                 throw std::runtime_error("decode retained the larger prefill device copy workspace");
             for(int p=0;p<3;++p) {
                 if(!sources[0][p]->gpu_resident(2) || sources[0][p]->gpu_resident(1))
@@ -461,17 +692,18 @@ int verify_warm_residency(const std::filesystem::path& root) {
                 if(std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
                     throw std::runtime_error("workspace resize changed the demoted RAM expert bytes");
             }
-            ++phase_cases;
+            if(!tail)++phase_cases;
         }
         ++cases;
     }
     std::cout<<"residency_workspace_phase_cases="<<phase_cases<<" changing copy workspace/ownership/demoted RAM exact PASS\n";
     std::cout<<"residency_async_publish_cases="<<async_cases<<" worker publishes GPU/RAM transaction before model-thread join PASS\n";
     std::cout<<"residency_window_prepare_cases="<<window_cases<<" prepare before graph finish/publication barrier/cancellation rollback PASS\n";
+    std::cout<<"residency_expert_fence_cases="<<fence_cases<<" copies before blocked tail/replay publication reset/deferred RAM publication PASS\n";
     std::cout<<"warm_residency_cases="<<cases<<" 33bundles/singleprefill/physicalbudget/shared-backup-rollback/RAMexact PASS\n";
     return cases;
 }
-int verify_projection_heat(const std::filesystem::path& root) {
+int verify_projection_heat(const std::filesystem::path& root,bool transfer_cached=false) {
     int cases=0;
     const std::array<std::array<std::string,3>,2> formats={
         std::array<std::string,3>{"nint5","nvq3j-512","nint5"},
@@ -480,6 +712,10 @@ int verify_projection_heat(const std::filesystem::path& root) {
         CudaExecutionContext execution;execution.config.moe_residency_warm=true;
         execution.config.moe_residency_projection_heat=phase!="disabled";
         execution.config.moe_ram_pcie_fraction=1.0;
+        if(transfer_cached) {
+            execution.config.moe_two_stage_ffn=true;
+            execution.config.moe_direct_ram=true;
+        }
         std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
         std::array<std::array<std::shared_ptr<MfeWeight>,3>,2> weights;
         std::array<MoeFfnForward,2> forwards;
@@ -518,6 +754,18 @@ int verify_projection_heat(const std::filesystem::path& root) {
                 throw std::runtime_error("mixed partial projection GPU graph changed canonical output bytes");
         };
         verify_gpu();
+        if(transfer_cached) {
+            verify_gpu();
+            std::ostringstream counters;print_moe_expert_cache_stats(cache,counters);
+            std::smatch match;const auto text=counters.str();
+            if(!std::regex_search(text,match,std::regex("pipeline_transfer_cache_hits=([0-9]+)")) ||
+                    std::stoull(match[1])<3)
+                throw std::runtime_error("promotion fixture did not retain all three cold projections on GPU");
+            // Release the previous upload's RAM leases while retaining the
+            // transfer-cache slots. The exchange must use those exact bytes.
+            ids.copy_(tb::zeros({1,1},ids.options()));verify_gpu();
+            ids.copy_(tb::ones({1,1},ids.options()));
+        }
         MoeHostExpertCache::Lease reader;
         MoeResidencyManager manager(cache.get(),[&](const char* event,std::size_t index) {
             if(index)return;
@@ -531,6 +779,15 @@ int verify_projection_heat(const std::filesystem::path& root) {
             if(std::string(e.what())!="injected projection exchange failure")throw;rejected=true;
         }
         const auto stats=manager.stats();const bool changed=phase=="none";
+        if(transfer_cached && changed) {
+            const auto* mode=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+            const bool reuse=mode && mode[0]=='2';
+            if((stats.cached_copy_bytes>0)!=reuse || (reuse && stats.direct_upload_bytes))
+                throw std::runtime_error("cached promotion did not use the requested RAM/GPU copy source");
+            const auto* refill=std::getenv("MFQ_MOE_RESIDENCY_CACHED_REFILL");
+            if(reuse && refill && refill[0]=='1' && !stats.cached_copy_batches)
+                throw std::runtime_error("cached promotion did not exercise the batched GPU refill");
+        }
         if((stats.committed_projections!=0)!=changed || stats.committed_bundles ||
             (phase=="disabled" ? stats.candidate_projections!=0 : stats.planned_projections!=1))
             throw std::runtime_error("projection heat did not select exactly one compatible cold projection");
@@ -560,7 +817,7 @@ int verify_projection_heat(const std::filesystem::path& root) {
         }
         ++cases;
     }
-    std::cout<<"projection_heat_cases="<<cases<<" incompatible GU/Down triples, one-projection cross-layer swap, RAM bytes, original GPU graph bytes and upload/map/host/publish/late-lease rollback exact PASS\n";
+    std::cout<<(transfer_cached?"transfer_promotion_cases=":"projection_heat_cases=")<<cases<<" incompatible GU/Down triples, one-projection cross-layer swap, RAM bytes, original GPU graph bytes and upload/map/host/publish/late-lease rollback exact PASS\n";
     return cases;
 }
 int verify_rounded_swiglu() {
@@ -764,7 +1021,28 @@ int verify_active_nvq(const std::filesystem::path& root) {
     std::cout<<"active_nvq_cases="<<cases<<" active_nvq_formats="<<formats.size()<<" actual640/2560, shared/routed input,1/3/8tokens, repeated/invalid/empty routes, changing ownership and original heterogeneous kernel bytes exact PASS\n";
     return cases;
 }
-int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cache=false,bool comparison=false) {
+int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cache=false,bool comparison=false,
+        bool compare_input_views=false,bool compare_default_math=false,bool compare_e8_narrow=false,
+        bool compare_resident_overlap=false,bool compare_dense=false,bool compare_nint_whole=false) {
+    const bool compare_math=compare_default_math || compare_e8_narrow || compare_resident_overlap || compare_dense || compare_nint_whole;
+    struct MathEnvironment {
+        const char* option;
+        bool enabled;
+        std::string previous;
+        void set(const char* value)const {
+#ifdef _WIN32
+            _putenv_s(option,value);
+#else
+            if(*value)setenv(option,value,1);else unsetenv(option);
+#endif
+        }
+        explicit MathEnvironment(bool active,const char* name):option(name),enabled(active) {
+            if(active)if(const auto* value=std::getenv(option))previous=value;
+        }
+        void select(bool candidate)const {if(enabled)set(candidate?"1":"0");}
+        ~MathEnvironment(){if(enabled)set(previous.c_str());}
+    } math_environment(compare_math,compare_nint_whole?"MFQ_MFE_NINT_WHOLE":compare_dense?"MFQ_MOE_NVQ_DENSE":compare_resident_overlap?"MFQ_MFE_RESIDENT_PLAN_OVERLAP":
+        compare_e8_narrow?"MFQ_MFE_E8_NARROW":"MFQ_MFE_DEFAULT_MATH");
     struct RestoreEnvironment {
         std::string previous;
         bool present=false;
@@ -804,7 +1082,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     };
     MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
-    int cases=0;std::int64_t cpu=0,transfers=0,resident=0,mapped_serves=0,mapped_bytes=0,mapped_overlaps=0,phased_serves=0;
+    int cases=0;std::int64_t cpu=0,transfers=0,resident=0,mapped_serves=0,mapped_bytes=0,mapped_overlaps=0,phased_serves=0,dense_conversions=0;
     for(bool graph:{false,true})for(auto gate_type:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})
     for(int tokens:{1,3,6})for(int routes:{3,10}) {
         std::array<CudaExecutionContext,2> executions;
@@ -821,9 +1099,10 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             return shared_gate(execution,x)*shared[2]->forward(execution,(g*tb::sigmoid(g))*u);
         };
         for(int mode=0;mode<2;++mode) {
+            if(compare_dense || compare_nint_whole)math_environment.select(mode==1);
             MfqCudaStreamGuard stream_guard(streams[mode]);
             auto& config=executions[mode].config;
-            config.moe_two_stage_ffn=mode==1;
+            config.moe_two_stage_ffn=mode==1 || compare_input_views || compare_math;
             config.moe_ram_pcie_fraction=transfer_cache && !comparison?1.0:.5;
             if(comparison)config.moe_residency_adapt=false;
             if(transfer_cache)config.moe_direct_ram=true;
@@ -849,6 +1128,12 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
                 MoeFfnSharedWeights{shared,shared_gate});
             if(comparison && mode==1){comparison_gu=gu;comparison_down=down;}
             finalize_moe_expert_cache(caches[mode]);
+            if(compare_dense)for(int p=0;p<3;++p) {
+                const auto count=sources[mode][p]->dense_materializations();
+                if((mode==0 && count) || (mode==1 && p>0 && !count))
+                    throw std::runtime_error("compact NVQ pipeline omitted expected layout conversion");
+                dense_conversions+=count;
+            }
             bool partial=false;
             for(int e=0;e<3;++e) {
                 int hits=0;for(const auto& s:sources[mode])hits+=s->gpu_resident(e);
@@ -880,7 +1165,13 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         }
         const auto dma_before=comparison?counter(caches[1],"ram_pcie_bytes"):0;
         tb::Tensor actual;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
-        if(graph)window.capture([&]{actual=forwards[1](executions[1],input,ids,weights);},[]{},[&]{actual={};});
+        math_environment.select(true);
+        if(graph)window.capture([&] {
+            if(compare_input_views) {
+                const auto temporary_input=input.clone(),temporary_ids=ids.clone(),temporary_weights=weights.clone();
+                actual=forwards[1](executions[1],temporary_input,temporary_ids,temporary_weights);
+            } else actual=forwards[1](executions[1],input,ids,weights);
+        },[]{},[&]{actual={};});
         for(int step=0;step<4;++step) {
             for(const auto& cache:caches)finish_moe_expert_exchanges(cache);
             std::vector<float> values(tokens*2560),route_weights(tokens*routes);
@@ -896,7 +1187,9 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             MFQ_CUDA_CHECK(cudaStreamSynchronize(streams[1]));
             tb::Tensor expected;
             {MfqCudaStreamGuard stream_guard(streams[0]);
+                math_environment.select(false);
                 expected=forwards[0](executions[0],input,ids,weights).cpu().contiguous();}
+            math_environment.select(true);
             if(graph)window.run();else actual=forwards[1](executions[1],input,ids,weights);
             auto result=actual.cpu().contiguous();
             if(plans[0].kinds!=plans[1].kinds)throw std::runtime_error("two-stage fusion changed CPU/GPU dispatch");
@@ -906,10 +1199,53 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
                 resident+=kind==mfq::MoeDispatchKind::GpuResident;
             }
             if(result.sizes()!=expected.sizes() || result.scalar_type()!=expected.scalar_type() ||
-                std::memcmp(result.data_ptr(),expected.data_ptr(),result.numel()*result.element_size()))
+                std::memcmp(result.data_ptr(),expected.data_ptr(),result.numel()*result.element_size())) {
+                if(result.sizes()==expected.sizes() && result.scalar_type()==expected.scalar_type()) {
+                    const auto* a=static_cast<const unsigned char*>(result.data_ptr());
+                    const auto* e=static_cast<const unsigned char*>(expected.data_ptr());
+                    int64_t first=-1,differences=0;
+                    for(int64_t i=0;i<result.numel();++i)
+                        if(std::memcmp(a+i*result.element_size(),e+i*result.element_size(),result.element_size())) {
+                            if(first<0)first=i;
+                            ++differences;
+                        }
+                    const auto actual_values=result.to(tb::kFloat32).contiguous();
+                    const auto expected_values=expected.to(tb::kFloat32).contiguous();
+                    std::ostringstream detail;detail.precision(9);
+                    detail<<"shared_output_first_difference="<<first<<" differences="<<differences
+                        <<" actual="<<actual_values.data_ptr<float>()[first]
+                        <<" expected="<<expected_values.data_ptr<float>()[first]<<" dispatch=";
+                    for(const auto kind:plans[1].kinds)detail<<int(kind)<<',';
+                    std::cerr<<detail.str()<<'\n';
+                    // Diagnose the shared contribution independently, retaining
+                    // the original weighted byte-equality failure below.
+                    const auto saved_weights=weights.clone();weights.zero_();mfq_cuda_synchronize();
+                    tb::Tensor shared_expected,shared_actual;
+                    {MfqCudaStreamGuard guard(streams[0]);
+                        math_environment.select(false);
+                        shared_expected=forwards[0](executions[0],input,ids,weights).cpu().contiguous();}
+                    math_environment.select(true);
+                    if(graph)window.run();else actual=forwards[1](executions[1],input,ids,weights);
+                    shared_actual=actual.cpu().contiguous();
+                    weights.copy_(saved_weights);mfq_cuda_synchronize();
+                    const auto shared_a=shared_actual.to(tb::kFloat32),shared_e=shared_expected.to(tb::kFloat32);
+                    int64_t shared_first=-1,shared_differences=0;
+                    for(int64_t i=0;i<shared_actual.numel();++i)
+                        if(std::memcmp(static_cast<const unsigned char*>(shared_actual.data_ptr())+i*shared_actual.element_size(),
+                                static_cast<const unsigned char*>(shared_expected.data_ptr())+i*shared_expected.element_size(),shared_actual.element_size())) {
+                            if(shared_first<0)shared_first=i;
+                            ++shared_differences;
+                        }
+                    std::ostringstream shared_detail;shared_detail.precision(9);
+                    shared_detail<<"zero_route_weights_differences="<<shared_differences;
+                    if(shared_first>=0)shared_detail<<" first="<<shared_first<<" actual="<<shared_a.data_ptr<float>()[shared_first]
+                        <<" expected="<<shared_e.data_ptr<float>()[shared_first];
+                    std::cerr<<shared_detail.str()<<'\n';
+                }
                 throw std::runtime_error("weighted shared two-stage output is not byte exact, tokens="+
                     std::to_string(tokens)+" routes="+std::to_string(routes)+" step="+std::to_string(step)+
                     " graph="+std::to_string(graph)+" gate_dtype="+std::to_string(int(gate_type)));
+            }
             for(const auto& mode:sources)for(const auto& s:mode)
                 if(s->expert_disk_reads_after_preload())throw std::runtime_error("weighted shared fusion read expert SSD after preload");
             ++cases;
@@ -923,8 +1259,15 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
                 throw std::runtime_error("comparison changed weight transfers or primary ownership");
         }
         }
-        if(counter(caches[0],"pipeline_two_stage_serves") || counter(caches[1],"pipeline_two_stage_serves")!=(comparison?12:4))
+        if(counter(caches[0],"pipeline_two_stage_serves")!=((compare_input_views || compare_math)?4:0) ||
+            counter(caches[1],"pipeline_two_stage_serves")!=(comparison?12:4))
             throw std::runtime_error("weighted shared test did not compare old and two-stage serving paths");
+        if(compare_resident_overlap && (counter(caches[0],"pipeline_early_gate_up_enabled")!=0 ||
+                counter(caches[1],"pipeline_early_gate_up_enabled")!=1))
+            throw std::runtime_error("resident overlap comparison did not exercise both dispatch settings");
+        if(compare_input_views && (counter(caches[0],"pipeline_window_input_view_serves") ||
+                counter(caches[1],"pipeline_window_input_view_serves")!=(graph?4:0)))
+            throw std::runtime_error("shared input-view check did not exercise its graph-only addresses");
         if(transfer_cache && (!counter(caches[1],"pipeline_transfer_cache_hits") ||
             !counter(caches[1],"pipeline_transfer_cache_misses") || !counter(caches[1],"pipeline_transfer_cache_saved_bytes")))
             throw std::runtime_error("retained transfer fields were not reused by changing shared FFN graphs");
@@ -933,7 +1276,8 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             const auto* mapped=std::getenv("MFQ_MOE_MAPPED_COPY");
             const bool enabled_phase=(!phases || std::string(phases)=="1") && !(mapped && std::string(mapped)=="1");
             const auto actual_phases=counter(caches[1],"pipeline_phased_transfer_serves");
-            if(actual_phases!=(comparison?4:enabled_phase?4:0) || counter(caches[0],"pipeline_phased_transfer_serves"))
+            if(actual_phases!=(comparison?4:enabled_phase?4:0) ||
+                counter(caches[0],"pipeline_phased_transfer_serves")!=(compare_math?actual_phases:0))
                 throw std::runtime_error("phased-transfer native arm was not exercised");
             if((enabled_phase || comparison) && (!counter(caches[1],"pipeline_gate_up_dma_bytes") || !counter(caches[1],"pipeline_down_dma_bytes")))
                 throw std::runtime_error("phased-transfer test omitted an original projection payload");
@@ -942,7 +1286,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             if(enabled && std::string(enabled)=="1") {
                 const auto serves=counter(caches[1],"pipeline_mapped_copy_serves");
                 const auto bytes=counter(caches[1],"pipeline_mapped_copy_bytes");
-                if(serves!=4 || !bytes || counter(caches[0],"pipeline_mapped_copy_serves"))
+                if(serves!=4 || !bytes || counter(caches[0],"pipeline_mapped_copy_serves")!=(compare_math?4:0))
                     throw std::runtime_error("shared graph did not compare DMA with mapped RAM transfer");
                 const auto* overlap=std::getenv("MFQ_MOE_MAPPED_COPY_OVERLAP");
                 const auto overlap_serves=counter(caches[1],"pipeline_mapped_overlap_serves");
@@ -954,12 +1298,13 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         }
     }
     if(((!transfer_cache || comparison) && !cpu) || !transfers || !resident)throw std::runtime_error("weighted shared fusion omitted a dispatch tier");
-    std::cout<<(transfer_cache?"transfer_cache_shared_cases=":"two_stage_shared_cases=")<<cases<<" cpu_positions="<<cpu<<" transfer_positions="<<transfers
+    std::cout<<(compare_nint_whole?"nint_whole_pipeline_cases=":compare_dense?"nvq_dense_pipeline_cases=":compare_resident_overlap?"resident_overlap_pipeline_cases=":compare_e8_narrow?"e8_narrow_pipeline_cases=":compare_default_math?"default_math_pipeline_cases=":compare_input_views?"shared_window_input_view_cases=":transfer_cache?"transfer_cache_shared_cases=":"two_stage_shared_cases=")<<cases<<" cpu_positions="<<cpu<<" transfer_positions="<<transfers
         <<" resident_positions="<<resident<<" mixed G/U/Down, released shared adaptive NINT6 gs24/sub7, Float/Half/BFloat gate, changing weighted graphs and partial VRAM/RAM exact PASS\n";
     if(comparison)std::cout<<"transfer_comparison_shared_cases="<<cases<<" passes=108 replay_guards=36 equal_dma=1 fixed_primary=1 PASS\n";
     if(phased_serves)std::cout<<"phased_transfer_shared_cases="<<phased_serves<<" PASS\n";
     if(mapped_serves)std::cout<<"mapped_copy_shared_cases="<<mapped_serves<<" mapped_bytes="<<mapped_bytes<<" PASS\n";
     if(mapped_overlaps)std::cout<<"mapped_overlap_shared_cases="<<mapped_overlaps<<" PASS\n";
+    if(compare_dense)std::cout<<"nvq_dense_pipeline_conversions="<<dense_conversions<<" PASS\n";
     return cases;
 }
 #include "../../../../bench/moe_residency_copy_bench.h"
@@ -985,6 +1330,7 @@ int verify_transfer_hit_reservation(const std::filesystem::path& root) {
         ~Environment(){set(old.c_str());}
     } environment;
     int cases=0;
+    std::int64_t dma_graph_launches=0,dma_graph_fallbacks=0;
     for(const std::string format:{"nint5","nvq3j-512"}) {
         std::array<std::shared_ptr<MoeExpertCache>,2> caches;
         std::array<std::array<MoeFfnForward,2>,2> forwards;
@@ -1031,9 +1377,175 @@ int verify_transfer_hit_reservation(const std::filesystem::path& root) {
                     " two_stage="+std::to_string(counter(caches[1],"pipeline_two_stage_serves")));
             ++cases;
         }
+        dma_graph_launches+=counter(caches[1],"pipeline_dma_graph_launches");
+        dma_graph_fallbacks+=counter(caches[1],"pipeline_dma_graph_fallbacks");
+        const auto skipped=counter(caches[1],"pipeline_gpu_only_cpu_wait_skips");
+        if(bool(skipped)!=mfq::cuda::runtime_options::skip_gpu_only_cpu_wait())
+            throw std::runtime_error("GPU-only transfer check did not exercise its CPU-wait option");
+        const bool skip_timing=mfq::cuda::runtime_options::skip_fixed_gpu_timing() &&
+            !mfq::cuda::runtime_options::moe_diagnostics().dma;
+        if(bool(counter(caches[1],"pipeline_fixed_gpu_timing_skips"))!=skip_timing)
+            throw std::runtime_error("GPU-only transfer check did not exercise its rate-timing option");
+        if(skip_timing && counter(caches[1],"pipeline_gpu_ns"))
+            throw std::runtime_error("skipped GPU rate events still contributed timing samples");
     }
+    if(mfq::cuda::runtime_options::dma_graph_batch() && !dma_graph_launches)
+        throw std::runtime_error("transfer reservation check did not execute DMA copy graphs");
     std::cout<<"transfer_hit_reservation_cases="<<cases<<" two sources sharing full staging arenas, miss-before-hit and original output bytes exact PASS\n";
+    if(dma_graph_launches)std::cout<<"transfer_dma_graph_launches="<<dma_graph_launches<<" ordinary_fallbacks="<<dma_graph_fallbacks<<" PASS\n";
     return cases;
+}
+void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_views=false,
+        bool noncontiguous=false,bool gpu_cold=false) {
+    const auto counter=[](const std::shared_ptr<MoeExpertCache>& cache,const char* name) {
+        std::ostringstream out;print_moe_expert_cache_stats(cache,out);
+        std::smatch match;const auto text=out.str();
+        if(!std::regex_search(text,match,std::regex(std::string(name)+"=([0-9]+)")))
+            throw std::runtime_error("missing CPU-ready counter");
+        return std::stoull(match[1]);
+    };
+    struct Environment {
+        const char* name;
+        std::string old;
+        bool existed=false;
+        explicit Environment(const char* key):name(key){if(const auto* value=std::getenv(name)){old=value;existed=true;}}
+        void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s(name,value);
+#else
+            if(*value)setenv(name,value,1);
+            else unsetenv(name);
+#endif
+        }
+        ~Environment(){set(existed?old.c_str():"");}
+    } environment(input_views?"MFQ_MFE_WINDOW_INPUT_VIEWS":"MFQ_MOE_EARLY_NO_CPU_READY");
+    int cases=0,cpu_groups=0,gpu_only=0,cancelled=0;
+    const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
+    for(const std::string format:{"nint5","nvq3j-512"}) {
+        std::array<CudaExecutionContext,2> executions;
+        std::array<std::shared_ptr<MoeExpertCache>,2> caches;
+        std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
+        std::array<MoeFfnForward,2> forwards;
+        std::array<tb::Tensor,2> outputs;
+        std::array<std::unique_ptr<mfq::cuda::DecodeWindow>,2> windows;
+        std::array<int,2> observed_cpu{};
+        int hot=-1,cold=-1;
+        for(int mode=0;mode<2;++mode) {
+            MfqCudaStreamGuard guard(streams[mode]);
+            auto& execution=executions[mode];auto& cfg=execution.config;
+            cfg.moe_preload_all=true;cfg.moe_assert_resident=true;cfg.moe_pipeline=true;
+            cfg.moe_hybrid_cpu=true;cfg.moe_direct_ram=true;cfg.moe_two_stage_ffn=true;
+            cfg.moe_ram_pcie=true;cfg.moe_ram_pcie_fraction=gpu_cold?1.:0.;cfg.moe_residency_adapt=false;
+            std::size_t bundle=0;
+            for(int p=0;p<3;++p) {
+                sources[mode][p]=source(root/(format+(p==2?"-2560-640.mfq":"-640-2560.mfq")));
+                bundle+=bytes(sources[mode][p]->metadata()->pools[0]);
+            }
+            cfg.moe_host_cache_bytes=3*bundle;caches[mode]=make_moe_expert_cache(2*bundle,cfg);
+            std::vector<std::shared_ptr<MfeWeight>> gu,down;
+            for(int p=0;p<3;++p) {
+                auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(caches[mode],
+                    "early-cpu/"+std::to_string(p),sources[mode][p],1,0,std::to_string(p)));
+                (p==2?down:gu).push_back(weight);
+            }
+            forwards[mode]=make_moe_ffn_pipeline(gu,down,{},[&,mode](const mfq::MoeDispatchPlan& plan) {
+                observed_cpu[mode]=int(std::count_if(plan.groups.begin(),plan.groups.end(),[](const auto& group) {
+                    return group.kind==mfq::MoeDispatchKind::Cpu;
+                }));
+            });
+            finalize_moe_expert_cache(caches[mode]);
+            for(int expert=0;expert<3;++expert) {
+                const bool all_hot=std::all_of(sources[mode].begin(),sources[mode].end(),[&](const auto& s){return s->gpu_resident(expert);});
+                const bool all_cold=std::none_of(sources[mode].begin(),sources[mode].end(),[&](const auto& s){return s->gpu_resident(expert);});
+                if(!mode && all_hot)hot=expert;
+                if(!mode && all_cold)cold=expert;
+            }
+        }
+        if(hot<0 || cold<0)throw std::runtime_error("CPU-ready test lacks a full GPU and RAM bundle");
+        std::vector<float> values(2560);for(int i=0;i<2560;++i)values[i]=std::sin(float(i)*.023f)*.15f;
+        auto x=tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA);
+        auto ids=tb::tensor(std::vector<int32_t>{hot,hot}).reshape({1,2}).to(tb::kCUDA);
+        auto weights=tb::tensor(std::vector<float>{.375f,.625f}).reshape({1,2}).to(tb::kCUDA);
+        mfq_cuda_synchronize();
+        for(int mode=0;mode<2;++mode) {
+            MfqCudaStreamGuard guard(streams[mode]);
+            environment.set(mode?"1":"0");
+            windows[mode]=std::make_unique<mfq::cuda::DecodeWindow>(streams[mode].stream());
+            windows[mode]->capture([&,mode] {
+                if(!input_views)outputs[mode]=forwards[mode](executions[mode],x,ids,weights);
+                else {
+                    {
+                        auto temporary_x=noncontiguous?tb::empty({1,2560,2},x.options()).select(2,0):x.clone();
+                        auto temporary_ids=noncontiguous?tb::empty({1,2,2},ids.options()).select(2,0):ids.clone();
+                        auto temporary_weights=noncontiguous?tb::empty({1,2,2},weights.options()).select(2,0):weights.clone();
+                        if(noncontiguous) {
+                            temporary_x.copy_(x);temporary_ids.copy_(ids);temporary_weights.copy_(weights);
+                            if(temporary_x.is_contiguous() || temporary_ids.is_contiguous() || temporary_weights.is_contiguous())
+                                throw std::runtime_error("window view fallback test lacks strided producers");
+                        }
+                        outputs[mode]=forwards[mode](executions[mode],temporary_x,temporary_ids,temporary_weights);
+                    }
+                    // Reuse temporary allocation sizes after the FFN consumers,
+                    // exercising graph-pool lifetimes rather than persistent inputs.
+                    auto overwrite_x=tb::full({1,2560},-.75f,x.options());
+                    auto overwrite_ids=tb::full({1,2},-123,ids.options());
+                    auto overwrite_weights=tb::full({1,2},-4.f,weights.options());
+                }
+            },[]{},[&,mode]{outputs[mode]={};});
+        }
+        const std::array<std::array<int32_t,2>,7> routes={{{hot,hot},{cold,cold},{hot,cold},
+            {cold,hot},{hot,hot},{cold,cold},{hot,hot}}};
+        const char* checked_counter=input_views?"pipeline_window_input_view_serves":"pipeline_early_no_cpu_ready_serves";
+        const std::array<uint64_t,2> early_before={counter(caches[0],checked_counter),counter(caches[1],checked_counter)};
+        uint64_t expected_early=0;
+        for(int repeat=0;repeat<2;++repeat)for(const auto& route:routes) {
+            if(input_views) {
+                for(int i=0;i<2560;++i)values[i]=std::sin(float(i+cases*19)*.023f)*(.11f+.01f*repeat);
+                x.copy_(tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA));
+                weights.copy_(tb::tensor(std::vector<float>{.125f+.025f*cases,.875f-.013f*cases}).reshape({1,2}).to(tb::kCUDA));
+            }
+            ids.copy_(tb::tensor(std::vector<int32_t>(route.begin(),route.end())).reshape({1,2}).to(tb::kCUDA));
+            mfq_cuda_synchronize();
+            std::array<tb::Tensor,2> actual;
+            for(int mode=0;mode<2;++mode) {
+                MfqCudaStreamGuard guard(streams[mode]);
+                environment.set(mode?"1":"0");windows[mode]->run();actual[mode]=outputs[mode].cpu().contiguous();
+            }
+            if(observed_cpu[0]!=observed_cpu[1] || std::memcmp(actual[0].data_ptr(),actual[1].data_ptr(),actual[0].numel()*actual[0].element_size()))
+                throw std::runtime_error("early CPU completion changed replayed GPU/CPU output bytes");
+            cpu_groups+=observed_cpu[1];gpu_only+=observed_cpu[1]==0;++cases;
+            expected_early+=input_views?!noncontiguous:observed_cpu[1]==0;
+        }
+        if(counter(caches[0],checked_counter)!=early_before[0] ||
+            counter(caches[1],checked_counter)-early_before[1]!=expected_early)
+            throw std::runtime_error("window completion/input-view option did not exercise its intended routes");
+        if(!gpu_cold && (counter(caches[0],"pipeline_gpu_only_cpu_wait_skips") ||
+            counter(caches[1],"pipeline_gpu_only_cpu_wait_skips")))
+            throw std::runtime_error("a graph with a CPU quota omitted its CPU completion wait");
+        if(!gpu_cold && (counter(caches[0],"pipeline_fixed_gpu_timing_skips") ||
+            counter(caches[1],"pipeline_fixed_gpu_timing_skips")))
+            throw std::runtime_error("a graph with a CPU quota omitted its rate timing");
+        // The public dispatcher rejects invalid expert IDs. Both notification
+        // schedules must cancel an in-flight graph and reject its next replay.
+        ids.copy_(tb::tensor(std::vector<int32_t>{cold,-1}).reshape({1,2}).to(tb::kCUDA));
+        mfq_cuda_synchronize();
+        for(int mode=0;mode<2;++mode) {
+            MfqCudaStreamGuard guard(streams[mode]);environment.set(mode?"1":"0");
+            bool rejected=false,unavailable=false;
+            try{windows[mode]->run();}catch(const std::exception& error) {
+                rejected=std::string(error.what()).find("expert ID is out of range")!=std::string::npos;
+            }
+            try{windows[mode]->run();}catch(const std::exception& error) {
+                unavailable=std::string(error.what()).find("unavailable")!=std::string::npos;
+            }
+            if(!rejected || !unavailable)throw std::runtime_error("CPU-ready failure did not cancel and invalidate its graph");
+            ++cancelled;
+        }
+    }
+    if((!gpu_cold && !cpu_groups) || !gpu_only)throw std::runtime_error("CPU-ready/view test did not exercise its configured dispatch tiers");
+    std::cout<<(input_views?"window_input_view_cases=":"early_no_cpu_ready_cases=")<<cases
+        <<" strided="<<noncontiguous<<" gpu_cold="<<gpu_cold<<" cpu_groups="<<cpu_groups<<" gpu_only="<<gpu_only
+        <<" cancellations="<<cancelled<<" repeated GPU/CPU transitions and duplicate routes exact; invalid-route cancellation PASS\n";
 }
 void verify_router_prefetch(const std::filesystem::path& root) {
     struct Environment {
@@ -1206,11 +1718,77 @@ void verify_router_lookahead_inputs() {
     if(guards!=4)throw std::runtime_error("lookahead audit shape/sample guards incomplete");
     std::cout<<"router_lookahead_input_samples=3 layer_rows=9 warmup_samples=0 guards=4 original_bytes_exact=1 PASS\n";
 }
+#include "residency_direct_exchange_test.h"
+#include "prefill_pipeline_test.h"
+#include "compact_prefill_mma_test.h"
+#include "nvq_prefill_k_tile_test.h"
 int main(int argc,char** argv)try {
+    std::cout.setf(std::ios::unitbuf);
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
+        if(std::string(argv[2])=="--nvq-prefill-k-tile-check") {verify_nvq_prefill_k_tiles(root);return 0;}
+        if(std::string(argv[2])=="--nvq-prefill-cohort-default-check") {verify_nvq_prefill_k_tiles(root,true,true);return 0;}
+        if(std::string(argv[2])=="--nvq-prefill-cohort-check") {verify_nvq_prefill_k_tiles(root,true);return 0;}
+        if(std::string(argv[2])=="--compact-prefill-mma-check") {verify_compact_prefill_mma(root);return 0;}
+        if(std::string(argv[2])=="--prefill-stream-oracle-check") {
+            verify_prefill_graph_execution(root,true,1,true,true);
+            verify_prefill_graph_execution(root,true,16,true,true);return 0;
+        }
+        if(std::string(argv[2])=="--prefill-graph-check") {verify_prefill_graph_execution(root);return 0;}
+        if(std::string(argv[2])=="--prefill-layer-oracle-check") {verify_prefill_graph_execution(root,false,16,true,true,true);return 0;}
+        if(std::string(argv[2])=="--prefill-layer-exact-check") {verify_prefill_graph_execution(root,false,16,true,false,true);return 0;}
+        if(std::string(argv[2])=="--prefill-layer-batch-check") {verify_prefill_graph_execution(root,false,16,true,true,true,false,true);return 0;}
+        if(std::string(argv[2])=="--prefill-layer-layout-check") {verify_prefill_graph_execution(root,false,16,false,false,true,true);return 0;}
+        if(std::string(argv[2])=="--prefill-group-check") {verify_prefill_graph_execution(root,true);return 0;}
+        if(std::string(argv[2])=="--prefill-group-sparse-check") {verify_prefill_graph_execution(root,true,1,true);return 0;}
+        if(std::string(argv[2])=="--prefill-group16-check") {verify_prefill_graph_execution(root,true,16);return 0;}
+        if(std::string(argv[2])=="--copy-overlap-check") {verify_copy_kernel_overlap();return 0;}
+        if(std::string(argv[2])=="--mapped-refill-check") {verify_mapped_refill_descriptors();return 0;}
+        if(std::string(argv[2])=="--direct-exchange-check") {verify_direct_exchange(root);return 0;}
+        if(std::string(argv[2])=="--transfer-promotion-check") {
+            const auto* mode=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+            if(!mode || (mode[0]!='1' && mode[0]!='2'))throw std::runtime_error("promotion check requires explicit candidate mode");
+            verify_projection_heat(root,true);return 0;
+        }
+        if(std::string(argv[2])=="--nint-whole-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--nvq-dense-default-check") {
+            verify_nvq_dense_default(root);return 0;
+        }
+        if(std::string(argv[2])=="--nvq-dense-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--resident-overlap-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--e8-narrow-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--default-math-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--shared-input-check") {
+            const auto cases=verify_shared_input(root);
+            std::cout<<"shared_input_cases="<<cases<<" mixed Gate/Up outputs, bytes and scales exact PASS\n";
+            return 0;
+        }
+        if(std::string(argv[2])=="--nint-dispatch-check") {
+            verify_nint_dispatch(root);return 0;
+        }
+        if(std::string(argv[2])=="--warm-residency-check") {
+            verify_warm_residency(root);return 0;
+        }
+        if(std::string(argv[2])=="--warm-residency-dedicated-check") {
+            verify_warm_residency(root,false);return 0;
+        }
         if(std::string(argv[2])=="--router-prefetch-check") {
             verify_router_prefetch(root);return 0;
         }
@@ -1223,8 +1801,24 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--phased-transfer-check") {
             verify_phased_wire_bytes();verify_two_stage_shared(root,true);return 0;
         }
+        if(std::string(argv[2])=="--weighted-shared-check") {
+            verify_two_stage_shared(root);return 0;
+        }
         if(std::string(argv[2])=="--transfer-reservation-check") {
             verify_transfer_hit_reservation(root);return 0;
+        }
+        if(std::string(argv[2])=="--early-no-cpu-ready-check") {
+            verify_early_no_cpu_ready(root);return 0;
+        }
+        if(std::string(argv[2])=="--window-input-views-check") {
+            for(bool strided:{false,true})for(bool gpu_cold:{false,true})
+                verify_early_no_cpu_ready(root,true,strided,gpu_cold);
+            return 0;
+        }
+        if(std::string(argv[2])=="--shared-window-input-views-check") {
+            if(!mfq::cuda::runtime_options::window_input_views())
+                throw std::runtime_error("shared input-view check requires MFQ_MFE_WINDOW_INPUT_VIEWS=1");
+            verify_two_stage_shared(root,false,false,true);return 0;
         }
         if(std::string(argv[2])!="--residency-copy-bench")throw std::runtime_error("unknown residency benchmark mode");
         residency_copy_benchmark(root);return 0;

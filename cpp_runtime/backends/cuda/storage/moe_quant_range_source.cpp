@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "moe_quant_range_source.h"
 #include "cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
@@ -5,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -26,6 +28,13 @@ std::size_t expert_fields_bytes(const MixedMoePool& pool) {
 MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStore> store)
     :store_(std::move(store)),metadata_(std::make_shared<MixedMoeRuntime>()) {
     if (!store_) throw std::invalid_argument("missing quantized expert range source");
+    const auto dense=mfq::cuda::runtime_options::moe_nvq_dense();
+    const auto preload=mfq::cuda::runtime_options::moe_preload_all();
+    const auto sealed=mfq::cuda::runtime_options::moe_assert_resident();
+    const bool complete=preload && *preload && sealed && *sealed;
+    dense_groups_=dense ? *dense : complete;
+    if(dense_groups_ && !complete)
+        throw std::invalid_argument("compact NVQ requires complete sealed preload");
     metadata_->n_experts=store_->num_experts();
     metadata_->out_per_expert=store_->out_per_expert();
     metadata_->neuron_len=store_->neuron_len();
@@ -80,6 +89,7 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
     } else {
         pool.family=MixedMoeFamily::Nvq;
         pool.nvq=to_cpu_nvq(unpack_nvq(encoded.payload,encoded.dtype));
+        if(dense_groups_ && prepare_nvq_dense_groups(pool.nvq))++dense_materializations_;
         if (static_cast<std::size_t>(index)<metadata_->pools.size())
             pool.nvq.codebook=metadata_->pools[index].nvq.codebook;
     }

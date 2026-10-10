@@ -30,6 +30,7 @@ struct RuntimeInput {
     int causal_columns = 0;
     bool half_query = false;
     bool wide_positions = false;
+    bool direct_query = false;
 };
 
 inline uint3 sparse_fastdiv_values(uint32_t divisor) {
@@ -94,7 +95,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     const int jt = static_cast<int>(query_work / iter_k);
     const int zt_q = z_kv * gqa_ratio + zt_gqa * ncols2;
 
-    const float2 * q_f2 = input.positions ? nullptr : reinterpret_cast<const float2 *>(q) +
+    const float2 * q_f2 = input.direct_query ? nullptr : reinterpret_cast<const float2 *>(q) +
         (static_cast<int64_t>(sequence) * heads * M +
          static_cast<int64_t>(zt_q) * M) * (DKQ / 2);
     const half2 * k_h2 = reinterpret_cast<const half2 *>(k) +
@@ -113,7 +114,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         mask + static_cast<int64_t>(sequence) * M * selected;
     const float * tile_sinks = sinks == nullptr ? nullptr : sinks + zt_q;
     mfq_fattn_runtime_input tile_input{};
-    if (input.positions) {
+    if (input.direct_query) {
         const int64_t query_offset = int64_t(sequence)*input.query_batch_stride +
             int64_t(zt_q)*input.query_head_stride;
         tile_input.query = static_cast<const char*>(q) + query_offset*(input.half_query ? sizeof(half) : sizeof(float));
@@ -121,6 +122,8 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         tile_input.query_head_stride = input.query_head_stride;
         tile_input.query_column_stride = input.query_column_stride;
         tile_input.half_query = input.half_query;
+    }
+    if (input.positions) {
         int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[jt]
             : static_cast<const int32_t*>(input.positions)[jt];
         end = end < -1 ? -1 : end;
@@ -272,11 +275,11 @@ Tensor launch(
         (causal || indices.is_cuda()) && q.device() == k.device() &&
         q.device() == v.device() && (causal || q.device() == indices.device()),
         name, ": tensors must share one CUDA device");
-    MFQ_RUNTIME_CHECK((causal || q.is_contiguous()) && k.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(k.is_contiguous() &&
         v.is_contiguous() && (causal || indices.is_contiguous()),
         name, ": tensors must be contiguous");
     MFQ_RUNTIME_CHECK((q.scalar_type() == mfq_tensor_backend::kFloat32 ||
-        (causal && q.scalar_type() == mfq_tensor_backend::kFloat16)) &&
+        q.scalar_type() == mfq_tensor_backend::kFloat16) &&
         k.scalar_type() == mfq_tensor_backend::kFloat16 &&
         v.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (causal || indices.scalar_type() == mfq_tensor_backend::kInt32),
@@ -400,7 +403,8 @@ Tensor launch(
     const RuntimeInput input{causal ? positions.data_ptr() : nullptr,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
-        causal && positions.scalar_type() == mfq_tensor_backend::kInt64};
+        causal && positions.scalar_type() == mfq_tensor_backend::kInt64,
+        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16};
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),

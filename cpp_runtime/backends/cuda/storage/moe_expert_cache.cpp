@@ -365,9 +365,54 @@ void MoeExpertCache::preload_complete_residency() {
         layer_sources[source->layer_id_].push_back(source.get());
     }
     int64_t ram_allocated=0;
+    const auto layer_option=mfq::cuda::runtime_options::moe_prefill_layer();
+    pipeline_prefill_layer_layout_=layer_option && *layer_option!=0;
+    std::vector<std::vector<std::vector<int64_t>>> ram_field_offsets;
+    if(pipeline_prefill_layer_layout_) {
+        ram_field_offsets.resize(sources_.size());
+        for(const auto& source:sources_)ram_field_offsets[source->id_].resize(source->n_experts());
+        // Loader role strings can name the model architecture. The registered
+        // FFN bundle defines Down independently of those strings and load order.
+        std::vector<bool> down_sources(sources_.size(),false);
+        for(const auto& bundle:pipeline_bundles_)down_sources.at(bundle[2])=true;
+        for(auto& layer:layer_sources) {
+            ram_allocated=(ram_allocated+255)&~int64_t(255);
+            const auto begin=ram_allocated;
+            const auto down=[&](const MoeCachedSource* source) {
+                return down_sources.at(source->id_);
+            };
+            std::stable_sort(layer.second.begin(),layer.second.end(),[&](const auto* a,const auto* b) {
+                return down(a)<down(b);
+            });
+            int64_t gate_up_end=-1;
+            for(auto* source:layer.second)for(auto& cohort:source->cohorts_) {
+                if(down(source) && gate_up_end<0)gate_up_end=ram_allocated-begin;
+                for(int expert=0;expert<source->n_experts();++expert)
+                    if(source->expert_to_cohort_[expert]==cohort.index &&
+                            !source->quant_source_->gpu_resident(expert) && !warm[source->id_][expert]) {
+                        cohort.prefill_ram_experts.push_back(expert);
+                        ram_field_offsets[source->id_][expert].resize(cohort.bytes_per_expert.size());
+                    }
+                for(std::size_t f=0;f<cohort.bytes_per_expert.size();++f) {
+                    ram_allocated=(ram_allocated+255)&~int64_t(255);
+                    cohort.prefill_ram_fields.push_back(ram_allocated);
+                    for(const auto expert:cohort.prefill_ram_experts) {
+                        ram_field_offsets[source->id_][expert][f]=ram_allocated;
+                        if(f==0)ram_offsets[source->id_][expert]=ram_allocated;
+                        if(cohort.bytes_per_expert[f]>std::numeric_limits<int64_t>::max()-ram_allocated)
+                            throw std::overflow_error("RAM layer size overflow");
+                        ram_allocated+=cohort.bytes_per_expert[f];
+                    }
+                }
+            }
+            ram_allocated=(ram_allocated+255)&~int64_t(255);
+            pipeline_prefill_layers_[layer.first]={begin,ram_allocated-begin};
+            pipeline_prefill_layer_gate_up_bytes_[layer.first]=gate_up_end<0?ram_allocated-begin:gate_up_end;
+        }
+    }
     // Keep each expert's missing projection fields together. CUDA can transfer
     // an immutable RAM interval without first copying it to another host arena.
-    for(const auto& layer:layer_sources) {
+    if(!pipeline_prefill_layer_layout_)for(const auto& layer:layer_sources) {
         int count=0;for(const auto* source:layer.second)count=std::max(count,source->n_experts());
         for(int expert=0;expert<count;++expert)for(const auto* source:layer.second) {
             if(expert>=source->n_experts())continue;
@@ -398,8 +443,10 @@ void MoeExpertCache::preload_complete_residency() {
                     auto offset=ram_offsets[source->id_][expert];
                     if(offset<0)return decoded;
                     auto fields=moe_cache_fields(decoded);
-                    for(auto& field:fields) {
-                        offset=(offset+15)&~int64_t(15);
+                    for(std::size_t f=0;f<fields.size();++f) {
+                        auto& field=fields[f];
+                        offset=pipeline_prefill_layer_layout_ ? ram_field_offsets[source->id_][expert][f]
+                                                             : (offset+15)&~int64_t(15);
                         auto view=moe_owned_host_view(pipeline_ram_complement_,static_cast<std::size_t>(offset),field);
                         const auto count=tensor_nbytes(field);
                         std::memcpy(view.data_ptr(),field.data_ptr(),static_cast<std::size_t>(count));
@@ -449,12 +496,17 @@ void MoeExpertCache::preload_complete_residency() {
         pipeline_ram_registered_bytes_=ram_allocated;
     }
     std::cerr << "moe_residency_h2d bytes=" << h2d_bytes << " cuda_ms=" << h2d_ms << std::endl;
+    std::uint64_t dense_materializations=0;
+    for(const auto& source:sources_)dense_materializations+=source->quant_source_->dense_materializations();
     const auto host=host_experts_->stats();
     complete_residency_=true;
     std::cerr << "moe_residency_ready experts=" << total_experts << " gpu_experts=" << gpu_experts
         << " ram_experts=" << ram_experts << " ram_bytes=" << host.resident_bytes
         << " ram_arena_bytes=" << ram_allocated
         << " ram_registered_bytes=" << pipeline_ram_registered_bytes_
+        << " prefill_layer_layout=" << pipeline_prefill_layer_layout_
+        << " residency_fixed_prefill_layout=" << pipeline_prefill_layer_layout_
+        << " nvq_dense_materializations=" << dense_materializations
         << " disk_reads_sealed=" << sources_.front()->quant_source_->expert_disk_sealed() << " elapsed_s="
         << std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count() << std::endl;
     stats_={};
@@ -1231,6 +1283,38 @@ void print_moe_expert_cache_stats(
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? cache->ram_pcie_fraction() : 0;
 }
+void release_moe_prefill_buffers(MoeExpertCache* cache) {
+    if(!cache || (cache->pipeline_prefill_release_.empty() &&
+            !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_))return;
+    cudaStreamCaptureStatus capture;
+    const auto stream=mfq_current_cuda_stream();
+    MFQ_CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
+    if(capture!=cudaStreamCaptureStatusNone)
+        throw std::runtime_error("prefill buffers must be released before decode graph capture");
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(cache->weight_stream_));
+    for(auto& release:cache->pipeline_prefill_release_)release();
+    cache->pipeline_prefill_release_.clear();
+    for(auto i=cache->pipeline_stages_.begin();i!=cache->pipeline_stages_.end();)
+        if(i->first.starts_with("prefill16:"))i=cache->pipeline_stages_.erase(i);else ++i;
+    cache->pipeline_prefill_activations_.reset();
+    cache->pipeline_prefill_ring_={};
+    cache->pipeline_prefill_layer_buffer_={};
+    cache->pipeline_prefill_layer_stride_=0;
+    cache->pipeline_prefill_layer_loaded_={};
+    cache->pipeline_prefill_layer_last_served_=-1;
+    cache->pipeline_prefill_layer_read_recorded_={};
+    if(cache->pipeline_prefill_pool_) {
+        MFQ_CUDA_CHECK(cudaMemPoolSetAttribute(cache->pipeline_prefill_pool_,cudaMemPoolAttrReleaseThreshold,
+            &cache->pipeline_prefill_pool_previous_threshold_));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+        MFQ_CUDA_CHECK(cudaMemPoolTrimTo(cache->pipeline_prefill_pool_,0));
+        cache->pipeline_prefill_pool_=nullptr;
+    }
+    cache->pipeline_prefill_dma_metadata_.reset();cache->pipeline_dma_leases_.clear();
+    cache->transfer_ready_recorded_=false;
+}
+
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
     if(cache)cache->finish_pipeline_exchanges();
 }

@@ -1,5 +1,8 @@
+#include "../runtime/execution_options.h"
 #include "mfq_cuda_moe_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_nint_route_hint.h"
+#include "mfq_cuda_nvq1_decode.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
 
@@ -503,10 +506,28 @@ static void initialize_mixed_nint_dispatch(MixedMoeRuntime& runtime) {
 
 void initialize_mixed_nvq_dispatch(
         MixedMoeRuntime & runtime,
-        const CudaExecutionConfig& config) {
+        const CudaExecutionConfig& config,bool dense_prefill) {
+    std::unordered_map<const void*,mfq_tensor_backend::Tensor> integer_books;
+    for(auto& pool:runtime.pools)if(pool.family==MixedMoeFamily::Nvq) {
+        auto& w=pool.nvq;
+        prepare_nvq_decode_records(w);
+        const auto* key=w.codebook.data_ptr();
+        const auto found=integer_books.find(key);
+        if(found!=integer_books.end())w.integer_codebook=found->second;
+        else {
+            prepare_nvq_integer_codebook(w);
+            if(w.integer_codebook.defined())integer_books.emplace(key,w.integer_codebook);
+        }
+    }
     initialize_mixed_nint_dispatch(runtime);
     runtime.nvq_dispatch.reset();
     if (!config.moe_nvq_heterogeneous) return;
+    bool has_dense_groups=false;
+    for(const auto& pool:runtime.pools)
+        if(pool.family==MixedMoeFamily::Nvq && pool.nvq.dense_groups)has_dense_groups=true;
+    // Prefill's FP16 weight reader handles compact records directly. Preserve
+    // the existing decode dispatch until its separate readers are validated.
+    if(has_dense_groups && !dense_prefill)return;
 
     int nvq_pools = 0;
     for (const auto & pool : runtime.pools) {
@@ -615,6 +636,7 @@ void initialize_mixed_nvq_dispatch(
     dispatch->map_ptrs=mfq_tensor_backend::tensor(map_ptrs).to(target).contiguous();
     dispatch->f16_format_group = f16_format_group;
     dispatch->masked_experts = owned_experts < runtime.n_experts;
+    dispatch->dense_groups = has_dense_groups;
     dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
         weight_ptrs.data(), {dispatch_pool, 5},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
@@ -693,6 +715,9 @@ int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
             bytes += tensor_storage_bytes(pool.nvq.sub_scale_packed);
             bytes += tensor_storage_bytes(pool.nvq.neuron_scale);
             bytes += tensor_storage_bytes(pool.nvq.codebook);
+            bytes += tensor_storage_bytes(pool.nvq.integer_codebook);
+            if(pool.nvq.decode_records.defined() && pool.nvq.decode_records.data_ptr()!=pool.nvq.indices_packed.data_ptr())
+                bytes += tensor_storage_bytes(pool.nvq.decode_records);
         } else {
             bytes += tensor_storage_bytes(pool.nepq.indices_packed);
             bytes += tensor_storage_bytes(pool.nepq.aux_packed);
@@ -1039,6 +1064,9 @@ static NvqWeight copy_cpu_nvq_to_cuda(const NvqWeight & source) {
     result.neuron_scale =
         copy_cpu_weight_to_cuda(source.neuron_scale);
     result.codebook = copy_cpu_weight_to_cuda(source.codebook);
+    result.integer_codebook = copy_cpu_weight_to_cuda(source.integer_codebook);
+    result.decode_records = source.decode_records.defined() && source.decode_records.data_ptr()==source.indices_packed.data_ptr()
+        ? result.indices_packed : copy_cpu_weight_to_cuda(source.decode_records);
     return result;
 }
 
@@ -1347,6 +1375,21 @@ MoeActivationWorkspace & MixedMoeRuntime::activation_workspace(
         key, std::move(value)).first->second;
 }
 
+MoeActivationWorkspace MixedMoeRuntime::prefill_activation_workspace(
+        mfq_tensor_backend::Tensor x,int input_rows,int groups,int gs,
+        MixedMoeTransformKey transform) const {
+    // All prompt groups execute on the same compute stream. One growing
+    // allocation per geometry can therefore serve every layer and density.
+    const MixedMoeActivationKey key{0,groups,gs,x.get_device(),transform};
+    auto& value=activation_workspaces[key];
+    if(!value.qx.defined() || value.qx.size(0)<input_rows) {
+        const int capacity=((input_rows+255)/256)*256;
+        value.qx=mfq_tensor_backend::empty({capacity,groups*gs},x.options().dtype(mfq_tensor_backend::kInt8));
+        value.xscale=mfq_tensor_backend::empty({capacity,groups},x.options().dtype(mfq_tensor_backend::kFloat32));
+    }
+    return {value.qx.narrow(0,0,input_rows),value.xscale.narrow(0,0,input_rows)};
+}
+
 std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
     std::vector<MoeActivationGeometry> result;
     for (const auto & pool : pools) {
@@ -1429,7 +1472,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     const bool use_f16_mma =
         config.moe_prefill_mma &&
         !force_prefill_mma_off &&
-        tokens >= config.moe_prefill_mma_min_tokens &&
+        (tokens >= config.moe_prefill_mma_min_tokens || prefill_only) &&
         route.map_ready &&
         route.ids_dst.numel() == route.ids.numel();
     const bool use_kl_mmq =
@@ -1440,11 +1483,11 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
           static_cast<int64_t>(tokens) * routes >
               static_cast<int64_t>(n_experts) * 16));
     const bool use_nvq_prefill =
-        use_f16_mma && !use_kl_mmq && nvq_hetero_prefill_ready;
+        use_f16_mma && tokens>8 && !use_kl_mmq && nvq_hetero_prefill_ready;
     const bool use_nvq_decode =
-        !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
+        !use_f16_mma && !use_kl_mmq && nvq_dispatch && !nvq_dispatch->dense_groups &&
         nvq_dispatch->pool_count > 1 &&
-        tokens <= 8 && !force_pool_path &&
+        tokens <= 8 && !prefill_only && !force_pool_path &&
         config.moe_nvq_heterogeneous_decode;
     const bool use_active_nvq=use_nvq_decode && config.moe_nvq_active_decode &&
         route.ids.numel()>0 && route.ids.numel()<=1024;
@@ -1531,7 +1574,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     }
 
     const bool use_nint_decode=config.moe_nint_heterogeneous_decode && nint_dispatch &&
-        !use_f16_mma && !use_kl_mmq && !force_pool_path && tokens<=8 &&
+        !use_f16_mma && !use_kl_mmq && !prefill_only && !force_pool_path && tokens<=8 &&
         int64_t(tokens)*routes<=65535 && epilogue_mode==0;
     if(use_nint_decode) {
         auto found=nint_input_plans.find(input_rows);
@@ -1558,19 +1601,70 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             plan.quantize_descriptors=mfq_tensor_backend::tensor(quantize).reshape({int64_t(geometries.size()),4}).to(x.device());
             found=nint_input_plans.emplace(input_rows,std::move(plan)).first;
         }
-        const auto& plan=found->second;
-        if(!input_prequantized)moe_quantize_shared_input_cuda(x.reshape({input_rows,neuron_len}),
+        auto& plan=found->second;
+        const auto row_setting=mfq::cuda::runtime_options::nint_route_row_workspace();
+        const auto direct_setting=mfq::cuda::runtime_options::nint_direct_pool();
+        const auto group_setting=mfq::cuda::runtime_options::nint_group_dot();
+        const auto hint_setting=mfq::cuda::runtime_options::nint_route_hint();
+        const auto warp_setting=mfq::cuda::runtime_options::nint_route_warps();
+        bool request_rows=row_setting && *row_setting;
+        if(!row_setting && tokens==1 && nint_dispatch->pools.size()==1) {
+            const auto& w=pools[nint_dispatch->pools.front()].nint;
+            if(neuron_len==2560 && out_per_expert==640 && w.gs==28 && w.bits==5 &&
+                    nint_late_scale_enabled(neuron_len,int(w.bits),x.get_device())) {
+                thread_local int cached_device=-1,major=0,minor=0;
+                if(cached_device!=x.get_device()) {
+                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,x.get_device()));
+                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,x.get_device()));
+                    cached_device=x.get_device();
+                }
+                request_rows=major==8 && minor==6;
+            }
+        }
+        bool prepare_rows=request_rows && nint_dispatch->pools.size()==1 &&
+            (!direct_setting || *direct_setting) && (!group_setting || *group_setting) &&
+            (!hint_setting || *hint_setting) && (!warp_setting || *warp_setting!=4);
+        if(prepare_rows) {
+            const auto& pool=pools[nint_dispatch->pools.front()];const auto& w=pool.nint;
+            prepare_rows=(w.gs==24 || w.gs==28) && w.bits>=4 && w.bits<=6;
+            if(prepare_rows) {
+                if(!plan.row_metadata_workspace.defined())plan.row_metadata_workspace=mfq_tensor_backend::empty(
+                    {w.out,4},w.q_packed.options().dtype(mfq_tensor_backend::kInt32));
+                moe_quantize_shared_nint_rows_cuda(x.reshape({input_rows,neuron_len}),plan.quantize_descriptors,
+                    plan.total_groups,!input_prequantized,w.row_q_bit_offsets,w.neuron_scale,w.neuron_min,
+                    plan.row_metadata_workspace,pool.expert_local,route.ids,out_per_expert,pool.local_experts);
+            }
+        }
+        if(!prepare_rows && !input_prequantized)moe_quantize_shared_input_cuda(x.reshape({input_rows,neuron_len}),
             plan.quantize_descriptors,plan.total_groups);
         for(int index:nint_dispatch->pools) {
             const auto& w=pools[index].nint;
             quantized.insert({input_rows,int(w.ng),int(w.gs),x.get_device(),identity});
         }
+        bool direct=false;
+        if(nint_dispatch->pools.size()==1) {
+            const auto& pool=pools[nint_dispatch->pools.front()];const auto& w=pool.nint;
+            auto& workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
+            const auto& row_metadata=prepare_rows?plan.row_metadata_workspace:w.route_metadata;
+            const NintSingleRouteWeight view{{reinterpret_cast<int64_t>(w.q_packed.data_ptr()),
+                reinterpret_cast<int64_t>(w.row_q_bits.data_ptr()),reinterpret_cast<int64_t>(w.row_q_bit_offsets.data_ptr()),
+                reinterpret_cast<int64_t>(w.sub_scale.data_ptr()),reinterpret_cast<int64_t>(w.sub_min.data_ptr()),
+                reinterpret_cast<int64_t>(w.neuron_scale.data_ptr()),reinterpret_cast<int64_t>(w.neuron_min.data_ptr()),
+                reinterpret_cast<int64_t>(workspace.qx.data_ptr()),reinterpret_cast<int64_t>(workspace.xscale.data_ptr())},
+                {int(w.ng),int(w.gs),int(w.q_packed.numel()/pool.local_experts)},pool.local_experts,
+                row_metadata.defined()?reinterpret_cast<int64_t>(row_metadata.data_ptr()):0};
+            direct=nint_try_single_route_cuda(view,pool.expert_local,route.ids,output,x.dim()==3,int(w.bits),prepare_rows);
+        }
+        if(!direct) {
         mfq::cuda::moe_update_nvq_maps(reinterpret_cast<const uint64_t*>(nint_dispatch->map_ptrs.data_ptr<int64_t>()),
             int(nint_dispatch->pools.size()),n_experts,nint_dispatch->expert_pool.data_ptr<int32_t>(),
             nint_dispatch->expert_local.data_ptr<int32_t>(),mfq_current_cuda_stream());
         MFQ_CUDA_CHECK(cudaGetLastError());
-        nint_moe_grouped_matmul_hetero_cuda(plan.weight_ptrs,nint_dispatch->pool_params,
-            nint_dispatch->expert_pool,nint_dispatch->expert_local,route.ids,output,neuron_len,x.dim()==3);
+        const auto& hint=pools[nint_dispatch->pools.front()].nint;
+        nint_moe_grouped_matmul_hinted_cuda(plan.weight_ptrs,nint_dispatch->pool_params,
+            nint_dispatch->expert_pool,nint_dispatch->expert_local,route.ids,output,neuron_len,x.dim()==3,
+            nint_dispatch->pools.size()==1?int(hint.gs):0,int(hint.bits));
+        }
     }
 
     for (const auto & pool : pools) {
@@ -1743,7 +1837,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         auto qx = workspace.qx;
         auto xscale = workspace.xscale;
         if (pool.family == MixedMoeFamily::Nint) {
-            const int route_tile_m = select_nint_prefill_route_tile(
+            const int route_tile_m = tokens<=8 ? 8 : select_nint_prefill_route_tile(
                 route, tokens, routes, n_experts);
             mfe_nint_matmul_ws_cuda(
                 pool.nint.q_packed, pool.nint.row_q_bits,
@@ -1782,6 +1876,23 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
                     ? route.mma_tile_experts : route.tile_experts,
                 use_coarse_q8_tiles ? route.mma_tile_m : 8);
         } else if (pool.family == MixedMoeFamily::Nvq) {
+            bool decode_done=false;
+            if(gs==24 && epilogue_mode==0 &&
+               ((pool.nvq.kernel_format==1 && pool.nvq.sub_bits==3) ||
+                (pool.nvq.kernel_format==8 && pool.nvq.sub_bits==4))) {
+                const auto& w=pool.nvq;Nvq1DecodeView view;
+                const std::array<mfq_tensor_backend::Tensor,7> fields={w.indices_packed,w.aux_packed,
+                    w.sub_scale_packed,w.neuron_scale,w.codebook,w.decode_records,w.integer_codebook};
+                for(int i=0;i<7;++i)if(fields[i].defined())view.pointers[i]=reinterpret_cast<int64_t>(fields[i].data_ptr());
+                view.sizes[0]=w.indices_packed.numel();view.sizes[1]=w.aux_packed.numel();
+                view.sizes[2]=w.sub_scale_packed.numel();view.sizes[3]=w.decode_records.defined()?w.decode_records.numel():0;
+                view.groups=int(w.ng);view.vectors=int((neuron_len+7)/8);
+                view.format=int(w.kernel_format);view.local_experts=pool.local_experts;
+                decode_done=nvq1_try_decode_cuda(view,value,route.ids,pool.expert_local,qx,xscale,
+                    output,n_experts,out_per_expert,input_quantized);
+            }
+            if(decode_done)activation_quantized_after_call=true;
+            else
             nvq_moe_grouped_matmul_pool_ws_cuda(
                 pool.nvq.indices_packed, pool.nvq.aux_packed,
                 pool.nvq.sub_scale_packed, pool.nvq.neuron_scale,

@@ -26,6 +26,11 @@ void finalize_moe_expert_cache(
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
+// Return prompt-only ring and workspace storage before preparing decode graphs.
+void release_moe_prefill_buffers(MoeExpertCache* cache);
+inline void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
+    release_moe_prefill_buffers(cache.get());
+}
 // Idle diagnostic passes retain primary weights, clear transfer-cache entries,
 // and replay the CPU assignments captured by the first pass.
 void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache, bool replay);
