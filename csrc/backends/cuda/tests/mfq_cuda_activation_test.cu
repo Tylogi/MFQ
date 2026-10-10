@@ -52,7 +52,7 @@ void check_glu(std::int64_t elements, ScalarType dtype, bool gelu) {
     }
 }
 
-void check_gate_beta(std::int64_t tokens, ScalarType dtype) {
+void check_gate_beta(std::int64_t tokens, ScalarType dtype, bool stable_softplus = false) {
     const Device gpu{DeviceType::cuda, 0};
     constexpr std::int64_t batch = 2, width = 7;
     const auto elements = batch * tokens * width;
@@ -78,7 +78,7 @@ void check_gate_beta(std::int64_t tokens, ScalarType dtype) {
     const auto context = default_context(0);
     kernels::linear_gate_beta(alpha.view_descriptor(), beta.view_descriptor(),
         dt.view_descriptor(), log_a.view_descriptor(), gates.view_descriptor(),
-        betas.view_descriptor(), context->stream().get());
+        betas.view_descriptor(), context->stream().get(), stable_softplus);
     context->stream().synchronize();
     auto a_ref = alpha.contiguous().to(kFloat32).cpu();
     auto b_ref = beta.contiguous().to(kFloat32).cpu();
@@ -90,7 +90,8 @@ void check_gate_beta(std::int64_t tokens, ScalarType dtype) {
                 const auto src = (b * tokens + t) * width + v;
                 const auto dst = (b * width + v) * tokens + t;
                 const double a = a_ref.data_ptr<float>()[src] + dt_host.data_ptr<float>()[v];
-                const double sp = a > 20.0 ? a : std::log1p(std::exp(a));
+                const double sp = stable_softplus ? std::max(a, 0.0) + std::log1p(std::exp(-std::abs(a)))
+                                                  : (a > 20.0 ? a : std::log1p(std::exp(a)));
                 const float expected_gate = static_cast<float>(-sp * std::exp(log_host.data_ptr<float>()[v]));
                 const float expected_beta = static_cast<float>(1. / (1. + std::exp(-double(b_ref.data_ptr<float>()[src]))));
                 close(g_got.data_ptr<float>()[dst], expected_gate, 2.e-6f, 2.e-6f);
@@ -134,7 +135,8 @@ int main() {
         }
         for (int tokens = 1; tokens <= 6; ++tokens) {
             check_gate_beta(tokens, dtype);
-            ++checked;
+            check_gate_beta(tokens, dtype, true);
+            checked += 2;
         }
     }
     check_half_saturation();

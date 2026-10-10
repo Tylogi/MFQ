@@ -438,12 +438,18 @@ set_target_properties(mfq-metal-nint-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-nint-test COMMAND mfq-metal-nint-test)
+add_test(NAME mfq-metal-nint-portable-test
+    COMMAND ${CMAKE_COMMAND} -E env MFQ_METAL_DISABLE_NAX=1
+        $<TARGET_FILE:mfq-metal-nint-test>)
 
 add_executable(mfq-metal-kernel-prepare-test tests/mlx_kernel_prepare_test.cpp)
 target_link_libraries(mfq-metal-kernel-prepare-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-kernel-prepare-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-kernel-prepare-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 add_test(NAME mfq-metal-kernel-prepare-test COMMAND mfq-metal-kernel-prepare-test)
+add_test(NAME mfq-metal-kernel-prepare-portable-test
+    COMMAND ${CMAKE_COMMAND} -E env MFQ_METAL_DISABLE_NAX=1
+        $<TARGET_FILE:mfq-metal-kernel-prepare-test>)
 
 add_executable(mfq-metal-inference-warmup-test tests/mlx_inference_warmup_test.cpp)
 target_link_libraries(mfq-metal-inference-warmup-test PRIVATE mfq-metal-runtime)
@@ -575,6 +581,34 @@ target_compile_features(
 set_target_properties(mfq-metal-dense-smallm-benchmark PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
+
+add_executable(mfq-metal-mfe-smallm-benchmark
+    benchmarks/mlx_mfe_smallm_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mfe-smallm-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mfe-smallm-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mfe-smallm-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-vq-smallm-benchmark
+    benchmarks/mlx_vq_smallm_benchmark.cpp
+)
+target_link_libraries(mfq-metal-vq-smallm-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-vq-smallm-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-vq-smallm-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-mfe-prefill-benchmark
+    benchmarks/mlx_mfe_prefill_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mfe-prefill-benchmark PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-mfe-prefill-benchmark PRIVATE cxx_std_20)
 
 add_executable(mfq-metal-vq-benchmark
     benchmarks/mlx_vq_benchmark.cpp
@@ -963,6 +997,8 @@ add_test(
     COMMAND mfq-metal-moe-test
 )
 add_test(NAME mfq-metal-moe-compat-test COMMAND mfq-metal-moe-test --test-compat)
+add_test(NAME mfq-metal-moe-portable-test COMMAND mfq-metal-moe-test)
+set_tests_properties(mfq-metal-moe-portable-test PROPERTIES ENVIRONMENT "MFQ_METAL_DISABLE_NAX=1")
 add_test(NAME mfq-metal-moe-prepare-test COMMAND mfq-metal-moe-test --test-prepare)
 add_test(NAME mfq-metal-model-prepare-test COMMAND mfq-metal-moe-test --test-model-prepare)
 

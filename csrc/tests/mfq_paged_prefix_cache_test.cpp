@@ -250,7 +250,9 @@ int main() try {
         require(cache.set_hot_limit(0) > 0 && cache.metrics().hot_bytes == 0, "online hot budget did not trim RAM");
         require(cache.load_prefix(cache.match(sequence).blocks).size() == 1, "hot budget change deleted durable cache");
         require(cache.metrics().hot_bytes == 0, "disabled hot tier retained restored payloads");
-        require(cache.set_disk_limit(0) > 0 && cache.metrics().disk_bytes == 0,
+        cache.set_disk_limit(0);
+        cache.flush();
+        require(cache.metrics().disk_bytes == 0,
             "online SSD disable retained durable cache");
         cache.set_disk_limit(4096);
         cache.store({}, sequence.data(), sequence.size(), payload({6}));
@@ -270,6 +272,33 @@ int main() try {
         require(cache.match(full).matched_tokens == 8, "full block was not reusable");
     }
     std::filesystem::remove_all(growing_root);
+    const auto budgets_root = temporary_directory();
+    {
+        PagedPrefixCache cache({budgets_root, "concurrent-budgets", 4, 0, 4096, 64});
+        std::thread budgets([&] {
+            for (std::size_t index = 0; index < 64; ++index) {
+                cache.set_disk_limit(index % 2 ? 4096 : 16384);
+                cache.set_hot_limit(index % 2 ? 0 : 4096);
+                cache.trim_hot(0);
+            }
+        });
+        for (std::int64_t index = 0; index < 64; ++index) {
+            const std::vector<std::int64_t> sequence{index, 1, 2, 3};
+            cache.store({}, sequence.data(), sequence.size(), payload({1, 2, 3}));
+            (void)cache.metrics();
+        }
+        budgets.join();
+        cache.set_disk_limit(0);
+        cache.set_hot_limit(0);
+        cache.flush();
+        const auto stats = cache.metrics();
+        require(stats.disk_bytes == 0 && stats.hot_bytes == 0 && stats.pending_bytes == 0,
+            "concurrent budget updates left pending or over-budget cache data");
+        const auto identity = budgets_root /
+            block_hash_hex(sha256("concurrent-budgets")) / "identity.txt";
+        require(std::filesystem::exists(identity), "enabling SSD cache did not persist its identity");
+    }
+    std::filesystem::remove_all(budgets_root);
     const auto binding_root = temporary_directory();
     {
         auto cache = std::make_shared<PagedPrefixCache>(PagedPrefixCacheConfig{binding_root, "bound-disk", 4, 200, 0, 8});

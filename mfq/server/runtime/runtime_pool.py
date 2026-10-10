@@ -105,6 +105,7 @@ class _MemoryPlanContext:
 _AUTOMATIC_MEMORY_SOFT_RATIO = 0.90
 _AUTOMATIC_MEMORY_HARD_RATIO = 0.95
 _AUTOMATIC_MEMORY_TARGET_RATIO = 0.85
+_RUNTIME_MAINTENANCE_WAIT_SECONDS = 30.0
 _RUNTIME_LOG_MAX_CHARS = 4096
 _RUNTIME_OUTPUT_DRAIN_TIMEOUT_SECONDS = 10.0
 
@@ -153,6 +154,7 @@ class _Runtime(BaseModel):
     load_progress: float = 0.02
     context_capacity: int | None = None
     prefix_dynamic_budget: bool = False
+    prefix_concurrent_maintenance: bool = False
     prefix_disk_capacity: int | None = None
     prefix_pressure_bytes: int = 0
     prefix_pending_writes: int = 0
@@ -349,6 +351,7 @@ class RuntimePool:
         self._session_routes: dict[UUID, UUID] = {}
         self._last_instance_id: UUID | None = None
         self._lock = asyncio.Lock()
+        self._request_state_changed = asyncio.Condition(self._lock)
         self._prefix_budget_lock = asyncio.Lock()
         self._resident_budget_lock = asyncio.Lock()
         self._resident_load_limits: dict[str, int] = {}
@@ -999,9 +1002,11 @@ class RuntimePool:
             return self.max_runtime_memory_bytes
         return min(requested, self.max_runtime_memory_bytes) if self.max_runtime_memory_bytes is not None else requested
 
-    async def _rebalance_resident_budget(self, preferred: UUID | None = None, *, additional_bytes: int = 0, prospective_model: str | None = None, activating: _Runtime | None = None) -> int | None:
+    async def _rebalance_resident_budget(self, preferred: UUID | None = None, *, additional_bytes: int = 0, prospective_model: str | None = None, activating: _Runtime | None = None, wait: bool = True) -> int | None:
         total = self._resident_total_limit()
         if total is None:
+            return None
+        if not wait and self._resident_budget_lock.locked():
             return None
         async with self._resident_budget_lock:
             async with self._lock:
@@ -1062,12 +1067,13 @@ class RuntimePool:
                     targets[ordered[-1].id] += max(0, available - sum(targets.values()))
                 elif prospective_model is not None:
                     additional_bytes += max(0, available - sum(targets.values()))
-                for item in idle:
-                    item.control_leases += 1
                 if prospective_model is not None:
                     self._resident_load_limits[prospective_model] = additional_bytes
                     self._resident_load_owners[prospective_model] = asyncio.current_task()
                 previous = {item.id: item.resident_budget_limit for item in idle}
+                changed = [item for item in idle if targets[item.id] != previous[item.id] or item.id in trims]
+                for item in changed:
+                    item.control_leases += 1
             applied = []
             try:
                 for item in ordered:
@@ -1075,7 +1081,7 @@ class RuntimePool:
                         result = await item.backend.trim_runtime_cache(trims[item.id])
                         if result.get("status") != "ok":
                             raise RuntimeError("prefix RAM could not be reclaimed for the shared resident budget")
-                changes = sorted(idle, key=lambda item: (targets[item.id] > previous[item.id] and previous[item.id] != 0, targets[item.id]))
+                changes = sorted(changed, key=lambda item: (targets[item.id] > previous[item.id] and previous[item.id] != 0, targets[item.id]))
                 for item in changes:
                     if targets[item.id] == previous[item.id]:
                         continue
@@ -1084,8 +1090,6 @@ class RuntimePool:
                         raise RuntimeError("native shared resident budget was not applied")
                     applied.append(item)
                     item.resident_budget_limit = targets[item.id]
-                    await self._refresh_instance_usage(item)
-                return additional_bytes or targets[ordered[-1].id]
             except BaseException:
                 if prospective_model is not None:
                     self._resident_load_limits.pop(prospective_model, None)
@@ -1097,8 +1101,12 @@ class RuntimePool:
                         pass
                 raise
             finally:
-                for item in idle:
+                for item in changed:
                     await self._release_control_lease(item)
+            if wait:
+                for item in changed:
+                    await self._refresh_instance_usage(item)
+            return additional_bytes or targets[ordered[-1].id]
 
     def _prefix_cache_directory(self) -> Path:
         if self.memory_policy.prefix_directory is not None:
@@ -1170,11 +1178,33 @@ class RuntimePool:
             if not evict and not force:
                 return
             result = await asyncio.to_thread(maintain_prefix_disk_budget,
-                self._prefix_cache_directory(), self.memory_policy.prefix_disk_limit_bytes, evict=evict)
+                self._prefix_cache_directory(), self.memory_policy.prefix_disk_limit_bytes, evict=False)
+            if evict and result["prefix_cache_total_disk_bytes"] > result["prefix_cache_total_disk_max_bytes"]:
+                async with self._lock:
+                    current = list(self._instances.values())
+                    evict = not self._loading_model_names and self._memory_configuration_job is None and not any(
+                        item.active_requests or item.queued_requests or item.control_leases or item.prefix_pending_writes
+                        or item.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.FAILED} for item in current)
+                    leased = current if evict else []
+                    for item in leased:
+                        item.control_leases += 1
+                if evict:
+                    cleanup = asyncio.create_task(asyncio.to_thread(maintain_prefix_disk_budget,
+                        self._prefix_cache_directory(), self.memory_policy.prefix_disk_limit_bytes, evict=True))
+                    try:
+                        result = await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                        raise
+                    finally:
+                        for item in leased:
+                            await self._release_control_lease(item)
             self._prefix_disk_status = {key: value for key, value in result.items() if key.startswith("prefix_cache_")}
             self._prefix_disk_checked_at = time.monotonic()
 
-    async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None) -> None:
+    async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None, *, wait: bool = True) -> None:
+        if not wait and self._prefix_budget_lock.locked():
+            return
         async with self._prefix_budget_lock:
             async with self._lock:
                 current = [item for item in self._instances.values()
@@ -1204,11 +1234,14 @@ class RuntimePool:
                 changes = [item for item in candidates if item.memory.prefix_cache_limit_bytes != targets[item.id]
                     or getattr(item, "prefix_disk_capacity", None) is not None and item.prefix_disk_capacity != disk_targets[item.id]]
                 changes.sort(key=lambda item: targets[item.id] > (item.memory.prefix_cache_limit_bytes or 0))
+                concurrent = {item.id: getattr(item, "prefix_concurrent_maintenance", False) for item in changes}
                 for item in changes:
                     item.control_leases += 1
+                    if concurrent[item.id]:
+                        item.read_control_leases += 1
             try:
                 for item in changes:
-                    disk_args = {"disk_target_bytes": disk_targets[item.id]} if getattr(item, "prefix_disk_capacity", None) is not None else {}
+                    disk_args = {"disk_target_bytes": disk_targets[item.id]} if getattr(item, "prefix_disk_capacity", None) is not None and item.prefix_disk_capacity != disk_targets[item.id] else {}
                     result = await asyncio.wait_for(item.backend.set_prefix_cache_budget(targets[item.id], **disk_args), timeout=30.0)
                     if result.get("status") != "ok":
                         raise RuntimeError("native prefix budget was not applied")
@@ -1219,10 +1252,12 @@ class RuntimePool:
                             item.prefix_pressure_bytes = 0
                             if disk_args:
                                 item.prefix_disk_capacity = disk_targets[item.id]
-                    await self._refresh_instance_usage(item)
             finally:
                 for item in changes:
-                    await self._release_control_lease(item)
+                    await self._release_control_lease(item, read_only=concurrent[item.id])
+            if wait:
+                for item in changes:
+                    await self._refresh_instance_usage(item)
 
     async def configure_memory_policy(self, context: JobContext, payload: dict[str, Any], *, additional: DiscoveredModel | None = None) -> dict[str, Any]:
         policy = RuntimeMemoryPolicy.model_validate(payload)
@@ -1254,7 +1289,9 @@ class RuntimePool:
             }) for item in current]
             self._memory_configuration_job = context.job_id
         if policy.total_limit_bytes != previous.total_limit_bytes and not cache_only:
-            self._memory_configuration_job = None
+            async with self._lock:
+                self._memory_configuration_job = None
+                self._request_state_changed.notify_all()
             raise _job_error("resident_budget_unsupported", "changing the shared resident budget requires online native budgeting; model reloads are not used as a substitute")
         if cache_only:
             try:
@@ -1271,7 +1308,9 @@ class RuntimePool:
                 await self._rebalance_resident_budget()
                 raise
             finally:
-                self._memory_configuration_job = None
+                async with self._lock:
+                    self._memory_configuration_job = None
+                    self._request_state_changed.notify_all()
         try:
             for item in current:
                 await self._retire_instance(item)
@@ -1299,6 +1338,7 @@ class RuntimePool:
         finally:
             async with self._lock:
                 self._memory_configuration_job = None
+                self._request_state_changed.notify_all()
 
     async def unload(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = ModelUnloadRequest.model_validate(payload)
@@ -1319,7 +1359,7 @@ class RuntimePool:
                     "runtime has active requests, queued requests, or control operations",
                     retryable=True,
                 )
-            instance.state = RuntimeInstanceState.UNLOADING
+            self._mark_instance_unloading_locked(instance)
 
         released = False
 
@@ -1468,6 +1508,25 @@ class RuntimePool:
                 logger.exception("Could not persist runtime admission error")
         raise error
 
+    async def _wait_for_runtime_maintenance_locked(self, instance: _Runtime, *, global_only: bool = False) -> None:
+        deadline = asyncio.get_running_loop().time() + _RUNTIME_MAINTENANCE_WAIT_SECONDS
+        while True:
+            if self._closed or self._instances.get(instance.id) is not instance or instance.state not in {
+                RuntimeInstanceState.READY, RuntimeInstanceState.BUSY,
+            } or instance.process.returncode is not None:
+                raise BackendError("model_not_ready", f"model runtime is {instance.state.value}",
+                    retryable=True, status_code=503)
+            if self._memory_configuration_job is None and (
+                global_only or instance.control_leases == instance.read_control_leases
+            ):
+                return
+            try:
+                await asyncio.wait_for(self._request_state_changed.wait(),
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+            except TimeoutError:
+                raise BackendError("runtime_maintenance_timeout", "runtime maintenance did not finish in time; retry the request",
+                    retryable=True, status_code=503) from None
+
     async def preflight(
         self,
         *,
@@ -1504,23 +1563,11 @@ class RuntimePool:
             )
             return
         async with self._lock:
-            current = self._instances.get(instance.id) is instance
-            ready = instance.state in {
-                RuntimeInstanceState.READY,
-                RuntimeInstanceState.BUSY,
-            }
-            process_exited = instance.process.returncode is not None
+            await self._wait_for_runtime_maintenance_locked(instance)
             queue_full = (
                 instance.active_requests + instance.queued_requests
                 >= instance.request_capacity
                 + self.max_queued_requests_per_instance
-            )
-        if not current or not ready or process_exited:
-            raise BackendError(
-                "model_not_ready",
-                f"model runtime is {instance.state.value}",
-                retryable=True,
-                status_code=503,
             )
         if queue_full:
             await self._reject_full_queue(instance, model)
@@ -1560,20 +1607,14 @@ class RuntimePool:
                     yield delta
             return
         assert instance.request_slots is not None
-        await self._rebalance_prefix_cache_budget(instance.id)
-        await self._rebalance_resident_budget(instance.id)
+        async with self._lock:
+            await self._wait_for_runtime_maintenance_locked(instance, global_only=True)
+        await self._rebalance_prefix_cache_budget(instance.id, wait=False)
+        await self._rebalance_resident_budget(instance.id, wait=False)
         acquired = False
         active = False
         async with self._lock:
-            if self._memory_configuration_job is not None:
-                raise BackendError('runtime_reconfiguring', 'runtime or cache maintenance is in progress', retryable=True, status_code=409)
-            if instance.control_leases > instance.read_control_leases:
-                raise BackendError('runtime_reconfiguring', 'resident budget or runtime maintenance is in progress', retryable=True, status_code=409)
-            if self._instances.get(instance.id) is not instance or instance.state not in {
-                RuntimeInstanceState.READY,
-                RuntimeInstanceState.BUSY,
-            }:
-                raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
+            await self._wait_for_runtime_maintenance_locked(instance, global_only=True)
             queue_full = (
                 instance.active_requests + instance.queued_requests
                 >= instance.request_capacity
@@ -1588,13 +1629,9 @@ class RuntimePool:
             await instance.request_slots.acquire()
             acquired = True
             async with self._lock:
+                await self._wait_for_runtime_maintenance_locked(instance)
                 instance.queued_requests = max(0, instance.queued_requests - 1)
                 queued = False
-                if self._instances.get(instance.id) is not instance or instance.state not in {
-                    RuntimeInstanceState.READY,
-                    RuntimeInstanceState.BUSY,
-                }:
-                    raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
                 instance.active_requests += 1
                 active = True
                 instance.state = RuntimeInstanceState.BUSY
@@ -2093,6 +2130,7 @@ class RuntimePool:
             finally:
                 async with self._lock:
                     self._memory_configuration_job = None
+                    self._request_state_changed.notify_all()
                 for item in current:
                     await self._release_control_lease(item)
 
@@ -2103,7 +2141,7 @@ class RuntimePool:
     ) -> dict[str, Any]:
         if target_bytes < 0:
             raise ValueError("target_bytes must be non-negative")
-        async with self._runtime_control_lease(instance_id) as (instance, backend):
+        async with self._runtime_control_lease(instance_id, concurrent_prefix=True) as (instance, backend):
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
             trim = getattr(backend, "trim_runtime_cache", None)
@@ -2114,9 +2152,9 @@ class RuntimePool:
                     status_code=501,
                 )
             result = await trim(target_bytes)
-            if instance is not None:
-                await self._refresh_instance_usage(instance)
-            return result
+        if instance is not None:
+            await self._refresh_instance_usage(instance)
+        return result
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         instance = self._instances.get(self._last_instance_id) if self._last_instance_id else None
@@ -2133,6 +2171,7 @@ class RuntimePool:
     async def aclose(self) -> None:
         async with self._lock:
             self._closed = True
+            self._request_state_changed.notify_all()
             instances = list(self._instances.values())
             idle_reaper = self._idle_reaper_task
             self._idle_reaper_task = None
@@ -2451,6 +2490,7 @@ class RuntimePool:
         *,
         allow_unready: bool = False,
         read_only: bool = False,
+        concurrent_prefix: bool = False,
     ) -> AsyncIterator[tuple[_Runtime | None, ChatBackend | None]]:
         async with self._lock:
             if instance_id is None:
@@ -2479,6 +2519,7 @@ class RuntimePool:
                 RuntimeInstanceState.BUSY,
             }
             if leased:
+                read_only = read_only or concurrent_prefix and getattr(instance, "prefix_concurrent_maintenance", False)
                 instance.control_leases += 1
                 if read_only:
                     instance.read_control_leases += 1
@@ -2493,6 +2534,7 @@ class RuntimePool:
             instance.control_leases = max(0, instance.control_leases - 1)
             if read_only:
                 instance.read_control_leases = max(0, instance.read_control_leases - 1)
+            self._request_state_changed.notify_all()
 
     def _finish_control_lease_release(self, task: asyncio.Task[None]) -> None:
         self._lease_release_tasks.discard(task)
@@ -2740,15 +2782,17 @@ class RuntimePool:
                 trim = getattr(instance.backend, "trim_runtime_cache", None)
                 if not callable(trim):
                     continue
+                concurrent = getattr(instance, "prefix_concurrent_maintenance", False)
                 instance.control_leases += 1
+                if concurrent:
+                    instance.read_control_leases += 1
             try:
                 await asyncio.wait_for(trim(target_bytes), timeout=2.0)
             except Exception:
                 pass
-            else:
-                await self._refresh_instance_usage(instance)
             finally:
-                await self._release_control_lease(instance)
+                await self._release_control_lease(instance, read_only=concurrent)
+            await self._refresh_instance_usage(instance)
 
     def _finish_model_load_locked(
         self,
@@ -3049,10 +3093,12 @@ class RuntimePool:
     def _mark_instance_unloading_locked(self, instance: _Runtime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
         self._unroute_instance_locked(instance)
+        self._request_state_changed.notify_all()
 
     def _detach_instance_locked(self, instance: _Runtime) -> None:
         self._instances.pop(instance.id, None)
         self._unroute_instance_locked(instance)
+        self._request_state_changed.notify_all()
 
     async def _idle_reaper(self) -> None:
         while True:
@@ -3370,6 +3416,7 @@ class RuntimePool:
             ):
                 return
             instance.state = RuntimeInstanceState.FAILED
+            self._request_state_changed.notify_all()
             instance.error = error
             model_name = instance.artifact.resource.name
             self._load_errors[model_name] = error
@@ -3454,6 +3501,7 @@ class RuntimePool:
             if status is not None:
                 instance.memory = self._memory_resources(status, instance.memory)
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
+                instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
                 instance.resident_dynamic_budget = status.get("resident_memory_dynamic_budget") == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
                     ("resident_memory_used", "resident_memory_used_bytes"), ("reclaimable_weight_bytes", "resident_reclaimable_weight_bytes")):

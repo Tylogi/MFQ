@@ -140,6 +140,36 @@ int main() {
                 !minicpm.use_sliding_window,
             "MiniCPM-o config was not normalized");
 
+        auto flash = nlohmann::json::parse(R"({
+            "model_type":"qwen4_exp_text","vocab_size":128,"hidden_size":32,
+            "num_hidden_layers":2,"max_position_embeddings":512,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+            "full_attention_interval":2,"hc_count":4,"hc_lowrank":8,
+            "layer_types":["linear_attention","full_attention"],
+            "linear_num_key_heads":2,"linear_num_value_heads":4,
+            "linear_key_head_dim":4,"linear_value_head_dim":4,"linear_conv_kernel_dim":4,
+            "num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,
+            "shared_expert_intermediate_size":16,"indexer_n_heads":2,
+            "indexer_head_dim":8,"indexer_kv_heads":1,"indexer_compress_ratio":2,
+            "indexer_budget":8,"ple_conv_kernel_size":4,"ngram_size":2,
+            "heads_per_ngram":4,"split_ngram_parts":2,"ngram_vocab_size_base":16,
+            "ple_embed_dim":32,"mtp_num_hidden_layers":0,"mtp":{"num_hidden_layers":1}})");
+        require(mfq::models::qwen4_exp::Config::parse(flash).predictor_layers == 0,
+                "disabled predictor retained in source config must not activate MTP");
+        flash["mtp_num_hidden_layers"] = 1;
+        require(mfq::models::qwen4_exp::Config::parse(flash).predictor_layers == 1,
+                "matching active predictor configuration was rejected");
+        for (auto count : {-1, 2}) {
+            flash["mtp_num_hidden_layers"] = count;
+            rejected = false;
+            try {
+                static_cast<void>(mfq::models::qwen4_exp::Config::parse(flash));
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            require(rejected, "invalid active predictor configuration was accepted");
+        }
+
         std::cout << "model config tests passed\n";
         return 0;
     } catch (const std::exception& error) {

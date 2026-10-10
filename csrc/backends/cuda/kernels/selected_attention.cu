@@ -77,11 +77,48 @@ __global__ void prepare_sparse_indices_kernel(
 // Each CTA retains the Metal kernel's eight warp partials and online-softmax
 // recurrence. The generic wide-D path stores accumulators in its output only;
 // it imposes no extra head-width limit. Published D=256/512 stay in registers.
+struct AttentionLayout {
+    int64_t batch, token, head, column;
+};
+
+struct AttentionEpilogue {
+    const void* gate = nullptr;
+    void* output = nullptr;
+    bool float_gate = false, half_output = false, double_sigmoid = false;
+    AttentionLayout layout{};
+};
+
+__device__ float apply_attention_gate(float value, float gate, bool double_sigmoid) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    const float sigmoid = double_sigmoid
+        ? float(__ddiv_rn(1.0, __dadd_rn(1.0, ::exp(-double(gate)))))
+        : __fdiv_rn(1.f, __fadd_rn(1.f, expf(-gate)));
+#else
+    const float sigmoid = 1.f / (1.f + expf(-gate));
+#endif
+    return __fmul_rn(value, sigmoid);
+}
+
+__device__ void store_attention(float value, float* output, int64_t offset,
+    int64_t batch, int64_t token, int64_t head, int64_t column,
+    const AttentionEpilogue& epilogue) {
+    if (!epilogue.gate) { output[offset] = value; return; }
+    const auto at = batch * epilogue.layout.batch + token * epilogue.layout.token +
+        head * epilogue.layout.head + column * epilogue.layout.column;
+    const float gate = epilogue.float_gate ? static_cast<const float*>(epilogue.gate)[at]
+        : __half2float(static_cast<const half*>(epilogue.gate)[at]);
+    value = apply_attention_gate(value, gate, epilogue.double_sigmoid);
+    if (epilogue.half_output) static_cast<half*>(epilogue.output)[offset] = __float2half_rn(value);
+    else static_cast<float*>(epilogue.output)[offset] = value;
+}
+
 template<int Slices>
 __global__ void sparse_attention_kernel(
-    const float* query, const half* key, const half* value, const int32_t* indices,
+    const void* query, const half* key, const half* value, const int32_t* indices,
     float* output, int64_t heads, int64_t kv_heads, int64_t tokens,
-    int64_t width, int64_t cache_length, int64_t topk, float scale) {
+    int64_t width, int64_t cache_length, int64_t topk, float scale,
+    bool half_query, const void* causal_positions, bool wide_positions,
+    AttentionEpilogue epilogue) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -104,14 +141,21 @@ __global__ void sparse_attention_kernel(
     }
     __syncthreads();
     for (int64_t selected = 0; selected < topk; ++selected) {
-        const int64_t index = indices[row * topk + selected];
+        int64_t index;
+        if (causal_positions) {
+            const int64_t end = wide_positions ? static_cast<const int64_t*>(causal_positions)[token]
+                : static_cast<const int32_t*>(causal_positions)[token];
+            index = selected <= end ? selected : -1;
+        } else index = indices[row * topk + selected];
         const bool valid = index >= 0 && index < cache_length;
         const int64_t cb = ((batch * kv_heads + kv_head) * cache_length +
             (valid ? index : 0)) * width;
         float dot = 0.f;
         if (valid) {
             for (int64_t d = tid; d < width; d += 256) {
-                dot += query[qb + d] * __half2float(key[cb + d]);
+                const float q = half_query ? __half2float(static_cast<const half*>(query)[qb + d])
+                    : static_cast<const float*>(query)[qb + d];
+                dot += q * __half2float(key[cb + d]);
             }
         }
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -152,10 +196,13 @@ __global__ void sparse_attention_kernel(
         #pragma unroll
         for (int slice = 0; slice < Slices; ++slice) {
             const int64_t d = tid + slice * 256;
-            if (d < width) output[ob + d] = accum[slice] * inverse;
+            if (d < width) store_attention(accum[slice] * inverse, output, ob + d,
+                batch, token, head, d, epilogue);
         }
     } else {
-        for (int64_t d = tid; d < width; d += 256) output[ob + d] *= inverse;
+        for (int64_t d = tid; d < width; d += 256)
+            store_attention(output[ob + d] * inverse, output, ob + d,
+                batch, token, head, d, epilogue);
     }
 }
 
@@ -237,12 +284,242 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
         query.data_ptr<float>(), reinterpret_cast<const half*>(key.data_ptr()), \
         reinterpret_cast<const half*>(value.data_ptr()), indices.data_ptr<int32_t>(), \
         output.data_ptr<float>(), q.size(1), k.size(1), q.size(2), q.size(3), \
-        k.size(2), selected.size(2), static_cast<float>(scale))
+        k.size(2), selected.size(2), static_cast<float>(scale), false, nullptr, false, AttentionEpilogue{})
     if (q.size(3) <= 256) { MFQ_LAUNCH_SPARSE(1); }
     else if (q.size(3) <= 512) { MFQ_LAUNCH_SPARSE(2); }
     else if (q.size(3) <= 1024) { MFQ_LAUNCH_SPARSE(4); }
     else { MFQ_LAUNCH_SPARSE(0); }
     #undef MFQ_LAUNCH_SPARSE
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+__global__ void attention_gated_kernel(const void* attended, bool half_input,
+    AttentionLayout layout, AttentionEpilogue epilogue, int64_t count,
+    int64_t heads, int64_t tokens, int64_t width) {
+    for (int64_t linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < count; linear += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t column = linear % width, row = linear / width;
+        const int64_t head = row % heads, token = (row / heads) % tokens,
+            batch = row / (heads * tokens);
+        const auto at = batch * layout.batch + token * layout.token + head * layout.head + column * layout.column;
+        const float value = half_input ? __half2float(static_cast<const half*>(attended)[at])
+            : static_cast<const float*>(attended)[at];
+        store_attention(value, nullptr, linear, batch, token, head, column, epilogue);
+    }
+}
+
+AttentionLayout attention_layout(const Tensor& x) {
+    return {x.stride(0), x.stride(1), x.stride(2), x.stride(3)};
+}
+
+bool half_or_float(const Tensor& x) {
+    return x.scalar_type() == tb::kFloat16 || x.scalar_type() == tb::kFloat32;
+}
+
+Tensor gated(const Tensor& attended, const Tensor& gate, bool half_output) {
+    values({&attended, &gate});
+    MFQ_RUNTIME_CHECK(attended.dim() == 4 && attended.sizes() == gate.sizes(),
+        "attention gate requires matching [B,T,H,D] inputs");
+    if (!half_or_float(attended) || !half_or_float(gate))
+        return (attended.to(tb::kFloat32) * tb::sigmoid(gate.to(tb::kFloat32)))
+            .to(half_output ? tb::kFloat16 : tb::kFloat32);
+    MfqCudaGuard guard(attended.device());
+    auto output = tb::empty(attended.sizes(), attended.options().dtype(half_output ? tb::kFloat16 : tb::kFloat32));
+    if (!output.numel()) return output;
+    const AttentionEpilogue epilogue{gate.data_ptr(), output.data_ptr(),
+        gate.scalar_type() == tb::kFloat32, half_output,
+        gate.scalar_type() == tb::kFloat32 && !gate.is_contiguous(), attention_layout(gate)};
+    const int blocks = int(std::min<int64_t>(65535, (output.numel() + 255) / 256));
+    attention_gated_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(attended.data_ptr(),
+        attended.scalar_type() == tb::kFloat16, attention_layout(attended), epilogue,
+        output.numel(), output.size(2), output.size(1), output.size(3));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+__global__ void prepare_causal_attention_kernel(const void* q, bool half_query,
+    AttentionLayout layout, float* query, int64_t query_count, int64_t heads,
+    int64_t tokens, int64_t width, const void* positions, bool wide_positions,
+    int32_t* indices, half* mask, int64_t index_count, int64_t columns,
+    int64_t padded_columns, int64_t capacity) {
+    const int64_t first = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t step = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t linear = first; linear < query_count; linear += step) {
+        const int64_t column = linear % width, row = linear / width;
+        const int64_t token = row % tokens, head = (row / tokens) % heads,
+            batch = row / (tokens * heads);
+        const auto at = batch * layout.batch + token * layout.token +
+            head * layout.head + column * layout.column;
+        query[linear] = half_query ? __half2float(static_cast<const half*>(q)[at])
+            : static_cast<const float*>(q)[at];
+    }
+    for (int64_t linear = first; linear < index_count; linear += step) {
+        const int64_t index = linear % padded_columns,
+            token = (linear / padded_columns) % tokens;
+        const int64_t end = wide_positions ? static_cast<const int64_t*>(positions)[token]
+            : static_cast<const int32_t*>(positions)[token];
+        const bool valid = index < columns && index <= end && index < capacity;
+        indices[linear] = valid ? int32_t(index) : 0;
+        mask[linear] = __float2half_rn(valid ? 0.f : -INFINITY);
+    }
+}
+
+__global__ void mma_reduce_gate_kernel(const float* partial, const float2* metadata,
+    const void* gate, void* output, AttentionLayout gate_layout, int tokens, int heads,
+    int kv_heads, int width, int total_blocks, int parts, int query_columns, int head_columns,
+    bool float_gate, bool half_output, bool double_sigmoid) {
+    const int head=blockIdx.x%heads, row=blockIdx.x/heads;
+    const int token=row%tokens, batch=row/tokens, lane=threadIdx.x;
+    const int grouped_heads=heads/kv_heads;
+    const int head_tiles=(grouped_heads+head_columns-1)/head_columns;
+    const int token_tiles=(tokens+query_columns-1)/query_columns;
+    const int tile=(((batch*kv_heads+head/grouped_heads)*head_tiles+
+        (head%grouped_heads)/head_columns)*token_tiles+token/query_columns);
+    const int tile_column=(token%query_columns)*head_columns+(head%grouped_heads)%head_columns;
+    const int columns=query_columns*head_columns, last=(tile+1)*parts-1;
+    const size_t output_base=size_t(row)*heads*width+head*width;
+    const float* contributions=reinterpret_cast<const float*>(metadata)+size_t(total_blocks)*4*columns;
+    extern __shared__ float2 factors[];
+    __shared__ float normalizer;
+    if(lane==0) {
+        float denominator=1.f;
+        if(parts>1) {
+            auto statistics=metadata[size_t(last)*columns+tile_column];
+            float peak=statistics.x;
+            denominator=statistics.y;
+            for(int step=1;step<parts;++step) {
+                statistics=metadata[size_t(total_blocks+last-step)*columns+tile_column];
+                const float maximum=fmaxf(peak,statistics.x);
+                const float previous=peak-maximum, incoming=statistics.x-maximum;
+                const float lhs=previous>=-20.f?expf(previous):0.f;
+                const float rhs=incoming>=-20.f?expf(incoming):0.f;
+                factors[step-1]=make_float2(lhs,rhs);
+                denominator=denominator*lhs+statistics.y*rhs;
+                peak=maximum;
+            }
+        }
+        normalizer=denominator;
+    }
+    __syncthreads();
+    for(int column=lane;column<width;column+=blockDim.x) {
+        float result=partial[output_base+column];
+        for(int step=1;step<parts;++step) {
+            const float incoming=contributions[(size_t(last-step)*columns+tile_column)*width+column];
+            const auto weights=factors[step-1];
+            result=result*weights.x+incoming*weights.y;
+        }
+        if(parts>1)result=normalizer!=0.f?result/normalizer:0.f;
+        const auto gate_index=int64_t(batch)*gate_layout.batch+int64_t(token)*gate_layout.token+
+            int64_t(head)*gate_layout.head+int64_t(column)*gate_layout.column;
+        const float g=float_gate?static_cast<const float*>(gate)[gate_index]
+            :__half2float(static_cast<const half*>(gate)[gate_index]);
+        result=apply_attention_gate(result,g,double_sigmoid);
+        if(half_output)static_cast<half*>(output)[output_base+column]=__float2half_rn(result);
+        else static_cast<float*>(output)[output_base+column]=result;
+    }
+}
+
+Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tensor& gate,
+    bool half_output,int kv_heads,int total_blocks,int parts,int query_columns,int head_columns) {
+    values({&partial,&metadata,&gate});
+    MFQ_RUNTIME_CHECK(partial.dim()==4 && partial.sizes()==gate.sizes() &&
+        partial.scalar_type()==tb::kFloat32 && metadata.scalar_type()==tb::kFloat32 &&
+        partial.is_contiguous() && metadata.is_contiguous() && half_or_float(gate) &&
+        kv_heads>0 && partial.size(2)%kv_heads==0 && total_blocks>0 && parts>0 &&
+        query_columns>0 && head_columns>0,"MMA gate reduction geometry mismatch");
+    const int64_t heads=partial.size(2),tokens=partial.size(1),width=partial.size(3);
+    const int64_t tiles=partial.size(0)*kv_heads*((heads/kv_heads+head_columns-1)/head_columns)*
+        ((tokens+query_columns-1)/query_columns);
+    MFQ_RUNTIME_CHECK(tokens>0 && heads>0 && width>0 && tiles*parts==total_blocks &&
+        (parts==1 || metadata.numel()>=int64_t(total_blocks)*query_columns*head_columns*(4+width)),
+        "MMA gate reduction metadata mismatch");
+    MFQ_RUNTIME_CHECK(partial.numel()/width<=INT_MAX && width<=INT_MAX && tokens<=INT_MAX && heads<=INT_MAX,
+        "MMA gate reduction exceeds CUDA geometry");
+    const size_t shared=size_t(parts-1)*sizeof(float2);
+    MFQ_RUNTIME_CHECK(shared+sizeof(float)<=48*1024,"MMA gate reduction shared memory exceeded");
+    MfqCudaGuard guard(partial.device());
+    auto output=tb::empty(partial.sizes(),partial.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
+    if(output.numel())mma_reduce_gate_kernel<<<unsigned(output.numel()/width),256,shared,mfq_current_cuda_stream()>>>(
+        partial.data_ptr<float>(),reinterpret_cast<const float2*>(metadata.data_ptr<float>()),
+        gate.data_ptr(),output.data_ptr(),attention_layout(gate),int(tokens),int(heads),kv_heads,
+        int(width),total_blocks,parts,query_columns,head_columns,gate.scalar_type()==tb::kFloat32,
+        half_output,gate.scalar_type()==tb::kFloat32 && !gate.is_contiguous());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
+    const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
+    bool half_output, bool fused_mma_gate, bool fused_mma_prepare) {
+    attention_shapes(q, k, v);
+    values({&q, &gate});
+    MFQ_RUNTIME_CHECK(gate.dim() == 4 && gate.size(0) == q.size(0) && gate.size(1) == q.size(2) &&
+        gate.size(2) == q.size(1) && gate.size(3) == q.size(3) && positions.defined() &&
+        positions.is_cuda() && positions.device() == q.device() && positions.dim() == 1 &&
+        positions.numel() == q.size(2) && (positions.scalar_type() == tb::kInt32 || positions.scalar_type() == tb::kInt64) &&
+        columns > 0 && columns <= INT_MAX && std::isfinite(scale), "causal attention gate geometry mismatch");
+    MfqCudaGuard guard(q.device());
+    auto cache_positions = positions.contiguous();
+    if (!half_or_float(q) || !half_or_float(gate) || (q.size(3) == 256 && !k.size(2))) {
+        auto selected = tb::arange(columns, positions.options()).reshape({1, 1, columns})
+            .expand({q.size(0), q.size(2), columns});
+        selected = tb::where(selected <= cache_positions.reshape({1, q.size(2), 1}),
+            selected, tb::full_like(selected, -1));
+        return gated(sparse(q, k, v, selected, scale, false), gate, half_output);
+    }
+    if (q.size(3) == 256) {
+        auto key = k.to(tb::kFloat16).contiguous(), value = v.to(tb::kFloat16).contiguous();
+        if (fused_mma_prepare && q.numel()) {
+            auto attended = mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
+                q, key, value, Tensor{}, Tensor{}, Tensor{}, Tensor{}, scale,
+                "causal_gqa_attention_gate", fused_mma_gate ? gate : Tensor{}, half_output,
+                cache_positions, columns);
+            return fused_mma_gate ? attended : gated(attended, gate, half_output);
+        }
+        // Prepare the original MMA query, safe indices and validity mask together.
+        MFQ_RUNTIME_CHECK(columns <= INT_MAX - 32, "causal MMA index geometry exceeds 32 bits");
+        const int64_t padded_columns = ((columns + 31) / 32) * 32;
+        auto query = tb::empty(q.sizes(), q.options().dtype(tb::kFloat32));
+        auto indices = tb::empty({q.size(0), q.size(2), padded_columns}, q.options().dtype(tb::kInt32));
+        auto mask = tb::empty(indices.sizes(), q.options().dtype(tb::kFloat16));
+        const int blocks = int(std::min<int64_t>(65535, (std::max(query.numel(), indices.numel()) + 255) / 256));
+        if (!blocks) return tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
+            q.options().dtype(half_output ? tb::kFloat16 : tb::kFloat32));
+        const auto layout = AttentionLayout{q.stride(0), q.stride(2), q.stride(1), q.stride(3)};
+        prepare_causal_attention_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            q.data_ptr(), q.scalar_type() == tb::kFloat16, layout, query.data_ptr<float>(), query.numel(),
+            q.size(1), q.size(2), q.size(3), cache_positions.data_ptr(), cache_positions.scalar_type() == tb::kInt64,
+            indices.data_ptr<int32_t>(), reinterpret_cast<half*>(mask.data_ptr()), indices.numel(),
+            columns, padded_columns, k.size(2));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        auto attended = mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
+            query, key, value, indices, mask, Tensor{}, Tensor{}, scale, "qwen4_causal_gqa_attention_gate",
+            fused_mma_gate?gate:Tensor{},half_output);
+        if(fused_mma_gate)return attended;
+        return gated(attended, gate, half_output);
+    }
+    auto query = q.contiguous();
+    auto key = k.to(tb::kFloat16).contiguous(), value = v.to(tb::kFloat16).contiguous();
+    auto output = tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
+        q.options().dtype(half_output ? tb::kFloat16 : tb::kFloat32));
+    if (!output.numel()) return output;
+    auto scratch = q.size(3) > 1024 ? tb::empty(output.sizes(), q.options().dtype(tb::kFloat32)) : Tensor{};
+    const auto blocks = output.numel() / q.size(3);
+    MFQ_RUNTIME_CHECK(blocks <= INT_MAX, "causal attention exceeds CUDA grid size");
+    const AttentionEpilogue epilogue{gate.data_ptr(), output.data_ptr(),
+        gate.scalar_type() == tb::kFloat32, half_output,
+        gate.scalar_type() == tb::kFloat32 && !gate.is_contiguous(), attention_layout(gate)};
+    #define MFQ_LAUNCH_CAUSAL(S) sparse_attention_kernel<S><<<unsigned(blocks), 256, 0, mfq_current_cuda_stream()>>>( \
+        query.data_ptr(), reinterpret_cast<const half*>(key.data_ptr()), reinterpret_cast<const half*>(value.data_ptr()), \
+        nullptr, scratch.defined() ? scratch.data_ptr<float>() : nullptr, q.size(1), k.size(1), q.size(2), q.size(3), \
+        k.size(2), columns, float(scale), q.scalar_type() == tb::kFloat16, cache_positions.data_ptr(), \
+        cache_positions.scalar_type() == tb::kInt64, epilogue)
+    if (q.size(3) <= 256) { MFQ_LAUNCH_CAUSAL(1); }
+    else if (q.size(3) <= 512) { MFQ_LAUNCH_CAUSAL(2); }
+    else if (q.size(3) <= 1024) { MFQ_LAUNCH_CAUSAL(4); }
+    else { MFQ_LAUNCH_CAUSAL(0); }
+    #undef MFQ_LAUNCH_CAUSAL
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

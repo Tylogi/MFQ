@@ -1,5 +1,8 @@
 #include "mlx_nint.h"
+#include "mlx_nint_metadata.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_memory_residency.h"
+#include "mlx_resident_budget.h"
 #include "mlx_weight_residency.h"
 
 #include "mfq/nint_blob.h"
@@ -60,7 +63,34 @@ struct DenseNintMmqConfig {
 };
 
 bool dense_nint_nax_enabled() noexcept {
-    return mlx_apple_chip_starts_with("Apple M5");
+    return !mlx_metal_nax_disabled() && mlx_apple_chip_starts_with("Apple M5");
+}
+
+bool dense_nint_prefers_dequantize(
+    std::int64_t rows,
+    int input_width,
+    int output_width,
+    bool use_nax) {
+    const auto elements = static_cast<std::size_t>(input_width) * output_width;
+    if (elements > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
+    std::int64_t crossover = 2048;
+    if (!use_nax && elements >= (std::size_t{1} << 20) && output_width >= 32) {
+        crossover = output_width <= input_width ? 64 : 512;
+    }
+    if (rows < crossover) return false;
+    auto limit = mlx::core::get_memory_limit();
+    if (const auto wired = MlxMemoryResidency::configured_limit(); wired != 0)
+        limit = std::min(limit, wired);
+    const auto active = mlx::core::get_active_memory();
+    auto available = limit > active ? limit - active : 0;
+    std::size_t temporary = 0;
+    for (const auto bytes : {elements * 2, static_cast<std::size_t>(rows) * input_width * 2,
+             static_cast<std::size_t>(rows) * output_width * 2}) {
+        if (bytes > available) return false;
+        available -= bytes;
+        temporary += bytes;
+    }
+    return MlxResidentBudgetScope::permits_optional(temporary);
 }
 
 class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
@@ -74,9 +104,34 @@ public:
         return std::string(config_.use_nax ? "dense_nint_nax_" : "dense_nint_mmq_")
             + std::to_string(config_.group_size);
     }
-    void prepare_gpu() override { (void)prepared_kernel(); }
+    void prepare_gpu() override {
+        if (config_.use_nax) {
+            (void)prepared_kernel();
+        } else {
+            (void)prepared_kernel("mfq_nint_prefill_portable_f16_bm64_bn32_bk32");
+            (void)prepared_kernel("mfq_nint_prefill_portable_f16_bm128_bn32_bk32");
+            (void)prepared_kernel("mfq_nint_prefill_narrow_f16");
+        }
+    }
 
-    MTL::ComputePipelineState* prepared_kernel() {
+    struct Launch {
+        const char* kernel;
+        int rows;
+        int outputs;
+        int threads;
+    };
+
+    Launch launch() const noexcept {
+        if (config_.use_nax)
+            return {"mfq_nint_prefill_nax_f16_bm128_bn64_bk96", 128, 64, 256};
+        if (config_.output_width <= 8)
+            return {"mfq_nint_prefill_narrow_f16", 16, 1, 128};
+        if (config_.output_width > config_.input_width && config_.rows >= 128)
+            return {"mfq_nint_prefill_portable_f16_bm128_bn32_bk32", 128, 32, 128};
+        return {"mfq_nint_prefill_portable_f16_bm64_bn32_bk32", 64, 32, 128};
+    }
+
+    MTL::ComputePipelineState* prepared_kernel(const char* name = nullptr) {
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(selected_stream.device);
         CompileOptions options;
@@ -84,7 +139,7 @@ public:
         auto* library = device.get_library(
             std::string(config_.use_nax
                 ? "mfq_dense_metadata_nint_nax_v3_gs"
-                : "mfq_dense_metadata_nint_mmq_v3_gs")
+                : "mfq_dense_metadata_nint_mmq_v4_gs")
                 + std::to_string(config_.group_size),
             options,
             [use_nax = config_.use_nax, group_size = config_.group_size] {
@@ -107,17 +162,14 @@ public:
                 }
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
+                source += detail::kNintMetadataSource;
                 source += use_nax
                     ? detail::kSteelNaxSource
                     : detail::kSteelMmaSource;
                 source += detail::kNintPrefillSource;
                 return source;
             });
-        return device.get_kernel(
-            config_.use_nax
-                ? "mfq_nint_prefill_nax_f16_bm128_bn64_bk96"
-                : "mfq_nint_prefill_mmq_f16_bm128_bn64_bk48",
-            library);
+        return device.get_kernel(name ? name : launch().kernel, library);
     }
 
     void eval_cpu(const std::vector<array>&, array&) override {
@@ -148,14 +200,13 @@ public:
         };
         encoder.set_bytes(parameters, 6);
         encoder.set_compute_pipeline_state(kernel);
+        const auto selected = launch();
         encoder.dispatch_threadgroups(
             MTL::Size(
-                (config_.output_width + 63) / 64,
-                config_.use_nax
-                    ? (config_.rows + 127) / 128
-                    : (config_.rows + 127) / 128,
+                (config_.output_width + selected.outputs - 1) / selected.outputs,
+                (config_.rows + selected.rows - 1) / selected.rows,
                 1),
-            MTL::Size(256, 1, 1));
+            MTL::Size(selected.threads, 1, 1));
     }
 
     const char* name() const override {
@@ -201,7 +252,7 @@ array dense_nint_mmq(
         {q, row_metadata, sub_scale, sub_min, x});
 }
 
-constexpr const char* kNintHeader = R"METAL(
+const std::string kNintHeader = std::string(detail::kNintMetadataSource) + R"METAL(
 template <typename InputScalar>
 inline float4 mfq_nint_load_input4(device const InputScalar* input, uint offset) {
     if ((offset & 3u) == 0u)
@@ -323,9 +374,11 @@ inline MfqNintValue8 mfq_nint_decode_value8_at(
         const uint bit = 4u * bits + shift;
         packed1 = bit == 32u ? word1 : (word0 >> bit) | (word1 << (32u - bit));
     } else {
-        const uint word1 = mfq_nint_load_u32(stream, byte_index + 4u);
+        const uint required_bits = shift + 8u * bits;
+        const uint word1 = required_bits > 32u
+            ? mfq_nint_load_u32(stream, byte_index + 4u) : 0u;
         const uint word2 = shift + 8u * bits > 64u
-            ? mfq_nint_load_u32(stream, byte_index + 8u) : 0u;
+            ? uint(stream[byte_index + 8u]) : 0u;
         packed0 = shift == 0u ? word0
             : (word0 >> shift) | (word1 << (32u - shift));
         const uint raw_second_cursor = shift + 4u * bits;
@@ -432,13 +485,12 @@ constexpr const char* kNintMatmul = R"METAL(
             && local_expert < int(LOCAL_EXPERTS);
     }
 
-    uint outputs[OUTPUTS_PER_SIMD];
-    uint metadata_bases[OUTPUTS_PER_SIMD];
     uint q_widths[OUTPUTS_PER_SIMD];
     uint q_row_byte_offsets[OUTPUTS_PER_SIMD];
     uint q_row_bit_shifts[OUTPUTS_PER_SIMD];
     float neuron_scales[OUTPUTS_PER_SIMD];
     float neuron_minimums[OUTPUTS_PER_SIMD];
+    uint4 sub_cursors[OUTPUTS_PER_SIMD];
     float accumulators[OUTPUTS_PER_SIMD][TILE_M];
 #pragma unroll
     for (uint output_row = 0u;
@@ -454,18 +506,16 @@ constexpr const char* kNintMatmul = R"METAL(
                 : 0u)
             : logical_output;
         output = min(output, uint(OUT) - 1u);
-        outputs[output_row] = output;
-        metadata_bases[output_row] = output * uint(NG);
-        const uint row_metadata_base = output * 4u;
-        uint row_layout = row_metadata[row_metadata_base];
-        q_widths[output_row] = row_layout & 15u;
-        q_row_byte_offsets[output_row] =
-            row_metadata[row_metadata_base + 1u];
-        q_row_bit_shifts[output_row] = row_layout >> 4u;
-        neuron_scales[output_row] =
-            as_type<float>(row_metadata[row_metadata_base + 2u]);
-        neuron_minimums[output_row] =
-            as_type<float>(row_metadata[row_metadata_base + 3u]);
+        const auto row = mfq_nint_row(row_metadata, output);
+        q_widths[output_row] = row.q_bits;
+        q_row_byte_offsets[output_row] = row.q_offset;
+        q_row_bit_shifts[output_row] = row.q_shift;
+        neuron_scales[output_row] = row.scale;
+        neuron_minimums[output_row] = row.minimum;
+        const uint sub_bit = row.sub_shift + (lane & 7u) * row.sub_bits;
+        sub_cursors[output_row] = uint4(
+            row.sub_offset + (lane >> 3u) * row.sub_bits + (sub_bit >> 3u),
+            sub_bit & 7u, (1u << row.sub_bits) - 1u, 4u * row.sub_bits);
 #pragma unroll
         for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
             accumulators[output_row][local_row] = 0.0f;
@@ -476,6 +526,8 @@ constexpr const char* kNintMatmul = R"METAL(
         for (uint group = lane; group < uint(NG); group += 32u) {
         float activation_sums[TILE_M];
         float quantized_dots[OUTPUTS_PER_SIMD][TILE_M];
+        float group_scales[OUTPUTS_PER_SIMD];
+        float group_minimums[OUTPUTS_PER_SIMD];
         uint byte_cursors[OUTPUTS_PER_SIMD];
         uint bit_cursors[OUTPUTS_PER_SIMD];
 #pragma unroll
@@ -492,6 +544,12 @@ constexpr const char* kNintMatmul = R"METAL(
         for (uint output_row = 0u;
              output_row < OUTPUTS_PER_SIMD;
              ++output_row) {
+            const uint4 sub = sub_cursors[output_row];
+            group_scales[output_row] = neuron_scales[output_row]
+                * float((mfq_nint_sub_word(sub_scale, sub.x) >> sub.y) & sub.z);
+            group_minimums[output_row] = neuron_minimums[output_row]
+                * float((mfq_nint_sub_word(sub_min, sub.x) >> sub.y) & sub.z);
+            sub_cursors[output_row].x += sub.w;
             const uint group_bit = q_row_bit_shifts[output_row]
                 + group * uint(GS) * q_widths[output_row];
             byte_cursors[output_row] = q_row_byte_offsets[output_row]
@@ -617,21 +675,15 @@ constexpr const char* kNintMatmul = R"METAL(
         for (uint output_row = 0u;
              output_row < OUTPUTS_PER_SIMD;
              ++output_row) {
-            const uint metadata_index =
-                metadata_bases[output_row] + group;
-            const float scale = neuron_scales[output_row]
-                * float(sub_scale[metadata_index]);
-            const float minimum = neuron_minimums[output_row]
-                * float(sub_min[metadata_index]);
 #pragma unroll
             for (uint local_row = 0u;
                  local_row < uint(TILE_M);
                  ++local_row) {
                 accumulators[output_row][local_row] = fma(
-                    scale,
+                    group_scales[output_row],
                     quantized_dots[output_row][local_row],
                     fma(
-                        -minimum,
+                        -group_minimums[output_row],
                         activation_sums[local_row],
                         accumulators[output_row][local_row]));
             }
@@ -679,7 +731,8 @@ constexpr const char* kNintSwiGlu = R"METAL(
     }
 
     uint outputs[OUTPUTS_PER_SIMD];
-    uint metadata_bases[OUTPUTS_PER_SIMD];
+    MfqNintRow gate_metadata_rows[OUTPUTS_PER_SIMD];
+    MfqNintRow up_metadata_rows[OUTPUTS_PER_SIMD];
     uint gate_widths[OUTPUTS_PER_SIMD];
     uint gate_byte_offsets[OUTPUTS_PER_SIMD];
     uint gate_bit_shifts[OUTPUTS_PER_SIMD];
@@ -699,28 +752,21 @@ constexpr const char* kNintSwiGlu = R"METAL(
          ++output_row) {
         uint output = min(output_base + output_row, uint(OUT) - 1u);
         outputs[output_row] = output;
-        metadata_bases[output_row] = output * uint(NG);
+        const auto gate_row = mfq_nint_row(gate_row_metadata, output);
+        gate_metadata_rows[output_row] = gate_row;
+        gate_widths[output_row] = gate_row.q_bits;
+        gate_byte_offsets[output_row] = gate_row.q_offset;
+        gate_bit_shifts[output_row] = gate_row.q_shift;
+        gate_neuron_scales[output_row] = gate_row.scale;
+        gate_neuron_minimums[output_row] = gate_row.minimum;
 
-        const uint row_metadata_base = output * 4u;
-        uint gate_layout = gate_row_metadata[row_metadata_base];
-        gate_widths[output_row] = gate_layout & 15u;
-        gate_byte_offsets[output_row] =
-            gate_row_metadata[row_metadata_base + 1u];
-        gate_bit_shifts[output_row] = gate_layout >> 4u;
-        gate_neuron_scales[output_row] =
-            as_type<float>(gate_row_metadata[row_metadata_base + 2u]);
-        gate_neuron_minimums[output_row] =
-            as_type<float>(gate_row_metadata[row_metadata_base + 3u]);
-
-        uint up_layout = up_row_metadata[row_metadata_base];
-        up_widths[output_row] = up_layout & 15u;
-        up_byte_offsets[output_row] =
-            up_row_metadata[row_metadata_base + 1u];
-        up_bit_shifts[output_row] = up_layout >> 4u;
-        up_neuron_scales[output_row] =
-            as_type<float>(up_row_metadata[row_metadata_base + 2u]);
-        up_neuron_minimums[output_row] =
-            as_type<float>(up_row_metadata[row_metadata_base + 3u]);
+        const auto up_row = mfq_nint_row(up_row_metadata, output);
+        up_metadata_rows[output_row] = up_row;
+        up_widths[output_row] = up_row.q_bits;
+        up_byte_offsets[output_row] = up_row.q_offset;
+        up_bit_shifts[output_row] = up_row.q_shift;
+        up_neuron_scales[output_row] = up_row.scale;
+        up_neuron_minimums[output_row] = up_row.minimum;
     }
 
     constexpr uint BLOCKS8 = uint(GS) / 8u;
@@ -852,15 +898,20 @@ constexpr const char* kNintSwiGlu = R"METAL(
         for (uint output_row = 0u;
              output_row < OUTPUTS_PER_SIMD;
              ++output_row) {
-            uint metadata_index = metadata_bases[output_row] + group;
+            const auto gate_row = gate_metadata_rows[output_row];
+            const auto up_row = up_metadata_rows[output_row];
             float gate_scale = gate_neuron_scales[output_row]
-                * float(gate_sub_scale[metadata_index]);
+                * float(mfq_nint_sub_value(gate_sub_scale, gate_row.sub_offset,
+                    gate_row.sub_shift, gate_row.sub_bits, group));
             float gate_minimum = gate_neuron_minimums[output_row]
-                * float(gate_sub_min[metadata_index]);
+                * float(mfq_nint_sub_value(gate_sub_min, gate_row.sub_offset,
+                    gate_row.sub_shift, gate_row.sub_bits, group));
             float up_scale = up_neuron_scales[output_row]
-                * float(up_sub_scale[metadata_index]);
+                * float(mfq_nint_sub_value(up_sub_scale, up_row.sub_offset,
+                    up_row.sub_shift, up_row.sub_bits, group));
             float up_minimum = up_neuron_minimums[output_row]
-                * float(up_sub_min[metadata_index]);
+                * float(mfq_nint_sub_value(up_sub_min, up_row.sub_offset,
+                    up_row.sub_shift, up_row.sub_bits, group));
             gate_accumulators[output_row] = fma(
                 gate_scale,
                 gate_quantized_dots[output_row],
@@ -900,14 +951,34 @@ constexpr const char* kNintDequantize = R"METAL(
     uint output = item / ITEMS_PER_ROW;
     uint input_index = (item - output * ITEMS_PER_ROW) * uint(VEC);
     uint group = input_index / uint(GS);
-    uint metadata_index = output * uint(NG) + group;
-    float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
-    float minimum = neuron_min[output] * float(sub_min[metadata_index]);
-    uint layout = uint(row_q_layout[output]);
-    if constexpr (VEC == 4) {
+    const auto row = mfq_nint_row(row_metadata, output);
+    float scale = row.scale * float(mfq_nint_sub_value(sub_scale,
+        row.sub_offset, row.sub_shift, row.sub_bits, group));
+    float minimum = row.minimum * float(mfq_nint_sub_value(sub_min,
+        row.sub_offset, row.sub_shift, row.sub_bits, group));
+    if constexpr (VEC == 8) {
+        const uint bit_index = row.q_shift + input_index * row.q_bits;
+        const uint byte_index = row.q_offset + (bit_index >> 3u);
+        const auto quantized = mfq_nint_decode_value8_at<1u>(
+            q_packed, byte_index, bit_index & 7u, row.q_bits);
+        float next_scale = scale;
+        float next_minimum = minimum;
+        const uint next_group = (input_index + 4u) / uint(GS);
+        if (next_group != group) {
+            next_scale = row.scale * float(mfq_nint_sub_value(sub_scale,
+                row.sub_offset, row.sub_shift, row.sub_bits, next_group));
+            next_minimum = row.minimum * float(mfq_nint_sub_value(sub_min,
+                row.sub_offset, row.sub_shift, row.sub_bits, next_group));
+        }
+        using Output4 = metal::vec<T, 4>;
+        *reinterpret_cast<device Output4*>(y + output * uint(K) + input_index)
+            = Output4(scale * float4(quantized.low) - minimum);
+        *reinterpret_cast<device Output4*>(y + output * uint(K) + input_index + 4u)
+            = Output4(next_scale * float4(quantized.high) - next_minimum);
+    } else if constexpr (VEC == 4) {
         uint4 quantized = mfq_nint_read_row_value4(
-            q_packed, row_q_byte_offsets[output], layout >> 4u,
-            input_index, layout & 15u);
+            q_packed, row.q_offset, row.q_shift,
+            input_index, row.q_bits);
         float4 decoded = scale * float4(quantized) - minimum;
 #pragma clang loop unroll(full)
         for (uint value = 0u; value < 4u; ++value) {
@@ -916,8 +987,8 @@ constexpr const char* kNintDequantize = R"METAL(
         }
     } else {
         uint quantized = mfq_nint_read_row_value(
-            q_packed, row_q_byte_offsets[output], layout >> 4u,
-            input_index, layout & 15u);
+            q_packed, row.q_offset, row.q_shift,
+            input_index, row.q_bits);
         y[output * uint(K) + input_index] = T(scale * float(quantized) - minimum);
     }
 )METAL";
@@ -933,15 +1004,17 @@ constexpr const char* kNintEmbedding = R"METAL(
     uint output = uint(token_ids[token_position]);
     uint group = input_index / uint(GS);
     uint element = input_index - group * uint(GS);
-    uint metadata_index = output * uint(NG) + group;
+    const auto row = mfq_nint_row(row_metadata, output);
     uint quantized = mfq_nint_read_row_value(
         q_packed,
-        row_q_byte_offsets[output],
-        uint(row_q_layout[output]) >> 4u,
+        row.q_offset,
+        row.q_shift,
         group * uint(GS) + element,
-        uint(row_q_layout[output]) & 15u);
-    float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
-    float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        row.q_bits);
+    float scale = row.scale * float(mfq_nint_sub_value(sub_scale,
+        row.sub_offset, row.sub_shift, row.sub_bits, group));
+    float minimum = row.minimum * float(mfq_nint_sub_value(sub_min,
+        row.sub_offset, row.sub_shift, row.sub_bits, group));
     y[output_index] = T(scale * float(quantized) - minimum);
 )METAL";
 
@@ -1045,31 +1118,6 @@ detail::StagingVector<std::uint8_t> pack_values(
         }
     }
     return result;
-}
-
-void copy_packed_bit_range(
-    std::span<const std::uint8_t> source,
-    std::size_t source_bit,
-    std::size_t bit_count,
-    std::span<std::uint8_t> destination) {
-    const auto byte_count = packed_size(bit_count, 1);
-    if (destination.size() != byte_count) {
-        throw std::logic_error("NINT aligned row destination size mismatch");
-    }
-    const auto source_byte = source_bit / 8;
-    const auto shift = static_cast<unsigned>(source_bit & 7u);
-    for (std::size_t byte = 0; byte < byte_count; ++byte) {
-        const auto index = source_byte + byte;
-        std::uint16_t packed = source[index];
-        if (shift != 0 && index + 1 < source.size()) {
-            packed |= static_cast<std::uint16_t>(source[index + 1]) << 8u;
-        }
-        destination[byte] = static_cast<std::uint8_t>(packed >> shift);
-    }
-    if ((bit_count & 7u) != 0) {
-        destination.back() &= static_cast<std::uint8_t>(
-            (1u << (bit_count & 7u)) - 1u);
-    }
 }
 
 detail::StagingVector<std::uint8_t> read_old_values(
@@ -1469,12 +1517,9 @@ mlx::core::fast::CustomKernelFunction make_nint_dequantize_kernel() {
         "mfq_cpp_nint_dequantize",
         {
             "q_packed",
-            "row_q_layout",
-            "row_q_byte_offsets",
+            "row_metadata",
             "sub_scale",
             "sub_min",
-            "neuron_scale",
-            "neuron_min",
         },
         {"y"},
         kNintDequantize,
@@ -1496,12 +1541,9 @@ mlx::core::fast::CustomKernelFunction make_nint_embedding_kernel() {
         "mfq_cpp_nint_embedding",
         {
             "q_packed",
-            "row_q_layout",
-            "row_q_byte_offsets",
+            "row_metadata",
             "sub_scale",
             "sub_min",
-            "neuron_scale",
-            "neuron_min",
             "token_ids",
         },
         {"y"},
@@ -1544,10 +1586,6 @@ MlxNintWeight::MlxNintWeight(
     array q_packed,
     array sub_scale,
     array sub_min,
-    array neuron_scale,
-    array neuron_min,
-    array row_q_layout,
-    array row_q_byte_offsets,
     array row_metadata,
     int bits,
     int group_size,
@@ -1559,10 +1597,6 @@ MlxNintWeight::MlxNintWeight(
     : q_packed_(std::move(q_packed)),
       sub_scale_(std::move(sub_scale)),
       sub_min_(std::move(sub_min)),
-      neuron_scale_(std::move(neuron_scale)),
-      neuron_min_(std::move(neuron_min)),
-      row_q_layout_(std::move(row_q_layout)),
-      row_q_byte_offsets_(std::move(row_q_byte_offsets)),
       row_metadata_(std::move(row_metadata)),
       bits_(bits),
       group_size_(group_size),
@@ -1600,21 +1634,20 @@ MlxNintWeight MlxNintWeight::from_blob(
         throw std::runtime_error("inconsistent NINT Metal dimensions");
     }
 
-    detail::StagingVector<float> neuron_scale(output_size);
-    detail::StagingVector<float> neuron_min(output_size);
-    for (auto& value : neuron_scale) {
-        value = half_to_float(cursor.scalar<std::uint16_t>("neuron scale"));
+    detail::StagingVector<std::uint32_t> neuron_packed(output_size);
+    for (std::size_t row = 0; row < output_size; ++row) {
+        const auto value = cursor.scalar<std::uint16_t>("neuron scale");
+        neuron_packed[row] = value;
+        if (!std::isfinite(half_to_float(value))) {
+            throw std::runtime_error("NINT neuron metadata must be finite");
+        }
     }
-    for (auto& value : neuron_min) {
-        value = half_to_float(cursor.scalar<std::uint16_t>("neuron minimum"));
-    }
-    if (!std::all_of(
-            neuron_scale.begin(), neuron_scale.end(),
-            [](float value) { return std::isfinite(value); }) ||
-        !std::all_of(
-            neuron_min.begin(), neuron_min.end(),
-            [](float value) { return std::isfinite(value); })) {
-        throw std::runtime_error("NINT neuron metadata must be finite");
+    for (std::size_t row = 0; row < output_size; ++row) {
+        const auto value = cursor.scalar<std::uint16_t>("neuron minimum");
+        neuron_packed[row] |= std::uint32_t(value) << 16u;
+        if (!std::isfinite(half_to_float(value))) {
+            throw std::runtime_error("NINT neuron metadata must be finite");
+        }
     }
 
     const auto metadata_count =
@@ -1635,14 +1668,14 @@ MlxNintWeight MlxNintWeight::from_blob(
     detail::StagingVector<std::uint8_t> row_sub_bits(
         output_size,
         static_cast<std::uint8_t>(sub_bits));
+    detail::StagingVector<std::uint8_t> row_sub_layout(output_size);
+    detail::StagingVector<std::uint32_t> row_sub_offsets(output_size);
     if (adaptive_storage) {
         const auto selector_bytes = packed_size(output_size, kSubSelectorBits);
         const auto selectors = unpack_values(
             cursor.bytes(selector_bytes, "sub-bit selectors"),
             output_size,
             kSubSelectorBits);
-        sub_scale.resize(metadata_count);
-        sub_min.resize(metadata_count);
         for (int selector = 0; selector < (1 << kSubSelectorBits); ++selector) {
             const int row_bits = sub_bits - 1 + selector;
             const auto selected_rows = static_cast<std::size_t>(std::count(
@@ -1656,23 +1689,24 @@ MlxNintWeight MlxNintWeight::from_blob(
             }
             const auto selected_values = selected_rows * groups;
             const auto stream_bytes = packed_size(selected_values, row_bits);
-            const auto scales = unpack_values(
-                cursor.bytes(stream_bytes, "sub scale"),
-                selected_values,
-                row_bits);
-            const auto minima = unpack_values(
-                cursor.bytes(stream_bytes, "sub minimum"),
-                selected_values,
-                row_bits);
+            const auto stream_offset = sub_scale.size();
+            const auto scales = cursor.bytes(stream_bytes, "sub scale");
+            const auto minima = cursor.bytes(stream_bytes, "sub minimum");
+            sub_scale.insert(sub_scale.end(), scales.begin(), scales.end());
+            sub_min.insert(sub_min.end(), minima.begin(), minima.end());
             std::size_t local_row = 0;
             for (std::size_t row = 0; row < output_size; ++row) {
                 if (selectors[row] != selector) {
                     continue;
                 }
-                const auto source = local_row * groups;
-                const auto destination = row * groups;
-                std::copy_n(scales.begin() + source, groups, sub_scale.begin() + destination);
-                std::copy_n(minima.begin() + source, groups, sub_min.begin() + destination);
+                const auto bit_offset = local_row * groups * row_bits;
+                const auto byte_offset = stream_offset + bit_offset / 8u;
+                if (byte_offset > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::runtime_error("NINT subgroup stream exceeds Metal uint range");
+                }
+                row_sub_layout[row] = static_cast<std::uint8_t>(
+                    row_bits | ((bit_offset & 7u) << 4u));
+                row_sub_offsets[row] = static_cast<std::uint32_t>(byte_offset);
                 row_sub_bits[row] = static_cast<std::uint8_t>(row_bits);
                 ++local_row;
             }
@@ -1680,19 +1714,31 @@ MlxNintWeight MlxNintWeight::from_blob(
     } else if (old_unpacked_storage) {
         sub_scale = read_old_values(cursor, metadata_count, 1, "sub scale");
         sub_min = read_old_values(cursor, metadata_count, 1, "sub minimum");
+        for (std::size_t row = 0; row < output_size; ++row) {
+            row_sub_layout[row] = 8;
+            if (row * groups > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error("NINT subgroup stream exceeds Metal uint range");
+            }
+            row_sub_offsets[row] = static_cast<std::uint32_t>(row * groups);
+        }
     } else {
         if (cursor.remaining() != packed_tail) {
             throw std::runtime_error("invalid NINT packed payload length");
         }
-        sub_scale = unpack_values(
-            cursor.bytes(packed_metadata_bytes, "sub scale"),
-            metadata_count,
-            sub_bits);
-        sub_min = unpack_values(
-            cursor.bytes(packed_metadata_bytes, "sub minimum"),
-            metadata_count,
-            sub_bits);
+        sub_scale = cursor.bytes(packed_metadata_bytes, "sub scale");
+        sub_min = cursor.bytes(packed_metadata_bytes, "sub minimum");
+        for (std::size_t row = 0; row < output_size; ++row) {
+            const auto bit_offset = row * groups * sub_bits;
+            if (bit_offset / 8u > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error("NINT subgroup stream exceeds Metal uint range");
+            }
+            row_sub_layout[row] = static_cast<std::uint8_t>(
+                sub_bits | ((bit_offset & 7u) << 4u));
+            row_sub_offsets[row] = static_cast<std::uint32_t>(bit_offset / 8u);
+        }
     }
+    sub_scale.insert(sub_scale.end(), 2u, 0u);
+    sub_min.insert(sub_min.end(), 2u, 0u);
 
     detail::StagingVector<std::uint8_t> q_packed;
     detail::StagingVector<std::uint8_t> row_q_layout(output_size);
@@ -1703,24 +1749,7 @@ MlxNintWeight MlxNintWeight::from_blob(
             cursor.bytes(selector_bytes, "q-bit selectors"),
             output_size,
             kQSelectorBits);
-        std::size_t aligned_bytes = 0;
-        for (std::size_t row = 0; row < output_size; ++row) {
-            const int row_bits = static_cast<int>(selectors[row]) + 1;
-            if (aligned_bytes > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::runtime_error(
-                    "NINT packed stream exceeds Metal uint range");
-            }
-            row_q_layout[row] = static_cast<std::uint8_t>(row_bits);
-            row_q_byte_offsets[row] =
-                static_cast<std::uint32_t>(aligned_bytes);
-            const auto row_bytes = packed_size(values_per_row, row_bits);
-            if (row_bytes > std::numeric_limits<std::size_t>::max() - aligned_bytes) {
-                throw std::runtime_error("NINT aligned q stream is too large");
-            }
-            aligned_bytes += row_bytes;
-        }
-        q_packed.reserve(aligned_bytes + 4);
-        q_packed.resize(aligned_bytes, 0);
+        std::size_t stream_offset = 0;
         for (int selector = 0; selector < (1 << kQSelectorBits); ++selector) {
             const int row_bits = selector + 1;
             const auto selected_rows = static_cast<std::size_t>(std::count(
@@ -1730,25 +1759,27 @@ MlxNintWeight MlxNintWeight::from_blob(
             const auto stream_bytes = packed_size(
                 selected_rows * values_per_row,
                 row_bits);
-            const auto stream = cursor.bytes(stream_bytes, "q values");
             std::size_t local_row = 0;
             for (std::size_t row = 0; row < output_size; ++row) {
                 if (selectors[row] != selector) {
                     continue;
                 }
-                const auto destination = static_cast<std::size_t>(
-                    row_q_byte_offsets[row]);
-                const auto row_bytes = packed_size(values_per_row, row_bits);
-                copy_packed_bit_range(
-                    stream,
-                    local_row * row_bit_count,
-                    row_bit_count,
-                    std::span<std::uint8_t>(
-                        q_packed.data() + destination,
-                        row_bytes));
+                const auto bit_offset = local_row * row_bit_count;
+                const auto byte_offset = stream_offset + bit_offset / 8;
+                if (byte_offset > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::runtime_error("NINT packed stream exceeds Metal uint range");
+                }
+                row_q_layout[row] = static_cast<std::uint8_t>(
+                    row_bits | ((bit_offset & 7u) << 4u));
+                row_q_byte_offsets[row] = static_cast<std::uint32_t>(byte_offset);
                 ++local_row;
             }
+            if (stream_bytes > std::numeric_limits<std::size_t>::max() - stream_offset) {
+                throw std::runtime_error("NINT q stream is too large");
+            }
+            stream_offset += stream_bytes;
         }
+        q_packed = cursor.bytes(stream_offset, "q values", 4);
     } else {
         q_packed = old_unpacked_storage
             ? pack_values(
@@ -1804,25 +1835,19 @@ MlxNintWeight MlxNintWeight::from_blob(
         static_cast<std::size_t>(output_size) * 4u);
     for (std::size_t row = 0; row < output_size; ++row) {
         const auto base = row * 4u;
-        row_metadata[base] = row_q_layout[row];
+        row_metadata[base] = row_q_layout[row] | (std::uint32_t(row_sub_layout[row]) << 8u);
         row_metadata[base + 1u] = row_q_byte_offsets[row];
-        row_metadata[base + 2u] = std::bit_cast<std::uint32_t>(
-            neuron_scale[row]);
-        row_metadata[base + 3u] = std::bit_cast<std::uint32_t>(
-            neuron_min[row]);
+        row_metadata[base + 2u] = neuron_packed[row];
+        row_metadata[base + 3u] = row_sub_offsets[row];
     }
     return MlxNintWeight(
         make_array(q_packed, Shape{checked_shape(q_packed.size(), "q bytes")}),
         make_array(
             sub_scale,
-            Shape{checked_shape(output_size, "output size"), checked_shape(groups, "groups")}),
+            Shape{checked_shape(sub_scale.size(), "sub scale bytes")}),
         make_array(
             sub_min,
-            Shape{checked_shape(output_size, "output size"), checked_shape(groups, "groups")}),
-        make_array(neuron_scale, Shape{checked_shape(output_size, "output size")}),
-        make_array(neuron_min, Shape{checked_shape(output_size, "output size")}),
-        make_array(row_q_layout, Shape{checked_shape(output_size, "output size")}),
-        make_array(row_q_byte_offsets, Shape{checked_shape(output_size, "output size")}),
+            Shape{checked_shape(sub_min.size(), "sub minimum bytes")}),
         make_array(
             row_metadata,
             Shape{checked_shape(output_size, "output size"), 4}),
@@ -1925,12 +1950,9 @@ array MlxNintWeight::matmul_impl(
         source,
         Shape{static_cast<std::int32_t>(rows), input_size_});
     if (rows >= 64) {
-        // Decode packed rows once per matrix tile.  For very long prefills a
-        // transient full dequantization wins because each weight tile would
-        // otherwise be revisited many times; it is never retained as a
-        // resident decoded copy.
-        constexpr std::int64_t packed_prefill_rows = 2048;
-        auto result = !allow_dequantize || rows < packed_prefill_rows
+        const bool use_nax = dense_nint_nax_enabled();
+        auto result = !allow_dequantize || !dense_nint_prefers_dequantize(
+            rows, input_size_, output_size_, use_nax)
             ? dense_nint_mmq(
                   q_packed_,
                   row_metadata_,
@@ -1943,7 +1965,7 @@ array MlxNintWeight::matmul_impl(
                       .input_width = input_size_,
                       .group_size = group_size_,
                       .groups = groups_,
-                      .use_nax = dense_nint_nax_enabled(),
+                      .use_nax = use_nax,
                   })
             : mlx::core::matmul(
                   source,
@@ -2193,7 +2215,9 @@ MlxNintSwiGluPair::from_weights(
         return std::nullopt;
     }
     const auto gate_q_bytes = gate.packed_values().size();
-    if (gate_q_bytes > std::numeric_limits<std::uint32_t>::max()) {
+    const auto gate_sub_bytes = gate.sub_scales().size();
+    if (gate_q_bytes > std::numeric_limits<std::uint32_t>::max() ||
+        gate_sub_bytes > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error(
             "combined NINT Gate/Up q offset exceeds Metal uint range");
     }
@@ -2222,6 +2246,13 @@ MlxNintSwiGluPair::from_weights(
         }
         metadata[offset] = original +
             static_cast<std::uint32_t>(gate_q_bytes);
+        const auto sub_offset = offset + 2u;
+        if (metadata[sub_offset] > std::numeric_limits<std::uint32_t>::max() -
+                static_cast<std::uint32_t>(gate_sub_bytes)) {
+            throw std::runtime_error(
+                "combined NINT Gate/Up subgroup offset exceeds Metal uint range");
+        }
+        metadata[sub_offset] += static_cast<std::uint32_t>(gate_sub_bytes);
     }
 
     detail::StagingVector<std::uint8_t> q_values(
@@ -2262,10 +2293,10 @@ MlxNintSwiGluPair::from_weights(
         Shape{static_cast<int>(q_values.size())});
     auto sub_scale = make_array(
         sub_scale_values,
-        Shape{2 * gate.output_size(), gate.groups()});
+        Shape{checked_shape(sub_scale_values.size(), "combined sub scale bytes")});
     auto sub_min = make_array(
         sub_min_values,
-        Shape{2 * gate.output_size(), gate.groups()});
+        Shape{checked_shape(sub_min_values.size(), "combined sub minimum bytes")});
     auto row_metadata = make_array(
         metadata,
         Shape{2 * gate.output_size(), 4});
@@ -2367,18 +2398,16 @@ array MlxNintWeight::dequantize(Dtype dtype) const {
                             std::numeric_limits<int>::max())) {
         throw std::runtime_error("NINT dequantization grid exceeds MLX limits");
     }
-    const int values_per_thread = group_size_ % 4 == 0 ? 4 : 1;
+    const int values_per_thread = group_size_ % 4 == 0
+        ? input_size_ % 8 == 0 ? 8 : 4 : 1;
     const int grid = static_cast<int>(static_cast<std::uint64_t>(output_size_) *
         ((static_cast<std::uint64_t>(input_size_) + values_per_thread - 1) / values_per_thread));
     auto outputs = nint_dequantize_kernel()(
         {
             q_packed_,
-            row_q_layout_,
-            row_q_byte_offsets_,
+            row_metadata_,
             sub_scale_,
             sub_min_,
-            neuron_scale_,
-            neuron_min_,
         },
         {Shape{output_size_, input_size_}},
         {dtype},
@@ -2425,12 +2454,9 @@ array MlxNintWeight::embedding(
     auto outputs = nint_embedding_kernel()(
         {
             q_packed_,
-            row_q_layout_,
-            row_q_byte_offsets_,
+            row_metadata_,
             sub_scale_,
             sub_min_,
-            neuron_scale_,
-            neuron_min_,
             ids,
         },
         {Shape{static_cast<std::int32_t>(count), input_size_}},
@@ -2453,10 +2479,7 @@ std::size_t MlxNintWeight::packed_nbytes() const noexcept {
     return q_packed_.nbytes() +
         sub_scale_.nbytes() +
         sub_min_.nbytes() +
-        neuron_scale_.nbytes() +
-        neuron_min_.nbytes() +
-        row_q_layout_.nbytes() +
-        row_q_byte_offsets_.nbytes();
+        row_metadata_.nbytes();
 }
 
 } // namespace mfq::metal

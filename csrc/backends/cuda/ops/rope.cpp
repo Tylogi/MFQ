@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "rope.h"
 
 #include "cuda_execution.h"
@@ -7,6 +8,8 @@
 #include <array>
 #include <numeric>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -260,9 +263,17 @@ namespace tb = mfq_tensor_backend;
 using Tensor = tb::Tensor;
 
 RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
-                               std::vector<int64_t> sections, bool interleaved)
+                               std::vector<int64_t> sections, bool interleaved,
+                               std::optional<bool> fused)
     : dimension_(dimension), maximum_(maximum), base_(base), sections_(std::move(sections)),
       interleaved_(interleaved) {
+    const auto configured = runtime_options::rotary_fusion();
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    constexpr bool default_fused = true;
+#else
+    constexpr bool default_fused = false;
+#endif
+    fused_ = fused.value_or(configured.value_or(default_fused));
     MFQ_RUNTIME_CHECK(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
                           std::isfinite(base) && base > 0,
                       "invalid rotary configuration");
@@ -272,6 +283,62 @@ RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base
              std::all_of(sections_.begin(), sections_.end(), [](auto n) { return n >= 0; }) &&
              std::accumulate(sections_.begin(), sections_.end(), int64_t(0)) == dimension / 2),
         "MRoPE sections disagree with rotary width");
+}
+
+RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& value) const {
+    const auto pairs = dimension_ / 2;
+    std::lock_guard lock(prepared_mutex_);
+    auto& cached = prepared_[value.get_device()];
+    if (!cached.frequencies.defined()) {
+        Prepared next;
+        auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
+        next.frequencies = tb::pow(tb::full({pairs}, base_, value.options().dtype(tb::kFloat32)),
+            -(pair.to(tb::kFloat32) * 2) / double(dimension_));
+        std::vector<int32_t> selected(static_cast<size_t>(pairs), 0);
+        for (int64_t j = 0; j < pairs; ++j) if (!sections_.empty()) {
+            if (interleaved_) {
+                if (j % 3 == 1 && j < sections_[1] * 3) selected[j] = 1;
+                else if (j % 3 == 2 && j < sections_[2] * 3) selected[j] = 2;
+            } else selected[j] = j < sections_[0] ? 0 : (j < sections_[0] + sections_[1] ? 1 : 2);
+        }
+        next.axes = tb::tensor(selected).to(value.device());
+        MFQ_RUNTIME_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()) == cudaSuccess,
+            "warm cached rotary parameters before CUDA graph capture");
+        cached = std::move(next);
+    }
+    return cached;
+}
+
+Tensor RotaryEmbedding::forward_normalized(const Tensor& value, const Tensor& weight,
+        const Tensor& positions, double eps, const Tensor& key_cache,
+        const Tensor& cache_positions, const Tensor& projected_value, const Tensor& value_cache) const {
+    MFQ_RUNTIME_CHECK(fused_ && value.is_cuda() && value.dim() == 4 &&
+        value.size(-1) >= dimension_, "normalized rotary requires fused [B,T,H,D] input");
+    const auto prepared = prepare_parameters(value);
+    auto active_positions = positions.scalar_type() == tb::kInt32 || positions.scalar_type() == tb::kInt64
+        ? positions.contiguous() : positions.to(tb::kInt32).contiguous();
+    return rotary_normalized_cached_cuda(value, weight.to(tb::kFloat32).contiguous(), active_positions,
+        prepared.frequencies, prepared.axes, maximum_, eps, key_cache, cache_positions,
+        projected_value, value_cache);
+}
+
+std::vector<Tensor> RotaryEmbedding::forward_normalized_grouped(
+        const std::vector<Tensor>& values,const std::vector<Tensor>& weights,
+        const Tensor& positions,double eps,int cache_entry,const Tensor& key_cache,
+        const Tensor& cache_positions,const Tensor& projected_value,const Tensor& value_cache) const {
+    MFQ_RUNTIME_CHECK(fused_ && !values.empty() && values.size()<=3 && weights.size()==values.size(),
+        "normalized rotary requires a fused input/weight group");
+    std::vector<Tensor> active_weights;active_weights.reserve(weights.size());
+    for(size_t i=0;i<values.size();++i) {
+        MFQ_RUNTIME_CHECK(values[i].is_cuda() && values[i].dim()==4 && values[i].size(-1)>=dimension_,
+            "normalized rotary group requires [B,T,H,D] inputs");
+        active_weights.push_back(weights[i].to(tb::kFloat32).contiguous());
+    }
+    const auto prepared=prepare_parameters(values[0]);
+    auto active_positions=positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64
+        ? positions.contiguous():positions.to(tb::kInt32).contiguous();
+    return rotary_normalized_grouped_cuda(values,active_weights,active_positions,prepared.frequencies,
+        prepared.axes,maximum_,eps,cache_entry,key_cache,cache_positions,projected_value,value_cache);
 }
 
 mfq_tensor_backend::Tensor RotaryEmbedding::forward(const Tensor &value, const Tensor &positions) const {
@@ -286,6 +353,11 @@ mfq_tensor_backend::Tensor RotaryEmbedding::forward(const Tensor &value, const T
     MFQ_RUNTIME_CHECK(axes > 0 && (batches == 1 || batches == b),
                       "RoPE position batch mismatch");
     auto input = value.scalar_type() == tb::kFloat32 ? value : value.to(tb::kFloat16);
+    if(fused_) {
+        const auto prepared = prepare_parameters(value);
+        return rotary_embedding_cached_cuda(input.contiguous(),positions.to(tb::kInt32).contiguous(),
+            prepared.frequencies,prepared.axes,maximum_);
+    }
     auto f = input.to(tb::kFloat32);
     auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
     auto frequencies = tb::pow(tb::full({pairs}, base_, f.options()),

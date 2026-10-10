@@ -10,10 +10,10 @@ namespace mfq::models::qwen4_exp {
 template <class Loader>
 auto load_residual(Loader &ops, const Config &c, const std::string &p, bool combine) {
     auto norm = ops.fp32(ops.dense(p + ".norm.weight"));
-    auto down = ops.dense(p + ".down.weight"), up = ops.dense(p + ".up.weight");
-    typename Loader::Tensor injection;
+    auto down = ops.residual_linear(p + ".down.weight"), up = ops.residual_linear(p + ".up.weight");
+    decltype(down) injection{};
     if (combine)
-        injection = ops.dense(p.substr(0, p.size() - 4) + ".post.inject.weight");
+        injection = ops.residual_linear(p.substr(0, p.size() - 4) + ".post.inject.weight");
     return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c);
 }
 
@@ -178,6 +178,23 @@ auto decoder_layer(Tensor hidden, bool has_ple, bool linear, PositionEmbedding p
             return ffn_post(std::move(branch), mix);
         },
         [](const auto &) {});
+}
+
+template <class Tensor, class PositionEmbedding, class Add, class AttentionPre,
+          class LinearAttention, class SparseAttention, class FfnPreAfter, class Ffn, class FfnPost>
+auto decoder_layer_chained(Tensor hidden, bool has_ple, bool linear,
+    PositionEmbedding position_embedding, Add add, AttentionPre attention_pre,
+    LinearAttention linear_attention, SparseAttention sparse_attention,
+    FfnPreAfter ffn_pre_after, Ffn ffn, FfnPost ffn_post) {
+    if (has_ple) {
+        auto positional = position_embedding(hidden);
+        hidden = add(std::move(hidden), std::move(positional));
+    }
+    auto attention_mix = attention_pre(hidden);
+    auto attention_branch = linear ? linear_attention(attention_mix[0]) : sparse_attention(attention_mix[0]);
+    auto ffn_mix = ffn_pre_after(std::move(attention_branch), attention_mix);
+    auto ffn_branch = ffn(ffn_mix[0]);
+    return ffn_post(std::move(ffn_branch), ffn_mix);
 }
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {

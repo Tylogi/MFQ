@@ -5,8 +5,10 @@ for NINT shards instead of loading the complete shard into QuantLinear.
 The shared C++ `NintRows` parser owns only q/k selectors and compact rank
 checkpoints in this mode (below one byte per embedding row). Packed q,
 subgroup scale/min and FP16 row anchors remain in the file. The reader owns
-its file handle independently of the source object and serializes seek/read
-operations; it does not mmap or register the full table with CUDA.
+its file handle independently of the source object. Buffered readers serialize
+seek/read operations; opt-in direct readers use independent positional reads
+(see [model source I/O](model-source-io.md)). The table is not mapped or
+registered with CUDA.
 
 Each lookup transfers requested token IDs to the host, gathers only selected
 packed row byte ranges, uploads the common six-word row descriptors and runs
@@ -16,6 +18,15 @@ resident NINT embedding operator remains available for other consumers.
 The canonical wire format, relative-k selector range, quantizer policy and
 existing non-NINT PLE paths are unchanged. NINT conversion is still opt-in
 with `--quantize-ple`; existing trained-model artifacts are not converted.
+
+Sources with concurrent positional reads gather selected rows on the persistent
+host worker pool using the configured CPU thread count. Buffered seek-based
+sources keep their serial reading order; unknown callbacks default to serial.
+Each worker owns its packed data and descriptors;
+merging preserves the original row order and byte protocol, including duplicate
+IDs. A read failure is propagated after all workers finish and leaves an
+existing batch unchanged. This issues concurrent file requests without retaining
+weight payloads between lookups. The quantized CUDA decoder is unchanged.
 
 The range-backed lookup needs a device-to-host ID transfer and CPU file I/O,
 so it explicitly rejects CUDA graph capture. The pure decoder supports

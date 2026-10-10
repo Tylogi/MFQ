@@ -97,6 +97,23 @@ def _qwen_config() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("active,nested", [(0, 1), (1, 1), (2, 2)])
+def test_qwen_predictor_active_count(active, nested):
+    raw = _qwen_config()
+    raw["text_config"]["mtp_num_hidden_layers"] = active
+    raw["text_config"]["mtp"]["num_hidden_layers"] = nested
+    assert Qwen4ExpConfig.from_hf_config(raw).mtp_num_hidden_layers == active
+
+
+@pytest.mark.parametrize("active,nested", [(1, 2), (2, 1), (-1, 1)])
+def test_qwen_predictor_invalid_active_count(active, nested):
+    raw = _qwen_config()
+    raw["text_config"]["mtp_num_hidden_layers"] = active
+    raw["text_config"]["mtp"]["num_hidden_layers"] = nested
+    with pytest.raises(ValueError, match="MTP layer"):
+        Qwen4ExpConfig.from_hf_config(raw)
+
+
 def _glm_config() -> dict[str, object]:
     return {
         "model_type": "glm5_next",

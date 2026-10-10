@@ -6,11 +6,65 @@
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "reduce.cuh"
 
 constexpr int NORM_BD = 256;
+
+template<class Gate,class Output,int Threads>
+__global__ void gdn_rms_norm_gate_kernel(const float* attended,const Gate* projection,
+    const float* weight,Output* output,int heads,int tokens,int width,double eps,
+    bool silu_gate,bool double_sigmoid) {
+    const int64_t row=blockIdx.x,base=row*width;
+    const int64_t batch=row/(int64_t(heads)*tokens),head=(row/tokens)%heads,token=row%tokens;
+    const int64_t destination=((batch*tokens+token)*heads+head)*width;
+    float sum=0;
+    for(int column=threadIdx.x;column<width;column+=Threads)
+        sum=__fadd_rn(sum,__fmul_rn(attended[base+column],attended[base+column]));
+    __shared__ float partial[Threads];partial[threadIdx.x]=sum;__syncthreads();
+    for(int stride=Threads/2;stride>0;stride/=2) {
+        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+        __syncthreads();
+    }
+    const float mean=__fdiv_rn(partial[0],static_cast<float>(width));
+    const float variance=static_cast<float>(static_cast<double>(mean)+eps);
+    const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(variance));
+    for(int column=threadIdx.x;column<width;column+=Threads) {
+        const float z=static_cast<float>(projection[destination+column]);
+        const float sigmoid=double_sigmoid
+            ? static_cast<float>(1.0/(1.0+::exp(-static_cast<double>(z))))
+            : __fdiv_rn(1.0f,__fadd_rn(1.0f,::expf(-z)));
+        const float gate=silu_gate?__fmul_rn(z,sigmoid):sigmoid;
+        const float scaled=__fmul_rn(__fmul_rn(attended[base+column],inverse),weight[column]);
+        output[destination+column]=static_cast<Output>(__fmul_rn(scaled,gate));
+    }
+}
+
+template<class Value,int Threads>
+__global__ void grouped_rms_norm_kernel(const Value* input,const float* weight,Value* output,
+    int width,int weight_rows,float eps,float weight_offset) {
+    const int64_t base=int64_t(blockIdx.x)*width;
+    const float* scale=weight+int64_t(blockIdx.x%weight_rows)*width;
+    float sum=0;
+    for(int column=threadIdx.x;column<width;column+=Threads) {
+        const float value=static_cast<float>(input[base+column]);
+        sum=__fadd_rn(sum,__fmul_rn(value,value));
+    }
+    __shared__ float partial[Threads];partial[threadIdx.x]=sum;__syncthreads();
+    for(int stride=Threads/2;stride>0;stride/=2) {
+        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+        __syncthreads();
+    }
+    const float mean=__fdiv_rn(partial[0],static_cast<float>(width));
+    const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(mean,eps)));
+    for(int column=threadIdx.x;column<width;column+=Threads) {
+        const float normalized=__fmul_rn(static_cast<float>(input[base+column]),inverse);
+        output[base+column]=static_cast<Value>(__fmul_rn(normalized,__fadd_rn(scale[column],weight_offset)));
+    }
+}
 
 template <int BD>
 __global__ void qwen_rms_norm_bf16_kernel(
@@ -412,6 +466,83 @@ mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_t
             (float)weight_offset);
     }
     return out;
+}
+
+mfq_tensor_backend::Tensor gdn_rms_norm_gate_cuda(mfq_tensor_backend::Tensor attended,
+    mfq_tensor_backend::Tensor gate,mfq_tensor_backend::Tensor weight,double eps,
+    bool silu_gate,bool output_half) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(attended.is_cuda() && attended.is_contiguous() && attended.dim()==4 &&
+        attended.scalar_type()==tb::kFloat32 && attended.size(0)>0 && attended.size(1)>0 &&
+        attended.size(2)>0 && attended.size(3)>0 && std::isfinite(eps) && eps>0,
+        "gdn_rms_norm_gate: expected nonempty contiguous CUDA f32 [batch,heads,tokens,width]");
+    const auto batch=attended.size(0),heads=attended.size(1),tokens=attended.size(2),width=attended.size(3);
+    const auto rows=attended.numel()/width;
+    MFQ_RUNTIME_CHECK(heads<=std::numeric_limits<int>::max() && tokens<=std::numeric_limits<int>::max() &&
+        width<=std::numeric_limits<int>::max() && rows<=std::numeric_limits<int>::max(),
+        "gdn_rms_norm_gate: geometry exceeds CUDA launch bounds");
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.device()==attended.device() && gate.is_contiguous() &&
+        gate.dim()==3 && gate.size(0)==batch && gate.size(1)==tokens && gate.size(2)==heads*width &&
+        (gate.scalar_type()==tb::kFloat16 || gate.scalar_type()==tb::kFloat32),
+        "gdn_rms_norm_gate: expected contiguous CUDA f16/f32 [batch,tokens,heads*width] gate");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.device()==attended.device() && weight.is_contiguous() &&
+        weight.scalar_type()==tb::kFloat32 && weight.dim()==1 && weight.numel()==width,
+        "gdn_rms_norm_gate: expected CUDA f32 width-vector weight");
+    MfqCudaGuard guard(attended.device());
+    auto output=tb::empty({batch,tokens,heads*width},attended.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
+    const bool double_sigmoid=gate.scalar_type()==tb::kFloat32 &&
+        !gate.reshape({batch,tokens,heads,width}).permute({0,2,1,3}).is_contiguous();
+    const auto launch=[&]<class Gate,class Output,int Threads>() {
+        gdn_rms_norm_gate_kernel<Gate,Output,Threads><<<static_cast<unsigned int>(rows),Threads,0,mfq_current_cuda_stream()>>>(
+            attended.data_ptr<float>(),gate.data_ptr<Gate>(),weight.data_ptr<float>(),output.data_ptr<Output>(),
+            static_cast<int>(heads),static_cast<int>(tokens),static_cast<int>(width),eps,
+            silu_gate,double_sigmoid);
+    };
+    const auto dispatch_width=[&]<class Gate,class Output>() {
+        if(width<=32)launch.template operator()<Gate,Output,32>();
+        else if(width<=64)launch.template operator()<Gate,Output,64>();
+        else if(width<=128)launch.template operator()<Gate,Output,128>();
+        else launch.template operator()<Gate,Output,256>();
+    };
+    const auto dispatch_output=[&]<class Gate>() {
+        if(output_half)dispatch_width.template operator()<Gate,mfq_half>();
+        else dispatch_width.template operator()<Gate,float>();
+    };
+    if(gate.scalar_type()==tb::kFloat16)dispatch_output.template operator()<mfq_half>();
+    else dispatch_output.template operator()<float>();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+mfq_tensor_backend::Tensor grouped_rms_norm_cuda(mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor weight, int64_t group, double eps, double weight_offset)
+{
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() > 0 && group > 0 &&
+        x.size(-1) > 0 && x.size(-1) % group == 0 &&
+        (x.scalar_type() == tb::kFloat16 || x.scalar_type() == tb::kFloat32),
+        "grouped_rms_norm: input must be contiguous cuda f16/f32 with complete groups");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.device() == x.device() && weight.is_contiguous() &&
+        weight.scalar_type() == tb::kFloat32 && weight.dim() == 1 && weight.numel() == x.size(-1),
+        "grouped_rms_norm: weight must be contiguous cuda f32 with input width");
+    const int rows = static_cast<int>(x.numel() / group);
+    const int width = static_cast<int>(group), weight_rows = static_cast<int>(x.size(-1) / group);
+    auto output = tb::empty_like(x);
+    if (rows == 0) return output;
+    const auto launch=[&]<class Value,int Threads>() {
+        grouped_rms_norm_kernel<Value,Threads><<<rows,Threads,0,mfq_current_cuda_stream()>>>(
+            x.data_ptr<Value>(),weight.data_ptr<float>(),output.data_ptr<Value>(),width,weight_rows,
+            static_cast<float>(eps),static_cast<float>(weight_offset));
+    };
+    const auto dispatch=[&]<class Value>() {
+        if(width<=32)launch.template operator()<Value,32>();
+        else if(width<=64)launch.template operator()<Value,64>();
+        else if(width<=128)launch.template operator()<Value,128>();
+        else launch.template operator()<Value,256>();
+    };
+    if(x.scalar_type()==tb::kFloat16)dispatch.template operator()<mfq_half>();
+    else dispatch.template operator()<float>();
+    return output;
 }
 
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16_cuda(

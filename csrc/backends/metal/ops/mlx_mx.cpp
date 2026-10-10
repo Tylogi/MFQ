@@ -543,10 +543,8 @@ constexpr const char* kMxfp8Gemv = R"METAL(
     }
 )METAL";
 
-// Short verifier blocks need a diagonal MultiLinear projection. The generic
-// grouped-row fallback dequantizes the complete MXFP8 matrix and launches one
-// GEMM per group. This
-// schedule instead keeps M=2..6 activation rows in registers and reuses each
+// Short verifier blocks need a diagonal MultiLinear projection. This schedule
+// keeps activation rows in registers and reuses each
 // packed weight byte across all of them.  Its 32-lane reduction and four
 // outputs per SIMD group match MLX's decode QMV arithmetic.
 //
@@ -558,7 +556,7 @@ constexpr const char* kMxfp8GroupedSmallM = R"METAL(
     constexpr uint OUTPUTS_PER_SIMD = 4u;
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint OUTPUTS_PER_TG = OUTPUTS_PER_SIMD * SIMD_GROUPS;
-    constexpr uint BLOCKS_PER_GROUP = uint(N) / OUTPUTS_PER_TG;
+    constexpr uint BLOCKS_PER_GROUP = (uint(N) + OUTPUTS_PER_TG - 1u) / OUTPUTS_PER_TG;
 
     uint simd_group = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
@@ -567,40 +565,43 @@ constexpr const char* kMxfp8GroupedSmallM = R"METAL(
     uint group_block = flat_block - group * BLOCKS_PER_GROUP;
     uint output_base =
         group_block * OUTPUTS_PER_TG + simd_group * OUTPUTS_PER_SIMD;
+    if (output_base >= uint(N)) return;
 
     device const uchar* weight_ptr = values
         + (group * uint(N) + output_base) * uint(K)
         + lane * VALUES_PER_THREAD;
-    device const half* input_ptr = x
+    auto input_ptr = x
         + group * uint(M) * uint(K)
         + lane * VALUES_PER_THREAD;
-    device half* output_ptr = y
+    auto output_ptr = y
         + group * uint(M) * uint(N) + output_base;
-    // Expanded scales use the same per-output, 32-value layout passed to
-    // MLX quantized_matmul for the ordinary M=1 decode path.
-    device const uchar* scale_ptr = expanded_scales
-        + (group * uint(N) + output_base) * (uint(K) / 32u)
-        + lane / 4u;
 
     float accum[M][OUTPUTS_PER_SIMD] = {{0.0f}};
     for (uint k = 0u; k < uint(K); k += K_BLOCK) {
         float input_values[M][VALUES_PER_THREAD];
         for (uint row = 0u; row < uint(M); ++row) {
-            for (uint element = 0u;
-                 element < VALUES_PER_THREAD;
-                 ++element) {
-                input_values[row][element] =
-                    float(input_ptr[row * uint(K) + element]);
-            }
+            for (uint element = 0u; element < VALUES_PER_THREAD; ++element)
+                input_values[row][element] = float(input_ptr[row * uint(K) + element]);
+        }
+        uint scale_column = (k + lane * VALUES_PER_THREAD) / uint(SCALE_COLUMNS);
+        float common_scale = 0.0f;
+        if constexpr (SCALE_ROWS > 1) {
+            common_scale = mfq_mx_e8m0(scales[
+                ((group * uint(N) + output_base) / uint(SCALE_ROWS))
+                    * (uint(K) / uint(SCALE_COLUMNS)) + scale_column]);
         }
         for (uint result = 0u;
              result < OUTPUTS_PER_SIMD;
              ++result) {
+            if (output_base + result >= uint(N)) continue;
             device const uchar* row_weight =
                 weight_ptr + result * uint(K);
-            device const uchar* row_scale =
-                scale_ptr + result * (uint(K) / 32u);
-            float scale = mfq_mx_e8m0(row_scale[0]);
+            float scale = common_scale;
+            if constexpr (SCALE_ROWS == 1) {
+                scale = mfq_mx_e8m0(scales[
+                    (group * uint(N) + output_base + result)
+                        * (uint(K) / uint(SCALE_COLUMNS)) + scale_column]);
+            }
             for (uint row = 0u; row < uint(M); ++row) {
                 float dot_value = 0.0f;
                 for (uint element = 0u;
@@ -613,7 +614,6 @@ constexpr const char* kMxfp8GroupedSmallM = R"METAL(
             }
         }
         weight_ptr += K_BLOCK;
-        scale_ptr += K_BLOCK / 32u;
         input_ptr += K_BLOCK;
     }
 
@@ -622,10 +622,51 @@ constexpr const char* kMxfp8GroupedSmallM = R"METAL(
              result < OUTPUTS_PER_SIMD;
              ++result) {
             float value = simd_sum(accum[row][result]);
-            if (lane == 0u) {
-                output_ptr[row * uint(N) + result] = half(value);
+            if (lane == 0u && output_base + result < uint(N)) {
+                output_ptr[row * uint(N) + result] = value;
             }
         }
+    }
+)METAL";
+
+// Copyright © 2025 Apple Inc. Adapted from MLX; see NOTICE.
+constexpr const char* kMxfp8GroupedQuad = R"METAL(
+    constexpr uint VALUES_PER_THREAD = uint(K) / 4u;
+    constexpr uint STEPS = VALUES_PER_THREAD > 32u ? VALUES_PER_THREAD / 32u : 1u;
+    constexpr uint VALUES_PER_STEP = VALUES_PER_THREAD / STEPS;
+    uint lane = thread_index_in_simdgroup;
+    uint quad = lane >> 2u;
+    uint quad_lane = lane & 3u;
+    uint token = threadgroup_position_in_grid.x;
+    uint group = threadgroup_position_in_grid.z;
+    uint output_base = threadgroup_position_in_grid.y * 64u + quad;
+    uint column_base = quad_lane * VALUES_PER_THREAD;
+    uint rows = uint(x_shape[1]);
+    float activation[VALUES_PER_THREAD];
+    for (uint i = 0u; i < VALUES_PER_THREAD; ++i)
+        activation[i] = float(x[(group * rows + token) * uint(K) + column_base + i]);
+    float accum[8] = {0.0f};
+    for (uint result = 0u; result < 8u; ++result) {
+        uint output = output_base + result * 8u;
+        if (output >= uint(N)) continue;
+        uint global_output = group * uint(N) + output;
+        for (uint step = 0u; step < STEPS; ++step) {
+            uint column = column_base + step * VALUES_PER_STEP;
+            float scale = mfq_mx_e8m0(scales[
+                (global_output / uint(SCALE_ROWS)) * (uint(K) / uint(SCALE_COLUMNS))
+                    + column / uint(SCALE_COLUMNS)]);
+            float dot_value = 0.0f;
+            for (uint i = 0u; i < VALUES_PER_STEP; ++i)
+                dot_value += activation[step * VALUES_PER_STEP + i]
+                    * mfq_mx_fp8(values[global_output * uint(K) + column + i]);
+            accum[result] += scale * dot_value;
+        }
+    }
+    for (uint result = 0u; result < 8u; ++result) {
+        float value = quad_sum(accum[result]);
+        uint output = output_base + result * 8u;
+        if (quad_lane == 0u && output < uint(N))
+            y[(group * rows + token) * uint(N) + output] = value;
     }
 )METAL";
 
@@ -650,30 +691,35 @@ constexpr const char* kMxfp8SmallMExact = R"METAL(
 
     device const uchar* weight_ptr = values
         + output_base * uint(K) + lane * VALUES_PER_THREAD;
-    device const half* input_ptr = x + lane * VALUES_PER_THREAD;
-    device half* output_ptr = y + output_base;
-    device const uchar* scale_ptr = expanded_scales
-        + output_base * (uint(K) / 32u) + lane / 4u;
+    auto input_ptr = x + lane * VALUES_PER_THREAD;
+    auto output_ptr = y + output_base;
 
     float accum[M][OUTPUTS_PER_SIMD] = {{0.0f}};
     for (uint k = 0u; k < uint(K); k += K_BLOCK) {
         float input_values[M][VALUES_PER_THREAD];
         for (uint row = 0u; row < uint(M); ++row) {
-            for (uint element = 0u;
-                 element < VALUES_PER_THREAD;
-                 ++element) {
-                input_values[row][element] =
-                    float(input_ptr[row * uint(K) + element]);
-            }
+            for (uint element = 0u; element < VALUES_PER_THREAD; ++element)
+                input_values[row][element] = float(input_ptr[row * uint(K) + element]);
+        }
+        uint scale_column = (k + lane * VALUES_PER_THREAD) / uint(SCALE_COLUMNS);
+        float common_scale = 0.0f;
+        if constexpr (SCALE_ROWS > 1) {
+            common_scale = mfq_mx_e8m0(scales[
+                (output_base / uint(SCALE_ROWS))
+                    * (uint(K) / uint(SCALE_COLUMNS)) + scale_column]);
         }
         for (uint result = 0u;
              result < OUTPUTS_PER_SIMD;
              ++result) {
+            if (output_base + result >= uint(N)) continue;
             device const uchar* row_weight =
                 weight_ptr + result * uint(K);
-            device const uchar* row_scale =
-                scale_ptr + result * (uint(K) / 32u);
-            float scale = mfq_mx_e8m0(row_scale[0]);
+            float scale = common_scale;
+            if constexpr (SCALE_ROWS == 1) {
+                scale = mfq_mx_e8m0(scales[
+                    (output_base + result)
+                        * (uint(K) / uint(SCALE_COLUMNS)) + scale_column]);
+            }
             for (uint row = 0u; row < uint(M); ++row) {
                 float dot_value = 0.0f;
                 for (uint element = 0u;
@@ -686,7 +732,6 @@ constexpr const char* kMxfp8SmallMExact = R"METAL(
             }
         }
         weight_ptr += K_BLOCK;
-        scale_ptr += K_BLOCK / 32u;
         input_ptr += K_BLOCK;
     }
 
@@ -695,8 +740,8 @@ constexpr const char* kMxfp8SmallMExact = R"METAL(
              result < OUTPUTS_PER_SIMD;
              ++result) {
             float value = simd_sum(accum[row][result]);
-            if (lane == 0u) {
-                output_ptr[row * uint(N) + result] = half(value);
+            if (lane == 0u && output_base + result < uint(N)) {
+                output_ptr[row * uint(N) + result] = value;
             }
         }
     }
@@ -776,7 +821,8 @@ std::string make_mxfp8_projection_group_source(
               "                        mfq_mx_fp8(code1.z),\n"
               "                        mfq_mx_fp8(code1.w));\n"
               "                    float scale = mfq_mx_e8m0(scales_"
-            + suffix + "[output * (uint(K) / 32u) + column / 32u]);\n"
+            + suffix + "[(output / uint(P" + suffix + "_SCALE_ROWS))"
+              " * (uint(K) / 32u) + column / 32u]);\n"
               "                    for (uint row = 0u;"
               " row < uint(M); ++row) {\n"
               "                        accum[row][result] = fma(scale,\n"
@@ -938,8 +984,7 @@ constexpr const char* kMxfp8GroupedInverseRope = R"METAL(
     }
 )METAL";
 
-// Native 32-column MXFP8 sidecars can be expanded once to MLX's per-output
-// scale layout. MLX's ordinary grouped path launches one QMV for each output
+// MLX's ordinary grouped path launches one QMV for each output
 // groups after a separate inverse-RoPE dispatch. Decode only needs M=1, so a
 // single threadgroup schedule can select the diagonal input group, rotate its
 // activation in registers, and retain the native block32 QMV accumulation
@@ -1001,7 +1046,7 @@ constexpr const char* kMxfp8Block32GroupedInverseRope = R"METAL(
             device const uchar* row_weight =
                 values + output * uint(K) + column_base;
             device const uchar* row_scale =
-                expanded_scales + output * (uint(K) / 32u)
+                scales + (output / uint(SCALE_ROWS)) * (uint(K) / 32u)
                 + block_base / 32u + lane / 4u;
             float dot_value = 0.0f;
             for (uint element = 0u;
@@ -1167,7 +1212,7 @@ mxfp8_grouped_small_m_kernel() {
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
             "mfq_cpp_mxfp8_grouped_small_m_m2_6",
-            {"values", "expanded_scales", "x"},
+            {"values", "scales", "x"},
             {"y"},
             kMxfp8GroupedSmallM,
             kMxHeader,
@@ -1184,10 +1229,28 @@ mxfp8_small_m_exact_kernel() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
-            "mfq_cpp_mxfp8_small_m_exact_m2_6",
-            {"values", "expanded_scales", "x"},
+            "mfq_cpp_mxfp8_small_m_exact_native_scales",
+            {"values", "scales", "x"},
             {"y"},
             kMxfp8SmallMExact,
+            kMxHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mxfp8_grouped_quad_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_mxfp8_grouped_quad_native_scales",
+            {"values", "scales", "x"},
+            {"y"},
+            kMxfp8GroupedQuad,
             kMxHeader,
             true,
             false,
@@ -1221,7 +1284,7 @@ mxfp8_block32_grouped_inverse_rope_kernel() {
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
             "mfq_cpp_mxfp8_block32_grouped_inverse_rope_m1",
-            {"values", "expanded_scales", "x", "cos_values", "sin_values"},
+            {"values", "scales", "x", "cos_values", "sin_values"},
             {"y"},
             kMxfp8Block32GroupedInverseRope,
             kMxHeader,
@@ -1405,9 +1468,6 @@ MlxMxWeight::MlxMxWeight(
         mxfp8_scale_row_block_size_ = 1;
         mxfp8_scale_column_block_size_ = 32;
     }
-    const auto* native_env = std::getenv("MFQ_METAL_MXFP8_NATIVE_QMV");
-    const bool native_enabled = native_env == nullptr ||
-        std::string_view(native_env) != "0";
     if (bits_ == 8) {
         const Shape row1x32_shape{
             output_size_,
@@ -1437,31 +1497,6 @@ MlxMxWeight::MlxMxWeight(
             throw std::invalid_argument(
                 "unsupported MXFP8 scale block geometry");
         }
-    }
-    if (bits_ == 8 &&
-        (native_enabled || mxfp8_scale_column_block_size_ == 32)) {
-        // MLX's native MXFP8 kernels use one E8M0 scale per output row and
-        // 32 input columns. Expand any supported source geometry to that
-        // common sidecar layout while keeping the FP8 payload zero-copy.
-        auto expanded = scales_;
-        if (mxfp8_scale_column_block_size_ > 32) {
-            expanded = mlx::core::repeat(
-                expanded,
-                mxfp8_scale_column_block_size_ / 32,
-                1);
-        }
-        expanded = mlx::core::repeat(
-            expanded,
-            mxfp8_scale_row_block_size_,
-            0);
-        if (expanded.shape() != Shape{
-                output_size_, input_size_ / 32}) {
-            expanded = mlx::core::slice(
-                expanded,
-                Shape{0, 0},
-                Shape{output_size_, input_size_ / 32});
-        }
-        expanded_mxfp8_scales_ = mlx::core::contiguous(std::move(expanded));
     }
 }
 
@@ -1654,13 +1689,13 @@ array MlxMxWeight::dequantize(Dtype dtype) const {
     if (dtype != mlx::core::float16 && dtype != mlx::core::float32) {
         throw std::runtime_error("MX dequantization requires float16 or float32");
     }
-    if (bits_ == 8 && mxfp8_scale_column_block_size_ == 32) {
+    if (bits_ == 8 && mxfp8_scale_row_block_size_ == 1) {
         auto packed = mlx::core::reshape(
             mlx::core::view(values_, mlx::core::uint32),
             Shape{output_size_, input_size_ / 4});
         return mlx::core::dequantize(
             packed,
-            *expanded_mxfp8_scales_,
+            scales_,
             std::nullopt,
             32,
             8,
@@ -1713,16 +1748,14 @@ array MlxMxWeight::matmul(const array& input) const {
         source,
         Shape{static_cast<int>(rows), input_size_});
     if (bits_ == 8 &&
-        expanded_mxfp8_scales_.has_value() &&
-        (mxfp8_scale_column_block_size_ == 32 ||
-         (rows == 1 && source.dtype() == mlx::core::float16))) {
+        mxfp8_scale_row_block_size_ == 1) {
         auto packed = mlx::core::reshape(
             mlx::core::view(values_, mlx::core::uint32),
             Shape{output_size_, input_size_ / 4});
         auto result = mlx::core::quantized_matmul(
             std::move(source),
             std::move(packed),
-            *expanded_mxfp8_scales_,
+            scales_,
             std::nullopt,
             true,
             32,
@@ -1733,24 +1766,24 @@ array MlxMxWeight::matmul(const array& input) const {
     const auto* mxfp8_small_m_layout =
         std::getenv("MFQ_METAL_MXFP8_SMALL_M_LAYOUT");
     const bool exact_mxfp8_small_m =
-        rows >= 2 && rows <= 6 && bits_ == 8 &&
-        source.dtype() == mlx::core::float16 &&
-        expanded_mxfp8_scales_.has_value() &&
-        input_size_ % 512 == 0 && output_size_ >= 8 &&
-        output_size_ % 8 == 0 &&
+        rows >= 1 && rows <= 6 && bits_ == 8 &&
+        input_size_ % 256 == 0 &&
         (mxfp8_small_m_layout == nullptr ||
          std::strcmp(mxfp8_small_m_layout, "legacy") != 0);
     if (exact_mxfp8_small_m) {
+        const auto dtype = source.dtype();
         auto outputs = mxfp8_small_m_exact_kernel()(
-            {values_, *expanded_mxfp8_scales_, std::move(source)},
+            {values_, scales_, std::move(source)},
             {Shape{static_cast<int>(rows), output_size_}},
-            {mlx::core::float16},
-            {32, output_size_ / 4, 1},
+            {dtype},
+            {32, ((output_size_ + 7) / 8) * 2, 1},
             {32, 2, 1},
             {
                 {"M", static_cast<int>(rows)},
                 {"K", input_size_},
                 {"N", output_size_},
+                {"SCALE_ROWS", mxfp8_scale_row_block_size_},
+                {"SCALE_COLUMNS", mxfp8_scale_column_block_size_},
             },
             std::nullopt,
             false,
@@ -1778,7 +1811,8 @@ array MlxMxWeight::matmul(const array& input) const {
     const int small_m_outputs_per_threadgroup =
         small_m_simd_groups * 32 / small_m_k_lanes;
     const bool mxfp8_gemv =
-        gemv && bits_ == 8 && source.dtype() == mlx::core::float16;
+        gemv && bits_ == 8 && source.dtype() == mlx::core::float16
+        && mxfp8_scale_column_block_size_ == 128;
     const int tile_rows = rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles = (rows + static_cast<std::size_t>(tile_rows) - 1) /
         static_cast<std::size_t>(tile_rows);
@@ -1865,10 +1899,9 @@ std::vector<array> MlxMxWeight::projection_group_matmul(
     int total_tiles = 0;
     for (const auto& weight : weights) {
         if (weight.bits_ != 8 || weight.input_size_ != input_size ||
-            weight.mxfp8_scale_column_block_size_ != 32 ||
-            !weight.expanded_mxfp8_scales_.has_value()) {
+            weight.mxfp8_scale_column_block_size_ != 32) {
             throw std::invalid_argument(
-                "MXFP8 projection group requires native column-32 sidecars");
+                "MXFP8 projection group requires native column-32 scales");
         }
         total_output = checked_dimension(
             static_cast<std::uint64_t>(total_output) +
@@ -1906,7 +1939,8 @@ std::vector<array> MlxMxWeight::projection_group_matmul(
         const auto& weight = weights[projection];
         const auto name = "P" + std::to_string(projection) + "_";
         inputs.push_back(weight.values_);
-        inputs.push_back(*weight.expanded_mxfp8_scales_);
+        inputs.push_back(weight.scales_);
+        arguments.emplace_back(name + "SCALE_ROWS", weight.mxfp8_scale_row_block_size_);
         arguments.emplace_back(name + "OUT", weight.output_size_);
         arguments.emplace_back(name + "OFFSET", output_offset);
         arguments.emplace_back(name + "TILE_BEGIN", tile_offset);
@@ -1980,7 +2014,7 @@ array MlxMxWeight::grouped_row_matmul(
     for (std::size_t axis = 0; axis + 2 < source.ndim(); ++axis) {
         rows *= static_cast<std::size_t>(source.shape(axis));
     }
-    if (mxfp8_scale_column_block_size_ == 32) {
+    if (mxfp8_scale_row_block_size_ == 1) {
         const auto* grouped_layout = std::getenv(
             "MFQ_METAL_MXFP8_GROUPED_PREFILL_LAYOUT");
         if (grouped_layout != nullptr &&
@@ -2004,7 +2038,7 @@ array MlxMxWeight::grouped_row_matmul(
                             input_size_ / 4,
                         }),
                     mlx::core::slice(
-                        *expanded_mxfp8_scales_,
+                        scales_,
                         Shape{group * output_per_group, 0},
                         Shape{
                             (group + 1) * output_per_group,
@@ -2022,7 +2056,7 @@ array MlxMxWeight::grouped_row_matmul(
         }
 
         // Present every logical output group to MLX as one batched native
-        // MXFP8 QMM. This keeps the packed payload and expanded scale view
+        // MXFP8 QMM. This keeps the packed payload and native scale view
         // zero-copy while replacing N separate launches plus a stack node.
         auto packed = mlx::core::reshape(
             mlx::core::view(values_, mlx::core::uint32),
@@ -2032,7 +2066,7 @@ array MlxMxWeight::grouped_row_matmul(
                 input_size_ / 4,
             });
         auto scales = mlx::core::reshape(
-            *expanded_mxfp8_scales_,
+            scales_,
             Shape{
                 group_count,
                 output_per_group,
@@ -2072,13 +2106,12 @@ array MlxMxWeight::grouped_row_matmul(
     const auto* layout = std::getenv(
         "MFQ_METAL_MXFP8_GROUPED_SMALL_M_LAYOUT");
     const bool use_exact_small_m =
-        rows >= 2 && rows <= 6 &&
-        source.dtype() == mlx::core::float16 &&
-        expanded_mxfp8_scales_.has_value() &&
+        rows >= 1 && rows <= 6 &&
         input_size_ % 256 == 0 &&
-        output_per_group % 8 == 0 &&
+        output_per_group % 4 == 0 &&
         (layout == nullptr || std::strcmp(layout, "dequant") != 0);
-    if (use_exact_small_m) {
+    const bool use_quad = rows < 32 && (input_size_ == 64 || input_size_ == 128);
+    if (use_exact_small_m || use_quad) {
         // Convert [prefix...,group,K] to the grouped [group,M,K] layout used
         // by the shared-weight verifier kernel.
         auto grouped_source = mlx::core::reshape(
@@ -2092,28 +2125,32 @@ array MlxMxWeight::grouped_row_matmul(
             mlx::core::transpose(
                 std::move(grouped_source),
                 {1, 0, 2}));
-        const auto grid_y = static_cast<std::size_t>(group_count)
-            * static_cast<std::size_t>(output_per_group / 4);
+        const auto grid_y = use_quad ? static_cast<std::size_t>((output_per_group + 63) / 64)
+            : static_cast<std::size_t>(group_count)
+                * static_cast<std::size_t>(((output_per_group + 7) / 8) * 2);
         if (grid_y > static_cast<std::size_t>(
                 std::numeric_limits<int>::max())) {
             throw std::runtime_error(
                 "MXFP8 grouped small-M grid exceeds MLX limits");
         }
-        auto grouped_output = mxfp8_grouped_small_m_kernel()(
-            {values_, *expanded_mxfp8_scales_, std::move(grouped_source)},
+        auto arguments = std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>{
+            {"K", input_size_}, {"N", output_per_group},
+            {"SCALE_ROWS", mxfp8_scale_row_block_size_},
+            {"SCALE_COLUMNS", mxfp8_scale_column_block_size_},
+        };
+        if (!use_quad) arguments.emplace_back("M", static_cast<int>(rows));
+        const auto& kernel = use_quad ? mxfp8_grouped_quad_kernel() : mxfp8_grouped_small_m_kernel();
+        auto grouped_output = kernel(
+            {values_, scales_, std::move(grouped_source)},
             {Shape{
                 group_count,
                 static_cast<int>(rows),
                 output_per_group,
             }},
-            {mlx::core::float16},
-            {32, static_cast<int>(grid_y), 1},
-            {32, 2, 1},
-            {
-                {"M", static_cast<int>(rows)},
-                {"K", input_size_},
-                {"N", output_per_group},
-            },
+            {source.dtype()},
+            {use_quad ? static_cast<int>(rows) * 32 : 32, static_cast<int>(grid_y), use_quad ? group_count : 1},
+            {32, use_quad ? 1 : 2, 1},
+            std::move(arguments),
             std::nullopt,
             false,
             {}).front();
@@ -2129,26 +2166,18 @@ array MlxMxWeight::grouped_row_matmul(
             std::move(row_major),
             std::move(output_shape));
     }
-    auto dense = dequantize(source.dtype());
-    std::vector<array> pieces;
-    pieces.reserve(static_cast<std::size_t>(group_count));
-    for (int group = 0; group < group_count; ++group) {
-        auto group_input = mlx::core::take(
-            source,
-            group,
-            source.ndim() - 2);
-        auto group_weight = mlx::core::slice(
-            dense,
-            Shape{group * output_per_group, 0},
-            Shape{(group + 1) * output_per_group, input_size_});
-        pieces.push_back(
-            mlx::core::matmul(
-                std::move(group_input),
-                mlx::core::transpose(group_weight)));
-    }
-    return mlx::core::stack(
-        pieces,
-        input.ndim() - 2);
+    auto grouped_source = mlx::core::transpose(
+        mlx::core::reshape(source, Shape{
+            checked_dimension(rows, "grouped MXFP8 row count"), group_count, input_size_}),
+        {1, 0, 2});
+    auto grouped_weight = mlx::core::reshape(dequantize(source.dtype()),
+        Shape{group_count, output_per_group, input_size_});
+    auto result = mlx::core::matmul(std::move(grouped_source),
+        mlx::core::transpose(grouped_weight, {0, 2, 1}));
+    Shape output_shape(input.shape().begin(), input.shape().end() - 2);
+    output_shape.push_back(group_count);
+    output_shape.push_back(output_per_group);
+    return mlx::core::reshape(mlx::core::transpose(result, {1, 0, 2}), std::move(output_shape));
 }
 
 array MlxMxWeight::grouped_row_matmul_inverse_rope(
@@ -2215,7 +2244,6 @@ array MlxMxWeight::grouped_row_matmul_inverse_rope(
             Shape{static_cast<int>(rows) * rotary_dimension / 2}));
     if (mxfp8_scale_column_block_size_ == 32) {
         if (rows != 1 || input.dtype() != mlx::core::float32 ||
-            !expanded_mxfp8_scales_.has_value() ||
             input_size_ % 512 != 0 ||
             out_per_group % 8 != 0 ||
             head_dimension % 8 != 0 ||
@@ -2238,7 +2266,7 @@ array MlxMxWeight::grouped_row_matmul_inverse_rope(
         auto outputs = mxfp8_block32_grouped_inverse_rope_kernel()(
             {
                 values_,
-                *expanded_mxfp8_scales_,
+                scales_,
                 std::move(source),
                 cos_values,
                 sin_values,
@@ -2252,6 +2280,7 @@ array MlxMxWeight::grouped_row_matmul_inverse_rope(
                 {"OUT_PER_GROUP", out_per_group},
                 {"OUT", output_size_},
                 {"K", input_size_},
+                {"SCALE_ROWS", mxfp8_scale_row_block_size_},
                 {"HEAD_DIM", head_dimension},
                 {"ROTARY", rotary_dimension},
             },

@@ -3,6 +3,8 @@
 #include "nint.h"
 #include "cuda_execution.h"
 #include "format.h"
+#include "packed_nint.h"
+#include "cpu_projection_rows.h"
 
 #include <cstring>
 #include <limits>
@@ -33,8 +35,8 @@ mfq_tensor_backend::Tensor nint_row_embedding_lookup(
         "NINT row lookup batch exceeds bounds");
     auto host = ids.contiguous().cpu();
     mfq::NintRowBatch selected;
-    for (int64_t i = 0; i < host.numel(); ++i)
-        table.append_row(host.data_ptr<int64_t>()[i], selected);
+    table.append_rows(host.data_ptr<int64_t>(), static_cast<std::size_t>(host.numel()),
+        selected, mfq_get_num_threads());
     selected.validate();
     auto packed = cpu_u8_tensor(selected.packed(), {static_cast<int64_t>(selected.packed_nbytes())}).to(ids.device());
     std::vector<int32_t> words(selected.descriptors().size());
@@ -238,11 +240,79 @@ float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
     std::memcpy(&value, &raw, sizeof(raw));
     return static_cast<float>(value);
 }
+CpuProjectionRows make_cpu_projection_rows(const NintWeight& w) {
+    MFQ_RUNTIME_CHECK(!w.q8_zero && w.q_packed.is_cpu(),"original-FP32 rows require CPU NINTv2 storage");
+    CpuProjectionRows p;
+    p.width=static_cast<int>(w.neuron_len); p.outputs=static_cast<int>(w.out);
+    p.nint={w.q_packed.data_ptr<uint8_t>(),static_cast<size_t>(w.q_packed.numel()),
+        w.row_q_bits.data_ptr<uint8_t>(),w.row_q_bit_offsets.data_ptr<int64_t>(),
+        w.sub_scale.data_ptr<uint8_t>(),w.sub_min.data_ptr<uint8_t>(),
+        w.neuron_scale.data_ptr<float>(),w.neuron_min.data_ptr<float>(),w.out,w.neuron_len,w.gs};
+    p.nint_rows=mfq::cpu::packed_nint_rows_kernel();
+    return p;
+}
+mfq_tensor_backend::Tensor nint_sharded_embedding_lookup(
+    const std::vector<std::shared_ptr<mfq::NintRows>>& tables,const std::vector<int64_t>& ids,
+    const std::vector<int64_t>& shape,const mfq_tensor_backend::Device& device) {
+    namespace tb=mfq_tensor_backend;
+    if(tables.empty() || !device.is_cuda())throw std::invalid_argument("sharded NINT embeddings require CUDA tables");
+    const MfqCudaGuard guard(device);const int64_t rows=tables.front()->rows();const int width=tables.front()->width();
+    int64_t count=1;for(auto n:shape){if(n<0 || (n && count>std::numeric_limits<int64_t>::max()/n))throw std::overflow_error("embedding shape overflow");count*=n;}
+    if(count!=static_cast<int64_t>(ids.size()))throw std::invalid_argument("sharded embedding ID shape mismatch");
+    std::vector<std::vector<int64_t>> selected(tables.size()),positions(tables.size());
+    for(std::size_t i=0;i<ids.size();++i) {
+        const auto id=ids[i];
+        if(id<0 || id/rows>=static_cast<int64_t>(tables.size()))throw std::out_of_range("sharded embedding row ID");
+        selected[id/rows].push_back(id%rows);positions[id/rows].push_back(static_cast<int64_t>(i));
+    }
+    std::vector<mfq::NintRowBatch> pieces(tables.size());
+    mfq::host_parallel_for(0,static_cast<int64_t>(tables.size()),1,mfq_get_num_threads(),[&](int64_t first,int64_t last) {
+        for(auto s=first;s<last;++s) {
+            if(tables[s]->rows()!=rows || tables[s]->width()!=width)throw std::invalid_argument("NINT shard geometry mismatch");
+            if(!selected[s].empty())tables[s]->append_rows(selected[s].data(),selected[s].size(),pieces[s],1);
+        }
+    });
+    mfq::NintRowBatch batch;std::vector<int64_t> inverse(ids.size());int64_t at=0;
+    for(std::size_t s=0;s<tables.size();++s) {
+        batch.append_batch(pieces[s]);for(auto p:positions[s])inverse[p]=at++;
+    }
+    auto out_shape=shape;out_shape.push_back(width);
+    if(ids.empty())return tb::empty(out_shape,tb::TensorOptions().device(device).dtype(tb::kFloat16));
+    batch.validate();
+    auto packed=cpu_u8_tensor(batch.packed(),{static_cast<int64_t>(batch.packed_nbytes())}).to(device);
+    std::vector<int32_t> words(batch.descriptors().size());std::memcpy(words.data(),batch.descriptors().data(),words.size()*sizeof(uint32_t));
+    auto descriptors=cpu_i32_tensor(words,{static_cast<int64_t>(batch.rows()),6}).to(device);
+    return nint_selected_rows_cuda(packed,descriptors,width).index_select(0,tb::tensor(inverse).to(device)).reshape(out_shape);
+}
 static mfq_tensor_backend::Tensor nint_matmul_cpu(
         const NintWeight & w,
         mfq_tensor_backend::Tensor x) {
     MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
     MFQ_RUNTIME_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    if (!w.q8_zero) {
+        MFQ_RUNTIME_CHECK(!w.row_q_bits.is_cuda() && !w.row_q_bit_offsets.is_cuda() &&
+            !w.sub_scale.is_cuda() && !w.sub_min.is_cuda() &&
+            !w.neuron_scale.is_cuda() && !w.neuron_min.is_cuda(),
+            "CPU NINT GEMV requires CPU-resident metadata");
+        x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat32), w.neuron_len).contiguous();
+        auto result = mfq_tensor_backend::empty({x.size(0), w.out},
+            x.options().dtype(mfq_tensor_backend::kFloat32));
+        mfq::cpu::PackedNintView view;
+        view.packed = w.q_packed.data_ptr<uint8_t>();
+        view.packed_bytes = static_cast<size_t>(w.q_packed.numel());
+        view.row_bits = w.row_q_bits.data_ptr<uint8_t>();
+        view.row_bit_offsets = w.row_q_bit_offsets.data_ptr<int64_t>();
+        view.group_scale = w.sub_scale.data_ptr<uint8_t>();
+        view.group_min = w.sub_min.data_ptr<uint8_t>();
+        view.row_scale = w.neuron_scale.data_ptr<float>();
+        view.row_min = w.neuron_min.data_ptr<float>();
+        view.outputs = w.out;
+        view.width = w.neuron_len;
+        view.group_size = w.gs;
+        mfq::cpu::packed_nint_matmul(view, x.data_ptr<float>(), x.size(0),
+            w.neuron_len, result.data_ptr<float>(), w.out, mfq_get_num_threads());
+        return result.to(mfq_tensor_backend::kFloat16);
+    }
     auto activation = cpu_quantize_activation(
         std::move(x), w.neuron_len, w.gs, true);
     const int64_t rows = activation.rows;
@@ -337,7 +407,10 @@ mfq_tensor_backend::Tensor nint_matmul(
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
-    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    x = x.contiguous();
+    if (x.size(0) > 8 || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
+            x.scalar_type() != mfq_tensor_backend::kFloat32))
+        x = x.to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (!w.q8_zero) {
@@ -477,8 +550,15 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
             : x * mfq_tensor_backend::silu(gate);
         return nint_matmul_cpu(w, value);
     }
-    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
-    gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
+    x = x.contiguous();
+    gate = gate.contiguous();
+    const bool fused_input = !w.q8_zero && x.size(0) <= 8;
+    if (!fused_input || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
+            x.scalar_type() != mfq_tensor_backend::kFloat32))
+        x = x.to(mfq_tensor_backend::kFloat16);
+    if (!fused_input || (gate.scalar_type() != mfq_tensor_backend::kFloat16 &&
+            gate.scalar_type() != mfq_tensor_backend::kFloat32))
+        gate = gate.to(mfq_tensor_backend::kFloat16);
     MFQ_RUNTIME_CHECK(
         x.sizes() == gate.sizes(),
         "NINT x and gate shapes must match");

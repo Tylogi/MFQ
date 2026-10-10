@@ -37,6 +37,19 @@ public:
     void clear_inflight(int slot);
     bool discard(const MoeCacheKey& key, int slot, uint64_t generation);
     bool inflight(int slot) const;
+    bool replace(int slot, const MoeCacheKey& expected, const MoeCacheKey& replacement);
+    struct Replacement {
+        int slot = -1;
+        MoeCacheKey expected{}, replacement{};
+        uint64_t generation = 0;
+        bool committed = false;
+        std::unordered_map<MoeCacheKey, int, MoeCacheKeyHash>::node_type incoming, original;
+    };
+    Replacement prepare_replace(
+        int slot, const MoeCacheKey& expected, const MoeCacheKey& replacement);
+    bool replacement_valid(const Replacement& change) const;
+    bool commit_replace(Replacement& change);
+    void rollback_replace(Replacement& change);
 private:
     struct Slot {
         std::optional<MoeCacheKey> key;

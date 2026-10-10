@@ -139,11 +139,13 @@ __global__ void nint_embedding_kernel(
 __global__ void nint_selected_rows_kernel(
         const uint8_t* __restrict__ packed,
         const uint32_t* __restrict__ descriptors,
+        const int64_t* __restrict__ inverse,
         __half* __restrict__ output, size_t total, int width) {
     for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          index < total; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int column = static_cast<int>(index % width);
-        const uint32_t* row = descriptors + (index / width) * 6;
+        const auto selected = inverse ? inverse[index / width] : index / width;
+        const uint32_t* row = descriptors + selected * 6;
         const uint32_t layout = row[3];
         const int qbits = layout & 15u, kbits = (layout >> 4u) & 15u;
         const int group = column / row[4];
@@ -289,10 +291,38 @@ mfq_tensor_backend::Tensor nint_selected_rows_cuda(
     nint_selected_rows_kernel<<<launch_blocks(total), 256, 0, mfq_current_cuda_stream()>>>(
         packed.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(descriptors.data_ptr<int32_t>()),
+        nullptr,
         reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
         total, static_cast<int>(width));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+void nint_selected_rows_into_cuda(
+        mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor descriptors,
+        mfq_tensor_backend::Tensor inverse, mfq_tensor_backend::Tensor output) {
+    MFQ_RUNTIME_CHECK(packed.is_cuda() && packed.is_contiguous() &&
+        packed.scalar_type() == mfq_tensor_backend::kUInt8 && packed.dim() == 1 && packed.numel() > 0,
+        "NINT selected payload must be nonempty CUDA uint8 rank-1");
+    MFQ_RUNTIME_CHECK(descriptors.is_cuda() && descriptors.is_contiguous() &&
+        descriptors.scalar_type() == mfq_tensor_backend::kInt32 && descriptors.dim() == 2 &&
+        descriptors.size(1) == 6 && descriptors.device() == packed.device(),
+        "NINT selected descriptors must be CUDA int32 [rows,6]");
+    MFQ_RUNTIME_CHECK(inverse.is_cuda() && inverse.is_contiguous() &&
+        inverse.scalar_type() == mfq_tensor_backend::kInt64 && inverse.dim() == 1 &&
+        inverse.device() == packed.device() && output.device() == packed.device() &&
+        output.is_contiguous() && output.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        output.dim() == 2 && output.size(0) == inverse.numel() && output.size(1) > 0 &&
+        output.size(1) <= std::numeric_limits<int>::max() &&
+        output.numel() <= std::numeric_limits<uint32_t>::max(),
+        "NINT selected inverse/output geometry differs");
+    if (!output.numel()) return;
+    const MfqCudaGuard guard(packed.device());
+    nint_selected_rows_kernel<<<launch_blocks(output.numel()), 256, 0, mfq_current_cuda_stream()>>>(
+        packed.data_ptr<uint8_t>(), reinterpret_cast<const uint32_t*>(descriptors.data_ptr<int32_t>()),
+        inverse.data_ptr<int64_t>(), reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+        output.numel(), static_cast<int>(output.size(1)));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 mfq_tensor_backend::Tensor nint_embedding_cuda(

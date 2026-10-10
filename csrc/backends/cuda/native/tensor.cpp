@@ -31,8 +31,10 @@ std::shared_ptr<TensorStorage> allocate_cpu_storage(std::size_t bytes, bool pinn
     }
     const auto allocation_bytes = std::max<std::size_t>(bytes, 1);
     void* pointer = ::operator new(allocation_bytes, std::align_val_t{64});
-    auto owner = std::shared_ptr<void>(pointer, [](void* value) {
+    charge_tensor_host_bytes(allocation_bytes);
+    auto owner = std::shared_ptr<void>(pointer, [allocation_bytes](void* value) {
         ::operator delete(value, std::align_val_t{64});
+        tensor_host_bytes.fetch_sub(allocation_bytes);
     });
     auto storage = std::make_shared<TensorStorage>();
     storage->owner = std::move(owner);

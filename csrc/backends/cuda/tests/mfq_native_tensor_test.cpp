@@ -9,6 +9,17 @@
 int main() {
     using namespace mfq::cuda;
 
+    const auto before=tensor_host_bytes.load();
+    Tensor retained_view;
+    {
+        auto storage=empty({16},TensorOptions{}.dtype(kFloat32));
+        retained_view=storage.narrow(0,3,4);
+        assert(tensor_host_bytes.load()==before+16*sizeof(float));
+    }
+    assert(tensor_host_bytes.load()==before+16*sizeof(float));
+    retained_view={};
+    assert(tensor_host_bytes.load()==before);
+
     auto values = zeros({2, 3, 4}, TensorOptions{}.dtype(kFloat32));
     assert(values.defined());
     assert(values.is_cpu());

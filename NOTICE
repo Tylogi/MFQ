@@ -85,5 +85,13 @@ Copyright (c) 2025 DeepSeek
 License: MIT (`LICENSES/DeepSelect-MIT.txt`)
 Source: https://github.com/deepseek-ai/DeepSelect
 
+MLX
+---
+MFQ's native-scale MXFP8 small-inner-dimension grouped projection schedule
+is adapted from MLX's fp_qmv_quad_impl, retaining the original scale layout.
+Copyright © 2023-2025 Apple Inc.
+License: MIT (`LICENSES/MLX-MIT.txt`)
+Source: https://github.com/ml-explore/mlx
+
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.

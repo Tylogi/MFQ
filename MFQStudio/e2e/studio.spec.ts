@@ -15,7 +15,7 @@ for (const language of ['zh', 'en'] as const) {
     const tools = sidebar.locator('nav > section').filter({ has: page.getByText(language === 'zh' ? '工具' : 'Tools', { exact: true }) });
     await expect(tools.locator('button')).toHaveText(language === 'zh'
       ? ['分析', '下载', '测评', '量化'] : ['Analysis', 'Downloads', 'Evaluations', 'Quantization']);
-    expect((await sidebar.boundingBox())!.width).toBe(200);
+    expect((await sidebar.boundingBox())!.width).toBeCloseTo(200, 3);
     for (const button of await tools.locator('button').all()) {
       expect(await button.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
     }

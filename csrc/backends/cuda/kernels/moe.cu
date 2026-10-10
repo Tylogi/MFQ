@@ -310,6 +310,152 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void __launch_bounds__(128) moe_topk_cached_kernel(
+        const scalar_t * __restrict__ logits,
+        const float * __restrict__ bias,
+        int32_t * __restrict__ ids,
+        float * __restrict__ weights,
+        int rows,
+        int experts,
+        int top_k,
+        bool use_sigmoid,
+        bool use_sqrt_softplus,
+        bool normalize,
+        bool delayed_softmax,
+        float norm_floor,
+        float scale) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
+    float softmax_max = -INFINITY;
+    if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
+        for (int expert = lane; expert < experts; expert += kWarpSize) {
+            float value = load_float(row_logits, expert);
+            value = isnan(value) ? -FLT_MAX : value;
+            softmax_max = fmaxf(softmax_max, value);
+        }
+        softmax_max = warp_max(softmax_max);
+    }
+
+    float softmax_sum = 1.0f;
+    if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
+        softmax_sum = 0.0f;
+        for (int expert = lane; expert < experts; expert += kWarpSize) {
+            float value = load_float(row_logits, expert);
+            value = isnan(value) ? -FLT_MAX : value;
+            softmax_sum += expf(value - softmax_max);
+        }
+        softmax_sum = warp_sum(softmax_sum);
+    }
+
+    // Every lane owns at most sixteen experts. Constant slot indexes keep
+    // their original activated weights in registers; the mask removes chosen
+    // experts without a dynamically indexed selected-ID array.
+    float cached_weights[16];
+    unsigned int selected_mask = 0;
+#pragma unroll
+    for (int slot = 0; slot < 16; ++slot) {
+        const int expert = lane + slot * kWarpSize;
+        float weight = 0.0f;
+        if (expert < experts) {
+            float raw = load_float(row_logits, expert);
+            raw = isnan(raw) ? -FLT_MAX : raw;
+            if (delayed_softmax) {
+                weight = raw;
+            } else if (use_sigmoid) {
+                weight = 1.0f / (1.0f + expf(-raw));
+            } else if (use_sqrt_softplus) {
+                weight = moe_sqrt_softplus(raw);
+            } else {
+                weight = expf(raw - softmax_max) / softmax_sum;
+            }
+        }
+        cached_weights[slot] = weight;
+    }
+
+    for (int rank = 0; rank < top_k; ++rank) {
+        float best_score = -INFINITY;
+        float best_weight = -INFINITY;
+        int best_expert = INT_MAX;
+
+#pragma unroll
+        for (int slot = 0; slot < 16; ++slot) {
+            const int expert = lane + slot * kWarpSize;
+            if (expert >= experts || (selected_mask & (1u << slot))) {
+                continue;
+            }
+            const float weight = cached_weights[slot];
+            const float score = weight + (bias == nullptr ? 0.0f : bias[expert]);
+            if (score > best_score || (score == best_score && expert < best_expert)) {
+                best_score = score;
+                best_weight = weight;
+                best_expert = expert;
+            }
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_score = __shfl_down_sync(0xffffffffu, best_score, offset);
+            const float other_weight = __shfl_down_sync(0xffffffffu, best_weight, offset);
+            const int other_expert = __shfl_down_sync(0xffffffffu, best_expert, offset);
+            if (other_score > best_score ||
+                    (other_score == best_score && other_expert < best_expert)) {
+                best_score = other_score;
+                best_weight = other_weight;
+                best_expert = other_expert;
+            }
+        }
+        best_weight = __shfl_sync(0xffffffffu, best_weight, 0);
+        best_expert = __shfl_sync(0xffffffffu, best_expert, 0);
+        if (best_expert >= 0 && best_expert < experts && (best_expert & 31) == lane) {
+            selected_mask |= 1u << (best_expert >> 5);
+        }
+        if (lane == 0) {
+            ids[static_cast<size_t>(row) * top_k + rank] = best_expert;
+            weights[static_cast<size_t>(row) * top_k + rank] = best_weight;
+        }
+    }
+
+    __syncwarp();
+    float value = lane < top_k
+        ? weights[static_cast<size_t>(row) * top_k + lane]
+        : 0.0f;
+    if (delayed_softmax) {
+        float selected_max = lane < top_k ? value : -INFINITY;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            selected_max = fmaxf(
+                selected_max,
+                __shfl_down_sync(0xffffffffu, selected_max, offset));
+        }
+        selected_max = __shfl_sync(0xffffffffu, selected_max, 0);
+        if (lane < top_k) {
+            value = expf(value - selected_max);
+        } else {
+            value = 0.0f;
+        }
+        const float denom = warp_sum(value);
+        if (lane < top_k) {
+            value /= denom;
+        }
+    } else if (normalize) {
+        float denom = warp_sum(value);
+        denom = fmaxf(denom, norm_floor);
+        if (lane < top_k) {
+            value /= denom;
+        }
+    }
+    if (lane < top_k) {
+        weights[static_cast<size_t>(row) * top_k + lane] = value * scale;
+    }
+}
+
+
 __device__ __forceinline__ bool moe_score_before(
         float lhs_score, int lhs_expert, float rhs_score, int rhs_expert) {
     return lhs_score > rhs_score ||
@@ -627,16 +773,14 @@ __global__ void scatter_routes_kernel(
     }
 }
 
-__global__ void __launch_bounds__(64) quantize_moe_input_kernel(
+__device__ __forceinline__ void quantize_moe_input_group(
         const __half * __restrict__ x,
         int8_t * __restrict__ qx,
         float * __restrict__ xscale,
         int rows,
         int k_real,
         int k_pad,
-        int gs) {
-    const int row = blockIdx.x;
-    const int group = blockIdx.y;
+        int gs,int row,int group,int groups) {
     const int tid = threadIdx.x;
     const int base = group * gs;
     const bool real = tid < gs && base + tid < k_real;
@@ -665,7 +809,7 @@ __global__ void __launch_bounds__(64) quantize_moe_input_kernel(
     __shared__ float group_scale;
     if (tid == 0) {
         group_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
-        xscale[static_cast<size_t>(row) * gridDim.y + group] = group_scale;
+        xscale[static_cast<size_t>(row) * groups + group] = group_scale;
     }
     __syncthreads();
     if (tid < gs) {
@@ -676,6 +820,21 @@ __global__ void __launch_bounds__(64) quantize_moe_input_kernel(
         }
         qx[static_cast<size_t>(row) * k_pad + base + tid] = static_cast<int8_t>(quant);
     }
+}
+
+__global__ void __launch_bounds__(64) quantize_moe_input_kernel(const __half* x,
+        int8_t* qx,float* xscale,int rows,int k_real,int k_pad,int gs) {
+    quantize_moe_input_group(x,qx,xscale,rows,k_real,k_pad,gs,blockIdx.x,blockIdx.y,gridDim.y);
+}
+
+__global__ void __launch_bounds__(64) quantize_shared_moe_input_kernel(const __half* x,
+        const int64_t* descriptors,int rows,int width) {
+    const int64_t* item=descriptors;
+    int group=blockIdx.x;
+    while(group>=item[2]) {group-=int(item[2]);item+=4;}
+    const int groups=int(item[2]),gs=int(item[3]);
+    quantize_moe_input_group(x,reinterpret_cast<int8_t*>(item[0]),reinterpret_cast<float*>(item[1]),
+        rows,width,groups*gs,gs,blockIdx.y,group,groups);
 }
 
 __device__ __forceinline__ int load_i8x4(const int8_t * values) {
@@ -1237,6 +1396,25 @@ __global__ void moe_glu_split_kernel(
     output[index] = __float2half_rn(mfq_glu<GELU>(gate, up));
 }
 
+__global__ void moe_sigmoid_table_kernel(__half* output) {
+    const unsigned bits=blockIdx.x*blockDim.x+threadIdx.x;
+    if(bits>=65536)return;
+    const float value=__half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
+    output[bits]=__float2half_rn(1.0f/(1.0f+::expf(-value)));
+    output[65536+bits]=__float2half_rn(static_cast<float>(1.0/(1.0+::exp(-static_cast<double>(value)))));
+}
+
+__global__ void moe_swiglu_rounded_kernel(const __half* gate,const __half* up,
+        const __half* sigmoid_table,__half* output,int64_t count) {
+    const int64_t index=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(index>=count)return;
+    const __half raw_gate=gate[index];
+    const float value=__half2float(raw_gate);
+    const __half rounded_sigmoid=sigmoid_table[__half_as_ushort(raw_gate)];
+    const __half activated=__float2half_rn(value*__half2float(rounded_sigmoid));
+    output[index]=__float2half_rn(__half2float(activated)*__half2float(up[index]));
+}
+
 __global__ void moe_add_shared_gate_kernel(
         const __half * __restrict__ routed,
         const __half * __restrict__ shared,
@@ -1705,6 +1883,25 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     }
     const dim3 block(32, 4);
     const int grid = (rows + 3) / 4;
+    // Capacity is a register-cache bound; all routing parameters remain runtime values.
+    const char* cache_flag = std::getenv("MFQ_MOE_TOPK_CACHE");
+    const bool use_cached = experts <= 16 * kWarpSize &&
+        (cache_flag == nullptr || std::atoi(cache_flag) != 0);
+    if (use_cached) {
+    if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+        moe_topk_cached_kernel<mfq_half><<<grid, block, 0, stream>>>(
+            logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            normalize, delayed_softmax,
+            static_cast<float>(norm_floor), static_cast<float>(scale));
+    } else {
+        moe_topk_cached_kernel<float><<<grid, block, 0, stream>>>(
+            logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            normalize, delayed_softmax,
+            static_cast<float>(norm_floor), static_cast<float>(scale));
+    }
+    } else {
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
         moe_topk_kernel<mfq_half><<<grid, block, 0, stream>>>(
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
@@ -1717,6 +1914,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
+    }
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {ids, weights};
@@ -1835,6 +2033,21 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     return result;
 }
 
+void moe_quantize_shared_input_cuda(mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor descriptors,int64_t total_groups) {
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        input.dim()==2 && input.size(0)>0 && input.size(0)<=65535 && input.size(1)>0 && input.size(1)<=INT_MAX &&
+        descriptors.is_cuda() && descriptors.device()==input.device() && descriptors.is_contiguous() &&
+        descriptors.scalar_type()==mfq_tensor_backend::kInt64 && descriptors.dim()==2 &&
+        descriptors.size(0)>0 && descriptors.size(1)==4 && total_groups>0 && total_groups<=INT_MAX,
+        "shared MoE input quantization geometry/device disagree");
+    const MfqCudaGuard guard(input.device());
+    quantize_shared_moe_input_kernel<<<dim3(unsigned(total_groups),unsigned(input.size(0))),64,0,
+        mfq_current_cuda_stream()>>>(reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+        descriptors.data_ptr<int64_t>(),int(input.size(0)),int(input.size(1)));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         mfq_tensor_backend::Tensor q_packed,
         mfq_tensor_backend::Tensor row_q_bits,
@@ -1866,8 +2079,8 @@ mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "n_local_experts must be a positive CUDA slot count");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
@@ -2054,7 +2267,8 @@ mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         use_compact, ids_dst, expert_bounds, tile_bounds, tile_experts, out,
         tokens, routes, experts, output_width, groups, k_pad, source_width,
         static_cast<int>(gs), q_expert_stride, static_cast<int>(route_tile_m),
-        static_cast<int>(pool_phase), local_experts < experts,
+        // A shared arena can contain more slots than this source has IDs.
+        static_cast<int>(pool_phase), local_experts != experts,
         static_cast<int>(epilogue_mode), routed_input, stream);
     return out;
 }
@@ -2085,14 +2299,16 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "n_local_experts must be a positive CUDA slot count");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
     const int experts = static_cast<int>(n_experts);
     const int local_experts = static_cast<int>(n_local_experts);
     const int output_width = static_cast<int>(out_per_expert);
+    MFQ_RUNTIME_CHECK(local_experts <= INT_MAX / output_width,
+        "NINT8-0 MoE row count exceeds the CUDA index range");
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
         q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
@@ -2224,6 +2440,44 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor p
         reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
         weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         tokens, routes, width);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+mfq_tensor_backend::Tensor moe_swiglu_sigmoid_table_cuda() {
+    auto table=mfq_tensor_backend::empty({2,65536},
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
+    moe_sigmoid_table_kernel<<<256,256,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<__half*>(table.data_ptr<mfq_half>()));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return table;
+}
+
+mfq_tensor_backend::Tensor moe_swiglu_rounded_cuda(
+        mfq_tensor_backend::Tensor gate,mfq_tensor_backend::Tensor up,
+        mfq_tensor_backend::Tensor sigmoid_table) {
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && up.is_cuda() && gate.get_device()==up.get_device() &&
+        gate.is_contiguous() && up.is_contiguous() && gate.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        up.scalar_type()==mfq_tensor_backend::kFloat16 && gate.dim()==3 && gate.sizes()==up.sizes(),
+        "rounded SwiGLU requires matching contiguous CUDA float16 [tokens,routes,width] projections");
+    MFQ_RUNTIME_CHECK(gate.size(0)>0 && gate.size(1)>0 && gate.size(2)>0,
+        "rounded SwiGLU dimensions must be positive");
+    MFQ_RUNTIME_CHECK(sigmoid_table.is_cuda() && sigmoid_table.get_device()==gate.get_device() &&
+        sigmoid_table.is_contiguous() && sigmoid_table.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        sigmoid_table.dim()==2 && sigmoid_table.size(0)==2 && sigmoid_table.size(1)==65536,
+        "rounded SwiGLU requires its canonical float/double sigmoid table on the projection device");
+    auto output=mfq_tensor_backend::empty(gate.sizes(),gate.options());
+    const int64_t count=gate.numel();
+    constexpr int threads=256;
+    const unsigned blocks=static_cast<unsigned>((count+threads-1)/threads);
+    const auto stream=mfq_current_cuda_stream();
+    const auto* g=reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>());
+    const auto* u=reinterpret_cast<const __half*>(up.data_ptr<mfq_half>());
+    auto* y=reinterpret_cast<__half*>(output.data_ptr<mfq_half>());
+    // The original concatenated gate view is contiguous only for one row.
+    const auto* table=reinterpret_cast<const __half*>(sigmoid_table.data_ptr<mfq_half>())+
+        (gate.size(0)*gate.size(1)>1?65536:0);
+    moe_swiglu_rounded_kernel<<<blocks,threads,0,stream>>>(g,u,table,y,count);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

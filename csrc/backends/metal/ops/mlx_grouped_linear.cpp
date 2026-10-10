@@ -1,6 +1,6 @@
 #include "mlx_grouped_linear.h"
 #include "mlx_kernel_prepare.h"
-#include "mlx_nvq3jl.h"
+#include "mlx_nvq_decode.h"
 #include "mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
@@ -69,7 +69,9 @@ struct DirectProjectionLayout {
     int tile_begin = 0;
     int tile_end = 0;
     int output_offset = 0;
-    bool nvq3jl_execution = false;
+    bool banked_execution = false;
+    bool nvq1_execution = false;
+    bool jsc_execution = false;
 };
 
 using RetainedProjection = std::variant<
@@ -648,27 +650,17 @@ const mlx::core::fast::CustomKernelFunction& grouped_kernel() {
 }
 
 std::vector<std::string> nint_projection_group_input_names(
-    std::size_t projections,
-    bool swiglu = true) {
+    std::size_t projections) {
     std::vector<std::string> names;
-    names.reserve(projections * 7 + 1);
+    names.reserve(projections * 4 + 2);
     for (std::size_t projection = 0;
          projection < projections;
          ++projection) {
         const auto suffix = std::to_string(projection);
         names.push_back("q_packed_" + suffix);
-        if (swiglu) {
-            names.push_back("row_q_layout_" + suffix);
-            names.push_back("row_q_byte_offsets_" + suffix);
-        } else {
-            names.push_back("row_metadata_" + suffix);
-        }
+        names.push_back("row_metadata_" + suffix);
         names.push_back("sub_scale_" + suffix);
         names.push_back("sub_min_" + suffix);
-        if (swiglu) {
-            names.push_back("neuron_scale_" + suffix);
-            names.push_back("neuron_min_" + suffix);
-        }
     }
     names.emplace_back("x");
     names.emplace_back("params");
@@ -704,7 +696,7 @@ std::string make_nint_projection_group_source(
             + " = output_base < uint(P" + suffix + "_OUT);\n"
             "    uint outputs_" + suffix
             + "[OUTPUTS_PER_SIMD];\n"
-            "    uint metadata_bases_" + suffix
+            "    MfqNintRow metadata_rows_" + suffix
             + "[OUTPUTS_PER_SIMD];\n"
             "    uint q_widths_" + suffix
             + "[OUTPUTS_PER_SIMD];\n"
@@ -725,23 +717,19 @@ std::string make_nint_projection_group_source(
             "            output_base + output_row,\n"
             "            uint(P" + suffix + "_OUT) - 1u);\n"
             "        outputs_" + suffix + "[output_row] = output;\n"
-            "        metadata_bases_" + suffix
-            + "[output_row] = output * uint(NG);\n"
-            "        uint row_layout = uint(row_q_layout_" + suffix
-            + "[output]);\n"
+            "        MfqNintRow row = mfq_nint_row(row_metadata_" + suffix
+            + ", output);\n"
+            "        metadata_rows_" + suffix + "[output_row] = row;\n"
             "        q_widths_" + suffix
-            + "[output_row] = row_layout & 15u;\n"
+            + "[output_row] = row.q_bits;\n"
             "        q_byte_offsets_" + suffix
-            + "[output_row] = row_q_byte_offsets_" + suffix
-            + "[output];\n"
+            + "[output_row] = row.q_offset;\n"
             "        q_bit_shifts_" + suffix
-            + "[output_row] = row_layout >> 4u;\n"
+            + "[output_row] = row.q_shift;\n"
             "        neuron_scales_" + suffix
-            + "[output_row] = neuron_scale_" + suffix
-            + "[output];\n"
+            + "[output_row] = row.scale;\n"
             "        neuron_minimums_" + suffix
-            + "[output_row] = neuron_min_" + suffix
-            + "[output];\n"
+            + "[output_row] = row.minimum;\n"
             "        for (uint local_row = 0u;\n"
             "             local_row < uint(TILE_M);\n"
             "             ++local_row) {\n"
@@ -921,16 +909,15 @@ std::string make_nint_projection_group_source(
             "            for (uint output_row = 0u;\n"
             "                 output_row < OUTPUTS_PER_SIMD;\n"
             "                 ++output_row) {\n"
-            "                uint metadata_index = metadata_bases_"
-            + suffix + "[output_row] + group;\n"
+            "                MfqNintRow row = metadata_rows_" + suffix + "[output_row];\n"
             "                float scale = neuron_scales_" + suffix
             + "[output_row]\n"
-            "                    * float(sub_scale_" + suffix
-            + "[metadata_index]);\n"
+            "                    * float(mfq_nint_sub_value(sub_scale_" + suffix
+            + ", row.sub_offset, row.sub_shift, row.sub_bits, group));\n"
             "                float minimum = neuron_minimums_" + suffix
             + "[output_row]\n"
-            "                    * float(sub_min_" + suffix
-            + "[metadata_index]);\n"
+            "                    * float(mfq_nint_sub_value(sub_min_" + suffix
+            + ", row.sub_offset, row.sub_shift, row.sub_bits, group));\n"
             "                for (uint local_row = 0u;\n"
             "                     local_row < uint(TILE_M);\n"
             "                     ++local_row) {\n"
@@ -1123,19 +1110,18 @@ private:
                 std::to_string(offset) + "\n";
             offset += config_.output_widths[index];
         }
+        source += detail::nint_matmul_metal_header();
         source += kNintProjectionHeader;
         source += "kernel void " + kernel_name_ + "(";
         const auto names = nint_projection_group_input_names(
             config_.output_widths.size());
         for (std::size_t index = 0; index + 2 < names.size(); ++index) {
-            const auto field = index % 7;
-            const auto field_type = field == 2
-                ? "uint" : (field >= 5 ? "float" : "uchar");
+            const auto field_type = index % 4 == 1 ? "uint" : "uchar";
             source += "device const " + std::string(field_type) + "* " +
                 names[index] + " [[buffer(" + std::to_string(index) + ")]], ";
         }
         const int input_index =
-            static_cast<int>(config_.output_widths.size()) * 7;
+            static_cast<int>(config_.output_widths.size()) * 4;
         source +=
             "device const T* x [[buffer(" + std::to_string(input_index) + ")]], "
             "constant float* params [[buffer(" +
@@ -1169,7 +1155,7 @@ private:
         source += detail::nint_matmul_metal_header();
         source += "kernel void " + kernel_name_ + "(";
         const auto names = nint_projection_group_input_names(
-            config_.output_widths.size(), false);
+            config_.output_widths.size());
         for (std::size_t index = 0; index + 2 < names.size(); ++index) {
             const auto type = index % 4 == 1 ? "uint" : "uchar";
             source += "device const " + std::string(type) + "* " +
@@ -1342,7 +1328,7 @@ std::string direct_kernel_key(
         if (layout.family == kFamilyNint8Zero) {
             key += "q8";
         } else if (layout.family == kFamilyVq) {
-            key += layout.nvq3jl_execution ? "nvq3jl"
+            key += layout.jsc_execution ? "jsc" : layout.nvq1_execution ? "nvq1" : layout.banked_execution ? "banked"
                 : (layout.execution_layout == 1 ? "vqg64" : "vq");
         } else if (layout.family == kFamilyMx) {
             key += "mx" + std::to_string(layout.bits);
@@ -1377,15 +1363,15 @@ bool supports_small_m_group64_output_tile(
         return false;
     }
     for (const auto& layout : layouts) {
-        if (layout.family != kFamilyVq ||
-            layout.execution_layout != 1 ||
+        if (!layout.jsc_execution || layout.execution_layout != 1
+            || layout.family != kFamilyVq ||
             layout.group_size != 24 ||
             layout.vector_size != 8 ||
             layout.index_bits != 12 ||
             layout.state_bits != 4 ||
             layout.entries != 4096 ||
-            layout.code_bank_mode == 2 ||
-            layout.aux_mode < 1 || layout.aux_mode > 2) {
+            layout.code_bank_mode != 1 ||
+            layout.table_banks != 1 || layout.aux_mode != 1) {
             return false;
         }
     }
@@ -1717,7 +1703,10 @@ std::string make_direct_source(
                 "    if (projection == " + suffix + "u) {\n"
                 "        const uint3 local_position = uint3(local_tile, 0u, 0u);\n"
                 "#define threadgroup_position_in_grid local_position\n"
-                "#define USE_NVQ3JL " + std::to_string(layouts[projection].nvq3jl_execution) + "\n"
+                "#define USE_BANKED_NVQ " + std::to_string(layouts[projection].banked_execution) + "\n"
+                "#define USE_NVQ1 " + std::to_string(layouts[projection].nvq1_execution) + "\n"
+                "#define USE_JSC " + std::to_string(layouts[projection].jsc_execution) + "\n"
+                "#define INPUT_ROWS 1\n"
                 "#define NSIGN ((K + 7) / 8)\n"
                 "#define MFQ_VQ_STORE_OUTPUT(index, value) y[uint(P" + suffix
                 + "_OUT_OFFSET) + index] = T(value)\n";
@@ -1741,7 +1730,7 @@ std::string make_direct_source(
                      "OUT", "NG", "GS", "VECTOR_SIZE", "NVEC", "INDEX_BITS",
                      "STATE_BITS", "STATES", "ENTRIES", "CODE_BANKS", "AUX_MODE",
                      "CODE_BANK_MODE", "EXECUTION_LAYOUT", "HAS_TABLE_BANKS",
-                     "GROUPS_PER_SUPER", "NSUPER", "NSIGN", "USE_NVQ3JL",
+                     "GROUPS_PER_SUPER", "NSUPER", "NSIGN", "USE_BANKED_NVQ", "USE_NVQ1", "USE_JSC", "INPUT_ROWS",
                      "MFQ_VQ_STORE_OUTPUT", "threadgroup_position_in_grid"}) {
                 source += "#undef " + std::string(name) + "\n";
             }
@@ -1959,7 +1948,8 @@ void append_blockwise_vq_read(
 
 std::string make_direct_small_m_blockwise_source(
     const std::vector<DirectProjectionLayout>& layouts,
-    bool vectorized_fp16) {
+    bool vectorized_fp16,
+    bool vector_nvq1_inputs) {
     std::string source = R"METAL(
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = 8u;
@@ -1994,6 +1984,55 @@ std::string make_direct_small_m_blockwise_source(
             "            accumulators[row] = 0.0f;\n"
             "        }\n";
 
+        if (layout.family == kFamilyVq
+            && (layout.banked_execution || layout.nvq1_execution || layout.jsc_execution)) {
+            source +=
+                "        uint outputs[1] = {output};\n"
+                "        float anchors[1] = {vq_anchors_" + suffix + "[output]};\n";
+            if (layout.nvq1_execution) {
+                source +=
+                    "        " + std::string(vector_nvq1_inputs ? "mfq_nvq1_vector_profile" : "mfq_nvq1_profile")
+                    + "<1u, uint(K), K_LANES, uint(P" + suffix
+                    + "_INDEX_BITS), uint(ROWS)>(x, vq_indices_" + suffix
+                    + ", vq_state_" + suffix + ", vq_aux_" + suffix
+                    + ", vq_scales_" + suffix + ", vq_codebooks_" + suffix
+                    + ", outputs, anchors, accumulators, vq_parameters_" + suffix
+                    + "[0], 0u, 0u, 0u, 0u, 0u, 0u, k_lane);\n";
+            } else if (layout.jsc_execution) {
+                source +=
+                    "        mfq_nvq_jsc_profile<uint(P" + suffix + "_VECTOR_SIZE), uint(K), 1u, 1u,\n"
+                    "            (P" + suffix + "_OUT > K && P" + suffix + "_VECTOR_SIZE == 4),\n"
+                    "            P" + suffix + "_EXECUTION_LAYOUT == 1 ? 0u : 8u, uint(ROWS)>(\n"
+                    "            x, vq_indices_" + suffix + ", vq_state_" + suffix
+                    + ", vq_aux_" + suffix + ", vq_scales_" + suffix
+                    + ", vq_state_banks_" + suffix + ", vq_codebooks_" + suffix
+                    + ", 0u, outputs, anchors, accumulators, uint(P" + suffix + "_INDEX_BITS),\n"
+                    "            uint(P" + suffix + "_ENTRIES), 0u, 0u, 0u, 0u, 0u, 0u,\n"
+                    "            k_lane, K_LANES,\n"
+                    "            P" + suffix + "_EXECUTION_LAYOUT == 1 ? 2u : 1u);\n";
+            } else {
+                source +=
+                    "        mfq_nvq_banked_profile<1u, uint(K), K_LANES, (P" + suffix
+                    + "_OUT > K), uint(P" + suffix + "_VECTOR_SIZE), uint(ROWS), uint(P" + suffix + "_INDEX_BITS)>(\n"
+                    "            x, vq_indices_" + suffix + ", vq_state_" + suffix
+                    + ", vq_aux_" + suffix + ", vq_state_banks_" + suffix
+                    + ", vq_scales_" + suffix + ", vq_codebooks_" + suffix
+                    + ", outputs, anchors, accumulators, 0u, 0u, 0u, 0u, 0u, 0u, 0u, k_lane, uint(P" + suffix + "_INDEX_BITS), uint(P" + suffix + "_AUX_MODE));\n";
+            }
+            source +=
+                "        for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+                "            float total = accumulators[row];\n"
+                "            for (uint offset = K_LANES / 2u; offset > 0u; offset >>= 1u) {\n"
+                "                total += simd_shuffle_down(total, offset);\n"
+                "            }\n"
+                "            if (k_lane == 0u && output_index < uint(P" + suffix + "_OUT)) {\n"
+                "                y[row * uint(TOTAL_OUT) + uint(P" + suffix
+                + "_OUT_OFFSET) + output_index] = T(total);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n";
+            continue;
+        }
         if (layout.family == kFamilyVq) {
             const int vectors_per_group =
                 (layout.group_size + layout.vector_size - 1)
@@ -2642,6 +2681,71 @@ std::string make_direct_small_m_blockwise_source(
     return source;
 }
 
+constexpr const char* kNvq1VectorProfileHeader = R"METAL(
+template <uint MATRIX_ROWS, uint K, uint K_LANES, uint INDEX_BITS, uint INPUT_ROWS,
+          typename T, typename IndexStream, typename StateStream, typename AuxStream,
+          typename ScaleStream, typename CodebookStream>
+__attribute__((always_inline)) inline void mfq_nvq1_vector_profile(
+    device const T* x, IndexStream indices, StateStream states, AuxStream auxiliary,
+    ScaleStream scales, CodebookStream codebooks, thread const uint* outputs,
+    thread const float* anchors, thread float* accumulators, float delta, uint x_offset,
+    uint indices_offset, uint state_offset, uint auxiliary_offset, uint scale_offset,
+    uint codebook_offset, uint k_lane) {
+    #define MFQ_NVQ1_VECTOR_PROFILE(INPUT) \
+        mfq_nvq1_profile<MATRIX_ROWS, K, K_LANES, INDEX_BITS, INPUT_ROWS>( \
+            INPUT, indices, states, auxiliary, scales, codebooks, outputs, anchors, accumulators, \
+            delta, x_offset, indices_offset, state_offset, auxiliary_offset, scale_offset, codebook_offset, k_lane)
+    if constexpr (INPUT_ROWS > 1u && K % 4u == 0u) {
+        if ((x_offset & 3u) == 0u && (reinterpret_cast<ulong>(x) & (4u * sizeof(T) - 1u)) == 0ul) {
+            MFQ_NVQ1_VECTOR_PROFILE(MfqNvqVectorInput<T>{x});
+            return;
+        }
+    }
+    MFQ_NVQ1_VECTOR_PROFILE(x);
+    #undef MFQ_NVQ1_VECTOR_PROFILE
+}
+)METAL";
+
+std::string make_direct_small_m_nvq1_pair_source(bool vector_inputs) {
+    std::string source = R"METAL(
+    constexpr uint K_LANES = 8u;
+    constexpr uint TILES = (uint(P0_OUT) + 7u) / 8u;
+    uint tile = threadgroup_position_in_grid.x;
+    bool second = tile >= TILES;
+    tile -= second ? TILES : 0u;
+    uint k_lane = thread_index_in_simdgroup & 7u;
+    uint output_index = tile * 8u + simdgroup_index_in_threadgroup * 4u
+        + thread_index_in_simdgroup / 8u;
+    uint output = min(output_index, uint(P0_OUT) - 1u);
+    auto indices = second ? vq_indices_1 : vq_indices_0;
+    auto states = second ? vq_state_1 : vq_state_0;
+    auto auxiliary = second ? vq_aux_1 : vq_aux_0;
+    auto anchors = second ? vq_anchors_1 : vq_anchors_0;
+    auto codebooks = second ? vq_codebooks_1 : vq_codebooks_0;
+    auto scales = second ? vq_scales_1 : vq_scales_0;
+    auto parameters = second ? vq_parameters_1 : vq_parameters_0;
+    uint outputs[1] = {output};
+    float row_anchors[1] = {anchors[output]};
+    float accumulators[ROWS] = {0.0f};
+)METAL";
+    source += "    " + std::string(vector_inputs ? "mfq_nvq1_vector_profile" : "mfq_nvq1_profile")
+        + "<1u, uint(K), K_LANES, uint(P0_INDEX_BITS), uint(ROWS)>(\n";
+    source += R"METAL(
+        x, indices, states, auxiliary, scales, codebooks, outputs, row_anchors,
+        accumulators, parameters[0], 0u, 0u, 0u, 0u, 0u, 0u, k_lane);
+    for (uint row = 0u; row < uint(ROWS); ++row) {
+        float total = accumulators[row];
+        for (uint offset = K_LANES / 2u; offset > 0u; offset >>= 1u)
+            total += simd_shuffle_down(total, offset);
+        if (k_lane == 0u && output_index < uint(P0_OUT)) {
+            uint output_offset = second ? uint(P1_OUT_OFFSET) : uint(P0_OUT_OFFSET);
+            y[row * uint(TOTAL_OUT) + output_offset + output_index] = T(total);
+        }
+    }
+)METAL";
+    return source;
+}
+
 std::string make_direct_small_m_group64_output_tile_source(
     const std::vector<DirectProjectionLayout>& layouts,
     int outputs_per_simd,
@@ -2653,162 +2757,41 @@ std::string make_direct_small_m_group64_output_tile_source(
         + std::to_string(outputs_per_simd) + "u;\n";
     source += R"METAL(
     constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
-
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
     uint global_tile = threadgroup_position_in_grid.x;
 )METAL";
-
-    for (std::size_t projection = 0;
-         projection < layouts.size();
-         ++projection) {
-        const auto& layout = layouts[projection];
+    for (std::size_t projection = 0; projection < layouts.size(); ++projection) {
         const auto suffix = std::to_string(projection);
         source += projection == 0 ? "    if (" : "    else if (";
         source += "global_tile >= uint(P" + suffix
             + "_TILE_BEGIN) && global_tile < uint(P" + suffix
             + "_TILE_END)) {\n";
         source +=
-            "        uint local_tile = global_tile - uint(P" + suffix
-            + "_TILE_BEGIN);\n"
+            "        uint local_tile = global_tile - uint(P" + suffix + "_TILE_BEGIN);\n"
             "        uint output_base = local_tile * OUTPUTS_PER_TG"
             " + simd_group * OUTPUTS_PER_SIMD;\n"
-            "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
-            "        uint output_super_bases[OUTPUTS_PER_SIMD];\n"
-            "        float output_anchors[OUTPUTS_PER_SIMD];\n"
-            "        float accumulators[OUTPUTS_PER_SIMD][ROWS];\n"
-            "        for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "            uint output = min(output_base + output_row,"
-            " uint(P" + suffix + "_OUT) - 1u);\n"
-            "            output_group_bases[output_row] ="
-            " output * uint(P" + suffix + "_NG);\n"
-            "            output_super_bases[output_row] ="
-            " output * uint(P" + suffix + "_NSUPER);\n"
-            "            output_anchors[output_row] ="
-            " vq_anchors_" + suffix + "[output];\n"
+            "        uint outputs[OUTPUTS_PER_SIMD];\n"
+            "        float anchors[OUTPUTS_PER_SIMD];\n"
+            "        float accumulators[OUTPUTS_PER_SIMD * ROWS] = {0.0f};\n"
+            "        for (uint row = 0u; row < OUTPUTS_PER_SIMD; ++row) {\n"
+            "            outputs[row] = min(output_base + row, uint(P" + suffix + "_OUT) - 1u);\n"
+            "            anchors[row] = vq_anchors_" + suffix + "[outputs[row]];\n"
+            "        }\n";
+        source +=
+            "        mfq_nvq_jsc_profile<8u, uint(K), OUTPUTS_PER_SIMD, 1u, false, 0u, uint(ROWS)>(\n"
+            "            x, vq_indices_" + suffix + ", vq_state_" + suffix
+            + ", vq_aux_" + suffix + ", vq_scales_" + suffix + ", vq_state_banks_" + suffix
+            + ", vq_codebooks_" + suffix + ", 0u, outputs, anchors, accumulators,\n"
+            "            12u, 4096u, 0u, 0u, 0u, 0u, 0u, 0u, lane, 32u, 2u);\n";
+        source +=
+            "        for (uint output_row = 0u; output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "            uint output = output_base + output_row;\n"
             "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
-            "                accumulators[output_row][row] = 0.0f;\n"
-            "            }\n"
-            "        }\n"
-            "        for (uint group = lane; group < uint(P" + suffix
-            + "_NG); group += 32u) {\n"
-            "            uint2 records[OUTPUTS_PER_SIMD];\n"
-            "            float weight_scales[OUTPUTS_PER_SIMD];\n"
-            "            uint table_banks[OUTPUTS_PER_SIMD];\n"
-            "            uint code_banks[OUTPUTS_PER_SIMD];\n"
-            "            for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "                uint2 record = mfq_grouped_vq_read_group64("
-            "vq_indices_" + suffix
-            + ", output_group_bases[output_row] + group);\n"
-            "                records[output_row] = record;\n"
-            "                uint state = record.y >> 28u;\n"
-            "                uint table_bank = 0u;\n";
-        if (layout.table_banks > 1) {
-            source +=
-                "                table_bank = uint(vq_bank_ids_" + suffix
-                + "[output_super_bases[output_row]"
-                " + group / uint(P" + suffix
-                + "_GROUPS_PER_SUPER)]);\n";
-        }
-        source +=
-            "                table_banks[output_row] = table_bank;\n"
-            "                uint code_bank = 0u;\n";
-        if (layout.code_bank_mode == 1) {
-            source +=
-                "                code_bank = uint(vq_state_banks_" + suffix
-                + "[state]);\n";
-        } else if (layout.code_bank_mode == 2) {
-            source +=
-                "                code_bank ="
-                " mfq_grouped_vq_group64_segment(record, 0u) >> 12u;\n";
-        }
-        source +=
-            "                code_banks[output_row] = code_bank;\n"
-            "                weight_scales[output_row] ="
-            " output_anchors[output_row] * vq_scales_" + suffix
-            + "[table_bank * uint(P" + suffix
-            + "_STATES) + state];\n"
-            "            }\n"
-            "            #pragma clang loop unroll(full)\n"
-            "            for (uint local_vector = 0u;"
-            " local_vector < 3u; ++local_vector) {\n"
-            "                uint column_base = group * 24u"
-            " + local_vector * 8u;\n"
-            "                if (column_base >= uint(K)) { break; }\n"
-            "                for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "                    uint segment ="
-            " mfq_grouped_vq_group64_segment("
-            "records[output_row], local_vector);\n"
-            "                    uint index = segment & 4095u;\n"
-            "                    uint sign_value = segment >> 12u;\n"
-            "                    uint code_base = ((("
-            "table_banks[output_row] * uint(P" + suffix
-            + "_CODE_BANKS) + code_banks[output_row])"
-            " * uint(P" + suffix + "_ENTRIES) + index) * 8u);\n"
-            "                    uint2 packed_words ="
-            " *(device const uint2*)(vq_codebooks_" + suffix
-            + " + code_base);\n"
-            "                    char4 packed_codes0 ="
-            " as_type<char4>(packed_words.x);\n"
-            "                    char4 packed_codes1 ="
-            " as_type<char4>(packed_words.y);\n"
-            "                    float4 codes0 = float4("
-            "float(packed_codes0.x), float(packed_codes0.y),"
-            " float(packed_codes0.z), float(packed_codes0.w));\n"
-            "                    float4 codes1 = float4("
-            "float(packed_codes1.x), float(packed_codes1.y),"
-            " float(packed_codes1.z), float(packed_codes1.w));\n"
-            "                    for (uint component = 0u;"
-            " component < 4u; ++component) {\n"
-            "                        if (((sign_value >> component)"
-            " & 1u) != 0u) { codes0[component] = -codes0[component]; }\n"
-            "                    }\n"
-            "                    for (uint component = 0u;"
-            " component < 4u; ++component) {\n"
-            "                        uint sign_position = component + 4u;\n"
-            "                        uint negative ="
-            " (sign_value >> sign_position) & 1u;\n";
-        if (layout.aux_mode == 2) {
-            source +=
-                "                        if (sign_position == 7u)"
-                " { negative ^= (index >> 7u) & 1u; }\n";
-        }
-        source +=
-            "                        if (negative != 0u)"
-            " { codes1[component] = -codes1[component]; }\n"
-            "                    }\n"
-            "                    float scale = weight_scales[output_row];\n"
-            "                    float4 weights0 = scale * codes0;\n"
-            "                    float4 weights1 = scale * codes1;\n"
-            "                    for (uint row = 0u;"
-            " row < uint(ROWS); ++row) {\n"
-            "                        uint input_base ="
-            " row * uint(K) + column_base;\n"
-            "                        float4 activation0 = float4("
-            "*(device const half4*)(x + input_base));\n"
-            "                        float4 activation1 = float4("
-            "*(device const half4*)(x + input_base + 4u));\n"
-            "                        accumulators[output_row][row] +="
-            " dot(activation0, weights0);\n"
-            "                        accumulators[output_row][row] +="
-            " dot(activation1, weights1);\n"
-            "                    }\n"
-            "                }\n"
-            "            }\n"
-            "        }\n"
-            "        for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "            uint output_index = output_base + output_row;\n"
-            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
-            "                float total ="
-            " simd_sum(accumulators[output_row][row]);\n"
-            "                if (lane == 0u &&"
-            " output_index < uint(P" + suffix + "_OUT)) {\n"
+            "                float total = simd_sum(accumulators[output_row * ROWS + row]);\n"
+            "                if (lane == 0u && output < uint(P" + suffix + "_OUT)) {\n"
             "                    y[row * uint(TOTAL_OUT) + uint(P" + suffix
-            + "_OUT_OFFSET) + output_index] = T(total);\n"
+            + "_OUT_OFFSET) + output] = T(total);\n"
             "                }\n"
             "            }\n"
             "        }\n"
@@ -2842,6 +2825,19 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
     plan->threadgroups = (batch_rows ? 1 : rows) * work_tiles;
     plan->threads = threads;
     plan->kernel_name = "mfq_direct_projection_" + direct_kernel_key(layouts);
+    const bool nvq1_contraction_pair = blockwise && layouts.size() == 2
+        && layouts[0].output_size == layouts[1].output_size
+        && layouts[0].output_size < input_width
+        && std::all_of(layouts.begin(), layouts.end(), [&](const auto& layout) {
+            return layout.family == kFamilyVq && layout.nvq1_execution
+                && layout.index_bits == layouts[0].index_bits;
+        });
+    const bool common_nvq1_pair = nvq1_contraction_pair && rows == 6 && layouts[0].index_bits == 11;
+    const bool vector_nvq1_inputs = nvq1_contraction_pair && rows > 1 && input_width % 4 == 0
+        && inputs.back().dtype() == mlx::core::float16
+        && (layouts[0].index_bits == 9 || common_nvq1_pair);
+    if (common_nvq1_pair) plan->kernel_name += "_shared_nvq1";
+    if (vector_nvq1_inputs) plan->kernel_name += "_vector_nvq1";
     for (int value : {
              static_cast<int>(batch_rows), static_cast<int>(blockwise),
              static_cast<int>(vectorized_fp16), outputs_per_simd, simd_groups}) {
@@ -2919,18 +2915,25 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
         "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
         "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
     if (rows == 1 && std::any_of(layouts.begin(), layouts.end(),
-            [](const DirectProjectionLayout& layout) { return layout.family == kFamilyVq; })) {
+            [](const DirectProjectionLayout& layout) {
+                return layout.family == kFamilyVq;
+            })) {
         header += detail::vq_gemv_metal_header();
     }
-    plan->source = header + kGroupedHeader + kNvq3jlHeader + constants +
-        "kernel void " + plan->kernel_name + "(" + arguments +
-        (outputs_per_simd > 0
-             ? make_direct_small_m_group64_output_tile_source(
-                   layouts, outputs_per_simd, simd_groups)
-             : (blockwise
-                    ? make_direct_small_m_blockwise_source(
-                          layouts, vectorized_fp16)
-                    : make_direct_source(layouts, batch_rows, rows))) + "}\n";
+    std::string body;
+    if (common_nvq1_pair) {
+        body = make_direct_small_m_nvq1_pair_source(vector_nvq1_inputs);
+    } else if (outputs_per_simd > 0) {
+        body = make_direct_small_m_group64_output_tile_source(
+            layouts, outputs_per_simd, simd_groups);
+    } else if (blockwise) {
+        body = make_direct_small_m_blockwise_source(layouts, vectorized_fp16, vector_nvq1_inputs);
+    } else {
+        body = make_direct_source(layouts, batch_rows, rows);
+    }
+    plan->source = header + (vector_nvq1_inputs ? kNvqVectorInputHeader : "")
+        + kGroupedHeader + kNvqDecodeHeader + (vector_nvq1_inputs ? kNvq1VectorProfileHeader : "") + constants +
+        "kernel void " + plan->kernel_name + "(" + arguments + body + "}\n";
     return plan;
 }
 
@@ -3456,7 +3459,6 @@ struct MlxGroupedLinear::Impl {
     std::vector<array> dense_projection_weights;
     std::vector<DirectProjectionLayout> direct_layouts;
     std::vector<array> direct_weight_inputs;
-    std::vector<array> single_row_weight_inputs;
     std::vector<int> output_sizes;
     int input_size = 0;
     int total_output_size = 0;
@@ -3920,7 +3922,7 @@ MlxGroupedLinear::MlxGroupedLinear(
     // (either every row or every 32 rows).  The older direct projection kernel
     // only understood 128x128 scale blocks, so merely registering a projection
     // batch silently excluded the real released-model geometry.  Retain each
-    // payload and its expanded row/32 sidecar separately and execute the whole
+    // payload and its native scales separately and execute the whole
     // compatible cohort in the format-level kernel.
     const bool contains_block32_mxfp8 = std::any_of(
         weights.begin(),
@@ -4057,13 +4059,9 @@ MlxGroupedLinear::MlxGroupedLinear(
                     mlx::core::uint8,
                     "NINT q");
                 validate_direct_array(
-                    value->row_q_layout(),
-                    mlx::core::uint8,
-                    "NINT row q layout");
-                validate_direct_array(
-                    value->row_q_byte_offsets(),
+                    value->row_metadata(),
                     mlx::core::uint32,
-                    "NINT row q byte offsets");
+                    "NINT row metadata");
                 validate_direct_array(
                     value->sub_scales(),
                     mlx::core::uint8,
@@ -4072,14 +4070,6 @@ MlxGroupedLinear::MlxGroupedLinear(
                     value->sub_mins(),
                     mlx::core::uint8,
                     "NINT sub minima");
-                validate_direct_array(
-                    value->neuron_scales(),
-                    mlx::core::float32,
-                    "NINT neuron scales");
-                validate_direct_array(
-                    value->neuron_mins(),
-                    mlx::core::float32,
-                    "NINT neuron minima");
                 nint_weights.push_back(*value);
             }
         }
@@ -4133,7 +4123,7 @@ MlxGroupedLinear::MlxGroupedLinear(
     if (weights.size() <= 3 || direct_mxfp8_group) {
         std::vector<DirectProjectionLayout> layouts;
         std::vector<array> direct_inputs;
-        std::vector<std::pair<std::size_t, array>> execution_inputs;
+        std::vector<array> vq_codebook_inputs;
         std::vector<int> output_sizes;
         layouts.reserve(weights.size());
         direct_inputs.reserve(weights.size() * 9);
@@ -4239,8 +4229,12 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->code_bank_mode();
                         layout.execution_layout =
                             weight->execution_layout();
-                        layout.nvq3jl_execution =
-                            weight->nvq3jl_execution_records() != nullptr;
+                        layout.banked_execution =
+                            weight->uses_native_jsc();
+                        layout.nvq1_execution =
+                            weight->uses_native_nvq1();
+                        layout.jsc_execution =
+                            !layout.banked_execution && weight->jsc_execution_records() != nullptr;
                         layout.table_banks =
                             weight->table_banks();
                         layout.groups_per_supergroup =
@@ -4283,11 +4277,6 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->parameters(),
                             mlx::core::float32,
                             "VQ parameters");
-                        if (const auto* records = weight->nvq3jl_execution_records()) {
-                            validate_direct_array(
-                                *records, mlx::core::uint8, "NVQ3J-L execution records");
-                            execution_inputs.emplace_back(direct_inputs.size(), *records);
-                        }
                         direct_inputs.push_back(
                             weight->packed_indices());
                         direct_inputs.push_back(
@@ -4296,8 +4285,21 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->packed_auxiliary());
                         direct_inputs.push_back(
                             weight->anchors());
-                        direct_inputs.push_back(
-                            weight->codebooks());
+                        auto codebooks = weight->codebooks();
+                        codebooks.eval();
+                        const auto shared_codebooks = std::find_if(
+                            vq_codebook_inputs.begin(), vq_codebook_inputs.end(),
+                            [&](const array& candidate) {
+                                return candidate.shape() == codebooks.shape()
+                                    && std::memcmp(candidate.data<std::int8_t>(),
+                                        codebooks.template data<std::int8_t>(), codebooks.nbytes()) == 0;
+                            });
+                        if (shared_codebooks == vq_codebook_inputs.end()) {
+                            vq_codebook_inputs.push_back(codebooks);
+                        } else {
+                            codebooks = *shared_codebooks;
+                        }
+                        direct_inputs.push_back(std::move(codebooks));
                         direct_inputs.push_back(
                             weight->scale_lut());
                         direct_inputs.push_back(
@@ -4364,12 +4366,6 @@ MlxGroupedLinear::MlxGroupedLinear(
             total_output,
             total_tiles,
             packed_bytes);
-        if (!execution_inputs.empty()) {
-            impl_->single_row_weight_inputs = impl_->direct_weight_inputs;
-            for (const auto& [index, records] : execution_inputs) {
-                impl_->single_row_weight_inputs[index] = records;
-            }
-        }
         return;
     }
 
@@ -4513,21 +4509,12 @@ array MlxGroupedLinear::run_nint_projection_group(
     const auto projection_count =
         impl_->nint_projection_weights.size();
     std::vector<array> inputs;
-    inputs.reserve(projection_count * 7 + 1);
+    inputs.reserve(projection_count * 4 + 1);
     for (const auto& weight : impl_->nint_projection_weights) {
         inputs.push_back(weight.packed_values());
-        if (swiglu) {
-            inputs.push_back(weight.row_q_layout());
-            inputs.push_back(weight.row_q_byte_offsets());
-        } else {
-            inputs.push_back(weight.row_metadata());
-        }
+        inputs.push_back(weight.row_metadata());
         inputs.push_back(weight.sub_scales());
         inputs.push_back(weight.sub_mins());
-        if (swiglu) {
-            inputs.push_back(weight.neuron_scales());
-            inputs.push_back(weight.neuron_mins());
-        }
     }
     inputs.push_back(source);
     const NintProjectionConfig config{
@@ -5014,7 +5001,7 @@ std::vector<array> MlxGroupedLinear::matmul(
         (impl_->input_size % 8) == 0 &&
         supports_small_m_group64_output_tile(impl_->direct_layouts)) {
         group64_outputs_per_simd = rows >= 5
-            ? 2
+            ? 4
             : (rows == 4 ? 5 : 8);
         if (const auto* value = std::getenv(
                 "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE")) {
@@ -5092,8 +5079,7 @@ std::vector<array> MlxGroupedLinear::matmul(
 
     array combined = [&]() {
         if (impl_->uses_zero_copy_storage()) {
-            auto inputs = rows == 1 && !impl_->single_row_weight_inputs.empty()
-                ? impl_->single_row_weight_inputs : impl_->direct_weight_inputs;
+            auto inputs = impl_->direct_weight_inputs;
             inputs.push_back(source);
             if (use_single_row_mxfp8_fast_path) {
                 std::vector<

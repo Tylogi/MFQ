@@ -61,10 +61,12 @@ std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
     if (bytes != 0) {
         MFQ_NATIVE_CUDA_CHECK(cudaHostAlloc(&pointer, bytes, cudaHostAllocDefault));
     }
-    auto owner = std::shared_ptr<void>(pointer, [](void* value) {
+    charge_tensor_host_bytes(bytes);
+    auto owner = std::shared_ptr<void>(pointer, [bytes](void* value) {
         if (value != nullptr) {
             (void)cudaFreeHost(value);
         }
+        tensor_host_bytes.fetch_sub(bytes);
     });
     auto storage = std::make_shared<TensorStorage>();
     storage->owner = std::move(owner);

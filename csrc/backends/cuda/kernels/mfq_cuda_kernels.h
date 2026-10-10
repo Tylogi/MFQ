@@ -25,6 +25,7 @@ void linear_gate_beta(
     const TensorView& a_log,
     const TensorView& gate_t,
     const TensorView& beta_t,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool stable_softplus = false);
 
 }  // namespace mfq::cuda::kernels

@@ -175,7 +175,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             else if (step.value("rollback",false)) block.rollback();
             else {
                 out.push_back(block.forward(execution,a.at(0).narrow(1,step.at("begin"),step.at("count")),step.value("cache",true),step.value("confirmed",0)));
-                out.push_back(block.conv_state());out.push_back(block.recurrent_state());
+                out.push_back(block.conv_state().clone());out.push_back(block.recurrent_state().clone());
             }
         }
         return out;
@@ -216,7 +216,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 else {
                     const int64_t begin=step.at("begin"),count=step.at("count");
                     out.push_back(block.forward(execution,a.at(0).narrow(1,begin,count),a.at(1).narrow(1,begin,count),step.value("cache",true),step.value("confirmed",0)));
-                    out.push_back(block.conv_state());
+                    out.push_back(block.conv_state().clone());
                 }
             }
         }
@@ -287,8 +287,8 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             else {
                 out.push_back(block.forward(execution,a.at(0).narrow(1, step.at("begin"), step.at("count")),
                     step.value("cache", true), step.value("confirmed", 0)));
-                out.push_back(block.conv_state());
-                out.push_back(block.recurrent_state());
+                out.push_back(block.conv_state().clone());
+                out.push_back(block.recurrent_state().clone());
             }
         }
         return out;
@@ -325,6 +325,241 @@ Json output(const std::vector<Tensor>& tensors) {
 }
 } // namespace
 
+void check_rotary_fusion() {
+    using namespace mfq::cuda;
+    int ordinary_cases=0,graph_cases=0,switch_cases=0;
+    const auto exact=[](const Tensor& actual,const Tensor& expected) {
+        const auto a=actual.cpu().contiguous(),b=expected.cpu().contiguous();
+        if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+            std::memcmp(a.data_ptr(),b.data_ptr(),size_t(a.numel()*a.element_size())))
+            throw std::runtime_error("fused rotary original output bytes differ, case "+std::to_string(a.numel()));
+    };
+    const std::array<std::array<int64_t,5>,3> shapes{{{1,24,1,256,96},{2,3,3,128,64},{2,2,35,17,12}}};
+    for(auto dtype:{kFloat16,kFloat32,kBFloat16})for(const auto& shape:shapes)
+        for(int layout=1;layout<=4;++layout)for(int mode=0;mode<3;++mode) {
+            const auto b=shape[0],h=shape[1],t=shape[2],d=shape[3],rotary=shape[4],pairs=rotary/2;
+            std::vector<float> values(size_t(b*h*t*d));
+            for(size_t i=0;i<values.size();++i) {
+                values[i]=float(std::sin(double(i)*.031)*.71);
+                if(i%17==0)values[i]=0.f;
+                if(i%17==1)values[i]=-0.f;
+                if(i%17==2)values[i]=std::numeric_limits<float>::denorm_min();
+                if(i%17==3)values[i]=-std::numeric_limits<float>::denorm_min();
+            }
+            auto x=tensor(values).reshape({b,h,t,d}).to(kCUDA,dtype);
+            if(layout==2)x=x.transpose(-1,-2).contiguous().transpose(-1,-2);
+            const int64_t axes=layout==1?1:(layout==2?2:(layout==3?3:5));
+            const int64_t batches=layout==3?b:1;
+            const auto position_shape=layout==1?std::vector<int64_t>{t}:
+                (layout==3 || layout==4?std::vector<int64_t>{axes,batches,t}:std::vector<int64_t>{axes,t});
+            std::vector<int64_t> positions(size_t(axes*batches*t));
+            const std::array<int64_t,9> choices{-5,0,1,96,511,512,2147483647LL,2147483648LL,-2147483649LL};
+            for(size_t i=0;i<positions.size();++i)positions[i]=choices[i%choices.size()];
+            auto p=tensor(positions).reshape(position_shape).to(kCUDA);
+            std::vector<int64_t> sections=mode==0?std::vector<int64_t>{}:std::vector<int64_t>{pairs/3,pairs/3,pairs-2*(pairs/3)};
+            RotaryEmbedding original(rotary,512,1e7,sections,mode==2,false);
+            RotaryEmbedding fused(rotary,512,1e7,sections,mode==2,true);
+            exact(fused.forward(x,p),original.forward(x,p));++ordinary_cases;
+            if(mode==2 && layout==3) {
+                std::array<StreamHandle,2> streams{stream_from_pool(false),stream_from_pool(false)};
+                std::array<Graph,2> graphs;std::array<Tensor,2> outputs;
+                for(int variant=0;variant<2;++variant) {
+                    StreamGuard guard(streams[variant]);
+                    auto& operation=variant?fused:original;
+                    graphs[variant].prepare_memory();outputs[variant]=operation.forward(x,p);
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+                    outputs[variant]=Tensor{};
+                    graphs[variant].capture_begin();outputs[variant]=operation.forward(x,p);graphs[variant].capture_end();
+                }
+                for(int step=0;step<3;++step) {
+                    for(size_t i=0;i<positions.size();++i)positions[i]=choices[(i+step+4)%choices.size()];
+                    p.copy_(tensor(positions).reshape(position_shape).to(kCUDA));
+                    x.copy_(tensor(values).reshape({b,h,t,d}).to(kCUDA,dtype)*(float(step)-1.f));
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+                    for(int variant=0;variant<2;++variant) {
+                        StreamGuard guard(streams[variant]);graphs[variant].replay();
+                        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(streams[variant].stream()));
+                    }
+                    exact(outputs[1],outputs[0]);++graph_cases;
+                }
+            }
+            fused.set_fused(false);
+            exact(fused.forward(x,p),original.forward(x,p));++switch_cases;
+            fused.set_fused(true);
+            exact(fused.forward(x,p),original.forward(x,p));++switch_cases;
+        }
+    std::cout<<"rotary_fused_ordinary_exact_cases="<<ordinary_cases<<" changing_graph_exact_cases="<<graph_cases
+             <<" mode_switch_exact_cases="<<switch_cases<<" PASS\n";
+}
+
+void check_rotary_normalized_fusion() {
+    using namespace mfq::cuda;
+    int ordinary_cases=0,cache_cases=0,graph_cases=0;
+    const auto exact=[](const Tensor& actual,const Tensor& expected,const char* label) {
+        const auto a=actual.cpu().contiguous(),b=expected.cpu().contiguous();
+        if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+            std::memcmp(a.data_ptr(),b.data_ptr(),size_t(a.numel()*a.element_size())))
+            throw std::runtime_error(std::string("normalized rotary bytes differ: ")+label);
+    };
+    const std::array<std::array<int64_t,5>,7> shapes{{
+        {1,20,1,128,96},{1,24,1,256,96},{2,3,3,128,64},{2,2,35,17,12},
+        {1,3,6,32,16},{1,2,3,64,48},{1,2,3,513,128}}};
+    for(auto dtype:{kFloat16,kFloat32})for(const auto& shape:shapes)
+        for(int layout=1;layout<=4;++layout)for(int mode=0;mode<3;++mode) {
+            const auto b=shape[0],h=shape[1],t=shape[2],d=shape[3],rotary=shape[4],pairs=rotary/2;
+            std::vector<float> values(size_t(b*t*h*d*2)),weights(static_cast<size_t>(d));
+            for(size_t i=0;i<values.size();++i) {
+                values[i]=float(std::sin(double(i)*.031)*.71);
+                if(i%17==0)values[i]=0.f;
+                if(i%17==1)values[i]=-0.f;
+                if(i%17==2)values[i]=std::numeric_limits<float>::denorm_min();
+                if(i%17==3)values[i]=-std::numeric_limits<float>::denorm_min();
+            }
+            for(size_t i=0;i<weights.size();++i)weights[i]=i%11==0?-1.f:float(std::cos(double(i)*.07)*.13);
+            auto joined=tensor(values).reshape({b,t,h,2*d}).to(kCUDA,dtype);
+            auto x=joined.narrow(-1,0,d),v=joined.narrow(-1,d,d);
+            if(layout==2)x=x.transpose(-1,-2).contiguous().transpose(-1,-2);
+            if(layout==4)v=v.transpose(-1,-2).contiguous().transpose(-1,-2);
+            const auto source=x.clone(),source_value=v.clone();
+            auto weight=tensor(weights).to(kCUDA);
+            const int64_t axes=layout==1?1:(layout==2?2:(layout==3?3:5));
+            const int64_t batches=layout==3?b:1;
+            const auto position_shape=layout==1?std::vector<int64_t>{t}:
+                (layout==3 || layout==4?std::vector<int64_t>{axes,batches,t}:std::vector<int64_t>{axes,t});
+            std::vector<int64_t> positions(size_t(axes*batches*t)),slots(static_cast<size_t>(t));
+            const std::array<int64_t,9> choices{-5,0,1,96,511,512,2147483647LL,2147483648LL,-2147483649LL};
+            for(size_t i=0;i<positions.size();++i)positions[i]=choices[i%choices.size()];
+            for(size_t i=0;i<slots.size();++i)slots[i]=5+3*i;
+            const auto index_dtype=layout%2?kInt64:kInt32;
+            auto p=tensor(positions).reshape(position_shape).to(kCUDA,index_dtype);
+            auto cache_positions=tensor(slots).to(kCUDA,index_dtype);
+            std::vector<int64_t> sections=mode==0?std::vector<int64_t>{}:std::vector<int64_t>{pairs/3,pairs/3,pairs-2*(pairs/3)};
+            RotaryEmbedding original(rotary,512,1e7,sections,mode==2,false);
+            RotaryEmbedding fused(rotary,512,1e7,sections,mode==2,true);
+            const auto options=x.options().dtype(kFloat16);
+            std::array<Tensor,2> keys{full({b,h,3*t+8,d},-.17,options),full({b,h,3*t+8,d},-.17,options)};
+            std::array<Tensor,2> cached_values{full({b,h,3*t+8,d},.23,options),full({b,h,3*t+8,d},.23,options)};
+            std::array<Tensor,2> outputs;
+            const auto forward=[&](int variant) {
+                if(variant) {
+                    outputs[1]=fused.forward_normalized(x,weight,p,1e-6);
+                    auto unused=fused.forward_normalized(x,weight,p,1e-6,keys[1],cache_positions,v,cached_values[1]);
+                    if(unused.defined())throw std::runtime_error("direct cached rotary allocated an output");
+                } else {
+                    auto norm=grouped_rms_norm_cuda(x.contiguous(),weight,d,1e-6,1.0);
+                    outputs[0]=original.forward(norm.permute({0,2,1,3}),p);
+                    keys[0].index_copy_(2,cache_positions,outputs[0].to(kFloat16));
+                    cached_values[0].index_copy_(2,cache_positions,v.permute({0,2,1,3}).to(kFloat16));
+                }
+            };
+            forward(0);forward(1);
+            exact(outputs[1],outputs[0],"output");++ordinary_cases;
+            exact(keys[1],keys[0],"keys");exact(cached_values[1],cached_values[0],"values");++cache_cases;
+            if(mode==2 && layout==3) {
+                std::array<StreamHandle,2> streams{stream_from_pool(false),stream_from_pool(false)};
+                std::array<Graph,2> graphs;
+                for(int variant=0;variant<2;++variant) {
+                    StreamGuard guard(streams[variant]);graphs[variant].prepare_memory();forward(variant);
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(streams[variant].stream()));outputs[variant]=Tensor{};
+                    graphs[variant].capture_begin();forward(variant);graphs[variant].capture_end();
+                }
+                for(int step=0;step<3;++step) {
+                    for(size_t i=0;i<positions.size();++i)positions[i]=choices[(i+step+4)%choices.size()];
+                    for(size_t i=0;i<slots.size();++i)slots[i]=5+3*i+step;
+                    p.copy_(tensor(positions).reshape(position_shape).to(kCUDA,index_dtype));
+                    cache_positions.copy_(tensor(slots).to(kCUDA,index_dtype));
+                    x.copy_(source*(float(step)-1.f));v.copy_(source_value*(float(step)*.5f-1.f));
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+                    for(int variant=0;variant<2;++variant) {
+                        StreamGuard guard(streams[variant]);graphs[variant].replay();
+                        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(streams[variant].stream()));
+                    }
+                    try { exact(outputs[1],outputs[0],"graph output"); }
+                    catch(const std::exception&) {
+                        std::cerr<<"normalized graph mismatch dtype="<<int(dtype)<<" B="<<b<<" H="<<h<<" T="<<t<<" D="<<d<<" step="<<step<<'\n';
+                        throw;
+                    }
+                    exact(keys[1],keys[0],"graph keys");
+                    exact(cached_values[1],cached_values[0],"graph values");++graph_cases;
+                }
+            }
+        }
+    std::cout<<"normalized_rotary_ordinary_exact_cases="<<ordinary_cases<<" cache_exact_cases="<<cache_cases
+             <<" changing_graph_exact_cases="<<graph_cases<<" PASS\n";
+}
+
+void check_attention_fusion() {
+    using namespace mfq::cuda;
+    int ordinary_cases=0,gate_cases=0,graph_cases=0;
+    const auto exact=[](const Tensor& actual,const Tensor& expected,const char* label) {
+        const auto a=actual.cpu().contiguous(),b=expected.cpu().contiguous();
+        if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+            std::memcmp(a.data_ptr(),b.data_ptr(),size_t(a.numel()*a.element_size())))
+            throw std::runtime_error(std::string("attention fusion bytes differ: ")+label);
+    };
+    const std::array<std::array<int64_t,7>,6> shapes{{
+        {1,20,2,1,128,128,163},{1,24,2,1,256,33,41},
+        {2,4,2,3,17,17,23},{1,4,2,2,513,17,23},
+        {1,2,1,2,1025,9,13},{1,4,2,3,64,0,13}}};
+    for(auto dtype:{kFloat16,kFloat32})for(auto gate_dtype:{kFloat16,kFloat32})
+        for(bool half_output:{false,true})for(const auto& shape:shapes)for(int layout=0;layout<2;++layout) {
+            const auto b=shape[0],h=shape[1],kh=shape[2],t=shape[3],d=shape[4],capacity=shape[5],columns=shape[6];
+            const auto make=[&](int64_t count,float scale,float shift) {
+                std::vector<float> numbers(static_cast<size_t>(count));
+                for(size_t i=0;i<numbers.size();++i) {
+                    numbers[i]=float(std::sin(double(i)*.043+shift)*scale);
+                    if(i%31==0)numbers[i]=0.f;
+                    if(i%31==1)numbers[i]=-0.f;
+                    if(i%31==2)numbers[i]=std::numeric_limits<float>::denorm_min();
+                    if(i%31==3)numbers[i]=-std::numeric_limits<float>::denorm_min();
+                }
+                return tensor(numbers).to(kCUDA);
+            };
+            auto q=make(b*h*t*d,.71f,.13f).reshape({b,h,t,d}).to(dtype);
+            auto k=make(b*kh*capacity*d,.37f,.27f).reshape({b,kh,capacity,d}).to(kFloat16);
+            auto v=make(b*kh*capacity*d,1.31f,.31f).reshape({b,kh,capacity,d}).to(kFloat16);
+            auto joined=make(b*t*h*d*2,17.f,.43f).reshape({b,t,h,2*d}).to(gate_dtype);
+            auto gate=joined.narrow(-1,d,d);
+            if(!layout)gate=gate.contiguous();
+            else {q=q.transpose(-1,-2).contiguous().transpose(-1,-2);v=v.transpose(-1,-2).contiguous().transpose(-1,-2);}
+            auto source_q=q.clone(),source_gate=gate.clone();
+            const auto index_dtype=layout?kInt64:kInt32;
+            std::vector<int64_t> choices{-5,0,capacity-1,capacity,2147483648LL,-2147483649LL};
+            std::vector<int64_t> ends(static_cast<size_t>(t));
+            for(size_t i=0;i<ends.size();++i)ends[i]=choices[(i+2)%choices.size()];
+            auto positions=tensor(ends).to(kCUDA,index_dtype);
+            const auto reference=[&] {
+                auto selected=arange(columns,positions.options()).reshape({1,1,columns}).expand({b,t,columns});
+                selected=where(selected<=positions.reshape({1,t,1}),selected,full_like(selected,-1));
+                auto attended=mfq_qwen4_exp::sparse_gqa_attention(q,k,v,selected);
+                auto out=(attended.to(kFloat32)*sigmoid(gate.to(kFloat32))).to(half_output?kFloat16:kFloat32);
+                exact(mfq_qwen4_exp::attention_gate(attended,gate,half_output),out,"gate");++gate_cases;
+                return out;
+            };
+            const auto candidate=[&] {return mfq_qwen4_exp::causal_gqa_attention_gate(q,k,v,positions,gate,columns,half_output);};
+            try {exact(candidate(),reference(),"causal output");}
+            catch(const std::exception&) {std::cerr<<"attention fusion mismatch D="<<d<<" dtype="<<int(dtype)
+                <<" gate_dtype="<<int(gate_dtype)<<" half_output="<<half_output<<" layout="<<layout<<'\n';throw;}
+            ++ordinary_cases;
+            if(layout && gate_dtype==kFloat16) {
+                auto stream=stream_from_pool(false);Graph graph;Tensor output;
+                {StreamGuard guard(stream);graph.prepare_memory();output=candidate();
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));output={};
+                    graph.capture_begin();output=candidate();graph.capture_end();}
+                for(int step=0;step<3;++step) {
+                    for(size_t i=0;i<ends.size();++i)ends[i]=choices[(i+step+3)%choices.size()];
+                    positions.copy_(tensor(ends).to(kCUDA,index_dtype));
+                    q.copy_(source_q*(float(step)-1.f));gate.copy_(source_gate*(float(step)*.5f-1.f));
+                    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+                    {StreamGuard guard(stream);graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));}
+                    exact(output,reference(),"changing graph");++graph_cases;
+                }
+            }
+        }
+    std::cout<<"attention_fusion_ordinary_exact_cases="<<ordinary_cases<<" gate_exact_cases="<<gate_cases
+             <<" changing_graph_exact_cases="<<graph_cases<<" PASS\n";
+}
+
 int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
@@ -332,6 +567,9 @@ int main(int argc, char** argv) {
         const auto context = mfq::cuda::default_context(0);
         auto stream = mfq::cuda::stream_from_pool(false, 0);
         mfq::cuda::StreamGuard stream_guard(stream);
+        if(argc==2 && std::string(argv[1])=="--rotary-fused-check") {check_rotary_fusion();return 0;}
+        if(argc==2 && std::string(argv[1])=="--rotary-normalized-check") {check_rotary_normalized_fusion();return 0;}
+        if(argc==2 && std::string(argv[1])=="--attention-fused-check") {check_attention_fusion();return 0;}
         if (argc == 1) {
             auto q = mfq::cuda::ones({1,1,2,4}, mfq::cuda::TensorOptions{}.device(mfq::cuda::kCUDA));
             auto k = mfq::cuda::ones({1,3,4}, q.options());

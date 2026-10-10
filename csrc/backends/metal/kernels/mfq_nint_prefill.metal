@@ -52,21 +52,15 @@ inline half4 nint_prefill_decode_row_quad(
     const device uchar* values,
     const device uchar* sub_scales,
     const device uchar* sub_mins,
-    uint row,
     uint column,
-    uint layout,
-    uint row_byte_offset,
-    float anchor_scale,
-    float anchor_minimum,
+    MfqNintRow row,
     constant MfqNintPrefillParams& params) {
-    const uint bits = layout & 15u;
-    const uint row_bit_shift = layout >> 4u;
     const ushort4 quantized = nint_prefill_read_row_quad(
         values,
-        row_byte_offset,
-        row_bit_shift,
+        row.q_offset,
+        row.q_shift,
         column,
-        bits);
+        row.q_bits);
 #if MFQ_NINT_PREFILL_GROUP_SIZE > 0
     constexpr uint group_size = MFQ_NINT_PREFILL_GROUP_SIZE;
 #else
@@ -76,9 +70,10 @@ inline half4 nint_prefill_decode_row_quad(
     if (column + 3u < uint(params.input_width) &&
         (group_size % 4u == 0u ||
          first_group == (column + 3u) / group_size)) {
-        const uint metadata = row * uint(params.groups) + first_group;
-        const float scale = anchor_scale * float(sub_scales[metadata]);
-        const float minimum = anchor_minimum * float(sub_mins[metadata]);
+        const float scale = row.scale * float(mfq_nint_sub_value(sub_scales,
+            row.sub_offset, row.sub_shift, row.sub_bits, first_group));
+        const float minimum = row.minimum * float(mfq_nint_sub_value(sub_mins,
+            row.sub_offset, row.sub_shift, row.sub_bits, first_group));
         return half4(scale * float4(quantized) - minimum);
     }
     half4 decoded = half4(0.0h);
@@ -86,10 +81,11 @@ inline half4 nint_prefill_decode_row_quad(
     for (uint lane = 0u; lane < 4u; ++lane) {
         const uint input_column = column + lane;
         if (input_column < uint(params.input_width)) {
-            const uint metadata = row * uint(params.groups)
-                + input_column / group_size;
-            const float scale = anchor_scale * float(sub_scales[metadata]);
-            const float minimum = anchor_minimum * float(sub_mins[metadata]);
+            const uint group = input_column / group_size;
+            const float scale = row.scale * float(mfq_nint_sub_value(sub_scales,
+                row.sub_offset, row.sub_shift, row.sub_bits, group));
+            const float minimum = row.minimum * float(mfq_nint_sub_value(sub_mins,
+                row.sub_offset, row.sub_shift, row.sub_bits, group));
             decoded[lane] = half(scale * float(quantized[lane]) - minimum);
         }
     }
@@ -98,7 +94,104 @@ inline half4 nint_prefill_decode_row_quad(
 
 } // namespace
 
-[[kernel]] void mfq_nint_prefill_mmq_f16_bm128_bn64_bk48(
+template <int BM, int BN, int BK, int WM, int WN>
+inline void mfq_nint_prefill_portable_impl(
+    const device uchar* q,
+    const device uint* row_metadata,
+    const device uchar* sub_scale,
+    const device uchar* sub_min,
+    const device half* x,
+    device half* y,
+    constant MfqNintPrefillParams& params,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    threadgroup uint4* row_state,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id,
+    uint thread_id) {
+    constexpr int STRIDE = BK + 8;
+    constexpr uint THREADS = WM * WN * 32;
+    using mma_t = mlx::steel::BlockMMA<
+        half, half, BM, BN, BK, WM, WN, false, true, STRIDE, STRIDE>;
+    const int output_base = int(tid.x) * BN;
+    const int row_base = int(tid.y) * BM;
+    const short valid_n = short(min(BN, params.output_width - output_base));
+    const short valid_m = short(min(BM, params.rows - row_base));
+    thread mma_t mma(simd_group_id, simd_lane_id);
+    if (thread_id < uint(BN)) {
+        row_state[thread_id] = thread_id < uint(valid_n)
+            ? *reinterpret_cast<const device uint4*>(
+                  row_metadata + (uint(output_base) + thread_id) * 4u)
+            : uint4(0u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k_base = 0; k_base < params.input_width; k_base += BK) {
+        for (uint item = thread_id; item < uint(BM * BK / 4); item += THREADS) {
+            const uint row = item / uint(BK / 4);
+            const uint column = (item % uint(BK / 4)) * 4u;
+            const uint input_column = uint(k_base) + column;
+            half4 value(0.0h);
+            if (row < uint(valid_m)) {
+                const device half* input = x + (uint(row_base) + row) * uint(params.input_width);
+                if (input_column + 3u < uint(params.input_width)) {
+                    value = half4(*reinterpret_cast<const device packed_half4*>(input + input_column));
+                } else {
+#pragma clang loop unroll(full)
+                    for (uint lane = 0; lane < 4; ++lane) {
+                        if (input_column + lane < uint(params.input_width))
+                            value[lane] = input[input_column + lane];
+                    }
+                }
+            }
+            *reinterpret_cast<threadgroup half4*>(Xs + row * STRIDE + column) = value;
+        }
+        for (uint item = thread_id; item < uint(BN * BK / 4); item += THREADS) {
+            const uint row = item / uint(BK / 4);
+            const uint column = (item % uint(BK / 4)) * 4u;
+            const uint input_column = uint(k_base) + column;
+            half4 value(0.0h);
+            if (row < uint(valid_n) && input_column < uint(params.input_width)) {
+                const uint4 metadata = row_state[row];
+                value = nint_prefill_decode_row_quad(
+                    q, sub_scale, sub_min, input_column, mfq_nint_row(metadata), params);
+            }
+            *reinterpret_cast<threadgroup half4*>(Ws + row * STRIDE + column) = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma.mma(Xs, Ws);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mma.store_result_slice(y + row_base * params.output_width + output_base,
+        params.output_width, short2(0, 0), short2(valid_n, valid_m));
+}
+
+#define MFQ_NINT_PORTABLE_KERNEL(BM, BN, BK, WM, WN) \
+[[kernel]] void mfq_nint_prefill_portable_f16_bm##BM##_bn##BN##_bk##BK( \
+    const device uchar* q [[buffer(0)]], \
+    const device uint* row_metadata [[buffer(1)]], \
+    const device uchar* sub_scale [[buffer(2)]], \
+    const device uchar* sub_min [[buffer(3)]], \
+    const device half* x [[buffer(4)]], \
+    device half* y [[buffer(5)]], \
+    constant MfqNintPrefillParams& params [[buffer(6)]], \
+    uint3 tid [[threadgroup_position_in_grid]], \
+    uint simd_group_id [[simdgroup_index_in_threadgroup]], \
+    uint simd_lane_id [[thread_index_in_simdgroup]], \
+    uint thread_id [[thread_index_in_threadgroup]]) { \
+    threadgroup half Xs[BM * (BK + 8)]; \
+    threadgroup half Ws[BN * (BK + 8)]; \
+    threadgroup uint4 row_state[BN]; \
+    mfq_nint_prefill_portable_impl<BM, BN, BK, WM, WN>( \
+        q, row_metadata, sub_scale, sub_min, x, y, params, Xs, Ws, row_state, \
+        tid, simd_group_id, simd_lane_id, thread_id); \
+}
+
+MFQ_NINT_PORTABLE_KERNEL(64, 32, 32, 2, 2)
+MFQ_NINT_PORTABLE_KERNEL(128, 32, 32, 4, 1)
+#undef MFQ_NINT_PORTABLE_KERNEL
+
+[[kernel]] void mfq_nint_prefill_narrow_f16(
     const device uchar* q [[buffer(0)]],
     const device uint* row_metadata [[buffer(1)]],
     const device uchar* sub_scale [[buffer(2)]],
@@ -108,102 +201,38 @@ inline half4 nint_prefill_decode_row_quad(
     constant MfqNintPrefillParams& params [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint thread_id [[thread_index_in_threadgroup]]) {
-    constexpr int BM = 128;
-    constexpr int BN = 64;
-    constexpr int BK = 48;
-    constexpr int BK_padded = 56;
-    constexpr uint TGP_SIZE = 256u;
-    using mma_t = mlx::steel::BlockMMA<
-        half,
-        half,
-        BM,
-        BN,
-        BK,
-        4,
-        2,
-        false,
-        true,
-        BK_padded,
-        BK_padded>;
-
-    const int output_base = int(tid.x) * BN;
-    const int row_base = int(tid.y) * BM;
-    if (output_base >= params.output_width || row_base >= params.rows) return;
-    const short valid_n = short(min(BN, params.output_width - output_base));
-    const short valid_m = short(min(BM, params.rows - row_base));
-    threadgroup half Xs[BM * BK_padded];
-    threadgroup half Ws[BN * BK_padded];
-    threadgroup uint4 row_state[BN];
-    thread mma_t mma(simd_group_id, simd_lane_id);
-
-    if (thread_id < uint(BN)) {
-        row_state[thread_id] = thread_id < uint(valid_n)
-            ? *reinterpret_cast<const device uint4*>(
-                  row_metadata + (uint(output_base) + thread_id) * 4u)
-            : uint4(0u);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int k_base = 0; k_base < params.input_width; k_base += BK) {
-        for (uint item = thread_id;
-             item < uint(BM * BK_padded);
-             item += TGP_SIZE) {
-            const uint row = item / uint(BK_padded);
-            const uint column = item - row * uint(BK_padded);
-            const int input_column = k_base + int(column);
-            Xs[item] = row < uint(valid_m) && column < uint(BK) &&
-                    input_column < params.input_width
-                ? x[(uint(row_base) + row) * uint(params.input_width)
-                    + uint(input_column)]
-                : half(0.0h);
-        }
-        for (uint item = thread_id;
-             item < uint(BN * BK_padded);
-             item += TGP_SIZE) {
-            Ws[item] = half(0.0h);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        constexpr uint VALUES_PER_ITEM = 4u;
-        constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
-        for (uint item = thread_id;
-             item < uint(BN) * ITEMS_PER_ROW;
-             item += TGP_SIZE) {
-            const uint output_row = item / ITEMS_PER_ROW;
-            const uint local_item = item - output_row * ITEMS_PER_ROW;
-            if (output_row < uint(valid_n)) {
-                const uint weight_row = uint(output_base) + output_row;
-                const uint4 metadata = row_state[output_row];
-                const uint local_column = local_item * VALUES_PER_ITEM;
-                const uint input_column = uint(k_base) + local_column;
-                if (input_column < uint(params.input_width)) {
-                    *reinterpret_cast<threadgroup half4*>(
-                        Ws + output_row * uint(BK_padded) + local_column) =
-                        nint_prefill_decode_row_quad(
-                            q,
-                            sub_scale,
-                            sub_min,
-                            weight_row,
-                            input_column,
-                            metadata.x,
-                            metadata.y,
-                            as_type<float>(metadata.z),
-                            as_type<float>(metadata.w),
-                            params);
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row_base = tid.y * 16u + simd_group_id * 4u;
+    if (row_base >= uint(params.rows)) return;
+    const uint output = tid.x;
+    const uint4 metadata = *reinterpret_cast<const device uint4*>(row_metadata + output * 4u);
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint column = lane * 4u; column < uint(params.input_width); column += 128u) {
+        const float4 weight = float4(nint_prefill_decode_row_quad(
+            q, sub_scale, sub_min, column, mfq_nint_row(metadata), params));
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < 4u; ++r) {
+            if (row_base + r < uint(params.rows)) {
+                const device half* input = x + (row_base + r) * uint(params.input_width);
+                float4 activation(0.0f);
+                if (column + 3u < uint(params.input_width)) {
+                    activation = float4(*reinterpret_cast<const device packed_half4*>(input + column));
+                } else {
+#pragma clang loop unroll(full)
+                    for (uint j = 0; j < 4; ++j) {
+                        if (column + j < uint(params.input_width)) activation[j] = float(input[column + j]);
+                    }
                 }
+                sums[r] += dot(weight, activation);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma.mma(Xs, Ws);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    mma.store_result_slice(
-        y + row_base * params.output_width + output_base,
-        params.output_width,
-        short2(0, 0),
-        short2(valid_n, valid_m));
+#pragma clang loop unroll(full)
+    for (uint r = 0u; r < 4u; ++r) {
+        const float sum = simd_sum(sums[r]);
+        if (lane == 0u && row_base + r < uint(params.rows))
+            y[(row_base + r) * uint(params.output_width) + output] = half(sum);
+    }
 }
 
 #ifdef MFQ_ENABLE_NAX
@@ -271,7 +300,6 @@ inline void mfq_nint_prefill_nax_f16_impl(
             const uint output_row = item / ITEMS_PER_ROW;
             const uint local_item = item - output_row * ITEMS_PER_ROW;
             if (output_row < uint(valid_n)) {
-                const uint weight_row = uint(output_base) + output_row;
                 const uint4 metadata = row_state[output_row];
                 const uint local_column = local_item * VALUES_PER_ITEM;
                 const uint input_column = uint(k_base) + local_column;
@@ -282,12 +310,8 @@ inline void mfq_nint_prefill_nax_f16_impl(
                             q,
                             sub_scale,
                             sub_min,
-                            weight_row,
                             input_column,
-                            metadata.x,
-                            metadata.y,
-                            as_type<float>(metadata.z),
-                            as_type<float>(metadata.w),
+                            mfq_nint_row(metadata),
                             params);
                 }
             }

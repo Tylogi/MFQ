@@ -50,8 +50,10 @@ MoeCacheSlotLease MoeCacheSlotBook::acquire(const MoeCacheKey& key) {
     return {slot, state.generation, false, replaced};
 }
 void MoeCacheSlotBook::touch(int slot) {
-    if (!checked(slot).key) throw std::runtime_error("cannot touch an empty MoE cache slot");
-    erase_lru(slot); append_lru(slot);
+    auto& state = checked(slot);
+    if (!state.key) throw std::runtime_error("cannot touch an empty MoE cache slot");
+    if (state.listed) lru_.splice(lru_.end(), lru_, state.position);
+    else append_lru(slot);
 }
 void MoeCacheSlotBook::mark_inflight(int slot) {
     auto& state = checked(slot);
@@ -60,6 +62,72 @@ void MoeCacheSlotBook::mark_inflight(int slot) {
 }
 void MoeCacheSlotBook::clear_inflight(int slot) { checked(slot).inflight = false; }
 bool MoeCacheSlotBook::inflight(int slot) const { return checked(slot).inflight; }
+bool MoeCacheSlotBook::replace(
+        int slot, const MoeCacheKey& expected, const MoeCacheKey& replacement) {
+    auto& state = checked(slot);
+    if (!state.key || !(*state.key == expected) || by_key_.count(replacement)) return false;
+    by_key_.emplace(replacement, slot);
+    by_key_.erase(expected);
+    state.key = replacement;
+    ++state.generation;
+    state.inflight = false;
+    if (state.listed) lru_.splice(lru_.end(), lru_, state.position);
+    return true;
+}
+MoeCacheSlotBook::Replacement MoeCacheSlotBook::prepare_replace(
+        int slot, const MoeCacheKey& expected, const MoeCacheKey& replacement) {
+    const auto& state = checked(slot);
+    if (!state.key || !(*state.key == expected) || by_key_.count(replacement))
+        throw std::runtime_error("MoE replacement no longer owns its slot");
+    by_key_.reserve(slots_.size() * 2);
+    std::unordered_map<MoeCacheKey, int, MoeCacheKeyHash> detached;
+    detached.emplace(replacement, slot);
+    Replacement result;
+    result.slot = slot;
+    result.expected = expected;
+    result.replacement = replacement;
+    result.generation = state.generation;
+    result.incoming = detached.extract(replacement);
+    return result;
+}
+bool MoeCacheSlotBook::replacement_valid(const Replacement& change) const {
+    const auto& state = checked(change.slot);
+    return !change.committed && state.key && *state.key == change.expected &&
+        state.generation == change.generation && !by_key_.count(change.replacement);
+}
+bool MoeCacheSlotBook::commit_replace(Replacement& change) {
+    if (!replacement_valid(change)) return false;
+    auto inserted = by_key_.insert(std::move(change.incoming));
+    if (!inserted.inserted) {
+        change.incoming = std::move(inserted.node);
+        return false;
+    }
+    change.original = by_key_.extract(change.expected);
+    auto& state = checked(change.slot);
+    state.key = change.replacement;
+    ++state.generation;
+    state.inflight = false;
+    if (state.listed) lru_.splice(lru_.end(), lru_, state.position);
+    change.committed = true;
+    return true;
+}
+void MoeCacheSlotBook::rollback_replace(Replacement& change) {
+    auto& state = checked(change.slot);
+    if (change.committed) {
+        if (!state.key || !(*state.key == change.replacement) ||
+                state.generation != change.generation + 1)
+            throw std::runtime_error("MoE replacement changed during rollback");
+        change.incoming = by_key_.extract(change.replacement);
+        by_key_.insert(std::move(change.original));
+        state.key = change.expected;
+        state.generation = change.generation;
+        change.committed = false;
+    } else if (!state.key || !(*state.key == change.expected) ||
+            state.generation != change.generation) {
+        return;
+    }
+    state.inflight = false;
+}
 bool MoeCacheSlotBook::discard(const MoeCacheKey& key, int slot, uint64_t generation) {
     auto& state = checked(slot);
     if (!state.key || !(*state.key == key) || state.generation != generation) return false;

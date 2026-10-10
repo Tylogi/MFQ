@@ -262,31 +262,6 @@ std::uint64_t output_hash(array output) {
     return result;
 }
 
-void report_group64_delta(array reference, array candidate) {
-    reference = mlx::core::contiguous(
-        mlx::core::astype(std::move(reference), mlx::core::float32));
-    candidate = mlx::core::contiguous(
-        mlx::core::astype(std::move(candidate), mlx::core::float32));
-    mlx::core::eval(reference, candidate);
-    require(reference.size() == candidate.size(), "comparison shape differs");
-    const auto* expected = reference.data<float>();
-    const auto* actual = candidate.data<float>();
-    std::size_t different = 0;
-    double total_absolute = 0.0;
-    float maximum_absolute = 0.0f;
-    for (std::size_t index = 0; index < reference.size(); ++index) {
-        const float absolute = std::fabs(expected[index] - actual[index]);
-        different += absolute != 0.0f;
-        total_absolute += absolute;
-        maximum_absolute = std::max(maximum_absolute, absolute);
-    }
-    std::cerr
-        << "group64_tile_delta\telements=" << reference.size()
-        << "\tdifferent=" << different
-        << "\tmean_abs=" << std::setprecision(9)
-        << total_absolute / reference.size()
-        << "\tmax_abs=" << maximum_absolute << '\n';
-}
 
 void benchmark_weight(
     std::string_view dtype,
@@ -300,28 +275,6 @@ void benchmark_weight(
     if (const auto* value = std::getenv("MFQ_METAL_VQ_EVAL_BATCH")) {
         eval_batch = std::stoi(value);
         require(eval_batch > 0, "eval batch must be positive");
-    }
-    if (const auto* tile = std::getenv("MFQ_METAL_VQ_COMPARE_GROUP64_TILE")) {
-        const auto* previous = std::getenv(
-            "MFQ_METAL_VQ_GROUP64_OUTPUT_TILE");
-        const std::string saved = previous == nullptr ? "" : previous;
-        const bool had_previous = previous != nullptr;
-        setenv("MFQ_METAL_VQ_GROUP64_OUTPUT_TILE", "legacy", 1);
-        auto reference = weight.matmul(source);
-        mlx::core::eval(reference);
-        setenv("MFQ_METAL_VQ_GROUP64_OUTPUT_TILE", tile, 1);
-        auto candidate = weight.matmul(source);
-        mlx::core::eval(candidate);
-        mlx::core::synchronize();
-        report_group64_delta(std::move(reference), std::move(candidate));
-        if (had_previous) {
-            setenv(
-                "MFQ_METAL_VQ_GROUP64_OUTPUT_TILE",
-                saved.c_str(),
-                1);
-        } else {
-            unsetenv("MFQ_METAL_VQ_GROUP64_OUTPUT_TILE");
-        }
     }
 
     auto result = weight.matmul(source);

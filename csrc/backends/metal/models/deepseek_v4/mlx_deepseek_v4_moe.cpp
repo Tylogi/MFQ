@@ -894,6 +894,9 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 streamed routed component "
                 "dimensions mismatch");
         }
+        for (const auto& name : {streamed_gate_up_name_, streamed_gate_name_,
+                streamed_up_name_, streamed_down_name_})
+            if (!name.empty()) expert_offload_->activate_record(name);
     } else {
         if (layer_ >= static_cast<std::size_t>(
                 config_.n_layers + config_.n_mtp_layers)) {

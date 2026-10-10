@@ -45,7 +45,7 @@ inline float mfq_fp8_sq_e4m3(uchar raw) {
     if (exponent == 0u) {
         value = float(mantissa) * 0x1p-9f;
     } else {
-        ushort half_bits = ushort(((exponent + 8u) << 10u) | (mantissa << 7u));
+        ushort half_bits = ushort((magnitude << 7u) + 0x2000u);
         value = float(as_type<half>(half_bits));
     }
     return (raw & 0x80u) == 0u ? value : -value;
@@ -64,20 +64,16 @@ inline float mfq_fp8_sq_scale(
     }
     if (scale_kind == 2u) {
         uint byte = index * 2u;
-        uint word = uint(scales[byte]) | (uint(scales[byte + 1u]) << 8u);
+        uint word = uint(as_type<ushort>(*(device const packed_uchar2*)(scales + byte)));
         return as_type<float>(word << 16u);
     }
     if (scale_kind == 3u) {
         uint byte = index * 2u;
-        ushort word = ushort(
-            uint(scales[byte]) | (uint(scales[byte + 1u]) << 8u));
+        ushort word = as_type<ushort>(*(device const packed_uchar2*)(scales + byte));
         return float(as_type<half>(word));
     }
     uint byte = index * 4u;
-    uint word = uint(scales[byte])
-        | (uint(scales[byte + 1u]) << 8u)
-        | (uint(scales[byte + 2u]) << 16u)
-        | (uint(scales[byte + 3u]) << 24u);
+    uint word = as_type<uint>(*(device const packed_uchar4*)(scales + byte));
     return as_type<float>(word);
 }
 
@@ -127,50 +123,331 @@ inline float mfq_fp8_sq_weight(
         blob + scales_offset, scale_index, scale_kind);
     return mfq_fp8_sq_e4m3(code) * scale;
 }
+
+template <uint WIDTH, typename T>
+__attribute__((always_inline)) inline float4 mfq_fp8_sq_load4(
+    device const T* input, uint offset, uint column) {
+    if (WIDTH % 4u == 0u || column + 4u <= WIDTH) {
+        if constexpr (sizeof(T) == 2u) {
+            return float4(*(device const packed_half4*)(input + offset));
+        } else {
+            return float4(*(device const packed_float4*)(input + offset));
+        }
+    }
+    return float4(float(input[offset]),
+        column + 1u < WIDTH ? float(input[offset + 1u]) : 0.0f,
+        column + 2u < WIDTH ? float(input[offset + 2u]) : 0.0f,
+        column + 3u < WIDTH ? float(input[offset + 3u]) : 0.0f);
+}
+
+template <uint WIDTH, typename T>
+inline float4 mfq_fp8_sq_load4(constant const T* input, uint offset, uint column) {
+    return float4(float(input[offset]),
+        column + 1u < WIDTH ? float(input[offset + 1u]) : 0.0f,
+        column + 2u < WIDTH ? float(input[offset + 2u]) : 0.0f,
+        column + 3u < WIDTH ? float(input[offset + 3u]) : 0.0f);
+}
+
+template <uint WIDTH, uint INPUT_ROWS, typename Blob, typename RowQ, typename RowOffsets, typename Palette>
+__attribute__((always_inline)) inline float4 mfq_fp8_sq_weight4(
+    Blob blob, RowQ row_q, RowOffsets row_offsets, Palette palette_values,
+    uint output, uint column,
+    uint palettes_offset, uint symbols_offset, uint scales_offset,
+    uint scale_kind, uint block_rows, uint block_columns, uint scale_columns
+) {
+    if (WIDTH % 4u != 0u && column + 4u > WIDTH) {
+        float4 result = float4(0.0f);
+        for (uint element = 0u; element < 4u && column + element < WIDTH; ++element) {
+            result[element] = mfq_fp8_sq_weight(blob, row_q, row_offsets, output,
+                column + element, palettes_offset, symbols_offset, scales_offset,
+                scale_kind, block_rows, block_columns, scale_columns);
+        }
+        return result;
+    }
+    uint bits = uint(row_q[output]);
+    auto symbols = blob + symbols_offset + row_offsets[output];
+    uchar4 codes;
+    if (bits == 8u) {
+        codes = *(device const packed_uchar4*)(symbols + column);
+    } else {
+        uint bit = column * bits;
+        uint byte = bit >> 3u;
+        uint shift = bit & 7u;
+        uint packed;
+        if (bits == 7u) {
+            packed = as_type<uint>(*(device const packed_uchar4*)(symbols + byte));
+        } else {
+            uint span = (INPUT_ROWS == 1u ? 0u : shift) + bits * 4u;
+            packed = uint(symbols[byte]);
+            if (span > 8u) packed |= uint(symbols[byte + 1u]) << 8u;
+            if (span > 16u) packed |= uint(symbols[byte + 2u]) << 16u;
+        }
+        uint4 indices = (uint4(packed >> shift) >> (uint4(0u, 1u, 2u, 3u) * bits))
+            & ((1u << bits) - 1u);
+        uint palette = (1u << bits) - 2u;
+        float4 values = float4(palette_values[palette + indices.x],
+            palette_values[palette + indices.y], palette_values[palette + indices.z],
+            palette_values[palette + indices.w]);
+        uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+        return values * mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+    }
+    uint4 raw = uint4(codes);
+    uint4 magnitudes = raw & 127u;
+    ushort4 half_bits = ushort4(((magnitudes << 7u) + 0x2000u)
+        | ((raw & 128u) << 8u));
+    float4 values = float4(as_type<half4>(half_bits));
+    float4 subnormal = float4(raw & 7u) * 0x1p-9f;
+    subnormal = select(subnormal, -subnormal, (raw & 128u) != 0u);
+    values = select(values, subnormal, magnitudes < 8u);
+    uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+    return values * mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+}
+
+inline float2 mfq_fp8_sq_pair(device const half* values, uint index) {
+    return float2(*(device const packed_half2*)(values + index * 2u));
+}
+
+inline float2 mfq_fp8_sq_pair(constant const half* values, uint index) {
+    return float2(values[index * 2u], values[index * 2u + 1u]);
+}
+
+template <uint BITS, uint WIDTH, uint INPUT_ROWS, uint LANES,
+          typename Symbols, typename Scales, typename Palette, typename Pairs, typename XStream>
+__attribute__((always_inline)) inline void mfq_fp8_sq_high_dot(
+    Symbols symbols, Scales scales, Palette palette_values, Pairs palette_pairs, XStream x,
+    uint first_row, uint rows, uint input_divisor, uint lane,
+    uint scale_base, uint scale_kind, uint block_columns, thread float* accum
+) {
+    for (uint column = lane * 4u; column < WIDTH; column += LANES * 4u) {
+        uint bit = column * BITS;
+        uint byte = bit >> 3u;
+        uint packed = uint(symbols[byte]) | (uint(symbols[byte + 1u]) << 8u);
+        if constexpr (BITS >= 5u) packed |= uint(symbols[byte + 2u]) << 16u;
+        packed >>= bit & 7u;
+        float4 weight;
+        if constexpr (BITS == 6u) {
+            uint4 indices = (uint4(packed) >> uint4(0u, 6u, 12u, 18u)) & 63u;
+            weight = float4(palette_values[62u + indices.x], palette_values[62u + indices.y],
+                palette_values[62u + indices.z], palette_values[62u + indices.w]);
+        } else {
+            constexpr uint MASK = (1u << (2u * BITS)) - 1u;
+            auto pairs = palette_pairs + 2u * ((1u << (2u * BITS)) - 64u) / 3u;
+            weight = float4(mfq_fp8_sq_pair(pairs, packed & MASK),
+                mfq_fp8_sq_pair(pairs, (packed >> (2u * BITS)) & MASK));
+        }
+        float scale = mfq_fp8_sq_scale(scales, scale_base + column / block_columns, scale_kind);
+        if constexpr (INPUT_ROWS > 4u) weight *= scale;
+        for (uint local = 0u; local < INPUT_ROWS; ++local) {
+            uint row = first_row + local;
+            if (row < rows) {
+                uint input = (row / input_divisor) * WIDTH + column;
+                float value = dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight);
+                if constexpr (INPUT_ROWS <= 4u) value *= scale;
+                accum[local] += value;
+            }
+        }
+    }
+}
+
+template <uint WIDTH, uint INPUT_ROWS, uint LANES, bool HAS_LOW_Q, uint FAST_Q_MAX,
+          typename Blob, typename RowQ, typename RowOffsets, typename Palette,
+          typename Quads, typename Pairs, typename XStream>
+__attribute__((always_inline)) inline void mfq_fp8_sq_dot(
+    Blob blob, RowQ row_q, RowOffsets row_offsets, Palette palette_values,
+    Quads palette_quads, Pairs palette_pairs,
+    XStream x, uint output, uint first_row, uint rows, uint input_divisor, uint lane,
+    uint palettes_offset, uint symbols_offset, uint scales_offset,
+    uint scale_kind, uint block_rows, uint block_columns, uint scale_columns,
+    thread float* accum
+) {
+    if constexpr (HAS_LOW_Q && WIDTH % 8u == 0u) {
+        constexpr bool WIDE_Q2 = LANES == 16u && WIDTH % 16u == 0u;
+        uint bits = uint(row_q[output]);
+        if (WIDE_Q2 && bits == 2u) {
+            auto symbols = blob + symbols_offset + row_offsets[output];
+            for (uint column = lane * 16u; column < WIDTH; column += LANES * 16u) {
+                uint packed = as_type<uint>(*(device const packed_uchar4*)(symbols + column / 4u));
+                float4 weight0 = mfq_fp8_sq_load4<4u>(palette_quads, (packed & 255u) * 4u, 0u);
+                float4 weight1 = mfq_fp8_sq_load4<4u>(palette_quads, ((packed >> 8u) & 255u) * 4u, 0u);
+                float4 weight2 = mfq_fp8_sq_load4<4u>(palette_quads, ((packed >> 16u) & 255u) * 4u, 0u);
+                float4 weight3 = mfq_fp8_sq_load4<4u>(palette_quads, (packed >> 24u) * 4u, 0u);
+                uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+                float scale = mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+                for (uint local = 0u; local < INPUT_ROWS; ++local) {
+                    uint row = first_row + local;
+                    if (row < rows) {
+                        uint input = (row / input_divisor) * WIDTH + column;
+                        float value = dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight0)
+                            + dot(mfq_fp8_sq_load4<WIDTH>(x, input + 4u, column + 4u), weight1)
+                            + dot(mfq_fp8_sq_load4<WIDTH>(x, input + 8u, column + 8u), weight2)
+                            + dot(mfq_fp8_sq_load4<WIDTH>(x, input + 12u, column + 12u), weight3);
+                        accum[local] += scale * value;
+                    }
+                }
+            }
+            return;
+        }
+        if (bits == 3u || (!WIDE_Q2 && bits == 2u)) {
+            auto symbols = blob + symbols_offset + row_offsets[output];
+            for (uint column = lane * 8u; column < WIDTH; column += LANES * 8u) {
+                uint byte = column / 8u * (WIDE_Q2 ? 3u : bits);
+                uint packed = uint(symbols[byte]) | (uint(symbols[byte + 1u]) << 8u);
+                if (WIDE_Q2 || bits == 3u) packed |= uint(symbols[byte + 2u]) << 16u;
+                float4 weight0, weight1;
+                if (!WIDE_Q2 && bits == 2u) {
+                    weight0 = mfq_fp8_sq_load4<4u>(palette_quads, (packed & 255u) * 4u, 0u);
+                    weight1 = mfq_fp8_sq_load4<4u>(palette_quads, ((packed >> 8u) & 255u) * 4u, 0u);
+                } else {
+                    weight0 = float4(mfq_fp8_sq_pair(palette_pairs, packed & 63u),
+                        mfq_fp8_sq_pair(palette_pairs, (packed >> 6u) & 63u));
+                    weight1 = float4(mfq_fp8_sq_pair(palette_pairs, (packed >> 12u) & 63u),
+                        mfq_fp8_sq_pair(palette_pairs, (packed >> 18u) & 63u));
+                }
+                uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+                float scale = mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+                for (uint local = 0u; local < INPUT_ROWS; ++local) {
+                    uint row = first_row + local;
+                    if (row < rows) {
+                        uint input = (row / input_divisor) * WIDTH + column;
+                        accum[local] += scale * (dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight0)
+                            + dot(mfq_fp8_sq_load4<WIDTH>(x, input + 4u, column + 4u), weight1));
+                    }
+                }
+            }
+            return;
+        }
+    }
+    if constexpr (FAST_Q_MAX >= 4u && WIDTH % 4u == 0u) {
+        uint bits = uint(row_q[output]);
+        auto symbols = blob + symbols_offset + row_offsets[output];
+        auto scales = blob + scales_offset;
+        uint scale_base = (output / block_rows) * scale_columns;
+        if (bits == 4u) {
+            mfq_fp8_sq_high_dot<4u, WIDTH, INPUT_ROWS, LANES>(symbols, scales,
+                palette_values, palette_pairs, x, first_row, rows, input_divisor,
+                lane, scale_base, scale_kind, block_columns, accum);
+            return;
+        }
+        if (FAST_Q_MAX >= 5u && bits == 5u) {
+            mfq_fp8_sq_high_dot<5u, WIDTH, INPUT_ROWS, LANES>(symbols, scales,
+                palette_values, palette_pairs, x, first_row, rows, input_divisor,
+                lane, scale_base, scale_kind, block_columns, accum);
+            return;
+        }
+        if (FAST_Q_MAX >= 6u && bits == 6u) {
+            mfq_fp8_sq_high_dot<6u, WIDTH, INPUT_ROWS, LANES>(symbols, scales,
+                palette_values, palette_pairs, x, first_row, rows, input_divisor,
+                lane, scale_base, scale_kind, block_columns, accum);
+            return;
+        }
+    }
+    if (uint(row_q[output]) == 1u) {
+        float low = palette_values[0];
+        float high = palette_values[1];
+        auto symbols = blob + symbols_offset + row_offsets[output];
+        for (uint column = lane * 8u; column < WIDTH; column += LANES * 8u) {
+            uint packed = uint(symbols[column >> 3u]);
+            uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+            float scale = mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+            float4 scaled_low = float4(low * scale);
+            float4 scaled_high = float4(high * scale);
+            float4 weight0 = select(scaled_low, scaled_high,
+                (uint4(packed) & uint4(1u, 2u, 4u, 8u)) != 0u);
+            float4 weight1 = select(scaled_low, scaled_high,
+                (uint4(packed >> 4u) & uint4(1u, 2u, 4u, 8u)) != 0u);
+            for (uint local = 0u; local < INPUT_ROWS; ++local) {
+                uint row = first_row + local;
+                if (row < rows) {
+                    uint input = (row / input_divisor) * WIDTH + column;
+                    float value = dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight0);
+                    if (WIDTH % 8u == 0u || column + 4u < WIDTH) {
+                        value += dot(mfq_fp8_sq_load4<WIDTH>(x, input + 4u, column + 4u), weight1);
+                    }
+                    accum[local] += value;
+                }
+            }
+        }
+    } else if (WIDTH % 4u == 0u && uint(row_q[output]) == 8u) {
+        auto symbols = blob + symbols_offset + row_offsets[output];
+        for (uint column = lane * 4u; column < WIDTH; column += LANES * 4u) {
+            uchar4 codes = *(device const packed_uchar4*)(symbols + column);
+            uint scale_index = (output / block_rows) * scale_columns + column / block_columns;
+            float scale = mfq_fp8_sq_scale(blob + scales_offset, scale_index, scale_kind);
+            float4 weight = float4(palette_values[256u + uint(codes.x)],
+                palette_values[256u + uint(codes.y)], palette_values[256u + uint(codes.z)],
+                palette_values[256u + uint(codes.w)]) * scale;
+            for (uint local = 0u; local < INPUT_ROWS; ++local) {
+                uint row = first_row + local;
+                if (row < rows) {
+                    uint input = (row / input_divisor) * WIDTH + column;
+                    accum[local] += dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight);
+                }
+            }
+        }
+    } else {
+        for (uint column = lane * 4u; column < WIDTH; column += LANES * 4u) {
+            float4 weight = mfq_fp8_sq_weight4<WIDTH, INPUT_ROWS>(
+                blob, row_q, row_offsets, palette_values, output, column,
+                palettes_offset, symbols_offset, scales_offset, scale_kind,
+                block_rows, block_columns, scale_columns);
+            for (uint local = 0u; local < INPUT_ROWS; ++local) {
+                uint row = first_row + local;
+                if (row < rows) {
+                    uint input = (row / input_divisor) * WIDTH + column;
+                    accum[local] += dot(mfq_fp8_sq_load4<WIDTH>(x, input, column), weight);
+                }
+            }
+        }
+    }
+}
 )METAL";
 
-constexpr const char* kMxfp8SqDequantize = R"METAL(
-    uint index = thread_position_in_grid.x;
+constexpr const char* kFp8SqDequantize = R"METAL(
+    uint index = thread_position_in_grid.x * 2u;
     if (index >= uint(WEIGHTS)) {
         return;
     }
     uint output = index / uint(K);
     uint column = index - output * uint(K);
-    y[index] = T(mfq_fp8_sq_weight(
+    float first = mfq_fp8_sq_weight(
         blob, row_q, row_symbol_byte_offsets, output, column,
         uint(PALETTES_OFFSET), uint(SYMBOLS_OFFSET), uint(SCALES_OFFSET),
         uint(SCALE_KIND), uint(BLOCK_ROWS), uint(BLOCK_COLUMNS),
-        uint(SCALE_COLUMNS)));
-)METAL";
-
-constexpr const char* kFp8_128SqDequantize = R"METAL(
-    uint index = thread_position_in_grid.x;
-    if (index >= uint(WEIGHTS)) {
+        uint(SCALE_COLUMNS));
+    if (index + 1u >= uint(WEIGHTS)) {
+        y[index] = T(first);
         return;
     }
-    uint output = index / uint(K);
-    uint column = index - output * uint(K);
-    y[index] = T(mfq_fp8_sq_weight(
-        blob, row_q, row_symbol_byte_offsets, output, column,
+    uint next_output = (index + 1u) / uint(K);
+    uint next_column = index + 1u - next_output * uint(K);
+    float second = mfq_fp8_sq_weight(
+        blob, row_q, row_symbol_byte_offsets, next_output, next_column,
         uint(PALETTES_OFFSET), uint(SYMBOLS_OFFSET), uint(SCALES_OFFSET),
         uint(SCALE_KIND), uint(BLOCK_ROWS), uint(BLOCK_COLUMNS),
-        uint(SCALE_COLUMNS)));
+        uint(SCALE_COLUMNS));
+    if constexpr (sizeof(T) == 2u) {
+        *(device packed_half2*)(y + index) = packed_half2(first, second);
+    } else {
+        *(device packed_float2*)(y + index) = packed_float2(first, second);
+    }
 )METAL";
 
-constexpr const char* kMxfp8SqMatmul = R"METAL(
+constexpr const char* kFp8SqMatmul = R"METAL(
     const int M = ROUTED != 0 ? expert_ids_shape[0] * ROUTES : x_shape[0];
-    uint lane = thread_index_in_simdgroup;
+    constexpr uint OUTPUTS_PER_SIMD = 32u / uint(K_LANES);
+    constexpr uint OUTPUT_TILES = (uint(LOGICAL_OUT) + OUTPUTS_PER_SIMD - 1u) / OUTPUTS_PER_SIMD;
+    uint lane = thread_index_in_simdgroup % uint(K_LANES);
     uint workgroup = thread_position_in_grid.x >> 5u;
-    uint logical_output = workgroup % uint(LOGICAL_OUT);
-    uint row_tile = workgroup / uint(LOGICAL_OUT);
+    uint logical_output = workgroup % OUTPUT_TILES * OUTPUTS_PER_SIMD
+        + thread_index_in_simdgroup / uint(K_LANES);
+    uint row_tile = workgroup / OUTPUT_TILES;
     uint first_row = row_tile * uint(TILE_M);
-    if (first_row >= uint(M)) {
+    if (first_row >= uint(M) || logical_output >= uint(LOGICAL_OUT)) {
         return;
     }
     int local_expert = 0;
     bool route_valid = true;
     uint output = logical_output;
-    uint input_row_base = first_row;
     if (uint(ROUTED) != 0u) {
         int expert = expert_ids[first_row];
         route_valid = expert >= 0 && expert < int(EXPERT_MAP_SIZE);
@@ -179,35 +456,27 @@ constexpr const char* kMxfp8SqMatmul = R"METAL(
         output = route_valid
             ? uint(local_expert) * uint(OUT_PER_EXPERT) + logical_output
             : 0u;
-        input_row_base = uint(SHARED_INPUT) != 0u
-            ? first_row / uint(ROUTES)
-            : first_row;
     }
     float accum[TILE_M];
     for (uint local = 0u; local < uint(TILE_M); ++local) {
         accum[local] = 0.0f;
     }
-    for (uint column = lane; column < uint(K); column += 32u) {
-        float weight = mfq_fp8_sq_weight(
-            blob, row_q, row_symbol_byte_offsets, output, column,
-            uint(PALETTES_OFFSET), uint(SYMBOLS_OFFSET), uint(SCALES_OFFSET),
-            uint(SCALE_KIND), uint(BLOCK_ROWS), uint(BLOCK_COLUMNS),
-            uint(SCALE_COLUMNS));
-        for (uint local = 0u; local < uint(TILE_M); ++local) {
-            uint row = first_row + local;
-            if (row < uint(M)) {
-                uint input_row = uint(ROUTED) != 0u
-                    ? (uint(SHARED_INPUT) != 0u
-                        ? row / uint(ROUTES)
-                        : row)
-                    : row;
-                accum[local] += float(x[input_row * uint(K) + column]) * weight;
-            }
-        }
-    }
+    mfq_fp8_sq_dot<uint(K), uint(TILE_M), uint(K_LANES), bool(HAS_LOW_Q), uint(FAST_Q_MAX)>(
+        blob, row_q, row_symbol_byte_offsets, palette_values, palette_quads, palette_pairs, x, output,
+        first_row, uint(M), uint(ROUTED) != 0u && uint(SHARED_INPUT) != 0u
+            ? uint(ROUTES) : 1u, lane,
+        uint(PALETTES_OFFSET), uint(SYMBOLS_OFFSET), uint(SCALES_OFFSET),
+        uint(SCALE_KIND), uint(BLOCK_ROWS), uint(BLOCK_COLUMNS), uint(SCALE_COLUMNS), accum);
     for (uint local = 0u; local < uint(TILE_M); ++local) {
         uint row = first_row + local;
-        float total = simd_sum(accum[local]);
+        float total = accum[local];
+        if constexpr (K_LANES == 32) {
+            total = simd_sum(total);
+        } else {
+            for (uint offset = uint(K_LANES) / 2u; offset > 0u; offset >>= 1u) {
+                total += simd_shuffle_down(total, offset);
+            }
+        }
         if (lane == 0u && row < uint(M)) {
             y[row * uint(LOGICAL_OUT) + logical_output] = T(
                 route_valid ? total : 0.0f);
@@ -215,59 +484,6 @@ constexpr const char* kMxfp8SqMatmul = R"METAL(
     }
 )METAL";
 
-constexpr const char* kFp8_128SqMatmul = R"METAL(
-    const int M = ROUTED != 0 ? expert_ids_shape[0] * ROUTES : x_shape[0];
-    uint lane = thread_index_in_simdgroup;
-    uint workgroup = thread_position_in_grid.x >> 5u;
-    uint logical_output = workgroup % uint(LOGICAL_OUT);
-    uint row_tile = workgroup / uint(LOGICAL_OUT);
-    uint first_row = row_tile * uint(TILE_M);
-    if (first_row >= uint(M)) {
-        return;
-    }
-    int local_expert = 0;
-    bool route_valid = true;
-    uint output = logical_output;
-    if (uint(ROUTED) != 0u) {
-        int expert = expert_ids[first_row];
-        route_valid = expert >= 0 && expert < int(EXPERT_MAP_SIZE);
-        local_expert = route_valid ? expert_map[expert] : -1;
-        route_valid = route_valid && local_expert >= 0;
-        output = route_valid
-            ? uint(local_expert) * uint(OUT_PER_EXPERT) + logical_output
-            : 0u;
-    }
-    float accum[TILE_M];
-    for (uint local = 0u; local < uint(TILE_M); ++local) {
-        accum[local] = 0.0f;
-    }
-    for (uint column = lane; column < uint(K); column += 32u) {
-        float weight = mfq_fp8_sq_weight(
-            blob, row_q, row_symbol_byte_offsets, output, column,
-            uint(PALETTES_OFFSET), uint(SYMBOLS_OFFSET), uint(SCALES_OFFSET),
-            uint(SCALE_KIND), uint(BLOCK_ROWS), uint(BLOCK_COLUMNS),
-            uint(SCALE_COLUMNS));
-        for (uint local = 0u; local < uint(TILE_M); ++local) {
-            uint row = first_row + local;
-            if (row < uint(M)) {
-                uint input_row = uint(ROUTED) != 0u
-                    ? (uint(SHARED_INPUT) != 0u
-                        ? row / uint(ROUTES)
-                        : row)
-                    : row;
-                accum[local] += float(x[input_row * uint(K) + column]) * weight;
-            }
-        }
-    }
-    for (uint local = 0u; local < uint(TILE_M); ++local) {
-        uint row = first_row + local;
-        float total = simd_sum(accum[local]);
-        if (lane == 0u && row < uint(M)) {
-            y[row * uint(LOGICAL_OUT) + logical_output] = T(
-                route_valid ? total : 0.0f);
-        }
-    }
-)METAL";
 
 // One metadata-driven packed input-gradient kernel body is compiled under
 // separate MXFP8-SQ and FP8-128SQ entry points.  It consumes q=1..8 rows
@@ -415,7 +631,7 @@ mlx::core::fast::CustomKernelFunction make_kernel(
         matmul
             ? std::vector<std::string>{
                   "blob", "row_q", "row_symbol_byte_offsets", "x",
-                  "expert_ids", "expert_map"}
+                  "expert_ids", "expert_map", "palette_values", "palette_quads", "palette_pairs"}
             : std::vector<std::string>{
                   "blob", "row_q", "row_symbol_byte_offsets"},
         {"y"},
@@ -443,25 +659,25 @@ mlx::core::fast::CustomKernelFunction make_backward_kernel(
 
 const mlx::core::fast::CustomKernelFunction& mxfp8_dequantize_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_mxfp8_sq_dequantize", kMxfp8SqDequantize, false);
+        "mfq_cpp_mxfp8_sq_dequantize", kFp8SqDequantize, false);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction& fp8_128_dequantize_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_fp8_128_sq_dequantize", kFp8_128SqDequantize, false);
+        "mfq_cpp_fp8_128_sq_dequantize", kFp8SqDequantize, false);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction& mxfp8_matmul_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_mxfp8_sq_matmul", kMxfp8SqMatmul, true);
+        "mfq_cpp_mxfp8_sq_matmul", kFp8SqMatmul, true);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction& fp8_128_matmul_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_fp8_128_sq_matmul", kFp8_128SqMatmul, true);
+        "mfq_cpp_fp8_128_sq_matmul", kFp8SqMatmul, true);
     return kernel;
 }
 
@@ -484,11 +700,21 @@ int checked_int(std::size_t value, const char* name) {
     return static_cast<int>(value);
 }
 
+unsigned maximum_fast_q(unsigned q_mask, bool grouped = false) {
+    if (grouped && (q_mask & (q_mask - 1u)) != 0u) return (q_mask & 4u) != 0u ? 3 : 0;
+    for (unsigned bits = 6; bits >= 3; --bits) {
+        if ((q_mask & (1u << (bits - 1))) != 0) return bits;
+    }
+    return 0;
+}
+
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 templates(const MlxFp8SqWeight& weight, Dtype dtype) {
     const auto& layout = weight.wire_layout();
     return {
         {"T", dtype},
+        {"HAS_LOW_Q", (weight.descriptor().q_mask & 6u) != 0},
+        {"FAST_Q_MAX", static_cast<int>(maximum_fast_q(weight.descriptor().q_mask))},
         {"K", layout.width},
         {"OUT", layout.outputs},
         {"WEIGHTS", checked_int(
@@ -528,7 +754,7 @@ const mlx::core::fast::CustomKernelFunction& backward_kernel(
 std::vector<std::string> projection_group_input_names(
     std::size_t projections) {
     std::vector<std::string> names;
-    names.reserve(projections * 3 + 1);
+    names.reserve(projections * 6 + 1);
     for (std::size_t projection = 0;
          projection < projections;
          ++projection) {
@@ -536,6 +762,9 @@ std::vector<std::string> projection_group_input_names(
         names.push_back("blob_" + suffix);
         names.push_back("row_q_" + suffix);
         names.push_back("row_symbol_byte_offsets_" + suffix);
+        names.push_back("palette_values_" + suffix);
+        names.push_back("palette_quads_" + suffix);
+        names.push_back("palette_pairs_" + suffix);
     }
     names.emplace_back("x");
     return names;
@@ -544,17 +773,22 @@ std::vector<std::string> projection_group_input_names(
 std::string make_projection_group_source(std::size_t projections) {
     std::string source = R"METAL(
     const int M = x_shape[0];
-    uint lane = thread_index_in_simdgroup;
+    constexpr uint OUTPUTS_PER_SIMD = 32u / uint(K_LANES);
+    constexpr uint OUTPUT_TILES = (uint(TOTAL_OUT) + OUTPUTS_PER_SIMD - 1u) / OUTPUTS_PER_SIMD;
+    uint lane = thread_index_in_simdgroup % uint(K_LANES);
     uint workgroup = thread_position_in_grid.x >> 5u;
-    uint logical_output = workgroup % uint(TOTAL_OUT);
-    uint row_tile = workgroup / uint(TOTAL_OUT);
+    uint logical_output = workgroup % OUTPUT_TILES * OUTPUTS_PER_SIMD
+        + thread_index_in_simdgroup / uint(K_LANES);
+    uint row_tile = workgroup / OUTPUT_TILES;
     uint first_row = row_tile * uint(TILE_M);
-    if (first_row >= uint(M)) {
+    if (first_row >= uint(M) || logical_output >= uint(TOTAL_OUT)) {
         return;
     }
 
-    uint local_output = 0u;
-    uint projection = 0u;
+    float accum[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accum[local] = 0.0f;
+    }
 )METAL";
     for (std::size_t projection = 0;
          projection < projections;
@@ -562,53 +796,35 @@ std::string make_projection_group_source(std::size_t projections) {
         const auto suffix = std::to_string(projection);
         source += projection == 0 ? "    if (" : "    else if (";
         source += "logical_output < uint(P" + suffix + "_END)) {\n";
-        source += "        projection = " + suffix + "u;\n";
-        source += "        local_output = logical_output - uint(P" + suffix
-            + "_OFFSET);\n"
-              "    }\n";
-    }
-    source += R"METAL(
-    float accum[TILE_M];
-    for (uint local = 0u; local < uint(TILE_M); ++local) {
-        accum[local] = 0.0f;
-    }
-    for (uint column = lane; column < uint(K); column += 32u) {
-        float weight = 0.0f;
-)METAL";
-    for (std::size_t projection = 0;
-         projection < projections;
-         ++projection) {
-        const auto suffix = std::to_string(projection);
-        source += projection == 0
-            ? "        if ("
-            : "        else if (";
-        source += "projection == " + suffix + "u) {\n";
+        source += "        uint local_output = logical_output - uint(P" + suffix
+            + "_OFFSET);\n";
         source +=
-            "            weight = mfq_fp8_sq_weight(\n"
+            "            mfq_fp8_sq_dot<uint(K), uint(TILE_M), uint(K_LANES), bool(P" + suffix
+            + "_HAS_LOW_Q), uint(P" + suffix + "_FAST_Q_MAX)>(\n"
             "                blob_" + suffix + ", row_q_" + suffix
-            + ", row_symbol_byte_offsets_" + suffix + ",\n"
-            "                local_output, column,\n"
+            + ", row_symbol_byte_offsets_" + suffix + ", palette_values_" + suffix
+            + ", palette_quads_" + suffix + ", palette_pairs_" + suffix + ",\n"
+            "                x, local_output, first_row, uint(M), 1u, lane,\n"
             "                uint(P" + suffix + "_PALETTES_OFFSET),\n"
             "                uint(P" + suffix + "_SYMBOLS_OFFSET),\n"
             "                uint(P" + suffix + "_SCALES_OFFSET),\n"
             "                uint(P" + suffix + "_SCALE_KIND),\n"
             "                uint(P" + suffix + "_BLOCK_ROWS),\n"
             "                uint(P" + suffix + "_BLOCK_COLUMNS),\n"
-            "                uint(P" + suffix + "_SCALE_COLUMNS));\n"
+            "                uint(P" + suffix + "_SCALE_COLUMNS), accum);\n"
             "        }\n";
     }
     source += R"METAL(
-        for (uint local = 0u; local < uint(TILE_M); ++local) {
-            uint row = first_row + local;
-            if (row < uint(M)) {
-                accum[local] +=
-                    float(x[row * uint(K) + column]) * weight;
-            }
-        }
-    }
     for (uint local = 0u; local < uint(TILE_M); ++local) {
         uint row = first_row + local;
-        float total = simd_sum(accum[local]);
+        float total = accum[local];
+        if constexpr (K_LANES == 32) {
+            total = simd_sum(total);
+        } else {
+            for (uint offset = uint(K_LANES) / 2u; offset > 0u; offset >>= 1u) {
+                total += simd_shuffle_down(total, offset);
+            }
+        }
         if (lane == 0u && row < uint(M)) {
             y[row * uint(TOTAL_OUT) + logical_output] = T(total);
         }
@@ -659,12 +875,18 @@ MlxFp8SqWeight::MlxFp8SqWeight(
     array blob,
     array row_q,
     array row_symbol_byte_offsets,
+    array palette_values,
+    array palette_quads,
+    array palette_pairs,
     mfq::fp8sq::Layout layout,
     Fp8SqDescriptor descriptor)
     : dtype_(std::move(dtype)),
       blob_(std::move(blob)),
       row_q_(std::move(row_q)),
       row_symbol_byte_offsets_(std::move(row_symbol_byte_offsets)),
+      palette_values_(std::move(palette_values)),
+      palette_quads_(std::move(palette_quads)),
+      palette_pairs_(std::move(palette_pairs)),
       layout_(std::move(layout)),
       descriptor_(descriptor) {}
 
@@ -683,6 +905,16 @@ MlxFp8SqWeight MlxFp8SqWeight::from_blob(
         throw std::runtime_error("FP8-SQ payload exceeds MLX limits");
     }
     const auto rows = mfq::fp8sq::row_metadata(blob.data(), layout);
+    std::array<float, mfq::fp8sq::kPaletteBytes + 256> palette_values{};
+    for (std::size_t index = 0; index < palette_values.size(); ++index) {
+        const auto code = index < mfq::fp8sq::kPaletteBytes ? blob[layout.palettes + index]
+            : static_cast<std::uint8_t>(index - mfq::fp8sq::kPaletteBytes);
+        const int exponent = (code & 127u) >> 3u;
+        const int mantissa = code & 7u;
+        const auto magnitude = exponent == 0 ? float(mantissa) * 0x1p-9f
+            : std::ldexp(1.0f + float(mantissa) / 8.0f, exponent - 7);
+        palette_values[index] = (code & 128u) != 0u ? -magnitude : magnitude;
+    }
     Fp8SqDescriptor descriptor;
     descriptor.format_version = layout.version;
     descriptor.aggregate_bpw = static_cast<double>(
@@ -690,6 +922,7 @@ MlxFp8SqWeight MlxFp8SqWeight::from_blob(
         (static_cast<double>(layout.outputs) * layout.width);
     std::array<std::size_t, 8> q_counts{};
     for (const auto q : rows.q) {
+        descriptor.q_mask |= 1u << (q - 1);
         ++q_counts[static_cast<std::size_t>(q - 1)];
     }
     for (const auto count : q_counts) {
@@ -699,11 +932,42 @@ MlxFp8SqWeight MlxFp8SqWeight::from_blob(
         const double probability = static_cast<double>(count) / layout.outputs;
         descriptor.distribution_entropy -= probability * std::log2(probability);
     }
+    std::vector<mlx::core::float16_t> palette_quads;
+    if ((descriptor.q_mask & 2u) != 0) {
+        palette_quads.reserve(1024);
+        for (unsigned code = 0; code < 256; ++code) {
+            for (unsigned element = 0; element < 4; ++element) {
+                const auto index = (code >> (element * 2u)) & 3u;
+                palette_quads.push_back(mlx::core::float16_t(palette_values[2u + index]));
+            }
+        }
+    } else {
+        palette_quads.push_back(mlx::core::float16_t(0.0f));
+    }
+    std::vector<mlx::core::float16_t> palette_pairs;
+    const unsigned maximum_q = maximum_fast_q(descriptor.q_mask & 31u);
+    if (maximum_q != 0) {
+        const unsigned count = 2u * ((1u << (2u * (maximum_q + 1u))) - 64u) / 3u;
+        palette_pairs.reserve(count);
+        for (unsigned bits = 3; bits <= maximum_q; ++bits) {
+            const unsigned palette = (1u << bits) - 2u;
+            for (unsigned code = 0; code < (1u << (2u * bits)); ++code) {
+                palette_pairs.push_back(mlx::core::float16_t(
+                    palette_values[palette + (code & ((1u << bits) - 1u))]));
+                palette_pairs.push_back(mlx::core::float16_t(palette_values[palette + (code >> bits)]));
+            }
+        }
+    } else {
+        palette_pairs.push_back(mlx::core::float16_t(0.0f));
+    }
     return MlxFp8SqWeight(
         std::string(dtype),
         array(blob.begin(), Shape{static_cast<int>(blob.size())}),
         array(rows.q.begin(), Shape{layout.outputs}),
         array(rows.symbol_byte_offsets.begin(), Shape{layout.outputs}),
+        array(palette_values.begin(), Shape{static_cast<int>(palette_values.size())}),
+        array(palette_quads.begin(), Shape{static_cast<int>(palette_quads.size())}),
+        array(palette_pairs.begin(), Shape{static_cast<int>(palette_pairs.size())}),
         layout,
         descriptor);
 }
@@ -715,7 +979,8 @@ array MlxFp8SqWeight::dequantize(Dtype dtype) const {
     const auto count = static_cast<std::size_t>(input_size()) * output_size();
     checked_int(count, "dequantization grid");
     constexpr int threads = 256;
-    const auto grid = (count + threads - 1) / threads * threads;
+    const auto work = (count + 1) / 2;
+    const auto grid = (work + threads - 1) / threads * threads;
     auto outputs = dequantize_kernel(*this)(
         {blob_, row_q_, row_symbol_byte_offsets_},
         {Shape{output_size(), input_size()}},
@@ -759,8 +1024,12 @@ array MlxFp8SqWeight::matmul(const array& input) const {
     }
     const int tile_rows = rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles = (rows + tile_rows - 1) / tile_rows;
-    const auto workgroups = row_tiles * static_cast<std::size_t>(output_size());
+    const int k_lanes = has_uniform_q() && (descriptor_.q_mask & 7u) != 0 ? 16 : 32;
+    const int outputs_per_simd = 32 / k_lanes;
+    const auto workgroups = row_tiles * ((static_cast<std::size_t>(output_size())
+        + outputs_per_simd - 1) / outputs_per_simd);
     auto arguments = templates(*this, source.dtype());
+    arguments.emplace_back("K_LANES", k_lanes);
     arguments.emplace_back("TILE_M", tile_rows);
     arguments.emplace_back("ROUTED", 0);
     arguments.emplace_back("ROUTES", 1);
@@ -770,7 +1039,7 @@ array MlxFp8SqWeight::matmul(const array& input) const {
     arguments.emplace_back("LOGICAL_OUT", output_size());
     const auto unused = mlx::core::zeros(Shape{1}, mlx::core::int32);
     auto outputs = matmul_kernel(*this)(
-        {blob_, row_q_, row_symbol_byte_offsets_, source, unused, unused},
+        {blob_, row_q_, row_symbol_byte_offsets_, source, unused, unused, palette_values_, palette_quads_, palette_pairs_},
         {Shape{static_cast<int>(rows), output_size()}},
         {source.dtype()},
         {checked_int(workgroups * 32, "matmul grid"), 1, 1},
@@ -830,9 +1099,14 @@ std::vector<array> MlxFp8SqWeight::projection_group_matmul(
         static_cast<std::size_t>(tile_rows);
 
     std::vector<array> inputs;
-    inputs.reserve(weights.size() * 3 + 1);
+    inputs.reserve(weights.size() * 6 + 1);
+    const int k_lanes = std::all_of(weights.begin(), weights.end(), [](const auto& weight) {
+        return weight.has_uniform_q() && (weight.descriptor().q_mask & 7u) != 0;
+    }) ? 16 : 32;
+    const int outputs_per_simd = 32 / k_lanes;
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
         {"T", source.dtype()},
+        {"K_LANES", k_lanes},
         {"TILE_M", tile_rows},
         {"K", input_size},
         {"TOTAL_OUT", total_output},
@@ -847,6 +1121,12 @@ std::vector<array> MlxFp8SqWeight::projection_group_matmul(
         inputs.push_back(weight.blob_);
         inputs.push_back(weight.row_q_);
         inputs.push_back(weight.row_symbol_byte_offsets_);
+        inputs.push_back(weight.palette_values_);
+        inputs.push_back(weight.palette_quads_);
+        inputs.push_back(weight.palette_pairs_);
+        arguments.emplace_back(prefix_name + "HAS_LOW_Q", (weight.descriptor().q_mask & 6u) != 0);
+        arguments.emplace_back(prefix_name + "FAST_Q_MAX",
+            static_cast<int>(maximum_fast_q(weight.descriptor().q_mask, true)));
         arguments.emplace_back(prefix_name + "OFFSET", output_offset);
         output_offset += weight.output_size();
         arguments.emplace_back(prefix_name + "END", output_offset);
@@ -869,7 +1149,8 @@ std::vector<array> MlxFp8SqWeight::projection_group_matmul(
             prefix_name + "SCALE_COLUMNS", layout.scale_columns);
     }
     inputs.push_back(source);
-    const auto workgroups = row_tiles * static_cast<std::size_t>(total_output);
+    const auto workgroups = row_tiles * ((static_cast<std::size_t>(total_output)
+        + outputs_per_simd - 1) / outputs_per_simd);
     auto combined = projection_group_kernel(dtype, weights.size())(
         std::move(inputs),
         {Shape{checked_int(rows, "projection-group row count"), total_output}},
@@ -932,7 +1213,10 @@ array MlxFp8SqWeight::routed_matmul(
     source = mlx::core::contiguous(source);
     auto ids = mlx::core::contiguous(expert_ids);
     auto map = mlx::core::contiguous(expert_map);
+    const int k_lanes = has_uniform_q() && (descriptor_.q_mask & 7u) != 0 ? 16 : 32;
+    const int outputs_per_simd = 32 / k_lanes;
     auto arguments = templates(*this, source.dtype());
+    arguments.emplace_back("K_LANES", k_lanes);
     arguments.emplace_back("TILE_M", 1);
     arguments.emplace_back("ROUTED", 1);
     arguments.emplace_back("ROUTES", routes);
@@ -940,9 +1224,10 @@ array MlxFp8SqWeight::routed_matmul(
     arguments.emplace_back("EXPERT_MAP_SIZE", expert_map.shape(0));
     arguments.emplace_back("OUT_PER_EXPERT", out_per_expert);
     arguments.emplace_back("LOGICAL_OUT", out_per_expert);
-    const auto workgroups = route_count * static_cast<std::size_t>(out_per_expert);
+    const auto workgroups = route_count * ((static_cast<std::size_t>(out_per_expert)
+        + outputs_per_simd - 1) / outputs_per_simd);
     auto outputs = matmul_kernel(*this)(
-        {blob_, row_q_, row_symbol_byte_offsets_, source, ids, map},
+        {blob_, row_q_, row_symbol_byte_offsets_, source, ids, map, palette_values_, palette_quads_, palette_pairs_},
         {Shape{checked_int(route_count, "route count"), out_per_expert}},
         {mlx::core::float16},
         {checked_int(workgroups * 32, "routed matmul grid"), 1, 1},

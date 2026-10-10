@@ -234,7 +234,7 @@ def test_read_only_runtime_monitoring_does_not_reject_inference_or_allow_evictio
     asyncio.run(run())
 
 
-def test_exclusive_maintenance_still_blocks_inference_when_read_only_monitoring_is_active(tmp_path):
+def test_inference_waits_for_exclusive_maintenance_but_not_read_only_monitoring(tmp_path):
     async def run():
         class Backend(IdleBackend):
             async def stream(self, **kwargs):
@@ -247,16 +247,24 @@ def test_exclusive_maintenance_still_blocks_inference_when_read_only_monitoring_
             process=SimpleNamespace(returncode=None), port=0, context_size=4096,
             state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
         pool._instances[instance.id] = instance
+        async def request():
+            return [delta async for delta in pool.stream(model="model-a", messages=[], sampling=SamplingParams())]
+
+        async def queued():
+            while not instance.queued_requests:
+                await asyncio.sleep(0)
+
         async with pool._runtime_control_lease(instance.id, read_only=True):
             async with pool._runtime_control_lease(instance.id):
                 assert instance.control_leases == 2 and instance.read_control_leases == 1
-                with pytest.raises(BackendError) as rejected:
-                    async for _ in pool.stream(model="model-a", messages=[], sampling=SamplingParams()):
-                        pass
-                assert rejected.value.code == "runtime_reconfiguring" and rejected.value.status_code == 409
-                assert instance.active_requests == instance.queued_requests == 0
-            assert len([delta async for delta in pool.stream(model="model-a", messages=[], sampling=SamplingParams())]) == 1
+                pending = asyncio.create_task(request())
+                await asyncio.wait_for(queued(), 1)
+                assert not pending.done() and instance.active_requests == 0
+            assert len(await asyncio.wait_for(pending, 1)) == 1
+            assert instance.control_leases == instance.read_control_leases == 1
         assert instance.control_leases == instance.read_control_leases == 0
+        assert instance.active_requests == instance.queued_requests == 0
+        assert instance.request_slots._value == 1
     asyncio.run(run())
 
 

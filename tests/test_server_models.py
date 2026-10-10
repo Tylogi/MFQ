@@ -2510,7 +2510,7 @@ def test_stream_revives_after_unexpected_exit_within_cooldown(
         revived = _Runtime(
             id=uuid4(),
             artifact=artifact,
-            process=SimpleNamespace(),  # type: ignore[arg-type]
+            process=SimpleNamespace(returncode=None),  # type: ignore[arg-type]
             backend=RevivedBackend(),  # type: ignore[arg-type]
             port=0,
             context_size=4096,

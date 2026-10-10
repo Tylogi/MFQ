@@ -358,6 +358,7 @@ const Kernel& sparse_block_nax_prefill_kernel() {
 }
 
 bool sparse_block_nax_available() {
+    if (mlx_metal_nax_disabled()) return false;
     static const bool available = [] {
         if (!__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
             return false;

@@ -55,6 +55,8 @@ public:
         return can_offload(name);
     }
     bool can_group_mfe(const std::string& name);
+    void activate_record(const std::string& name);
+    std::size_t backing_payload_bytes() const;
 
     MlxMfeProjectionInfo projection_info(
         const std::string& name);
@@ -160,7 +162,8 @@ public:
 
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
-        const mlx::core::array& expert_ids) const;
+        const mlx::core::array& expert_ids,
+        const mlx::core::array* route_groups = nullptr) const;
     mlx::core::array routed_matmul_mapped(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -171,7 +174,8 @@ public:
     mlx::core::array routed_swiglu(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
-        float limit = 0.0f) const;
+        float limit = 0.0f,
+        const mlx::core::array* route_groups = nullptr) const;
     mlx::core::array routed_swiglu_mapped(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -202,7 +206,8 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_weights,
-        bool shared_gate_is_logits = false) const;
+        bool shared_gate_is_logits = false,
+        const mlx::core::array* route_groups = nullptr) const;
     // Decode/small-M MXFP4 fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection
@@ -286,7 +291,8 @@ private:
         bool fused_swiglu,
         float swiglu_limit,
         const mlx::core::array* expert_map = nullptr,
-        bool packed_expert_ids = false) const;
+        bool packed_expert_ids = false,
+        const mlx::core::array* route_groups = nullptr) const;
     mlx::core::array routed_bf16_reference(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,

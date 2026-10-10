@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -9,6 +10,12 @@
 #endif
 
 namespace mfq::metal {
+
+inline bool mlx_metal_nax_disabled() noexcept {
+    const auto* value = std::getenv("MFQ_METAL_DISABLE_NAX");
+    return value != nullptr && (std::string_view(value) == "1"
+        || std::string_view(value) == "true" || std::string_view(value) == "on");
+}
 
 inline const std::string& mlx_apple_chip_name() noexcept {
     static const std::string name = []() noexcept {

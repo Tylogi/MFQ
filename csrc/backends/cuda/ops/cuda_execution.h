@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -230,12 +231,16 @@ struct CudaExecutionConfig {
     bool nvq_extended_group_exec = false;
     bool moe_nvq_heterogeneous = true;
     bool moe_nvq_heterogeneous_decode = true;
+    bool moe_nvq_active_decode = false;
     bool moe_prefill_mma = true;
     int moe_prefill_mma_min_tokens = 9;
     bool moe_small_heterogeneous = true;
     bool moe_delayed_route_readback = true;
     bool moe_projection_bundle_prefetch = true;
     bool split_moe_activation_reuse = true;
+    bool moe_gpu_resident_dispatch = false;
+    bool moe_ffn_fused_activation = true;
+    bool moe_two_stage_ffn = false;
     bool moe_swiglu_quant_fusion = true;
     bool moe_reduce_gate_fusion = true;
     bool ffn_geglu_fusion = true;
@@ -248,6 +253,19 @@ struct CudaExecutionConfig {
     bool diagnostic_in_f32_down = false;
     bool kv_cache_write_aten = false;
     bool gdn_transposed_state = true;
+    bool gdn_fused_output = true;
+    bool gr_fused_projections = true;
+    bool gr_fused_projection_activation = true;
+    bool gr_fused_post_norm = true;
+    bool gdn_fused_preparation = true;
+    bool gdn_fused_core = true;
+    bool gr_prepared_dense_projection = false;
+    bool gr_native_projection_input = true;
+    bool gr_fixed_group_projection = true;
+    bool gr_compact_mix = true;
+    bool gr_two_stage = true;
+    bool gr_two_stage_dense_injection = true;
+    bool moe_nint_heterogeneous_decode = true;
     bool linear_conv_prefill_fused = true;
     bool minicpm_fused_bf16_rope = true;
     bool minicpm_fused_qk_norm_rope_kv = true;
@@ -268,6 +286,20 @@ struct CudaExecutionConfig {
     int moe_ssd_io_workers = 8;
     bool moe_ssd_overlap = true;
     bool moe_ssd_ranges = true;
+    std::size_t moe_host_cache_bytes = 0;
+    bool moe_pipeline = false;
+    bool moe_hybrid_cpu = false;
+    bool moe_preload_all = false;
+    bool moe_assert_resident = false;
+    bool moe_ram_pcie = false;
+    bool moe_direct_ram = true;
+    // Diagnostics may hold primary residency constant across paired passes.
+    bool moe_residency_adapt = true;
+    std::optional<bool> moe_ffn_transfer_phases;
+    bool moe_residency_warm = true;
+    bool moe_residency_projection_heat = true;
+    std::size_t moe_host_physical_bytes = 0;
+    std::optional<double> moe_ram_pcie_fraction;
 };
 
 CudaExecutionConfig load_cuda_execution_config();

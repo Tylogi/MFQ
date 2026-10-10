@@ -96,6 +96,7 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
         except BackendError as error:
             return JSONResponse(
                 status_code=backend_error_status(error),
+                headers={"Retry-After": "1"} if error.retryable and backend_error_status(error) in {429, 503} else None,
                 content=openai_error_body(
                     str(error),
                     error_type=error.code,
@@ -119,6 +120,7 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
     except BackendError as error:
         return JSONResponse(
             status_code=backend_error_status(error),
+            headers={"Retry-After": "1"} if error.retryable and backend_error_status(error) in {429, 503} else None,
             content=openai_error_body(
                 str(error),
                 error_type=error.code,

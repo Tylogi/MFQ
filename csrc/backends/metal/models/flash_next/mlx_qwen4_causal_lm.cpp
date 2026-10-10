@@ -248,8 +248,9 @@ public:
 
     array routed_matmul(
         const array& input,
-        const array& expert_ids) const {
-        if (packed_) return packed_->routed_matmul(input, expert_ids);
+        const array& expert_ids,
+        const array* route_groups = nullptr) const {
+        if (packed_) return packed_->routed_matmul(input, expert_ids, route_groups);
         return dense_matmul(input, expert_ids);
     }
 
@@ -267,8 +268,9 @@ public:
 
     array routed_swiglu(
         const array& input,
-        const array& expert_ids) const {
-        if (packed_) return packed_->routed_swiglu(input, expert_ids);
+        const array& expert_ids,
+        const array* route_groups = nullptr) const {
+        if (packed_) return packed_->routed_swiglu(input, expert_ids, 0.0f, route_groups);
         return moe_swiglu_split(dense_matmul(input, expert_ids));
     }
 
@@ -582,6 +584,8 @@ public:
         }
     }
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) {
+        for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
+            cache->activate_record(name);
         gate_up_.reset();
         down_.reset();
         ssd_expert_cache_.reset();
@@ -664,6 +668,7 @@ public:
             router_logits,
             static_cast<int>(config_.num_experts_per_tok),
             false, false, config_.norm_topk_prob);
+        const auto* route_groups = routes.groups ? &*routes.groups : nullptr;
         if (detail::component_profile_active()) {
             detail::profile_eval(
                 "qwen4.moe.topk",
@@ -691,7 +696,7 @@ public:
                         source,
                         routes.ids,
                         routes.weights,
-                        shared_gate_weight == nullptr)) {
+                        shared_gate_weight == nullptr, route_groups)) {
                     if (detail::component_profile_active()) {
                         detail::profile_eval(
                             "qwen4.moe.two_stage", *fused);
@@ -894,7 +899,7 @@ public:
             }
             auto intermediate = gate_up_->routed_swiglu(
                 source,
-                routes.ids);
+                routes.ids, route_groups);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "qwen4.moe.routed_gate_up",
@@ -910,7 +915,7 @@ public:
                       intermediate,
                       routes.ids,
                       routes.weights)
-                : down_->routed_matmul(intermediate, routes.ids);
+                : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
             if (detail::component_profile_active()) {
                 detail::profile_eval("qwen4.moe.routed_down", output);
@@ -1001,6 +1006,10 @@ private:
             down_->neuron_len() != config_.moe_intermediate_size ||
             down_->out_per_expert() != config_.hidden_size)) {
             throw std::runtime_error("Qwen4 routed expert geometry disagrees");
+        }
+        if (mfe_offload_cache_) {
+            for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
+                mfe_offload_cache_->activate_record(name);
         }
         if (auto* preparation = MlxKernelPreparation::current(); preparation && !cached) {
             preparation->collect([&] {
@@ -3895,7 +3904,8 @@ std::size_t MlxQwen4CausalLm::ssd_ple_payload_bytes() const noexcept {
 }
 
 std::size_t MlxQwen4CausalLm::ssd_expert_payload_bytes() const noexcept {
-    return (impl_->ssd_expert_cache || impl_->mfe_offload_cache) ? impl_->expert_payload_bytes : 0;
+    if (impl_->mfe_offload_cache) return impl_->mfe_offload_cache->backing_payload_bytes();
+    return impl_->ssd_expert_cache ? impl_->expert_payload_bytes : 0;
 }
 
 std::int32_t MlxQwen4CausalLm::generate(

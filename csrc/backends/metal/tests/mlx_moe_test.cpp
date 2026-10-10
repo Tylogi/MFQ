@@ -1,4 +1,6 @@
 #include "mlx_moe.h"
+#include "mlx_grouped_linear.h"
+#include "mlx_tensor.h"
 #include "mlx_moe_ops.h"
 #include "mlx_mxfp4_sq.h"
 #include "mlx_nint.h"
@@ -7,6 +9,8 @@
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_inference_warmup.h"
+#include "mlx_resource_telemetry.h"
+#include "mlx_platform.h"
 
 #include "nvq_codebooks.generated.h"
 
@@ -20,15 +24,18 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -569,6 +576,50 @@ VqFixture make_plain_nvq3(
         output,
         input,
     };
+}
+
+VqFixture make_varied_plain_nvq(int output, int input, bool d4 = false, bool index_parity = false,
+    int group_size = 24) {
+    auto result = d4 ? make_plain_nvq3(output, input)
+        : make_plain_nvq(output, input, index_parity);
+    const int vector_size = d4 ? 4 : 8;
+    const int old_groups = (input + 23) / 24;
+    const int groups = (input + group_size - 1) / group_size;
+    const int vectors = (input + vector_size - 1) / vector_size;
+    const int signs = (input + 7) / 8;
+    result.blob.resize(result.blob.size() - output * 2
+        - (output * old_groups + 1) / 2 - output * vectors - (output * signs * 7 + 7) / 8);
+    const auto group16 = static_cast<std::uint16_t>(group_size);
+    std::memcpy(result.blob.data() + 6, &group16, sizeof(group16));
+    append_vq_anchors(result.blob, output);
+    std::vector<std::uint16_t> states(output * groups);
+    std::vector<std::uint16_t> indices(output * vectors);
+    std::vector<std::uint16_t> masks(output * signs);
+    for (int row = 0; row < output; ++row) {
+        for (int group = 0; group < groups; ++group) {
+            states[row * groups + group] = (row + group * 3) & 15;
+        }
+        for (int vector = 0; vector < vectors; ++vector) {
+            indices[row * vectors + vector] = (row * 137 + vector * 59 + 257) & 255;
+        }
+        for (int sign = 0; sign < signs; ++sign) {
+            masks[row * signs + sign] = (row * 13 + sign * 7 + 21) & 127;
+        }
+        for (int column = 0; column < input; ++column) {
+            const auto index = indices[row * vectors + column / vector_size];
+            const auto mask = masks[row * signs + column / 8];
+            const auto component = column % vector_size;
+            float value = float(2 * ((index >> (component * (d4 ? 3 : 2)))
+                & (d4 ? 7 : 3)) + 1) * states[row * groups + column / group_size];
+            const auto negative = column % 8 < 7 ? (mask >> (column % 8)) & 1u
+                : (std::popcount(mask) & 1u) ^ (index_parity ? (index >> 7u) & 1u : 0u);
+            result.dense[row * input + column] = negative ? -value : value;
+        }
+    }
+    append_bytes(result.blob, pack_vq_values(states, 4));
+    append_bytes(result.blob, pack_vq_values(indices, 8));
+    append_bytes(result.blob, pack_vq_values(masks, 7));
+    return result;
 }
 
 VqFixture make_jsc_nvq(
@@ -2021,7 +2072,8 @@ void require(
 void require_close(
     float actual,
     float expected,
-    float tolerance = 8e-4f) {
+    float tolerance = 8e-4f,
+    std::source_location location = std::source_location::current()) {
     if (
         !std::isfinite(actual)
         || std::fabs(actual - expected) > tolerance
@@ -2030,7 +2082,8 @@ void require_close(
             "MFE Metal result mismatch: actual="
             + std::to_string(actual)
             + " expected="
-            + std::to_string(expected));
+            + std::to_string(expected) + " at " + location.function_name()
+            + ":" + std::to_string(location.line()));
     }
 }
 
@@ -2061,9 +2114,9 @@ float dot(
 
 std::vector<float> evaluated_floats(
     mlx::core::array value) {
-    value = mlx::core::astype(
+    value = mlx::core::contiguous(mlx::core::astype(
         value,
-        mlx::core::float32);
+        mlx::core::float32));
     value.eval();
     return {
         value.data<float>(),
@@ -2095,10 +2148,12 @@ public:
     explicit TemporaryMfq(
         const std::vector<MappedRecordFixture>&
             records, std::string_view architecture = "streamed-mfe-test")
-        : path_(
-              std::filesystem::
-                  temp_directory_path()
-              / "mfq-metal-streamed-mfe-test.mfq") {
+        {
+        auto filename = (std::filesystem::temp_directory_path() / "mfq-metal-streamed-mfe-test-XXXXXX").string();
+        const auto fd = mkstemp(filename.data());
+        if (fd < 0) throw std::runtime_error("cannot create temporary MFE container");
+        close(fd);
+        path_ = filename;
         std::vector<std::uint8_t> file;
         append_magic(file, "MFQ1");
         append<std::uint32_t>(file, 1);
@@ -2787,6 +2842,21 @@ void test_two_stage_nint_shared_decode(
             row_outputs.push_back(*row_output);
         }
         const auto batched_values = evaluated_floats(*fused);
+        std::vector<std::int32_t> groups(ids.size() * 8, -1);
+        for (std::size_t index = 0; index < ids.size(); ++index) {
+            int matched = 0;
+            for (std::size_t route = 0; route < ids.size(); ++route)
+                if (ids[route] == ids[index]) groups[index * 8 + 2 + matched++] = int(route);
+            groups[index * 8] = ids[index];
+            groups[index * 8 + 1] = matched;
+        }
+        const auto route_groups = mlx::core::array(groups.begin(), mlx::core::Shape{tokens, routes, 8});
+        auto planned = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+            gate_input, input, expert_ids, route_weights, precomputed_gate, &route_groups);
+        require(planned.has_value(), "route groups disabled two-stage fusion");
+        const auto planned_values = evaluated_floats(*planned);
+        require(batched_values == planned_values,
+                "route groups changed two-stage NINT/shared decode output");
         const auto row_values = evaluated_floats(mlx::core::concatenate(row_outputs, 0));
         require(batched_values == row_values,
                 "batched NINT/shared decode differs from identical row-wise routes");
@@ -3974,6 +4044,210 @@ void test_large_mxfp4_arena_avoids_single_group_builder() {
         "large SSD arena direct MXFP4 output shape mismatch");
 }
 
+void test_vq_small_m_route_order() {
+    const char* setting = std::getenv("MFQ_METAL_MFE_SORT_ROUTES");
+    const std::optional<std::string> saved = setting
+        ? std::optional<std::string>(setting) : std::nullopt;
+    for (const auto [output, input] : {std::pair{64, 24}, std::pair{24, 64}}) {
+        const auto fixture = make_vq_moe_fixture({
+            make_nvq1_s(output, input),
+            make_nvq1_l(output, input),
+            make_jsc_nvq(output, input),
+            make_jsc_nvq(output, input, "NVQ2J-L", 4, 8, 10, false, 4),
+            make_jsc_nvq(output, input, "NVQ2J-XL", 5, 8, 12, true, 4),
+            make_jsc_nvq(output, input, "NVQ3J", 2, 4, 8),
+            make_jsc_nvq(output, input, "NVQ3J-512", 3, 4, 9, false, 4),
+            make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4),
+            make_varied_plain_nvq(output, input),
+            make_varied_plain_nvq(output, input, false, true),
+            make_varied_plain_nvq(output, input, true),
+            make_varied_plain_nvq(output, input, false, false, 32),
+            make_varied_plain_nvq(output, input, false, true, 32),
+            make_varied_plain_nvq(output, input, true, false, 32),
+            make_varied_plain_nvq(output, input, false, false, 64),
+            make_varied_plain_nvq(output, input, false, true, 64),
+            make_varied_plain_nvq(output, input, true, false, 64),
+        });
+        const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+        const int routes = static_cast<int>(fixture.expert_weights.size());
+        std::vector<mfq::metal::MlxVqWeight> direct;
+        direct.reserve(routes);
+        for (const auto& expert : fixture.expert_weights) {
+            direct.push_back(mfq::metal::MlxVqWeight::from_blob(expert.dtype, expert.blob));
+        }
+        for (int tokens = 1; tokens <= 6; ++tokens) {
+            for (bool shared : {true, false}) {
+                std::vector<float> values(tokens * (shared ? 1 : routes) * input);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = static_cast<float>(static_cast<int>(
+                        (index * 17 + 3) % 31) - 15) / 512.0f;
+                }
+                std::vector<std::int32_t> ids(tokens * routes);
+                for (std::size_t index = 0; index < ids.size(); ++index) {
+                    ids[index] = static_cast<std::int32_t>((index * 3 + index / routes) % routes);
+                }
+                const auto source = mlx::core::array(values.begin(), shared
+                    ? mlx::core::Shape{tokens, input}
+                    : mlx::core::Shape{tokens, routes, input});
+                const auto selected = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, routes});
+                unsetenv("MFQ_METAL_MFE_SORT_ROUTES");
+                const auto actual = evaluated_floats(weight.routed_matmul(source, selected));
+                setenv("MFQ_METAL_MFE_SORT_ROUTES", "1", 1);
+                const auto sorted = evaluated_floats(weight.routed_matmul(source, selected));
+                require(actual == sorted, "small-M VQ route sorting changed output");
+                if (tokens > 1) {
+                    std::vector<std::int32_t> groups(ids.size() * 8, -1);
+                    for (std::size_t index = 0; index < ids.size(); ++index) {
+                        int matched = 0;
+                        for (std::size_t route = 0; route < ids.size(); ++route)
+                            if (ids[route] == ids[index])
+                                groups[index * 8 + 2 + matched++] = static_cast<std::int32_t>(route);
+                        require(matched <= 6, "route group fixture exceeds Top-K uniqueness bound");
+                        groups[index * 8] = ids[index];
+                        groups[index * 8 + 1] = matched;
+                    }
+                    const auto plan = mlx::core::array(groups.begin(), mlx::core::Shape{tokens, routes, 8});
+                    const auto planned = evaluated_floats(weight.routed_matmul(source, selected, &plan));
+                    require(actual == planned, "route group consumption changed mixed VQ output");
+                }
+                if (shared) {
+                    const auto check_direct = [&](const std::vector<float>& result, int expert,
+                                                  std::string_view mode) {
+                        for (int token = 0; token < tokens; ++token) {
+                            const std::vector<float> row(values.begin() + token * input,
+                                values.begin() + (token + 1) * input);
+                            for (int column = 0; column < output; ++column) {
+                                try {
+                                    require_close(result[token * output + column],
+                                        routed_vq_dot(row, fixture, expert, column), 2e-3f);
+                                } catch (const std::exception& error) {
+                                    throw std::runtime_error(std::string(mode) + " "
+                                        + fixture.expert_weights[expert].dtype + " M="
+                                        + std::to_string(tokens) + " OUT=" + std::to_string(output)
+                                        + " K=" + std::to_string(input) + " row=" + std::to_string(token)
+                                        + " output=" + std::to_string(column) + ": " + error.what());
+                                }
+                            }
+                        }
+                    };
+                    for (int expert = 0; expert < routes; ++expert) {
+                        check_direct(evaluated_floats(direct[expert].matmul(source)), expert, "standalone");
+                    }
+                    const mfq::metal::MlxGroupedLinear xl_pair({&direct[4], &direct[4]});
+                    for (const auto& result : xl_pair.matmul(mlx::core::astype(source, mlx::core::float16))) {
+                        check_direct(evaluated_floats(result), 4, "XL FP16 output tile");
+                    }
+                    for (int group = 0; group < (routes + 1) / 2; ++group) {
+                        const int first = std::min(group * 2, routes - 2);
+                        std::vector<mfq::metal::MlxGroupedLinearWeightRef> refs;
+                        for (int expert = first; expert < std::min(first + 2, routes); ++expert) {
+                            refs.emplace_back(&direct[expert]);
+                        }
+                        const mfq::metal::MlxGroupedLinear grouped(std::move(refs));
+                        const auto results = grouped.matmul(source);
+                        for (std::size_t index = 0; index < results.size(); ++index) {
+                            check_direct(evaluated_floats(results[index]), first + static_cast<int>(index), "grouped");
+                        }
+                    }
+                }
+                for (int token = 0; token < tokens; ++token) {
+                    for (int route = 0; route < routes; ++route) {
+                        const auto first = (token * (shared ? 1 : routes)
+                            + (shared ? 0 : route)) * input;
+                        const std::vector<float> row(values.begin() + first, values.begin() + first + input);
+                        for (int column = 0; column < output; ++column) {
+                            require_close(actual[(token * routes + route) * output + column],
+                                routed_vq_dot(row, fixture, ids[token * routes + route], column), 2e-3f);
+                        }
+                    }
+                }
+                if (tokens == 3 || tokens == 6) {
+                    auto repeated_ids = ids;
+                    std::fill(repeated_ids.begin(), repeated_ids.begin() + 8, 4);
+                    const auto repeated_routes = mlx::core::array(repeated_ids.begin(),
+                        mlx::core::Shape{tokens, routes});
+                    const auto repeated = evaluated_floats(weight.routed_matmul(source, repeated_routes));
+                    const auto packed = evaluated_floats(weight.routed_swiglu(source, repeated_routes));
+                    const auto pair = mfq::metal::MlxMfeWeight::from_projection_blobs(
+                        std::array<std::span<const std::uint8_t>, 2>{fixture.blob, fixture.blob});
+                    const auto split = evaluated_floats(pair.routed_swiglu(source, repeated_routes));
+                    for (int index = 0; index < tokens * routes; ++index) {
+                        const auto first = (shared ? index / routes : index) * input;
+                        const std::vector<float> row(values.begin() + first, values.begin() + first + input);
+                        for (int column = 0; column < output; ++column) {
+                            const auto value = repeated[index * output + column];
+                            require_close(value, routed_vq_dot(row, fixture,
+                                repeated_ids[index], column), 2e-3f);
+                            require_close(split[index * output + column],
+                                value * value / (1.0f + std::exp(-value)), 2e-3f);
+                            if (column < output / 2) {
+                                const auto up = repeated[index * output + column + output / 2];
+                                require_close(packed[index * (output / 2) + column],
+                                    value * up / (1.0f + std::exp(-value)), 2e-3f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (saved) setenv("MFQ_METAL_MFE_SORT_ROUTES", saved->c_str(), 1);
+    else unsetenv("MFQ_METAL_MFE_SORT_ROUTES");
+}
+
+void test_generic_vq_wide_small_m() {
+    using namespace mlx::core;
+    constexpr int output = 9;
+    for (const int input : {640, 2560}) {
+        const auto fixture = make_vq_moe_fixture({
+            make_varied_plain_nvq(output, input, false, false, 32),
+            make_varied_plain_nvq(output, input, false, true, 32),
+            make_varied_plain_nvq(output, input, true, false, 32),
+            make_varied_plain_nvq(output, input, false, false, 64),
+            make_varied_plain_nvq(output, input, false, true, 64),
+            make_varied_plain_nvq(output, input, true, false, 64),
+        });
+        const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+        const int routes = static_cast<int>(fixture.expert_weights.size());
+        for (const auto dtype : {float16, float32}) {
+            for (int tokens = 1; tokens <= 6; ++tokens) {
+                for (const bool shared : {true, false}) {
+                    std::vector<float> values(tokens * (shared ? 1 : routes) * input);
+                    for (std::size_t index = 0; index < values.size(); ++index) {
+                        values[index] = float(int((index * 17 + 3) % 31) - 15) / 512.0f;
+                    }
+                    std::vector<std::int32_t> ids(tokens * routes);
+                    for (std::size_t index = 0; index < ids.size(); ++index) {
+                        ids[index] = (index * 5 + index / routes) % routes;
+                    }
+                    const auto source = astype(array(values.begin(), shared
+                        ? Shape{tokens, input} : Shape{tokens, routes, input}), dtype);
+                    const auto selected = array(ids.begin(), Shape{tokens, routes});
+                    const auto actual = evaluated_floats(weight.routed_matmul(source, selected));
+                    std::vector<float> expected(actual.size());
+                    for (int token = 0; token < tokens; ++token) {
+                        for (int route = 0; route < routes; ++route) {
+                            const int first = (token * (shared ? 1 : routes)
+                                + (shared ? 0 : route)) * input;
+                            const std::vector<float> row(values.begin() + first,
+                                values.begin() + first + input);
+                            for (int column = 0; column < output; ++column) {
+                                expected[(token * routes + route) * output + column] =
+                                    routed_vq_dot(row, fixture, ids[token * routes + route], column);
+                            }
+                        }
+                    }
+                    const auto rounded = evaluated_floats(astype(array(expected.begin(),
+                        Shape{tokens, routes, output}), dtype));
+                    for (std::size_t index = 0; index < actual.size(); ++index) {
+                        require_close(actual[index], rounded[index], 2e-3f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_vq_cohorts_and_ffn() {
     constexpr int tokens = 2;
     constexpr int routes = 5;
@@ -4018,28 +4292,9 @@ void test_vq_cohorts_and_ffn() {
         make_npq(width, width),
         make_rotated_nepq1_s(width, width),
     });
-    const char* previous_exec = std::getenv(
-        "MFQ_METAL_MFE_JSC_EXEC");
-    const bool had_previous_exec =
-        previous_exec != nullptr;
-    const std::string previous_exec_value =
-        had_previous_exec ? previous_exec : "";
-    setenv("MFQ_METAL_MFE_JSC_EXEC", "1", 1);
     const auto weight =
         mfq::metal::MlxMoeWeight::from_blob(
             fixture.blob);
-    setenv("MFQ_METAL_MFE_JSC_EXEC", "0", 1);
-    const auto legacy_weight =
-        mfq::metal::MlxMoeWeight::from_blob(
-            fixture.blob);
-    if (had_previous_exec) {
-        setenv(
-            "MFQ_METAL_MFE_JSC_EXEC",
-            previous_exec_value.c_str(),
-            1);
-    } else {
-        unsetenv("MFQ_METAL_MFE_JSC_EXEC");
-    }
     require(
         weight.experts() == fixture.experts
             && weight.out_per_expert() == width
@@ -4077,36 +4332,6 @@ void test_vq_cohorts_and_ffn() {
                     tokens,
                     routes,
                 })));
-    const auto legacy_actual = evaluated_floats(
-        legacy_weight.routed_matmul(
-            mlx::core::array(
-                input.begin(),
-                mlx::core::Shape{
-                    tokens,
-                    width,
-                }),
-            mlx::core::array(
-                ids.begin(),
-                mlx::core::Shape{
-                    tokens,
-                    routes,
-                })));
-    require(
-        legacy_actual.size() == actual.size(),
-        "JSC execution layout result size mismatch");
-    for (std::size_t index = 0;
-         index < actual.size();
-         ++index) {
-        try {
-            require_close(actual[index], legacy_actual[index], 1e-6f);
-        } catch (const std::exception& error) {
-            throw std::runtime_error(
-                "execution-layout comparison expert="
-                + std::to_string(ids[index / width])
-                + " row=" + std::to_string(index % width)
-                + ": " + error.what());
-        }
-    }
     for (int token = 0; token < tokens; ++token) {
         std::vector<float> source(
             input.begin() + token * width,
@@ -4308,6 +4533,81 @@ void test_vq_cohorts_and_ffn() {
             ffn_actual[index],
             expected[index],
             8e-3f);
+    }
+}
+
+void test_shared_rotated_input() {
+    constexpr int width = 24;
+    constexpr int routes = 3;
+    const auto fixture = make_vq_moe_fixture({
+        make_rotated_nepq1_s(width, width),
+        make_rotated_nepq1_s(width, width),
+        make_rotated_nepq1_s(width, width, 0x8899aabbccddeeffull, 1),
+    });
+    const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+    const auto pair = mfq::metal::MlxMfeWeight::concatenate_projections({weight, weight});
+    for (int tokens : {1, 6, 65, 513}) {
+        std::vector<float> values(tokens * width);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = static_cast<float>(
+                static_cast<int>((index * 13 + 7) % 29) - 14) / 1024.0f;
+        }
+        std::vector<std::int32_t> route_ids(tokens * routes);
+        for (std::size_t index = 0; index < route_ids.size(); ++index) {
+            route_ids[index] = static_cast<int>((index * 7 + index / routes) % routes);
+        }
+        const auto x = mlx::core::astype(mlx::core::array(
+            values.begin(), mlx::core::Shape{tokens, width}), mlx::core::float16);
+        const auto repeated = mlx::core::contiguous(mlx::core::broadcast_to(
+            mlx::core::expand_dims(x, 1), mlx::core::Shape{tokens, routes, width}));
+        const auto ids = mlx::core::array(
+            route_ids.begin(), mlx::core::Shape{tokens, routes});
+        const auto order = mlx::core::astype(mlx::core::argsort(
+            mlx::core::reshape(ids, mlx::core::Shape{tokens * routes})), mlx::core::int32);
+        const auto inverse = mfq::metal::moe_inverse_permutation(order);
+        for (const auto& projection : {weight, pair}) {
+            auto shared_output = projection.routed_matmul(x, ids);
+            std::function<void(const mlx::core::array&)> visit = [&](const auto& node) {
+                if (!node.has_primitive()) return;
+                const auto* name = node.primitive().name();
+                if ((std::strcmp(name, "NativeMfePrimitive") == 0
+                     || std::strcmp(name, "GroupedMmqPrimitive") == 0)
+                    && node.inputs().size() >= 26) {
+                    require(node.inputs()[22].size() ==
+                        static_cast<std::size_t>(3 * tokens * width),
+                        "shared HSG1 input was expanded by route count");
+                }
+                for (const auto& input : node.inputs()) visit(input);
+            };
+            visit(shared_output);
+            const auto actual = evaluated_floats(shared_output);
+            const auto reference = evaluated_floats(projection.routed_matmul(repeated, ids));
+            require(actual == reference, "shared HSG1 routed output changed");
+            if (tokens >= 32) {
+                const auto plan = projection.build_grouped_mmq_plan(ids, order);
+                auto shared_sorted = projection.routed_matmul_sorted(
+                    x, ids, order, false, false, 0.0f, &plan);
+                visit(shared_sorted);
+                const auto sorted = evaluated_floats(shared_sorted);
+                const auto sorted_reference = evaluated_floats(projection.routed_matmul_sorted(
+                    repeated, ids, order, false, false, 0.0f, &plan));
+                require(sorted == sorted_reference, "shared HSG1 sorted output changed");
+                const auto restored = evaluated_floats(mlx::core::take(shared_sorted, inverse, 0));
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    require_close(restored[index], actual[index], 2e-3f);
+            }
+        }
+        const auto actual = evaluated_floats(weight.routed_matmul(x, ids));
+        for (int token = 0; token < tokens; ++token) {
+            const std::vector<float> source(values.begin() + token * width,
+                values.begin() + (token + 1) * width);
+            for (int route = 0; route < routes; ++route) {
+                const int expert = route_ids[token * routes + route];
+                for (int output = 0; output < width; ++output)
+                    require_close(actual[(token * routes + route) * width + output],
+                        routed_vq_dot(source, fixture, expert, output), 2e-3f);
+            }
+        }
     }
 }
 
@@ -4848,6 +5148,61 @@ void test_grouped_mmq_prefill() {
     }
 }
 
+void test_portable_mmq_row_buckets() {
+    constexpr int input_width = 96;
+    constexpr int output_width = 68;
+    const std::vector<int> counts{1, 8, 9, 16, 17, 32, 33, 48, 49, 64, 65, 80, 96};
+    auto fixture = make_vq_moe_fixture({
+        make_jsc_nvq(output_width, input_width, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+        make_jsc_nvq(output_width, input_width, "NVQ3J-512", 3, 4, 9),
+        make_jsc_nvq(output_width, input_width, "NVQ2J-L", 4, 8, 10),
+        make_nvq1_l(output_width, input_width),
+        make_jsc_nvq(output_width, input_width, "NVQ3J", 2, 4, 8),
+        make_jsc_nvq(output_width, input_width, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+        make_jsc_nvq(output_width, input_width, "NVQ3J", 2, 4, 8),
+        make_nvq1_l(output_width, input_width),
+        make_jsc_nvq(output_width, input_width, "NVQ2J-L", 4, 8, 10),
+        make_jsc_nvq(output_width, input_width, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+        make_nvq1_s(output_width, input_width),
+        make_jsc_nvq(output_width, input_width, "NVQ3J-512", 3, 4, 9),
+        make_jsc_nvq(output_width, input_width, "NVQ3J", 2, 4, 8),
+    });
+    const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+    std::vector<std::int32_t> ids;
+    for (std::size_t expert = 0; expert < counts.size(); ++expert)
+        ids.insert(ids.end(), counts[expert], static_cast<std::int32_t>(expert));
+    const int tokens = static_cast<int>(ids.size());
+    std::vector<float> values(tokens * input_width);
+    for (std::size_t index = 0; index < values.size(); ++index)
+        values[index] = float(int((index * 13 + 7) % 29) - 14) / 1024.0f;
+    const auto x = mlx::core::astype(mlx::core::array(values.begin(),
+        mlx::core::Shape{tokens, input_width}), mlx::core::float16);
+    const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, 1});
+    const auto order = mlx::core::astype(mlx::core::argsort(mlx::core::reshape(
+        routes, mlx::core::Shape{tokens})), mlx::core::int32);
+    const auto inverse = mlx::core::argsort(order);
+    for (const int block_rows : {64, 80, 96}) {
+        const auto plan = weight.build_grouped_mmq_plan(routes, order, block_rows);
+        const auto plain = evaluated_floats(mlx::core::take(weight.routed_matmul_sorted(
+            x, routes, order, false, false, 0.0f, &plan), inverse, 0));
+        const auto fused = evaluated_floats(mlx::core::take(weight.routed_matmul_sorted(
+            x, routes, order, false, true, 0.0f, &plan), inverse, 0));
+        for (int token = 0; token < tokens; ++token) {
+            const std::vector<float> source(values.begin() + token * input_width,
+                values.begin() + (token + 1) * input_width);
+            for (int row = 0; row < output_width; ++row)
+                require_close(plain[token * output_width + row],
+                    routed_vq_dot(source, fixture, ids[token], row), 2e-3f);
+            for (int row = 0; row < output_width / 2; ++row) {
+                const float gate = routed_vq_dot(source, fixture, ids[token], row);
+                const float up = routed_vq_dot(source, fixture, ids[token], row + output_width / 2);
+                require_close(fused[token * (output_width / 2) + row],
+                    gate / (1.0f + std::exp(-gate)) * up, 2e-3f);
+            }
+        }
+    }
+}
+
 void test_grouped_vq_decoder_tail_prefill(
     int input_width = 640,
     int output = 16) {
@@ -4901,7 +5256,7 @@ void test_grouped_vq_decoder_tail_prefill(
     require(
         weight.supports_grouped_mmq(),
         "mixed VQ decoder tail fixture must support grouped prefill");
-    const auto exercise = [&](int tokens, int first_expert = 0) {
+    const auto exercise = [&](int tokens, int first_expert = 0, int forced_block_rows = 0) {
         std::vector<float> input(tokens * input_width);
         for (std::size_t index = 0; index < input.size(); ++index) {
             input[index] = static_cast<float>(
@@ -4916,11 +5271,13 @@ void test_grouped_vq_decoder_tail_prefill(
             input.begin(), mlx::core::Shape{tokens, input_width}), mlx::core::float16);
         const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, 1});
         auto result = weight.routed_matmul(x, routes);
-        if (tokens >= 1025
-            && weight.recommended_grouped_mmq_block_rows(tokens, false) != 32) {
+        if (forced_block_rows > 0 || (tokens >= 1025
+            && weight.recommended_grouped_mmq_block_rows(tokens, false) != 32)) {
             auto order = mlx::core::astype(mlx::core::argsort(
                 mlx::core::reshape(routes, mlx::core::Shape{tokens})), mlx::core::int32);
-            auto plan = weight.build_grouped_mmq_plan(routes, order, 128);
+            const int block_rows = forced_block_rows > 0 ? forced_block_rows
+                : weight.recommended_grouped_mmq_block_rows(tokens, false);
+            auto plan = weight.build_grouped_mmq_plan(routes, order, block_rows);
             result = mlx::core::take(weight.routed_matmul_sorted(
                 x, routes, order, false, false, 0.0f, &plan),
                 mfq::metal::moe_inverse_permutation(order), 0);
@@ -4946,6 +5303,8 @@ void test_grouped_vq_decoder_tail_prefill(
     exercise(31);
     exercise(32);
     exercise(49);
+    exercise(641, 0, 96);
+    exercise(897, 0, 80);
     exercise(1025);
 }
 
@@ -5001,10 +5360,8 @@ void test_nvq3jl_half_chunk(int output) {
         auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, 1});
         auto order = mlx::core::astype(mlx::core::argsort(
             mlx::core::reshape(routes, mlx::core::Shape{tokens})), mlx::core::int32);
-        const int block_rows = tokens >= 512
-                && weight.recommended_grouped_mmq_block_rows(tokens, false) != 32
-            ? 128 : 32;
-        auto plan = weight.build_grouped_mmq_plan(routes, order, block_rows);
+        const int selected_rows = weight.recommended_grouped_mmq_block_rows(tokens, false);
+        auto plan = weight.build_grouped_mmq_plan(routes, order, selected_rows);
         const auto actual = evaluated_floats(tokens == 1
             ? weight.routed_matmul(x, routes)
             : weight.routed_matmul_sorted(x, routes, order, false, false, 0.0f, &plan));
@@ -5157,13 +5514,12 @@ void test_grouped_split_nint_swiglu_prefill(
         gate.blob);
     const auto up_weight = mfq::metal::MlxMoeWeight::from_blob(
         up.blob);
-    const auto gate_up =
-        mfq::metal::MlxMoeWeight::concatenate_projections(
-            {gate_weight, up_weight});
+    const auto gate_up = mfq::metal::MlxMoeWeight::from_projection_blobs(
+        std::array<std::span<const std::uint8_t>, 2>{gate.blob, up.blob});
     require(
         gate_up.projections() == 2
             && gate_up.supports_grouped_mmq(),
-        "split NINT Gate/Up must retain one grouped MFE dispatch");
+        "split NINT Gate/Up must retain grouped prefill support");
 
     std::vector<float> input(tokens * input_width);
     for (std::size_t index = 0; index < input.size(); ++index) {
@@ -5449,11 +5805,9 @@ void test_shared_nint_mapped_and_packed_routes() {
     validate(packed);
 }
 
-void test_grouped_dense_quad_tail_prefill() {
+void test_grouped_dense_quad_tail_prefill(int output = 24, int input_width = 642) {
     constexpr int tokens = 1025;
     constexpr int routes = 2;
-    constexpr int output = 24;
-    constexpr int input_width = 642;
     constexpr int experts = 2;
     const auto fixture = make_moe_fixture(
         {"F16", "BF16"}, output, input_width, 37, 48);
@@ -5500,10 +5854,9 @@ void test_grouped_dense_quad_tail_prefill() {
     }
 }
 
-void test_mixed_mfe_native_and_grouped_dispatch() {
+void test_mixed_mfe_native_and_grouped_dispatch(int output = 48, bool skewed = false) {
     constexpr int experts = 4;
     constexpr int routes = 2;
-    constexpr int output = 48;
     constexpr int input_width = 128;
     const auto nint = make_nint_tensor(4, output, input_width, 3, 32);
     const auto mxfp8 = make_mxfp8(output, input_width, 5);
@@ -5555,6 +5908,14 @@ void test_mixed_mfe_native_and_grouped_dispatch() {
     require(
         weight.supports_grouped_mmq(),
         "metadata-driven NINT must support mixed grouped prefill");
+    if (mfq::metal::mlx_metal_nax_disabled() && output >= 64) {
+        for (const auto& [mean_rows, block_rows] : {
+                 std::pair{31, 32}, std::pair{32, 32}, std::pair{33, 64},
+                 std::pair{64, 64}, std::pair{65, 96}, std::pair{96, 96},
+                 std::pair{97, 96}, std::pair{128, 96}})
+            require(weight.recommended_grouped_mmq_block_rows(mean_rows * experts, false) == block_rows,
+                "portable grouped MMQ did not select adaptive row tiles");
+    }
     std::optional<std::pair<std::string, std::string>> plan_signature;
     const auto exercise = [&](int tokens) {
         std::vector<float> input(
@@ -5566,7 +5927,8 @@ void test_mixed_mfe_native_and_grouped_dispatch() {
         }
         std::vector<std::int32_t> ids(tokens * routes);
         for (int row = 0; row < tokens * routes; ++row) {
-            ids[row] = (row * 3 + row / 5) % experts;
+            ids[row] = skewed && row < 3 * tokens * routes / 4
+                ? row % 2 : (row * 3 + row / 5) % experts;
         }
         const auto input_array = mlx::core::astype(
             mlx::core::array(
@@ -5704,12 +6066,10 @@ void test_multiple_nint_pools_share_cpp_dispatch(int tokens = 3) {
     }
 }
 
-void test_grouped_mxfp4_vq_mmq_prefill() {
+void test_grouped_mxfp4_vq_mmq_prefill(int output = 17, int input = 96) {
     constexpr int experts = 2;
     constexpr int tokens = 37;
     constexpr int routes = 2;
-    constexpr int output = 17;
-    constexpr int input = 96;
     const auto mx_weight = make_mxfp4(output, input);
     const auto vq_weight = make_jsc_nvq(output, input);
     std::vector<std::uint8_t> blob;
@@ -5774,7 +6134,8 @@ void test_grouped_mxfp4_vq_mmq_prefill() {
             mlx::core::int32));
     const auto plan = weight.build_grouped_mmq_plan(
         ids_array,
-        order);
+        order,
+        weight.recommended_grouped_mmq_block_rows(tokens * routes, false));
     const auto matrix = evaluated_floats(
         mlx::core::take(
             weight.routed_matmul_sorted(
@@ -5946,11 +6307,17 @@ void test_streamed_mixed_mfe_residency() {
             && info.available_experts.size() == experts,
         "mixed streamed MFE projection metadata mismatch");
     const auto alternate_info = residency.projection_info("alternate");
+    require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == 0,
+        "probing streamable MFE records reported resident weights as SSD backing");
     require(
         alternate_info.experts == 4
             && residency.grouped_mfe("alternate", {3, 0}).experts() == 2,
         "dynamic streamed MFE expert geometry mismatch");
+    require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == alternate_blob.size(),
+        "streaming one MFE record reported other probed records as SSD backing");
     residency.discard_record("alternate");
+    require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == 0,
+        "discarding an MFE record retained SSD backing telemetry");
 
     const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
     const auto exercise = [&](const std::vector<std::int32_t>& active) {
@@ -6005,6 +6372,8 @@ void test_streamed_mixed_mfe_residency() {
         residency.cached_expert_count() == experts
             && residency.resident_packed_bytes() > 0,
         "mixed streamed MFE cache accounting mismatch");
+    require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == blob.size(),
+        "MFE cache hits duplicated SSD backing telemetry");
     const auto before = residency.resident_packed_bytes();
     const auto active_before = mlx::core::get_active_memory();
     const auto released = residency.set_cache_limit(before / 2);
@@ -6164,6 +6533,12 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
     }
     const auto kv = paged.kv_cache_bytes();
     require(kv > 0 && paged.reclaimable_expert_bytes() > 0, "Qwen4 full-resident fixture has no weights or KV");
+    std::size_t layer_payload = 0;
+    for (const auto& record : records)
+        if (record.name.starts_with("model.block.0.mlp.experts.")) layer_payload += record.payload.size();
+    require(paged.ssd_expert_payload_bytes() == 0 &&
+            mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == 0,
+        "full-resident Qwen4 model reported SSD expert backing");
     if (mtp) {
         const auto full = paged.resident_full_expert_bytes();
         const auto before = mlx::core::get_active_memory();
@@ -6175,12 +6550,18 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false) {
             "Qwen4 partial shrink did not release actual expert buffers");
         require(paged.cache_position() == 3 && paged.kv_cache_bytes() == kv,
             "Qwen4 partial expert shrink discarded the live context");
+        require(paged.ssd_expert_payload_bytes() == layer_payload &&
+                mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload,
+            "Qwen4 partial offload reported fully resident layers as SSD backing");
     }
     const auto active = mlx::core::get_active_memory();
     paged.set_expert_cache_limit(0);
     require(mlx::core::get_active_memory() < active, "Qwen4 expert offload did not release actual buffers");
     require(paged.cache_position() == 3 && paged.kv_cache_bytes() == kv,
         "Qwen4 expert offload discarded the live context");
+    require(paged.ssd_expert_payload_bytes() == layer_payload * (mtp ? 2 : 1) &&
+            mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload * (mtp ? 2 : 1),
+        "Qwen4 full offload did not report its active SSD backing records");
     for (const int token : {4, 5, 6}) {
         const auto input = mlx::core::array({token}, mlx::core::Shape{1, 1});
         const auto expected = evaluated_floats(reference.forward(input));
@@ -6228,6 +6609,22 @@ void test_materialized_mfe_projections() {
             mfq::metal::MlxMfeWeight::from_blob(up_blob),
         });
     };
+    const auto bound_storage_bytes = [&](const mfq::metal::MlxMfeWeight& weight) {
+        std::unordered_set<const void*> allocations;
+        std::size_t bytes = 0;
+        std::function<void(const mlx::core::array&)> visit = [&](const auto& node) {
+            if (const auto data = node.data_shared_ptr(); data && data->buffer.ptr()
+                && allocations.insert(data->buffer.ptr()).second) {
+                bytes += node.buffer_size();
+            }
+            if (node.has_primitive())
+                for (const auto& input : node.inputs()) visit(input);
+        };
+        visit(weight.routed_swiglu(
+            mlx::core::zeros(mlx::core::Shape{1, input}, mlx::core::float16),
+            mlx::core::array({0, 1}, mlx::core::Shape{1, 2}, mlx::core::int32)));
+        return bytes;
+    };
     mlx::core::synchronize();
     const auto initial = mlx::core::get_active_memory();
     const auto reference = build();
@@ -6267,12 +6664,14 @@ void test_materialized_mfe_projections() {
     // Allow small descriptor/allocator overhead, but never a second Gate/Up copy.
     mlx::core::synchronize();
     const auto allocated = mlx::core::get_active_memory() - before;
-    require(allocated < candidate.packed_nbytes() + (64u << 10),
+    const auto bound_bytes = bound_storage_bytes(candidate);
+    require(allocated < bound_bytes + (64u << 10),
         "materialized projections retained duplicate source weight buffers: allocated=" +
-        std::to_string(allocated) + " packed=" + std::to_string(candidate.packed_nbytes()));
+        std::to_string(allocated) + " bound=" + std::to_string(bound_bytes));
     require(before - initial > allocated + candidate.packed_nbytes() / 2,
         "projection fixture did not reproduce lazy duplicate storage");
 
+    mlx::core::clear_cache();
     const auto before_direct = mlx::core::get_active_memory();
     const auto direct = [&] {
         auto gate_bytes = blob;
@@ -6289,8 +6688,10 @@ void test_materialized_mfe_projections() {
     }
     mlx::core::synchronize();
     const auto direct_allocated = mlx::core::get_active_memory() - before_direct;
-    require(direct_allocated < direct.packed_nbytes() + (64u << 10),
-        "direct projection loader retained duplicate buffers");
+    const auto direct_bound_bytes = bound_storage_bytes(direct);
+    require(direct_allocated < direct_bound_bytes + (64u << 10),
+        "direct projection loader retained duplicate buffers: allocated=" +
+        std::to_string(direct_allocated) + " bound=" + std::to_string(direct_bound_bytes));
 }
 
 void test_direct_mfe_projection_tails() {
@@ -6361,6 +6762,74 @@ void test_direct_mfe_projection_tails() {
         rejected = true;
     }
     require(rejected, "mismatched projection geometry must be rejected");
+}
+
+void test_banked_vq_input_views() {
+    using namespace mlx::core;
+    constexpr int input = 96;
+    constexpr int output = 17;
+    constexpr int route_count = 3;
+    const auto gate = make_vq_moe_fixture({
+        make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+        make_jsc_nvq(output, input, "NVQ3J-512", 3, 4, 9),
+    });
+    const auto up = make_vq_moe_fixture({
+        make_jsc_nvq(output, input, "NVQ3J-512", 3, 4, 9),
+        make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+    });
+    const auto single = mfq::metal::MlxMfeWeight::from_blob(gate.blob);
+    const auto pair = mfq::metal::MlxMfeWeight::from_projection_blobs(
+        std::array<std::span<const std::uint8_t>, 2>{gate.blob, up.blob});
+    for (int tokens = 2; tokens <= 6; ++tokens) {
+        std::vector<std::int32_t> ids(tokens * route_count);
+        for (std::size_t index = 0; index < ids.size(); ++index)
+            ids[index] = index % route_count == 2 ? -1 : index % route_count;
+        const auto routes = array(ids.begin(), Shape{tokens, route_count});
+        for (const bool shared : {false, true}) {
+            std::vector<float> values(tokens * (shared ? 1 : route_count) * input);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = float(int((index * 13 + 7) % 29) - 14) / 1024.0f;
+            for (const auto dtype : {float16, float32}) {
+                std::vector<std::vector<float>> reference;
+                for (const int offset : {4, 1}) {
+                    std::vector<float> backing(values.size() + offset, 17.0f);
+                    std::copy(values.begin(), values.end(), backing.begin() + offset);
+                    const auto x = reshape(slice(astype(array(backing.begin(),
+                        Shape{static_cast<int>(backing.size())}), dtype), Shape{offset},
+                        Shape{static_cast<int>(backing.size())}), shared
+                            ? Shape{tokens, input} : Shape{tokens, route_count, input});
+                    const std::vector<std::vector<float>> actual{
+                        evaluated_floats(single.routed_matmul(x, routes)),
+                        evaluated_floats(pair.routed_matmul(x, routes)),
+                        evaluated_floats(pair.routed_swiglu(x, routes)),
+                    };
+                    if (offset == 4) reference = actual;
+                    else require(actual == reference, "banked VQ aligned/unaligned input mismatch");
+                    require(x.offset() == static_cast<std::size_t>(offset) * x.itemsize(),
+                        "banked VQ input view lost its offset");
+                    for (int token = 0; token < tokens; ++token) {
+                        for (int route = 0; route < route_count; ++route) {
+                            const int row = token * route_count + route;
+                            const int source_row = shared ? token : row;
+                            const std::vector<float> source(values.begin() + source_row * input,
+                                values.begin() + (source_row + 1) * input);
+                            for (int column = 0; column < output; ++column) {
+                                const float g = ids[row] < 0 ? 0.0f
+                                    : routed_vq_dot(source, gate, ids[row], column);
+                                const float u = ids[row] < 0 ? 0.0f
+                                    : routed_vq_dot(source, up, ids[row], column);
+                                require_close(actual[0][row * output + column], g, 2e-3f);
+                                require_close(actual[1][row * 2 * output + column], g, 2e-3f);
+                                require_close(actual[1][row * 2 * output + output + column], u, 2e-3f);
+                                require_close(actual[2][row * output + column],
+                                    g / (1.0f + std::exp(-g)) * u, 6e-3f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void test_direct_mfe_projection_families() {
@@ -6459,13 +6928,14 @@ void test_direct_mfe_projection_families() {
     }
 }
 
-void test_mixed_decode_row_packing(int group_size) {
+void test_mixed_decode_row_packing(
+    int group_size, int tokens = 1, int output = 17, int input = 96) {
     using namespace mlx::core;
-    constexpr int output = 17;
-    constexpr int input = 96;
     const auto nint = make_nint_v2_tensor(
         output, input, 17, group_size, true);
-    const auto jsc = make_jsc_nvq(output, input);
+    const auto jsc = input == 640 && output == 2560
+        ? make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1)
+        : make_jsc_nvq(output, input);
     const auto nvq = make_nvq1_s(output, input);
     const auto gate = mfq::metal::MlxMfeWeight::from_blob(make_raw_nim2(3, output, input, {
         {{0}, "NINTv2", nint, {}},
@@ -6485,11 +6955,16 @@ void test_mixed_decode_row_packing(int group_size) {
     const char* prior_split = std::getenv("MFQ_METAL_MFE_SPLIT_SWIGLU");
     const std::optional<std::string> saved_split = prior_split == nullptr
         ? std::nullopt : std::optional<std::string>(prior_split);
-    const array ids({2, 0, 1, -1, 3}, Shape{1, 5}, int32);
+    std::vector<std::int32_t> expert_ids(tokens * 5);
+    const int experts[]{2, 0, 1, -1, 3};
+    for (int token = 0; token < tokens; ++token)
+        for (int route = 0; route < 5; ++route)
+            expert_ids[token * 5 + route] = experts[(token + route) % 5];
+    const array ids(expert_ids.begin(), Shape{tokens, 5}, int32);
     for (const auto dtype : {float16, float32}) {
         for (const bool routed : {false, true}) {
-            const Shape shape = routed ? Shape{1, 5, input} : Shape{1, input};
-            std::vector<float> values(routed ? 5 * input : input);
+            const Shape shape = routed ? Shape{tokens, 5, input} : Shape{tokens, input};
+            std::vector<float> values(tokens * (routed ? 5 : 1) * input);
             for (std::size_t i = 0; i < values.size(); ++i) {
                 values[i] = float(int((i * 7 + 3) % 29) - 14) / 256.0f;
             }
@@ -6506,20 +6981,21 @@ void test_mixed_decode_row_packing(int group_size) {
                 if (!swiglu) {
                     const std::vector<float>* dense_weights[]{
                         &nint.dense, &jsc.dense, &nvq.dense};
-                    const int experts[]{2, 0, 1, -1, 3};
-                    for (int route = 0; route < 5; ++route) {
-                        const auto* dense = experts[route] >= 0
-                            && experts[route] < 3
-                            ? dense_weights[experts[route]] : nullptr;
+                    for (int slot = 0; slot < tokens * 5; ++slot) {
+                        const auto* dense = expert_ids[slot] >= 0
+                            && expert_ids[slot] < 3
+                            ? dense_weights[expert_ids[slot]] : nullptr;
                         for (int row = 0; row < output; ++row) {
                             float reference = 0.0f;
                             if (dense != nullptr) {
                                 for (int column = 0; column < input; ++column) {
-                                    reference += values[(routed ? route * input : 0) + column]
+                                    reference += values[(routed ? slot : slot / 5) * input + column]
                                         * (*dense)[row * input + column];
                                 }
                             }
-                            require_close(expected[route * output + row], reference, 2e-3f);
+                            if (dtype == float16)
+                                reference = float(static_cast<float16_t>(reference));
+                            require_close(expected[slot * output + row], reference, 2e-3f);
                         }
                     }
                 }
@@ -7019,6 +7495,46 @@ void test_kernel_preparation() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--test-portable-prefill") {
+            test_portable_mmq_row_buckets();
+            test_grouped_split_nint_swiglu_prefill();
+            test_grouped_split_nint_swiglu_prefill(513, 193, 65);
+            test_grouped_nint_mmq_prefill(65, 24, 256, 256);
+            test_grouped_nint_mmq_prefill(65, 28, 200, 256);
+            test_grouped_nint_mmq_prefill(385, 24, 256, 256);
+            test_grouped_nint_mmq_prefill(340, 28, 200, 256);
+            test_grouped_nint_mmq_prefill(513, 24, 193, 256);
+            test_grouped_nint_mmq_prefill(513, 28, 193, 256);
+            test_grouped_vq_decoder_tail_prefill(200, 257);
+            test_grouped_vq_decoder_tail_prefill(256, 384);
+            std::cout << "MFQ portable prefill tile tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-vq-prefill") {
+            test_grouped_vq_decoder_tail_prefill(640, 256);
+            test_grouped_vq_decoder_tail_prefill(200, 257);
+            test_grouped_vq_decoder_tail_prefill(256, 384);
+            std::cout << "MFQ VQ prefill decoder tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-nax-prefill") {
+            test_mixed_mfe_native_and_grouped_dispatch(256, true);
+            test_multiple_nint_pools_share_cpp_dispatch(513);
+            test_grouped_dense_quad_tail_prefill(66, 128);
+            test_grouped_vq_decoder_tail_prefill(640, 256);
+            test_grouped_vq_decoder_tail_prefill(256, 384);
+            test_grouped_nint_mmq_prefill(513, 24, 256, 66);
+            test_grouped_nint_mmq_prefill(513, 28, 256, 66);
+            test_grouped_nint_mmq_prefill(513, 24, 192, 256);
+            test_grouped_nint_mmq_prefill(513, 28, 192, 256);
+            std::cout << "MFQ NAX prefill decoder tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-shared-rotation") {
+            test_shared_rotated_input();
+            std::cout << "MFQ shared HSG1 rotation tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-prepare") {
             test_kernel_preparation();
             std::cout << "MFQ pure MFE preparation tests passed\n";
@@ -7036,12 +7552,16 @@ int main(int argc, char** argv) {
             }
             test_swiglu_ffn();
             test_vq_cohorts_and_ffn();
+            test_shared_rotated_input();
             test_nepq_a_routed_and_fused_swiglu();
             std::cout << "MFQ compatibility MFE variable-length tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-direct-mfe") {
+            test_banked_vq_input_views();
             test_direct_mfe_projection_families();
+            test_mixed_decode_row_packing(28, 1, 2560, 640);
+            test_mixed_decode_row_packing(28, 6, 2560, 640);
             std::cout << "MFQ direct MFE projection family tests passed\n";
             return 0;
         }
@@ -7076,6 +7596,8 @@ int main(int argc, char** argv) {
                 "usage: mfq-metal-moe-test "
                 "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe|--test-direct-mfe]");
         }
+        test_vq_small_m_route_order();
+        test_generic_vq_wide_small_m();
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_two_stage_nint_shared_decode();
@@ -7113,8 +7635,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 std::string("VQ cohorts/FFN: ") + error.what());
         }
+        test_shared_rotated_input();
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_mmq_prefill();
+        test_portable_mmq_row_buckets();
         try {
             test_grouped_vq_decoder_tail_prefill();
             test_grouped_vq_decoder_tail_prefill(256, 128);
@@ -7155,19 +7679,25 @@ int main(int argc, char** argv) {
         test_shared_nint8_mixed_prefill();
         test_shared_nint_mapped_and_packed_routes();
         test_grouped_dense_quad_tail_prefill();
+        test_grouped_dense_quad_tail_prefill(130, 194);
         test_mixed_mfe_native_and_grouped_dispatch();
+        test_mixed_mfe_native_and_grouped_dispatch(130, true);
         test_multiple_nint_pools_share_cpp_dispatch();
         test_multiple_nint_pools_share_cpp_dispatch(1);
         test_multiple_nint_pools_share_cpp_dispatch(513);
         test_grouped_mxfp4_vq_mmq_prefill();
+        test_grouped_mxfp4_vq_mmq_prefill(129, 224);
         test_concatenate_resident_mfe_experts();
         test_streamed_mixed_mfe_residency();
         test_streamed_nvq1_residency();
         test_materialized_mfe_projections();
         test_direct_mfe_projection_tails();
+        test_banked_vq_input_views();
         test_direct_mfe_projection_families();
         test_mixed_decode_row_packing(24);
         test_mixed_decode_row_packing(28);
+        test_mixed_decode_row_packing(28, 1, 2560, 640);
+        test_mixed_decode_row_packing(28, 6, 2560, 640);
         test_container_validation();
         std::cout
             << "MFQ native heterogeneous MFE/streamed "

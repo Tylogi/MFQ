@@ -180,7 +180,7 @@ __device__ inline float ssm_decode_cur(
 }
 
 template <int BD>
-__global__ void ssm_conv_qk_norm_decode_kernel(
+__device__ __forceinline__ void ssm_conv_qk_norm_decode(
     float* __restrict__ state,
     const __half* __restrict__ qk,
     const __half* __restrict__ v,
@@ -196,9 +196,8 @@ __global__ void ssm_conv_qk_norm_decode_kernel(
     int K,
     int weight_layout,
     int has_bias,
-    float eps)
+    float eps, int row)
 {
-    int row = blockIdx.x;
     int b = row / (2 * nk);
     int rem = row - b * 2 * nk;
     int which = rem / nk;
@@ -251,7 +250,7 @@ __global__ void ssm_conv_qk_norm_decode_kernel(
     }
 }
 
-__global__ void ssm_conv_v_decode_kernel(
+__device__ __forceinline__ void ssm_conv_v_decode(
     float* __restrict__ state,
     const __half* __restrict__ qk,
     const __half* __restrict__ v_in,
@@ -265,10 +264,8 @@ __global__ void ssm_conv_v_decode_kernel(
     int dv,
     int K,
     int weight_layout,
-    int has_bias)
+    int has_bias, int b, int idx)
 {
-    int b = blockIdx.x;
-    int idx = blockIdx.y * blockDim.x + threadIdx.x;
     int vsz = nv * dv;
     if (b >= B || idx >= vsz) {
         return;
@@ -294,6 +291,89 @@ __global__ void ssm_conv_v_decode_kernel(
         state[state_base + (size_t)j * (size_t)C] = state[state_base + (size_t)(j + 1) * (size_t)C];
     }
     state[state_base + (size_t)(K - 2) * (size_t)C] = x_cur;
+}
+
+template<int BD>
+__global__ void ssm_conv_qk_norm_decode_kernel(float* state,const __half* qk,const __half* v,
+    const float* w,const float* bias,float* q,float* k,int B,int nk,int nv,int dk,int dv,
+    int K,int layout,int has_bias,float eps) {
+    ssm_conv_qk_norm_decode<BD>(state,qk,v,w,bias,q,k,B,nk,nv,dk,dv,K,layout,has_bias,eps,blockIdx.x);
+}
+__global__ void ssm_conv_v_decode_kernel(float* state,const __half* qk,const __half* v,
+    const float* w,const float* bias,float* output,int B,int nk,int nv,int dk,int dv,
+    int K,int layout,int has_bias) {
+    ssm_conv_v_decode(state,qk,v,w,bias,output,B,nk,nv,dk,dv,K,layout,has_bias,
+        blockIdx.x,blockIdx.y*blockDim.x+threadIdx.x);
+}
+
+template<class Gate>
+__global__ void ssm_conv_qkv_gate_decode_kernel(float* state,const __half* qk,const __half* v,
+    const float* weight,const Gate* alpha,const Gate* beta,const float* dt_bias,const float* a_log,
+    float* q,float* k,float* output,float* decay,float* beta_out,
+    int B,int nk,int nv,int dk,int dv,int K,int layout,float eps,
+    int64_t as0,int64_t as2,int64_t bs0,int64_t bs2) {
+    const int v_blocks=(nv*dv+255)/256;
+    if(blockIdx.x<unsigned(2*nk)) {
+        ssm_conv_qk_norm_decode<256>(state,qk,v,weight,nullptr,q,k,B,nk,nv,dk,dv,K,layout,0,
+            eps,blockIdx.y*2*nk+blockIdx.x);
+    } else if(blockIdx.x<unsigned(2*nk+v_blocks)) {
+        ssm_conv_v_decode(state,qk,v,weight,nullptr,output,B,nk,nv,dk,dv,K,layout,0,
+            blockIdx.y,(blockIdx.x-2*nk)*256+threadIdx.x);
+    } else {
+        const int head=(blockIdx.x-2*nk-v_blocks)*256+threadIdx.x,b=blockIdx.y;
+        if(head<nv) {
+            const float a=static_cast<float>(alpha[int64_t(b)*as0+int64_t(head)*as2])+dt_bias[head];
+            const float sp=fmaxf(a,0.0f)+log1pf(expf(-fabsf(a)));
+            decay[int64_t(b)*nv+head]=sp*-expf(a_log[head]);
+            const float bv=static_cast<float>(beta[int64_t(b)*bs0+int64_t(head)*bs2]);
+            beta_out[int64_t(b)*nv+head]=1.0f/(1.0f+expf(-bv));
+        }
+    }
+}
+
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_decode_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qk,mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor dt_bias,mfq_tensor_backend::Tensor a_log,
+    int64_t nk,int64_t nv,int64_t dk,int64_t dv,double eps) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type()==tb::kFloat32 &&
+        state.dim()==3 && state.size(1)>0 && nk>0 && nv>0 && nv%nk==0 && dk>0 && dk<=256 && dv>0,
+        "GDN combined decode state/geometry disagrees");
+    const int B=int(state.size(0)),K=int(state.size(1))+1,C=int(2*nk*dk+nv*dv);
+    const auto same_device=[&](const tb::Tensor& x){return x.is_cuda() && x.device()==state.device();};
+    MFQ_RUNTIME_CHECK(same_device(qk) && same_device(v) && qk.is_contiguous() && v.is_contiguous() &&
+        qk.scalar_type()==tb::kFloat16 && v.scalar_type()==tb::kFloat16 &&
+        qk.sizes().vec()==std::vector<int64_t>({B,1,2*nk*dk}) &&
+        v.sizes().vec()==std::vector<int64_t>({B,1,nv*dv}) && state.size(2)==C,
+        "GDN combined decode projection shape/dtype disagrees");
+    MFQ_RUNTIME_CHECK(same_device(alpha) && same_device(beta) && alpha.scalar_type()==beta.scalar_type() &&
+        (alpha.scalar_type()==tb::kFloat16 || alpha.scalar_type()==tb::kFloat32) &&
+        alpha.sizes().vec()==std::vector<int64_t>({B,1,nv}) && beta.sizes()==alpha.sizes(),
+        "GDN combined decode gates disagree");
+    MFQ_RUNTIME_CHECK(same_device(weight) && same_device(dt_bias) && same_device(a_log) &&
+        weight.is_contiguous() && dt_bias.is_contiguous() && a_log.is_contiguous() &&
+        weight.scalar_type()==tb::kFloat32 && dt_bias.scalar_type()==tb::kFloat32 && a_log.scalar_type()==tb::kFloat32 &&
+        dt_bias.numel()==nv && a_log.numel()==nv,"GDN combined decode parameters disagree");
+    const bool channels_first=weight.sizes().vec()==std::vector<int64_t>({C,1,K});
+    MFQ_RUNTIME_CHECK(channels_first || weight.sizes().vec()==std::vector<int64_t>({K,C}),
+        "GDN combined decode convolution shape disagrees");
+    MfqCudaGuard guard(state.device());auto options=state.options();
+    auto q=tb::empty({B,nk,1,dk},options),k=tb::empty_like(q),output=tb::empty({B,nv,1,dv},options);
+    auto decay=tb::empty({B,nv,1},options),beta_out=tb::empty_like(decay);
+    const dim3 grid(unsigned(2*nk+(nv*dv+255)/256+(nv+255)/256),unsigned(B));
+    const auto launch=[&](auto tag) {
+        using Gate=decltype(tag);
+        ssm_conv_qkv_gate_decode_kernel<Gate><<<grid,256,0,mfq_current_cuda_stream()>>>(
+            state.data_ptr<float>(),reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()),weight.data_ptr<float>(),
+            alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),
+            q.data_ptr<float>(),k.data_ptr<float>(),output.data_ptr<float>(),decay.data_ptr<float>(),beta_out.data_ptr<float>(),
+            B,int(nk),int(nv),int(dk),int(dv),K,channels_first?0:1,float(eps),
+            alpha.stride(0),alpha.stride(2),beta.stride(0),beta.stride(2));
+    };
+    if(alpha.scalar_type()==tb::kFloat16)launch(mfq_half{});else launch(float{});
+    MFQ_CUDA_CHECK(cudaGetLastError());return {q,k,output,decay,beta_out};
 }
 
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(

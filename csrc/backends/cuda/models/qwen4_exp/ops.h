@@ -11,6 +11,13 @@
 namespace mfq::cuda::qwen4_exp { struct Gr; }
 
 namespace mfq::cuda {
+struct Qwen4DecodeGraph;
+void qwen4_begin_router_lookahead_audit(Qwen4CausalLm&,int samples);
+void qwen4_finish_router_lookahead_audit(Qwen4CausalLm&,const std::string& prefix);
+void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
+void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
+std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
 
 struct Qwen4Model : CausalResources {
     Qwen4Model();
@@ -22,6 +29,12 @@ struct Qwen4Model : CausalResources {
     std::unique_ptr<qwen4_exp::Gr> final_mixer;
     mfq_tensor_backend::Tensor positions;
     int64_t batch = 0;
+    std::optional<bool> router_lookahead;
+    std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    template<class Model> std::optional<mfq_tensor_backend::Tensor>
+    adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
+        return qwen4_decode_graph_logits(model,std::move(ids),kind);
+    }
 
     void adapter_validate_load_options() const;
     void adapter_load_final_state(const mfq::ModelSource &source,
@@ -30,6 +43,7 @@ struct Qwen4Model : CausalResources {
                                               const std::string &type);
 
     void adapter_reset(int64_t batch);
+    void adapter_begin_forward(bool capture_raw_hidden);
 
     mfq_tensor_backend::Tensor
     adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,

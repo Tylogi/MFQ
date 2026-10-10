@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -142,9 +143,13 @@ public:
     void prepare_memory(
         const std::vector<StreamHandle>& participant_streams);
     void capture_begin();
+    // Record in a pool already owned by a decoder or expert-cache lifetime.
+    void capture_begin_shared();
     void capture_end();
     void replay();
     void reset() noexcept;
+    bool valid() const noexcept { return executable_ != nullptr; }
+    std::size_t nodes() const;
 
 private:
     int device_ = 0;
@@ -154,6 +159,7 @@ private:
     std::vector<std::shared_ptr<Context>> pool_contexts_;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
+    bool shared_pool_ = false;
 };
 
 class BlasHandle final {
@@ -175,6 +181,12 @@ private:
 };
 
 struct ParallelBatchMatmulContext;
+struct AllocationBudget;
+struct DeviceMemoryStats {
+    std::size_t limit = 0;
+    std::size_t allocated = 0;
+    std::size_t peak = 0;
+};
 
 class Context final : public std::enable_shared_from_this<Context> {
 public:
@@ -188,6 +200,9 @@ public:
     std::shared_ptr<ParallelBatchMatmulContext> parallel_blas;
     cudaMemPool_t memory_pool() const noexcept { return pool_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
+    DeviceMemoryStats memory_stats() const noexcept;
+    std::size_t local_memory_usage() const;
+    void check_memory_limit(std::size_t additional = 0) const;
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
     void release(
@@ -195,6 +210,8 @@ public:
         std::size_t bytes,
         cudaStream_t stream = nullptr) noexcept;
     void begin_graph_pool(cudaStream_t stream);
+    void begin_graph_warmup(cudaStream_t stream);
+    void end_graph_warmup(cudaStream_t stream) noexcept;
     void begin_graph_capture(cudaStream_t stream);
     void end_graph_capture(cudaStream_t stream) noexcept;
     void end_graph_pool(cudaStream_t stream) noexcept;
@@ -205,7 +222,9 @@ public:
 private:
     struct GraphPool {
         bool capturing = false;
+        bool warming = false;
         std::unordered_map<std::size_t, std::vector<void*>> available;
+        std::unordered_set<void*> owned;
     };
 
     int device_ = 0;
@@ -214,6 +233,7 @@ private:
     cudaMemPool_t pool_ = nullptr;
     bool async_allocations_ = false;
     std::atomic<std::size_t> allocation_limit_{0}, allocated_bytes_{0};
+    std::shared_ptr<AllocationBudget> allocation_budget_;
     std::mutex graph_pool_mutex_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };
@@ -232,6 +252,16 @@ private:
     std::unordered_map<int, StreamHandle> streams_;
 };
 std::shared_ptr<Context> default_context(int device = 0);
+class GraphWarmupScope {
+public:
+    GraphWarmupScope(std::shared_ptr<Context> context,cudaStream_t stream):context_(std::move(context)),stream_(stream) {
+        context_->begin_graph_warmup(stream_);
+    }
+    ~GraphWarmupScope(){context_->end_graph_warmup(stream_);}
+    GraphWarmupScope(const GraphWarmupScope&)=delete;
+private:
+    std::shared_ptr<Context> context_;cudaStream_t stream_;
+};
 
 class Buffer final {
 public:

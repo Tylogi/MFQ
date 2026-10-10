@@ -251,7 +251,10 @@ class Qwen4ExpConfig:
             raise ValueError("unsupported Qwen4-Exp vision-tower semantics")
         mtp_count = int(text.get("mtp_num_hidden_layers", 0) or 0)
         mtp_raw = text.get("mtp")
-        if isinstance(mtp_raw, Mapping):
+        if mtp_count < 0:
+            raise ValueError("Qwen4-Exp MTP layer count must be non-negative")
+        # Text-only packed releases retain the original optional-head config.
+        if mtp_count > 0 and isinstance(mtp_raw, Mapping):
             nested_count = int(mtp_raw.get("num_hidden_layers", mtp_count) or 0)
             if nested_count != mtp_count:
                 raise ValueError("Qwen4-Exp MTP layer counts disagree")

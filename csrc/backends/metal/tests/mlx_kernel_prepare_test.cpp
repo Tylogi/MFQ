@@ -1,5 +1,6 @@
 #include "mlx_kernel_prepare.h"
 #include "mlx_nint.h"
+#include "mlx_resident_budget.h"
 #include "mlx_sampling.h"
 
 #include <cstdint>
@@ -24,7 +25,7 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-mfq::metal::MlxNintWeight weight() {
+mfq::metal::MlxNintWeight weight(int output_size = 2) {
     std::vector<std::uint8_t> blob;
     append<std::uint8_t>(blob, 4);
     append<std::uint8_t>(blob, 1);
@@ -32,17 +33,15 @@ mfq::metal::MlxNintWeight weight() {
     append<std::int32_t>(blob, 0);
     append<std::int32_t>(blob, 64);
     append<std::uint32_t>(blob, 2);
-    append<std::int64_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
     append<std::int64_t>(blob, 64);
-    append<std::uint32_t>(blob, 2);
+    append<std::uint32_t>(blob, output_size);
     append<std::uint32_t>(blob, 1);
-    append<std::uint16_t>(blob, 0x3c00);
-    append<std::uint16_t>(blob, 0x3c00);
-    append<std::uint16_t>(blob, 0);
-    append<std::uint16_t>(blob, 0);
-    append<std::uint8_t>(blob, 3);
-    append<std::uint8_t>(blob, 0);
-    blob.insert(blob.end(), 64, 0x11);
+    for (int row = 0; row < output_size; ++row) append<std::uint16_t>(blob, 0x3c00);
+    for (int row = 0; row < output_size; ++row) append<std::uint16_t>(blob, 0);
+    blob.insert(blob.end(), (output_size + 7) / 8, 0xff);
+    blob.insert(blob.end(), (output_size + 7) / 8, 0);
+    blob.insert(blob.end(), output_size * 32, 0x11);
     return mfq::metal::MlxNintWeight::from_blob(blob);
 }
 }
@@ -54,6 +53,7 @@ int main() {
 #endif
         set_default_device(Device::gpu);
         const auto packed = weight();
+        const auto expanded = weight(129);
         mfq::metal::MlxKernelPreparation preparation(2048, 2048);
         const auto memory = get_active_memory();
         mfq_kernel_prepare_phase(1);
@@ -61,6 +61,14 @@ int main() {
         for (const auto rows : preparation.row_buckets()) {
             descriptions.push_back(packed.matmul(zeros({rows, 64}, float16)));
             preparation.add(descriptions.back());
+            descriptions.push_back(expanded.matmul(zeros({rows, 64}, float16)));
+            preparation.add(descriptions.back());
+            if (rows >= 64) {
+                preparation.add(packed.matmul_packed(zeros({rows, 64}, float16)));
+                preparation.add(expanded.matmul_packed(zeros({rows, 64}, float16)));
+                preparation.add(packed.dequantize(float16));
+                preparation.add(expanded.dequantize(float16));
+            }
         }
         const auto logits = zeros({1, 13}, float32);
         auto counts = mfq::metal::sample_token_counts_add(zeros({13}, int32), zeros({8}, int32));
@@ -78,11 +86,21 @@ int main() {
         for (const auto& description : descriptions)
             require(!description.is_available(), "pure compilation evaluated an output");
         mfq_kernel_prepare_phase(2);
-        for (const int rows : {9, 17, 29}) {
-            auto output = astype(packed.matmul(ones({rows, 64}, float16)), float32);
-            output.eval();
-            for (std::size_t index = 0; index < output.size(); ++index)
-                require(output.data<float>()[index] == 64.0f, "prepared projection is incorrect");
+        for (const int rows : {9, 17, 29, 64, 65, 127, 128, 129, 511, 512, 2039, 2048}) {
+            for (const auto* projection : {&packed, &expanded}) {
+                auto output = astype(projection->matmul(ones({rows, 64}, float16)), float32);
+                output.eval();
+                for (std::size_t index = 0; index < output.size(); ++index)
+                    require(output.data<float>()[index] == 64.0f, "prepared projection is incorrect");
+            }
+        }
+        {
+            mfq::metal::MlxResidentBudgetScope denied({}, [](std::size_t) { return false; });
+            for (const auto* projection : {&packed, &expanded}) {
+                const auto fallback = projection->matmul(ones({2048, 64}, float16));
+                require(all(equal(fallback, array(64.0f, float16))).item<bool>(),
+                    "prepared low-memory fallback is incorrect");
+            }
         }
         descriptions.back().eval();
         require(descriptions.back().item<int>() == 1, "prepared sampling is incorrect");

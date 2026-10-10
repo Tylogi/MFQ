@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <vector>
 
+void nint_moe_grouped_matmul_hetero_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool,mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor route_ids,mfq_tensor_backend::Tensor output,
+    int64_t input_width,bool routed_input);
+
 mfq_tensor_backend::Tensor embedding_lookup_cuda(
     mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor token_ids);
 mfq_tensor_backend::Tensor nepq_hadamard_input_cuda(
@@ -19,6 +25,9 @@ mfq_tensor_backend::Tensor nint_embedding_cuda(
 mfq_tensor_backend::Tensor nint_selected_rows_cuda(
     mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor descriptors,
     int64_t width);
+void nint_selected_rows_into_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor descriptors,
+    mfq_tensor_backend::Tensor inverse, mfq_tensor_backend::Tensor output);
 mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len);
@@ -30,6 +39,9 @@ mfq_tensor_backend::Tensor nint8_zero_mmq_f16_packed_cuda(
 mfq_tensor_backend::Tensor nint8_zero_mmq_f32_packed_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     int64_t neuron_len);
+// Packed GEMV accepts contiguous Half/Float activations (and gates). Float
+// loads preserve the existing Half rounding inside the quantizer; output is
+// always Half, with no intermediate converted activation tensor.
 mfq_tensor_backend::Tensor nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
