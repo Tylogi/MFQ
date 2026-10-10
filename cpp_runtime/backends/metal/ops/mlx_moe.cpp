@@ -5069,14 +5069,20 @@ void validate_nint_payload_shape(
         || group_size <= 0
         || axis != 0
         || columns != expected_columns
-        || dimensions != 2
+        || (dimensions != 2 && dimensions != 3)
     ) {
         throw std::runtime_error(
             "MFE NINT cohort shape is inconsistent");
     }
-    const auto rows =
+    auto rows =
         cursor.scalar<std::int64_t>(
             "NINT output shape");
+    if (dimensions == 3) {
+        const auto output = cursor.scalar<std::int64_t>("NINT expert output shape");
+        if (rows <= 0 || output <= 0 || rows > expected_rows / output)
+            throw std::runtime_error("MFE NINT cohort row dimensions are inconsistent");
+        rows *= output;
+    }
     const auto shape_columns =
         cursor.scalar<std::int64_t>(
             "NINT input shape");
@@ -6033,6 +6039,35 @@ struct MfeProjectionView {
     int input;
     std::vector<MfePoolView> pools;
 };
+
+MfeProjectionView inspect_nint_projection(std::span<const std::uint8_t> blob) {
+    BlobCursor cursor(blob);
+    const auto bits = cursor.scalar<std::uint8_t>("NINT bits") & 127;
+    const auto sub_bits = cursor.scalar<std::uint8_t>("NINT sub bits");
+    const auto group_size = cursor.scalar<std::int32_t>("NINT group size");
+    const auto axis = cursor.scalar<std::int32_t>("NINT axis");
+    const auto input = cursor.scalar<std::int32_t>("NINT input width");
+    const auto rank = cursor.scalar<std::uint32_t>("NINT rank");
+    if (bits < 1 || bits > 8 || sub_bits < 1 || sub_bits > 8 ||
+        group_size <= 0 || rank != 3 || axis != 0 || input <= 0)
+        throw std::runtime_error("routed NINT tensor must use [experts,out,in]");
+    const int experts = checked_int(checked_size(cursor.scalar<std::int64_t>("NINT experts"), "NINT experts"), "NINT experts");
+    const int output = checked_int(checked_size(cursor.scalar<std::int64_t>("NINT output"), "NINT output"), "NINT output");
+    if (experts <= 0 || output <= 0 || cursor.scalar<std::int64_t>("NINT input") != input)
+        throw std::runtime_error("routed NINT tensor shape disagrees");
+    const auto rows = checked_int(checked_product(static_cast<std::size_t>(experts),
+        static_cast<std::size_t>(output), "routed NINT rows"), "routed NINT rows");
+    if (cursor.scalar<std::uint32_t>("NINT rows") != rows ||
+        cursor.scalar<std::uint32_t>("NINT groups") != (static_cast<std::int64_t>(input) + group_size - 1) / group_size ||
+        static_cast<std::size_t>(rows) > cursor.remaining() / 4)
+        throw std::runtime_error("routed NINT tensor row metadata disagrees");
+    MfePoolView pool;
+    pool.expert_ids.resize(experts);
+    std::iota(pool.expert_ids.begin(), pool.expert_ids.end(), 0);
+    pool.dtype = "NINT";
+    pool.payload = blob;
+    return {experts, output, input, {std::move(pool)}};
+}
 
 MfeProjectionView inspect_mfe_projection(std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
@@ -8405,6 +8440,18 @@ MlxMfeWeight MlxMfeWeight::from_blob(
 
 MlxMfeWeight MlxMfeWeight::from_projection_blobs(
     std::span<const std::span<const std::uint8_t>> blobs) {
+    return from_projection_blobs_impl(blobs, false);
+}
+
+MlxMfeWeight MlxMfeWeight::from_nint_blob(
+    std::span<const std::uint8_t> blob) {
+    const std::array blobs{blob};
+    return from_projection_blobs_impl(blobs, true);
+}
+
+MlxMfeWeight MlxMfeWeight::from_projection_blobs_impl(
+    std::span<const std::span<const std::uint8_t>> blobs,
+    bool nint_tensor) {
     if (blobs.empty()) {
         throw std::invalid_argument("at least one MFE projection is required");
     }
@@ -8412,7 +8459,8 @@ MlxMfeWeight MlxMfeWeight::from_projection_blobs(
     std::vector<MfeProjectionView> projections;
     projections.reserve(blobs.size());
     for (const auto blob : blobs) {
-        projections.push_back(inspect_mfe_projection(blob));
+        projections.push_back(nint_tensor
+            ? inspect_nint_projection(blob) : inspect_mfe_projection(blob));
     }
     const int expert_count = projections.front().experts;
     const int output_width = projections.front().output;

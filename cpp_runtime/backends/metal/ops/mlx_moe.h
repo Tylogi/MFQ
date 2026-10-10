@@ -117,6 +117,8 @@ class MlxMfeWeight {
 public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_nint_blob(
+        std::span<const std::uint8_t> blob);
 
     // Load compatible packed projections into one final arena, without
     // separate Gate/Up arenas or model-sized staging vectors. Standalone
@@ -282,6 +284,10 @@ public:
 
 private:
     struct Impl;
+
+    static MlxMfeWeight from_projection_blobs_impl(
+        std::span<const std::span<const std::uint8_t>> blobs,
+        bool nint_tensor);
 
     explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 

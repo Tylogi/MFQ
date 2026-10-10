@@ -224,10 +224,6 @@ MlxMfeWeight moe_weight(
     return MlxMfeWeight::from_blob(mapped.view());
 }
 
-// A canonical routed projection may be stored either as a heterogeneous
-// MFE container or as one dense [experts,out,in] tensor. Predictor heads
-// are intentionally left dense by the standard presets, so the model adapter
-// must dispatch by record representation rather than by architecture role.
 class Qwen4RoutedWeight {
 public:
     const array& training_weight() const {
@@ -256,6 +252,11 @@ public:
                 return Qwen4RoutedWeight(std::move(values));
             }
             return Qwen4RoutedWeight(moe_weight(model, name));
+        }
+        if (model.record(name).dtype == "NINT") {
+            const auto mapped = model.map_record(name);
+            model.record_prepared(name);
+            return Qwen4RoutedWeight(MlxMfeWeight::from_nint_blob(mapped.view()));
         }
         auto values = dense(model, name);
         if (values.ndim() != 3 || values.shape(0) <= 0 ||
@@ -1940,9 +1941,18 @@ public:
         const MfqContainer& model,
         const Qwen4Config& config,
         const std::string& prefix) {
+        std::vector<MlxLinear> qkv;
+        const bool independent = model.contains(prefix + ".query.weight") ||
+            model.contains(prefix + ".key.weight") || model.contains(prefix + ".value.weight");
+        if (independent) {
+            if (model.contains(prefix + ".qkv.weight"))
+                throw std::runtime_error("ambiguous Qwen4 GDN input projections");
+            for (const auto* name : {"query", "key", "value"})
+                qkv.push_back(MlxLinear::load(model, prefix + "." + name + ".weight"));
+        } else qkv.push_back(MlxLinear::load(model, prefix + ".qkv.weight"));
         return std::unique_ptr<Qwen4Gdn>(new Qwen4Gdn(
             config,
-            MlxLinear::load(model, prefix + ".qkv.weight"),
+            std::move(qkv),
             MlxLinear::load(model, prefix + ".gate.weight"),
             MlxLinear::load(model, prefix + ".alpha.weight"),
             MlxLinear::load(model, prefix + ".beta.weight"),
@@ -2115,7 +2125,7 @@ public:
 private:
     Qwen4Gdn(
         Qwen4Config config,
-        MlxLinear qkv,
+        std::vector<MlxLinear> qkv,
         MlxLinear gate,
         MlxLinear alpha,
         MlxLinear beta,
@@ -2129,17 +2139,26 @@ private:
           gate_(std::move(gate)),
           alpha_(std::move(alpha)),
           beta_(std::move(beta)),
-          input_projections_(std::vector<const MlxLinear*>{
-              &qkv_,
-              &gate_,
-              &alpha_,
-              &beta_,
-          }),
+          input_projections_([&] {
+              std::vector<const MlxLinear*> inputs;
+              for (const auto& projection : qkv_) inputs.push_back(&projection);
+              inputs.insert(inputs.end(), {&gate_, &alpha_, &beta_});
+              return inputs;
+          }()),
           convolution_weight_(std::move(convolution_weight)),
           dt_bias_(std::move(dt_bias)),
           decay_scale_(-mlx::core::exp(a_log) * array(1.0f)),
           output_norm_(std::move(output_norm)),
           output_(std::move(output)) {
+        const int hidden = static_cast<int>(config_.hidden_size);
+        const std::vector<int> widths = qkv_.size() == 3
+            ? std::vector<int>{key_width(), key_width(), value_width()}
+            : std::vector<int>{2 * key_width() + value_width()};
+        if (qkv_.size() != widths.size())
+            throw std::runtime_error("invalid Qwen4 GDN projection count");
+        for (std::size_t i = 0; i < widths.size(); ++i)
+            if (qkv_[i].input_size() != hidden || qkv_[i].output_size() != widths[i])
+                throw std::runtime_error("Qwen4 GDN input projection geometry disagrees");
         compiled_decode_ = mlx::core::compile(
             [this](const std::vector<array>& inputs) {
                 return decode_step(inputs);
@@ -2179,17 +2198,26 @@ private:
         }
     }
 
+    std::vector<array> project_inputs(const array& hidden) const {
+        auto projected = input_projections_(hidden);
+        if (qkv_.size() == 3)
+            return {mlx::core::concatenate({projected[0], projected[1]}, -1),
+                std::move(projected[2]), std::move(projected[3]),
+                std::move(projected[4]), std::move(projected[5])};
+        auto qkv = mlx::core::split(projected[0], Shape{2 * key_width()}, -1);
+        return {std::move(qkv[0]), std::move(qkv[1]), std::move(projected[1]),
+            std::move(projected[2]), std::move(projected[3])};
+    }
+
     std::vector<array> decode_step(const std::vector<array>& inputs) {
-        auto projections = input_projections_(inputs[0]);
-        auto qkv = mlx::core::split(
-            projections.at(0), Shape{2 * key_width()}, -1);
-        detail::profile_eval("qwen4.gdn.qkv", projections[0]);
-        detail::profile_eval("qwen4.gdn.gate", projections[1]);
+        auto projections = project_inputs(inputs[0]);
+        detail::profile_eval("qwen4.gdn.qkv", {projections[0], projections[1]});
+        detail::profile_eval("qwen4.gdn.gate", projections[2]);
         const Shape gates{1, 1, static_cast<int>(config_.linear_num_value_heads)};
         auto decoded = gated_delta_decode_step(
-            qkv[0], qkv[1], projections[1],
-            mlx::core::reshape(projections[2], gates),
+            projections[0], projections[1], projections[2],
             mlx::core::reshape(projections[3], gates),
+            mlx::core::reshape(projections[4], gates),
             inputs[1], inputs[2], convolution_weight_, dt_bias_, decay_scale_,
             output_norm_.weight(),
             static_cast<int>(config_.linear_num_key_heads),
@@ -2208,23 +2236,16 @@ private:
         const auto& hidden = inputs[0];
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
-        auto input_projections = input_projections_(hidden);
-        if (input_projections.size() != 4) {
-            throw std::logic_error(
-                "Qwen4 GDN projection group output mismatch");
-        }
-        auto projected = std::move(input_projections[0]);
-        detail::profile_eval("qwen4.gdn.qkv", projected);
-        auto qkv_parts = mlx::core::split(
-            projected, Shape{2 * key_width()}, -1);
-        auto qk = std::move(qkv_parts.at(0));
-        auto value = std::move(qkv_parts.at(1));
-        auto z = std::move(input_projections[1]);
+        auto input_projections = project_inputs(hidden);
+        auto qk = std::move(input_projections[0]);
+        auto value = std::move(input_projections[1]);
+        detail::profile_eval("qwen4.gdn.qkv", {qk, value});
+        auto z = std::move(input_projections[2]);
         detail::profile_eval("qwen4.gdn.gate", z);
         const Shape gate_shape{
             batch, tokens, static_cast<int>(config_.linear_num_value_heads)};
-        auto alpha = mlx::core::reshape(input_projections[2], gate_shape);
-        auto beta = mlx::core::reshape(input_projections[3], gate_shape);
+        auto alpha = mlx::core::reshape(input_projections[3], gate_shape);
+        auto beta = mlx::core::reshape(input_projections[4], gate_shape);
         auto gates = gated_delta_gates(
             alpha,
             beta,
@@ -2309,7 +2330,7 @@ private:
     }
 
     Qwen4Config config_;
-    MlxLinear qkv_;
+    std::vector<MlxLinear> qkv_;
     MlxLinear gate_;
     MlxLinear alpha_;
     MlxLinear beta_;
@@ -2335,6 +2356,7 @@ public:
     const std::vector<array>& training_context() const { return training_context_; }
     void prepare_training(MlxMtpLora& lora) const {
         lora.prepare_linear(*query_.dense_weight_ref());
+        if (gate_) lora.prepare_linear(*gate_->dense_weight_ref());
         lora.prepare_linear(*output_.dense_weight_ref());
         lora.prepare_attention(config_.head_dim, ((config_.indexer_budget + config_.indexer_compress_ratio + 30) / 32) * 32);
         mlx::core::eval(query_norm_.weight());
@@ -2348,8 +2370,11 @@ public:
         if (keys.shape(2) > attention_width) throw std::invalid_argument("MTP sparse training cache exceeds its budget");
         auto padded_keys = mlx::core::pad(keys, {{0, 0}, {0, 0}, {0, attention_width - keys.shape(2)}, {0, 0}}, array(0.0f), "constant", cpu);
         auto padded_values = mlx::core::pad(values, {{0, 0}, {0, 0}, {0, attention_width - values.shape(2)}, {0, 0}}, array(0.0f), "constant", cpu);
-        auto query_full = mlx::core::reshape(p.linear(hidden, *query_.dense_weight_ref()), {heads, 2 * dimension}, cpu);
-        auto parts = mlx::core::split(query_full, 2, -1, cpu);
+        auto query_full = p.linear(hidden, *query_.dense_weight_ref());
+        auto parts = gate_
+            ? std::vector<array>{mlx::core::reshape(query_full, {heads, dimension}, cpu),
+                mlx::core::reshape(p.linear(hidden, *gate_->dense_weight_ref()), {heads, dimension}, cpu)}
+            : mlx::core::split(mlx::core::reshape(query_full, {heads, 2 * dimension}, cpu), 2, -1, cpu);
         auto raw_query = mlx::core::add(mlx::core::reshape(parts[0], {1, width}, cpu), p.delta("attention.q", hidden), cpu);
         auto output_gate = mlx::core::add(mlx::core::reshape(parts[1], {1, width}, cpu), p.delta("attention.gate", hidden), cpu);
         auto query = mlx::core::reshape(raw_query, {heads, dimension}, cpu);
@@ -2519,7 +2544,10 @@ public:
                 static_cast<float>(config.rms_norm_eps), 1.0f),
             MlxRmsNorm(
                 dense_vector(model, prefix + ".indexer.key_norm.weight"),
-                static_cast<float>(config.rms_norm_eps), 1.0f)));
+                static_cast<float>(config.rms_norm_eps), 1.0f),
+            model.contains(prefix + ".gate.weight")
+                ? std::optional<MlxLinear>{MlxLinear::load(model, prefix + ".gate.weight")}
+                : std::nullopt));
     }
 
     void reset(int batch) override {
@@ -2575,11 +2603,19 @@ public:
                 "Qwen4 QSA speculative boundary disagrees");
         }
         auto input_projections = input_projections_(hidden);
-        if (input_projections.size() != 4) {
+        if (input_projections.size() != (gate_ ? 5 : 4)) {
             throw std::logic_error(
                 "Qwen4 QSA projection group output mismatch");
         }
         auto query_full = std::move(input_projections[0]);
+        if (gate_) {
+            const Shape heads{batch, tokens, static_cast<int>(config_.num_attention_heads),
+                static_cast<int>(config_.head_dim)};
+            query_full = mlx::core::reshape(mlx::core::concatenate({
+                mlx::core::reshape(query_full, heads),
+                mlx::core::reshape(input_projections[4], heads)}, -1),
+                Shape{batch, tokens, static_cast<int>(2 * config_.num_attention_heads * config_.head_dim)});
+        }
         if (auto* lora = MlxMtpLora::current(); lora && lora->active()) {
             auto parts = mlx::core::split(mlx::core::reshape(query_full,
                 {batch, tokens, int(config_.num_attention_heads), 2 * int(config_.head_dim)}), 2, -1);
@@ -2920,7 +2956,8 @@ private:
         MlxLinear output,
         MlxLinear index_query_key,
         MlxRmsNorm index_query_norm,
-        MlxRmsNorm index_key_norm)
+        MlxRmsNorm index_key_norm,
+        std::optional<MlxLinear> gate)
         : config_(std::move(config)),
           maximum_(maximum),
           query_(std::move(query)),
@@ -2930,12 +2967,12 @@ private:
           key_norm_(std::move(key_norm)),
           output_(std::move(output)),
           index_query_key_(std::move(index_query_key)),
-          input_projections_(std::vector<const MlxLinear*>{
-              &query_,
-              &key_,
-              &value_,
-              &index_query_key_,
-          }),
+          gate_(std::move(gate)),
+          input_projections_([&] {
+              std::vector<const MlxLinear*> inputs{&query_, &key_, &value_, &index_query_key_};
+              if (gate_) inputs.push_back(&*gate_);
+              return inputs;
+          }()),
           cache_projections_(std::vector<const MlxLinear*>{
               &key_, &value_, &index_query_key_,
           }),
@@ -2946,6 +2983,10 @@ private:
                static_cast<int>(config_.indexer_compress_ratio) - 1) /
                   static_cast<int>(config_.indexer_compress_ratio),
               static_cast<int>(config_.indexer_head_dim), mlx::core::float32) {
+        const int width = static_cast<int>(config_.num_attention_heads * config_.head_dim);
+        if (query_.output_size() != (gate_ ? width : 2 * width) ||
+            (gate_ && (gate_->input_size() != config_.hidden_size || gate_->output_size() != width)))
+            throw std::runtime_error("Qwen4 QSA query/gate projection geometry disagrees");
         if (auto* preparation = MlxKernelPreparation::current()) {
             preparation->collect([&] {
                 for (const auto requested : preparation->row_buckets()) {
@@ -3137,6 +3178,7 @@ private:
     MlxRmsNorm key_norm_;
     MlxLinear output_;
     MlxLinear index_query_key_;
+    std::optional<MlxLinear> gate_;
     MlxProjectionBatch input_projections_;
     MlxProjectionBatch cache_projections_;
     MlxRmsNorm index_query_norm_;

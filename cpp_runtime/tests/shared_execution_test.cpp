@@ -1385,6 +1385,16 @@ struct ParameterLoader {
     }
     static Tensor residual(Tensor norm, Tensor, Tensor, Tensor, const mfq::models::qwen4_exp::Config &) { return norm; }
     static Tensor final_mixer(Tensor value) { return value; }
+    GdnWeights gdn_weights(const std::string &p) {
+        return {linear(p + ".qkv.weight"),linear(p + ".gate.weight"),linear(p + ".alpha.weight"),
+            linear(p + ".beta.weight"),linear(p + ".output.weight"),dense(p + ".conv.weight"),
+            dense(p + ".dt_bias"),dense(p + ".a"),dense(p + ".norm.weight")};
+    }
+    QsaWeights qsa_weights(const std::string &p) {
+        return {linear(p + ".query.weight"),linear(p + ".key.weight"),linear(p + ".value.weight"),
+            linear(p + ".output.weight"),linear(p + ".indexer.query_key.weight"),dense(p + ".query_norm.weight"),
+            dense(p + ".key_norm.weight"),dense(p + ".indexer.query_norm.weight"),dense(p + ".indexer.key_norm.weight")};
+    }
     static Tensor gdn(GdnWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
     static Tensor qsa(QsaWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
     template <class... Args> static Tensor moe(Args &&...) { return "moe"; }

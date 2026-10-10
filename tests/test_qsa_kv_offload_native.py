@@ -5,12 +5,13 @@ import numpy as np
 import pytest
 
 from mfq.formats.io import Float8E4M3Array
-from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
+from tests.test_cuda_flash_next_runtime import independent_qwen_attention, mtp_fixture, write_qwen_fixture
 
 
 @pytest.mark.parametrize("budget", [128 << 10, 32 << 20])
 @pytest.mark.parametrize("native_context", [1024, 256])
-def test_complete_qsa_offload_prefix_and_mtp(tmp_path, budget, native_context):
+@pytest.mark.parametrize('independent', [False, True])
+def test_complete_qsa_offload_prefix_and_mtp(tmp_path, budget, native_context, independent, packed_predictor=False):
     binary = os.environ.get("MFQ_QSA_OFFLOAD_TEST")
     if not binary:
         pytest.skip("MFQ_QSA_OFFLOAD_TEST required")
@@ -35,13 +36,26 @@ def test_complete_qsa_offload_prefix_and_mtp(tmp_path, budget, native_context):
             "indexer.query_norm": 128, "indexer.key_norm": 128}.items():
             weights[f"{prefix}.{name}.weight"] = rng.normal(scale=.02, size=width).astype(np.float32)
     path = tmp_path / "qsa-offload.mfq"
+    if independent: weights = independent_qwen_attention(config, weights)
+    if packed_predictor:
+        from dataclasses import replace
+        from mfq.formats.nint import NintSpec
+        from mfq.quantize.nint_quant import quantize
+        spec = NintSpec(bits=8, groupsize=48, sub_bits=7)
+        for name, values in list(weights.items()):
+            if not name.startswith('predictor.') or '.experts.' not in name: continue
+            weights[name] = replace(quantize(values.reshape(-1, values.shape[-1]), spec), shape=values.shape)
     write_qwen_fixture(path, config, weights, predictor=True)
     result = subprocess.run([binary, str(path), str(budget)], text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Complete model offload, prefix restore and MTP checks passed" in result.stdout
 
 
+def test_complete_nint_predictor_independent_projections(tmp_path):
+    test_complete_qsa_offload_prefix_and_mtp(tmp_path, 128 << 10, 1024, True, True)
+
+
 @pytest.mark.parametrize('bits', [2.5, 4])
 def test_complete_quantized_qsa_prefix_and_mtp(tmp_path, monkeypatch, bits):
     monkeypatch.setenv('MFQ_KV_TURBOQUANT_BITS', str(bits))
-    test_complete_qsa_offload_prefix_and_mtp(tmp_path, 128 << 10, 1024)
+    test_complete_qsa_offload_prefix_and_mtp(tmp_path, 128 << 10, 1024, False)

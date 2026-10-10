@@ -8,6 +8,7 @@ executes them with the custom kernels from :mod:`mfq.kernels.metal`.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from mfq.formats import io
 from mfq.formats.compat import NEPQ_DTYPE, NPQ_DTYPE, NVQ_DTYPE, is_nint_dtype
 from mfq.formats.io import MfqTensor
-from mfq.formats.mfe import MfeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
@@ -790,6 +791,13 @@ class MlxNintModel:
         tensor = self._require(name)
         if isinstance(tensor, MfeTensor):
             return MlxRoutedLinear(tensor)
+        if isinstance(tensor, NintTensor) and len(tensor.shape) == 3 and tensor.axis == 0:
+            experts, output, width = map(int, tensor.shape)
+            if tensor.q.shape[0] != experts * output or tensor.neuron_len != width:
+                raise ValueError(f"routed NINT tensor shape disagrees: {name}")
+            flat = replace(tensor, shape=(experts * output, width))
+            return MlxRoutedLinear(MfeTensor(shape=tensor.shape,
+                pools=(MfePool(np.arange(experts, dtype=np.int32), flat),)))
         if isinstance(tensor, np.ndarray) and tensor.ndim == 3:
             return MlxDenseRoutedLinear(tensor)
         raise TypeError(f"tensor {name!r} must use MFE or a dense 3D expert bank")

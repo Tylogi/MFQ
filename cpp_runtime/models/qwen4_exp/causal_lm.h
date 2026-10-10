@@ -62,20 +62,11 @@ void load_block(Block &b, Loader &ops, const Config &c, int layer, bool predicto
     b.ffn = load_ffn(ops, c, layer, p + ".mlp");
     if (c.linear_layer(layer, predictor)) {
         const auto a = p + ".linear_attention";
-        typename Loader::GdnWeights w{
-            ops.linear(a + ".qkv.weight"), ops.linear(a + ".gate.weight"),
-            ops.linear(a + ".alpha.weight"), ops.linear(a + ".beta.weight"),
-            ops.linear(a + ".output.weight"), ops.dense(a + ".conv.weight"),
-            ops.dense(a + ".dt_bias"), ops.dense(a + ".a"), ops.dense(a + ".norm.weight")};
+        auto w = ops.gdn_weights(a);
         b.gdn = ops.gdn(std::move(w), c);
     } else {
         const auto a = p + ".attention";
-        typename Loader::QsaWeights w{
-            ops.linear(a + ".query.weight"), ops.linear(a + ".key.weight"),
-            ops.linear(a + ".value.weight"), ops.linear(a + ".output.weight"),
-            ops.linear(a + ".indexer.query_key.weight"), ops.dense(a + ".query_norm.weight"),
-            ops.dense(a + ".key_norm.weight"), ops.dense(a + ".indexer.query_norm.weight"),
-            ops.dense(a + ".indexer.key_norm.weight")};
+        auto w = ops.qsa_weights(a);
         b.qsa = ops.qsa(std::move(w), c);
     }
     if (c.position_embedding_layer(layer, predictor))
