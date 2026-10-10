@@ -1,11 +1,55 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import TYPE_CHECKING, Any
 
-from mfq.server.protocol.models import ModelCacheComponent, ModelCacheFixedComponent, ModelCacheProfile
+from mfq.formats.assets import MODEL_CONFIG_ASSET
+from mfq.formats.io import open_mmap
+from mfq.server.protocol.models import (
+    ModelCacheComponent,
+    ModelCacheFixedComponent,
+    ModelCacheProfile,
+)
+
+if TYPE_CHECKING:
+    from mfq.server.state.catalog import DiscoveredModel
 
 
-def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True) -> ModelCacheProfile | None:
+def checkpoint_cache_profile(artifact: DiscoveredModel) -> ModelCacheProfile | None:
+    if not artifact.resource.complete:
+        raise ValueError('checkpoint shards are incomplete')
+    if artifact.resource.format == 'mfq':
+        with open_mmap(artifact.path) as store:
+            record = store.records.get(MODEL_CONFIG_ASSET)
+            if record is not None:
+                if record.nbytes > 4 << 20:
+                    raise ValueError('model configuration exceeds 4 MiB')
+                config = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
+            else:
+                config = store.header.extra.get('hf_config', {})
+            has_predictor = any(name.startswith(('predictor.block.', 'mtp.')) for name in store.records)
+    else:
+        path = artifact.path / 'config.json'
+        if path.stat().st_size > 4 << 20:
+            raise ValueError('model configuration exceeds 4 MiB')
+        config = json.loads(path.read_text(encoding='utf-8'))
+        index = artifact.path / 'model.safetensors.index.json'
+        if index.is_file():
+            names = json.loads(index.read_text(encoding='utf-8')).get('weight_map', {})
+        else:
+            from mfq.server.state.catalog import ModelCatalog
+            names = {name for shard in artifact.path.glob('*.safetensors') for name in ModelCatalog._safetensors_header(shard)}
+        has_predictor = any(name.startswith(('predictor.block.', 'mtp.')) for name in names)
+    if not isinstance(config, dict):
+        return None
+    text = config.get('text_config', config)
+    predictor_layers = text.get('mtp_num_hidden_layers', 1) if isinstance(text, dict) and has_predictor else 0
+    if type(predictor_layers) is not int or predictor_layers < 0:
+        return None
+    return cache_profile(config, include_recurrent=False, predictor_layers=predictor_layers)
+
+
+def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, predictor_layers: int = 0) -> ModelCacheProfile | None:
     text = config.get('text_config', config)
     if not isinstance(text, dict):
         return None
@@ -71,25 +115,26 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True) -> 
                 state('GDN', 'recurrent_state', linear, recurrent)
                 state('GDN', 'convolution_state', linear, convolution)
                 state('GDN', 'reset_template', linear, (state_copies - 1) * (recurrent + convolution))
-            full = types.count('full_attention')
+            full = types.count('full_attention') + predictor_layers
             if full:
                 heads, dim = integer('num_key_value_heads'), integer('head_dim')
                 if min(heads, dim) <= 0:
                     return None
                 group = 'QSA' if kind in {'qwen4_exp', 'qwen4_exp_text'} else 'GQA'
+                read_rows = integer('indexer_budget') if group == 'QSA' and 'indexer_budget' in text else None
                 components.append(ModelCacheComponent(group=group, name='raw_kv', layers=full,
-                    bytes_per_row=full * heads * dim * 4, allocation='power_of_two', minimum_rows=16))
+                    bytes_per_row=full * heads * dim * 4, allocation='power_of_two', minimum_rows=16,
+                    max_read_rows_per_token=read_rows, head_dimension=dim, kv_heads=heads))
             if kind in {'qwen4_exp', 'qwen4_exp_text'}:
                 index, ratio = integer('indexer_head_dim'), integer('indexer_compress_ratio')
                 if min(index, ratio) <= 0:
                     return None
                 if full:
+                    state('QSA', 'indexer_tail', full, full * ((ratio + 5) * index * 2 + 2))
                     components.extend([
-                        ModelCacheComponent(group='QSA', name='indexer_key', subgroup='indexer', layers=full,
-                            bytes_per_row=full * index * 2, allocation='power_of_two', minimum_rows=16),
                         ModelCacheComponent(group='QSA', name='indexer_pooled', subgroup='indexer', layers=full,
                             bytes_per_row=full * index * 4, tokens_per_row=ratio, allocation='power_of_two', minimum_rows=16,
-                            row_rounding='floor', active_after=integer('indexer_budget', 2048)),
+                            row_rounding='floor'),
                     ])
                 ple_layers = text.get('ple_layer_ids', [])
                 if not isinstance(ple_layers, list):
@@ -107,7 +152,8 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True) -> 
             query_heads = integer('num_attention_heads')
             group = 'GQA' if query_heads > heads else 'MHA'
             components.append(ModelCacheComponent(group=group, name='raw_kv', layers=layers,
-                bytes_per_row=layers * heads * dim * 4, allocation='power_of_two', minimum_rows=16))
+                bytes_per_row=layers * heads * dim * 4, allocation='power_of_two', minimum_rows=16,
+                head_dimension=dim, kv_heads=heads))
         else:
             return None
         return ModelCacheProfile(max_context=maximum, fixed_bytes=sum(item.bytes for item in fixed_components),

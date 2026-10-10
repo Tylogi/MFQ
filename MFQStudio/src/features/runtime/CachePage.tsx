@@ -3,7 +3,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
-import { ScreenHeader, SectionLabel, TMPanel, UsageBar, EmptyPanel } from '../../app/display';
+import { ScreenHeader, SectionLabel, TMPanel, UsageBar, EmptyPanel, Icon } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
@@ -83,8 +83,8 @@ function ResourcePageContent() {
       <ScreenHeader
         title={tr('资源', 'Resources')}
         subtitle={tr(
-          '监视计算占用、权重流量、带宽与前缀缓存。',
-          'Monitor compute utilization, weight traffic, bandwidth, and prefix caching.',
+          '监视计算占用、权重与 KV 流量、前缀缓存。',
+          'Monitor compute utilization, weight and KV traffic, and prefix caching.',
         )}
       />
 
@@ -95,7 +95,7 @@ function ResourcePageContent() {
         <TMPanel className="cache-panel">
           <div className="panel-heading">
             <div>
-              <h2>Session KV cache</h2>
+              <h2>{tr('前缀缓存概况', 'Prefix cache overview')}</h2>
               <p>
                 {prefixCacheHotOnly
                   ? tr(
@@ -221,14 +221,17 @@ function ResourcePageContent() {
             </>
           )}
           {prefixCacheSnapshots > 0 && (
-            <button
-              className="panel-action danger"
-              disabled={busy || Number(runtime?.active_requests || 0) > 0}
-              onClick={() => void clearRuntimeCache()}
-              type="button"
-            >
-              {tr('清除此模型的前缀缓存', 'Clear this model’s prefix cache')}
-            </button>
+            <div className="cache-panel-actions">
+              <button
+                className="cache-clear-button"
+                disabled={busy || Number(runtime?.active_requests || 0) > 0}
+                onClick={() => void clearRuntimeCache()}
+                type="button"
+              >
+                <Icon name="trash" size={14} />
+                {tr('清除此模型的前缀缓存', 'Clear this model’s prefix cache')}
+              </button>
+            </div>
           )}
         </TMPanel>
       ) : (

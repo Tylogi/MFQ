@@ -247,7 +247,7 @@ MFQ exposes several interfaces for applications and tooling:
 - **WebSocket realtime APIs** for audio and full-duplex sessions;
 - **OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints** from
   managed C++ workers and runtime adapters;
-- **MCP and function-tool execution** through the server tool registry.
+- **Function-tool calling** through the inference API; clients execute tools and return results.
 
 Start with the [HTTP API](./docs/api/http.md),
 [WebSocket API](./docs/api/websocket.md), or

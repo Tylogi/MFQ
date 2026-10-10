@@ -101,7 +101,7 @@ private:
 
 class MlxQwen35CausalLm {
 public:
-    static MlxQwen35CausalLm load(const MfqContainer& model);
+    static MlxQwen35CausalLm load(const MfqContainer& model, int requested_context = 0);
 
     static MlxQwen35CausalLm load(
         const MfqContainer& model,

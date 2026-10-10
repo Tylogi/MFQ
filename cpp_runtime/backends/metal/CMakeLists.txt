@@ -65,6 +65,18 @@ find_library(MFQ_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 find_library(MFQ_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
 find_library(MFQ_COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
 find_library(MFQ_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+find_library(MFQ_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
+
+add_library(mfq-ane STATIC platform/mfq_ane.mm runtime/mtp_lora.cpp)
+target_include_directories(mfq-ane PUBLIC ${MFQ_METAL_ROOT}/platform)
+target_include_directories(mfq-ane PUBLIC ${MFQ_METAL_ROOT}/runtime)
+target_compile_features(mfq-ane PUBLIC cxx_std_20)
+target_compile_options(mfq-ane PRIVATE -fobjc-arc)
+target_link_libraries(mfq-ane PRIVATE ${MFQ_FOUNDATION_FRAMEWORK} ${MFQ_IOSURFACE_FRAMEWORK})
+
+add_executable(mfq-ane-test tests/mfq_ane_test.cpp)
+target_link_libraries(mfq-ane-test PRIVATE mfq-ane)
+target_compile_features(mfq-ane-test PRIVATE cxx_std_20)
 
 add_library(mfq-avfoundation-video SHARED
     platform/mfq_avfoundation_video.mm
@@ -235,6 +247,9 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
     runtime/mlx_mtp.cpp
+    runtime/mlx_mtp_lora.cpp
+    runtime/mlx_ane_matmul.cpp
+    runtime/mtp_lora_sessions.cpp
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
@@ -243,6 +258,9 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_ssd_expert_cache.cpp
     runtime/mlx_tensor.cpp
     runtime/mlx_transformer.cpp
+    runtime/mlx_kv_quantization.cpp
+    runtime/qsa_kv_store.cpp
+    runtime/mlx_qsa_kv_offload.cpp
     ops/mlx_grouped_linear.cpp
     ops/mlx_linear_attention.cpp
     ops/mlx_moe.cpp
@@ -291,6 +309,7 @@ target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-engine
     mfq-mlx
     mfq-jaccl
+    mfq-ane
     Threads::Threads
     ${MFQ_METAL_FRAMEWORK}
     ${MFQ_FOUNDATION_FRAMEWORK}
@@ -316,6 +335,11 @@ add_executable(mfq-metal-engine-test tests/mlx_engine_test.cpp)
 target_link_libraries(mfq-metal-engine-test PRIVATE mfq-metal-engine)
 target_compile_features(mfq-metal-engine-test PRIVATE cxx_std_20)
 add_test(NAME mfq-metal-engine-test COMMAND mfq-metal-engine-test)
+
+add_executable(mfq-qsa-kv-offload-test tests/qsa_kv_offload_test.cpp runtime/mlx_paged_session_codec.cpp)
+target_link_libraries(mfq-qsa-kv-offload-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-qsa-kv-offload-test PRIVATE cxx_std_20)
+add_test(NAME mfq-qsa-kv-offload-test COMMAND mfq-qsa-kv-offload-test)
 
 add_executable(mfq-decode-metal
     apps/mfq_decode_mlx.cpp
@@ -927,6 +951,11 @@ set_target_properties(mfq-metal-mtp-test PROPERTIES
 )
 add_test(NAME mfq-metal-mtp-test COMMAND mfq-metal-mtp-test)
 
+add_executable(mfq-mtp-lora-sessions-test tests/mtp_lora_sessions_test.cpp)
+target_link_libraries(mfq-mtp-lora-sessions-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-mtp-lora-sessions-test PRIVATE cxx_std_20)
+add_test(NAME mfq-mtp-lora-sessions-test COMMAND mfq-mtp-lora-sessions-test)
+
 add_executable(mfq-metal-deepseek-v4-dspark-test
     tests/mlx_deepseek_v4_dspark_test.cpp
 )
@@ -980,6 +1009,7 @@ add_test(
 )
 
 add_executable(mfq-metal-moe-test
+    runtime/mlx_paged_session_codec.cpp
     tests/mlx_moe_test.cpp
 )
 target_link_libraries(mfq-metal-moe-test PRIVATE
@@ -999,6 +1029,12 @@ add_test(NAME mfq-metal-moe-portable-test COMMAND mfq-metal-moe-test)
 set_tests_properties(mfq-metal-moe-portable-test PROPERTIES ENVIRONMENT "MFQ_METAL_DISABLE_NAX=1")
 add_test(NAME mfq-metal-moe-prepare-test COMMAND mfq-metal-moe-test --test-prepare)
 add_test(NAME mfq-metal-model-prepare-test COMMAND mfq-metal-moe-test --test-model-prepare)
+option(MFQ_TEST_ANE "Run private ANE hardware tests" OFF)
+if(MFQ_TEST_ANE)
+    add_test(NAME mfq-ane-test COMMAND mfq-ane-test)
+    add_test(NAME mfq-metal-ane-autograd-test COMMAND mfq-metal-moe-test --test-ane-autograd)
+    add_test(NAME mfq-metal-mtp-ttt-test COMMAND mfq-metal-moe-test --test-mtp-ttt)
+endif()
 
 add_executable(mfq-metal-vq-test
     tests/mlx_vq_test.cpp

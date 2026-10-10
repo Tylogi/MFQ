@@ -1,6 +1,7 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
   ModelArtifact,
+  ModelCacheProfile,
   CheckpointAnalysis,
   ModelDirectoryList,
   HubModelSummary,
@@ -35,6 +36,10 @@ export const modelsApi = {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/analysis`, { signal });
   },
 
+  modelCacheProfile(modelId: string, signal?: AbortSignal): Promise<ModelCacheProfile | null> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile`, { signal });
+  },
+
   openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {
     return request('/api/v1/models/directories/open', {
       method: 'POST', body: JSON.stringify({ directory_id: directoryId }),
@@ -54,7 +59,7 @@ export const modelsApi = {
   /** 提交模型加载任务，配置上下文和空闲卸载策略。 */
   loadModel(
     model: string,
-    contextSize: number,
+    contextSize: number | null = null,
     prefillChunkSize = 2048,
     policy: { pin?: boolean; idle_ttl_seconds?: number | null } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {

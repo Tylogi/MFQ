@@ -33,6 +33,9 @@ event_router = APIRouter()
     tags=["jobs"],
 )
 async def create_job(service: ServiceDependency, body: CreateJobRequest) -> JobResource:
+    if body.kind == "runtime.context.configure":
+        from mfq.server.services.service import ServiceError
+        raise ServiceError(403, "use_context_endpoint", "configure context through /api/v1/runtime/context")
     if body.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")
@@ -128,6 +131,9 @@ async def cancel_job(service: ServiceDependency, job_id: UUID) -> JobResource:
 )
 async def retry_job(service: ServiceDependency, job_id: UUID) -> JobResource:
     job = await service.get_job(job_id)
+    if job.kind == "runtime.context.configure":
+        from mfq.server.services.service import ServiceError
+        raise ServiceError(403, "use_context_endpoint", "configure context through /api/v1/runtime/context")
     if job.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")

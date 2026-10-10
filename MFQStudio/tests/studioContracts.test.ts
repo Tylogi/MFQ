@@ -201,10 +201,11 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   it('test_studio_uses_theme_aware_model_actions_and_readable_errors', () => {
     expect(STYLES).toContain('.panel-heading-actions button {');
     expect(STYLES).toContain('border: 1px solid var(--accent-border)');
-    expect(STYLES).toContain('.mcp-form button { min-width: 64px;');
+    expect(STYLES).toContain('.node-form input, .node-form button {');
     expect(STYLES).toContain('.job-actions .secondary { border: 1px solid var(--panel-line);');
-    expect(STYLES).toMatch(/\.log-record-copy > strong \{[^}]*overflow-wrap: anywhere;/);
-    expect(STYLES).toMatch(/\.log-record-detail > pre \{[^}]*white-space: pre-wrap; overflow-wrap: anywhere;/);
+    expect(STYLES).toMatch(/\.log-record-copy\s*\{[^}]*min-width:\s*0/);
+    expect(STYLES).toMatch(/\.log-record-copy\s*>\s*strong\s*\{[^}]*overflow-wrap:\s*anywhere/);
+    expect(STYLES).toMatch(/\.log-record-detail\s*>\s*pre\s*\{[^}]*white-space:\s*pre-wrap;[^}]*overflow-wrap:\s*anywhere/);
     expect(STYLES).toContain('.error-banner span { min-width: 0; overflow-wrap: anywhere;');
   });
 
@@ -246,18 +247,32 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(runtime.indexOf('setStudio(status)')).toBeLessThan(runtime.indexOf('await startLocalStudio()'));
     expect(shell).toContain('location.pathname === \'/runtime\'');
     expect(connection).toContain('await configureStudio(draft)');
-    expect(connection).toContain('if (credentialWritable) {');
-    expect(connection).toContain('await saveStudioCredential(token)');
+    expect(connection).toMatch(/if\s*\(credentialWritable\)\s*\{\s*await saveStudioCredential\(token\)/);
     expect(connection).toContain('setCredentialWritable(true)');
     expect(connection).toContain('await reloadService()');
   });
 
-  it('test_server_page_matches_hivellm_information_architecture', () => {
-    const connection = readSources('features/connections/ConnectionsPage.tsx', 'features/connections/MemorySettingsPanel.tsx', 'features/connections/InferenceDefaultsPanel.tsx');
-    for (const label of ['Runtime', 'Memory plan', 'Persistent Prefix cache', 'Chat', 'Automation', 'Model ID', 'Bind address', 'Maximum output']) {
+  it('keeps service sections separate and chat settings on the chat page', () => {
+    const connection = readSources('features/connections/ConnectionsPage.tsx');
+    for (const label of ['API parameters', 'Automation', 'Model ID', 'Bind address', 'OpenAI port', 'Anthropic port']) {
       expect(connection).toContain(label);
     }
-    expect(connection).toContain('<ToolsRoutingPanel />');
+    for (const [component, path, label] of [
+      ['MemorySettingsPanel', 'features/connections/MemorySettingsPanel.tsx', 'Memory plan'],
+      ['ContextManagementPanel', 'features/connections/ContextManagementPanel.tsx', 'Context management'],
+      ['PrefixCacheSettingsPanel', 'features/connections/PrefixCacheSettingsPanel.tsx', 'Persistent prefix cache'],
+      ['InferencePolicyPanel', 'features/connections/InferencePolicyPanel.tsx', 'Inference controls'],
+      ['RuntimeProfilesPanel', 'features/runtime/RuntimeProfilesPanel.tsx', 'Runtime profiles'],
+      ['RemoteRoutingPanel', 'features/connections/RemoteRoutingPanel.tsx', 'Remote routing'],
+    ]) {
+      expect(connection).toContain(`<${component} />`);
+      expect(readSources(path)).toContain(label);
+    }
+    expect(connection).toContain('<ModelAliasMapping');
+    expect(readSources('features/connections/ModelAliasMapping.tsx')).toContain('Alias mapping');
+    expect(connection).not.toContain('InferenceDefaultsPanel');
+    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('<InferenceDefaultsPanel />');
+    expect(readSources('features/connections/InferenceDefaultsPanel.tsx')).toContain('Maximum output');
     expect(connection).toContain('className="server-active-notice"');
     expect(APP_ENTRY).toContain('path="runtime"');
     expect(STYLES).toContain('.server-active-notice');

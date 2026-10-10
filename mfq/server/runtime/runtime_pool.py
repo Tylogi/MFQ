@@ -34,6 +34,10 @@ from mfq.server.protocol.models import (
     JobEventLevel,
     ModelLoadRequest,
     ModelUnloadRequest,
+    ConfigureQsaKvOffloadRequest,
+    QsaKvOffloadPolicy,
+    QsaKvStorageSettings,
+    KvQuantizationSettings,
     ResponseFormat,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
@@ -42,6 +46,8 @@ from mfq.server.protocol.models import (
     RuntimeMemoryResources,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
+    RuntimeContextPolicy,
+    RuntimeReloadRequest,
     RuntimeLogLevel,
     SamplingParams,
     ToolChoice,
@@ -57,8 +63,9 @@ from mfq.server.runtime.backend import (
     preflight_backend_request,
 )
 from mfq.server.runtime.client import HttpRuntimeClient, StdioRuntimeClient
-from mfq.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget, inspect_prefix_cache, purge_prefix_cache, read_prefix_cache_tokens
+from mfq.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget, inspect_prefix_cache, purge_prefix_cache, read_prefix_cache_tokens, prefix_cache_identity
 from mfq.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
+from mfq.server.runtime.qsa_kv_policy import QSA_KV_BUFFER_BYTES, qsa_index_requirement
 from mfq.server.runtime.native import (
     append_native_prefill_chunk_override,
     find_native_runtime_resource,
@@ -137,6 +144,8 @@ class _Runtime(BaseModel):
     request_capacity: int = 1
     mtp_supported: bool = False
     mtp_available: bool = False
+    qsa_kv_offload_supported: bool = False
+    kv_quantization_supported: bool = False
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     log_to_load_job: bool = False
@@ -153,6 +162,7 @@ class _Runtime(BaseModel):
     usage_refreshed_at: float = 0.0
     load_progress: float = 0.02
     context_capacity: int | None = None
+    context_job: JobContext | bool | None = None
     prefix_dynamic_budget: bool = False
     prefix_concurrent_maintenance: bool = False
     prefix_disk_capacity: int | None = None
@@ -313,6 +323,8 @@ class RuntimePool:
         self.max_runtime_memory_bytes = max_runtime_memory_bytes or automatic_budget
         self.memory_policy = RuntimeMemoryPolicy()
         self.inference_policy = RuntimeInferencePolicy()
+        self.context_policy = RuntimeContextPolicy()
+        self._context_policy_lock = asyncio.Lock()
         self._policy_model_limits: dict[str, int] = {}
         self._policy_prefix_limits: dict[str, int] = {}
         self._memory_configuration_job: UUID | None = None
@@ -465,7 +477,8 @@ class RuntimePool:
             requested=self.max_requests_per_instance,
         )
         canonical_request = load_request.model_copy(
-            update={"model": artifact.resource.name}
+            update={"model": artifact.resource.name,
+                    "context_size": self.resolve_context_size(artifact, load_request.context_size)}
         )
         instance = _Runtime(
             id=uuid4(),
@@ -528,6 +541,24 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        if 'qsa_kv_offload' not in request.model_fields_set:
+            saved_storage = self.context_policy.model_qsa_kv_offload.get(artifact.resource.name)
+            if saved_storage is not None:
+                request = request.model_copy(update={"qsa_kv_offload": QsaKvOffloadPolicy(**saved_storage.model_dump())})
+        if 'kv_quantization' not in request.model_fields_set:
+            saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
+            if saved_quantization is not None:
+                request = request.model_copy(update={"kv_quantization": saved_quantization})
+        if request.kv_quantization.enabled and (self.backend != "metal" or not artifact.resource.architecture.casefold().startswith(
+            ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35"))):
+            raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
+        if request.yarn_enabled and (self.backend != "metal" or artifact.resource.yarn_context_capacity is None):
+            raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
+        resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
+        request = request.model_copy(update={"context_size": resolved,
+            "qsa_kv_offload": request.qsa_kv_offload.model_copy(update={"target_context": resolved})})
+        if request.qsa_kv_offload.enabled:
+            await self._validate_qsa_kv_policy(artifact, request.qsa_kv_offload, yarn_enabled=request.yarn_enabled)
         if self.memory_policy.total_limit_bytes is not None or self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
             async with self._lock:
                 current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
@@ -940,6 +971,14 @@ class RuntimePool:
                 pid,
             )
         await self._refresh_instance_usage(instance)
+        if request.qsa_kv_offload.enabled:
+            native_status = await backend.runtime_status()
+            if not instance.qsa_kv_offload_supported or native_status.get("qsa_kv_offload_enabled") != 1:
+                raise _job_error("qsa_kv_offload_unavailable", "the native runtime did not enable QSA KV offload")
+        if request.kv_quantization.enabled:
+            native_status = await backend.runtime_status()
+            if not instance.kv_quantization_supported or native_status.get("kv_quantization_bits") != request.kv_quantization.bits:
+                raise _job_error("kv_quantization_unavailable", "the native runtime did not enable the requested TurboQuant KV precision")
         await self._rebalance_resident_budget(instance.id, activating=instance)
         instance.monitor_task = asyncio.create_task(
             self._monitor(instance), name=f"mfq-server-runtime-monitor-{instance.id}"
@@ -984,6 +1023,77 @@ class RuntimePool:
                 await asyncio.to_thread(self.store.save_runtime_inference_policy, policy.model_dump())
             self.inference_policy = policy.model_copy()
         return self.inference_policy.model_dump()
+
+    async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *, yarn_enabled: bool | None = None) -> int:
+        if self.backend != "metal":
+            raise _job_error("qsa_kv_offload_unsupported", "KV offload currently supports Metal QSA models only")
+        try:
+            return await asyncio.to_thread(qsa_index_requirement, artifact, policy.target_context,
+                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled))
+        except (ValueError, OSError, KeyError) as error:
+            raise _job_error("qsa_kv_configuration_invalid", str(error)) from error
+
+    async def qsa_kv_offload_info(self, instance_id: UUID, target_context: int | None = None) -> dict[str, Any]:
+        async with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None:
+                raise BackendError("runtime_instance_not_found", "runtime instance was not found", status_code=404)
+            request = self._load_requests[instance.artifact.resource.name]
+            supported = instance.qsa_kv_offload_supported
+            architecture = instance.artifact.resource.architecture
+        policy = request.qsa_kv_offload
+        target = target_context or instance.context_size
+        policy = policy.model_copy(update={"target_context": instance.context_size})
+        required = await self._validate_qsa_kv_policy(instance.artifact, policy.model_copy(update={"target_context": target})) if supported else None
+        return {"supported": supported, "architecture": architecture, "policy": policy.model_dump(),
+            "required_index_bytes": required, "buffer_bytes": min(QSA_KV_BUFFER_BYTES, policy.budget_bytes // 4),
+            "target_context": target, "reason": None if supported else "model_or_backend_unsupported"}
+
+    def _qsa_kv_policy(self, model: str) -> QsaKvOffloadPolicy:
+        request = self._load_requests.get(model)
+        return request.qsa_kv_offload if request is not None else QsaKvOffloadPolicy()
+
+    def _kv_quantization_policy(self, model: str) -> KvQuantizationSettings:
+        request = self._load_requests.get(model)
+        return request.kv_quantization if request is not None else KvQuantizationSettings()
+
+    async def configure_qsa_kv_offload(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = ConfigureQsaKvOffloadRequest.model_validate(payload)
+        async with self._lock:
+            instance = self._instances.get(settings.instance_id)
+            if instance is None:
+                raise _job_error("runtime_instance_not_found", "runtime instance was not found")
+            if not instance.qsa_kv_offload_supported:
+                raise _job_error("qsa_kv_offload_unsupported", "the loaded model or native backend does not support QSA KV offload")
+            previous = self._load_requests[instance.artifact.resource.name].model_copy(deep=True)
+            target = instance.context_size
+        policy = QsaKvOffloadPolicy(**settings.model_dump(exclude={"instance_id"}), target_context=target)
+        if settings.enabled:
+            await self._validate_qsa_kv_policy(instance.artifact, policy)
+        updated = ModelLoadRequest.model_validate({**previous.model_dump(), "qsa_kv_offload": policy.model_dump(),
+            "context_size": target,
+            "pin": instance.pinned, "idle_ttl_seconds": instance.idle_ttl_seconds})
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY or \
+                instance.active_requests or instance.queued_requests or instance.control_leases or instance.context_size != target:
+                raise _job_error("runtime_busy", "wait for model requests to finish before changing QSA KV storage", retryable=True)
+            self._mark_instance_unloading_locked(instance)
+            self._load_requests[instance.artifact.resource.name] = updated
+        try:
+            await context.progress(0.01, message="Reloading model with QSA KV storage settings")
+            await self._retire_instance(instance)
+            result = await self.load(context, updated.model_dump(mode="json"))
+            return {**result, "qsa_kv_offload": policy.model_dump()}
+        except BaseException:
+            self._load_requests[instance.artifact.resource.name] = previous
+            for item in list(self._instances.values()):
+                if item.artifact.resource.name == instance.artifact.resource.name:
+                    await self._retire_instance(item)
+            try:
+                await self.load(_MemoryPlanContext(context, recovery=True), previous.model_dump(mode="json"))
+            except BaseException as error:
+                await context.log(f"Could not restore the previous model configuration: {type(error).__name__}")
+            raise
 
     def _apply_inference_policy(self, sampling: SamplingParams) -> SamplingParams:
         if self.inference_policy.mtp_enabled or not sampling.enable_mtp:
@@ -1426,6 +1536,10 @@ class RuntimePool:
                     pinned=item.pinned,
                     mtp_supported=item.mtp_supported,
                     mtp_available=item.mtp_available,
+                    qsa_kv_offload_supported=item.qsa_kv_offload_supported,
+                    kv_quantization_supported=item.kv_quantization_supported,
+                    kv_quantization=self._kv_quantization_policy(item.artifact.resource.name),
+                    qsa_kv_offload=self._qsa_kv_policy(item.artifact.resource.name),
                     error=item.error,
                 )
                 for item in values
@@ -1490,6 +1604,10 @@ class RuntimePool:
                 pinned=instance.pinned,
                 mtp_supported=instance.mtp_supported,
                 mtp_available=instance.mtp_available,
+                qsa_kv_offload_supported=instance.qsa_kv_offload_supported,
+                kv_quantization_supported=instance.kv_quantization_supported,
+                kv_quantization=self._kv_quantization_policy(instance.artifact.resource.name),
+                qsa_kv_offload=self._qsa_kv_policy(instance.artifact.resource.name),
                 error=instance.error,
             )
             self._idle_reaper_wakeup.set()
@@ -1842,6 +1960,18 @@ class RuntimePool:
             allow_unready=True,
             read_only=True,
         ) as (instance, backend):
+            if instance is not None and instance.context_job is not None:
+                return {
+                    **memory_status,
+                    "instance_id": str(instance.id),
+                    "runtime_state": "loading",
+                    "model": instance.artifact.resource.name,
+                    "max_context": instance.context_size,
+                    "context_capacity": instance.context_capacity,
+                    "active_requests": instance.active_requests,
+                    "queued_requests": instance.queued_requests,
+                    "reloading": True,
+                }
             if instance is not None and instance.state not in {
                 RuntimeInstanceState.READY,
                 RuntimeInstanceState.BUSY,
@@ -1905,7 +2035,8 @@ class RuntimePool:
                         instance.memory = self._memory_resources(status, instance.memory)
                         capacity = status.get("context_capacity")
                         if isinstance(capacity, int) and capacity > 0:
-                            instance.context_capacity = capacity
+                            instance.context_capacity = instance.artifact.resource.context_capacity or capacity
+                            status["context_capacity"] = instance.context_capacity
             return status
 
     async def runtime_models(self) -> dict[str, Any]:
@@ -2036,27 +2167,195 @@ class RuntimePool:
             assert instance is not None
             await self._release_control_lease(instance)
 
+    def resolve_context_size(self, artifact: DiscoveredModel, explicit: int | None = None,
+        *, ignore_override: bool = False, yarn_enabled: bool | None = None) -> int:
+        override = None if ignore_override else self.context_policy.model_overrides.get(artifact.resource.name)
+        if explicit is not None:
+            return min(explicit, self._context_limit(artifact, yarn_enabled) or explicit)
+        if override is not None:
+            return min(override, self._context_limit(artifact, yarn_enabled) or override)
+        native = artifact.resource.context_capacity
+        if native is not None:
+            cap = self.context_policy.max_context_size
+            return min(native, cap) if cap is not None else native
+        return self.context_policy.fallback_context_size
+
+    def _context_limit(self, artifact: DiscoveredModel, yarn_enabled: bool | None = None) -> int | None:
+        if yarn_enabled is None:
+            yarn_enabled = self.context_policy.model_yarn_enabled.get(artifact.resource.name, False)
+        if yarn_enabled and self.backend == "metal" and artifact.resource.yarn_context_capacity is not None:
+            return artifact.resource.yarn_context_capacity
+        return artifact.resource.context_capacity
+
+    async def yarn_context_info(self, instance_id: UUID) -> dict[str, Any]:
+        async with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None:
+                raise BackendError("model_not_loaded", "model is not loaded", status_code=404)
+            resource = instance.artifact.resource
+            supported = self.backend == "metal" and resource.yarn_context_capacity is not None
+            return {"supported": supported, "native_context": resource.context_capacity,
+                "maximum_context": resource.yarn_context_capacity if supported else resource.context_capacity,
+                "maximum_factor": resource.yarn_max_factor if supported else None,
+                "enabled": self.context_policy.model_yarn_enabled.get(resource.name, False) and supported,
+                "effective_factor": max(1.0, instance.context_size / resource.context_capacity) if resource.context_capacity else 1.0}
+
+    async def configure_context_policy(self, policy: RuntimeContextPolicy) -> dict[str, Any]:
+        async with self._context_policy_lock:
+            policy = RuntimeContextPolicy.model_validate({**self.context_policy.model_dump(), **policy.model_dump(exclude_unset=True)})
+            if self.store is not None:
+                await asyncio.to_thread(self.store.save_runtime_context_policy, policy.model_dump())
+            self.context_policy = policy
+        return policy.model_dump()
+
+    async def configure_context(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        request = RuntimeReloadRequest.model_validate(payload)
+        context.raise_if_cancelled()
+        try:
+            if request.qsa_kv_offload is not None or request.kv_quantization is not None:
+                return await self._configure_model_context(context, request)
+            return await self.reload_runtime(request.context_size, request.instance_id, context=context, yarn_enabled=request.yarn_enabled)
+        except BackendError as error:
+            raise _job_error(error.code, str(error), retryable=error.retryable) from error
+
+    async def _configure_model_context(self, context: JobContext, settings: RuntimeReloadRequest) -> dict[str, Any]:
+        async with self._lock:
+            instance = self._instances.get(settings.instance_id)
+            if instance is None:
+                raise _job_error("runtime_instance_not_found", "runtime instance was not found")
+            previous = self._load_requests[instance.artifact.resource.name].model_copy(deep=True)
+            name = instance.artifact.resource.name
+            enabled = self.context_policy.model_yarn_enabled.get(name, False) if settings.yarn_enabled is None else settings.yarn_enabled
+        if enabled and (self.backend != "metal" or instance.artifact.resource.yarn_context_capacity is None):
+            raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
+        target = self.resolve_context_size(instance.artifact, settings.context_size, ignore_override=True, yarn_enabled=enabled)
+        warning = None if settings.context_size is None or target == settings.context_size else (
+            "yarn_context_size_exceeded" if enabled else "context_size_exceeded")
+        storage = settings.qsa_kv_offload or QsaKvStorageSettings(enabled=previous.qsa_kv_offload.enabled,
+            budget_bytes=previous.qsa_kv_offload.budget_bytes)
+        quantization = settings.kv_quantization or previous.kv_quantization
+        if quantization.enabled and not getattr(instance, "kv_quantization_supported", False):
+            raise _job_error("kv_quantization_unsupported", "the model or backend does not support TurboQuant KV")
+        policy = QsaKvOffloadPolicy(**storage.model_dump(), target_context=target)
+        if policy.enabled:
+            if not instance.qsa_kv_offload_supported:
+                raise _job_error("qsa_kv_offload_unsupported", "the model or backend does not support QSA KV offload")
+            await self._validate_qsa_kv_policy(instance.artifact, policy, yarn_enabled=enabled)
+        updated = previous.model_copy(update={"context_size": target, "yarn_enabled": enabled,
+            "qsa_kv_offload": policy, "kv_quantization": quantization,
+            "pin": instance.pinned, "idle_ttl_seconds": instance.idle_ttl_seconds})
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY or \
+                instance.active_requests or instance.queued_requests or instance.control_leases:
+                raise _job_error("runtime_busy", "wait for model requests to finish before saving model context settings", retryable=True)
+            self._mark_instance_unloading_locked(instance)
+        try:
+            await context.progress(0.01, message="Applying model context settings", data={"phase": "reloading", "context_size": target})
+            await self._retire_instance(instance)
+            result = await self.load(context, updated.model_dump(mode="json"))
+            if result.get("context_size") != target:
+                raise _job_error("context_reload_mismatch", "runtime context does not match the saved settings")
+            async with self._context_policy_lock:
+                overrides = dict(self.context_policy.model_overrides)
+                if settings.context_size is None:
+                    overrides.pop(name, None)
+                else:
+                    overrides[name] = target
+                yarn = dict(self.context_policy.model_yarn_enabled)
+                if enabled:
+                    yarn[name] = True
+                else:
+                    yarn.pop(name, None)
+                offload = dict(self.context_policy.model_qsa_kv_offload)
+                offload[name] = storage
+                quantization_map = dict(self.context_policy.model_kv_quantization)
+                quantization_map[name] = quantization
+                saved = self.context_policy.model_copy(update={"model_overrides": overrides,
+                    "model_yarn_enabled": yarn, "model_qsa_kv_offload": offload, "model_kv_quantization": quantization_map})
+                if self.store is not None:
+                    await asyncio.to_thread(self.store.save_runtime_context_policy, saved.model_dump())
+                self.context_policy = saved
+            return {**result, "max_context": target, "context_override": target if settings.context_size is not None else None,
+                "yarn_enabled": enabled, "qsa_kv_offload": policy.model_dump(),
+                "kv_quantization": quantization.model_dump(), "warning": warning}
+        except BaseException:
+            for item in list(self._instances.values()):
+                if item.artifact.resource.name == name:
+                    await self._retire_instance(item)
+            self._load_requests[name] = previous
+            try:
+                await self.load(_MemoryPlanContext(context, recovery=True), previous.model_dump(mode="json"))
+            except BaseException as error:
+                await context.log(f"Could not restore the previous model configuration: {type(error).__name__}")
+            raise
+
     async def reload_runtime(
         self,
-        context_size: int,
+        context_size: int | None,
         instance_id: UUID | None = None,
+        *, context: JobContext | None = None, yarn_enabled: bool | None = None,
     ) -> dict[str, Any]:
         async with self._runtime_control_lease(instance_id) as (instance, backend):
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
-            if instance is not None and instance.context_capacity is not None and context_size > instance.context_capacity:
-                raise BackendError("context_size_exceeded", "context exceeds the model capacity", status_code=400)
-            result = await backend.reload_runtime(context_size)
+            requested = context_size
+            warning = None
             if instance is not None:
+                enabled = self.context_policy.model_yarn_enabled.get(instance.artifact.resource.name, False) if yarn_enabled is None else yarn_enabled
+                if enabled and (self.backend != "metal" or instance.artifact.resource.yarn_context_capacity is None):
+                    raise BackendError("yarn_unsupported", "YaRN extension is not supported by this model/backend", status_code=400)
+                context_size = requested if requested is not None else self.resolve_context_size(instance.artifact, ignore_override=True)
+                limit = self._context_limit(instance.artifact, enabled) or instance.context_capacity
+                if limit is not None and context_size > limit:
+                    context_size = limit
+                    warning = "yarn_context_size_exceeded" if enabled else "context_size_exceeded"
+            elif context_size is None:
+                context_size = self.context_policy.fallback_context_size
+            if instance is not None and instance.context_job is not None:
+                raise BackendError("runtime_busy", "context settings are already being applied", status_code=409)
+            if instance is not None:
+                instance.context_job = context or True
+                instance.load_progress = 0.0
+            try:
+                if context is not None:
+                    await context.progress(0.01, message="Applying context settings", data={"phase": "reloading", "context_size": context_size})
+                result = await backend.reload_runtime(context_size)
+                actual = result.get("max_context")
+                if type(actual) is not int or actual != context_size:
+                    raise BackendError("context_reload_mismatch", f"Requested context {context_size}, but runtime reported {actual}")
+                if instance is None:
+                    return result
                 async with self._lock:
                     if self._instances.get(instance.id) is instance:
-                        actual = result.get("max_context", context_size)
-                        instance.context_size = actual if isinstance(actual, int) and actual > 0 else context_size
+                        instance.context_size = actual
                         name = instance.artifact.resource.name
                         request = self._load_requests.get(name)
                         if request is not None:
-                            self._load_requests[name] = request.model_copy(update={"context_size": instance.context_size})
-            return result
+                            self._load_requests[name] = request.model_copy(update={"context_size": instance.context_size,
+                                "yarn_enabled": enabled,
+                                "qsa_kv_offload": request.qsa_kv_offload.model_copy(update={"target_context": instance.context_size})})
+                async with self._context_policy_lock:
+                    overrides = dict(self.context_policy.model_overrides)
+                    if requested is None:
+                        overrides.pop(instance.artifact.resource.name, None)
+                    else:
+                        overrides[instance.artifact.resource.name] = actual
+                    yarn_settings = dict(self.context_policy.model_yarn_enabled)
+                    if enabled:
+                        yarn_settings[instance.artifact.resource.name] = True
+                    else:
+                        yarn_settings.pop(instance.artifact.resource.name, None)
+                    policy = self.context_policy.model_copy(update={"model_overrides": overrides, "model_yarn_enabled": yarn_settings})
+                    if self.store is not None:
+                        await asyncio.to_thread(self.store.save_runtime_context_policy, policy.model_dump())
+                    self.context_policy = policy
+                if context is not None:
+                    await context.progress(1.0, message="Context settings applied", data={"phase": "ready", "context_size": actual})
+                return {**result, "instance_id": str(instance.id), "context_override": actual if requested is not None else None,
+                    "yarn_enabled": enabled, "warning": warning}
+            finally:
+                if instance is not None:
+                    instance.context_job = None
 
     async def clear_runtime_cache(
         self,
@@ -2067,8 +2366,20 @@ class RuntimePool:
                 raise BackendError("model_not_loaded", "no runtime is available")
             return await backend.clear_runtime_cache()
 
-    async def inspect_prefix_cache(self, namespace: str | None = None, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
-        result = await asyncio.to_thread(inspect_prefix_cache, self._prefix_cache_directory(), namespace, offset=offset, limit=limit)
+    async def inspect_prefix_cache(self, namespace: str | None = None, *, offset: int = 0, limit: int = 100,
+        query: str = '', search_in: str = 'all', text_filter: str = 'all', chain_filter: str = 'all', sort: str = 'recent') -> dict[str, Any]:
+        directory = self._prefix_cache_directory()
+        decode_text = None
+        if namespace and query.strip() and search_in != 'id':
+            identity = await asyncio.to_thread(prefix_cache_identity, directory, namespace)
+            try:
+                if identity.get('model_path') or identity.get('model_name'):
+                    artifact = await self.catalog.resolve_path(identity['model_path']) if identity.get('model_path') else await self.catalog.resolve(identity['model_name'])
+                    decode_text = lambda tokens: decode_prefix_cache_tokens(artifact.path, tokens)
+            except (OSError, ValueError, KeyError, ImportError, ModelArtifactNotFoundError):
+                pass
+        result = await asyncio.to_thread(inspect_prefix_cache, directory, namespace, offset=offset, limit=limit,
+            query=query, search_in=search_in, text_filter=text_filter, chain_filter=chain_filter, sort=sort, decode_text=decode_text)
         async with self._lock:
             result['can_clear'] = not self._loading_model_names and self._memory_configuration_job is None and not any(
                 item.active_requests or item.queued_requests or item.control_leases > item.read_control_leases or item.prefix_pending_writes
@@ -3340,6 +3651,7 @@ class RuntimePool:
         if stream is None:
             return
         async for line in self._log_lines(stream):
+            job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
             normalized = message.casefold()
             if message.startswith("mfq-decode-metal:"):
@@ -3350,7 +3662,7 @@ class RuntimePool:
                 level = RuntimeLogLevel.ERROR
             else:
                 level = RuntimeLogLevel.INFO
-            if message and instance.state == RuntimeInstanceState.LOADING:
+            if message and (instance.state == RuntimeInstanceState.LOADING or isinstance(instance.context_job, JobContext)):
                 match = re.fullmatch(r"mfq_load_progress completed=(\d{1,10}) total=(\d{1,10})", message)
                 value = None
                 data = None
@@ -3376,10 +3688,10 @@ class RuntimePool:
                     with suppress(JobCancelledError, InvalidJobStateError, JobNotFoundError):
                         message_label = {"compiling": "Compiling inference kernels", "warming": "Preparing first inference",
                                          "weights": "Preparing model", "finalizing": "Finalizing runtime"}[data["phase"]]
-                        await context.progress(value, message=message_label, data=data)
-            if message and (instance.state == RuntimeInstanceState.LOADING or instance.log_to_load_job):
+                        await job_context.progress(value, message=message_label, data=data)
+            if message and (instance.state == RuntimeInstanceState.LOADING or instance.log_to_load_job or isinstance(instance.context_job, JobContext)):
                 with suppress(JobNotFoundError):
-                    await context.log(message[:_RUNTIME_LOG_MAX_CHARS], level=JobEventLevel(level.value))
+                    await job_context.log(message[:_RUNTIME_LOG_MAX_CHARS], level=JobEventLevel(level.value))
             if message and self.store is not None:
                 await asyncio.to_thread(
                     self.store.append_runtime_log,
@@ -3503,6 +3815,10 @@ class RuntimePool:
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
                 instance.resident_dynamic_budget = status.get("resident_memory_dynamic_budget") == 1
+                if "qsa_kv_offload_supported" in status:
+                    instance.qsa_kv_offload_supported = self.backend == "metal" and status["qsa_kv_offload_supported"] == 1
+                if "kv_quantization_supported" in status:
+                    instance.kv_quantization_supported = self.backend == "metal" and status["kv_quantization_supported"] == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
                     ("resident_memory_used", "resident_memory_used_bytes"), ("reclaimable_weight_bytes", "resident_reclaimable_weight_bytes")):
                     value = status.get(metric)
@@ -3519,7 +3835,7 @@ class RuntimePool:
                     instance.prefix_pressure_bytes = int(pressure)
                 capacity = status.get("context_capacity")
                 if isinstance(capacity, int) and capacity > 0:
-                    instance.context_capacity = capacity
+                    instance.context_capacity = instance.artifact.resource.context_capacity or capacity
 
     @staticmethod
     def _memory_resources(
@@ -3537,11 +3853,19 @@ class RuntimePool:
             ("wired_limit_bytes", "metal_wired_limit_bytes"),
             ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
             ("ssd_ple_bytes", "ssd_ple_payload_bytes"),
+            ("ssd_kv_bytes", "qsa_kv_ssd_bytes"),
+            ("streaming_kv_resident_bytes", "qsa_kv_resident_bytes"),
+            ("streaming_kv_budget_bytes", "qsa_kv_budget_bytes"),
+            ("streaming_kv_pending_bytes", "qsa_kv_pending_bytes"),
+            ("ssd_kv_read_bytes", "qsa_kv_ssd_read_bytes"),
+            ("ssd_kv_written_bytes", "qsa_kv_ssd_written_bytes"),
+            ("ssd_kv_reads", "qsa_kv_ssd_reads"),
+            ("ssd_kv_hits", "qsa_kv_ram_hits"),
         ):
             value = status.get(source)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                 values[target] = int(value)
-        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("wired_available", "metal_wired_available")):
+        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("ssd_kv", "qsa_kv_offload_enabled"), ("wired_available", "metal_wired_available")):
             value = status.get(source)
             if isinstance(value, (bool, int, float)) and value in (0, 1):
                 values[target] = bool(value)
@@ -3733,11 +4057,15 @@ class RuntimePool:
             command.extend(["--host", "127.0.0.1", "--port", str(port)])
         command.extend([
             "--ctx-size",
-            str(request.context_size),
+            str(self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)),
             "--model-name",
             artifact.resource.name,
         ])
         append_native_prefill_chunk_override(command, request.prefill_chunk_size)
+        yarn_enabled = self.context_policy.model_yarn_enabled.get(artifact.resource.name, False) if request.yarn_enabled is None else request.yarn_enabled
+        if (self.backend == "metal" and yarn_enabled
+            and artifact.resource.yarn_context_capacity is not None):
+            command.append("--yarn-context-extension")
         if self.backend == "cuda" and request_capacity > 1:
             command.extend(
                 [
@@ -3753,6 +4081,15 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        process_environment["MFQ_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
+        process_environment.pop("MFQ_QSA_KV_BUDGET_BYTES", None)
+        process_environment.pop("MFQ_QSA_KV_TARGET_CONTEXT", None)
+        if request.qsa_kv_offload.enabled:
+            if self.backend != "metal":
+                raise _job_error("qsa_kv_offload_unsupported", "KV offload currently supports Metal QSA models only")
+            qsa_index_requirement(artifact, self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
+                maximum_context=self._context_limit(artifact, request.yarn_enabled))
+            process_environment["MFQ_QSA_KV_BUDGET_BYTES"] = str(request.qsa_kv_offload.budget_bytes)
         if self.backend == "metal" and artifact.resource.name in self._resident_load_limits:
             process_environment["MFQ_SERVER_RESIDENT_BUDGET_BYTES"] = str(self._resident_load_limits[artifact.resource.name])
         cache_directory = str(self._prefix_cache_directory())

@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import { CaretRightIcon } from '@phosphor-icons/react';
+import { ListToolbar } from '../../shared/ui/ListToolbar';
 import { Icon } from '../../app/display';
 import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { modelsApi } from '../../shared/api/resources/models';
@@ -37,6 +39,10 @@ export function EvaluationsPage() {
   const [selected, setSelected] = useState<string[]>([]);
   const [comparison, setComparison] = useState<EvaluationComparison | null>(null);
   const [resultKind, setResultKind] = useState('all');
+  const [resultQuery, setResultQuery] = useState('');
+  const [resultModel, setResultModel] = useState('all');
+  const [resultPeriod, setResultPeriod] = useState('all');
+  const [resultSort, setResultSort] = useState('recent');
   const [generatedReference, setGeneratedReference] = useState<GeneratedWt2Reference | null>(null);
   const metricLabels: Record<string, string> = {
     kld: 'KLD', top1_agreement: tr('Top1 一致率', 'Top1 agreement'),
@@ -125,6 +131,15 @@ export function EvaluationsPage() {
     spec.sha256 === (item.dataset_manifest.source_sha256 || item.dataset_manifest.sha256) && spec.byte_size === (item.dataset_manifest.source_byte_size || item.dataset_manifest.byte_size));
   const comparable = selectedResults.length >= 2 && selectedResults.length <= 16 &&
     selectedResults.every((item) => officialResult(item) && item.kind === selectedResults[0].kind && item.comparison_key === selectedResults[0].comparison_key);
+  const resultName = (item: EvaluationResult) => item.kind === 'inference_benchmark' ? tr('推理测速', 'Inference benchmark')
+    : item.kind === 'accuracy_benchmark' ? String(item.parameters.benchmark || tr('答案评测', 'Answer evaluation'))
+      : item.kind === 'perplexity' ? 'WT2 KLD / Top1' : item.kind;
+  const visibleResults = evaluations.filter(item =>
+    (resultKind === 'all' || item.kind === resultKind) && (resultModel === 'all' || item.model_id === resultModel) &&
+    (resultPeriod === 'all' || Date.parse(item.created_at) >= Date.now() - Number(resultPeriod) * 86400000) &&
+    `${item.model_id} ${resultName(item)} ${item.kind} ${item.id}`.toLowerCase().includes(resultQuery.trim().toLowerCase()))
+    .sort((a, b) => resultSort === 'model' ? a.model_id.localeCompare(b.model_id) :
+      (Date.parse(b.created_at) - Date.parse(a.created_at)) * (resultSort === 'oldest' ? -1 : 1));
   const catalog = [
     { id: 'quality', name: 'WT2 KLD / Top1', description: tr('量化质量', 'Quantization quality'), icon: 'flask', available: tools?.quality_available },
     { id: 'performance', name: tr('推理测速', 'Inference benchmark'), description: 'prefill · decode · MTP', icon: 'gauge', available: tools?.benchmark_available },
@@ -159,7 +174,7 @@ export function EvaluationsPage() {
     </section>
     <div hidden={view !== 'datasets'}><OfficialDatasets catalog={officialCatalog} datasets={datasets} jobs={jobs} busy={busy} readiness={tools?.task_benchmarks} submit={submit} tr={tr} /></div>
     <div className="evaluation-results-view" hidden={view !== 'results'}>
-    {jobs.length > 0 && <section className="tm-panel"><details open={hasActiveJobs}><summary className="evaluation-job-heading">{tr('评测任务', 'Evaluation jobs')}<small>{tr(`${jobs.filter(activeJob).length} 个正在运行`, `${jobs.filter(activeJob).length} active`)}</small></summary>
+    {jobs.length > 0 && <section className="tm-panel"><details open={hasActiveJobs}><summary className="evaluation-job-heading"><CaretRightIcon className="evaluation-disclosure-arrow" size={15} aria-hidden="true" /><span>{tr('评测任务', 'Evaluation jobs')}</span><small>{tr(`${jobs.filter(activeJob).length} 个正在运行`, `${jobs.filter(activeJob).length} active`)}</small></summary>
       <div className="evaluation-job-list">{jobs.slice(0, 8).map((job) => <div key={job.id}>
         <div><strong>{job.kind === 'benchmark.inference' ? tr('推理测速', 'Inference benchmark') : job.kind === 'evaluate.accuracy' ? String(datasets.find((item) => item.id === job.payload.dataset_id)?.metadata.task || tr('任务 benchmark', 'Task benchmark')) : job.kind === 'dataset.download' ? tr('官方集合下载', 'Official collection download') : job.kind === 'reference.wikitext2' ? tr('WT2 logits 生成', 'WT2 logits generation') : 'WT2 KLD / Top1'}</strong><small>{statusLabels[job.status]} · {(job.progress * 100).toFixed(0)}%</small></div>
         <progress aria-label={tr('评测进度', 'Evaluation progress')} max={1} value={job.progress} />
@@ -178,8 +193,25 @@ export function EvaluationsPage() {
     </section>}
     <section className="tm-panel evaluation-history"><div className="panel-heading"><div><h2>{tr('历史结果', 'Result history')}</h2><p>{tr('保存测试条件、实际 token 数与每轮原始数据；仅对比相同条件的结果', 'Conditions, actual token counts and raw rounds are saved; compare only matching conditions')}</p></div><b>{evaluations.length}</b></div>
       {!evaluations.length && <div className="inline-empty">{tr('选择上方测试并运行，结果会自动保存在这里', 'Choose and run a test above; results are saved here automatically')}</div>}
-      {evaluations.length > 0 && <label className="evaluation-answer-filter">{tr('结果类型', 'Result type')}<select value={resultKind} onChange={(event) => setResultKind(event.target.value)}><option value="all">{tr('全部', 'All')}</option><option value="perplexity">WT2 KLD / Top1</option><option value="inference_benchmark">{tr('推理测速', 'Inference benchmark')}</option><option value="accuracy_benchmark">{tr('答案评测', 'Answer evaluation')}</option></select></label>}
-      <div className="evaluation-results">{evaluations.filter((item) => resultKind === 'all' || item.kind === resultKind).map((item) => <article key={item.id}>
+      <ListToolbar label={tr('搜索历史结果', 'Search result history')} placeholder={tr('搜索模型、测试名称或结果 ID', 'Search model, test or result ID')}
+        query={resultQuery} onQueryChange={setResultQuery} count={visibleResults.length} total={evaluations.length}
+        activeFilters={[resultKind, resultModel, resultPeriod].filter(value => value !== 'all').length}
+        onReset={() => { setResultQuery(''); setResultKind('all'); setResultModel('all'); setResultPeriod('all'); setResultSort('recent'); }}>
+        <label>{tr('结果类型', 'Result type')}<select aria-label={tr('结果类型', 'Result type')} value={resultKind} onChange={event => setResultKind(event.target.value)}>
+          <option value="all">{tr('全部', 'All')}</option><option value="perplexity">WT2 KLD / Top1</option><option value="inference_benchmark">{tr('推理测速', 'Inference benchmark')}</option><option value="accuracy_benchmark">{tr('答案评测', 'Answer evaluation')}</option>
+        </select></label>
+        <label>{tr('模型', 'Model')}<select aria-label={tr('结果模型', 'Result model')} value={resultModel} onChange={event => setResultModel(event.target.value)}>
+          <option value="all">{tr('全部', 'All')}</option>{[...new Set(evaluations.map(item => item.model_id))].sort().map(name => <option key={name} value={name}>{name}</option>)}
+        </select></label>
+        <label>{tr('时间', 'Time')}<select aria-label={tr('结果时间', 'Result time')} value={resultPeriod} onChange={event => setResultPeriod(event.target.value)}>
+          <option value="all">{tr('不限', 'Any time')}</option><option value="7">{tr('最近 7 天', 'Last 7 days')}</option><option value="30">{tr('最近 30 天', 'Last 30 days')}</option><option value="90">{tr('最近 90 天', 'Last 90 days')}</option>
+        </select></label>
+        <label>{tr('排序', 'Sort')}<select aria-label={tr('结果排序', 'Result sort')} value={resultSort} onChange={event => setResultSort(event.target.value)}>
+          <option value="recent">{tr('最新优先', 'Newest first')}</option><option value="oldest">{tr('最早优先', 'Oldest first')}</option><option value="model">{tr('模型名称', 'Model name')}</option>
+        </select></label>
+      </ListToolbar>
+      {evaluations.length > 0 && visibleResults.length === 0 && <p className="list-no-matches">{tr('没有匹配的历史结果', 'No matching results')}</p>}
+      <div className="evaluation-results">{visibleResults.map((item) => <article key={item.id}>
         <header><label><input type="checkbox" checked={selected.includes(item.id)} onChange={(event) => { setComparison(null); setSelected((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id)); }} />
           <strong>{item.model_id}</strong></label><ModelVendorMark name={item.model_id} /></header>
         <small>{item.kind === 'inference_benchmark' ? tr('推理测速', 'Inference benchmark') : item.kind === 'accuracy_benchmark' ? String(item.parameters.benchmark || tr('答案评测', 'Answer evaluation')) : item.kind === 'perplexity' ? 'WT2 / KLD' : item.kind} · {new Date(item.created_at).toLocaleString()}</small>

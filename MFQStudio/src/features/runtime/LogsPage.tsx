@@ -88,7 +88,8 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
     'dataset.download': tr('下载官方测评集合', 'Download official test collection'),
     'evaluate.wikitext2': 'WT2 KLD / Top1', 'evaluate.accuracy': tr('任务测评', 'Task evaluation'),
     'benchmark.inference': tr('推理测速', 'Inference benchmark'), 'benchmark.kernel': tr('算子测速', 'Kernel benchmark'),
-    'runtime.memory.configure': tr('调整内存预算', 'Adjust memory budget') })[kind] || kind;
+    'runtime.memory.configure': tr('调整内存预算', 'Adjust memory budget'),
+    'runtime.context.configure': tr('调整模型上下文', 'Change model context') })[kind] || kind;
   const time = (value: string | number) => new Date(typeof value === 'number' ? value * 1000 : value)
     .toLocaleString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
   const metric = (value: number | undefined, suffix = '') => value == null ? '--' : `${formatNumber(value, 1)}${suffix}`;

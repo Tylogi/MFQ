@@ -1,8 +1,6 @@
-/** 管理历史消息编辑、重新生成和确认后的工具执行，不持有全局运行时状态。 */
 import { useMemo, useRef, useState } from 'react';
 import type { EditDraft } from '../SavedMessageList';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import { connectionsApi } from '../../../shared/api/resources/connections';
 import type { ContentPart, Message, Session } from '../../../shared/api/types';
 import { textParts, isMediaPart } from '../messageParts';
 import type { useConversationSessions } from './useConversationSessions';
@@ -123,42 +121,6 @@ export function useMessageActions({
       }
     }
 
-    /** 仅在用户点击确认后执行工具，按会话版本提交工具结果并继续生成。 */
-    async function executeToolCalls(message: Message) {
-      const { conversation, blocked, generate, setBusy } = latest.current;
-      const { active, setError } = conversation;
-      if (!active || blocked) return;
-      const calls = message.parts.filter(
-        (part): part is Extract<ContentPart, { type: 'tool_call' }> => part.type === 'tool_call',
-      );
-      if (!calls.length) return;
-      setBusy(true);
-      try {
-        const results = await Promise.all(
-          calls.map(async (call) => ({
-            call,
-            result: await connectionsApi.callMcpTool(call.name, call.arguments),
-          })),
-        );
-        if (!current(active.id)) return;
-        let updated = await sessionsApi.getSession(active.id);
-        const parts = results.map(({ call, result }): ContentPart => ({
-          type: 'tool_result',
-          call_id: call.call_id,
-          result: result.structured_content ?? result.content,
-          is_error: result.is_error,
-        }));
-        for (const part of parts.slice(0, -1)) {
-          updated = (await sessionsApi.appendMessage(updated.id, updated.revision, 'tool', [part])).session;
-          if (!current(active.id)) return;
-        }
-        await generate(updated, [parts.at(-1)!], false, 'tool');
-      } catch (cause) {
-        if (current(active.id)) setError(errorMessage(cause));
-      } finally {
-        setBusy(false);
-      }
-    }
-    return { saveEdit, regenerate, copyMessage, executeToolCalls };
+    return { saveEdit, regenerate, copyMessage };
   }, []);
 }

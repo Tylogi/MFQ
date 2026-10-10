@@ -31,6 +31,7 @@ from mfq.server.state.catalog import (
     ModelRegistrationError,
 )
 from mfq.server.services.checkpoint_analysis import analyze_checkpoint
+from mfq.server.services.model_memory import checkpoint_cache_profile
 from mfq.server.services.documents import DocumentExtractionError, extract_document
 from mfq.server.services.evaluation_datasets import official_for_digest
 from mfq.server.services.hub import (
@@ -46,7 +47,6 @@ from mfq.server.services.jobs import (
     JobManager,
     TypedJobHandler,
 )
-from mfq.server.services.mcp import McpClient, McpError
 from mfq.server.protocol.analysis import CheckpointAnalysis
 from mfq.server.protocol.models import (
     AppendMessageRequest,
@@ -59,7 +59,6 @@ from mfq.server.protocol.models import (
     CreateDocumentRequest,
     CreateGenerationPresetRequest,
     CreateJobRequest,
-    CreateMcpServerRequest,
     CreateRemoteNodeRequest,
     CreateResponseRequest,
     CreateRuntimeProfileRequest,
@@ -88,21 +87,19 @@ from mfq.server.protocol.models import (
     JobList,
     JobResource,
     JobStatus,
-    McpServerList,
-    McpServerResource,
-    McpToolCallRequest,
-    McpToolCallResult,
-    McpToolList,
-    McpToolResource,
     MediaResource,
     Message,
     MessageList,
     MessageRole,
     ModelArtifactList,
+    ModelCacheProfile,
     ModelDirectoryList,
     ModelLoadRequest,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
+    ConfigureQsaKvOffloadRequest,
+    RuntimeContextPolicy,
+    RuntimeReloadRequest,
     ModelUnloadRequest,
     OfficialModelList,
     OpenModelDirectoryRequest,
@@ -147,7 +144,6 @@ from mfq.server.protocol.models import (
     ToolResultPart,
     TranscriptPart,
     UpdateGenerationPresetRequest,
-    UpdateMcpServerRequest,
     UpdateRemoteNodeRequest,
     UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
@@ -322,11 +318,16 @@ class ServerService:
         self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
+            if hasattr(runtime_manager, "context_policy"):
+                runtime_manager.context_policy = RuntimeContextPolicy.model_validate(store.runtime_context_policy())
+                self.jobs.register("runtime.context.configure", TypedJobHandler(runtime_manager.configure_context, RuntimeReloadRequest))
             if hasattr(runtime_manager, "inference_policy"):
                 runtime_manager.inference_policy = RuntimeInferencePolicy.model_validate(store.runtime_inference_policy())
             if hasattr(runtime_manager, "configure_memory_policy"):
                 runtime_manager.memory_policy = RuntimeMemoryPolicy.model_validate(store.runtime_memory_policy())
                 self.jobs.register("runtime.memory.configure", TypedJobHandler(runtime_manager.configure_memory_policy, RuntimeMemoryPolicy))
+            if hasattr(runtime_manager, "configure_qsa_kv_offload"):
+                self.jobs.register("runtime.qsa-kv.configure", TypedJobHandler(runtime_manager.configure_qsa_kv_offload, ConfigureQsaKvOffloadRequest))
             self.jobs.register(
                 "model.load", TypedJobHandler(runtime_manager.load, ModelLoadRequest)
             )
@@ -410,6 +411,9 @@ class ServerService:
 
     async def cancel_job(self, job_id: UUID) -> JobResource:
         try:
+            job = await asyncio.to_thread(self.store.get_job, job_id)
+            if job.kind == "runtime.context.configure" and job.status in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELLING}:
+                raise ServiceError(409, "context_reload_in_progress", "context reload cannot be cancelled once submitted")
             return await self.jobs.cancel(job_id)
         except JobNotFoundError as error:
             raise ServiceError(404, "job_not_found", str(error)) from error
@@ -875,99 +879,6 @@ class ServerService:
         except MediaNotFoundError as error:
             raise ServiceError(404, "document_not_found", str(error)) from error
 
-    async def create_mcp_server(self, request: CreateMcpServerRequest) -> McpServerResource:
-        try:
-            return await asyncio.to_thread(self.store.create_mcp_server, request)
-        except StorageError as error:
-            raise ServiceError(409, "mcp_server_conflict", str(error)) from error
-
-    async def list_mcp_servers(self) -> McpServerList:
-        return McpServerList(data=await asyncio.to_thread(self.store.list_mcp_servers))
-
-    async def update_mcp_server(
-        self, server_id: UUID, request: UpdateMcpServerRequest
-    ) -> McpServerResource:
-        try:
-            return await asyncio.to_thread(
-                self.store.set_mcp_server_enabled, server_id, request.enabled
-            )
-        except MediaNotFoundError as error:
-            raise ServiceError(404, "mcp_server_not_found", str(error)) from error
-
-    async def delete_mcp_server(self, server_id: UUID) -> None:
-        try:
-            await asyncio.to_thread(self.store.delete_mcp_server, server_id)
-        except MediaNotFoundError as error:
-            raise ServiceError(404, "mcp_server_not_found", str(error)) from error
-
-    async def list_mcp_tools(self) -> McpToolList:
-        servers = await asyncio.to_thread(self.store.list_mcp_servers, enabled_only=True)
-
-        async def discover(
-            server: McpServerResource,
-        ) -> tuple[list[McpToolResource], str | None]:
-            try:
-                return await McpClient(server).list_tools(), None
-            except (McpError, OSError) as error:
-                return [], str(error)
-
-        results = await asyncio.gather(*(discover(server) for server in servers))
-        tools: list[McpToolResource] = []
-        errors: dict[str, str] = {}
-        for server, (items, error) in zip(servers, results, strict=True):
-            tools.extend(items)
-            if error:
-                errors[server.name] = error
-        return McpToolList(data=tools, errors=errors)
-
-    async def call_mcp_tool(self, request: McpToolCallRequest) -> McpToolCallResult:
-        if not request.confirm:
-            raise ServiceError(
-                409,
-                "tool_confirmation_required",
-                "tool execution requires explicit confirmation",
-            )
-        servers = await asyncio.to_thread(self.store.list_mcp_servers, enabled_only=True)
-        server_name, separator, tool_name = request.name.partition(".")
-        if not separator or not server_name or not tool_name:
-            raise ServiceError(
-                422,
-                "invalid_tool_name",
-                "MCP tools must use the server.tool qualified name",
-            )
-        server = next((item for item in servers if item.name == server_name), None)
-        if server is None:
-            raise ServiceError(404, "mcp_server_not_found", server_name)
-        started = time.perf_counter()
-        try:
-            client = McpClient(server)
-            available = await client.list_tools()
-            if not any(item.name == tool_name for item in available):
-                raise ServiceError(404, "mcp_tool_not_found", request.name)
-            result = await client.call_tool(tool_name, request.arguments)
-        except ServiceError:
-            raise
-        except (McpError, OSError) as error:
-            await asyncio.to_thread(
-                self.store.append_runtime_log,
-                RuntimeLogLevel.ERROR,
-                "MCP tool call failed",
-                fields={"server": server.name, "tool": tool_name},
-            )
-            raise ServiceError(502, "mcp_tool_failed", str(error)) from error
-        await asyncio.to_thread(
-            self.store.append_runtime_log,
-            RuntimeLogLevel.INFO,
-            "MCP tool call completed",
-            fields={
-                "server": server.name,
-                "tool": tool_name,
-                "is_error": result.is_error,
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            },
-        )
-        return result
-
     async def fork_session(
         self,
         session_id: UUID,
@@ -1088,6 +999,18 @@ class ServerService:
             raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
         directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
         return await self.model_directories(path=str(directory))
+
+    async def model_cache_profile(self, model_id: str) -> ModelCacheProfile | None:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        try:
+            return await asyncio.to_thread(checkpoint_cache_profile, artifact)
+        except (ValueError, OSError) as error:
+            raise ServiceError(422, "model_cache_profile_unavailable", "checkpoint cache metadata cannot be read") from error
 
     async def checkpoint_analysis(self, model_id: str) -> CheckpointAnalysis:
         if self.catalog is None:
@@ -1516,16 +1439,19 @@ class ServerService:
 
     async def reload_runtime(
         self,
-        context_size: int,
+        context_size: int | None,
         *,
         instance_id: UUID | None = None,
+        yarn_enabled: bool | None = None,
     ) -> dict[str, Any]:
+        options = {} if yarn_enabled is None else {"yarn_enabled": yarn_enabled}
         if instance_id is None:
-            return await self._runtime_request("reload_runtime", context_size)
+            return await self._runtime_request("reload_runtime", context_size, **options)
         return await self._runtime_request(
             "reload_runtime",
             context_size,
             instance_id,
+            **options,
         )
 
     async def clear_runtime_cache(
@@ -2212,7 +2138,7 @@ class ServerService:
             "input_audio": {"data": encoded, "format": audio_format},
         }
 
-    async def _runtime_request(self, method: str, *args: Any) -> dict[str, Any]:
+    async def _runtime_request(self, method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         operation = getattr(self.backend, method, None)
         if operation is None:
             raise ServiceError(
@@ -2221,7 +2147,7 @@ class ServerService:
                 f"the configured backend does not implement {method}",
             )
         try:
-            return await operation(*args)
+            return await operation(*args, **kwargs)
         except BackendError as error:
             raise ServiceError(
                 error.status_code or 503,

@@ -20,9 +20,9 @@ interface SettingsContextValue {
   replaceSettings: Dispatch<SetStateAction<GenerationSettings>>;
   tr: (zh: string, en: string) => string;
   english: boolean;
-  contextSize: number;
+  contextSize: number | null;
   /** 更新模型加载和重载共用的上下文容量。 */
-  setContextSize: Dispatch<SetStateAction<number>>;
+  setContextSize: Dispatch<SetStateAction<number | null>>;
 }
 
 const SettingsContext = createContext<SettingsContextValue | null>(null);
@@ -30,7 +30,7 @@ const SettingsContext = createContext<SettingsContextValue | null>(null);
 /** 在应用外壳提供共享偏好；草稿和业务请求由各页面自行持有。 */
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, replaceSettings] = useState(loadSettings);
-  const [contextSize, setContextSize] = useState(32768);
+  const [contextSize, setContextSize] = useState<number | null>(null);
   const english =
     settings.language === 'en' ||
     (settings.language === 'system' && !navigator.language.toLowerCase().startsWith('zh'));

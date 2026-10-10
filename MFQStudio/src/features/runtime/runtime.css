@@ -84,6 +84,10 @@
 .memory-tier-track { display: flex; height: 8px; overflow: hidden; border-radius: 5px; margin-top: 9px; background: var(--line-soft); }
 .memory-tier-track > span { height: 100%; flex: 0 0 auto; }
 .memory-tier-track > span + span { box-shadow: -1px 0 0 var(--surface); }
+.memory-tier-streaming-summary { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 9px; color: var(--muted); font-size: 11px; }
+.memory-tier-streaming-summary > span { white-space: nowrap; }
+.memory-tier-streaming-summary b { color: var(--ink-soft); font-weight: 500; font-variant-numeric: tabular-nums; }
+.resource-tier-model > .memory-tier-streaming-summary { grid-column: 1 / -1; margin-top: 0; }
 .memory-tier-notice { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: var(--muted-light); font-size: 10px; line-height: 1.5; }
 
 .overview-footer-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
@@ -91,7 +95,8 @@
 .overview-session-panel { display: grid; align-content: start; gap: 15px; min-height: 158px; }
 .overview-panel-title { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .overview-panel-title > .ui-icon { flex: 0 0 auto; color: var(--muted); }
-.overview-panel-title > button {
+.overview-panel-title > button,
+.overview-api-entry > button {
   display: grid;
   width: 27px;
   height: 27px;
@@ -103,10 +108,17 @@
   color: var(--muted);
   background: transparent;
 }
-.overview-panel-title > button:hover { color: var(--ink); background: var(--surface-hover); }
-.overview-panel-title > button.copied { color: var(--success); }
+.overview-panel-title > button:hover,
+.overview-api-entry > button:hover { color: var(--ink); background: var(--surface-hover); }
+.overview-panel-title > button.copied,
+.overview-api-entry > button.copied { color: var(--success); }
 .overview-panel-title > span { margin-left: auto; color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.overview-endpoint-panel > code {
+.overview-api-list { display: grid; }
+.overview-api-entry { display: grid; grid-template-columns: 62px minmax(0, 1fr) 27px; min-width: 0; align-items: center; gap: 10px; }
+.overview-api-entry + .overview-api-entry { margin-top: 8px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+.overview-api-entry > strong { color: var(--muted); font-size: 11px; font-weight: 500; }
+.overview-api-entry > span { color: var(--muted-light); font-size: 11px; }
+.overview-api-entry > code {
   overflow: hidden;
   color: var(--ink-soft);
   font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -115,7 +127,7 @@
   user-select: text;
   border: 1px solid var(--line-soft);
   border-radius: 7px;
-  padding: 10px 12px;
+  padding: 5px 8px;
   background: var(--surface-control);
 }
 .overview-endpoint-panel > p,

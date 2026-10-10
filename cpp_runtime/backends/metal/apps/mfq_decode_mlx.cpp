@@ -102,6 +102,7 @@ struct Arguments {
     std::string host = "127.0.0.1";
     int port = 8080;
     std::int64_t context_size = 32768;
+    bool yarn_context_extension = false;
     int prefill_chunk_size = 2048;
     bool prefill_chunk_size_explicit = false;
     std::optional<double> expert_cache_gb;
@@ -248,6 +249,8 @@ Arguments parse_arguments(int argc, char** argv) {
                 usage_error("--ctx-size must be positive");
             }
             result.context_size = parsed;
+        } else if (value == "--yarn-context-extension") {
+            result.yarn_context_extension = true;
         } else if (value == "--prefill-chunk-size") {
             const auto parsed = std::stoll(
                 require_value("--prefill-chunk-size"));
@@ -333,6 +336,7 @@ void print_help() {
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
+        << "  --yarn-context-extension  permit Qwen YaRN context extension on load\n"
         << "  --prefill-chunk-size N maximum prompt chunk (portable default 2048;\n"
         << "                          capable runtimes may autotune when omitted)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
@@ -880,7 +884,8 @@ template <typename Runtime>
 std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
     const mfq::metal::MfqContainer& container,
     std::int64_t context_size,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const std::string& predictor_key = {}) {
     using SessionState = decltype(
         std::declval<const Runtime&>().capture_text_session_state(
             std::declval<const std::vector<std::int64_t>&>()));
@@ -911,6 +916,16 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();
         config.compatibility_key = metal_prefix_cache_compatibility_key(
             container, Codec::name, context_size);
+        if constexpr (recurrent) config.compatibility_key += mfq::metal::mlx_kv_quantization_tag();
+        if constexpr (recurrent) {
+            const auto native_context = [&] {
+                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
+                    return mfq::metal::Qwen4Config::from_mfq(container).max_position_embeddings;
+                else return mfq::metal::Qwen35Config::from_mfq(container).max_position_embeddings;
+            }();
+            if (context_size > native_context) config.compatibility_key += "\nqwen-yarn-v1";
+        }
+        if (!predictor_key.empty()) config.compatibility_key += "\n" + predictor_key;
         config.block_size_tokens = static_cast<std::size_t>(block_size);
         config.max_disk_bytes = cache_bytes_from_environment(
             "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
@@ -1965,6 +1980,14 @@ public:
                 mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
                     enforce_memory_budget(bytes);
                 }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
+                if constexpr (requires { loaded_runtime.begin_mtp_session(std::string{}); })
+                    loaded_runtime.begin_mtp_session(parameters.enable_mtp ? cache_plan.session_id : std::string{});
+                struct EndMtpSession {
+                    Runtime& runtime;
+                    ~EndMtpSession() {
+                        if constexpr (requires { runtime.end_mtp_session(); }) runtime.end_mtp_session();
+                    }
+                 } end_mtp_session{loaded_runtime};
                 enforce_memory_budget(0);
                 const auto stable_prefix_tokens =
                     session_cache->normalize_stable_prefix_tokens(std::min(
@@ -2171,10 +2194,18 @@ public:
         }
         std::lock_guard lock(*runtime_mutex);
         switch (command.kind) {
-        case Kind::fork:
-            return {session_cache->fork_session(command.source, command.target), {}};
-        case Kind::close:
-            return {session_cache->close_session(command.source), {}};
+        case Kind::fork: {
+            std::size_t copied = 0;
+            if constexpr (requires(Runtime& value) { value.fork_mtp_session(command.source, command.target); })
+                if (runtime_holder->has_value()) copied = runtime_holder->value().fork_mtp_session(command.source, command.target);
+            return {copied + session_cache->fork_session(command.source, command.target), {}};
+        }
+        case Kind::close: {
+            std::size_t removed = 0;
+            if constexpr (requires(Runtime& value) { value.close_mtp_session(command.source); })
+                if (runtime_holder->has_value()) removed = runtime_holder->value().close_mtp_session(command.source);
+            return {removed + session_cache->close_session(command.source), {}};
+        }
         case Kind::memory_budget: {
             const auto previous = resident_budget.load();
             const auto before = mlx::core::get_active_memory();
@@ -2202,6 +2233,8 @@ public:
             mfq::metal::drain_metal_work(runtime_stream);
             const auto released = session_cache->clear();
             if (runtime_holder->has_value()) {
+                if constexpr (requires(Runtime& value) { value.clear_mtp_sessions(); })
+                    runtime_holder->value().clear_mtp_sessions();
                 if constexpr (requires(Runtime& value) { value.reset_cache(1); })
                     runtime_holder->value().reset_cache(1);
                 else runtime_holder->value().reset();
@@ -2306,6 +2339,8 @@ private:
         for (const auto& metric : session_cache->metrics()) if (metric.first == "prefix_cache_hot_bytes") prefix = static_cast<std::size_t>(metric.second);
         const auto shortage = used() > target ? used() - target : 0;
         session_cache->trim_hot(prefix > shortage ? prefix - shortage : 0);
+        if constexpr (requires(Runtime& value) { value.trim_mtp_sessions(std::size_t{}); })
+            if (used() > target) runtime_holder->value().trim_mtp_sessions(0);
         if (used() <= target) return;
         if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
             auto& runtime = runtime_holder->value();
@@ -2324,8 +2359,18 @@ private:
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         std::size_t prefix = 0;
         for (const auto& metric : session_cache->metrics()) if (metric.first == "prefix_cache_resident_bytes") prefix = static_cast<std::size_t>(metric.second);
+        std::size_t adapters = 0;
+        if constexpr (requires(Runtime& value) { value.mtp_session_bytes(); })
+            if (runtime_holder->has_value()) adapters = runtime_holder->value().mtp_session_bytes();
+        std::size_t offloaded = 0;
+        if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); }) {
+            if (runtime_holder->has_value()) {
+                const auto stats = runtime_holder->value().qsa_kv_offload_stats();
+                if (stats) offloaded = stats->hot_bytes + stats->pending_bytes;
+            }
+        }
         return std::max(mlx::core::get_active_memory(), resident_weight_baseline +
-            usage.dynamic_weight_bytes + usage.cache_bytes) + prefix + mlx::core::get_cache_memory();
+            usage.dynamic_weight_bytes + usage.cache_bytes) + offloaded + prefix + adapters + mlx::core::get_cache_memory();
     }
     void capture_weight_residency() {
         mfq::metal::MlxMemoryResidency::refresh();
@@ -2346,8 +2391,21 @@ private:
     }
 
     mfq::engine::Metrics metrics() const {
+        double qsa_offload_supported = 0;
+        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+            if (runtime_holder->has_value()) {
+                const auto& config = runtime_holder->value().config();
+                qsa_offload_supported = config.mtp_num_hidden_layers > 0 ||
+                    std::find(config.layer_types.begin(), config.layer_types.end(), "full_attention") != config.layer_types.end();
+            }
+        }
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+            {"qsa_kv_offload_supported", qsa_offload_supported},
+            {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
+            {"kv_quantization_bits", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? mfq::metal::mlx_kv_quantization().bits : 0.0},
             {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
@@ -2367,11 +2425,32 @@ private:
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
         if (lock.owns_lock() && runtime_holder->has_value()) {
             metrics.emplace_back("resident_memory_used_bytes", static_cast<double>(resident_memory_used()));
+            if constexpr (requires(Runtime& value) { value.mtp_session_metrics(); }) {
+                const auto adapters = runtime_holder->value().mtp_session_metrics();
+                metrics.insert(metrics.end(), adapters.begin(), adapters.end());
+            }
             const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
             metrics.emplace_back("resident_weight_bytes", static_cast<double>(
                 resident_weight_baseline + usage.dynamic_weight_bytes));
-            metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
+            if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
+                metrics.emplace_back("kv_cache_bytes", static_cast<double>(runtime_holder->value().kv_cache_bytes()));
+            else metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
             metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
+            {
+                std::optional<mfq::metal::QsaKvStoreStats> offload;
+                if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
+                    offload = runtime_holder->value().qsa_kv_offload_stats();
+                metrics.emplace_back("qsa_kv_offload_enabled", offload ? 1.0 : 0.0);
+                metrics.emplace_back("qsa_kv_resident_bytes", offload ? static_cast<double>(offload->hot_bytes + offload->pending_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_ssd_bytes", offload ? static_cast<double>(offload->disk_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_pending_bytes", offload ? static_cast<double>(offload->pending_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_hot_limit_bytes", offload ? static_cast<double>(offload->hot_limit) : 0.0);
+                metrics.emplace_back("qsa_kv_budget_bytes", offload ? static_cast<double>(offload->budget_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_ssd_read_bytes", offload ? static_cast<double>(offload->read_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_ssd_written_bytes", offload ? static_cast<double>(offload->written_bytes) : 0.0);
+                metrics.emplace_back("qsa_kv_ssd_reads", offload ? static_cast<double>(offload->reads) : 0.0);
+                metrics.emplace_back("qsa_kv_ram_hits", offload ? static_cast<double>(offload->hits) : 0.0);
+            }
             const auto ple = usage.ple_payload_bytes;
             const auto experts = usage.expert_payload_bytes;
             metrics.emplace_back("ssd_ple_enabled", ple > 0 ? 1.0 : 0.0);
@@ -2574,6 +2653,22 @@ private:
         }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
         enforce_memory_budget(0);
         auto& runtime = runtime_holder->value();
+        int warmup_chunk = prefill_chunk_size;
+        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+            if (const auto stats = runtime.qsa_kv_offload_stats()) {
+                const auto& config = runtime.config();
+                const auto layers = std::count(config.layer_types.begin(), config.layer_types.end(), "full_attention") +
+                    config.mtp_num_hidden_layers;
+                const auto row_bytes = static_cast<std::size_t>(layers) *
+                    (config.num_key_value_heads * config.head_dim * 4 +
+                        config.indexer_head_dim * 2 +
+                        (config.indexer_head_dim * 4 + config.indexer_compress_ratio - 1) / config.indexer_compress_ratio);
+                warmup_chunk = static_cast<int>(std::max<std::size_t>(1,
+                    std::min<std::size_t>(warmup_chunk, stats->hot_limit / std::max<std::size_t>(1, row_bytes))));
+            }
+        }
+        if constexpr (requires { runtime.prepare_mtp_ttt(default_prefix_cache_directory()); })
+            runtime.prepare_mtp_ttt(default_prefix_cache_directory());
         const auto generate = [&](const std::vector<std::int64_t>& prompt,
                                   const mfq::metal::MlxSamplingParams& sampling, int count) {
             generate_with_prefill_metrics(runtime, prompt, sampling, count,
@@ -2592,7 +2687,7 @@ private:
             release_model_load_staging_memory(runtime_stream);
         };
         mfq::metal::warm_mlx_inference(warmup_prompt, static_cast<int>(*loaded_context),
-            prefill_chunk_size, preparation_sampling, runtime_components.mtp_available,
+            warmup_chunk, preparation_sampling, runtime_components.mtp_available,
             generate, reset);
     }
 
@@ -2712,10 +2807,13 @@ int run_loaded_runtime(
         std::make_shared<std::optional<Runtime>>(
             std::move(model));
     const auto paged_cache_factory =
-        [&container, prefill_chunk_size](std::int64_t context_size)
+        [&container, prefill_chunk_size, runtime_holder](std::int64_t context_size)
             -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
+            std::string predictor_key;
+            if constexpr (requires(Runtime& runtime) { runtime.mtp_cache_fingerprint(); })
+                if (runtime_holder->has_value()) predictor_key = runtime_holder->value().mtp_cache_fingerprint();
             return make_metal_paged_cache<Runtime>(
-                container, context_size, prefill_chunk_size);
+                container, context_size, prefill_chunk_size, predictor_key);
         };
     auto session_cache =
         std::make_shared<MlxServerTextSessionCache<Runtime>>(
@@ -2763,8 +2861,23 @@ int run_loaded_runtime(
     info.duplex = static_cast<bool>(runtime_components.duplex);
     info.reload = true;
     info.probability = requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); };
-    auto engine_model = std::make_unique<LoadedMetalModel<Runtime, Loader>>(
-        runtime_mutex, runtime_holder, session_cache, std::move(load_runtime),
+    auto reload_runtime = [&container, loader = std::move(load_runtime)](std::int64_t context) {
+        container.observe_load_records([](std::size_t completed, std::size_t total) {
+            std::cerr << "mfq_load_progress completed=" << completed
+                      << " total=" << total << std::endl;
+        });
+        try {
+            auto loaded = loader(context);
+            container.stop_load_observation();
+            std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
+            return loaded;
+        } catch (...) {
+            container.stop_load_observation();
+            throw;
+        }
+    };
+    auto engine_model = std::make_unique<LoadedMetalModel<Runtime, decltype(reload_runtime)>>(
+        runtime_mutex, runtime_holder, session_cache, std::move(reload_runtime),
         paged_cache_factory, loaded_context, runtime_stream, prefill_chunk_size,
         allocator_cache_limit, std::move(runtime_components), preparation_sampling,
         preparation_routes, static_cast<int>(vocabulary_size),
@@ -2982,11 +3095,14 @@ int run_native_runtime(
     if (backbone == "qwen4_exp") {
         const auto config =
             mfq::metal::Qwen4Config::from_mfq(container);
+        const auto extended_context = mfq::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
         preparation.set_routes(static_cast<int>(config.num_experts_per_tok));
         const int context = static_cast<int>(
             std::min<std::int64_t>(
                 arguments.context_size,
-                config.max_position_embeddings));
+                arguments.yarn_context_extension ? extended_context : config.max_position_embeddings));
+        auto runtime_arguments = arguments;
+        runtime_arguments.context_size = context;
         std::optional<std::size_t> expert_cache_bytes;
         if (arguments.expert_cache_gb.has_value() || native_hf) {
             const auto bytes = requested_cache_bytes(
@@ -3026,14 +3142,14 @@ int run_native_runtime(
                     expert_cache_bytes);
             };
         return run_loaded_runtime(
-            arguments,
+            runtime_arguments,
             container,
             std::move(runtime),
             load_runtime,
             config.text_model_type.empty()
                 ? config.model_type
                 : config.text_model_type,
-            config.max_position_embeddings,
+            extended_context,
             config.vocab_size,
             runtime_stream);
     }
@@ -3045,12 +3161,17 @@ int run_native_runtime(
 
     const auto config =
         mfq::metal::Qwen35Config::from_mfq(container);
+    const auto extended_context = mfq::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
+    const auto context = static_cast<int>(std::min(arguments.context_size,
+        arguments.yarn_context_extension ? extended_context : config.max_position_embeddings));
+    auto runtime_arguments = arguments;
+    runtime_arguments.context_size = context;
     std::cout
         << "Loading native C++/MLX Qwen3.5 model "
            "on Apple GPU..."
         << std::endl;
     auto runtime =
-        mfq::metal::MlxQwen35CausalLm::load(container);
+        mfq::metal::MlxQwen35CausalLm::load(container, context);
     release_model_load_staging_memory(runtime_stream);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
@@ -3061,19 +3182,19 @@ int run_native_runtime(
         << (runtime.supports_mtp() ? "sampling" : "disabled")
         << std::endl;
     const auto load_runtime =
-        [&container](std::int64_t) {
+        [&container](std::int64_t requested_context) {
             return mfq::metal::
-                MlxQwen35CausalLm::load(container);
+                MlxQwen35CausalLm::load(container, static_cast<int>(requested_context));
         };
     return run_loaded_runtime(
-        arguments,
+        runtime_arguments,
         container,
         std::move(runtime),
         load_runtime,
         config.text_model_type.empty()
             ? config.model_type
             : config.text_model_type,
-        config.max_position_embeddings,
+        extended_context,
         config.vocab_size,
         runtime_stream);
 }
@@ -3084,9 +3205,11 @@ int run_native_runtime(
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
+#ifdef MFQ_METAL_RUNTIME_COMMUNICATION
         if (arguments.stdio) {
             prepare_mfq_stdio_transport();
         }
+#endif
         mfq::metal::set_mlx_predequantize_fp16(
             arguments.predequantize_fp16);
         if (arguments.help) {

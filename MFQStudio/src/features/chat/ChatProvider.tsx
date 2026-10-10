@@ -30,7 +30,6 @@ import { useMessageActions } from './hooks/useMessageActions';
 import { useVoiceConversation } from '../voice/useVoiceConversation';
 import { isGenerationBusy } from './state/generationController';
 import { conversationActions } from './state/conversationStore';
-import { ChatToolsProvider, useChatTools } from './ChatToolsProvider';
 
 /** 按聊天访问惰性加载数据，生成和语音控制器不会因为切换其他页面而丢失。 */
 function useChatDomain() {
@@ -75,7 +74,6 @@ function useChatDomain() {
   const attachmentError = useChatAttachmentError();
   const [operationBusy, setBusy] = useState(false);
   const [voiceComponentBusy, setVoiceComponentBusy] = useState(false);
-  const { mcpTools, selectedTools, error: toolsError } = useChatTools();
   const revisionRef = useRef(connectionRevision);
   revisionRef.current = connectionRevision;
   const busy = operationBusy || isGenerationBusy(generationPhase);
@@ -85,16 +83,9 @@ function useChatDomain() {
     setBusy(false);
   }, [activeId, connectionRevision, generation]);
   useEffect(() => {
-    if (toolsError) setError(toolsError);
-  }, [toolsError, setError]);
-  useEffect(() => {
     if (attachmentError) setError(attachmentError);
   }, [attachmentError, setError]);
 
-  const selectedToolsRef = useRef(selectedTools);
-  selectedToolsRef.current = selectedTools;
-  const mcpToolsRef = useRef(mcpTools);
-  mcpToolsRef.current = mcpTools;
   const inferenceRef = useRef(inference);
   inferenceRef.current = inference;
   const voiceRef = voice.voiceRef;
@@ -145,8 +136,6 @@ function useChatDomain() {
             created_at: new Date().toISOString(),
           },
         ]);
-      const currentSelected = selectedToolsRef.current;
-      const currentMcpTools = mcpToolsRef.current;
       const inference = inferenceRef.current;
       await generation.start(session.id, {
         request_id: crypto.randomUUID(),
@@ -156,17 +145,8 @@ function useChatDomain() {
         sampling: inference.sampling,
         system_prompt: inference.effectiveSettings.systemPrompt.trim(),
         include_reasoning_history: !inference.effectiveSettings.excludeReasoning,
-        tools: currentMcpTools
-          .filter((tool) => currentSelected.includes(tool.qualified_name))
-          .map((tool) => ({
-            type: 'function' as const,
-            function: {
-              name: tool.qualified_name,
-              description: tool.description,
-              parameters: tool.input_schema,
-            },
-          })),
-        tool_choice: currentSelected.length ? 'auto' : 'none',
+        tools: [],
+        tool_choice: 'none',
         stream: true,
       }, onAccepted);
       void refreshRuntime();
@@ -429,9 +409,7 @@ const ChatContext = createContext<ReturnType<typeof useChatDomain> | null>(null)
 export function ChatProvider({ children }: { children: ReactNode }) {
   return (
     <ChatAttachmentsProvider>
-      <ChatToolsProvider>
-        <ChatLifecycleProvider>{children}</ChatLifecycleProvider>
-      </ChatToolsProvider>
+      <ChatLifecycleProvider>{children}</ChatLifecycleProvider>
     </ChatAttachmentsProvider>
   );
 }
@@ -445,7 +423,7 @@ function ChatLifecycleProvider({ children }: { children: ReactNode }) {
 /**
  * 从聊天页面或工具栏读取聊天领域接口。
  *
- * @returns 聊天领域上下文，包含会话、推理、语音、生成与工具操作
+ * @returns 聊天领域上下文，包含会话、推理、语音与生成操作
  */
 export function useChat() {
   const value = useContext(ChatContext);

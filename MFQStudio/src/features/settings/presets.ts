@@ -25,7 +25,7 @@ export interface StoredPreset {
   name: string;
   settings: StoredPresetSettings;
   inheritGlobalSettings: boolean;
-  contextSize: number;
+  contextSize: number | null;
   model?: string | null;
   mode?: SessionMode | null;
   icon?: string;
@@ -117,7 +117,7 @@ export function loadStoredPresets(key = STORED_PRESETS_KEY): StoredPreset[] {
         contextSize:
           Number.isFinite(contextSize) && contextSize >= 512
             ? Math.floor(contextSize)
-            : 32768,
+            : null,
         model: typeof raw.model === "string" ? raw.model : null,
         mode:
           raw.mode === "text" || raw.mode === "voice" || raw.mode === "full_duplex"

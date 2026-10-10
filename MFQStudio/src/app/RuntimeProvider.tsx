@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { runtimeApi } from '../shared/api/resources/runtime';
+import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
 import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
 import type {
@@ -46,7 +46,7 @@ interface RuntimeContextValue {
   refreshError: string | null;
   jobStreamErrors: Record<string, string>;
   reloadingInstances: Record<string, number>;
-  reloadModelContext: (instanceId: string, contextSize: number) => Promise<RuntimeStatus>;
+  reloadModelContext: (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => Promise<JobResource>;
 }
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -128,33 +128,29 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number) => {
+  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => {
     const version = initializationVersion.current;
     if (reloads.current.has(instanceId)) throw new Error('Model reload is already in progress');
     reloads.current.add(instanceId);
-    setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize }));
+    setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize ?? 0 }));
     try {
-      const result = await runtimeApi.reloadRuntime(contextSize, instanceId);
+      const result = await runtimeApi.configureContext(contextSize, instanceId, yarnEnabled, qsaKvOffload, kvQuantization);
       if (mounted.current && version === initializationVersion.current) {
-        setInstances((current) => current.map((item) => item.id === instanceId
-          ? { ...item, context_size: result.max_context ?? contextSize }
-          : item));
+        ++jobRequestVersion.current;
+        useJobStore.getState().addJob(result);
       }
       return result;
     } finally {
       if (version === initializationVersion.current) {
-        await refreshRuntime(true);
-        if (version === initializationVersion.current) {
-          reloads.current.delete(instanceId);
-          if (mounted.current) setReloadingInstances((current) => {
-            const next = { ...current };
-            delete next[instanceId];
-            return next;
-          });
-        }
+        reloads.current.delete(instanceId);
+        if (mounted.current) setReloadingInstances((current) => {
+          const next = { ...current };
+          delete next[instanceId];
+          return next;
+        });
       }
     }
-  }, [refreshRuntime]);
+  }, []);
 
   const reloadService = useCallback(async () => {
     const version = ++initializationVersion.current;

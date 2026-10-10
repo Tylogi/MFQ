@@ -13,8 +13,10 @@ import { runtimeModelNames } from '../runtime/modelSelection';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { getApiBaseUrl, getApiToken, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
-import { ToolsRoutingPanel } from './ToolsRoutingPanel';
+import { RemoteRoutingPanel } from './RemoteRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
+import { ContextManagementPanel } from './ContextManagementPanel';
+import { PrefixCacheSettingsPanel } from './PrefixCacheSettingsPanel';
 import { RuntimeProfilesPanel } from '../runtime/RuntimeProfilesPanel';
 import { ModelAliasMapping } from './ModelAliasMapping';
 import { InferencePolicyPanel } from './InferencePolicyPanel';
@@ -41,26 +43,36 @@ export function ConnectionsPage() {
   } = useRuntime();
   const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
   const [listeningPort, setListeningPort] = useState<number | null>(null);
+  const [anthropicPort, setAnthropicPort] = useState<number | null>(null);
+  const [anthropicDraft, setAnthropicDraft] = useState('');
+  const [configurable, setConfigurable] = useState(false);
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [applyState, setApplyState] = useState<{ error: boolean; text: string } | null>(null);
+  const applying = useRef(false);
+  const applied = useRef(draft);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
   useEffect(() => {
-    if (studio) setDraft(studio.config);
-    else {
-      let disposed = false;
-      void runtimeApi.runtimeListener().then((listener) => {
-        if (!disposed) {
+    if (studio) { setDraft(studio.config); applied.current = studio.config; }
+    let disposed = false;
+    void runtimeApi.runtimeListener().then((listener) => {
+      if (!disposed) {
+        if (!studio) {
           setDraft((current) => ({ ...current, local_service_port: listener.port }));
-          setListeningPort(listener.port);
+          applied.current = { ...applied.current, local_service_port: listener.port };
         }
-      }).catch(() => {});
-      return () => { disposed = true; };
-    }
+        setListeningPort(listener.port);
+        setConfigurable(listener.configurable);
+        setAnthropicPort(listener.anthropic_port ?? null);
+        setAnthropicDraft(listener.anthropic_port == null ? '' : String(listener.anthropic_port));
+      }
+    }).catch(() => {});
+    return () => { disposed = true; };
   }, [studio]);
   useEffect(() => {
     let disposed = false;
@@ -81,14 +93,17 @@ export function ConnectionsPage() {
   const modelNames = runtimeModelNames(models, instances);
 
 
-  async function save() {
-    if (!draft || busy) return;
+  async function apply(draft: StudioConfig) {
+    if (applying.current) return;
+    if (JSON.stringify(draft) === JSON.stringify(applied.current) && !credentialWritable && !applyState?.error) return;
     const endpoint = getApiBaseUrl();
     let credential = getApiToken();
     const current = () => getApiBaseUrl() === endpoint && getApiToken() === credential;
+    applying.current = true;
     setBusy(true);
+    setApplyState({ error: false, text: tr('正在应用…', 'Applying…') });
     try {
-      if (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535) {
+      if (draft.mode === 'local' && (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535)) {
         throw new Error(tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535'));
       }
       if (isStudio()) {
@@ -125,21 +140,56 @@ export function ConnectionsPage() {
           return;
         }
       }
+      if (mounted.current && draft.mode === 'local') setListeningPort(draft.local_service_port);
       const reconnected = await reloadService();
+      applied.current = draft;
       if (mounted.current && reconnected) {
         setCredentialWritable(false);
-        toast.success(tr('服务器设置已保存', 'Server settings saved'));
+        setApplyState({ error: false, text: tr('已应用，无需重载模型', 'Applied without reloading models') });
+      } else if (mounted.current) {
+        setApplyState({ error: true, text: tr('设置已应用，但连接失败，请检查地址和凭据', 'Settings applied, but reconnection failed. Check the address and credentials.') });
       }
     } catch (cause) {
-      if (mounted.current && current()) toast.error(errorMessage(cause));
+      if (mounted.current && current()) {
+        setApplyState({ error: true, text: errorMessage(cause) });
+      }
     } finally {
+      applying.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }
+
+  async function applyAnthropic() {
+    const port = Number(anthropicDraft);
+    if (applying.current || port === anthropicPort) return;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setApplyState({ error: true, text: tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535') });
+      return;
+    }
+    const endpoint = getApiBaseUrl();
+    const credential = getApiToken();
+    applying.current = true;
+    setBusy(true);
+    setApplyState({ error: false, text: tr('正在应用…', 'Applying…') });
+    try {
+      const listener = await runtimeApi.configureRuntimeListener(port, 'anthropic');
+      if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
+        setAnthropicPort(listener.anthropic_port ?? port);
+        setApplyState({ error: false, text: tr('已应用，无需重载模型', 'Applied without reloading models') });
+      }
+    } catch (cause) {
+      if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
+        setApplyState({ error: true, text: errorMessage(cause) });
+      }
+    } finally {
+      applying.current = false;
       if (mounted.current) setBusy(false);
     }
   }
 
 
   return (
-    <section className="dashboard-view">
+    <section className="dashboard-view service-view">
       <ScreenHeader
         title={tr('服务', 'Service')}
         subtitle={tr(
@@ -153,14 +203,14 @@ export function ConnectionsPage() {
             <Icon name="info" size={15} />
             <span>
               {tr(
-                '服务器正在运行；网络设置保存后会立即重新连接。',
-                'The server is active. Network changes reconnect as soon as they are saved.',
+                '服务器正在运行；网络设置失焦或按回车自动应用，无需重载模型。',
+                'The server is active. Network settings apply on blur or Enter without reloading models.',
               )}
             </span>
           </div>
         )}
-        <SectionLabel title={tr('运行服务', 'Runtime')} />
-        <TMPanel className="server-settings-panel">
+        <SectionLabel title={tr('API参数', 'API parameters')} />
+        <TMPanel className="server-settings-panel server-api-panel">
           <div className="setting-list">
             <SettingRow
               title={tr('模型 ID', 'Model ID')}
@@ -184,12 +234,11 @@ export function ConnectionsPage() {
                 <select
                   aria-label={tr('绑定地址', 'Bind address')}
                   disabled={busy || !draft}
-                  onChange={(event) =>
-                    setDraft(
-                      (current) =>
-                        current && { ...current, mode: event.target.value as StudioConfig['mode'] },
-                    )
-                  }
+                  onChange={(event) => {
+                    const next = { ...draft, mode: event.target.value as StudioConfig['mode'] };
+                    setDraft(next);
+                    void apply(next);
+                  }}
                   value={draft?.mode ?? 'local'}
                 >
                   <option value="local">
@@ -212,6 +261,8 @@ export function ConnectionsPage() {
                       aria-label={tr('远程端点', 'Remote endpoint')}
                       className="server-wide-input"
                       disabled={busy}
+                      onBlur={() => void apply(draft)}
+                      onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void apply(draft); } }}
                       onChange={(event) =>
                         setDraft(
                           (current) => current && { ...current, remote_url: event.target.value },
@@ -235,6 +286,8 @@ export function ConnectionsPage() {
                       autoComplete="off"
                       className="server-wide-input"
                       disabled={busy}
+                      onBlur={() => void apply(draft)}
+                      onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void apply(draft); } }}
                       onChange={(event) => {
                         setToken(event.target.value);
                         setCredentialWritable(true);
@@ -247,19 +300,20 @@ export function ConnectionsPage() {
                 />
               </>
             ) : (
+              <>
               <SettingRow
-                title={tr('端口', 'Port')}
-                detail={tr(
-                  'OpenAI 兼容 HTTP 服务使用的 TCP 端口。',
-                  'TCP port used by the OpenAI-compatible HTTP server.',
-                )}
+                title={tr('OpenAI 端口', 'OpenAI port')}
+                detail={listeningPort == null ? tr('OpenAI 兼容 HTTP 服务端口。', 'OpenAI-compatible HTTP server port.')
+                  : `http://127.0.0.1:${listeningPort}/v1`}
                 trailing={
                   <input
-                    aria-label={tr('端口', 'Port')}
+                    aria-label={tr('OpenAI 端口', 'OpenAI port')}
                     className="server-number-input"
-                    disabled={busy || !draft}
+                    disabled={busy || !configurable}
                     max={65535}
                     min={1}
+                    onBlur={() => void apply(draft)}
+                    onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void apply(draft); } }}
                     onChange={(event) =>
                       setDraft(
                         (current) =>
@@ -271,10 +325,29 @@ export function ConnectionsPage() {
                   />
                 }
               />
+              <SettingRow
+                title={tr('Anthropic 端口', 'Anthropic port')}
+                detail={anthropicPort == null
+                  ? tr('当前服务尚未启用 Anthropic API。', 'The current service has not enabled the Anthropic API.')
+                  : `http://127.0.0.1:${anthropicPort}/v1/messages`}
+                trailing={<input
+                  aria-label={tr('Anthropic 端口', 'Anthropic port')}
+                  className="server-number-input"
+                  disabled={busy || !configurable || anthropicPort == null}
+                  max={65535} min={1} type="number" value={anthropicDraft}
+                  onChange={(event) => setAnthropicDraft(event.target.value)}
+                  onBlur={() => void applyAnthropic()}
+                  onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void applyAnthropic(); } }}
+                />}
+              />
+              </>
             )}
           </div>
+          {applyState && <p className="server-apply-state" role={applyState.error ? 'alert' : 'status'}>{applyState.text}</p>}
         </TMPanel>
         <MemorySettingsPanel />
+        <ContextManagementPanel />
+        <PrefixCacheSettingsPanel />
         <SectionLabel title={tr('自动化', 'Automation')} />
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
@@ -299,20 +372,10 @@ export function ConnectionsPage() {
             />
           </div>
         </TMPanel>
-        <div className="server-page-footer">
-          <button
-            className="primary"
-            disabled={busy || !draft}
-            onClick={() => void save()}
-            type="button"
-          >
-            {tr('保存服务器设置', 'Save server settings')}
-          </button>
-        </div>
       </div>
       <InferencePolicyPanel />
       <RuntimeProfilesPanel />
-      <ToolsRoutingPanel />
+      <RemoteRoutingPanel />
     </section>
   );
 }

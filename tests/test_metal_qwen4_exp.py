@@ -527,10 +527,10 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         indexer_budget=4,
         indexer_compress_ratio=2,
     )
-    source = mx.array(_random(rng, (1, 6, hidden), 0.2)).astype(mx.float16)
-    positions = mx.arange(6, dtype=mx.int32)
+    source = mx.array(_random(rng, (1, 37, hidden), 0.2)).astype(mx.float16)
+    positions = mx.arange(37, dtype=mx.int32)
 
-    full = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 16)
+    full = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 64)
     expected = full(
         source,
         positions,
@@ -538,7 +538,7 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         use_cache=False,
     )
 
-    cached = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 16)
+    cached = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 64)
     cached.reset_cache(1)
     first = cached(
         source[:, :2],
@@ -554,6 +554,9 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
     )
     actual = mx.concatenate((first, second), axis=1)
     mx.eval(expected, actual)
+    assert cached.index_tail.shape[1] <= config.indexer_compress_ratio + 5
+    assert cached.index_start + cached.index_tail.shape[1] == 37
+    assert cached.pooled_index_cache.position == 37 // config.indexer_compress_ratio
 
     np.testing.assert_allclose(
         np.asarray(actual),
@@ -561,6 +564,11 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         rtol=1.5e-2,
         atol=1.5e-2,
     )
+    cached.cache.pos = 35
+    cached.trim_index_cache(35)
+    continued = cached(source[:, 35:], positions[35:], positions, use_cache=True)
+    mx.eval(continued)
+    np.testing.assert_allclose(np.asarray(continued), np.asarray(expected[:, 35:]), rtol=1.5e-2, atol=1.5e-2)
 
 
 def test_qwen4_mtp_cached_chunks_match_full_multistream_sequence() -> None:

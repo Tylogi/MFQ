@@ -160,8 +160,6 @@
 
 .tool-call { overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; padding: 10px; color: var(--ink-soft); background: var(--surface-inset); font-size: 11px; }
 .tool-call pre { margin: 0; color: inherit; white-space: pre-wrap; }
-.tool-confirm { margin-top: 6px; }
-.tool-confirm button { border: 1px solid var(--accent-border); border-radius: 7px; padding: 5px 8px; color: var(--accent-ink); background: var(--accent-soft); font-size: 10.5px; }
 
 .message-editor { display: grid; gap: 7px; }
 .message-editor textarea { width: 100%; min-height: 90px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; outline: none; padding: 9px; color: var(--ink); background: var(--surface-control); }

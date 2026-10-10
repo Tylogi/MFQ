@@ -76,14 +76,17 @@ export function ResourceMonitorPanel() {
           </div>
           <small>{tr('整机占用', 'System utilization')}</small>
         </div>)}
-        <div className="resource-monitor-metric">
-          <span>{tr('内存带宽', 'Memory bandwidth')}</span>
-          <strong>{rate(resources?.memory_bandwidth_bytes_per_second)}</strong>
-          <small>{tr('占用率', 'Utilization')} {utilization(resources?.memory_bandwidth_utilization_percent)}</small>
-          <small>{resources?.memory_bandwidth_limit_bytes_per_second
-            ? `${tr('规格上限', 'Specified limit')} ${rate(resources.memory_bandwidth_limit_bytes_per_second)}`
-            : tr('系统未提供带宽计数器', 'No system bandwidth counter')}</small>
-        </div>
+        {[{ label: tr('内存占用', 'Memory used'), bytes: resources?.memory_used_bytes,
+          description: resources?.memory_total_bytes != null
+            ? `${tr('总内存', 'Total memory')} ${formatNumber(resources.memory_total_bytes / 2 ** 30, 1)} GiB`
+            : tr('整机内存', 'System memory') },
+        { label: tr('空余内存', 'Available memory'), bytes: resources?.memory_available_bytes,
+          description: tr('系统可用内存', 'System available memory') }].map(item =>
+          <div className="resource-monitor-metric" key={item.label}>
+            <span>{item.label}</span>
+            <strong>{item.bytes == null ? '--' : `${formatNumber(item.bytes / 2 ** 30, 1)} GiB`}</strong>
+            <small>{item.description}</small>
+          </div>)}
       </div>
       <div className="resource-monitor-section">
         <h2>{tr('SSD / 磁盘流量', 'SSD / disk traffic')}</h2>
@@ -97,13 +100,17 @@ export function ResourceMonitorPanel() {
         </div>
       </div>
       <div className="resource-monitor-section">
-        <h2>{tr('权重流量', 'Weight traffic')}</h2>
-        <p>{tr('文件逻辑读取；系统页缓存命中也计入，不等于物理 SSD 或内存总线流量。', 'Logical file reads include system page-cache hits, not physical SSD or memory-bus traffic.')}</p>
+        <h2>{tr('权重与 KV 流量', 'Weight and KV traffic')}</h2>
+        <p>{tr('文件逻辑读写；系统页缓存命中也计入，不等于物理 SSD 或内存总线流量。', 'Logical file reads and writes include system page-cache hits, not physical SSD or memory-bus traffic.')}</p>
         {resources?.weights.length ? resources.weights.map((weight) => <div className="resource-weight-row" key={weight.instance_id}>
           <strong title={weight.model}>{weight.model}</strong>
+          <div className="resource-weight-metrics">
           <div><span>{tr('流式专家', 'Streamed experts')}</span><b>{rate(weight.expert_read_bytes_per_second)}</b></div>
           <div><span>PLE</span><b>{rate(weight.ple_read_bytes_per_second)}</b></div>
           {weight.engram_read_bytes_per_second != null && <div><span>Engram</span><b>{rate(weight.engram_read_bytes_per_second)}</b></div>}
+          <div><span>{tr('流式 KV 读取', 'Streamed KV read')}</span><b>{rate(weight.kv_read_bytes_per_second)}</b></div>
+          <div><span>{tr('流式 KV 写入', 'Streamed KV write')}</span><b>{rate(weight.kv_write_bytes_per_second)}</b></div>
+          </div>
         </div>) : <p>{tr('加载模型后显示逐模型权重读取。', 'Load a model to monitor per-model weight reads.')}</p>}
         <p>{tr('常驻权重读取带宽：未上报', 'Resident weight read bandwidth: not reported')}</p>
       </div>

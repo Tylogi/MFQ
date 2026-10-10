@@ -20,7 +20,7 @@ from mfq.architectures.tensor_schema import (
     graph_spec_for_source_names,
     map_source_tensor_name,
 )
-from mfq.formats.assets import is_asset_record
+from mfq.formats.assets import is_asset_record, MODEL_CONFIG_ASSET, HF_TOKENIZER_CONFIG_ASSET
 from mfq.formats.compat import canonical_dtype
 from mfq.formats.io import open_mmap
 from mfq.formats.shards import matching_shard_paths, parse_shard_path
@@ -32,6 +32,7 @@ from mfq.server.protocol.models import (
     ModelDirectoryList,
 )
 from mfq.server.state.model_weights import estimated_resident_weight_bytes
+from mfq.server.services.model_context import declared_context_size, yarn_context_limits
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 _ROUTED_EXPERT_RE = re.compile(
@@ -698,6 +699,16 @@ class ModelCatalog:
                     dtype = canonical_dtype(record.dtype)
                     weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + int(record.nbytes)
                 weight_bytes = sum(weight_bytes_by_dtype.values())
+                def json_asset(asset: str) -> dict:
+                    record = store.records.get(asset)
+                    if record is None or record.nbytes > 4 * 1024 * 1024:
+                        return {}
+                    value = json.loads(store.read_blob(asset))
+                    return value if isinstance(value, dict) else {}
+                config = json_asset(MODEL_CONFIG_ASSET) or store.header.extra.get("hf_config", {})
+                capacity = declared_context_size(config if isinstance(config, dict) else {}, json_asset(HF_TOKENIZER_CONFIG_ASSET))
+                native, yarn_capacity, yarn_factor = yarn_context_limits(config if isinstance(config, dict) else {}, store.header.model_arch)
+                capacity = native or capacity
                 fingerprint = "\0".join(
                     [
                         store.header.model_arch,
@@ -717,6 +728,9 @@ class ModelCatalog:
                     total_bytes=sum(stat.st_size for stat in stats),
                     estimated_resident_weight_bytes=estimated_resident_weight_bytes(weight_bytes, weight_bytes_by_dtype),
                     ssd_ple_bytes=always_streamed_bytes,
+                    context_capacity=capacity,
+                    yarn_context_capacity=yarn_capacity,
+                    yarn_max_factor=yarn_factor,
                     tensor_count=tensor_count,
                     record_count=len(store.records),
                     dtypes=dtypes,
@@ -767,6 +781,17 @@ class ModelCatalog:
             return any(item.is_file() for item in path.glob("*.safetensors"))
         except OSError:
             return False
+
+    @staticmethod
+    def _tokenizer_config(path: Path) -> dict:
+        try:
+            source = path / "tokenizer_config.json"
+            if source.stat().st_size > 4 * 1024 * 1024:
+                return {}
+            value = json.loads(source.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
     @staticmethod
     def _safetensors_header(path: Path) -> dict[str, object]:
@@ -867,6 +892,7 @@ class ModelCatalog:
                 else:
                     dtype = canonical_dtype(tensor_dtypes[tensor_name])
                     weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + tensor_bytes
+            native, yarn_capacity, yarn_factor = yarn_context_limits(config, model_type)
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -876,6 +902,9 @@ class ModelCatalog:
                 total_bytes=sum(stat.st_size for stat in stats),
                 estimated_resident_weight_bytes=estimated_resident_weight_bytes(sum(weight_bytes_by_dtype.values()), weight_bytes_by_dtype),
                 ssd_ple_bytes=always_streamed_bytes,
+                context_capacity=native or declared_context_size(config, ModelCatalog._tokenizer_config(path)),
+                yarn_context_capacity=yarn_capacity,
+                yarn_max_factor=yarn_factor,
                 tensor_count=len(indexed_names if indexed_names is not None else tensors),
                 record_count=len(indexed_names if indexed_names is not None else tensors) + 1,
                 dtypes=sorted(dtypes),

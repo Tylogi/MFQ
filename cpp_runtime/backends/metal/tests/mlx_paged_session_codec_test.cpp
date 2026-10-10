@@ -329,9 +329,10 @@ int main() {
     MlxQwen4LayerCacheSnapshot qsa;
     qsa.position = 6;
     qsa.batch = 1;
+    qsa.index_ratio = 2;
     qsa.kv = std::get<MlxKvCacheSnapshot>(unaligned_hybrid.layers[0]);
     qsa.index_keys = mlx::core::ones({1, 6, 3}, mlx::core::float16);
-    qsa.pooled_keys = mlx::core::ones({1, 3, 3}, mlx::core::float16);
+    qsa.pooled_keys = mlx::core::ones({1, 3, 3}, mlx::core::float32);
     qsa.ple_convolution = convolution;
     qsa.ple_context = {3, 4};
     flash.layers.push_back(qsa);
@@ -348,7 +349,7 @@ int main() {
     flash_head.position = 5;
     flash_head.kv->position = 5;
     flash_head.index_keys = mlx::core::ones({1, 5, 3}, mlx::core::float16);
-    flash_head.pooled_keys = mlx::core::ones({1, 2, 3}, mlx::core::float16);
+    flash_head.pooled_keys = mlx::core::ones({1, 2, 3}, mlx::core::float32);
     flash_head.ple_convolution.reset();
     flash_head.ple_context.clear();
     flash.mtp_layers.push_back(flash_head);
@@ -369,6 +370,62 @@ int main() {
         flash_restored.layers[1].ple_context == gdn.ple_context &&
         flash_restored.mtp_layers.size() == 1 && flash_restored.mtp_layers[0].position == 5,
         "Flash-Next QSA/GDN/PLE/MTP checkpoint did not round trip");
+    QsaKvStoreConfig offload_config;
+    offload_config.budget_bytes = 16384;
+    offload_config.buffer_bytes = 8192;
+    auto offload_store = std::make_shared<QsaKvStore>(offload_config);
+    mlx_set_qsa_kv_offload_store(offload_store);
+    const auto offloaded = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
+        {flash_first, flash_last}, flash.tokens, 4);
+    require(!offloaded.layers[0].kv && offloaded.layers[0].index_keys &&
+        offloaded.layers[0].offloaded_kv &&
+        offloaded.layers[0].offloaded_pooled_keys && offloaded.mtp_layers[0].offloaded_kv,
+        "prefix restore expanded offloaded QSA or MTP caches into full MLX arrays");
+    const auto offloaded_first = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(offloaded, 4, 0);
+    const auto offloaded_last = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(offloaded, 4, 1);
+    mlx_set_qsa_kv_offload_store({});
+    const auto offloaded_roundtrip = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
+        {offloaded_first, offloaded_last}, flash.tokens, 4);
+    require(byte_equal(offloaded_roundtrip.layers[0].kv->key, flash_restored.layers[0].kv->key) &&
+        byte_equal(offloaded_roundtrip.layers[0].kv->value, flash_restored.layers[0].kv->value) &&
+        byte_equal(*offloaded_roundtrip.layers[0].index_keys, *flash_restored.layers[0].index_keys) &&
+        byte_equal(*offloaded_roundtrip.layers[0].pooled_keys, *flash_restored.layers[0].pooled_keys) &&
+        byte_equal(offloaded_roundtrip.mtp_layers[0].kv->key, flash_restored.mtp_layers[0].kv->key),
+        "offloaded cache serialization changed persisted KV/indexer/MTP bytes");
+    for (double bits : {2.5, 4.0, 8.0}) {
+        auto quantized = flash;
+        for (auto* list : {&quantized.layers, &quantized.mtp_layers}) for (auto& layer : *list) if (layer.kv) {
+            auto& kv = *layer.kv;
+            kv.quantization = {bits}; kv.dtype = mlx::core::uint32;
+            kv.key = mlx_kv_encode(mlx::core::slice(kv.key, {0, 0, 0, 0}, {kv.batch, kv.heads, kv.position, kv.head_dimension}),
+                kv.quantization.key_bits(), false);
+            kv.value = mlx_kv_encode(mlx::core::slice(kv.value, {0, 0, 0, 0}, {kv.batch, kv.heads, kv.position, kv.head_dimension}),
+                kv.quantization.value_bits(), true);
+            mlx::core::eval(kv.key, kv.value);
+        }
+        const std::vector<MlxPagedPayload> payloads{
+            MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(quantized, 4, 0),
+            MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(quantized, 4, 1)};
+        const auto decoded = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(payloads, quantized.tokens, 4);
+        require(decoded.layers[0].kv->quantization.bits == bits &&
+            byte_equal(decoded.layers[0].kv->key, quantized.layers[0].kv->key) &&
+            byte_equal(decoded.layers[0].kv->value, quantized.layers[0].kv->value) &&
+            byte_equal(*decoded.layers[0].pooled_keys, *quantized.layers[0].pooled_keys),
+            "quantized prefix changed packed KV or FP32 Indexer bytes");
+        mlx_set_qsa_kv_offload_store(offload_store);
+        const auto streamed = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(payloads, quantized.tokens, 4);
+        require(streamed.layers[0].offloaded_kv->quantization.bits == bits, "streamed prefix lost quantization metadata");
+        const std::vector<MlxPagedPayload> streamed_payloads{
+            MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(streamed, 4, 0),
+            MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(streamed, 4, 1)};
+        mlx_set_qsa_kv_offload_store({});
+        const auto restored = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(streamed_payloads, quantized.tokens, 4);
+        require(byte_equal(restored.layers[0].kv->key, quantized.layers[0].kv->key) &&
+            byte_equal(restored.layers[0].kv->value, quantized.layers[0].kv->value) &&
+            byte_equal(*restored.layers[0].pooled_keys, *quantized.layers[0].pooled_keys) &&
+            restored.mtp_layers[0].kv->quantization.bits == bits,
+            "RAM/SSD prefix round trip requantized or expanded KV");
+    }
     flash.layers.pop_back();
     const auto qsa_nonfinal = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(flash, 4, 0);
     require(!MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_exact_boundary(qsa_nonfinal),

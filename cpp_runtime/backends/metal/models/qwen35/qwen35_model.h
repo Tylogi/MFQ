@@ -31,6 +31,8 @@ struct Qwen35Config {
     std::int64_t max_position_embeddings = 0;
     std::int64_t head_dim = 0;
     double rope_base = 1'000'000.0;
+    MlxYarnScaling yarn;
+    double yarn_max_factor = 4.0;
     std::int64_t rotary_dim = 0;
     std::vector<std::int64_t> rope_sections;
     double rms_norm_eps = 1e-6;

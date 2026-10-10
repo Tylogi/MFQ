@@ -15,8 +15,9 @@ import { runtimeModelNames } from './modelSelection';
 import { displayPrefillMetric, preferPositiveMetric } from './metrics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
-import { openAIEndpoint } from './endpoint';
-import { getApiBaseUrl } from '../../shared/api/client';
+import { anthropicEndpoint, openAIEndpoint } from './endpoint';
+import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
+import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
@@ -33,7 +34,9 @@ export function OverviewPage() {
     connectionRevision,
   } = useRuntime();
   const { tr } = useSettings();
-  const [endpointCopied, setEndpointCopied] = useState(false);
+  const [endpointCopied, setEndpointCopied] = useState<string | null>(null);
+  const [listener, setListener] = useState<{ url: string; revision: number; port: number | null } | null>(null);
+  const serviceUrl = studio?.service_url || getApiBaseUrl();
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
@@ -41,18 +44,45 @@ export function OverviewPage() {
     },
     [],
   );
+  useEffect(() => {
+    let disposed = false;
+    let pending = false;
+    const endpoint = getApiBaseUrl();
+    const credential = getApiToken();
+    const current = () => !disposed && endpoint === getApiBaseUrl() && credential === getApiToken();
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const value = await runtimeApi.runtimeListener();
+        if (current()) setListener({ url: serviceUrl, revision: connectionRevision, port: value.anthropic_port ?? null });
+      } catch {
+        if (current()) setListener(null);
+      } finally {
+        pending = false;
+      }
+    };
+    void refresh();
+    const poll = setInterval(() => void refresh(), 5000);
+    window.addEventListener('focus', refresh);
+    return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
+  }, [serviceUrl, connectionRevision]);
   const availableModelNames = runtimeModelNames(models, instances);
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
-  const endpoint = openAIEndpoint(studio?.service_url || getApiBaseUrl());
-  async function copyEndpoint() {
+  const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
+  const endpoints = [
+    { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
+    { id: 'anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: anthropicEndpoint(serviceUrl, anthropicPort) },
+  ];
+  async function copyEndpoint(id: string, endpoint: string) {
     try {
       await navigator.clipboard.writeText(endpoint);
-      setEndpointCopied(true);
+      setEndpointCopied(id);
       toast.success(tr('服务地址已复制到剪贴板', 'Endpoint URL copied to clipboard'));
       if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(() => setEndpointCopied(false), 1600);
+      timer.current = setTimeout(() => setEndpointCopied(null), 1600);
     } catch (cause) {
       toast.error(errorMessage(cause));
     }
@@ -226,24 +256,21 @@ export function OverviewPage() {
         <TMPanel className="overview-endpoint-panel">
           <div className="overview-panel-title">
             <Icon name="link" size={15} />
-            <h2>{tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint')}</h2>
-            <button
-              aria-label={endpointCopied ? tr('已复制', 'Copied') : tr('复制端点', 'Copy endpoint')}
-              className={endpointCopied ? 'copied' : ''}
-              onClick={() => void copyEndpoint()}
-              title={endpointCopied ? tr('已复制', 'Copied') : tr('复制端点', 'Copy endpoint')}
-              type="button"
-            >
-              <Icon name={endpointCopied ? 'check' : 'copy'} size={14} />
-            </button>
+            <h2>{tr('API 端点', 'API endpoints')}</h2>
           </div>
-          <code>{endpoint}</code>
-          <p>
-            {tr(
-              '可直接用于 OpenAI SDK；默认回环地址不经过云端。',
-              'Use this base URL with OpenAI SDKs. The default loopback address sends no traffic to the cloud.',
-            )}
-          </p>
+          <div className="overview-api-list">
+            {endpoints.map(({ id, label, url }) => (
+              <div className="overview-api-entry" key={id} data-protocol={id}>
+                  <strong title={label}>{id === 'openai' ? 'OpenAI' : 'Anthropic'}</strong>
+                  {url ? <code title={url}>{url}</code> : <span>{tr('暂不可用', 'Unavailable')}</span>}
+                  <button aria-label={tr(`复制 ${id === 'openai' ? 'OpenAI' : 'Anthropic'} 端点`, `Copy ${id === 'openai' ? 'OpenAI' : 'Anthropic'} endpoint`)}
+                    className={endpointCopied === id ? 'copied' : ''} disabled={!url}
+                    onClick={() => { if (url) void copyEndpoint(id, url); }} type="button">
+                    <Icon name={endpointCopied === id ? 'check' : 'copy'} size={14} />
+                  </button>
+              </div>
+            ))}
+          </div>
         </TMPanel>
         <TMPanel className="overview-session-panel">
           <div className="overview-panel-title">

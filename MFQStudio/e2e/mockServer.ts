@@ -97,6 +97,21 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       return json({ import_directory: '/models', export_directory: '/outputs',
         candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
+    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
+    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
+      cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
+      memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });
+    if (path === '/api/v1/runtime/cache/entries') return json({ directory: '/data/mfq/prefix-cache',
+      total_bytes: 0, total_blocks: 0, can_clear: true, offset: 0, limit: 100, data: [], blocks: [] });
+    if (path === '/api/v1/runtime/context-policy') return json({ max_context_size: null,
+      model_overrides: {}, model_yarn_enabled: {}, model_qsa_kv_offload: {}, model_kv_quantization: {}, fallback_context_size: 32768 });
+    if (path.startsWith('/api/v1/runtime/yarn/')) return json({ supported: false,
+      native_context: 262144, maximum_context: 262144, maximum_factor: 1, enabled: false, effective_factor: 1 });
+    if (/^\/api\/v1\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
+    if (path === '/api/v1/evaluations/tools')
+      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
+        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',
@@ -119,9 +134,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         duplex_available: false,
       });
     if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
-    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, configurable: true });
-    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
-    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
     if (path === '/api/v1/runtime/instances')
       return json({
         data: [
@@ -255,18 +268,19 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
       });
-    if (path === '/api/v1/evaluations/tools')
-      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
-        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
-    if (path === '/api/v1/models/directories')
+    if (path === '/api/v1/models/directories') {
+      const query = new URL(route.request().url()).searchParams;
+      const directory = query.get('path') || ({ 'root-dir': '/', 'models-dir': '/models', 'empty-dir': '/models/empty' }[query.get('directory_id') || ''] ?? '/');
+      const root = directory === '/';
       return json({
-        current_id: 'models-dir',
-        current_name: 'Models',
-        current_path: '/models',
-        parent_id: null,
+        current_id: root ? 'root-dir' : directory === '/models' ? 'models-dir' : 'empty-dir',
+        current_name: root ? '/' : 'Models',
+        current_path: directory,
+        parent_id: root ? null : directory === '/models' ? 'root-dir' : 'models-dir',
         model_file_count: 0,
-        data: [{ id: 'empty-dir', name: 'Empty directory', model_file_count: 0 }],
+        data: root ? [{ id: 'models-dir', name: 'Models', model_file_count: 0 }] : [{ id: 'empty-dir', name: 'Empty directory', model_file_count: 0 }],
       });
+    }
     if (
       [
         '/api/v1/models',
@@ -274,8 +288,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/runtime/metrics',
         '/api/v1/runtime/logs',
         '/api/v1/jobs/kinds',
-        '/api/v1/mcp/servers',
-        '/api/v1/mcp/tools',
         '/api/v1/presets',
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',

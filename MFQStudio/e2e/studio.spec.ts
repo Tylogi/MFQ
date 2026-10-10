@@ -83,7 +83,7 @@ test('服务器移除对话和可执行文件，设置迁入对话页，模型�
   await expect(box).toContainText('max tokens');
   await expect(box).toContainText('temperature');
   await expect(box).toContainText('streaming');
-  if (testInfo.project.name === 'desktop') expect((await box.boundingBox())!.width).toBeGreaterThan(400);
+  if (testInfo.project.name === 'desktop') expect((await box.boundingBox())!.width).toBeLessThanOrEqual(360);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.getByRole('button', { name: 'Chat settings' }).click();
   await expect(page.getByRole('dialog', { name: 'Chat settings' })).toBeVisible();
@@ -91,7 +91,7 @@ test('服务器移除对话和可执行文件，设置迁入对话页，模型�
   await page.screenshot({ path: testInfo.outputPath('chat-settings-and-selector.png'), animations: 'disabled' });
 });
 
-test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一个模型', async ({ page }, testInfo) => {
+test('每个模型独立保留 ctx 草稿，保存整套设置且不丢失另一个模型', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [
     { id: 'flash', model: 'Qwen3.8-Flash-S4-L', state: 'ready', devices: ['metal'], active_sessions: 0,
@@ -112,40 +112,55 @@ test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一�
   let complete!: () => void;
   const pending = new Promise<void>((resolve) => { complete = resolve; });
   const reloads: { instance_id: string; context_size: number }[] = [];
-  await page.route('**/api/v1/runtime/reload', async (route) => {
+  const policy = { max_context_size: null, model_overrides: {} as Record<string, number>, fallback_context_size: 32768 };
+  await page.route('**/api/v1/runtime/context-policy', route => route.fulfill({ json: policy }));
+  await page.route('**/api/v1/runtime/context', async (route) => {
     const body = route.request().postDataJSON();
     reloads.push(body);
     await pending;
     const item = instances.find((entry) => entry.id === body.instance_id)!;
     item.context_size = body.context_size;
-    await route.fulfill({ json: { model: item.model, max_context: item.context_size } });
+    policy.model_overrides[item.model] = body.context_size;
+    await route.fulfill({ json: { id: 'context-save-job', kind: 'runtime.context.configure', status: 'succeeded',
+      payload: body, progress: 1, result: { model: item.model, instance_id: item.id, max_context: item.context_size,
+        context_override: body.context_size }, cancel_requested: false,
+      created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:01:00Z' } });
   });
   const dialogs: string[] = [];
   page.on('dialog', async (dialog) => { dialogs.push(dialog.message()); await dialog.dismiss(); });
   await page.goto('/runtime');
   const flash = page.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' });
   const dense = page.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' });
-  await expect(flash).toHaveValue('32768');
-  await expect(dense).toHaveValue('16384');
+  const selected = page.getByRole('combobox', { name: 'Per-model context model' });
+  const save = page.getByRole('button', { name: 'Save to this model', exact: true });
+  await expect(save).toBeEnabled();
+  await expect(flash).toHaveValue('');
   const contexts = page.locator('.model-context-settings');
-  await expect(contexts.locator('svg')).toHaveCount(0);
+  await expect(contexts.locator('.model-context-controls svg')).toHaveCount(0);
   expect(await contexts.evaluate((element) => {
-    const heading = element.querySelector('.model-context-heading')!;
+    const heading = element.querySelector('.model-context-list-heading')!;
     const row = heading.nextElementSibling!;
-    return Number.parseFloat(getComputedStyle(heading).paddingTop) >= 16
-      && getComputedStyle(row).borderTopWidth === '0px';
+    return Number.parseFloat(getComputedStyle(heading).borderBottomWidth) >= 1
+      && row.getBoundingClientRect().top >= heading.getBoundingClientRect().bottom;
   })).toBe(true);
   await flash.fill('8192');
+  await selected.selectOption(instances[1].model);
+  await expect(dense).toHaveValue('');
   await dense.fill('65536');
-  await page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }).click();
-  await expect.poll(() => reloads).toEqual([{ instance_id: 'flash', context_size: 8192 }]);
-  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reloading…');
-  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-27B-S4-M' })).toBeEnabled();
+  await selected.selectOption(instances[0].model);
+  await save.click();
+  await expect.poll(() => reloads).toEqual([{ instance_id: 'flash', context_size: 8192, yarn_enabled: false }]);
+  await expect(save).toHaveText('Saving…');
+  await selected.selectOption(instances[1].model);
+  await expect(save).toBeEnabled();
+  await expect(dense).toHaveValue('65536');
   await expect(page.locator('.memory-budget-actions')).toContainText('96.3');
   await page.screenshot({ path: testInfo.outputPath('per-model-context.png'), animations: 'disabled' });
   complete();
-  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reload');
+  await selected.selectOption(instances[0].model);
+  await expect(save).toHaveText('Save to this model');
   await expect(flash).toHaveValue('8192');
+  await selected.selectOption(instances[1].model);
   await expect(dense).toHaveValue('65536');
   expect(dialogs).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
@@ -159,11 +174,11 @@ test('网页运行服务允许编辑端口，无效端口不发送更改', async
     return route.fulfill({ json: { host: '127.0.0.1', port: 8090, configurable: true } });
   });
   await page.goto('/runtime');
-  const port = page.getByRole('spinbutton', { name: 'Port', exact: true });
+  const port = page.getByRole('spinbutton', { name: 'OpenAI port', exact: true });
   await expect(port).toBeEnabled();
   await expect(port).toHaveValue('8090');
   await port.fill('65536');
-  await page.getByRole('button', { name: 'Save server settings' }).click();
+  await port.blur();
   await expect(page.getByText('Port must be an integer between 1 and 65535')).toBeVisible();
   expect(updates).toEqual([]);
 });
@@ -399,7 +414,9 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
   await expect(page.locator('[data-tier="weights"] .memory-tier-heading > span')).toHaveText('10 GiB / 20 GiB');
   await expect(page.locator('[data-tier="kv"] .memory-tier-heading > span')).toHaveText('10 MiB / 10 GiB');
   await expect(page.getByText(/Colors show each model/)).toHaveCount(0);
-  await expect(page.locator('.overview-endpoint-panel code')).toHaveText('http://127.0.0.1:8090/v1');
+  await expect(page.locator('.overview-endpoint-panel code')).toHaveText([
+    'http://127.0.0.1:8090/v1', 'http://127.0.0.1:8091/v1/messages',
+  ]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
 });
@@ -497,7 +514,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
-  for (const path of ['sessions', 'datasets', 'datasets/catalog', 'evaluations', 'evaluations/tools', 'models', 'runtime/logs', 'runtime/profiles', 'mcp/servers']) {
+  for (const path of ['sessions', 'datasets', 'datasets/catalog', 'evaluations', 'evaluations/tools', 'models', 'runtime/logs', 'runtime/profiles', 'cluster/nodes']) {
     expect(state.requests).not.toContain(`GET /api/v1/${path}`);
   }
   const routes = [
@@ -505,8 +522,8 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
     ['/model-hub', null],
     ['/quantization', null],
     ['/settings', '/api/v1/presets'],
-    ['/runtime', '/api/v1/mcp/servers'],
-    ['/resources', '/api/v1/runtime/profiles'],
+    ['/runtime', '/api/v1/cluster/nodes'],
+    ['/resources', '/api/v1/runtime/resources'],
     ['/logs', '/api/v1/runtime/logs'],
   ] as const;
   for (const [path, endpoint] of routes) {

@@ -4,12 +4,12 @@
 @container (max-width: 620px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .cache-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .node-form, .mcp-form, .dataset-form { grid-template-columns: 1fr 1fr; }
+  .node-form, .dataset-form { grid-template-columns: 1fr 1fr; }
 }
 
 @container (max-width: 390px) {
   .metric-grid, .cache-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .node-form, .mcp-form, .dataset-form, .profile-create { grid-template-columns: 1fr; }
+  .node-form, .dataset-form, .profile-create { grid-template-columns: 1fr; }
   .panel-heading p { display: none; }
 }
 
@@ -17,7 +17,7 @@
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .metric-grid > .metric-tile:nth-child(3n) { border-right: 0; }
   .metric-grid > .metric-tile:nth-child(n + 4) { border-top: 1px solid var(--line-soft); }
-  .server-tools-grid { grid-template-columns: 1fr; }
+  .remote-routing-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 980px) {
@@ -34,6 +34,7 @@
 }
 
 @media (max-width: 760px) {
+  .remote-routing-grid .node-form { grid-template-columns: minmax(0, 1fr); }
   .screen-header { min-height: 0; align-items: flex-start; }
   .screen-header h1 { font-size: 24px; }
   .screen-header { flex-wrap: wrap; gap: 16px; }

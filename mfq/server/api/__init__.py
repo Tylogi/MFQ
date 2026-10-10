@@ -15,11 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from mfq.server.api.auth import ApiKeyManager, required_scope
+from mfq.server.api.anthropic_compat import error_body as anthropic_error_body, error_type as anthropic_error_type, is_anthropic_request
+from mfq.server.api.routes.anthropic import router as anthropic_router
 from mfq.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
 from mfq.server.api.routes.auth import router as auth_router
 from mfq.server.api.routes.jobs import event_router as job_event_router
 from mfq.server.api.routes.jobs import router as job_router
-from mfq.server.api.routes.mcp import router as mcp_router
 from mfq.server.api.routes.media import router as media_router
 from mfq.server.api.routes.models import hub_router
 from mfq.server.api.routes.models import router as model_router
@@ -75,7 +76,7 @@ def create_app(
             "http://localhost:5174",
         ],
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta"],
     )
 
     @app.middleware("http")
@@ -83,6 +84,9 @@ def create_app(
         if (api_key or api_keys is not None) and request.url.path.startswith(("/api/", "/v1")):
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+            anthropic = is_anthropic_request(request)
+            if not supplied and anthropic:
+                supplied = request.headers.get("x-api-key", "")
             authenticated = api_keys.authenticate(supplied) if api_keys is not None else None
             legacy = api_key and secrets.compare_digest(supplied, api_key)
             scope = required_scope(request.method, request.url.path)
@@ -90,7 +94,7 @@ def create_app(
                 detail = ErrorDetail(code="unauthorized", message="invalid API credential")
                 return JSONResponse(
                     status_code=401,
-                    content=ErrorResponse(error=detail).model_dump(mode="json"),
+                    content=anthropic_error_body(detail.message, "authentication_error") if anthropic else ErrorResponse(error=detail).model_dump(mode="json"),
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             if (
@@ -105,7 +109,7 @@ def create_app(
                 )
                 return JSONResponse(
                     status_code=403,
-                    content=ErrorResponse(error=detail).model_dump(mode="json"),
+                    content=anthropic_error_body(detail.message, "permission_error") if anthropic else ErrorResponse(error=detail).model_dump(mode="json"),
                 )
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -120,10 +124,10 @@ def create_app(
         return response
 
     @app.exception_handler(ServiceError)
-    async def handle_service_error(_: Any, error: ServiceError) -> JSONResponse:
+    async def handle_service_error(request: Request, error: ServiceError) -> JSONResponse:
         return JSONResponse(
             status_code=error.status_code,
-            content=ErrorResponse(error=error.detail).model_dump(mode="json"),
+            content=anthropic_error_body(error.detail.message, anthropic_error_type(error.status_code)) if is_anthropic_request(request) else ErrorResponse(error=error.detail).model_dump(mode="json"),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -139,6 +143,7 @@ def create_app(
         )
 
     app.include_router(openai_router)
+    app.include_router(anthropic_router)
     app.include_router(auth_router)
     app.include_router(initial_session_router)
     app.include_router(profile_router)
@@ -147,7 +152,6 @@ def create_app(
     app.include_router(job_event_router)
     app.include_router(session_router)
     app.include_router(media_router)
-    app.include_router(mcp_router)
     app.include_router(model_router)
     app.include_router(quantization_router)
     app.include_router(runtime_router)

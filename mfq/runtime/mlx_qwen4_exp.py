@@ -104,9 +104,10 @@ def _embedding_shape(embedding: object) -> tuple[int, int]:
 
 
 class _MlxQwenSequenceCache:
-    def __init__(self, max_sequence: int, width: int) -> None:
+    def __init__(self, max_sequence: int, width: int, dtype: mx.Dtype = mx.float16) -> None:
         self.max_sequence = int(max_sequence)
         self.width = int(width)
+        self.dtype = dtype
         self.values: mx.array | None = None
         self.batch = 0
         self.position = 0
@@ -118,7 +119,7 @@ class _MlxQwenSequenceCache:
         capacity = min(max(1, int(initial_capacity)), self.max_sequence)
         self.values = mx.zeros(
             (self.batch, capacity, self.width),
-            dtype=mx.float16,
+            dtype=self.dtype,
         )
         self.position = 0
 
@@ -490,7 +491,12 @@ class MlxQwen4ExpQsa:
             mrope_interleaved=config.mrope_interleaved,
         )
         self.cache: MlxKVCache | None = None
-        self.index_cache = _MlxQwenSequenceCache(max_context, config.indexer_head_dim)
+        self.pooled_index_cache = _MlxQwenSequenceCache(
+            (max_context + config.indexer_compress_ratio - 1) // config.indexer_compress_ratio,
+            config.indexer_head_dim, mx.float32)
+        self.index_tail: mx.array | None = None
+        self.index_start = 0
+        self.index_position = 0
         self.batch = 0
         self.max_context = int(max_context)
 
@@ -502,38 +508,61 @@ class MlxQwen4ExpQsa:
             self.max_context,
             self.config.head_dim,
         )
-        self.index_cache.reset(selected)
+        self.pooled_index_cache.reset(selected)
+        self.index_tail = None
+        self.index_start = self.index_position = 0
         self.batch = selected
+
+    def _pool_index_keys(self, keys: mx.array, positions: mx.array, begin: int, end: int,
+                         offset: int = 0) -> mx.array:
+        ratio = self.config.indexer_compress_ratio
+        pooled = mx.mean(keys[:, begin * ratio:end * ratio].reshape(
+            int(keys.shape[0]), end - begin, ratio, self.config.indexer_head_dim).astype(mx.float32),
+            axis=-2).astype(keys.dtype)
+        pooled = self.index_k_norm(pooled)
+        starts = mx.arange(offset + begin * ratio, offset + end * ratio, ratio, dtype=mx.int32)
+        return self.rope(pooled[:, None], positions[..., starts])[:, 0]
+
+    def _append_index_keys(self, keys: mx.array, positions: mx.array) -> mx.array:
+        ratio = self.config.indexer_compress_ratio
+        end = self.index_position + int(keys.shape[1])
+        raw = keys.astype(mx.float16)
+        if self.index_tail is not None:
+            raw = mx.concatenate((self.index_tail, raw), axis=1)
+        begin = self.pooled_index_cache.position - self.index_start // ratio
+        complete = end // ratio - self.index_start // ratio
+        if complete > begin:
+            self.pooled_index_cache.append(self._pool_index_keys(raw, positions, begin, complete, self.index_start))
+        keep = max(self.index_start, max(0, end - 6) // ratio * ratio)
+        tail = raw[:, keep - self.index_start:]
+        flat = mx.concatenate((tail.reshape(-1), mx.zeros((1,), dtype=tail.dtype)))
+        self.index_tail = flat[:-1].reshape(tail.shape)
+        self.index_start, self.index_position = keep, end
+        assert self.pooled_index_cache.values is not None
+        return self.pooled_index_cache.values[:, :self.pooled_index_cache.position]
+
+    def trim_index_cache(self, position: int) -> None:
+        if position < self.index_start or position > self.index_position:
+            raise ValueError('QSA rollback exceeds the uncommitted index tail')
+        if self.index_tail is not None:
+            self.index_tail = self.index_tail[:, :position - self.index_start]
+        self.index_position = position
+        self.pooled_index_cache.position = position // self.config.indexer_compress_ratio
 
     def _selected_indices(
         self,
         query: mx.array,
-        raw_keys: mx.array,
-        positions_full: mx.array,
+        pooled: mx.array,
         query_offset: int,
     ) -> mx.array:
         config = self.config
         batch, tokens = (int(item) for item in query.shape[:2])
         ratio = config.indexer_compress_ratio
-        complete = int(raw_keys.shape[1]) // ratio
+        complete = int(pooled.shape[1])
         select_count = min(config.indexer_budget // ratio, complete)
         absolute = mx.arange(tokens, dtype=mx.int32) + int(query_offset)
         if select_count:
-            pooled = mx.mean(
-                raw_keys[:, : complete * ratio]
-                .reshape(
-                    batch,
-                    complete,
-                    ratio,
-                    config.indexer_head_dim,
-                )
-                .astype(mx.float32),
-                axis=-2,
-            ).astype(raw_keys.dtype)
-            pooled = self.index_k_norm(pooled)
             starts = mx.arange(complete, dtype=mx.int32) * ratio
-            block_positions = positions_full[..., starts]
-            pooled = self.rope(pooled[:, None], block_positions)[:, 0]
             scores = qsa_block_scores(query, pooled)
             ends = starts + ratio - 1
             visible = ends[None, None, :] <= absolute[None, :, None]
@@ -647,13 +676,12 @@ class MlxQwen4ExpQsa:
             assert self.cache is not None
             query_offset = self.cache.pos
             key_cache, value_cache = self.cache.append(key, value)
-            raw_key_cache, index_offset = self.index_cache.append(raw_key)
-            if index_offset != query_offset:
+            if self.index_position != query_offset:
                 raise RuntimeError("Qwen4-Exp attention/index caches diverged")
+            pooled = self._append_index_keys(raw_key, positions_full)
         else:
             query_offset = 0
             key_cache, value_cache = key, value
-            raw_key_cache = raw_key
         logical_length = int(key_cache.shape[2])
         if logical_length <= config.indexer_budget:
             attended = qwen4_dense_gqa_attention(
@@ -663,10 +691,11 @@ class MlxQwen4ExpQsa:
                 query_offset=query_offset,
             )
         else:
+            if not use_cache:
+                pooled = self._pool_index_keys(raw_key, positions_full, 0, tokens // config.indexer_compress_ratio)
             selected = self._selected_indices(
                 index_q,
-                raw_key_cache,
-                positions_full,
+                pooled,
                 query_offset,
             )
             attended = qwen4_sparse_gqa_attention(
@@ -680,6 +709,8 @@ class MlxQwen4ExpQsa:
             tokens,
             config.num_attention_heads * config.head_dim,
         )
+        if use_cache:
+            attended = mx.depends(attended, (self.index_tail, self.pooled_index_cache.values))
         output_gate = output_gate.reshape(attended.shape)
         gated = attended.astype(mx.float32) * mx.sigmoid(output_gate.astype(mx.float32))
         return self.output(gated.astype(hidden_states.dtype))
@@ -1404,7 +1435,7 @@ class MlxQwen4Exp:
                 if layer.attention.cache is None:
                     raise RuntimeError("Qwen4-Exp QSA cache is not initialized")
                 layer.attention.cache.pos = keep
-                layer.attention.index_cache.position = keep
+                layer.attention.trim_index_cache(keep)
             if layer.ple is not None:
                 layer.ple.rollback_speculative_cache()
         self.position = keep

@@ -8,6 +8,7 @@ import struct
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 _HASH = re.compile(r"[0-9a-f]{64}")
 _BUCKET = re.compile(r"[0-9a-f]{2}")
@@ -145,8 +146,10 @@ def maintain_prefix_disk_budget(directory: Path, limit: int | None, *, evict: bo
         "prefix_cache_total_disk_max_bytes": capacity, "released_bytes": released, "evicted_blocks": removed}
 
 
-def _identity(directory: Path, namespace: str) -> dict[str, str | int | None]:
+def prefix_cache_identity(directory: Path, namespace: str) -> dict[str, str | int | None]:
     result: dict[str, str | int | None] = {"model_name": None, "source_file": None, "architecture": None, "codec": None, "context_size": None, "model_path": None}
+    if not _HASH.fullmatch(namespace) or (directory / namespace).is_symlink():
+        return result
     try:
         descriptor = os.open(directory / namespace / "identity.txt", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(descriptor, "rb") as stream:
@@ -173,13 +176,18 @@ def _identity(directory: Path, namespace: str) -> dict[str, str | int | None]:
     return result
 
 
-def inspect_prefix_cache(directory: Path, namespace: str | None = None, *, offset: int = 0, limit: int = 100) -> dict:
+def inspect_prefix_cache(directory: Path, namespace: str | None = None, *, offset: int = 0, limit: int = 100,
+    query: str = '', search_in: str = 'all', text_filter: str = 'all', chain_filter: str = 'all', sort: str = 'recent',
+    decode_text: Callable[[list[int]], str] | None = None) -> dict:
     blocks = _scan_blocks(directory)
     groups: dict[str, list[_Block]] = {}
     for block in blocks:
         groups.setdefault(block.namespace, []).append(block)
     data = []
     details = []
+    matched_blocks = 0
+    search_text_unavailable = False
+    needle = query.strip().casefold()
     for identity, items in groups.items():
         if namespace is not None and namespace != identity:
             continue
@@ -200,7 +208,7 @@ def inspect_prefix_cache(directory: Path, namespace: str | None = None, *, offse
             return lengths.get(digest, (0, False))
         parents = {item.parent for item in items}
         tips = [item for item in items if item.digest not in parents]
-        metadata = _identity(directory, identity)
+        metadata = prefix_cache_identity(directory, identity)
         metadata.pop('model_path', None)
         data.append({"id": identity, **metadata,
             "bytes": sum(item.size for item in items), "blocks": len(items), "prefixes": len(tips),
@@ -210,7 +218,29 @@ def inspect_prefix_cache(directory: Path, namespace: str | None = None, *, offse
             "incomplete_prefixes": sum(not length(item.digest)[1] for item in tips),
             "last_used_at": datetime.fromtimestamp(max(item.stat.st_mtime for item in items), timezone.utc).isoformat()})
         if namespace is not None:
-            ordered = sorted(items, key=lambda item: (item.stat.st_mtime_ns, item.digest), reverse=True)
+            filtered = []
+            for item in items:
+                if text_filter != 'all' and (item.text_stat is not None) != (text_filter == 'saved'):
+                    continue
+                if chain_filter != 'all' and length(item.digest)[1] != (chain_filter == 'complete'):
+                    continue
+                matches = not needle or search_in != 'text' and needle in item.digest
+                if not matches and search_in != 'id' and item.text_stat is not None:
+                    if decode_text is None:
+                        search_text_unavailable = True
+                    else:
+                        tokens = _text_record(item.path, identity, item.digest, item.tokens, read=True)
+                        if tokens is not None:
+                            try:
+                                matches = needle in decode_text(tokens).casefold()
+                            except (OSError, ValueError, ImportError):
+                                search_text_unavailable = True
+                if matches:
+                    filtered.append(item)
+            key = (lambda item: (length(item.digest)[0], item.digest)) if sort == 'length' else (
+                (lambda item: (item.size, item.digest)) if sort == 'size' else (lambda item: (item.stat.st_mtime_ns, item.digest)))
+            ordered = sorted(filtered, key=key, reverse=sort != 'oldest')
+            matched_blocks = len(ordered)
             details = [{"id": item.digest, "parent": item.parent, "tokens": item.tokens,
                 "prefix_tokens": length(item.digest)[0], "complete_chain": length(item.digest)[1],
                 "payload_bytes": item.payload_bytes, "bytes": item.size, "text_available": item.text_stat is not None,
@@ -218,7 +248,8 @@ def inspect_prefix_cache(directory: Path, namespace: str | None = None, *, offse
                 for item in ordered[offset:offset + limit]]
     data.sort(key=lambda item: item["last_used_at"], reverse=True)
     return {"directory": str(directory), "total_bytes": sum(item.size for item in blocks),
-        "total_blocks": len(blocks), "data": data, "blocks": details, "offset": offset, "limit": limit}
+        "total_blocks": len(blocks), "data": data, "blocks": details, "offset": offset, "limit": limit,
+        "matched_blocks": matched_blocks, "search_text_unavailable": search_text_unavailable}
 
 
 def purge_prefix_cache(directory: Path, namespace: str | None = None) -> dict[str, int]:
@@ -253,4 +284,4 @@ def read_prefix_cache_tokens(directory: Path, namespace: str, digest: str) -> di
         chain.append(tokens)
         current = item.parent
     return {"available": True, "tokens": [token for values in reversed(chain) for token in values],
-        **_identity(directory, namespace)}
+        **prefix_cache_identity(directory, namespace)}

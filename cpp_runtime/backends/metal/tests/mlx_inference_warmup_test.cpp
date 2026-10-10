@@ -39,6 +39,14 @@ int main() {
                 ++calls;
             }, [&] { ++resets; });
         require(calls == 2 && resets == 1, "small context coverage mismatch");
+        calls = resets = draft_mask = 0;
+        mfq::metal::warm_mlx_inference(std::vector<std::int64_t>(64, 1), 262144, 16, defaults, true,
+            [&](const auto& prompt, const auto& sampling, int count) {
+                require(prompt.size() <= 16 && count <= 8, "budget-limited warmup exceeded its working set");
+                if (sampling.enable_mtp) draft_mask |= 1 << sampling.mtp_max_draft_tokens;
+                ++calls;
+            }, [&] { ++resets; });
+        require(calls == 12 && resets == 1 && draft_mask == 62, "bounded warmup lost decode or MTP coverage");
         calls = resets = 0;
         try {
             mfq::metal::warm_mlx_inference({1}, 128, 64, defaults, false,

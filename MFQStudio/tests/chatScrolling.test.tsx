@@ -107,8 +107,8 @@ it('历史消息编辑展示草稿与保存入口，助手消息提供重新生�
   const user = { id: 'user', role: 'user', parts: [{ type: 'text', text: 'original' }], created_at: '' } as Message;
   const assistant = { ...user, id: 'assistant', role: 'assistant' } as Message;
   const setEditDraft = vi.fn();
-  const actions = { saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() };
-  const props = { messages: [user, assistant], responses: {}, mcpTools: [], busy: false, tr: (_zh: string, en: string) => en, setEditDraft, actions };
+  const actions = { saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn() };
+  const props = { messages: [user, assistant], responses: {}, busy: false, tr: (_zh: string, en: string) => en, setEditDraft, actions };
   const view = render(<TooltipProvider><SavedMessageList {...props} editDraft={null} /></TooltipProvider>);
   expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(1);
   expect(screen.getAllByRole('button', { name: 'Regenerate' })).toHaveLength(1);
@@ -129,7 +129,7 @@ it('历史推理默认折叠，流式推理默认展开且只显示当前会话'
   const message = { id: 'answer', role: 'assistant', parts: [{ type: 'reasoning', text: 'saved reasoning' }], created_at: '' } as Message;
   const tr = (_zh: string, en: string) => en;
   const view = render(<TooltipProvider>
-    <SavedMessageList messages={[message]} responses={{}} mcpTools={[]} busy={false} tr={tr} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }} />
+    <SavedMessageList messages={[message]} responses={{}} busy={false} tr={tr} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn() }} />
     <StreamingMessage controller={controller} sessionId="a" tr={tr} />
   </TooltipProvider>);
   expect(screen.getByText('Reasoning').closest('details')).not.toHaveAttribute('open');

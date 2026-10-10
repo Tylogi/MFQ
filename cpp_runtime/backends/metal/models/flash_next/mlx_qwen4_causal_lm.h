@@ -8,6 +8,7 @@
 #include "mlx_transformer.h"
 #include "mlx_sampling.h"
 #include "mlx_ssd_expert_cache.h"
+#include "mlx_qsa_kv_offload.h"
 
 #include "mfq/token_constraint.h"
 
@@ -59,6 +60,8 @@ struct Qwen4Config {
     std::int64_t eos_token_id = 0;
     double rms_norm_eps = 1e-6;
     double rope_theta = 1e7;
+    MlxYarnScaling yarn;
+    double yarn_max_factor = 4.0;
     bool mrope_interleaved = false;
     bool norm_topk_prob = true;
     bool output_gate_silu = true;
@@ -76,6 +79,10 @@ struct MlxQwen4LayerCacheSnapshot {
     int position = 0;
     int batch = 0;
     std::optional<MlxKvCacheSnapshot> kv;
+    std::optional<MlxQsaKvSnapshot> offloaded_kv;
+    std::optional<MlxQsaIndexSnapshot> offloaded_pooled_keys;
+    int index_start = 0;
+    int index_ratio = 0;
     std::optional<mlx::core::array> index_keys;
     std::optional<mlx::core::array> pooled_keys;
     std::optional<mlx::core::array> convolution;
@@ -93,6 +100,10 @@ struct MlxQwen4TextSessionState {
     int cache_batch = 0;
     std::size_t bytes = 0;
 };
+
+std::pair<std::int32_t, mlx::core::array> qwen4_mtp_logits_from_state(
+    const MfqContainer& model, const MfqContainer& predictor_source,
+    const MlxQwen4TextSessionState& state, bool fp16);
 
 class MlxQwen4CausalLm {
 public:
@@ -141,6 +152,7 @@ public:
     std::size_t resident_full_expert_bytes() const noexcept;
     // Telemetry reads metadata only: no evaluation, copies, or device sync.
     std::size_t kv_cache_bytes() const noexcept;
+    std::optional<QsaKvStoreStats> qsa_kv_offload_stats() const;
     std::size_t kv_cache_contexts() const noexcept;
     std::size_t dynamic_weight_bytes() const noexcept;
     std::size_t ssd_ple_payload_bytes() const noexcept;
@@ -150,11 +162,22 @@ public:
     MlxQwen4TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens, bool detached = true) const;
     void restore_text_session_state(const MlxQwen4TextSessionState& state);
+    const std::string& mtp_cache_fingerprint() const noexcept;
+    void prepare_mtp_ttt(const std::filesystem::path& directory);
+    void begin_mtp_session(const std::string& session);
+    void end_mtp_session();
+    bool close_mtp_session(const std::string& session);
+    bool fork_mtp_session(const std::string& source, const std::string& target);
+    void clear_mtp_sessions();
+    std::size_t trim_mtp_sessions(std::size_t bytes);
+    std::size_t mtp_session_bytes() const;
+    std::vector<std::pair<std::string, double>> mtp_session_metrics() const;
 
 private:
     struct Impl;
     explicit MlxQwen4CausalLm(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
+    std::shared_ptr<QsaKvStore> kv_offload_store_;
 };
 
 } // namespace mfq::metal

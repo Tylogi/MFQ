@@ -135,8 +135,8 @@ struct MfqContainer::RandomAccessFiles {
 };
 
 void MfqContainer::load_hf_directory(
-    const std::filesystem::path& requested_path) {
-    hf_source_ = std::make_shared<mfq::HfModelSource>(requested_path);
+    const std::filesystem::path& requested_path, const std::string& source_prefix) {
+    hf_source_ = std::make_shared<mfq::HfModelSource>(requested_path, source_prefix);
     header_.version = 2;
     header_.architecture = std::string(hf_source_->architecture());
     header_.extra_json = hf_source_->metadata();
@@ -171,12 +171,12 @@ void MfqContainer::load_hf_directory(
     }
 }
 
-MfqContainer::MfqContainer(std::filesystem::path path)
+MfqContainer::MfqContainer(std::filesystem::path path, std::string hf_source_prefix)
     : random_access_files_(std::make_shared<RandomAccessFiles>()) {
     std::error_code directory_error;
     if (std::filesystem::is_directory(path, directory_error) &&
         !directory_error) {
-        load_hf_directory(path);
+        load_hf_directory(path, hf_source_prefix);
         return;
     }
     mfq::MfqModelSource source(std::move(path));

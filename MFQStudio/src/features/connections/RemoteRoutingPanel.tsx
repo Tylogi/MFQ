@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { connectionsApi } from '../../shared/api/resources/connections';
-import type { McpServerResource, McpToolResource, RemoteNode } from '../../shared/api/types';
+import type { RemoteNode } from '../../shared/api/types';
 import { SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -8,30 +8,19 @@ import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 
-export function ToolsRoutingPanel() {
+export function RemoteRoutingPanel() {
   const { tr } = useSettings();
   const { ready, connectionRevision } = useRuntime();
   const connectionScope = useConnectionScope();
-  const [servers, setServers] = useState<McpServerResource[]>([]);
-  const [tools, setTools] = useState<McpToolResource[]>([]);
   const [nodes, setNodes] = useState<RemoteNode[]>([]);
-  const [mcpDraft, setMcpDraft] = useState({
-    name: '',
-    transport: 'streamable_http' as 'stdio' | 'streamable_http',
-    endpoint: '',
-  });
   const [nodeDraft, setNodeDraft] = useState({ name: '', url: '', api_key_env: '' });
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     if (!ready) return;
     let disposed = false;
-    void Promise.all([connectionsApi.mcpServers(), connectionsApi.mcpTools(), connectionsApi.remoteNodes(true)])
-      .then(([servers, tools, nodes]) => {
-        if (!disposed) {
-          setServers(servers);
-          setTools(tools.data);
-          setNodes(nodes);
-        }
+    void connectionsApi.remoteNodes(true)
+      .then(nodes => {
+        if (!disposed) setNodes(nodes);
       })
       .catch((cause) => {
         if (!disposed) {
@@ -50,35 +39,14 @@ export function ToolsRoutingPanel() {
     try {
       await operation(current);
       if (!current()) return;
-      const [nextServers, nextTools, nextNodes] = await Promise.all([
-        connectionsApi.mcpServers(),
-        connectionsApi.mcpTools(),
-        connectionsApi.remoteNodes(true),
-      ]);
+      const nextNodes = await connectionsApi.remoteNodes(true);
       if (!current()) return;
-      setServers(nextServers);
-      setTools(nextTools.data);
       setNodes(nextNodes);
-      window.dispatchEvent(new Event('mfq:tools-changed'));
     } catch (cause) {
       if (current()) toast.error(errorMessage(cause));
     } finally {
       if (current()) setBusy(false);
     }
-  }
-  function createMcpServer(event: FormEvent) {
-    event.preventDefault();
-    if (!mcpDraft.name.trim() || !mcpDraft.endpoint.trim()) return;
-    void mutate(async (current) => {
-      await connectionsApi.createMcpServer({
-        name: mcpDraft.name.trim(),
-        transport: mcpDraft.transport,
-        enabled: true,
-        url: mcpDraft.transport === 'streamable_http' ? mcpDraft.endpoint.trim() : null,
-        command: mcpDraft.transport === 'stdio' ? mcpDraft.endpoint.trim() : null,
-      });
-      if (current()) setMcpDraft({ name: '', transport: 'streamable_http', endpoint: '' });
-    });
   }
   function registerRemoteNode(event: FormEvent) {
     event.preventDefault();
@@ -96,93 +64,10 @@ export function ToolsRoutingPanel() {
   return (
     <>
       <SectionLabel
-        title={tr('工具与路由', 'Tools and routing')}
-        subtitle={tr('可选的 MCP 与远程节点', 'Optional MCP and remote nodes')}
+        title={tr('远程路由', 'Remote routing')}
+        subtitle={tr('可选的远程推理节点', 'Optional remote inference nodes')}
       />
-      <div className="dashboard-grid server-tools-grid">
-        <TMPanel className="mcp-panel">
-          <div className="panel-heading">
-            <div>
-              <h2>MCP</h2>
-              <p>{tr('工具服务器与模型可见工具', 'Tool servers and model-visible tools')}</p>
-            </div>
-            <b>{tr(`${tools.length} 个工具`, `${tools.length} tools`)}</b>
-          </div>
-          <form className="mcp-form" onSubmit={createMcpServer}>
-            <input
-              aria-label={tr('服务器名称', 'Server name')}
-              onChange={(event) =>
-                setMcpDraft((current) => ({ ...current, name: event.target.value }))
-              }
-              placeholder={tr('名称', 'Name')}
-              value={mcpDraft.name}
-            />
-            <select
-              aria-label={tr('传输方式', 'Transport')}
-              onChange={(event) =>
-                setMcpDraft((current) => ({
-                  ...current,
-                  transport: event.target.value as 'stdio' | 'streamable_http',
-                }))
-              }
-              value={mcpDraft.transport}
-            >
-              <option value="streamable_http">HTTP</option>
-              <option value="stdio">stdio</option>
-            </select>
-            <input
-              aria-label={
-                mcpDraft.transport === 'streamable_http'
-                  ? 'Streamable HTTP URL'
-                  : tr('可执行文件', 'Executable')
-              }
-              onChange={(event) =>
-                setMcpDraft((current) => ({ ...current, endpoint: event.target.value }))
-              }
-              placeholder={
-                mcpDraft.transport === 'streamable_http'
-                  ? 'https://host/mcp'
-                  : tr('可执行文件路径', 'Executable path')
-              }
-              type={mcpDraft.transport === 'streamable_http' ? 'url' : 'text'}
-              value={mcpDraft.endpoint}
-            />
-            <button
-              className="primary"
-              disabled={!ready || busy || !mcpDraft.name.trim() || !mcpDraft.endpoint.trim()}
-              type="submit"
-            >
-              {tr('添加', 'Add')}
-            </button>
-          </form>
-          <div className="mcp-server-list">
-            {servers.map((server) => (
-              <div className="mcp-server" key={server.id}>
-                <span className={server.enabled ? 'model-state active' : 'model-state'} />
-                <div>
-                  <strong>{server.name}</strong>
-                  <small>
-                    {server.transport} · {server.url || server.command}
-                  </small>
-                </div>
-                <button
-                  disabled={busy}
-                  onClick={() => void mutate(() => connectionsApi.updateMcpServer(server.id, !server.enabled))}
-                  type="button"
-                >
-                  {server.enabled ? tr('停用', 'Disable') : tr('启用', 'Enable')}
-                </button>
-                <button
-                  disabled={busy}
-                  onClick={() => void mutate(() => connectionsApi.deleteMcpServer(server.id))}
-                  type="button"
-                >
-                  {tr('删除', 'Delete')}
-                </button>
-              </div>
-            ))}
-          </div>
-        </TMPanel>
+      <div className="dashboard-grid remote-routing-grid">
         <TMPanel className="cluster-panel">
           <div className="panel-heading">
             <div>

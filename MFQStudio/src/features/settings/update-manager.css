@@ -1,37 +1,75 @@
-/* Studio Release 检查、下载、切换与回退界面。 */
-.settings-update-panel { padding-block: 15px; }
-.update-manager { display: grid; gap: 14px; }
-.update-manager-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
-.update-manager-heading h3 { margin: 0; font-size: 13px; }
-.update-manager-heading p { max-width: 680px; margin: 4px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
-.update-current-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; border-block: 1px solid var(--line-soft); padding-block: 12px; }
-.update-current-row > div { display: grid; gap: 2px; }
-.update-current-row > div span, .update-current-row small { color: var(--muted); font-size: 9.5px; }
-.update-current-row > div strong { font-size: 12px; }
-.update-current-row label { display: flex; align-items: center; gap: 9px; color: var(--ink-soft); font-size: 10.5px; }
-.update-current-row input { accent-color: var(--accent); }
-.update-manager-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.update-manager-grid > div { min-width: 0; }
-.update-manager h4 { margin: 0 0 7px; color: var(--muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.05em; }
-.release-version-list, .installed-version-list { display: grid; gap: 4px; }
-.release-version-list > div, .installed-version-list > div { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; border: 1px solid var(--panel-line); border-radius: 8px; padding: 8px; background: var(--panel-control); }
-.release-version-list > div.latest { border-color: var(--accent-border); background: var(--accent-soft); }
-.release-version-list > div > div, .installed-version-list > div > div { display: grid; min-width: 0; gap: 2px; }
-.release-version-list strong, .installed-version-list strong { font-size: 10.5px; }
-.release-version-list small, .installed-version-list small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.release-version-list progress { width: min(180px, 100%); height: 3px; border: 0; accent-color: var(--accent); }
-.release-version-list span, .installed-version-list span { color: var(--muted); font-size: 9.5px; }
-.release-version-list button, .installed-version-list button { padding: 6px 8px; font-size: 9.5px; }
-.installed-version-list button.version-remove { width: 27px; padding-inline: 0; color: var(--muted); }
-.update-empty { border: 1px dashed var(--panel-line) !important; padding: 18px !important; color: var(--muted); background: transparent !important; font-size: 10px; text-align: center; }
-.update-error { margin: -5px 0 0; border-left: 2px solid var(--danger); padding: 6px 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); font-size: 9.5px; }
-.settings-page button.release-page-link { width: max-content; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 10px; }
-.update-available-banner { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 8px; border: 1px solid var(--sidebar-line); border-radius: 9px; margin: 7px 10px 0; padding: 8px; color: var(--ink-soft); background: var(--accent-soft); text-align: left; }
-.update-available-banner > span { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; color: var(--on-accent); background: var(--accent); font-size: 14px; font-weight: 800; }
-.update-available-banner > div { display: grid; min-width: 0; gap: 2px; }
-.update-available-banner strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.update-available-banner small { color: var(--muted); font-size: 8.5px; }
-
+.versions-page { max-width: 1280px; }
+.update-manager { display: grid; gap: 20px; }
+.update-manager button:not(.studio-switch) { min-height: 32px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px; color: var(--ink-soft); background: var(--surface-control); cursor: pointer; }
+.update-manager button:not(.studio-switch):hover:not(:disabled) { color: var(--ink); background: var(--surface-hover); }
+.update-manager button:disabled { opacity: 0.45; cursor: default; }
+.update-manager button:not(.studio-switch):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.update-current-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; background: var(--panel-surface); }
+.update-current-row > div { display: grid; min-width: 0; gap: 7px; }
+.update-current-row > div > span { color: var(--muted); font-size: 11px; }
+.update-current-row strong { overflow-wrap: anywhere; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.update-current-row small, .version-note { color: var(--muted); font-size: 11px; line-height: 1.65; }
+.update-current-row button, .release-version-heading button, .local-version button, .release-page-link { display: inline-flex; align-items: center; justify-content: center; gap: 7px; white-space: nowrap; font-size: 11px; }
+.version-preferences { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--panel-surface); }
+.version-preferences > div { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px 22px; }
+.version-preferences > div + div { border-top: 1px solid var(--line-soft); }
+.version-preferences > div > div { display: grid; gap: 5px; }
+.version-preferences strong { font-size: 12px; font-weight: 550; }
+.version-preferences small, .version-preferences > p { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.version-preferences > p { margin: 0; border-top: 1px solid var(--line-soft); padding: 10px 22px; }
+.update-manager-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 24px; align-items: start; }
+.version-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 2px 0 12px; }
+.version-section-heading h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.version-section-heading > span { color: var(--muted); font-size: 11px; }
+.release-version-list, .installed-version-list { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-surface); }
+.release-version { padding: 18px 20px; }
+.release-version + .release-version, .local-version + .local-version { border-top: 1px solid var(--line-soft); }
+.release-version-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.release-version-heading > strong { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.version-badge { border-radius: 5px; padding: 3px 6px; color: var(--ink-soft); background: var(--panel-control); font-size: 10px; }
+.release-version-heading time { margin-left: auto; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.release-version-heading button { padding: 7px 10px; }
+.release-version-heading .version-link { padding-inline: 7px; color: var(--muted); }
+.release-version-name { margin: 9px 0 14px; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.release-notes-disclosure > summary, .experimental-versions > summary, .local-version-notes > summary { width: fit-content; color: var(--ink-soft); font-size: 11px; cursor: pointer; }
+.release-notes-disclosure[open] > summary { margin-bottom: 15px; }
+.release-notes { color: var(--ink-soft); font-size: 12px; line-height: 1.85; overflow-wrap: anywhere; }
+.release-notes > :first-child { margin-top: 0; }
+.release-notes > :last-child { margin-bottom: 0; }
+.release-notes h1, .release-notes h2, .release-notes h3 { margin: 20px 0 9px; font-size: 13px; font-weight: 600; line-height: 1.6; }
+.release-notes h1 { font-size: 15px; }
+.release-notes ul, .release-notes ol { padding-left: 21px; }
+.release-notes li { margin-block: 5px; }
+.release-notes p { margin: 10px 0; }
+.release-notes code { padding: 2px 4px; border-radius: 4px; background: var(--panel-control); font-size: 11px; }
+.release-notes pre { overflow: auto; padding: 12px; border-radius: 8px; background: var(--panel-control); }
+.release-notes a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.release-notes table { width: 100%; border-collapse: collapse; }
+.release-notes th, .release-notes td { border-bottom: 1px solid var(--line-soft); padding: 7px; text-align: left; }
+.local-version { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 15px 16px; }
+.local-version > div { display: grid; min-width: 0; gap: 5px; }
+.local-version strong { overflow-wrap: anywhere; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.local-version small { color: var(--muted); font-size: 10px; }
+.local-version button { padding: 6px 8px; }
+.local-version.current > svg { color: var(--muted); }
+.local-version-notes { grid-column: 1 / -1; }
+.installed-version-list > .version-note { margin: 0; border-top: 1px solid var(--line-soft); padding: 14px 16px; }
+.experimental-versions { margin-top: 18px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
+.experimental-versions .local-version { border: 1px solid var(--line); border-radius: 8px; margin-block: 8px; }
+.update-manager button.release-page-link { width: fit-content; color: var(--muted); }
+.update-empty { padding: 28px 20px; color: var(--muted); font-size: 12px; text-align: center; line-height: 1.6; }
+.update-error { display: grid; gap: 7px; border-left: 2px solid var(--danger); padding: 12px 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.update-error strong { color: var(--ink-soft); font-weight: 550; }
+.update-error details { overflow-wrap: anywhere; }
+.version-download-progress { display: grid; gap: 8px; margin: 12px 0; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.version-download-progress progress { width: 100%; height: 4px; accent-color: var(--ink-soft); }
+@media (max-width: 1000px) { .update-manager-grid { grid-template-columns: minmax(0, 1fr) 240px; gap: 18px; } }
 @media (max-width: 760px) {
   .update-manager-grid { grid-template-columns: 1fr; }
+  .update-current-row { padding: 18px; }
+  .update-current-row strong { font-size: 15px; }
+  .update-current-row > button { padding: 8px; }
+  .version-preferences > div { padding: 14px 18px; gap: 12px; }
+  .release-version { padding: 16px; }
+  .release-version-heading time { margin-left: 0; }
 }

@@ -125,9 +125,9 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .dashboard-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); gap: 14px; }
 .logs-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .logs-grid > .runtime-log-panel { grid-column: 1 / -1; }
-.server-tools-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.server-tools-grid .mcp-panel,
-.server-tools-grid .cluster-panel { height: 100%; margin: 0; }
+.remote-routing-grid { grid-template-columns: minmax(0, 1fr); }
+.remote-routing-grid .cluster-panel { height: 100%; margin: 0; }
+.remote-routing-grid .panel-heading > b { white-space: nowrap; flex-shrink: 0; }
 
 .dashboard-panel { border: 1px solid var(--panel-line); border-radius: 12px; padding: 18px; background: var(--panel-surface); box-shadow: none; }
 .dashboard-panel dl { margin: 12px 0 0; }

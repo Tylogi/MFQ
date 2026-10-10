@@ -146,6 +146,7 @@ export interface RuntimeListener {
   host: string;
   port: number;
   configurable: boolean;
+  anthropic_port?: number | null;
 }
 
 export interface RuntimeResources {
@@ -155,6 +156,9 @@ export interface RuntimeResources {
   cpu_cores?: number | null;
   cpu_utilization_percent: number | null;
   gpus: { name: string; core_count?: number | null; utilization_percent: number | null }[];
+  memory_total_bytes?: number | null;
+  memory_used_bytes?: number | null;
+  memory_available_bytes?: number | null;
   memory_bandwidth_bytes_per_second: number | null;
   memory_bandwidth_limit_bytes_per_second: number | null;
   memory_bandwidth_utilization_percent: number | null;
@@ -162,7 +166,8 @@ export interface RuntimeResources {
     write_bytes_per_second: number | null; busy_percent: number | null;
     bandwidth_utilization_percent: number | null }[];
   weights: { instance_id: string; model: string; expert_read_bytes_per_second: number | null;
-    ple_read_bytes_per_second: number | null; engram_read_bytes_per_second: number | null }[];
+    ple_read_bytes_per_second: number | null; engram_read_bytes_per_second: number | null;
+    kv_read_bytes_per_second?: number | null; kv_write_bytes_per_second?: number | null }[];
 }
 
 export interface RuntimeModel {
@@ -185,6 +190,15 @@ export interface RuntimeMemoryResources {
   ssd_expert_bytes: number | null;
   ssd_ple: boolean | null;
   ssd_ple_bytes: number | null;
+  ssd_kv?: boolean | null;
+  ssd_kv_bytes?: number | null;
+  streaming_kv_resident_bytes?: number | null;
+  streaming_kv_budget_bytes?: number | null;
+  streaming_kv_pending_bytes?: number | null;
+  ssd_kv_read_bytes?: number | null;
+  ssd_kv_written_bytes?: number | null;
+  ssd_kv_reads?: number | null;
+  ssd_kv_hits?: number | null;
 }
 
 export interface RuntimeInstance {
@@ -205,6 +219,10 @@ export interface RuntimeInstance {
   pinned?: boolean;
   mtp_supported?: boolean;
   mtp_available?: boolean;
+  qsa_kv_offload_supported?: boolean;
+  kv_quantization_supported?: boolean;
+  kv_quantization?: { enabled: boolean; bits: 2 | 2.5 | 3 | 3.5 | 4 | 6 | 8; algorithm: 'turboquant' };
+  qsa_kv_offload?: { enabled: boolean; budget_bytes: number; target_context: number };
   error?: ApiErrorBody['error'] | null;
 }
 
@@ -217,7 +235,7 @@ export interface RuntimeProfile {
     device_ids: string[];
     idle_ttl_seconds?: number | null;
     pin: boolean;
-    context_size: number;
+    context_size: number | null;
     prefill_chunk_size: number;
     moe_gpu_cache_gb?: number | null;
     prefix_cache_max_sessions?: number | null;

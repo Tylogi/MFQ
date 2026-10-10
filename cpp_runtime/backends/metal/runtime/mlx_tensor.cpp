@@ -31,6 +31,7 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 std::atomic_bool g_predequantize_fp16{false};
+thread_local unsigned int g_fp16_weight_scopes = 0;
 
 // Decode verification presents two through six hidden states at once.  MLX's
 // general GEMM path does not reuse a dense weight row efficiently at this M,
@@ -460,7 +461,14 @@ void set_mlx_predequantize_fp16(bool enabled) noexcept {
 }
 
 bool mlx_predequantize_fp16_enabled() noexcept {
-    return g_predequantize_fp16.load(std::memory_order_relaxed);
+    return g_fp16_weight_scopes > 0 || g_predequantize_fp16.load(std::memory_order_relaxed);
+}
+
+MlxFp16WeightScope::MlxFp16WeightScope(bool enabled) noexcept : enabled_(enabled) {
+    if (enabled_) ++g_fp16_weight_scopes;
+}
+MlxFp16WeightScope::~MlxFp16WeightScope() {
+    if (enabled_) --g_fp16_weight_scopes;
 }
 
 array load_dense_array(
@@ -960,7 +968,8 @@ const array* MlxLinear::dense_weight_ref() const noexcept {
 }
 
 void MlxLinear::materialize_fp16() {
-    if (std::holds_alternative<array>(weight_)) return;
+    if (const auto* dense = std::get_if<array>(&weight_);
+        dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, output_size_);
     weight_ = std::move(dense);
 }
@@ -1259,7 +1268,8 @@ MlxEmbedding::MlxEmbedding(array weight)
 }
 
 void MlxEmbedding::materialize_fp16() {
-    if (std::holds_alternative<array>(weight_)) return;
+    if (const auto* dense = std::get_if<array>(&weight_);
+        dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, vocabulary_size_);
     weight_ = std::move(dense);
 }
