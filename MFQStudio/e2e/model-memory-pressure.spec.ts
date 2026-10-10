@@ -33,6 +33,13 @@ for (const moe of [true, false]) {
       await expect(page.getByRole('progressbar', { name: 'RAM 压力: 126.6%' })).toHaveCount(moe ? 1 : 0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByRole('progressbar', { name: moe ? '显存压力: 8.3%' : '显存压力: 116.7%' }).scrollIntoViewIfNeeded();
+      if (path === '/model-hub') {
+        const bounds = await page.locator('.model-variant').evaluate(element => ({
+          pressureRight: element.querySelector('.variant-memory-tiers')!.getBoundingClientRect().right,
+          buttonLeft: element.querySelector('button')!.getBoundingClientRect().left,
+        }));
+        expect(bounds.pressureRight).toBeLessThanOrEqual(bounds.buttonLeft);
+      }
       await page.locator(path === '/models' ? '.model-library-panel .model-row' : '.model-variant-list').screenshot({ path: testInfo.outputPath(`${moe ? 'moe' : 'dense'}-${path.slice(1)}.png`), animations: 'disabled' });
     }
   });

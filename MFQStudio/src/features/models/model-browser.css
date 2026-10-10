@@ -206,7 +206,9 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .model-browser-header { align-items: stretch; flex-direction: column; }
   .model-browser-tabs button { flex: 1; }
   .community-model-search { grid-template-columns: 1fr; }
-  .model-variant { grid-template-columns: minmax(0, 1fr) minmax(90px, 0.35fr) auto; }
+  .model-variant { grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; }
+  .model-variant > .variant-memory-tiers { grid-column: 1; grid-row: 2; padding: 0 0 12px 12px; }
+  .model-variant > button { grid-column: 2; grid-row: 1 / span 2; }
   .download-circle { right: 20px; bottom: max(20px, env(safe-area-inset-bottom)); }
   .download-queue-item { flex-wrap: wrap; gap: 10px; padding: 14px; }
   .download-item-icon { flex-basis: 32px; height: 32px; }
