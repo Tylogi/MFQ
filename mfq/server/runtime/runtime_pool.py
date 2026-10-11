@@ -332,7 +332,7 @@ class RuntimePool:
         self.default_idle_ttl_seconds = default_idle_ttl_seconds
         self.load_failure_cooldown_seconds = load_failure_cooldown_seconds
         self.metric_interval_seconds = max(0.25, metric_interval_seconds)
-        if backend not in {"cuda", "metal"}:
+        if backend not in {"cuda", "hip", "metal"}:
             raise ValueError(f"unsupported native backend: {backend}")
         if transport not in {"stdio", "http"}:
             raise ValueError(f"unsupported native runtime transport: {transport}")
