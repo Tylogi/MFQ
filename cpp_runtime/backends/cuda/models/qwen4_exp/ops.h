@@ -11,6 +11,7 @@
 #include <iosfwd>
 
 namespace mfq::cuda::qwen4_exp { struct Gr; }
+struct MtpModule;
 
 namespace mfq::cuda {
 struct Qwen4DecodeGraph;
@@ -25,6 +26,7 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
     mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
 void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
+std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const Qwen4CausalLm&,const MtpModule*);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,
@@ -81,7 +83,12 @@ struct Qwen4Model : CausalResources {
     void adapter_rollback_speculative(int64_t keep);
 };
 
-extern template struct CudaSessionCodec<Qwen4Model>;
+template <> struct CudaSessionCodec<Qwen4Model> {
+    static TextSessionStateKind kind(const Qwen4CausalLm&);
+    static bool supports_paged(const Qwen4CausalLm&);
+    static TextSessionState capture(const Qwen4CausalLm&,const std::vector<int64_t>&);
+    static void restore(Qwen4CausalLm&,const TextSessionState&);
+};
 
 } // namespace mfq::cuda
 

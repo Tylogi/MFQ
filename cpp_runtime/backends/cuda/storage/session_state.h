@@ -35,6 +35,7 @@ enum class TextSessionStateKind : int {
     HybridAttention,
     DeepseekV4,
     GlmDsa,
+    Qwen4,
 };
 
 struct Dsv4PoolSessionState {
@@ -77,9 +78,19 @@ struct HybridBlockSessionState {
     mfq_tensor_backend::Tensor recurrent_state;
 };
 
+struct Qwen4BlockSessionState {
+    mfq_tensor_backend::Tensor keys, values, index;
+    mfq_tensor_backend::Tensor convolution, recurrent, ple_convolution;
+    int64_t ple_batch = 0;
+    std::vector<int64_t> ple_tokens;
+};
+
 struct MtpSessionState {
     std::vector<FullBlockSessionState> blocks;
     mfq_tensor_backend::Tensor last_target_hidden;
+    std::vector<Qwen4BlockSessionState> qwen4_blocks;
+    std::vector<mfq_tensor_backend::Tensor> qwen4_positions;
+    std::vector<int64_t> qwen4_lengths;
     int64_t cache_pos = 0;
     size_t bytes = 0;
 };
@@ -89,12 +100,14 @@ using TextSessionPayload = std::variant<
     std::vector<FullBlockSessionState>,
     std::vector<HybridBlockSessionState>,
     std::vector<Dsv4BlockSessionState>,
-    std::vector<GlmDsaBlockSessionState>>;
+    std::vector<GlmDsaBlockSessionState>,
+    std::vector<Qwen4BlockSessionState>>;
 
 struct TextSessionState {
     std::vector<int64_t> tokens;
     std::string input_key;
     TextSessionPayload payload;
+    mfq_tensor_backend::Tensor qwen4_positions;
     std::optional<MtpSessionState> mtp;
     int64_t cache_pos = 0;
     int64_t decode_position_delta = 0;
@@ -203,6 +216,11 @@ TextSessionState decode_cuda_paged_session(
     size_t block_size);
 
 size_t session_tensor_bytes(const mfq_tensor_backend::Tensor& tensor);
+
+CudaPagedPayload encode_cuda_qwen4_paged_block(const TextSessionState&,size_t,size_t);
+TextSessionState decode_cuda_qwen4_paged_session(const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t);
+size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>&);
+size_t cuda_paged_payload_tokens(const CudaPagedPayload&);
 
 bool session_tensor_layout_matches(
     const mfq_tensor_backend::Tensor& target,

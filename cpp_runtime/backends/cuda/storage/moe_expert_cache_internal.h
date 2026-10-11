@@ -649,7 +649,11 @@ public:
     std::vector<std::pair<std::string, double>> memory_metrics() const {
         const auto host = host_experts_->stats();
         const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.resident_bytes;
+        std::size_t gpu_weights=0;
+        for(const auto& [signature,arena]:arenas_)
+            for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
         return {{"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
+            {"resident_expert_cache_bytes",double(gpu_weights)},
             {"ram_expert_payload_bytes", double(resident)},
             {"ram_expert_pcie_read_bytes", double(stats_.ram_pcie_bytes)}};
     }
@@ -758,6 +762,7 @@ private:
     friend class MoeFfnPipeline;
     friend class MoeResidencyManager;
     friend void release_moe_prefill_buffers(MoeExpertCache* cache);
+    friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
     friend struct MoeResidencyTestAccess;
     friend void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>&,bool);
     friend void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>&,bool,bool);
@@ -766,6 +771,7 @@ private:
     std::unique_ptr<MoeResidencyManager> moe_residency_;
     std::vector<std::array<int,3>> pipeline_bundles_;
     std::unordered_map<std::string,std::unique_ptr<MoeGpuArena>> pipeline_stages_;
+    std::vector<std::function<void()>> pipeline_decode_release_;
     // Eager prefill projections execute in order on pipeline_pool_stream_.
     // Their quantization scratch can be reused across projections and layers.
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;

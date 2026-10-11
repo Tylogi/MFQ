@@ -1725,12 +1725,63 @@ void verify_router_lookahead_inputs() {
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
 #include "mfe_token_group_test.h"
+void verify_memory_phase_reuse(const std::filesystem::path& root) {
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    int cases=0;
+    for(const std::string format:{"nint5","nvq3j-512"}) {
+        CudaExecutionContext execution;
+        execution.config.moe_pipeline=true;execution.config.moe_preload_all=true;
+        execution.config.moe_ram_pcie=true;execution.config.moe_ram_pcie_fraction=1;
+        execution.config.moe_residency_adapt=false;
+        std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources={
+            source(root/(format+"-640-2560.mfq")),source(root/(format+"-640-2560.mfq")),
+            source(root/(format+"-2560-640.mfq"))};
+        std::size_t gpu_bytes=0;for(const auto& s:sources)gpu_bytes+=bytes(s->metadata()->pools[0]);
+        execution.config.moe_host_cache_bytes=3*gpu_bytes;
+        auto cache=make_moe_expert_cache(gpu_bytes,execution.config);
+        std::vector<std::shared_ptr<MfeWeight>> gu,down;
+        const std::array<std::string,3> roles={"gate","up","down"};
+        for(int p=0;p<3;++p) {
+            auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,roles[p],sources[p],1,0,roles[p]));
+            (p==2?down:gu).push_back(std::move(weight));
+        }
+        auto ffn=make_moe_ffn_pipeline(gu,down);finalize_moe_expert_cache(cache);
+        if(!ffn)throw std::runtime_error("phase reuse fixture has no FFN pipeline");
+        for(int tokens:{1,3,6}) {
+            auto x=tb::full({tokens,2560},.0001,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+            auto ids=tb::arange(3,x.options().dtype(tb::kInt32)).unsqueeze(0).expand({tokens,3}).contiguous();
+            auto weights=tb::ones({tokens,3},x.options().dtype(tb::kFloat32));
+            auto expected=ffn(execution,x,ids,weights).to(tb::kCPU).to(tb::kFloat32).contiguous();
+            const auto before=context->memory_stats().allocated;
+            release_moe_decode_buffers(cache);context->reclaim_idle_memory();
+            const auto after=context->memory_stats().allocated;
+            if(after>=before)throw std::runtime_error("phase transition retained all decode buffers");
+            tb::Tensor result;
+            {
+                mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&]{result=ffn(execution,x,ids,weights);},[]{},[&]{result={};});
+                window.run();
+                auto actual=result.to(tb::kCPU).to(tb::kFloat32).contiguous();
+                if(actual.sizes()!=expected.sizes())throw std::runtime_error("phase reuse changed FFN geometry");
+                for(int64_t i=0;i<actual.numel();++i)
+                    if(!std::isfinite(actual.data_ptr<float>()[i]) ||
+                       std::abs(actual.data_ptr<float>()[i]-expected.data_ptr<float>()[i])>2e-5+1e-3*std::abs(expected.data_ptr<float>()[i]))
+                        throw std::runtime_error("phase reuse changed FFN output");
+            }
+            result={};release_moe_decode_buffers(cache);++cases;
+            std::cout<<"phase_reuse format="<<format<<" tokens="<<tokens
+                <<" released_bytes="<<before-after<<" output=PASS\n";
+        }
+    }
+    std::cout<<"memory_phase_reuse_cases="<<cases<<" PASS\n";
+}
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
+        if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-pipeline-check") {
             for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,true);

@@ -57,6 +57,9 @@ struct Qwen4ExpMtp final : MtpModule {
     bool target_bootstrap_decode() const noexcept override;
 
     bool preserve_output_dtype() const noexcept override;
+    bool supports_session_state() const noexcept override;
+    MtpSessionState capture_session_state(int64_t,const Tensor&) const override;
+    void restore_session_state(const MtpSessionState&) override;
 };
 
 } // namespace mfq::cuda::qwen4_exp

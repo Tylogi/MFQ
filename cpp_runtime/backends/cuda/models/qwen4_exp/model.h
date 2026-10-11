@@ -10,6 +10,7 @@
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/kv_offload.h"
+#include "storage/session_state.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,10 @@ class Gdn {
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
+    void restore_session(const Tensor& convolution,const Tensor& recurrent) {
+        MFQ_RUNTIME_CHECK(convolution.defined() && recurrent.defined(),"missing Qwen4 GDN session state");
+        reset();conv_=convolution.clone();state_=recurrent.clone();
+    }
     Tensor recurrent_state() const {
         return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
     }
@@ -447,6 +452,11 @@ class Ple {
     const Tensor &conv_state() const { return conv_; }
     std::vector<Tensor*> graph_state() { return {&conv_}; }
     bool graph_supported() const { return embedding_.graph_supported(); }
+    const NgramEmbedding::Context& session_context() const { return embedding_.context(); }
+    void restore_session(const Tensor& convolution,NgramEmbedding::Context context) {
+        MFQ_RUNTIME_CHECK(convolution.defined(),"missing Qwen4 PLE session state");
+        reset();conv_=convolution.clone();embedding_.restore(std::move(context));
+    }
     std::shared_ptr<NintRowStage> graph_stage(int64_t tokens,const tb::Device& device) {
         return embedding_.graph_stage(1,tokens,device);
     }
@@ -573,6 +583,32 @@ class Qsa {
         }
     }
     int64_t position() const { return offload_ ? offloaded_kv_->position() : keys_.position(); }
+    bool supports_session() const { return !offload_; }
+    void capture_session(Qwen4BlockSessionState& state,int64_t count,std::size_t& bytes) const {
+        MFQ_RUNTIME_CHECK(!offload_ && count>0 && count<=position(),"invalid Qwen4 QSA session boundary");
+        const auto save=[&](const Tensor& tensor) {
+            auto saved=tensor.contiguous().clone();bytes+=session_tensor_bytes(saved);return saved;
+        };
+        if(graph_keys_.defined()) {
+            state.keys=save(graph_keys_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*c_.width}));
+            state.values=save(graph_values_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*c_.width}));
+        } else {
+            state.keys=save(keys_.storage().narrow(1,0,count));
+            state.values=save(values_.storage().narrow(1,0,count));
+        }
+        state.index=save(index_.storage().narrow(1,0,count));
+    }
+    void restore_session(const Qwen4BlockSessionState& state,int64_t count) {
+        MFQ_RUNTIME_CHECK(!offload_ && state.keys.defined() && state.values.defined() && state.index.defined() &&
+            state.keys.dim()==3 && state.keys.size(0)==1 && state.keys.size(1)==count &&
+            state.keys.size(2)==c_.kv_heads*c_.width && state.values.sizes()==state.keys.sizes() &&
+            state.index.dim()==3 && state.index.size(0)==1 && state.index.size(1)==count && state.index.size(2)==c_.index_width,
+            "incompatible Qwen4 QSA session state");
+        reset();keys_.append(state.keys);values_.append(state.values);index_.append(state.index);
+    }
+    std::vector<Tensor> resident_cache_tensors() const {
+        return {keys_.storage(),values_.storage(),index_.storage(),graph_keys_,graph_values_,graph_pooled_};
+    }
     void set_grouped_projection(bool enabled) {
         MFQ_RUNTIME_CHECK(!graph_keys_.defined() && position()==0,"reset QSA before switching projection execution");
         grouped_projection_=enabled;

@@ -1366,6 +1366,27 @@ void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
     if(cache)cache->finish_pipeline_exchanges();
 }
 
+void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(!cache)return;
+    cache->finish_pipeline_exchanges();
+    MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    release_moe_prefill_buffers(cache);
+    for(const auto& held:cache->pipeline_transfer_slots_)
+        if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
+    cache->pipeline_transfer_slots_.clear();cache->pipeline_dma_leases_.clear();
+    // Destroy captured DMA/FFN consumers before returning their storage.
+    for(auto& batch:cache->pipeline_dma_batches_)batch.reset();
+    for(auto& release:cache->pipeline_decode_release_)release();
+    if(cache->pipeline_pool_context_) {
+        cache->pipeline_pool_context_->end_graph_pool(cache->pipeline_pool_stream_);
+        cache->pipeline_pool_context_.reset();cache->pipeline_pool_stream_=nullptr;
+    }
+    cache->pipeline_stages_.clear();
+    cache->pipeline_wire_gpu_={};cache->pipeline_prefetch_wire_gpu_={};
+    cache->pipeline_prefetch_host_stage_={};
+    cache->pipeline_prefetched_keys_.clear();cache->transfer_ready_recorded_=false;
+}
+
 
 void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
     if(!cache || !cache->complete_residency_ || cache->config_.moe_residency_adapt ||

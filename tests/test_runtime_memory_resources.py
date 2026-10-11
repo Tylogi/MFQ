@@ -39,6 +39,18 @@ def test_busy_worker_retains_last_breakdown_instead_of_resetting_to_zero():
     assert RuntimePool._memory_resources({"mlx_active_bytes": 2048}, previous) == previous
 
 
+def test_model_buffers_remain_separate_from_weights_kv_and_device_global_usage():
+    previous = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
+        "resident_buffer_bytes": 512, "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 100,
+        "device_total_bytes": 100000, "device_free_bytes": 20000})
+    assert previous.resident_buffer_bytes == 512
+    assert previous.resident_weight_bytes == 1024 and previous.kv_bytes == 300
+    assert RuntimePool._memory_resources({"device_free_bytes": 10000}, previous) == previous
+    assert RuntimePool._memory_resources({"cuda_allocated_bytes": 99999}).resident_buffer_bytes is None
+    assert RuntimePool._memory_resources({"resident_buffer_bytes": math.nan}).resident_buffer_bytes is None
+    assert RuntimePool._memory_resources({"resident_buffer_bytes": 0}).resident_buffer_bytes == 0
+
+
 def test_older_worker_does_not_fabricate_weight_bytes_or_ssd_modes():
     memory = RuntimePool._memory_resources({"mlx_active_bytes": 1024, "prefix_cache_bytes": 128})
     assert memory.resident_weight_bytes is None

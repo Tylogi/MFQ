@@ -309,7 +309,7 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
 def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> None:
     assert "class CudaSessionStateError" in CUDA_SESSION_STATE_HEADER
     assert "throw CudaSessionStateError(" in CUDA_SESSION_CACHE
-    restore = CUDA_SESSION_CACHE.split("size_t restore_paged(", 1)[1].split(
+    restore = CUDA_SESSION_CACHE.split("Restore restore_paged(", 1)[1].split(
         "void store_paged(", 1
     )[0]
     corrupt, transient = restore.split(

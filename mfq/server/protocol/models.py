@@ -763,6 +763,7 @@ class RuntimeMemoryResources(ProtocolModel):
     """
 
     resident_weight_bytes: int | None = Field(default=None, ge=0)
+    resident_buffer_bytes: int | None = Field(default=None, ge=0)
     wired_bytes: int | None = Field(default=None, ge=0)
     wired_limit_bytes: int | None = Field(default=None, ge=0)
     wired_available: bool | None = None

@@ -1,5 +1,6 @@
 #include "../runtime/execution_options.h"
 #include "weight_loader.h"
+#include "mfq_weight_memory.h"
 #include "float_projection.h"
 #include "gated_residual_fused.h"
 #include "selected_attention.h"
@@ -33,10 +34,12 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     if(const auto trace=mfq::cuda::runtime_options::trace_ple_timings();trace && *trace)
         std::fprintf(stderr,"nint_row_source mapped_file=%d nbytes=%llu name=%s\n",int(mapped_file),
             static_cast<unsigned long long>(metadata.nbytes),name.c_str());
-    return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
+    auto table=std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
         [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
             read(offset, reinterpret_cast<std::byte*>(out), count);
         }, parallel,std::move(batch));
+    mfq::cuda::observe_streamed_ple(table,static_cast<std::size_t>(metadata.nbytes));
+    return table;
 }
 
 MfeWeight load_mfe_gpu(
@@ -45,6 +48,7 @@ MfeWeight load_mfe_gpu(
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     auto& cache = execution.moe_expert_cache;
     if (cache && cacheable &&
             !moe_parallel_config(execution).enabled() &&
@@ -240,6 +244,7 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
 }
 
 ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
     MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint(),
         "floating residual projection requires dense or NINT weights: ", name);
@@ -291,6 +296,7 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
 }
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const auto& dtype=require_tensor(file, name).dtype;
     MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
         "expected a dense parameter: ",name);
@@ -400,6 +406,7 @@ mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
 mfq_tensor_backend::Tensor load_dense_native_gpu(CudaExecutionContext &execution,
                                                  const mfq::ModelSource &source,
                                                  const std::string &name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     MfqCudaGuard guard(active_weight_load_device(execution));
     return load_dense_cpu(execution, source, name).to(mfq_tensor_backend::kCUDA).contiguous();
 }

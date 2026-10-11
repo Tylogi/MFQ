@@ -53,12 +53,14 @@ class HardwareIdentity:
 
 def memory_topology() -> dict[str, Any]:
     hardware = hardware_identity()
+    host_total, host_available = host_memory_capacity()
     architecture = hardware.memory_architecture
     capacities = [item.capacity_bytes for item in hardware.gpu_memory if not item.unified and not _unified_gpu_name(item.name)]
     return {
         "memory_architecture": architecture,
         "unified_memory": architecture == "unified" if architecture != "unknown" else None,
-        "host_memory_total_bytes": hardware.physical_memory_bytes or host_memory_capacity()[0],
+        "host_memory_total_bytes": hardware.physical_memory_bytes or host_total,
+        "host_memory_available_bytes": host_available,
         "device_memory_total_bytes": sum(capacities) if capacities and all(value is not None for value in capacities) else None,
         "prefix_cache_hot_tier": "vram" if architecture == "discrete" else "ram" if architecture == "unified" else None,
         "prefix_cache_cold_tier": "ssd",

@@ -3875,6 +3875,7 @@ class RuntimePool:
         values = previous.model_dump() if previous is not None else {}
         for target, source in (
             ("resident_weight_bytes", "resident_weight_bytes"),
+            ("resident_buffer_bytes", "resident_buffer_bytes"),
             ("ram_expert_bytes", "ram_expert_payload_bytes"),
             ("ram_kv_bytes", "qsa_kv_ram_bytes"),
             ("ram_kv_limit_bytes", "qsa_kv_ram_limit_bytes"),

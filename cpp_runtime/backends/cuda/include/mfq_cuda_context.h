@@ -190,6 +190,10 @@ public:
     bool supports_async_allocations() const noexcept { return async_allocations_; }
     DeviceMemoryStats memory_stats() const noexcept;
     std::size_t local_memory_usage() const;
+    // Process-owned pages, including idle allocator pages and CUDA libraries.
+    std::size_t resident_memory_usage() const;
+    std::size_t available_memory() const;
+    void reclaim_idle_memory();
     void check_memory_limit(std::size_t additional = 0) const;
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);

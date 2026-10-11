@@ -11,6 +11,7 @@
 #include "mtp_metrics.h"
 #include "request_executor.h"
 #include "generation_flow.h"
+#include "mfq_weight_memory.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -23,6 +24,7 @@ using namespace mfq::cuda::internal;
 namespace {
 template <typename Model>
 struct CudaEngineState {
+    std::shared_ptr<WeightMemoryLedger> weight_memory;
     std::shared_ptr<CudaExecutionContext> execution;
     CudaRuntimeConfig config;
     Model model;
@@ -34,8 +36,9 @@ struct CudaEngineState {
     bool duplex_active = false;
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
-            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config)
-        : execution(std::move(owner)), config(std::move(runtime_config)),
+            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,
+            std::shared_ptr<WeightMemoryLedger> weights)
+        : weight_memory(std::move(weights)), execution(std::move(owner)), config(std::move(runtime_config)),
           model(std::move(loaded)), components(std::move(optional)),
           language(components.language(model)), graph(language.max_position_embeddings()),
           cache(config.session_cache, config.prefix_cache,
@@ -94,14 +97,29 @@ struct CudaEngineState {
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
             auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
+            std::size_t resident_weights=weight_memory->resident_bytes();
+            for(const auto& metric:experts)
+                if(metric.first=="resident_expert_cache_bytes")resident_weights+=std::size_t(metric.second);
+            const auto ple=weight_memory->ple_bytes();
+            metrics.insert(metrics.end(),{{"resident_weight_bytes",double(resident_weights)},
+                {"ssd_ple_enabled",ple>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple)}});
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                auto cache_memory=qwen4_cache_memory_metrics(language,components.mtp.get());
+                metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
+                std::size_t kv_bytes=0,hot_bytes=0;
+                for(const auto& metric:cache_memory)
+                    if(metric.first=="kv_cache_bytes")kv_bytes=std::size_t(metric.second);
+                for(const auto& metric:cache.metrics())
+                    if(metric.first=="prefix_cache_hot_bytes")hot_bytes=std::size_t(metric.second);
+                const auto categorized=resident_weights+kv_bytes+hot_bytes;
+                const auto resident=std::max(memory.reserved_bytes,memory.allocated_bytes);
+                metrics.emplace_back("resident_buffer_bytes",double(resident>categorized?resident-categorized:0));
+            }
             metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
                 {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
             if (execution->qsa_kv_store) {
                 auto kv = execution->qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());
-                for (const auto& value : kv)
-                    if (value.first == "qsa_kv_resident_bytes") metrics.emplace_back("kv_cache_bytes", value.second);
-                metrics.emplace_back("kv_cache_contexts", language.cache_pos > 0 ? 1.0 : 0.0);
             } else metrics.insert(metrics.end(), {{"qsa_kv_offload_enabled", 0.0},
                 {"qsa_kv_ram_enabled", 0.0}, {"qsa_kv_ram_bytes", 0.0}, {"qsa_kv_ssd_bytes", 0.0}});
             if (components.mtp) {
@@ -152,6 +170,8 @@ struct CudaBackend {
         auto execution = std::make_shared<CudaExecutionContext>();
         setup_cuda_load(options, *execution);
         execution->profiler.enabled = false;
+        auto weight_memory=std::make_shared<WeightMemoryLedger>();
+        const WeightMemoryLoadScope memory_load(*weight_memory);
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
         const auto kv_options = runtime_options::qsa_kv_offload();
@@ -168,7 +188,7 @@ struct CudaBackend {
                 using Model = std::decay_t<decltype(model)>;
                 if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
                     if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
-                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config);
+                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config,weight_memory);
             });
         return visit([&](auto& state) {
             EngineInfo info;

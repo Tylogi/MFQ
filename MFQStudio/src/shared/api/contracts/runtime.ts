@@ -56,6 +56,7 @@ export interface RuntimeStatus {
   memory_architecture?: 'unified' | 'discrete' | 'unknown';
   unified_memory?: boolean | null;
   host_memory_total_bytes?: number | null;
+  host_memory_available_bytes?: number | null;
   device_memory_total_bytes?: number | null;
   prefix_cache_hot_tier?: 'vram' | 'ram' | null;
   instance_id?: string;
@@ -189,6 +190,7 @@ export interface RuntimeMemoryResources {
   ram_kv_bytes?: number | null;
   ram_kv_limit_bytes?: number | null;
   resident_weight_bytes: number | null;
+  resident_buffer_bytes?: number | null;
   wired_bytes?: number | null;
   wired_limit_bytes?: number | null;
   wired_available?: boolean | null;

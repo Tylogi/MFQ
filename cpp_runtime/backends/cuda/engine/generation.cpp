@@ -12,6 +12,8 @@
 #include "cuda_sampling.h"
 #include "storage/text_session_cache.h"
 #include "mfq_cuda_sampling_ops.h"
+#include "storage/moe_expert_cache.h"
+#include "runtime/execution_options.h"
 
 #include <algorithm>
 #include <iostream>
@@ -267,6 +269,66 @@ template <class Model> struct CudaGenerationContext {
     std::string request_id;
 
     bool batched() const { return batching != nullptr; }
+    void prepare_request(const mfq::engine::InferenceRequest& input) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(!batching && input.prompt.size()>1024) {
+                finish_moe_expert_exchanges(model.execution->moe_expert_cache);
+                if(model.cache_pos==0 && !model.graph_registry)
+                    release_moe_decode_buffers(model.execution->moe_expert_cache);
+                else release_moe_prefill_buffers(model.execution->moe_expert_cache);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
+    }
+    void reserve_workspace(std::size_t bytes) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+            auto available=context->available_memory();
+            if(available>=bytes)return;
+            std::size_t hot=0;
+            for(const auto& metric:cache.metrics())
+                if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
+            const auto shortage=bytes-available;
+            const auto released=cache.trim_hot(hot>shortage?hot-shortage:0);
+            context->reclaim_idle_memory();
+            std::cerr<<"runtime_workspace_budget requested_bytes="<<bytes
+                <<" available_bytes="<<context->available_memory()
+                <<" prefix_released_bytes="<<released<<'\n';
+        }
+#endif
+    }
+    bool prepare_snapshot() {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            // Retire prefill buffers before copying KV/recurrent state. Evict
+            // old hot entries before allocating the incoming checkpoint.
+            release_moe_prefill_buffers(model.execution->moe_expert_cache);
+            std::size_t incoming=0,hot=0,limit=0;
+            for(const auto& metric:qwen4_cache_memory_metrics(model,mtp))
+                if(metric.first=="kv_cache_bytes")incoming=std::size_t(metric.second);
+            for(const auto& metric:cache.metrics()) {
+                if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
+                if(metric.first=="prefix_cache_max_bytes")limit=std::size_t(metric.second);
+            }
+            const auto target=limit>incoming?limit-incoming:0;
+            if(hot>target)cache.trim_hot(target);
+            // Transposing graph KV can temporarily hold a contiguous copy in
+            // addition to the checkpoint. Include that peak and metadata.
+            const auto needed=incoming*2+(std::size_t(64)<<20);
+            reserve_workspace(needed);
+            const auto available=mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
+            if(available<needed) {
+                std::cerr<<"runtime_session_cache action=skip reason=workspace_pressure"
+                    <<" requested_bytes="<<needed<<" available_bytes="<<available<<'\n';
+                return false;
+            }
+        }
+#endif
+        return true;
+    }
     void invalidate_plan() { graph.invalidate(); }
     bool has_hidden(const Hidden &value) const { return value.defined(); }
     void reset() {
@@ -284,6 +346,8 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
+        if(input.prompt.size()-reused>1024)
+            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
         auto logical_chunk=config.generation.prefill_chunk_size;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             if(reused==0 && (stable==0 || stable==input.prompt.size()) &&
@@ -298,6 +362,8 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
+        if(input.prompt.size()-reused>1024)
+            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
         return run_mtp_generation(model,
             *mtp,
             input,

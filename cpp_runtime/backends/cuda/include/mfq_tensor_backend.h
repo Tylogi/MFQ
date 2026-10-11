@@ -160,16 +160,15 @@ struct MfqCudaMemoryStats {
 
 inline MfqCudaMemoryStats mfq_cuda_memory_stats(int device) {
     ::mfq::cuda::DeviceGuard guard(device);
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
-    MFQ_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const auto context=::mfq::cuda::default_context(device);
+    const auto owned=context->memory_stats();
     MfqCudaMemoryStats stats;
-    stats.allocated_bytes = total_bytes - free_bytes;
+    stats.allocated_bytes = owned.allocated;
     stats.active_bytes = stats.allocated_bytes;
-    stats.reserved_bytes = stats.allocated_bytes;
+    stats.reserved_bytes = context->resident_memory_usage();
     stats.requested_bytes = stats.allocated_bytes;
-    stats.peak_allocated_bytes = stats.allocated_bytes;
-    stats.peak_reserved_bytes = stats.reserved_bytes;
+    stats.peak_allocated_bytes = owned.peak;
+    stats.peak_reserved_bytes = std::max(stats.reserved_bytes,stats.peak_allocated_bytes);
     return stats;
 }
 

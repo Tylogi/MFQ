@@ -88,6 +88,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         mtp->last_stats.available = true;
     }
     ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
+    if constexpr(requires { ops.prepare_request(request); })ops.prepare_request(request);
     typename Ops::Restore restored;
     if (caching && (!use_mtp || mtp->supports_session_state()))
         restored = session_cache.restore_best(model,
@@ -109,6 +110,8 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             static_cast<std::size_t>(position) == last_snapshot)
             return;
         try {
+            if constexpr(requires { ops.prepare_snapshot(); })
+                if(!ops.prepare_snapshot())return;
             std::vector<int64_t> tokens(history.begin(), history.begin() + position);
             auto state = model.capture_text_session_state(tokens);
             state.input_key = input_key;
@@ -134,8 +137,13 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             progress && !use_mtp && caching &&
             progress->timing.prompt_tokens + restored.tokens == plan.stable_prefix_tokens)
             snapshot();
-        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr)
+        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr) {
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
+            // The first MTP token is yielded after predictor prompt priming,
+            // while the target still holds the complete prompt boundary.
+            if (use_mtp && caching && !last_snapshot)
+                snapshot();
+        }
         co_yield std::move(step);
     }
     snapshot();

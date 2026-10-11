@@ -27,7 +27,7 @@ template <class Backend> class SessionCache {
         int disabled_reason = 0, bool native_hot_snapshots = false)
         : snapshots_([&] {
               auto configuration = session_config.snapshots;
-              if (native_hot_snapshots) configuration.max_bytes = prefix_config.hot_bytes;
+              if (native_hot_snapshots) configuration.max_bytes = prefix_config.enabled ? prefix_config.hot_bytes : 0;
               return configuration;
           }()), paged_cache_(std::move(paged_cache)),
           paged_bindings_(paged_cache_, snapshots_.max_sessions()),
@@ -36,7 +36,9 @@ template <class Backend> class SessionCache {
           trace_(session_config.trace), supported_(supported), disabled_reason_(disabled_reason),
           native_hot_snapshots_(native_hot_snapshots) {}
 
-    bool persistent_prefix_enabled() const noexcept { return static_cast<bool>(paged_cache_); }
+    bool persistent_prefix_enabled() const noexcept {
+        return static_cast<bool>(paged_cache_) || (native_hot_snapshots_ && supported_ && snapshots_.enabled());
+    }
 
     template <typename Model>
     Restore restore_best(Model &model, Predictor *mtp, const std::string &requested_session,
@@ -45,7 +47,7 @@ template <class Backend> class SessionCache {
         if (!supported_)
             return {};
         if (paged_cache_ && !native_hot_snapshots_ && mtp == nullptr && input_key.empty()) {
-            return {restore_paged(model, requested_session, prompt, maximum_prefix_tokens), {}};
+            return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp);
         }
         if (!model.supports_text_session_state())
             return {};
@@ -56,8 +58,8 @@ template <class Backend> class SessionCache {
                    (mtp == nullptr || (mtp->supports_session_state() && state.mtp.has_value()));
         });
         if (!match) {
-            if (paged_cache_ && native_hot_snapshots_ && mtp == nullptr && input_key.empty())
-                return {restore_paged(model, requested_session, prompt, maximum_prefix_tokens), {}};
+            if (paged_cache_ && native_hot_snapshots_ && input_key.empty())
+                return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp);
             return {};
         }
         try {
@@ -90,7 +92,9 @@ template <class Backend> class SessionCache {
     void store(const std::string &session_id, Snapshot state) {
         if (!supported_)
             return;
-        if (paged_cache_ && state.input_key.empty() && !state.mtp.has_value()) {
+        bool paged_mtp=false;
+        if constexpr(requires { Backend::paged_mtp(state); })paged_mtp=Backend::paged_mtp(state);
+        if (paged_cache_ && state.input_key.empty() && (!state.mtp.has_value() || paged_mtp)) {
             store_paged(session_id, state);
             if (!native_hot_snapshots_) return;
         }
@@ -254,11 +258,11 @@ template <class Backend> class SessionCache {
 
   private:
     template <typename Model>
-    size_t restore_paged(Model &model, const std::string &requested_session,
-        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens) {
+    Restore restore_paged(Model &model, const std::string &requested_session,
+        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens, Predictor* mtp) {
         if (snapshots_.max_sessions() == 0 || !model.supports_paged_text_session_state() ||
             prompt.size() < 2) {
-            return 0;
+            return {};
         }
         const auto limit = std::min(maximum_prefix_tokens, prompt.size() - 1);
         std::vector<int64_t> candidate(
@@ -266,20 +270,14 @@ template <class Backend> class SessionCache {
         auto match = paged_cache_->match(candidate, {}, false);
         if (match.matched_tokens == 0) {
             paged_cache_->record_match(0);
-            return 0;
+            return {};
         }
 
         auto payloads = paged_cache_->load_prefix(match.blocks);
         if (payloads.empty()) {
             paged_cache_->record_match(0);
-            return 0;
+            return {};
         }
-        if (payloads.size() != match.blocks.size()) {
-            match.blocks.resize(payloads.size());
-            match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
-        }
-        std::vector<int64_t> matched_tokens(
-            prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(match.matched_tokens));
         const auto fail = [&](const char *action, const std::exception &error, bool invalidate) {
             if (invalidate && !match.blocks.empty()) {
                 paged_cache_->invalidate(match.blocks.back());
@@ -288,16 +286,46 @@ template <class Backend> class SessionCache {
             model.reset(1);
             std::cerr << "runtime_session_cache action=" << action
                       << " session=" << requested_session << " error=" << error.what() << std::endl;
-            return size_t{0};
+            if(mtp)mtp->reset(1);
+            return Restore{};
         };
         const char *invalid_action = "paged_codec_invalidate";
         const char *failure_action = "paged_codec_failed";
         try {
+            if constexpr(requires { Backend::decodable_blocks(payloads); })
+                payloads.resize(Backend::decodable_blocks(payloads));
+            if(payloads.empty()) { paged_cache_->record_match(0);return {}; }
+            if (payloads.size() != match.blocks.size()) {
+                match.blocks.resize(payloads.size());
+                match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
+            }
+            if constexpr(requires { Backend::token_count(payloads.front()); }) {
+                match.matched_tokens=0;
+                for(const auto& payload:payloads) {
+                    const auto count = Backend::token_count(payload);
+                    if (count == 0 || count > paged_cache_->block_size_tokens() ||
+                        count > limit - match.matched_tokens)
+                        throw StateError("invalid paged prefix token count");
+                    match.matched_tokens += count;
+                }
+            }
+            if (match.matched_tokens > limit)
+                throw StateError("paged prefix exceeds the requested prefix");
+            std::vector<int64_t> matched_tokens(
+                prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(match.matched_tokens));
             auto state =
                 Backend::decode(payloads, matched_tokens, paged_cache_->block_size_tokens());
+            if(mtp && (!mtp->supports_session_state() || !state.mtp)) {
+                paged_cache_->record_match(0);return {};
+            }
             invalid_action = "paged_restore_invalidate";
             failure_action = "paged_restore_failed";
             model.restore_text_session_state(state);
+            Restore restored{match.matched_tokens,{}};
+            if(mtp) {
+                mtp->restore_session_state(*state.mtp);
+                restored.mtp_last_target_hidden=state.mtp->last_target_hidden;
+            }
             if (native_hot_snapshots_)
                 snapshots_.store(requested_session.empty() ? "\x01prefix-" + std::to_string(++anonymous_snapshots_) : requested_session,
                     std::move(state), [](const Snapshot &saved, const Snapshot &candidate) {
@@ -314,7 +342,7 @@ template <class Backend> class SessionCache {
                           << " prefill_tokens=" << prompt.size() - match.matched_tokens
                           << std::endl;
             }
-            return match.matched_tokens;
+            return restored;
         } catch (const StateError &error) {
             return fail(invalid_action, error, true);
         } catch (const std::exception &error) {
@@ -327,11 +355,15 @@ template <class Backend> class SessionCache {
             return;
         }
         const auto block_size = paged_cache_->block_size_tokens();
-        const auto full_blocks = state.tokens.size() / block_size;
+        bool partial=false;
+        if constexpr(requires { Backend::partial_blocks(state); })partial=Backend::partial_blocks(state);
+        const auto full_blocks = state.tokens.size() / block_size + (partial && state.tokens.size()%block_size ? 1 : 0);
         if (full_blocks == 0)
             return;
 
         auto existing = paged_cache_->match(state.tokens, {}, false);
+        // A shorter tail cannot become the parent of a subsequent full block.
+        existing.blocks.resize(std::min(existing.blocks.size(),existing.matched_tokens/block_size));
         if (existing.blocks.size() > full_blocks) {
             throw std::runtime_error("paged prefix match exceeds the session state");
         }
@@ -341,13 +373,14 @@ template <class Backend> class SessionCache {
             parent = blocks.back();
         for (size_t index = blocks.size(); index < full_blocks; ++index) {
             const auto token_offset = index * block_size;
+            const auto count=std::min(block_size,state.tokens.size()-token_offset);
             auto payload = Backend::encode(state, block_size, index);
             parent = paged_cache_->store(
-                parent, state.tokens.data() + token_offset, block_size, std::move(payload));
+                parent, state.tokens.data() + token_offset, count, std::move(payload));
             blocks.push_back(parent);
         }
         if (!session_id.empty()) {
-            paged_bindings_.bind(session_id, std::move(blocks), full_blocks * block_size);
+            paged_bindings_.bind(session_id, std::move(blocks), partial?state.tokens.size():full_blocks * block_size);
         }
         if (trace_) {
             std::cerr << "runtime_session_cache action=paged_store "

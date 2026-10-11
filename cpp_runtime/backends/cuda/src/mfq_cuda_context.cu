@@ -60,7 +60,7 @@ std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
             candidate->limit=static_cast<std::size_t>(bytes);
         }
 #ifdef _WIN32
-        if(candidate->limit) {
+        {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
             cudaDeviceProp properties{};MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceProperties(&properties,device));
             if(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
@@ -72,7 +72,7 @@ std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
                         !std::memcmp(properties.luid,&description.AdapterLuid,8)) {item.As(&candidate->adapter);break;}
                 }
             }
-            if(!candidate->adapter)throw Error("CUDA VRAM limit requires the matching WDDM adapter");
+            if(candidate->limit && !candidate->adapter)throw Error("CUDA VRAM limit requires the matching WDDM adapter");
         }
 #endif
         budget=std::move(candidate);
@@ -649,6 +649,40 @@ std::size_t Context::local_memory_usage() const {
     return memory_stats().allocated;
 }
 
+std::size_t Context::resident_memory_usage() const {
+    DeviceGuard guard(device_);
+    auto bytes=memory_stats().allocated;
+    if(pool_) {
+        std::uint64_t used=0,reserved=0;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&used));
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&reserved));
+        // Allocated bytes already include live pool and graph allocations.
+        // Add only unused pages, never device-wide usage from other processes.
+        if(reserved>used)bytes+=reserved-used;
+    }
+    return std::max(bytes,local_memory_usage());
+}
+
+std::size_t Context::available_memory() const {
+    DeviceGuard guard(device_);
+    std::size_t free=0,total=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+    const auto budget=memory_stats();
+    if(budget.limit) {
+        const auto used=resident_memory_usage();
+        free=std::min(free,used<budget.limit?budget.limit-used:0);
+    }
+    return free;
+}
+
+void Context::reclaim_idle_memory() {
+    DeviceGuard guard(device_);
+    // Phase transitions must retire frees on all compute/transfer streams.
+    // Trimming unused pages leaves live graph-pool allocations untouched.
+    MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+    if(pool_)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+}
+
 void Context::check_memory_limit(std::size_t additional) const {
     if(!allocation_budget_->limit)return;
     auto usage=local_memory_usage();
@@ -723,8 +757,14 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     allocation_budget_->acquire(bytes);
     try {
-        const auto result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
+        auto result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
             : cudaMalloc(&pointer,bytes);
+        if(result==cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            reclaim_idle_memory();
+            result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
+                : cudaMalloc(&pointer,bytes);
+        }
         if(result==cudaErrorMemoryAllocation)
             throw Error("CUDA allocation failed: requested="+std::to_string(bytes)+
                 " allocated="+std::to_string(memory_stats().allocated));

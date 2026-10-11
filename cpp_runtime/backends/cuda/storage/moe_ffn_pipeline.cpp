@@ -654,6 +654,19 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     maximum=std::max(maximum,layer.second.second);
             const auto overlap=mfq::cuda::runtime_options::moe_prefill_layer_overlap();
             cache_->pipeline_prefill_layer_overlap_=!overlap || *overlap!=0;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+            // Strata sizes its transfer ring together with the compute
+            // workspace. A second layer image is optional under pressure.
+            const auto context=mfq::cuda::default_context(ids.get_device());
+            const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/2;
+            const auto available=context->available_memory();
+            if(cache_->pipeline_prefill_layer_overlap_ &&
+                (available<=reserve || std::size_t(maximum)>((available-reserve)/2))) {
+                cache_->pipeline_prefill_layer_overlap_=false;
+                std::cerr<<"runtime_prefill_ring slots=1 layer_bytes="<<maximum
+                    <<" available_bytes="<<available<<" compute_reserve_bytes="<<reserve<<'\n';
+            }
+#endif
             cache_->pipeline_prefill_layer_stride_=maximum;
             cache_->pipeline_prefill_layer_buffer_=tb::empty(
                 {maximum*(cache_->pipeline_prefill_layer_overlap_?2:1)},ids.options().dtype(tb::kUInt8));
@@ -2402,6 +2415,13 @@ public:
                 owner->prediction_cells_.erase(window);
             }};
     }
+    void register_idle_reclaimer() {
+        cache_->pipeline_decode_release_.push_back([owner=weak_from_this()] {
+            if(auto pipeline=owner.lock()) {
+                pipeline->cells_.clear();pipeline->prediction_cells_.clear();
+            }
+        });
+    }
     ~MoeFfnPipeline() {
         // A host error releases every graph wait. Drain both producers before
         // destroying mapped flags that a graph or DMA callback still uses.
@@ -2577,6 +2597,7 @@ MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>
     if(!gate_up[0]->cached_source->pipeline_enabled())return {};
     auto runtime=std::make_shared<MoeFfnPipeline>(std::array<std::shared_ptr<MoeCachedSource>,3>{
         gate_up[0]->cached_source,up->cached_source,down[0]->cached_source},std::move(shared),std::move(observer),std::move(shared_weights));
+    runtime->register_idle_reclaimer();
     if(prefetch)*prefetch=[runtime](const tb::Tensor& ids){return runtime->prediction(ids);};
     return [runtime](CudaExecutionContext& execution,const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights){
         return runtime->forward(execution,input,ids,weights);

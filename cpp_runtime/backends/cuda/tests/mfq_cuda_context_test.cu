@@ -88,6 +88,35 @@ int memory_pool_reuse_case() {
     return 0;
 }
 
+int memory_telemetry_case() {
+    constexpr auto mib=std::size_t(1024)*1024;
+    auto context=std::make_shared<mfq::cuda::Context>(0);
+    const auto stream=context->stream().get();
+    mfq::cuda::StreamGuard active(mfq::cuda::StreamHandle(0,stream));
+    context->begin_graph_pool(stream);
+    void* retained=nullptr;
+    {
+        mfq::cuda::GraphWarmupScope warm(context,stream);
+        mfq::cuda::Buffer graph(context,16*mib);retained=graph.data();
+    }
+    {mfq::cuda::Buffer temporary(context,32*mib);}
+    context->stream().synchronize();
+    if(context->memory_stats().allocated!=16*mib || context->resident_memory_usage()<16*mib)
+        throw std::runtime_error("memory telemetry lost retained graph allocations");
+    context->reclaim_idle_memory();
+    context->begin_graph_capture(stream);
+    {
+        mfq::cuda::Buffer replay(context,16*mib);
+        if(replay.data()!=retained)throw std::runtime_error("memory reclamation freed live graph storage");
+        MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(replay.data(),0,replay.size(),stream));
+    }
+    context->end_graph_capture(stream);context->stream().synchronize();
+    context->end_graph_pool(stream);context->reclaim_idle_memory();
+    if(context->memory_stats().allocated!=0)throw std::runtime_error("memory reclamation leaked graph storage");
+    std::cout<<"cuda_memory_telemetry retained_graph_reuse=PASS allocated_after_release=0\n";
+    return 0;
+}
+
 int main(int argc,char** argv) {
     int devices = 0;
     MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceCount(&devices));
@@ -96,6 +125,7 @@ int main(int argc,char** argv) {
     }
     if(argc==2 && std::string(argv[1])=="--memory-limit")return memory_limit_cases();
     if(argc==2 && std::string(argv[1])=="--memory-pool-reuse")return memory_pool_reuse_case();
+    if(argc==2 && std::string(argv[1])=="--memory-telemetry")return memory_telemetry_case();
 
     auto context = std::make_shared<mfq::cuda::Context>(0);
     mfq::cuda::Buffer device(context, sizeof(std::uint32_t) * 4);

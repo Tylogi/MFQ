@@ -822,6 +822,68 @@ bool Qwen4ExpMtp::target_bootstrap_decode() const noexcept { return true; }
 
 bool Qwen4ExpMtp::preserve_output_dtype() const noexcept { return true; }
 
+Qwen4BlockSessionState capture_block_session(const Qwen4Block& block,int64_t position,std::size_t& bytes) {
+    Qwen4BlockSessionState state;
+    const auto save=[&](const Tensor& tensor) {
+        MFQ_RUNTIME_CHECK(tensor.defined(),"Qwen4 recurrent session state is unavailable");
+        auto saved=tensor.clone();bytes+=session_tensor_bytes(saved);return saved;
+    };
+    if(block.qsa)block.qsa->capture_session(state,position,bytes);
+    if(block.gdn) {
+        const auto tensors=block.gdn->graph_state();
+        state.convolution=save(*tensors[0]);state.recurrent=save(*tensors[1]);
+    }
+    if(block.ple) {
+        state.ple_convolution=save(block.ple->conv_state());
+        const auto& context=block.ple->session_context();
+        state.ple_batch=context.batch;state.ple_tokens=context.tokens;
+        bytes+=state.ple_tokens.size()*sizeof(int64_t);
+    }
+    return state;
+}
+
+void restore_block_session(Qwen4Block& block,const Qwen4BlockSessionState& state,int64_t position) {
+    block.reset(1);
+    if(block.qsa)block.qsa->restore_session(state,position);
+    if(block.gdn)block.gdn->restore_session(state.convolution,state.recurrent);
+    if(block.ple)block.ple->restore_session(state.ple_convolution,{state.ple_batch,state.ple_tokens});
+}
+
+bool Qwen4ExpMtp::supports_session_state() const noexcept {
+    return execution && !execution->qsa_kv_store && !layers.empty();
+}
+
+MtpSessionState Qwen4ExpMtp::capture_session_state(int64_t target_position,const Tensor& hidden) const {
+    const auto position=target_position-1;
+    MFQ_RUNTIME_CHECK(supports_session_state() && position>0 && position<=cache_position() &&
+        hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
+        "Qwen4 MTP session boundary is unavailable");
+    MtpSessionState state;state.cache_pos=position;
+    for(std::size_t i=0;i<layers.size();++i) {
+        const auto count=std::min(position,lengths[i]);
+        state.qwen4_lengths.push_back(count);
+        state.qwen4_blocks.push_back(count?capture_block_session(*layers[i],count,state.bytes):Qwen4BlockSessionState{});
+        auto pos=count?positions[i].narrow(-1,0,count).clone():Tensor{};
+        state.bytes+=session_tensor_bytes(pos);state.qwen4_positions.push_back(std::move(pos));
+    }
+    state.last_target_hidden=hidden.clone();state.bytes+=session_tensor_bytes(state.last_target_hidden);
+    return state;
+}
+
+void Qwen4ExpMtp::restore_session_state(const MtpSessionState& state) {
+    MFQ_RUNTIME_CHECK(supports_session_state() && state.cache_pos>0 &&
+        state.qwen4_blocks.size()==layers.size() && state.qwen4_positions.size()==layers.size() &&
+        state.qwen4_lengths.size()==layers.size() && state.qwen4_lengths.front()==state.cache_pos &&
+        state.last_target_hidden.defined() && state.last_target_hidden.dim()==3 &&
+        state.last_target_hidden.size(0)==1 && state.last_target_hidden.size(1)==1 &&
+        state.last_target_hidden.size(2)==hidden_norm.numel(),"incompatible Qwen4 MTP session state");
+    reset(1);
+    for(std::size_t i=0;i<layers.size();++i)if(state.qwen4_lengths[i]) {
+        restore_block_session(*layers[i],state.qwen4_blocks[i],state.qwen4_lengths[i]);
+        positions[i]=state.qwen4_positions[i].clone();lengths[i]=state.qwen4_lengths[i];
+    }
+}
+
 } // namespace mfq::cuda::qwen4_exp
 
 namespace mfq::cuda {
@@ -1133,6 +1195,40 @@ void qwen4_finish_router_lookahead_audit(Qwen4CausalLm& model,const std::string&
     std::cout<<"router_lookahead_audit_samples="<<audit->samples()<<" layers="<<model.blocks.size()
         <<" hidden="<<model.config.hidden<<" experts="<<model.config.experts<<" topk="<<model.config.topk
         <<" scores=predicted_then_same_layer_oracle row_dtype=FP32\n";
+}
+
+std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
+        const Qwen4CausalLm& model,const MtpModule* mtp) {
+    // Shared checkpoint views and recurrent state aliases count once. These
+    // are existing cache tensors; collecting telemetry never copies GPU data.
+    std::map<std::pair<int,std::uintptr_t>,std::size_t> allocations;
+    const auto add=[&](const mfq_tensor_backend::Tensor& tensor) {
+        if(!tensor.defined() || !tensor.is_cuda())return;
+        auto& bytes=allocations[{tensor.get_device(),reinterpret_cast<std::uintptr_t>(tensor.data_ptr())}];
+        bytes=std::max(bytes,std::size_t(tensor.numel())*tensor.element_size());
+    };
+    const auto block_cache=[&](const qwen4_exp::Qwen4Block& block) {
+        if(block.qsa)for(const auto& tensor:block.qsa->resident_cache_tensors())add(tensor);
+        if(block.gdn)for(const auto* tensor:block.gdn->graph_state())add(*tensor);
+        if(block.ple)for(const auto* tensor:block.ple->graph_state())add(*tensor);
+    };
+    for(const auto& block:model.blocks)block_cache(static_cast<const qwen4_exp::Qwen4Block&>(*block));
+    add(model.positions);
+    if(model.graph_registry)for(const auto& [key,cell]:model.graph_registry->cells)
+        for(const auto& checkpoint:cell->checkpoints) {
+            add(checkpoint.gdn_conv);add(checkpoint.gdn_state);add(checkpoint.ple_conv);
+        }
+    if(const auto* predictor=dynamic_cast<const qwen4_exp::Qwen4ExpMtp*>(mtp)) {
+        for(const auto& block:predictor->layers)block_cache(*block);
+        for(const auto& positions:predictor->positions)add(positions);
+    }
+    std::size_t bytes=0;
+    for(const auto& [address,size]:allocations)bytes+=size;
+    if(model.execution->qsa_kv_store)
+        for(const auto& metric:model.execution->qsa_kv_store->metrics())
+            if(metric.first=="qsa_kv_resident_bytes")bytes+=std::size_t(metric.second);
+    return {{"kv_cache_bytes",double(bytes)},
+        {"kv_cache_contexts",model.cache_pos>0?double(model.batch):0.0}};
 }
 
 Qwen4Model::Qwen4Model() = default;
@@ -1491,7 +1587,36 @@ void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
 
 namespace mfq::cuda {
 
-template struct CudaSessionCodec<Qwen4Model>;
+TextSessionStateKind CudaSessionCodec<Qwen4Model>::kind(const Qwen4CausalLm& model) {
+    return model.execution && !model.execution->qsa_kv_store && !model.blocks.empty()
+        ? TextSessionStateKind::Qwen4 : TextSessionStateKind::Unsupported;
+}
+bool CudaSessionCodec<Qwen4Model>::supports_paged(const Qwen4CausalLm& model) { return kind(model)==TextSessionStateKind::Qwen4; }
+
+TextSessionState CudaSessionCodec<Qwen4Model>::capture(const Qwen4CausalLm& model,const std::vector<int64_t>& tokens) {
+    MFQ_RUNTIME_CHECK(kind(model)==TextSessionStateKind::Qwen4 && model.batch==1 && model.cache_pos>0 &&
+        std::size_t(model.cache_pos)==tokens.size() && model.speculative_start<0,
+        "Qwen4 text session boundary is unavailable");
+    TextSessionState state;state.tokens=tokens;state.cache_pos=model.cache_pos;
+    std::vector<Qwen4BlockSessionState> blocks;
+    for(const auto& block:model.blocks)blocks.push_back(qwen4_exp::capture_block_session(
+        static_cast<const qwen4_exp::Qwen4Block&>(*block),model.cache_pos,state.bytes));
+    state.payload=std::move(blocks);
+    state.qwen4_positions=model.positions.clone();state.bytes+=session_tensor_bytes(state.qwen4_positions);
+    return state;
+}
+
+void CudaSessionCodec<Qwen4Model>::restore(Qwen4CausalLm& model,const TextSessionState& state) {
+    const auto* blocks=std::get_if<std::vector<Qwen4BlockSessionState>>(&state.payload);
+    MFQ_RUNTIME_CHECK(kind(model)==TextSessionStateKind::Qwen4 && blocks && blocks->size()==model.blocks.size() &&
+        state.cache_pos>0 && std::size_t(state.cache_pos)==state.tokens.size() &&
+        state.qwen4_positions.defined() && state.qwen4_positions.size(-1)==state.cache_pos,
+        "incompatible Qwen4 text session state");
+    model.reset(1);
+    for(std::size_t i=0;i<blocks->size();++i)qwen4_exp::restore_block_session(
+        static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]),(*blocks)[i],state.cache_pos);
+    model.positions=state.qwen4_positions.clone();model.cache_pos=state.cache_pos;
+}
 
 } // namespace mfq::cuda
 
