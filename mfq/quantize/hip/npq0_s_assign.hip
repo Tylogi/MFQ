@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <vector>
+#include "../../kernels/hip/mfq_hip_compat.h"  // shfl
 
 namespace {
 
@@ -119,9 +120,9 @@ __global__ void npq0_s_assign_kernel(
         int best_index = entry;
         for (int shift = 4; shift > 0; shift >>= 1) {
             const float other_error =
-                __shfl_down_sync(0xffffffff, error, shift, 8);
+                __shfl_down(error, shift, 8);
             const int other_index =
-                __shfl_down_sync(0xffffffff, best_index, shift, 8);
+                __shfl_down(best_index, shift, 8);
             if ((lane & 7) < shift
                     && better(other_error, other_index, error, best_index)) {
                 error = other_error;

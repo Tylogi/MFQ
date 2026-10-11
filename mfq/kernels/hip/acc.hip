@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../hip/reduce.cuh"
+#include "mfq_hip_compat.h"  // bf16
 
 template <typename scalar_t>
 __global__ void acc_kernel(const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,

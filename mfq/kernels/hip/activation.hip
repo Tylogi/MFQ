@@ -18,7 +18,6 @@
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.
 // Ordinary tanhf is rewritten to the lower-accuracy tanh.approx instruction.
-extern "C" __device__ float __nv_tanhf(float);
 
 template <typename T>
 __device__ __forceinline__ float activation_as_float(T value) {
@@ -156,7 +155,7 @@ __global__ void gelu_mul_kernel(
             constexpr float kGeluA = 0.044715f;
             constexpr float kSqrt2OverPi = 0.79788456080286535587989211986876f;
             value = u * (0.5f * g *
-                (1.0f + __nv_tanhf(kSqrt2OverPi * g * (1.0f + kGeluA * g * g))));
+                (1.0f + tanhf(kSqrt2OverPi * g * (1.0f + kGeluA * g * g))));
         } else {
             value = mfq_glu<true>(g, u);
         }

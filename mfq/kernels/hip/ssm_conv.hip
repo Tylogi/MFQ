@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../hip/reduce.cuh"
+#include "mfq_hip_compat.h"  // shfl
 
 constexpr int SSM_CONV_BD = 256;
 

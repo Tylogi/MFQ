@@ -5,6 +5,7 @@
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "mfq_hip_compat.h"  // shfl
 
 
 namespace {
@@ -359,8 +360,7 @@ __global__ void nepq_sparse_residual_backward_transpose_kernel(
         const unsigned rotate_active = __activemask();
 #pragma unroll
         for (int stride = 1; stride < 8; stride <<= 1) {
-            const float other = __shfl_xor_sync(
-                rotate_active, value, stride, 8);
+            const float other = __shfl_xor(value, stride, 8);
             value = (component & stride) ? other - value : value + other;
         }
         value *= 0.3535533905932738f *

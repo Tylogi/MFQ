@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../hip/reduce.cuh"
+#include "mfq_hip_compat.h"  // bf16
 
 constexpr int NORM_BD = 256;
 

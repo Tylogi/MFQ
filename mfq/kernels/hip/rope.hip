@@ -272,7 +272,7 @@ std::vector<mfq_tensor_backend::Tensor> rotary_normalized_grouped_cuda(
     } else {
         if(inputs[0].scalar_type()==tb::kFloat32)
            hipLaunchKernelGGL(( rotary_normalized_grouped_kernel<float>), dim3(unsigned(rows)),dim3(threads),0,mfq_current_cuda_stream(), group);
-        elsehipLaunchKernelGGL(( rotary_normalized_grouped_kernel<__half>), dim3(unsigned(rows)),dim3(threads),0,mfq_current_cuda_stream(), group);
+        else hipLaunchKernelGGL(( rotary_normalized_grouped_kernel<__half>), dim3(unsigned(rows)),dim3(threads),0,mfq_current_cuda_stream(), group);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return outputs;

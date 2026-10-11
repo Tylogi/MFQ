@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <vector>
+#include "../../kernels/hip/mfq_hip_compat.h"  // shfl
 
 namespace {
 
