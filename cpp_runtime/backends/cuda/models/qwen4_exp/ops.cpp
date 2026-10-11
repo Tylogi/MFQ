@@ -1282,7 +1282,10 @@ struct Qwen4BatchRequestState::Impl {
     }
     std::size_t growth_bytes(int64_t tokens) const {
         std::size_t bytes = 0;
-        for (const auto& layer : layers) if (layer.qsa) bytes += layer.qsa->growth_bytes(tokens);
+        for (const auto& layer : layers) {
+            if (layer.qsa) bytes += layer.qsa->growth_bytes(tokens);
+            if (layer.gdn) bytes += layer.gdn->growth_bytes();
+        }
         return bytes;
     }
 };
@@ -1303,6 +1306,9 @@ Qwen4BatchRequestState::Qwen4BatchRequestState(Qwen4CausalLm& model)
 }
 Qwen4BatchRequestState::~Qwen4BatchRequestState() = default;
 int64_t Qwen4BatchRequestState::position() const { return state_->cache_position; }
+std::size_t Qwen4BatchRequestState::prefill_growth_bytes(int64_t tokens) const {
+    return state_->growth_bytes(tokens);
+}
 std::size_t Qwen4BatchRequestState::resident_bytes() const {
     std::map<std::pair<int,std::uintptr_t>,std::size_t> allocations;
     const auto add = [&](const mfq_tensor_backend::Tensor& tensor) {
@@ -1535,6 +1541,70 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         ++state.cache_position;
     }
     return graph.logits;
+}
+
+std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(Qwen4CausalLm& model,
+        const std::vector<Qwen4BatchRequestState*>& requests,
+        const std::vector<mfq_tensor_backend::Tensor>& chunks) {
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(!requests.empty() && requests.size()==chunks.size(),"invalid packed prefill rows");
+    auto& execution = *model.execution;
+    model.adapter_begin_forward(false);
+    std::vector<int64_t> offsets{0};
+    std::vector<tb::Tensor> current,full;
+    for (std::size_t row=0;row<requests.size();++row) {
+        const auto& state=*requests[row]->state_;
+        const auto& ids=chunks[row];
+        MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)==1 && ids.size(1)>0 &&
+            ids.size(1)<=model.max_position_embeddings()-state.cache_position,"invalid packed prefill chunk");
+        auto positions=tb::arange(ids.size(1),ids.options())+state.cache_position;
+        current.push_back(positions);
+        full.push_back(state.positions.defined()?tb::cat({state.positions,positions},-1):positions);
+        offsets.push_back(offsets.back()+ids.size(1));
+    }
+    auto ids=tb::cat(chunks,1);
+    auto host_ids=ids.to(tb::kCPU);
+    const auto tokens=offsets.back();
+    auto hidden=model.adapter_prepare_hidden(model.embed_tokens(ids),1,tokens);
+    for (std::size_t i=0;i<model.blocks.size();++i) {
+        NintPrefillDecodeCacheScope decode_reuse(true);
+        auto& block=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
+        if (block.ple) {
+            std::vector<tb::Tensor> positional;
+            for (std::size_t row=0;row<requests.size();++row) {
+                auto x=hidden.narrow(1,offsets[row],chunks[row].size(1));
+                positional.push_back(x+requests[row]->state_->layers[i].ple->forward(
+                    execution,x,chunks[row],true,0,host_ids.narrow(1,offsets[row],chunks[row].size(1))));
+            }
+            hidden=tb::cat(positional,1);
+        }
+        auto mix=block.attention_gr.pre(execution,hidden);
+        const auto projections=block.gdn?block.gdn->project_inputs(execution,mix[0])
+                                         :block.qsa->project_inputs(execution,mix[0]);
+        std::vector<tb::Tensor> attended;
+        for (std::size_t row=0;row<requests.size();++row) {
+            auto& layer=requests[row]->state_->layers[i];
+            auto branch=mix[0].narrow(1,offsets[row],chunks[row].size(1));
+            std::vector<tb::Tensor> projected;
+            for (const auto& value:projections)
+                projected.push_back(value.narrow(1,offsets[row],chunks[row].size(1)));
+            attended.push_back(layer.gdn?layer.gdn->forward_chunk(execution,branch,true,std::move(projected),false)
+                :layer.qsa->forward(execution,branch,current[row],full[row],true,nullptr,std::move(projected),false));
+        }
+        auto attention=tb::cat(attended,1);
+        attention=block.gdn?block.gdn->project_output(execution,attention):block.qsa->project_output(execution,attention);
+        auto ffn_mix=block.ffn_gr.pre_after(execution,std::move(attention),mix);
+        // All prompt tokens share each expert transfer and compressed decode.
+        hidden=block.ffn_gr.post(block.ffn(execution,ffn_mix[0]),ffn_mix);
+    }
+    hidden=model.finalize_hidden(std::move(hidden),1,tokens);
+    std::vector<tb::Tensor> result;
+    for (std::size_t row=0;row<requests.size();++row) {
+        result.push_back(hidden.narrow(1,offsets[row+1]-1,1));
+        requests[row]->state_->positions=std::move(full[row]);
+        requests[row]->state_->cache_position+=chunks[row].size(1);
+    }
+    return result;
 }
 
 mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,

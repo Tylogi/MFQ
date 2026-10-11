@@ -86,6 +86,7 @@ struct FlashNextBatchRequest : mfq::engine::BatchRequest {
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     std::unique_ptr<Qwen4BatchRequestState> cache;
     int64_t decode_row = -1;
+    double packed_prefill_ms = 0;
 };
 class FlashNextBatchOperations {
   public:
@@ -101,6 +102,10 @@ class FlashNextBatchOperations {
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
+    std::size_t prefill_batch_limit() const;
+    int64_t prefill_batch_token_budget() const;
+    std::vector<mfq::engine::PrefillBatchResult<Sample>> prefill_batch(
+        const std::vector<std::pair<std::shared_ptr<Request>,mfq::engine::PrefillChunk>>&);
     void activate(const std::shared_ptr<Request>&, const Sample&);
     void resume_decode(int64_t);
     void discard_prefill(const std::shared_ptr<Request>&);
@@ -112,12 +117,15 @@ class FlashNextBatchOperations {
     static constexpr bool isolate_prefill_failures = true;
     static constexpr bool isolate_context_growth_failures = true;
   private:
+    void initialize_prefill(const std::shared_ptr<Request>&,mfq::engine::PrefillChunk);
+    Sample finish_prefill(const std::shared_ptr<Request>&,Tensor next);
     Qwen4CausalLm& model_;
     CudaExecutionContext& execution_;
     CudaContinuousBatchConfig config_;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
+    int64_t packed_prefill_batches_ = 0, packed_prefill_requests_ = 0, packed_prefill_tokens_ = 0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<
     std::is_same_v<Model,Qwen4CausalLm>, FlashNextBatchOperations, QwenBatchOperations>;

@@ -26,6 +26,11 @@ template <class Request> struct BatchState {
     std::vector<std::shared_ptr<Request>> active;
 };
 
+template <class Sample> struct PrefillBatchResult {
+    Sample sample;
+    std::exception_ptr failure;
+};
+
 // Groups pending numerical operations. All rows run generate_sequence(), also
 // used by B=1 execution; this component never accepts tokens or publishes events.
 template <class Ops> class ContinuousBatch {
@@ -39,7 +44,7 @@ template <class Ops> class ContinuousBatch {
         std::exception_ptr failure;
         bool decode = false, active = false;
     };
-    int64_t prefill_chunk_size;
+    int64_t prefill_chunk_size, prefill_token_budget;
     Ops operations;
     State state;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
@@ -107,7 +112,7 @@ template <class Ops> class ContinuousBatch {
   public:
     template <class... Args>
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
-        : prefill_chunk_size(std::min(chunk_size, token_budget)),
+        : prefill_chunk_size(std::min(chunk_size, token_budget)), prefill_token_budget(token_budget),
           operations(std::forward<Args>(args)...) {
         if (prefill_chunk_size <= 0)
             throw std::invalid_argument("continuous batching requires a positive prefill chunk");
@@ -149,6 +154,7 @@ template <class Ops> class ContinuousBatch {
             [](const auto& request) { return request->eligible; });
         bool prefilling_operation = false;
         bool decoding_operation = false;
+        std::vector<std::shared_ptr<Work>> prefill_work;
         try {
             if (has_decode && (prefill == requests.end() || decode_next)) {
                 decoding_operation = true;
@@ -161,26 +167,62 @@ template <class Ops> class ContinuousBatch {
                     work.decode = false;
                 }
             } else if (prefill != requests.end()) {
-                auto& work = *prefill->second;
-                auto& request = work.request;
-                const auto chunk = *work.prefill;
+                prefill_work.push_back(prefill->second);
+                using Item = std::pair<std::shared_ptr<Request>, PrefillChunk>;
+                std::vector<Item> items{{prefill->second->request, *prefill->second->prefill}};
+                if constexpr (requires { operations.prefill_batch_limit(); operations.prefill_batch(items); }) {
+                    auto budget=prefill_token_budget;
+                    if constexpr(requires {operations.prefill_batch_token_budget();})
+                        budget=std::min(budget,operations.prefill_batch_token_budget());
+                    auto remaining = budget - items.front().second.count;
+                    const auto limit = operations.prefill_batch_limit();
+                    for (const auto& id : eligible) {
+                        auto it = requests.find(id);
+                        if (it == requests.end() || !it->second->prefill ||
+                            std::find(prefill_work.begin(),prefill_work.end(),it->second) != prefill_work.end()) continue;
+                        const auto chunk = *it->second->prefill;
+                        if (items.size() >= limit || chunk.count > remaining) continue;
+                        remaining -= chunk.count;
+                        prefill_work.push_back(it->second);
+                        items.emplace_back(it->second->request,chunk);
+                    }
+                }
                 operations.suspend_decode();
                 PrefillActivity prefill_activity;
                 prefilling_operation = true;
-                auto sample = operations.prefill(request, chunk);
+                std::vector<PrefillBatchResult<Sample>> samples;
+                if constexpr (requires { operations.prefill_batch(items); }) {
+                    if (items.size() > 1) samples = operations.prefill_batch(items);
+                }
+                if (samples.empty()) {
+                    const auto& [request,chunk]=items.front();
+                    samples.push_back({operations.prefill(request, chunk),{}});
+                }
                 prefilling_operation = false;
-                request->prefill_offset = chunk.offset + chunk.count;
-                ++prefill_chunks;
-                if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
-                    request->cache_length = request->prompt.size();
-                    operations.activate(request, sample);
-                    state.active.push_back(request);
-                    work.active = true;
-                    ++admissions;
-                } else ++prefill_yields;
+                if (samples.size() != items.size()) throw std::runtime_error("invalid packed prefill result count");
+                for (std::size_t row = 0; row < items.size(); ++row) {
+                    auto& work = *prefill_work[row];
+                    auto& request = work.request;
+                    auto& result = samples[row];
+                    const auto chunk = items[row].second;
+                    if (result.failure) {
+                        work.failure = result.failure;
+                        operations.discard_prefill(request);
+                    } else {
+                        request->prefill_offset = chunk.offset + chunk.count;
+                        ++prefill_chunks;
+                        if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
+                            request->cache_length = request->prompt.size();
+                            operations.activate(request,result.sample);
+                            state.active.push_back(request);
+                            work.active = true;
+                            ++admissions;
+                        } else ++prefill_yields;
+                        work.result = std::move(result.sample);
+                    }
+                    work.prefill.reset();
+                }
                 operations.resume_decode(cache_position());
-                work.result = std::move(sample);
-                work.prefill.reset();
             }
             decode_next = !decode_next;
         } catch (...) {
@@ -210,12 +252,14 @@ template <class Ops> class ContinuousBatch {
             }
             if constexpr (requires { Ops::isolate_prefill_failures; }) {
                 if (Ops::isolate_prefill_failures && prefilling_operation && prefill != requests.end()) {
-                    auto& work = *prefill->second;
-                    work.failure = std::current_exception();
-                    work.prefill.reset();
-                    work.decode = false;
+                    const auto error = std::current_exception();
                     try {
-                        operations.discard_prefill(work.request);
+                        for (const auto& work : prefill_work) {
+                            work->failure = error;
+                            work->prefill.reset();
+                            work->decode = false;
+                            operations.discard_prefill(work->request);
+                        }
                         operations.resume_decode(cache_position());
                         return;
                     } catch (...) { recover(std::current_exception()); throw; }

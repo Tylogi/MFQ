@@ -120,6 +120,8 @@ public:
         struct Task {
             std::thread thread;
             std::shared_ptr<std::atomic<bool>> done;
+            std::shared_ptr<std::atomic<bool>> submitted;
+            std::string id;
         };
         std::vector<Task> tasks;
 
@@ -311,6 +313,8 @@ public:
                 if (op == "request.cancel") {
                     const std::string target = params.value(
                         "target_id", std::string());
+                    for(const auto& task:tasks) if(task.id==target)
+                        task.submitted->wait(false,std::memory_order_acquire);
                     const bool cancelled = scheduler.cancel_request(target);
                     if (!id.empty()) {
                         send_result(id, {
@@ -835,13 +839,18 @@ public:
                         body["mfq_multimodal"]);
                 }
                 RequestWork work = std::move(input);
-                auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
                 auto done = std::make_shared<std::atomic<bool>>(false);
+                auto submitted = std::make_shared<std::atomic<bool>>(false);
                 tasks.push_back({
                     std::thread([
-                        &, id, work = std::move(work), completion, done
+                        &, id, work = std::move(work), done, submitted
                     ]() mutable {
                         try {
+                            // Admission can wait for a GPU quantum. Keep the
+                            // protocol reader available for concurrent arrivals.
+                            auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
+                            submitted->store(true,std::memory_order_release);
+                            submitted->notify_all();
                             const std::string response_id =
                                 request_id("run-");
                             const int64_t created = unix_time_seconds();
@@ -903,13 +912,19 @@ public:
                             send_error(
                                 id, 400, input_error_type(error.code),
                                 error.what());
+                        } catch (const std::invalid_argument& error) {
+                            send_error(id,400,"invalid_request_error",error.what());
                         } catch (const std::exception & error) {
                             send_error(
                                 id, 500, "server_error", error.what());
                         }
+                        submitted->store(true,std::memory_order_release);
+                        submitted->notify_all();
                         done->store(true, std::memory_order_release);
                     }),
                     done,
+                    submitted,
+                    id,
                 });
             } catch (const ApiError & error) {
                 send_error(id, error.status, error.type, error.what());
@@ -925,6 +940,7 @@ public:
             }
         }
 
+        for(const auto& task:tasks)task.submitted->wait(false,std::memory_order_acquire);
         scheduler.cancel_all();
         close_realtime("");
         reap_tasks(true);

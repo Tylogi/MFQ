@@ -140,6 +140,13 @@ bool batch_attention_projections() {
     const auto* value=std::getenv("MFQ_BATCH_ATTENTION_PROJECTIONS");
     return !value || value[0]!='0';
 }
+bool batch_packed_prefill() {
+    const auto* value=std::getenv("MFQ_BATCH_PACKED_PREFILL");
+    return !value || value[0]!='0';
+}
+int batch_packed_prefill_token_budget() {
+    return environment_int("MFQ_BATCH_PACKED_PREFILL_TOKEN_BUDGET",512,16,8192);
+}
 bool nint_compressed_decode_batch() {
     // Keep the faster GEMM dispatch while tuning the online Tensor Core path.
     return exact_one("MFQ_NINT_COMPRESSED_DECODE_BATCH");

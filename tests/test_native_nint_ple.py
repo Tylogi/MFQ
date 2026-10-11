@@ -523,6 +523,8 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     metrics = dict(field.split("=", 1) for field in state.split()[1:])
     assert int(metrics["captures"]) > 0
     assert int(metrics["replays"]) > int(metrics["captures"])
+    if os.environ.get("MFQ_BATCH_PACKED_PREFILL") != "0":
+        assert int(metrics["packed_prefills"]) > 0
 
 
 @pytest.mark.parametrize("requests", [2, 32])
@@ -571,6 +573,8 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                 assert status["continuous_batching_admissions"] == 2 * requests
                 assert status["continuous_batching_cuda_graph_replays"] > 0
                 assert status["continuous_batching_batched_greedy_batches"] > 0
+                if requests == 32 and os.environ.get("MFQ_BATCH_PACKED_PREFILL") != "0":
+                    assert status["continuous_batching_packed_prefill_batches"] > 0
                 assert status["continuous_batching_decode_tokens"] > status["continuous_batching_decode_batches"]
                 assert status["continuous_batching_active"] == 0
                 assert status["kv_cache_bytes"] == 0
@@ -582,6 +586,35 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                 await process.wait()
 
     asyncio.run(asyncio.wait_for(run(),30))
+
+
+@pytest.mark.parametrize("cancel",[False,True])
+def test_cuda_flash_next_stdio_eof_cancels_concurrent_admissions(tmp_path,cancel):
+    from mfq.server.runtime.client import _runtime_generate_params
+
+    executable=os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _,model=_models(tmp_path,qsa=True,ple_layer=3,context_size=512,quantized_experts=True)
+    tokenizer=_worker_tokenizer(tmp_path)
+    params=_runtime_generate_params({"messages":[{"role":"user","content":"aa"}],
+        "temperature":0,"top_k":1,"max_tokens":128,"stream":True})
+    commands=[{"v":1,"id":f"eof-{row}","op":"generate","params":params} for row in range(32)]
+    if cancel:
+        commands.extend({"v":1,"id":f"cancel-{row}","op":"request.cancel",
+            "params":{"target_id":f"eof-{row}"}} for row in range(32))
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    result=subprocess.run([executable,"--model",str(model),"--tokenizer",str(tokenizer),
+        "--transport","stdio","--ctx-size","512","--continuous-batching","32",
+        "--moe-gpu-cache-gb","0.00004"],
+        input="".join(json.dumps(command)+"\n" for command in commands),
+        capture_output=True,text=True,env=environment,timeout=15)
+    assert result.returncode==0,result.stderr
+    frames=[json.loads(line) for line in result.stdout.splitlines()]
+    terminals=[frame for frame in frames if frame["type"] in {"done","error"}]
+    assert sorted(frame["id"] for frame in terminals)==sorted(f"eof-{row}" for row in range(32))
+    assert not any(frame["type"]=="error" for frame in frames)
 
 
 def test_cuda_dense_fixture_matches_canonical_nint_rows(tmp_path):

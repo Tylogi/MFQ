@@ -253,13 +253,26 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
                     terminals[ids[row]] == 1,"parallel context growth differs from serial oracle");
             std::cout << "continuous_batching_growth_check requests=" << requests << " boundary=256 PASS\n";
         }
-        double captures = 0, replays = 0;
+        double captures = 0, replays = 0, packed_prefills = 0;
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            std::vector<RequestId> ids;
+            for(int row=0;row<requests;++row) {
+                ids.push_back("packed"+std::to_string(row));
+                admit(ids.back(),row%2?second_prompt:first_prompt);
+            }
+            for(int ticks=0;ticks<500 && !executor.empty();++ticks)tick(ids);
+            MFQ_RUNTIME_CHECK(executor.empty(),"packed prefill requests did not finish");
+            for(int row=0;row<requests;++row)
+                MFQ_RUNTIME_CHECK(tokens[ids[row]]==(row%2?second_reference:first_reference) &&
+                    terminals[ids[row]]==1,"packed prefill differs from serial oracle");
+        }
         for (const auto& [key, value] : batcher.metrics()) {
             if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");
             if (key == "continuous_batching_active" || key == "continuous_batching_prefilling")
                 MFQ_RUNTIME_CHECK(value == 0, "batch retained finished requests");
             if (key == "continuous_batching_cuda_graph_captures") captures = value;
             if (key == "continuous_batching_cuda_graph_replays") replays = value;
+            if (key == "continuous_batching_packed_prefill_batches") packed_prefills = value;
         }
         if constexpr (std::is_same_v<Model,Qwen35CausalLm>)
             if (config.continuous_batch.greedy &&
@@ -267,6 +280,7 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
                 MFQ_RUNTIME_CHECK(captures > 0 && replays > captures, "batch graph was not replayed");
         std::cout << "continuous_batching_state_check paged=" << config.continuous_batch.paged_kv
             << " captures=" << captures << " replays=" << replays
+            << " packed_prefills=" << packed_prefills
             << " prefill_cancel=1 slot_reuse=1\n";
     }
     MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};

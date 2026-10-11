@@ -26,14 +26,21 @@ class Qwen4BatchRequestState {
     mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor);
     int64_t position() const;
     std::size_t resident_bytes() const;
+    std::size_t prefill_growth_bytes(int64_t tokens) const;
   private:
     struct Impl;
     std::unique_ptr<Impl> state_;
     friend class Qwen4BatchDecodeGraph;
+    friend std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
+        Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
+        const std::vector<mfq_tensor_backend::Tensor>&);
     friend mfq_tensor_backend::Tensor qwen4_batch_decode(
         Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
         mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&);
 };
+std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
+    Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
+    const std::vector<mfq_tensor_backend::Tensor>&);
 mfq_tensor_backend::Tensor qwen4_batch_decode(
     Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
     mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids);

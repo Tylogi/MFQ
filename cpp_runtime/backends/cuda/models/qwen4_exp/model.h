@@ -68,6 +68,10 @@ class Gdn {
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
+    std::size_t growth_bytes() const {
+        return (conv_.defined() ? 0 : std::size_t(kernel_-1)*(2*nk_+nv_)*d_*sizeof(float)) +
+            (state_.defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
+    }
     void restore_session(const Tensor& convolution,const Tensor& recurrent) {
         MFQ_RUNTIME_CHECK(convolution.defined() && recurrent.defined(),"missing Qwen4 GDN session state");
         reset();conv_=convolution.clone();state_=recurrent.clone();
@@ -798,15 +802,17 @@ class Qsa {
     }
     Tensor forward(CudaExecutionContext &execution, const Tensor &hidden,
                    const Tensor &current_positions, const Tensor &full_positions, bool use_cache,
-                   std::vector<Tensor> *selection_trace = nullptr) {
+                   std::vector<Tensor> *selection_trace = nullptr,
+                   std::vector<Tensor> projections = {}, bool project_output = true) {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
                               hidden.size(1) > 0,
                           "Qwen4 QSA requires nonempty [B,T,H] input");
         if (offload_ && use_cache)
-            return forward_offloaded(execution, hidden, current_positions, full_positions, selection_trace);
+            return forward_offloaded(execution, hidden, current_positions, full_positions, selection_trace,
+                                     std::move(projections),project_output);
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
         const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
-        const bool fused_prefill=t>8 && (!prefill_option || *prefill_option!=0);
+        const bool fused_prefill=!projections.empty() || (t>8 && (!prefill_option || *prefill_option!=0));
         MFQ_RUNTIME_CHECK(
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),
@@ -815,7 +821,7 @@ class Qsa {
             offset + t, c_.budget, use_cache,
             [&] {
                 if(fused_prefill)
-                    return project(execution,hidden,current_positions,offset+t>c_.budget);
+                    return project(execution,hidden,current_positions,offset+t>c_.budget,{},{},{},std::move(projections));
                 auto pair = w_.query(execution, hidden).reshape({b, t, c_.heads, 2 * c_.width});
                 auto gate = pair.narrow(-1, c_.width, c_.width);
                 auto query = rms_norm(pair.narrow(-1, 0, c_.width),
@@ -878,8 +884,8 @@ class Qsa {
             },
             [&](Tensor attended, const Projection &p) {
                 auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
-                return w_.output(
-                    execution, gated.reshape({b, t, c_.heads * c_.width}).to(hidden.scalar_type()));
+                auto result = gated.reshape({b, t, c_.heads * c_.width}).to(hidden.scalar_type());
+                return project_output ? w_.output(execution,result) : result;
             },
             [&] { truncate(offset); });
     }
@@ -887,7 +893,8 @@ class Qsa {
   private:
     struct Projection {Tensor gate,query,key,value,iq,raw;bool cache_written=false;};
     Tensor forward_offloaded(CudaExecutionContext& execution, const Tensor& hidden,
-        const Tensor& positions, const Tensor& full_positions, std::vector<Tensor>* trace) {
+        const Tensor& positions, const Tensor& full_positions, std::vector<Tensor>* trace,
+        std::vector<Tensor> projections={},bool project_output=true) {
         const auto offset = position(), tokens = hidden.size(1), length = offset + tokens;
         MFQ_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
             "streamed QSA requires one sequence within its configured context");
@@ -896,7 +903,7 @@ class Qsa {
         const auto row_bytes = std::size_t(row_width) * 4;
         MFQ_RUNTIME_CHECK(std::size_t(max_keys) * row_bytes <= offload_->config().buffer_bytes / 4,
             "QSA I/O buffer cannot hold one selected context; increase the resident KV budget");
-        auto p = project(execution, hidden, positions, length > c_.budget);
+        auto p = project(execution, hidden, positions, length > c_.budget,{},{},{},std::move(projections));
         try {
             offloaded_kv_->append(tb::cat({p.key.reshape({tokens, row_width}), p.value.reshape({tokens, row_width})}, 1));
             offloaded_index_->append(p.raw.reshape({tokens, c_.index_width}));
@@ -963,7 +970,8 @@ class Qsa {
             }
             auto attended = tb::cat(outputs, 1);
             auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
-            return w_.output(execution, gated.reshape({1, tokens, c_.heads * c_.width}).to(hidden.scalar_type()));
+            auto result=gated.reshape({1, tokens, c_.heads * c_.width}).to(hidden.scalar_type());
+            return project_output?w_.output(execution,result):result;
         } catch (...) { truncate(offset); throw; }
     }
     Tensor project_norm(const Tensor& value,const Tensor& weight) {
