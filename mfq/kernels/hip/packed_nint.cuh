@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include "../hip/glu.cuh"
+#include "mfq_hip_compat.h"
 
 namespace mfq::cuda::packed_nint {
 __device__ __forceinline__ uint8_t unpack_nint_code(

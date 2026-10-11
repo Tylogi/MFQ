@@ -2,9 +2,16 @@
 #include "hip/hip_runtime.h"
 #pragma once
 
-#include "ggml_hip.h"
-#include "ggml-impl_hip.h"
-#include "ggml-hip.h"
+#ifndef GGML_CUDA_MAX_DEVICES
+#define GGML_CUDA_MAX_DEVICES 16
+#endif
+#ifndef GGML_CUDA_NAME
+#define GGML_CUDA_NAME "HIP"
+#endif
+#include "vendors/cuda_fp16.h"
+#include "vendors/cuda_bf16.h"
+#include "ggml.h"
+#include "ggml-impl.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -22,7 +29,7 @@
 #define GGML_COMMON_IMPL_MUSA
 #endif
 #endif
-#include "ggml-common_hip.h"
+#include "../ggml-common.h"
 
 #include <array>
 #include <algorithm>

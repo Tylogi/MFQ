@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include "../../hip/include/mfq_tensor_backend.h"
+#include "mfq_hip_compat.h"
 
 
 namespace {

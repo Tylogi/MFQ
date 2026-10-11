@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
     mfq_tensor_backend::Tensor x,

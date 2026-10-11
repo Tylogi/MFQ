@@ -8,7 +8,7 @@
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
-#include "cuda_execution.h"
+#include "hip_execution.h"
 #include "qwen35/linear_attention.h"
 #include "mfq/kernels/hip/deepseek_v41.h"
 #include "nlohmann/json.hpp"
@@ -67,7 +67,7 @@ static int run_prefill_sweep(
         for (int warmup = 0; warmup < 2; ++warmup) {
             model.reset(1);
             (void)model.last_logits(ids);
-            mfq_cuda_synchronize();
+            mfq_hip_synchronize();
         }
 
         std::vector<double> elapsed_ms;
@@ -77,7 +77,7 @@ static int run_prefill_sweep(
             model.reset(1);
             auto started = std::chrono::steady_clock::now();
             auto logits = model.last_logits(ids);
-            mfq_cuda_synchronize();
+            mfq_hip_synchronize();
             auto ended = std::chrono::steady_clock::now();
             elapsed_ms.push_back(std::chrono::duration<double, std::milli>(ended - started).count());
             if (repeat == 0) top = logits.argmax(-1).template item<int64_t>();
@@ -131,7 +131,7 @@ static int run_block_trace_compare(
     reference.reset(ids.size(0));
     auto reference_hidden = reference.hidden_forward(
         ids, mfq_nullopt, mfq_nullopt, &reference_trace);
-    mfq_cuda_synchronize();
+    mfq_hip_synchronize();
 
     if (test_trace.size() != reference_trace.size()) {
         throw std::runtime_error("block trace stage count mismatch");
@@ -220,7 +220,7 @@ static int run_block_trace_dump(
     std::vector<mfq_tensor_backend::Tensor> trace;
     auto final_hidden = model.hidden_forward(
         ids, mfq_nullopt, mfq_nullopt, &trace);
-    mfq_cuda_synchronize();
+    mfq_hip_synchronize();
 
     auto ids_cpu = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32).contiguous();
     {
@@ -334,7 +334,7 @@ static int run_dsv4_hc_model_compare(
         *model.execution, repeat_hidden)
         .to(mfq_tensor_backend::kFloat32);
     g_dsv4_fused_hc = true;
-    mfq_cuda_synchronize();
+    mfq_hip_synchronize();
 
     if (reference_trace.size() != candidate_trace.size() ||
             reference_trace.size() != repeat_trace.size()) {

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 mfq_tensor_backend::Tensor dsv4_compress_cuda(
     mfq_tensor_backend::Tensor kv,

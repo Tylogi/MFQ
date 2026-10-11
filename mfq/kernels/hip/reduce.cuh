@@ -4,6 +4,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include "mfq_hip_compat.h"
 
 __device__ __forceinline__ float warp_sum(float v)
 {

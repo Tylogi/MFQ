@@ -32,6 +32,44 @@
 
 // CUDA bf16 conversion intrinsic absent from hip_bf16.h. HIP's
 // __float2bfloat16 already rounds to nearest even.
+// Ballot over the wave, truncated to the low 32 lanes, which matches the
+// 32-lane warp groups of the translated CUDA code.
+#if !defined(MFQ_HIP_COMPAT_BALLOT)
+#define MFQ_HIP_COMPAT_BALLOT
+#define __ballot_sync(mask, predicate) ((unsigned)__ballot(predicate))
+#endif
+
+// ROCm does not provide CUDA's __dp4a intrinsic; emulate it in device code.
+#if !defined(MFQ_HIP_COMPAT_DP4A)
+#define MFQ_HIP_COMPAT_DP4A
+__device__ __forceinline__ int __dp4a(int a, int b, int c) {
+    const signed char* av = reinterpret_cast<const signed char*>(&a);
+    const signed char* bv = reinterpret_cast<const signed char*>(&b);
+    return c + av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2] + av[3] * bv[3];
+}
+#endif
+
+// CUDA SIMD per-byte subtract (modular, no saturation) absent from HIP.
+// CUDA backoff intrinsic absent from HIP; map to the GCN sleep instruction.
+#if !defined(MFQ_HIP_COMPAT_NANOSLEEP)
+#define MFQ_HIP_COMPAT_NANOSLEEP
+#define __nanosleep(nanoseconds) \
+    __builtin_amdgcn_s_sleep(static_cast<unsigned>((nanoseconds) / 64u + 1u))
+#endif
+
+#if !defined(MFQ_HIP_COMPAT_VSUB4)
+#define MFQ_HIP_COMPAT_VSUB4
+__device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
+    const unsigned char* av = reinterpret_cast<const unsigned char*>(&a);
+    const unsigned char* bv = reinterpret_cast<const unsigned char*>(&b);
+    unsigned char out[4];
+    for (int i = 0; i < 4; ++i) out[i] = static_cast<unsigned char>(av[i] - bv[i]);
+    unsigned int result;
+    __builtin_memcpy(&result, out, sizeof(result));
+    return result;
+}
+#endif
+
 #if !defined(__HIP_NO_BF16_CONVERSIONS__) && !defined(__float2bfloat16_rn)
 #define __float2bfloat16_rn(value) __float2bfloat16(value)
 #endif

@@ -7,11 +7,12 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include "../../hip/include/mfq_tensor_backend.h"
-#include <cub/block/block_radix_sort.cuh>
+#include <hipcub/block/block_radix_sort.hpp>
 #include <float.h>
 #include <climits>
 #include <cstdlib>
 #include <cstdint>
+#include "mfq_hip_compat.h"
 
 constexpr int SAMPLE_BD = 256;
 constexpr int SAMPLE_MAX_TOP_K = 1024;

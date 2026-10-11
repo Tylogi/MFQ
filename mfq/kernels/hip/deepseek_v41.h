@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../../hip/include/mfq_tensor_backend.h"
+#include "mfq_hip_compat.h"
 
 mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda(
     mfq_tensor_backend::Tensor input);

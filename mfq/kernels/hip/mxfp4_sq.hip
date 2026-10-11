@@ -7,7 +7,7 @@
 #include <cstdlib>
 
 #include "../hip/packed_backward.cuh"
-#include <mma.h>
+#include "mfq_hip_compat.h"
 
 namespace {
 
@@ -84,10 +84,9 @@ __device__ __forceinline__ float decode_native(
     float magnitude = float((0xc8643210u >> ((nibble & 7) * 4)) & 15) * 0.5f;
     if (nibble & 8) magnitude = -magnitude;
     const float scale = __uint_as_float(exponent == 0 ? 0x00400000u : exponent << 23);
-    float result;
-    // No .ftz: preserve base-zero E8M0 in --use_fast_math builds too.
-    asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(magnitude), "f"(scale));
-    return result;
+    // HIP's default float multiply is round-to-nearest and non-flushing,
+    // matching the PTX mul.rn.f32 used on CUDA.
+    return magnitude * scale;
 }
 
 __device__ __forceinline__ float decode_value(
@@ -140,15 +139,18 @@ __global__ void sq_packed_gemm(
     constexpr int tile_m = 32, tile_n = 64, tile_k = 32, stride = 40;
     constexpr int warps_n = tile_n / 16, warps = tile_m * tile_n / 256;
     constexpr int mma_k = 8;
-    using Operand = nvcuda::wmma::precision::tf32;
     __shared__ __align__(32) float a[tile_m * stride];
     __shared__ __align__(32) float b[tile_n * stride];
     __shared__ __align__(32) float result[warps * 256];
     const int warp = threadIdx.x / 32;
     const int row_begin = blockIdx.y * tile_m;
     const int output_begin = blockIdx.x * tile_n;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, mma_k, float> acc;
-    nvcuda::wmma::fill_fragment(acc, 0.0f);
+    // Direct FMA tile (wmma tf32 tile path replaced for HIP): each lane
+    // owns eight elements, e = lane + 32*j -> (row, col).
+    const int lane = threadIdx.x & 31;
+    float acc[8];
+#pragma unroll
+    for (int element = 0; element < 8; ++element) acc[element] = 0.0f;
     for (int begin = 0; begin < width; begin += tile_k) {
         for (int i = threadIdx.x; i < tile_m * tile_k; i += blockDim.x) {
             const int m = i / tile_k, k = i % tile_k;
@@ -162,17 +164,27 @@ __global__ void sq_packed_gemm(
         }
         __syncthreads();
         for (int k = 0; k < tile_k; k += mma_k) {
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, mma_k, Operand,
-                nvcuda::wmma::row_major> fa;
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, mma_k, Operand,
-                nvcuda::wmma::col_major> fb;
-            nvcuda::wmma::load_matrix_sync(fa, a + (warp / warps_n) * 16 * stride + k, stride);
-            nvcuda::wmma::load_matrix_sync(fb, b + (warp % warps_n) * 16 * stride + k, stride);
-            nvcuda::wmma::mma_sync(acc, fa, fb, acc);
+            const float* a_base = a + (warp / warps_n) * 16 * stride + k;
+            const float* b_base = b + (warp % warps_n) * 16 * stride + k;
+#pragma unroll
+            for (int element = 0; element < 8; ++element) {
+                const int row = (lane + 32 * element) / 16;
+                const int column = (lane + 32 * element) % 16;
+                float value = acc[element];
+#pragma unroll
+                for (int kk = 0; kk < mma_k; ++kk) {
+                    value += a_base[row * stride + kk] * b_base[column * stride + kk];
+                }
+                acc[element] = value;
+            }
         }
         __syncthreads();
     }
-    nvcuda::wmma::store_matrix_sync(result + warp * 256, acc, 16, nvcuda::wmma::mem_row_major);
+    __syncwarp();
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        result[warp * 256 + lane + 32 * element] = acc[element];
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < tile_m * tile_n; i += blockDim.x) {
         const int m = i / tile_n, n = i % tile_n;

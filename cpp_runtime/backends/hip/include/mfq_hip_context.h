@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 namespace mfq::cuda {
 

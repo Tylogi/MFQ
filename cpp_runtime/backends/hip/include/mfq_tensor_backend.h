@@ -21,6 +21,7 @@
 #include "mfq/host_parallel.h"
 #include "../../hip/include/mfq_hip_context.h"
 #include "../../hip/include/mfq_native_tensor.h"
+#include "mfq_hip_compat.h"
 
 namespace mfq_tensor_backend = ::mfq::cuda;
 using mfq_half = __half;
@@ -42,7 +43,7 @@ inline hipblasHandle_t mfq_current_cublas_handle() {
     return context->blas().get();
 }
 
-inline void mfq_cuda_synchronize() {
+inline void mfq_hip_synchronize() {
     int device = 0;
     MFQ_NATIVE_CUDA_CHECK(hipGetDevice(&device));
     MFQ_NATIVE_CUDA_CHECK(hipStreamSynchronize(
@@ -130,16 +131,16 @@ inline int mfq_current_cuda_device() {
     return device;
 }
 
-inline void mfq_cuda_empty_cache() {
+inline void mfq_hip_empty_cache() {
     ::mfq::cuda::default_context(mfq_current_cuda_device())->trim();
 }
 
-inline bool mfq_cuda_graph_capture_supported() {
+inline bool mfq_hip_graph_capture_supported() {
     return ::mfq::cuda::default_context(
         mfq_current_cuda_device())->supports_async_allocations();
 }
 
-inline void mfq_cuda_record_stream(
+inline void mfq_hip_record_stream(
     const ::mfq::cuda::Tensor& tensor,
     const MfqCudaStream& stream) {
     tensor.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()));
@@ -159,7 +160,7 @@ struct MfqCudaMemoryStats {
     std::uint64_t ooms = 0;
 };
 
-inline MfqCudaMemoryStats mfq_cuda_memory_stats(int device) {
+inline MfqCudaMemoryStats mfq_hip_memory_stats(int device) {
     ::mfq::cuda::DeviceGuard guard(device);
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
@@ -199,10 +200,10 @@ inline void mfq_disable_tf32_cublas() {
     auto context = ::mfq::cuda::default_context(mfq_current_cuda_device());
     context->blas().set_stream(mfq_current_cuda_stream());
     MFQ_NATIVE_CUDA_CHECK(hipblasSetMathMode(
-        context->blas().get(), CUBLAS_DEFAULT_MATH));
+        context->blas().get(), HIPBLAS_DEFAULT_MATH));
 }
 
-inline void mfq_cuda_manual_seed_all(std::uint64_t seed) {
+inline void mfq_hip_manual_seed_all(std::uint64_t seed) {
     ::mfq::cuda::manual_seed(static_cast<std::int64_t>(seed));
 }
 
@@ -232,7 +233,7 @@ inline hipblasHandle_t mfq_current_cublas_handle() {
     return ::at::cuda::getCurrentCUDABlasHandle();
 }
 
-inline void mfq_cuda_synchronize() {
+inline void mfq_hip_synchronize() {
     ::torch::cuda::synchronize();
 }
 
@@ -284,13 +285,13 @@ inline int mfq_current_cuda_device() {
     return ::c10::cuda::current_device();
 }
 
-inline void mfq_cuda_empty_cache() {
+inline void mfq_hip_empty_cache() {
     ::c10::cuda::CUDACachingAllocator::emptyCache();
 }
 
-inline bool mfq_cuda_graph_capture_supported() { return true; }
+inline bool mfq_hip_graph_capture_supported() { return true; }
 
-inline void mfq_cuda_record_stream(
+inline void mfq_hip_record_stream(
     const ::torch::Tensor& tensor,
     const MfqCudaStream& stream) {
     ::c10::cuda::CUDACachingAllocator::recordStream(
@@ -311,7 +312,7 @@ struct MfqCudaMemoryStats {
     std::uint64_t ooms = 0;
 };
 
-inline MfqCudaMemoryStats mfq_cuda_memory_stats(int device) {
+inline MfqCudaMemoryStats mfq_hip_memory_stats(int device) {
     const auto source = ::c10::cuda::CUDACachingAllocator::getDeviceStats(device);
     constexpr auto aggregate = static_cast<std::size_t>(
         ::c10::CachingDeviceAllocator::StatType::AGGREGATE);
@@ -347,7 +348,7 @@ inline void mfq_disable_tf32_cublas() {
 }
 
 
-inline void mfq_cuda_manual_seed_all(std::uint64_t seed) {
+inline void mfq_hip_manual_seed_all(std::uint64_t seed) {
     ::torch::cuda::manual_seed_all(seed);
 }
 

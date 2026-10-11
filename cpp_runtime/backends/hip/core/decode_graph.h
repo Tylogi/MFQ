@@ -5,7 +5,7 @@
 #include "../../hip/include/hip_model_plan.h"
 #include "mfq/runtime.h"
 #include "../../hip/core/block.h"
-#include "cuda_execution.h"
+#include "hip_execution.h"
 
 #include <cstdint>
 #include <memory>

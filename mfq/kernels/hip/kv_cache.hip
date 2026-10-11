@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 namespace {
 

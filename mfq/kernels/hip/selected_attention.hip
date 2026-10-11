@@ -2,10 +2,24 @@
 #include "hip/hip_runtime.h"
 // Shared dense and index-selected attention mechanics.
 #include "../hip/selected_attention.h"
+#ifndef __HIP_PLATFORM_AMD__
 #include "../hip/mfq_sparse_attn_mma_f16.cuh"
+#else
+// Sparse MMA attention builds on NVIDIA tensor-core tile paths; fail
+// loudly if a model graph selects it on HIP until an MFMA port exists.
+namespace mfq_sparse_attn_mma {
+template <int... IntArgs, typename... Args>
+mfq_tensor_backend::Tensor launch(Args&&...) {
+    MFQ_RUNTIME_CHECK(false,
+        "sparse MMA attention is not yet available on HIP");
+    return mfq_tensor_backend::Tensor{};
+}
+}  // namespace mfq_sparse_attn_mma
+#endif
 
 #include <cmath>
 #include <limits>
+#include "mfq_hip_compat.h"
 
 namespace mfq_selected_attention {
 namespace tb = mfq_tensor_backend;
@@ -442,7 +456,7 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     MFQ_RUNTIME_CHECK(shared+sizeof(float)<=48*1024,"MMA gate reduction shared memory exceeded");
     MfqCudaGuard guard(partial.device());
     auto output=tb::empty(partial.sizes(),partial.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
-    if(outputhipLaunchKernelGGL((.numel())mma_reduce_gate_kernel), dim3(unsigned(output.numel()/width)),dim3(256),shared,mfq_current_cuda_stream(), 
+    hipLaunchKernelGGL(( mma_reduce_gate_kernel), dim3(unsigned(output.numel()/width)),dim3(256),shared,mfq_current_cuda_stream(),
         partial.data_ptr<float>(),reinterpret_cast<const float2*>(metadata.data_ptr<float>()),
         gate.data_ptr(),output.data_ptr(),attention_layout(gate),int(tokens),int(heads),kv_heads,
         int(width),total_blocks,parts,query_columns,head_columns,gate.scalar_type()==tb::kFloat32,

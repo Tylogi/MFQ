@@ -3,7 +3,7 @@
 
 #include "generation_step.h"
 #include "../../hip/engine/hip_batching.h"
-#include "cuda_execution.h"
+#include "hip_execution.h"
 #include "core/decode_graph.h"
 #include "core/mtp.h"
 #include "../../hip/include/hip_runtime_config.h"

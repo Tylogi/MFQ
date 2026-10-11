@@ -4,6 +4,7 @@
 #include "../../hip/include/mfq_tensor_backend.h"
 
 #include <initializer_list>
+#include "mfq_hip_compat.h"
 
 namespace mfq_selected_attention {
 using mfq_tensor_backend::Tensor;

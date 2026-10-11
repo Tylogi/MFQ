@@ -107,14 +107,14 @@ struct CudaProfiler {
         hipEventCreate(&stop);
         auto stream = mfq_get_current_cuda_stream().stream();
         if (graph_events) {
-            cudaEventRecordWithFlags(start, stream, hipEventRecordExternal);
+            hipEventRecordWithFlags(start, stream, hipEventRecordExternal);
         } else {
             hipEventRecord(start, stream);
         }
         auto t0 = std::chrono::steady_clock::now();
         auto out = fn();
         if (graph_events) {
-            cudaEventRecordWithFlags(stop, stream, hipEventRecordExternal);
+            hipEventRecordWithFlags(stop, stream, hipEventRecordExternal);
         } else {
             hipEventRecord(stop, stream);
         }
@@ -507,7 +507,7 @@ struct CudaIndependentBranchExecutor {
             MFQ_CUDA_CHECK(hipStreamWaitEvent(
                 parent.stream(), completed[index], 0));
             if (outputs[index].defined()) {
-                mfq_cuda_record_stream(outputs[index], parent);
+                mfq_hip_record_stream(outputs[index], parent);
             }
         }
         return true;

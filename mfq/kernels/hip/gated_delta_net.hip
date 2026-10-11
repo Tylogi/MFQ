@@ -9,7 +9,6 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <cuda/atomic>
 #include <cmath>
 #include <limits>
 #include "../../hip/include/mfq_tensor_backend.h"
@@ -17,6 +16,7 @@
 #include <cstdlib>
 
 #include "../hip/reduce.cuh"
+#include "mfq_hip_compat.h"
 
 template <int D>
 __global__ void gdn_kernel(
@@ -560,8 +560,8 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         __syncthreads();
         if(tid==0) {
             auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(bh)*(width+1)+width);
-            cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
-            final_tile=progress.fetch_add(1u,cuda::std::memory_order_acq_rel)==unsigned(tiles-1);
+            // cuda::atomic_ref replaced with clang device atomics for HIP.
+            final_tile=__atomic_fetch_add(counter,1u,__ATOMIC_ACQ_REL)==unsigned(tiles-1);
         }
         __syncthreads();
         if(!final_tile)return;
@@ -599,8 +599,7 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         __syncthreads();
         if(tid==0) {
             auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(bh)*(width+1)+width);
-            cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
-            progress.store(0u,cuda::std::memory_order_release);
+            __atomic_store_n(counter,0u,__ATOMIC_RELEASE);
         }
     }
 }

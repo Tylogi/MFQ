@@ -15,7 +15,6 @@
 #include <hip/hip_fp16.h>
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <hip/hip_runtime.h>
-#include <mma.h>
 
 #include <algorithm>
 #include <cfloat>
@@ -27,6 +26,7 @@
 
 #include "../../hip/include/moe_cache_transfer.h"
 #include "../hip/glu.cuh"
+#include "mfq_hip_compat.h"
 
 
 void launch_nint_matmul_routed_cuda(
@@ -1173,15 +1173,16 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
     const int warp_m0 = warp / NFRAGS;
     const int warp_n = warp % NFRAGS;
 
-    using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
-                                         __half, nvcuda::wmma::row_major>;
-    using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
-                                         __half, nvcuda::wmma::col_major>;
-    using FragC = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>;
-    FragC acc[ACCS_PER_WARP];
+    // Direct FMA tiles (wmma tile path replaced for HIP): each lane owns
+    // eight elements per 16x16 accumulator, e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
+    float acc[ACCS_PER_WARP][kAccElements];
 #pragma unroll
     for (int a = 0; a < ACCS_PER_WARP; ++a) {
-        nvcuda::wmma::fill_fragment(acc[a], 0.0f);
+#pragma unroll
+        for (int element = 0; element < kAccElements; ++element) {
+            acc[a][element] = 0.0f;
+        }
     }
 
     const int chunks = (groups + GROUPS_PER_CHUNK - 1) / GROUPS_PER_CHUNK;
@@ -1257,17 +1258,27 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
 #pragma unroll
         for (int ks = 0; ks < BK; ks += 16) {
             if (warp_active) {
-                FragB bfrag;
-                nvcuda::wmma::load_matrix_sync(
-                    bfrag, &W_s[warp_n * 16][ks], kMoeMmaMaxBkStride);
 #pragma unroll
                 for (int a = 0; a < ACCS_PER_WARP; ++a) {
                     const int mi = warp_m0 + a * 2;
                     if (mi < MTILES) {
-                        FragA afrag;
-                        nvcuda::wmma::load_matrix_sync(
-                            afrag, &X_s[mi * 16][ks], kMoeMmaMaxBkStride);
-                        nvcuda::wmma::mma_sync(acc[a], afrag, bfrag, acc[a]);
+#pragma unroll
+                        for (int element = 0; element < kAccElements;
+                             ++element) {
+                            const int e = lane + 32 * element;
+                            const int row = e >> 4;
+                            const int column = e & 15;
+                            float value = acc[a][element];
+#pragma unroll
+                            for (int kk = 0; kk < 16; ++kk) {
+                                value += __half2float(
+                                             X_s[mi * 16 + row][ks + kk]) *
+                                         __half2float(
+                                             W_s[warp_n * 16 + column]
+                                               [ks + kk]);
+                            }
+                            acc[a][element] = value;
+                        }
                     }
                 }
             }
@@ -1279,9 +1290,13 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
     for (int a = 0; a < ACCS_PER_WARP; ++a) {
         const int mi = warp_m0 + a * 2;
         const bool owns = mi < MTILES;
+        __syncwarp();
         if (owns) {
-            nvcuda::wmma::store_matrix_sync(
-                &C_s[warp][0][0], acc[a], 16, nvcuda::wmma::mem_row_major);
+#pragma unroll
+            for (int element = 0; element < kAccElements; ++element) {
+                const int e = lane + 32 * element;
+                C_s[warp][e >> 4][e & 15] = acc[a][element];
+            }
         }
         __syncthreads();
         if (owns) {

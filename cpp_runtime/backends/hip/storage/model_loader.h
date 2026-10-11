@@ -112,7 +112,7 @@ auto with_loaded_cuda_model(
                 !moe_expert_cache_finalized(execution.moe_expert_cache)) {
             finalize_moe_expert_cache(execution.moe_expert_cache);
         }
-        mfq_cuda_synchronize();
+        mfq_hip_synchronize();
         auto loaded = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "loaded");
         return run(model, runtime_components, started, loaded);

@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
+#include "mfq_hip_compat.h"
 
 namespace mfq::cuda::packed_nvq {
 constexpr int kNvq1L = 1;
@@ -499,9 +500,10 @@ __device__ __forceinline__ float format_scale(
 __device__ __forceinline__ int2 apply_sign8(int2 values, uint32_t mask8) {
     const uint32_t spread0=(mask8 & 15u)*0x10204080u;
     const uint32_t spread1=((mask8 >> 4) & 15u)*0x10204080u;
-    uint32_t signs0,signs1;
-    asm("prmt.b32 %0,%1,0,0xba98;" : "=r"(signs0) : "r"(spread0));
-    asm("prmt.b32 %0,%1,0,0xba98;" : "=r"(signs1) : "r"(spread1));
+    // prmt.b32 ...,0xba98 sign-replicates each byte; expressed arithmetically
+    // for HIP (PTX inline asm replaced).
+    const uint32_t signs0 = ((spread0 >> 7) & 0x01010101u) * 0xffu;
+    const uint32_t signs1 = ((spread1 >> 7) & 0x01010101u) * 0xffu;
     const uint32_t x=uint32_t(values.x)^signs0,y=uint32_t(values.y)^signs1;
     return make_int2(int(((x & 0x7f7f7f7fu)+(signs0 & 0x01010101u))^(x & 0x80808080u)),
                      int(((y & 0x7f7f7f7fu)+(signs1 & 0x01010101u))^(y & 0x80808080u)));

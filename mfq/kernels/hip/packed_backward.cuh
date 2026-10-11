@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include "mfq_hip_compat.h"
 
 namespace mfq_packed_backward {
 
@@ -35,7 +36,7 @@ inline void launch_half_gemm_nn(
             output_gradient, HIP_R_16F, outputs,
             &beta,
             input_gradient, HIP_R_16F, width,
-            CUBLAS_COMPUTE_16F,
+            HIPBLAS_COMPUTE_16F,
             HIPBLAS_GEMM_DEFAULT) == HIPBLAS_STATUS_SUCCESS,
         "packed backward GEMM failed");
 }

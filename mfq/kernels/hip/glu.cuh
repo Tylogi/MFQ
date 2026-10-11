@@ -2,6 +2,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include "mfq_hip_compat.h"
 
 template <bool GELU>
 __device__ __forceinline__ float mfq_glu(float gate, float up) {

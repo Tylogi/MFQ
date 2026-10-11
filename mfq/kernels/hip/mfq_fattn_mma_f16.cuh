@@ -5,6 +5,7 @@
 #include "../ggml-hip/mma.cuh"
 #include "../ggml-hip/fattn-common.cuh"
 #include "../ggml-hip/fattn-swizzle.cuh"
+#include "mfq_hip_compat.h"
 
 using namespace ggml_cuda_mma;
 

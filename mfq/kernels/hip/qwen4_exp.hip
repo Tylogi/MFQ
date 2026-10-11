@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include "mfq_hip_compat.h"
 
 namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;

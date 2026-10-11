@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 namespace mfq::cuda::native_ops_detail {
 

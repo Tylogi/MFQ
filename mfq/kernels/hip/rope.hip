@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 constexpr int ROPE_BD = 256;
 

@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "../hip/packed_backward.cuh"
+#include "mfq_hip_compat.h"
 
 namespace {
 
@@ -581,7 +582,7 @@ void launch_dense_gemm_nt(
                 input.data_ptr<mfq_half>(), HIP_R_16F, width,
                 &beta,
                 output.data_ptr<mfq_half>(), HIP_R_16F, outputs,
-                CUBLAS_COMPUTE_16F,
+                HIPBLAS_COMPUTE_16F,
                 HIPBLAS_GEMM_DEFAULT) == HIPBLAS_STATUS_SUCCESS,
             "FP8-SQ FP16 GEMM failed");
         return;

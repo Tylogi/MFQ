@@ -12,15 +12,14 @@
 #include <hip/hip_runtime.h>
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <hip/hip_fp16.h>
-#include <mma.h>
 #include <cfloat>
 #include <climits>
 #include <cstdlib>
 #include <utility>
 
 #include "../hip/reduce.cuh"
+#include "mfq_hip_compat.h"
 
-namespace wmma = nvcuda::wmma;
 
 // Qwen3.5 full-attention prefill: FP16 GQA, head_dim=256, causal self-attention.
 // QK is recomputed in the second pass so the full T x T score matrix is never materialized.
@@ -74,17 +73,18 @@ __global__ void attention_flash256_f16_kernel(
         __syncthreads();
 
         if (warp < 8) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-            wmma::fill_fragment(c_frag, 0.0f);
+            // Direct FMA score tiles (wmma tile path replaced for HIP).
             const int qr = warp;
-            for (int d0 = 0; d0 < D; d0 += 16) {
-                wmma::load_matrix_sync(a_frag, q_s + qr * 16 * D + d0, D);
-                wmma::load_matrix_sync(b_frag, kv_s + d0, D);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            for (int e = lane; e < 16 * 16; e += 32) {
+                const int r = e / 16;
+                const int c = e - r * 16;
+                float acc = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    acc += __half2float(q_s[(size_t)(qr * 16 + r) * D + d])
+                         * __half2float(kv_s[(size_t)c * D + d]);
+                }
+                scores[(size_t)(qr * 16 + r) * KT + c] = acc;
             }
-            wmma::store_matrix_sync(scores + qr * 16 * KT, c_frag, KT, wmma::mem_row_major);
         }
         __syncthreads();
 
@@ -111,9 +111,14 @@ __global__ void attention_flash256_f16_kernel(
         __syncthreads();
     }
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[8];
+    // Direct FMA output tiles (wmma tile path replaced for HIP). Each lane
+    // owns eight elements per tile: e = lane + 32*j -> (r, c) = (e/16, e%16).
+    float o_acc[8][8];
     #pragma unroll
-    for (int i = 0; i < 8; ++i) wmma::fill_fragment(o_frag[i], 0.0f);
+    for (int fi = 0; fi < 8; ++fi) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) o_acc[fi][j] = 0.0f;
+    }
 
     for (int k0 = 0; k0 < T; k0 += KT) {
         for (int i = tid; i < KT * D; i += blockDim.x) {
@@ -124,17 +129,18 @@ __global__ void attention_flash256_f16_kernel(
         __syncthreads();
 
         if (warp < 8) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-            wmma::fill_fragment(c_frag, 0.0f);
+            // Direct FMA score tiles (wmma tile path replaced for HIP).
             const int qr = warp;
-            for (int d0 = 0; d0 < D; d0 += 16) {
-                wmma::load_matrix_sync(a_frag, q_s + qr * 16 * D + d0, D);
-                wmma::load_matrix_sync(b_frag, kv_s + d0, D);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            for (int e = lane; e < 16 * 16; e += 32) {
+                const int r = e / 16;
+                const int c = e - r * 16;
+                float acc = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    acc += __half2float(q_s[(size_t)(qr * 16 + r) * D + d])
+                         * __half2float(kv_s[(size_t)c * D + d]);
+                }
+                scores[(size_t)(qr * 16 + r) * KT + c] = acc;
             }
-            wmma::store_matrix_sync(scores + qr * 16 * KT, c_frag, KT, wmma::mem_row_major);
         }
         __syncthreads();
 
@@ -158,17 +164,21 @@ __global__ void attention_flash256_f16_kernel(
         }
         __syncthreads();
 
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
         const int qr = warp >> 1;
         const int parity = warp & 1;
-        for (int kk = 0; kk < KT; kk += 16) {
-            wmma::load_matrix_sync(p_frag, probs + qr * 16 * KT + kk, KT);
+        for (int fi = 0; fi < 8; ++fi) {
+            const int ni = parity + fi * 2;
             #pragma unroll
-            for (int fi = 0; fi < 8; ++fi) {
-                const int ni = parity + fi * 2;
-                wmma::load_matrix_sync(v_frag, kv_s + ni * 16 * KT + kk, KT);
-                wmma::mma_sync(o_frag[fi], p_frag, v_frag, o_frag[fi]);
+            for (int j = 0; j < 8; ++j) {
+                const int e = lane + 32 * j;
+                const int r = e / 16;
+                const int c = e - r * 16;
+                float acc = o_acc[fi][j];
+                for (int kk = 0; kk < KT; ++kk) {
+                    acc += __half2float(probs[(size_t)(qr * 16 + r) * KT + kk])
+                         * __half2float(kv_s[(size_t)(ni * 16 + c) * KT + kk]);
+                }
+                o_acc[fi][j] = acc;
             }
         }
         __syncthreads();
@@ -180,7 +190,12 @@ __global__ void attention_flash256_f16_kernel(
     #pragma unroll
     for (int fi = 0; fi < 8; ++fi) {
         const int ni = parity + fi * 2;
-        wmma::store_matrix_sync(out_s, o_frag[fi], 16, wmma::mem_row_major);
+        __syncwarp();
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int e = lane + 32 * j;
+            out_s[e] = o_acc[fi][j];
+        }
         __syncwarp();
         for (int e = lane; e < 256; e += 32) {
             const int r = e / 16;
@@ -214,7 +229,7 @@ mfq_tensor_backend::Tensor attention_flash256_cuda(mfq_tensor_backend::Tensor q,
     auto out = mfq_tensor_backend::empty_like(q);
     const dim3 grid((T + 127) / 128, B * Hq);
     constexpr int shmem = 96 * 1024;
-    hipFuncSetAttribute(attention_flash256_f16_kernel,
+    hipFuncSetAttribute(reinterpret_cast<const void*>(attention_flash256_f16_kernel),
                          hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
    hipLaunchKernelGGL(( attention_flash256_f16_kernel), dim3(grid), dim3(512), shmem, mfq_current_cuda_stream(), 
         reinterpret_cast<const half*>(q.data_ptr<mfq_half>()),

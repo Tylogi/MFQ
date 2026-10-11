@@ -3,6 +3,7 @@
 #include <hip/hip_runtime_api.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
+#include "mfq_hip_compat.h"
 
 namespace mfq::cuda {
 struct MfePackedProjection {

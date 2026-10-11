@@ -5,6 +5,7 @@
 
 #include "cpp_runtime/backends/hip/include/mfq_tensor_backend.h"
 #include "mfq/fp8_sq_blob.h"
+#include "mfq_hip_compat.h"
 
 // The CPU loader validates the self-describing wire payload and expands the
 // compact three-bit q descriptor into row_q/row_symbol_byte_offsets.  CUDA

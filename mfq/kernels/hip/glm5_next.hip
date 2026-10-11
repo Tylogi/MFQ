@@ -4,6 +4,7 @@
 #include "../hip/selected_attention.h"
 
 #include <cmath>
+#include "mfq_hip_compat.h"
 
 namespace mfq_glm5_next {
 namespace tb = mfq_tensor_backend;

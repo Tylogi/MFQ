@@ -22,13 +22,13 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <mma.h>
 
 #include "../hip/async_copy.cuh"
 #include "../hip/glu.cuh"
 #include "../../hip/include/mfq_tensor_backend.h"
 #include "../hip/packed_backward.cuh"
 #include "../hip/packed_nint.cuh"
+#include "mfq_hip_compat.h"
 
 
 #define MFQ_CUBLAS_CHECK(expression) \
@@ -477,14 +477,9 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
     const int64_t total_tasks =
         static_cast<int64_t>(total_tiles) * output_tiles;
 
-    using FragmentA = nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_a, 16, 16, 16,
-        __half, nvcuda::wmma::row_major>;
-    using FragmentB = nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_b, 16, 16, 16,
-        __half, nvcuda::wmma::col_major>;
-    using FragmentC = nvcuda::wmma::fragment<
-        nvcuda::wmma::accumulator, 16, 16, 16, float>;
+    // Direct FMA tiles (wmma tile path replaced for HIP). Each lane owns
+    // eight elements per 16x16 accumulator: e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
 
     const int64_t task_shift = total_tasks == 0
         ? 0
@@ -509,14 +504,16 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         const uint8_t * expert_stream = bitstream +
             static_cast<size_t>(local_expert) * q_expert_stride;
 
-        FragmentC accumulators[projections][accumulators_per_warp];
+        float accumulators[projections][accumulators_per_warp][kAccElements];
 #pragma unroll
         for (int projection = 0; projection < projections; ++projection) {
 #pragma unroll
             for (int accumulator = 0;
                  accumulator < accumulators_per_warp; ++accumulator) {
-                nvcuda::wmma::fill_fragment(
-                    accumulators[projection][accumulator], 0.0f);
+#pragma unroll
+                for (int element = 0; element < kAccElements; ++element) {
+                    accumulators[projection][accumulator][element] = 0.0f;
+                }
             }
         }
 
@@ -544,12 +541,8 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
             for (int k_local = 0; k_local < kNintPrefillTileK;
                  k_local += 16) {
                 if (active_warp && column_base + k_local < input_width) {
-                    FragmentB weight_fragment;
-                    nvcuda::wmma::load_matrix_sync(
-                        weight_fragment,
-                        weight_tile + warp_n * 16 *
-                            kNintPrefillStrideK + k_local,
-                        kNintPrefillStrideK);
+                    const __half* weight_base = weight_tile +
+                        warp_n * 16 * kNintPrefillStrideK + k_local;
 #pragma unroll
                     for (int accumulator = 0;
                          accumulator < accumulators_per_warp;
@@ -557,19 +550,29 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                         const int matrix_tile_m =
                             warp_m0 + accumulator * 2;
                         if (matrix_tile_m < matrix_tiles_m) {
-                            FragmentA activation_fragment;
-                            nvcuda::wmma::load_matrix_sync(
-                                activation_fragment,
+                            const __half* activation_base =
                                 activation_tile + matrix_tile_m * 16 *
-                                    kNintPrefillStrideK + k_local,
-                                kNintPrefillStrideK);
-                            nvcuda::wmma::mma_sync(
-                                accumulators[0][accumulator],
-                                activation_fragment, weight_fragment,
-                                accumulators[0][accumulator]);
+                                    kNintPrefillStrideK + k_local;
+#pragma unroll
+                            for (int element = 0;
+                                 element < kAccElements; ++element) {
+                                const int e = lane + 32 * element;
+                                const int row = e / 16;
+                                const int col = e - row * 16;
+                                float value =
+                                    accumulators[0][accumulator][element];
+#pragma unroll
+                                for (int kk = 0; kk < 16; ++kk) {
+                                    value += __half2float(
+                                        activation_base[row * kNintPrefillStrideK + kk]) *
+                                        __half2float(
+                                        weight_base[col * kNintPrefillStrideK + kk]);
+                                }
+                                accumulators[0][accumulator][element] = value;
+                            }
                         }
                     }
-                }
+}
             }
             __syncthreads();
 
@@ -585,32 +588,38 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                 for (int k_local = 0; k_local < kNintPrefillTileK;
                      k_local += 16) {
                     if (active_warp && column_base + k_local < input_width) {
-                        FragmentB weight_fragment;
-                        nvcuda::wmma::load_matrix_sync(
-                            weight_fragment,
-                            weight_tile + warp_n * 16 *
-                                kNintPrefillStrideK + k_local,
-                            kNintPrefillStrideK);
+                        const __half* weight_base = weight_tile +
+                        warp_n * 16 * kNintPrefillStrideK + k_local;
 #pragma unroll
-                        for (int accumulator = 0;
-                             accumulator < accumulators_per_warp;
-                             ++accumulator) {
-                            const int matrix_tile_m =
-                                warp_m0 + accumulator * 2;
-                            if (matrix_tile_m < matrix_tiles_m) {
-                                FragmentA activation_fragment;
-                                nvcuda::wmma::load_matrix_sync(
-                                    activation_fragment,
-                                    activation_tile + matrix_tile_m * 16 *
-                                        kNintPrefillStrideK + k_local,
-                                    kNintPrefillStrideK);
-                                nvcuda::wmma::mma_sync(
-                                    accumulators[1][accumulator],
-                                    activation_fragment, weight_fragment,
-                                    accumulators[1][accumulator]);
+                    for (int accumulator = 0;
+                         accumulator < accumulators_per_warp;
+                         ++accumulator) {
+                        const int matrix_tile_m =
+                            warp_m0 + accumulator * 2;
+                        if (matrix_tile_m < matrix_tiles_m) {
+                            const __half* activation_base =
+                                activation_tile + matrix_tile_m * 16 *
+                                    kNintPrefillStrideK + k_local;
+#pragma unroll
+                            for (int element = 0;
+                                 element < kAccElements; ++element) {
+                                const int e = lane + 32 * element;
+                                const int row = e / 16;
+                                const int col = e - row * 16;
+                                float value =
+                                    accumulators[1][accumulator][element];
+#pragma unroll
+                                for (int kk = 0; kk < 16; ++kk) {
+                                    value += __half2float(
+                                        activation_base[row * kNintPrefillStrideK + kk]) *
+                                        __half2float(
+                                        weight_base[col * kNintPrefillStrideK + kk]);
+                                }
+                                accumulators[1][accumulator][element] = value;
                             }
                         }
                     }
+}
                 }
                 __syncthreads();
             }
@@ -627,13 +636,15 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
             float * first_projection = output_tile_storage + warp * 16 * 16;
             float * second_projection = first_projection +
                 kNintPrefillWarps * 16 * 16;
-            nvcuda::wmma::store_matrix_sync(
-                first_projection, accumulators[0][accumulator], 16,
-                nvcuda::wmma::mem_row_major);
-            if constexpr (FusedGlu) {
-                nvcuda::wmma::store_matrix_sync(
-                    second_projection, accumulators[1][accumulator], 16,
-                    nvcuda::wmma::mem_row_major);
+            __syncwarp();
+#pragma unroll
+            for (int element = 0; element < kAccElements; ++element) {
+                first_projection[lane + 32 * element] =
+                    accumulators[0][accumulator][element];
+                if constexpr (FusedGlu) {
+                    second_projection[lane + 32 * element] =
+                        accumulators[1][accumulator][element];
+                }
             }
             __syncwarp();
 #pragma unroll
@@ -1852,7 +1863,7 @@ mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f16acc_cuda(
         result.data_ptr<mfq_half>(),
         HIP_R_16F,
         outputs,
-        CUBLAS_COMPUTE_16F,
+        HIPBLAS_COMPUTE_16F,
         HIPBLAS_GEMM_DEFAULT));
     return result;
 }

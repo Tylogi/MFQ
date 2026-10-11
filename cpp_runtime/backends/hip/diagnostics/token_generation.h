@@ -3,7 +3,7 @@
 #include "../../hip/diagnostics/hip_activity_trace.h"
 
 #include "../../hip/include/mfq_hip_sampling_ops.h"
-#include "cuda_execution.h"
+#include "hip_execution.h"
 #include "core/decode_graph.h"
 #include "core/full_block.h"
 #include "storage/moe_expert_cache.h"
@@ -62,13 +62,13 @@ int generate_diagnostic_tokens(
         report_source_file_io(model.source.get(), "prefill_begin");
         profiler.reset();
         auto next = model.next_token(ids);
-        mfq_cuda_synchronize();
+        mfq_hip_synchronize();
         auto t2 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "prefill");
         report_source_file_io(model.source.get(), "prefill");
         const char * empty_cache_env = std::getenv("MFQ_EMPTY_CACHE_BEFORE_GRAPH");
         if (empty_cache_env != nullptr && std::atoi(empty_cache_env) != 0) {
-            mfq_cuda_empty_cache();
+            mfq_hip_empty_cache();
             report_cuda_memory(execution.config, "prefill_empty_cache");
         }
         profiler.report("prefill");
@@ -86,7 +86,7 @@ int generate_diagnostic_tokens(
             !forced_inputs.defined() &&
             (graph_env == nullptr || graph_env[0] != '0') &&
             !model.metadata.flash_next &&
-            mfq_cuda_graph_capture_supported() &&
+            mfq_hip_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&
             !execution.moe_expert_cache &&
@@ -181,7 +181,7 @@ int generate_diagnostic_tokens(
                 });
             }
         }
-        mfq_cuda_synchronize();
+        mfq_hip_synchronize();
         if (cuda_profiler_range) MFQ_CUDA_CHECK(hipProfilerStop());
         auto t3 = std::chrono::steady_clock::now();
         profiler.report("decode");

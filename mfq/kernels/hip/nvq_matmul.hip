@@ -13,7 +13,6 @@
 #include <hip/hip_runtime.h>
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <hip/hip_fp16.h>
-#include <mma.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
@@ -24,8 +23,8 @@
 #include "../hip/packed_backward.cuh"
 #include "../hip/packed_nvq.cuh"
 #include "../hip/async_copy.cuh"
+#include "mfq_hip_compat.h"
 
-using namespace nvcuda;
 
 namespace {
 
@@ -1905,26 +1904,6 @@ __device__ __forceinline__ int mma168_j(int fragment) {
     return ((threadIdx.x % 4) * 2) + (fragment % 2);
 }
 
-__device__ __forceinline__ void load_mma_a_m16n8k32(int (&a)[4], const int * ptr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "l"(ptr));
-}
-
-__device__ __forceinline__ void load_mma_b_m16n8k32(int (&b)[2], const int * ptr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
-        : "=r"(b[0]), "=r"(b[1])
-        : "l"(ptr));
-}
-
-__device__ __forceinline__ void mma_m16n8k32_s8(
-    int (&d)[4], const int (&a)[4], const int (&b)[2]) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
 // Integer Tensor Core path for M=4..64. Each gs24 quantization group is
 // represented as one transient K32 tile in shared memory. The MMA dot is
 // rescaled per group before accumulation, preserving NVQ's group scales.
@@ -2037,23 +2016,25 @@ __global__ void __launch_bounds__(256) nvq_mmq_mma24_kernel(
 
 #pragma unroll
         for (int group_local = 0; group_local < kChunkGroups; ++group_local) {
-            int a[MTILES][4];
-#pragma unroll
-            for (int mt = 0; mt < MTILES; ++mt) {
-                load_mma_a_m16n8k32(
-                    a[mt],
-                    &activation[mt * 16 + lane % 16]
-                               [group_local * kGroupInts + (lane / 16) * 4]);
-            }
-            int b[2];
-            load_mma_b_m16n8k32(
-                b,
-                &weight[warp][lane % 8]
-                       [group_local * kGroupInts + (((lane / 8) * 4) & 7)]);
-#pragma unroll
+            #pragma unroll
             for (int mt = 0; mt < MTILES; ++mt) {
                 int dot[4] = {0, 0, 0, 0};
-                mma_m16n8k32_s8(dot, a[mt], b);
+                // Direct dp4a dot products over the shared group tiles
+                // (integer MMA path replaced for HIP).
+#pragma unroll
+                for (int fragment = 0; fragment < 4; ++fragment) {
+                    const int dot_row = mt * 16 + mma168_i(fragment);
+                    const int dot_col = mma168_j(fragment);
+                    int value = 0;
+#pragma unroll
+                    for (int gi = 0; gi < kGroupInts; ++gi) {
+                        value = __dp4a(
+                            activation[dot_row][group_local * kGroupInts + gi],
+                            weight[warp][dot_col][group_local * kGroupInts + gi],
+                            value);
+                    }
+                    dot[fragment] = value;
+                }
 #pragma unroll
                 for (int fragment = 0; fragment < 4; ++fragment) {
                     const int m_local = mt * 16 + mma168_i(fragment);
@@ -2132,15 +2113,16 @@ __global__ void __launch_bounds__(256) nvq_gemm_f16_gs24_kernel(
     __shared__ __half activation_tile[kTileM][kStrideK];
     __shared__ float output_tile[kNFragments][kWmmaM][kWmmaN];
 
-    using FragmentA = wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
-                                     __half, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
-                                     __half, wmma::col_major>;
-    using FragmentC = wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>;
-    FragmentC accumulators[kAccumulatorsPerWarp];
+    // Direct FMA tiles (wmma tile path replaced for HIP): each lane owns
+    // eight elements per 16x16 accumulator, e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
+    float accumulators[kAccumulatorsPerWarp][kAccElements];
 #pragma unroll
     for (int accumulator = 0; accumulator < kAccumulatorsPerWarp; ++accumulator) {
-        wmma::fill_fragment(accumulators[accumulator], 0.0f);
+#pragma unroll
+        for (int element = 0; element < kAccElements; ++element) {
+            accumulators[accumulator][element] = 0.0f;
+        }
     }
 
     const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
@@ -2211,25 +2193,30 @@ __global__ void __launch_bounds__(256) nvq_gemm_f16_gs24_kernel(
 #pragma unroll
         for (int k_local = 0; k_local < kTileK; k_local += kWmmaK) {
             if (warp_active) {
-                FragmentB weight_fragment;
-                wmma::load_matrix_sync(
-                    weight_fragment,
-                    &weight_tile[warp_n * kWmmaN][k_local],
-                    kStrideK);
+                const __half* weight_base =
+                    &weight_tile[warp_n * kWmmaN][k_local];
 #pragma unroll
                 for (int accumulator = 0;
                      accumulator < kAccumulatorsPerWarp;
                      ++accumulator) {
                     const int m_fragment = warp_m0 + accumulator * 2;
                     if (m_fragment < MTILES) {
-                        FragmentA activation_fragment;
-                        wmma::load_matrix_sync(
-                            activation_fragment,
-                            &activation_tile[m_fragment * kWmmaM][k_local],
-                            kStrideK);
-                        wmma::mma_sync(
-                            accumulators[accumulator], activation_fragment,
-                            weight_fragment, accumulators[accumulator]);
+                        const __half* activation_base =
+                            &activation_tile[m_fragment * kWmmaM][k_local];
+#pragma unroll
+                        for (int element = 0; element < kAccElements;
+                             ++element) {
+                            const int e = lane + 32 * element;
+                            const int row = e >> 4;
+                            const int column = e & 15;
+                            float value = accumulators[accumulator][element];
+#pragma unroll
+                            for (int kk = 0; kk < kWmmaK; ++kk) {
+                                value += __half2float(activation_base[row * kStrideK + kk]) *
+                                         __half2float(weight_base[column * kStrideK + kk]);
+                            }
+                            accumulators[accumulator][element] = value;
+                        }
                     }
                 }
             }
@@ -2245,10 +2232,14 @@ __global__ void __launch_bounds__(256) nvq_gemm_f16_gs24_kernel(
         for (int warp_row = 0; warp_row < 2; ++warp_row) {
             const int m_fragment = warp_m0 + accumulator * 2;
             const bool owns_fragment = warp_m0 == warp_row && m_fragment < MTILES;
+            __syncwarp();
             if (owns_fragment) {
-                wmma::store_matrix_sync(
-                    &output_tile[warp_n][0][0], accumulators[accumulator],
-                    kWmmaN, wmma::mem_row_major);
+#pragma unroll
+                for (int element = 0; element < kAccElements; ++element) {
+                    output_tile[warp_n][(lane + 32 * element) >> 4]
+                                      [(lane + 32 * element) & 15] =
+                        accumulators[accumulator][element];
+                }
             }
             __syncthreads();
             if (owns_fragment) {
@@ -2534,23 +2525,25 @@ __global__ void __launch_bounds__(256) nepq_mmq_mma24_kernel(
 
 #pragma unroll
         for (int group_local = 0; group_local < kChunkGroups; ++group_local) {
-            int a[MTILES][4];
-#pragma unroll
-            for (int mt = 0; mt < MTILES; ++mt) {
-                load_mma_a_m16n8k32(
-                    a[mt],
-                    &activation[mt * 16 + lane % 16]
-                               [group_local * kGroupInts + (lane / 16) * 4]);
-            }
-            int b[2];
-            load_mma_b_m16n8k32(
-                b,
-                &weight[warp][lane % 8]
-                       [group_local * kGroupInts + (((lane / 8) * 4) & 7)]);
-#pragma unroll
+            #pragma unroll
             for (int mt = 0; mt < MTILES; ++mt) {
                 int dot[4] = {0, 0, 0, 0};
-                mma_m16n8k32_s8(dot, a[mt], b);
+                // Direct dp4a dot products over the shared group tiles
+                // (integer MMA path replaced for HIP).
+#pragma unroll
+                for (int fragment = 0; fragment < 4; ++fragment) {
+                    const int dot_row = mt * 16 + mma168_i(fragment);
+                    const int dot_col = mma168_j(fragment);
+                    int value = 0;
+#pragma unroll
+                    for (int gi = 0; gi < kGroupInts; ++gi) {
+                        value = __dp4a(
+                            activation[dot_row][group_local * kGroupInts + gi],
+                            weight[warp][dot_col][group_local * kGroupInts + gi],
+                            value);
+                    }
+                    dot[fragment] = value;
+                }
 #pragma unroll
                 for (int fragment = 0; fragment < 4; ++fragment) {
                     const int m_local = mt * 16 + mma168_i(fragment);
@@ -2629,15 +2622,16 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
     __shared__ __half activation_tile[kTileM][kStrideK];
     __shared__ float output_tile[kNFragments][kWmmaM][kWmmaN];
 
-    using FragmentA = wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
-                                     __half, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
-                                     __half, wmma::col_major>;
-    using FragmentC = wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>;
-    FragmentC accumulators[kAccumulatorsPerWarp];
+    // Direct FMA tiles (wmma tile path replaced for HIP): each lane owns
+    // eight elements per 16x16 accumulator, e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
+    float accumulators[kAccumulatorsPerWarp][kAccElements];
 #pragma unroll
     for (int accumulator = 0; accumulator < kAccumulatorsPerWarp; ++accumulator) {
-        wmma::fill_fragment(accumulators[accumulator], 0.0f);
+#pragma unroll
+        for (int element = 0; element < kAccElements; ++element) {
+            accumulators[accumulator][element] = 0.0f;
+        }
     }
 
     const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
@@ -2708,23 +2702,30 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
 #pragma unroll
         for (int k_local = 0; k_local < kTileK; k_local += kWmmaK) {
             if (warp_active) {
-                FragmentB weight_fragment;
-                wmma::load_matrix_sync(
-                    weight_fragment, &weight_tile[warp_n * kWmmaN][k_local], kStrideK);
+                const __half* weight_base =
+                    &weight_tile[warp_n * kWmmaN][k_local];
 #pragma unroll
                 for (int accumulator = 0;
                      accumulator < kAccumulatorsPerWarp;
                      ++accumulator) {
                     const int m_fragment = warp_m0 + accumulator * 2;
                     if (m_fragment < MTILES) {
-                        FragmentA activation_fragment;
-                        wmma::load_matrix_sync(
-                            activation_fragment,
-                            &activation_tile[m_fragment * kWmmaM][k_local],
-                            kStrideK);
-                        wmma::mma_sync(
-                            accumulators[accumulator], activation_fragment,
-                            weight_fragment, accumulators[accumulator]);
+                        const __half* activation_base =
+                            &activation_tile[m_fragment * kWmmaM][k_local];
+#pragma unroll
+                        for (int element = 0; element < kAccElements;
+                             ++element) {
+                            const int e = lane + 32 * element;
+                            const int row = e >> 4;
+                            const int column = e & 15;
+                            float value = accumulators[accumulator][element];
+#pragma unroll
+                            for (int kk = 0; kk < kWmmaK; ++kk) {
+                                value += __half2float(activation_base[row * kStrideK + kk]) *
+                                         __half2float(weight_base[column * kStrideK + kk]);
+                            }
+                            accumulators[accumulator][element] = value;
+                        }
                     }
                 }
             }
@@ -2738,10 +2739,14 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
         for (int warp_row = 0; warp_row < 2; ++warp_row) {
             const int m_fragment = warp_m0 + accumulator * 2;
             const bool owns_fragment = warp_m0 == warp_row && m_fragment < MTILES;
+            __syncwarp();
             if (owns_fragment) {
-                wmma::store_matrix_sync(
-                    &output_tile[warp_n][0][0], accumulators[accumulator],
-                    kWmmaN, wmma::mem_row_major);
+#pragma unroll
+                for (int element = 0; element < kAccElements; ++element) {
+                    output_tile[warp_n][(lane + 32 * element) >> 4]
+                                      [(lane + 32 * element) & 15] =
+                        accumulators[accumulator][element];
+                }
             }
             __syncthreads();
             if (owns_fragment) {
@@ -3768,10 +3773,8 @@ void launch_aligned_group_row_tiled_m1(
     if constexpr (STAGE_E8_THREE_BANKS) {
         shared_bytes =
             3 * kJscE8Codebook4096Bytes + kJscE8PartialBytes;
-        static const hipError_t attribute_status = hipFuncSetAttribute(
-            aligned_group_row_tiled_m1_kernel<
-                FORMAT, NWARPS, ROWS_PER_WARP, MULTI2, true, ADD_RESIDUAL>,
-            hipFuncAttributeMaxDynamicSharedMemorySize,
+        static const hipError_t attribute_status = hipFuncSetAttribute(reinterpret_cast<const void*>(aligned_group_row_tiled_m1_kernel<
+                FORMAT, NWARPS, ROWS_PER_WARP, MULTI2, true, ADD_RESIDUAL>), hipFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shared_bytes));
         MFQ_RUNTIME_CHECK(
             attribute_status == hipSuccess,
@@ -4914,11 +4917,9 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid = warp * 32 + lane;
-    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
-                                     __half, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
-                                     __half, wmma::col_major>;
-    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+    // Direct FMA tiles (wmma tile path replaced for HIP): each lane owns
+    // eight elements per 16x16 accumulator, e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
 
     static_assert(BM == 16 || BM == 32 || BM == 64 || BM == 128);
     static_assert(BN == 64 || BN == 128);
@@ -4944,12 +4945,15 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             ? -1 : (routed_input ? pair_index : pair_index / routes);
     }
     __syncthreads();
-    FragmentC accumulators[kAccumulatorFragments];
+    float accumulators[kAccumulatorFragments][kAccElements];
 #pragma unroll
     for (int fragment = 0;
          fragment < kAccumulatorFragments;
          ++fragment) {
-        wmma::fill_fragment(accumulators[fragment], 0.0f);
+#pragma unroll
+        for (int element = 0; element < kAccElements; ++element) {
+            accumulators[fragment][element] = 0.0f;
+        }
     }
     const int chunks =
         (ng + GROUPS_PER_CHUNK - 1) / GROUPS_PER_CHUNK;
@@ -5085,26 +5089,31 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                  k_local < kTileK;
                  k_local += 16) {
                 if (BM < 64 || k_base + k_local < K) {
-                    FragmentB weight_fragment;
-                    wmma::load_matrix_sync(
-                        weight_fragment,
-                        weight_tile + warp_n * 16 * kStrideK + k_local,
-                        kStrideK);
+                    const __half* weight_base =
+                        weight_tile + warp_n * 16 * kStrideK + k_local;
 #pragma unroll
                     for (int fragment = 0;
                          fragment < kAccumulatorFragments;
                          ++fragment) {
                         const int m_fragment = m_fragment_base +
                             fragment * (BM == 128 ? 2 : 1);
-                        FragmentA activation_fragment;
-                        wmma::load_matrix_sync(
-                            activation_fragment,
+                        const __half* activation_base =
                             activation_tile +
-                                m_fragment * 16 * kStrideK + k_local,
-                            kStrideK);
-                        wmma::mma_sync(
-                            accumulators[fragment], activation_fragment,
-                            weight_fragment, accumulators[fragment]);
+                                m_fragment * 16 * kStrideK + k_local;
+#pragma unroll
+                        for (int element = 0; element < kAccElements;
+                             ++element) {
+                            const int e = lane + 32 * element;
+                            const int row = e >> 4;
+                            const int column = e & 15;
+                            float value = accumulators[fragment][element];
+#pragma unroll
+                            for (int kk = 0; kk < 16; ++kk) {
+                                value += __half2float(activation_base[row * kStrideK + kk]) *
+                                         __half2float(weight_base[column * kStrideK + kk]);
+                            }
+                            accumulators[fragment][element] = value;
+                        }
                     }
                 }
             }
@@ -5122,10 +5131,12 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                  ++fragment) {
                 const int m_fragment =
                     m_fragment_base + fragment * 2;
-                wmma::store_matrix_sync(
-                    output_tile + warp * 16 * 16,
-                    accumulators[fragment],
-                    16, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int element = 0; element < kAccElements; ++element) {
+                    output_tile[warp * 16 * 16 + lane + 32 * element] =
+                        accumulators[fragment][element];
+                }
                 __syncwarp();
                 for (int element = lane; element < 16 * 16; element += 32) {
                     const int m_local = m_fragment * 16 + element / 16;
@@ -5148,11 +5159,14 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             for (int m_fragment = 0;
                  m_fragment < kMFragments;
                  ++m_fragment) {
-                wmma::store_matrix_sync(
-                    output_tile +
-                        (warp * BM + m_fragment * 16) * 16,
-                    accumulators[m_fragment],
-                    16, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int element = 0; element < kAccElements; ++element) {
+                    output_tile[(warp * BM + m_fragment * 16) * 16 +
+                                lane + 32 * element] =
+                        accumulators[m_fragment][element];
+                }
+                __syncwarp();
             }
         }
         __syncthreads();
@@ -5438,11 +5452,9 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
     __shared__ __half activation_tile[kTileM][kStrideK];
     __shared__ float output_tile[kNFragments][16][16];
 
-    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
-                                     __half, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
-                                     __half, wmma::col_major>;
-    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+    // Direct FMA tiles (wmma tile path replaced for HIP): each lane owns
+    // eight elements per 16x16 accumulator, e = lane + 32*j -> (row, col).
+    constexpr int kAccElements = 8;
 
     for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
         const int fine_tile = static_cast<int>(task / ntiles_n);
@@ -5459,8 +5471,11 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
         const int last = min(first + kTileM, expert_bounds[expert + 1]);
         const int n0 = ntile * kTileN;
 
-        FragmentC accumulator;
-        wmma::fill_fragment(accumulator, 0.0f);
+        float accumulator[kAccElements];
+#pragma unroll
+        for (int element = 0; element < kAccElements; ++element) {
+            accumulator[element] = 0.0f;
+        }
         const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
         for (int chunk = 0; chunk < chunks; ++chunk) {
             const int group_base = chunk * kGroupsPerChunk;
@@ -5539,26 +5554,33 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
             if (warp < kNFragments) {
 #pragma unroll
                 for (int k_local = 0; k_local < kTileK; k_local += 16) {
-                    FragmentA activation_fragment;
-                    FragmentB weight_fragment;
-                    wmma::load_matrix_sync(
-                        activation_fragment, &activation_tile[0][k_local],
-                        kStrideK);
-                    wmma::load_matrix_sync(
-                        weight_fragment, &weight_tile[warp * 16][k_local],
-                        kStrideK);
-                    wmma::mma_sync(
-                        accumulator, activation_fragment,
-                        weight_fragment, accumulator);
+                    const __half* activation_base = &activation_tile[0][k_local];
+                    const __half* weight_base = &weight_tile[warp * 16][k_local];
+#pragma unroll
+                    for (int element = 0; element < kAccElements; ++element) {
+                        const int e = lane + 32 * element;
+                        const int row = e >> 4;
+                        const int column = e & 15;
+                        float value = accumulator[element];
+#pragma unroll
+                        for (int kk = 0; kk < 16; ++kk) {
+                            value += __half2float(activation_base[row * kStrideK + kk]) *
+                                     __half2float(weight_base[column * kStrideK + kk]);
+                        }
+                        accumulator[element] = value;
+                    }
                 }
             }
             __syncthreads();
         }
 
+        __syncwarp();
         if (warp < kNFragments) {
-            wmma::store_matrix_sync(
-                &output_tile[warp][0][0], accumulator,
-                16, wmma::mem_row_major);
+#pragma unroll
+            for (int element = 0; element < kAccElements; ++element) {
+                const int e = lane + 32 * element;
+                output_tile[warp][e >> 4][e & 15] = accumulator[element];
+            }
         }
         __syncthreads();
         if (warp < kNFragments) {
@@ -5801,9 +5823,10 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
             BM_VALUE, BN_VALUE, GROUP_VALUE>);                                  \
         if constexpr (kSharedBytes > 48 * 1024) {                               \
             static const hipError_t attribute_status = hipFuncSetAttribute(   \
-                nvq_moe_grouped_hetero_f16_kernel<                              \
-                    BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE,               \
-                    FORMAT_GROUP_VALUE, true>,                                  \
+                reinterpret_cast<const void*>(                                 \
+                    nvq_moe_grouped_hetero_f16_kernel<                          \
+                        BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE,           \
+                        FORMAT_GROUP_VALUE, true>),                             \
                 hipFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);     \
             MFQ_RUNTIME_CHECK(                                                   \
                 attribute_status == hipSuccess,                                \
@@ -6861,8 +6884,11 @@ __global__ void __launch_bounds__(256) nvq_backward_mma_m8_kernel(
     for (int index = lane; index < 16 * 16; index += 32) {
         gradient_tile[warp][index] = __float2half_rn(0.0f);
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
+    // Direct FMA tile (wmma tile path replaced for HIP): each lane owns
+    // eight elements, e = lane + 32*j -> (row, col).
+    float accumulator[8];
+#pragma unroll
+    for (int element = 0; element < 8; ++element) accumulator[element] = 0.0f;
     for (int output_group = warp * 128;
          output_group < N;
          output_group += kWarps * 128) {
@@ -6915,23 +6941,27 @@ __global__ void __launch_bounds__(256) nvq_backward_mma_m8_kernel(
                     : __float2half_rn(0.0f);
             }
             __syncwarp();
-            wmma::fragment<
-                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
-                    gradient_fragment;
-            wmma::fragment<
-                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
-                    weight_fragment;
-            wmma::load_matrix_sync(
-                gradient_fragment, gradient_tile[warp], 16);
-            wmma::load_matrix_sync(
-                weight_fragment, weight_tile[warp], 16);
-            wmma::mma_sync(
-                accumulator, gradient_fragment, weight_fragment, accumulator);
+#pragma unroll
+            for (int element = 0; element < 8; ++element) {
+                const int e = lane + 32 * element;
+                const int row = e >> 4;
+                const int column = e & 15;
+                float value = accumulator[element];
+#pragma unroll
+                for (int k = 0; k < 16; ++k) {
+                    value += __half2float(gradient_tile[warp][row * 16 + k]) *
+                             __half2float(weight_tile[warp][k * 16 + column]);
+                }
+                accumulator[element] = value;
+            }
             __syncwarp();
         }
     }
-    wmma::store_matrix_sync(
-        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncwarp();
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        result_tile[warp][lane + 32 * element] = accumulator[element];
+    }
     __syncthreads();
     const int index = static_cast<int>(threadIdx.x);
     if (index < M * 16) {
@@ -7011,8 +7041,11 @@ __global__ void __launch_bounds__(256) nepq_backward_mma_m8_kernel(
     for (int index = lane; index < 16 * 16; index += 32) {
         gradient_tile[warp][index] = __float2half_rn(0.0f);
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
+    // Direct FMA tile (wmma tile path replaced for HIP): each lane owns
+    // eight elements, e = lane + 32*j -> (row, col).
+    float accumulator[8];
+#pragma unroll
+    for (int element = 0; element < 8; ++element) accumulator[element] = 0.0f;
     for (int output_group = warp * 128;
          output_group < N;
          output_group += kWarps * 128) {
@@ -7067,23 +7100,27 @@ __global__ void __launch_bounds__(256) nepq_backward_mma_m8_kernel(
                     : __float2half_rn(0.0f);
             }
             __syncwarp();
-            wmma::fragment<
-                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
-                    gradient_fragment;
-            wmma::fragment<
-                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
-                    weight_fragment;
-            wmma::load_matrix_sync(
-                gradient_fragment, gradient_tile[warp], 16);
-            wmma::load_matrix_sync(
-                weight_fragment, weight_tile[warp], 16);
-            wmma::mma_sync(
-                accumulator, gradient_fragment, weight_fragment, accumulator);
+#pragma unroll
+            for (int element = 0; element < 8; ++element) {
+                const int e = lane + 32 * element;
+                const int row = e >> 4;
+                const int column = e & 15;
+                float value = accumulator[element];
+#pragma unroll
+                for (int k = 0; k < 16; ++k) {
+                    value += __half2float(gradient_tile[warp][row * 16 + k]) *
+                             __half2float(weight_tile[warp][k * 16 + column]);
+                }
+                accumulator[element] = value;
+            }
             __syncwarp();
         }
     }
-    wmma::store_matrix_sync(
-        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncwarp();
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        result_tile[warp][lane + 32 * element] = accumulator[element];
+    }
     __syncthreads();
     const int index = static_cast<int>(threadIdx.x);
     if (index < M * 16) {

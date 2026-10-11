@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include "mfq_hip_compat.h"
 
 namespace mfq_sparse_attn_mma {
 

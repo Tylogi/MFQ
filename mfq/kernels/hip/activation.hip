@@ -14,6 +14,7 @@
 
 #include "../hip/glu.cuh"
 #include "../../hip/include/mfq_hip_kernels.h"
+#include "mfq_hip_compat.h"
 
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.

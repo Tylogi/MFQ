@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 namespace mfq_qwen4_exp {
 using mfq_tensor_backend::Tensor;

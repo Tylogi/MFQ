@@ -2,9 +2,9 @@
 #pragma once
 
 #include "continuous_batch.h"
-#include "cuda_execution.h"
+#include "hip_execution.h"
 #include "../../hip/include/hip_runtime_config.h"
-#include "cuda_sampling.h"
+#include "hip_sampling.h"
 #include "models/qwen35/batch_state.h"
 
 namespace mfq::cuda {

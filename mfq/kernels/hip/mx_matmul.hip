@@ -2,7 +2,6 @@
 #include <hip/hip_fp16.h>
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <hip/hip_runtime.h>
-#include <mma.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -10,6 +9,7 @@
 #include <type_traits>
 
 #include "../hip/packed_backward.cuh"
+#include "mfq_hip_compat.h"
 
 namespace {
 
@@ -1057,7 +1057,6 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
         int rows,
         int outputs,
         int width) {
-    using namespace nvcuda;
     constexpr int kWarps = 8;
     __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
     __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
@@ -1072,8 +1071,11 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
             weight_tile[warp][index] = __float2half_rn(0.0f);
         }
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
+    // Direct FMA tile (wmma tile path replaced for HIP): each lane owns
+    // eight elements, e = lane + 32*j -> (row, col).
+    float accumulator[8];
+#pragma unroll
+    for (int element = 0; element < 8; ++element) accumulator[element] = 0.0f;
     for (int output_group = warp * 128;
          output_group < outputs;
          output_group += kWarps * 128) {
@@ -1107,23 +1109,27 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
                     : __float2half_rn(0.0f);
             }
             __syncwarp();
-            wmma::fragment<
-                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
-                    gradient_fragment;
-            wmma::fragment<
-                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
-                    weight_fragment;
-            wmma::load_matrix_sync(
-                gradient_fragment, gradient_tile[warp], 16);
-            wmma::load_matrix_sync(
-                weight_fragment, weight_tile[warp], 16);
-            wmma::mma_sync(
-                accumulator, gradient_fragment, weight_fragment, accumulator);
+#pragma unroll
+            for (int element = 0; element < 8; ++element) {
+                const int e = lane + 32 * element;
+                const int row = e >> 4;
+                const int column = e & 15;
+                float value = accumulator[element];
+#pragma unroll
+                for (int k = 0; k < 16; ++k) {
+                    value += __half2float(gradient_tile[warp][row * 16 + k]) *
+                             __half2float(weight_tile[warp][k * 16 + column]);
+                }
+                accumulator[element] = value;
+            }
             __syncwarp();
         }
     }
-    wmma::store_matrix_sync(
-        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncwarp();
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        result_tile[warp][lane + 32 * element] = accumulator[element];
+    }
     __syncthreads();
     const int index = static_cast<int>(threadIdx.x);
     if (index < rows * Columns) {

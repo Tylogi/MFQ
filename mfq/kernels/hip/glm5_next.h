@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <vector>
+#include "mfq_hip_compat.h"
 
 namespace mfq_glm5_next {
 using mfq_tensor_backend::Tensor;

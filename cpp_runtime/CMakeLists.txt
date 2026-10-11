@@ -14,6 +14,33 @@ option(
     ${APPLE}
 )
 
+include(CheckLanguage)
+check_language(CUDA)
+if(NOT APPLE AND CMAKE_CUDA_COMPILER)
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT OFF)
+endif()
+option(
+    MFQ_BUILD_CUDA_RUNTIME
+    "Build the native CUDA runtime (requires the CUDA toolkit)"
+    ${_MFQ_BUILD_CUDA_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT)
+
+check_language(HIP)
+if(NOT APPLE AND CMAKE_HIP_COMPILER)
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT OFF)
+endif()
+option(
+    MFQ_BUILD_HIP_RUNTIME
+    "Build the native HIP runtime on AMD ROCm hosts"
+    ${_MFQ_BUILD_HIP_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_HIP_RUNTIME_DEFAULT)
+
 if(APPLE)
     set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT OFF)
 else()
@@ -59,8 +86,12 @@ if(MFQ_BUILD_METAL_RUNTIME)
     add_subdirectory(backends/metal metal)
 endif()
 
-if(NOT APPLE)
+if(MFQ_BUILD_CUDA_RUNTIME)
     add_subdirectory(backends/cuda cuda)
+endif()
+
+if(MFQ_BUILD_HIP_RUNTIME)
+    add_subdirectory(backends/hip hip)
 endif()
 
 if(BUILD_TESTING)
