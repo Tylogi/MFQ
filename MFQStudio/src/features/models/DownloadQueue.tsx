@@ -68,12 +68,22 @@ export function DownloadQueue({ jobs, onJobCreated }: {
       {jobs.map((job) => {
         const progress = downloadProgress(job);
         const retry = ['failed', 'cancelled', 'interrupted'].includes(job.status);
+        const files = Array.isArray(job.payload.include)
+          ? Array.from(new Set(job.payload.include.filter((file): file is string => typeof file === 'string' && !!file && !/[?*\[]/.test(file))))
+          : [];
+        const destination = String(job.payload.destination || '');
+        const title = files[0] || destination.split(/[\\/]/).filter(Boolean).pop() || String(job.payload.repo_id || job.kind);
         return (
           <article className={`download-queue-item ${job.status}`} key={job.id} data-job-id={job.id}>
             <div className="download-item-icon"><Icon name={job.status === 'succeeded' ? 'check' : 'download'} size={20} /></div>
             <div className="download-item-body">
-              <div className="download-item-heading"><strong>{String(job.payload.repo_id || job.kind)}</strong><span className="model-identity-trailing">{statusLabels[job.status]}<ModelVendorMark name={String(job.payload.repo_id || '')} /></span></div>
-              <small>{job.kind === 'download.huggingface' ? 'Hugging Face' : 'ModelScope'} · {String(job.payload.destination || '')}</small>
+              <div className="download-item-heading"><strong>{title}</strong><span className="model-identity-trailing">{statusLabels[job.status]}<ModelVendorMark name={String(job.payload.repo_id || '')} /></span></div>
+              <small><span>{String(job.payload.repo_id || job.kind)}</span> · {job.kind === 'download.huggingface' ? 'Hugging Face' : 'ModelScope'}</small>
+              {files.length > 1 && <details className="download-item-files">
+                <summary>{tr(`查看 ${files.length} 个文件`, `View ${files.length} files`)}</summary>
+                <ul>{files.map((file) => <li key={file}>{file}</li>)}</ul>
+              </details>}
+              <small>{tr('保存到', 'Save to')} · {destination}</small>
               <div className="download-item-progress"><progress aria-label={tr('下载进度', 'Download progress')} max={1} value={progress} /><span>{formatNumber(progress * 100, 1)}%</span></div>
               {isActiveDownload(job) && job.progress_data?.downloaded_bytes != null && <small className="download-transfer-stats">
                 {(job.progress_data.bytes_per_second ? formatBytes(job.progress_data.bytes_per_second).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`) : '0 B')}/s
