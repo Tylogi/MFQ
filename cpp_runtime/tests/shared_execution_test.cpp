@@ -114,6 +114,116 @@ void batch_test() {
         if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
+void staggered_decode_batch_test() {
+    struct CoalescingOps : BatchOps {
+        std::vector<int>& rows;
+        explicit CoalescingOps(std::vector<int>& rows) : rows(rows) {}
+        int decode(State& state) {
+            rows.push_back(static_cast<int>(std::count_if(state.active.begin(),state.active.end(),
+                [](const auto& request) { return request->eligible; })));
+            return 0;
+        }
+    };
+    std::vector<int> rows;
+    BatchExecution<CoalescingOps> ops(rows);
+    RequestExecutor executor(2);
+    executor.admit(batch_request("short",1,12),nullptr,batch_info(),ops);
+    executor.admit(batch_request("long",7,12),nullptr,batch_info(),ops);
+    std::map<std::string,std::vector<int64_t>> tokens;
+    const auto tick = [&](std::vector<RequestId> eligible) {
+        auto result = executor.step(eligible,ops);
+        assert(result.status.healthy);
+        for (const auto& event : result.events)
+            if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                tokens[event.id].insert(tokens[event.id].end(),delta->token_ids.begin(),delta->token_ids.end());
+    };
+    for (int i = 0; i < 80 && tokens["long"].empty(); ++i) tick({"short","long"});
+    assert(!tokens["short"].empty() && !tokens["long"].empty());
+    // Backpressure on a peer must not hold an otherwise eligible request.
+    const auto before = tokens["short"].size();
+    for (int i = 0; i < 12 && tokens["short"].size() == before; ++i) tick({"short"});
+    assert(tokens["short"].size() > before && tokens["long"].size() == 1);
+    rows.clear();
+    for (int i = 0; i < 160 && !executor.empty(); ++i) tick({"short","long"});
+    assert(executor.empty());
+    assert(std::count(rows.begin(),rows.end(),2) >= 6);
+    for (const auto& id : {"short","long"}) {
+        std::vector<int64_t> expected(12);
+        std::iota(expected.begin(),expected.end(),10);
+        assert(tokens[id] == expected);
+    }
+}
+
+struct IsolatedPrefillOps : BatchOps {
+    static constexpr bool isolate_prefill_failures = true;
+    Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
+        if (request->id == "pressure" && chunk.offset > 0)
+            throw InferenceInputError(InferenceInputErrorCode::ContextLength,
+                                      "context growth exceeds available memory");
+        return BatchOps::prefill(request,chunk);
+    }
+};
+void isolated_prefill_failure_test() {
+    BatchExecution<IsolatedPrefillOps> ops;
+    RequestExecutor executor(2);
+    std::map<std::string,std::vector<int64_t>> tokens;
+    std::map<std::string,int> failures, terminals;
+    const auto tick = [&](std::vector<RequestId> eligible) {
+        auto result = executor.step(eligible,ops);
+        assert(result.status.healthy);
+        for (const auto& event : result.events) {
+            if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                tokens[event.id].insert(tokens[event.id].end(),delta->token_ids.begin(),delta->token_ids.end());
+            failures[event.id] += std::holds_alternative<Failed>(event.data);
+            terminals[event.id] += terminal(event.data);
+        }
+    };
+    executor.admit(batch_request("survivor",2,5),nullptr,batch_info(),ops);
+    for (int i = 0; i < 10 && tokens["survivor"].empty(); ++i) tick({"survivor"});
+    assert(tokens["survivor"] == std::vector<int64_t>{10});
+    executor.admit(batch_request("pressure",5,5),nullptr,batch_info(),ops);
+    for (int i = 0; i < 40 && !executor.empty(); ++i) tick({"pressure","survivor"});
+    assert(executor.empty() && failures["pressure"] == 1 && terminals["pressure"] == 1);
+    assert(failures["survivor"] == 0 && terminals["survivor"] == 1 &&
+        tokens["survivor"] == std::vector<int64_t>({10,11,12,13,14}));
+    assert(executor.admit(batch_request("reuse",2,1),nullptr,batch_info(),ops) == Admission::accepted);
+    for (int i = 0; i < 10 && !executor.empty(); ++i) tick({"reuse"});
+    assert(executor.empty() && tokens["reuse"] == std::vector<int64_t>{10});
+}
+
+struct IsolatedGrowthOps : BatchOps {
+    static constexpr bool isolate_context_growth_failures = true;
+    int decode(State& state) {
+        for (const auto& request : state.active)
+            if (request->eligible && request->id == "pressure")
+                throw InferenceInputError(InferenceInputErrorCode::ContextLength,"KV growth exceeds available memory");
+        return 0;
+    }
+};
+void isolated_context_growth_test() {
+    BatchExecution<IsolatedGrowthOps> ops;
+    RequestExecutor executor(2);
+    std::map<std::string,std::vector<int64_t>> tokens;
+    std::map<std::string,int> failures;
+    const auto tick = [&](std::vector<RequestId> eligible) {
+        auto result = executor.step(eligible,ops);
+        assert(result.status.healthy);
+        for (const auto& event : result.events) {
+            if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                tokens[event.id].insert(tokens[event.id].end(),delta->token_ids.begin(),delta->token_ids.end());
+            failures[event.id] += std::holds_alternative<Failed>(event.data);
+        }
+    };
+    executor.admit(batch_request("survivor",2,5),nullptr,batch_info(),ops);
+    executor.admit(batch_request("pressure",2,5),nullptr,batch_info(),ops);
+    for (const auto& id : {"survivor","pressure"})
+        for (int i = 0; i < 10 && tokens[id].empty(); ++i) tick({id});
+    for (int i = 0; i < 40 && !executor.empty(); ++i) tick({"survivor","pressure"});
+    assert(executor.empty() && failures["pressure"] == 1 && failures["survivor"] == 0);
+    assert(tokens["survivor"] == std::vector<int64_t>({10,11,12,13,14}) &&
+           tokens["pressure"] == std::vector<int64_t>{10});
+}
+
 void batch_failure_test() {
     enum Stage { suspend, prefill, activate, resume };
     struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
@@ -1666,6 +1776,9 @@ int main() {
     inner_model_flow_test();
     predictor_flow_test();
     batch_test();
+    staggered_decode_batch_test();
     batch_failure_test();
+    isolated_prefill_failure_test();
+    isolated_context_growth_test();
     model_test();
 }

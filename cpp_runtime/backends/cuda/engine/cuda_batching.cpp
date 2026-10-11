@@ -5,6 +5,7 @@
 #include "core/decode_graph.h"
 #include "core/full_block.h"
 #include "models/qwen35/ops.h"
+#include "storage/moe_expert_cache.h"
 
 #include <algorithm>
 #include <exception>
@@ -444,5 +445,115 @@ void QwenBatchOperations::recover(State &state) {
         caches.push_back(&request->cache);
     state_adapter_.recover(caches);
     invalidate_decode_graph();
+}
+
+FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
+        CudaExecutionContext& execution, CudaContinuousBatchConfig config)
+    : model_(model), execution_(execution), config_(std::move(config)) {
+    MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= 32,
+                      "Flash-Next continuous batching supports 1..32 requests");
+    model_.reset(1);
+    if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
+}
+FlashNextBatchOperations::~FlashNextBatchOperations() = default;
+int64_t FlashNextBatchOperations::vocab_size() const { return model_.vocab_size(); }
+int64_t FlashNextBatchOperations::max_context() const { return model_.max_position_embeddings(); }
+mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
+    std::size_t bytes = 0, contexts = 0;
+    for (const auto& weak : requests_) if (const auto request = weak.lock(); request && request->cache) {
+        bytes += request->cache->resident_bytes();
+        contexts += request->cache->position() > 0;
+    }
+    return {{"continuous_batching_decode_batches",double(decode_batches_)},
+        {"continuous_batching_decode_tokens",double(decode_tokens_)},
+        {"continuous_batching_moe_cached_row_serial",0.0},
+        {"continuous_batching_cuda_graph_captures",double(graph_ ? graph_->captures() : 0)},
+        {"continuous_batching_cuda_graph_replays",double(graph_ ? graph_->replays() : 0)},
+        {"continuous_batching_request_kv_bytes",double(bytes)},
+        {"continuous_batching_request_contexts",double(contexts)}};
+}
+void FlashNextBatchOperations::suspend_decode() { if (graph_) graph_->clear(); }
+void FlashNextBatchOperations::resume_decode(int64_t) {}
+FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill(
+        const std::shared_ptr<Request>& request, mfq::engine::PrefillChunk chunk) {
+    MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    if (!request->cache) {
+        MFQ_RUNTIME_CHECK(chunk.offset == 0,"Flash-Next batch lost request state");
+        std::erase_if(requests_,[](const auto& weak) { return weak.expired(); });
+        requests_.push_back(request);
+        request->cache = std::make_unique<Qwen4BatchRequestState>(model_);
+        request->prefill_ids = mfq_tensor_backend::tensor(request->prompt,
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)
+                .device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
+                    execution_.layer_placement.primary_device()))).reshape({1,-1});
+        request->sampler.emplace(request->sampling);
+        if (request->sampler->has_penalties())
+            request->counts = SamplingOps::token_counts(request->prefill_ids,model_.vocab_size());
+    }
+    MFQ_RUNTIME_CHECK(request->cache->position() == chunk.offset,"Flash-Next batch prefill position mismatch");
+    auto timer = std::make_unique<PrefillCudaTimer>();
+    auto hidden = request->cache->prefill(model_,request->prefill_ids.narrow(1,chunk.offset,chunk.count).contiguous());
+    const auto finished = chunk.offset + chunk.count == static_cast<int64_t>(request->prompt.size());
+    Tensor next;
+    if (finished) next = sample_logits(*request->sampler,
+        model_.logits_from_hidden(model_.last_hidden(std::move(hidden))).reshape({1,-1}),
+        request->counts,request->token_constraint);
+    MFQ_CUDA_CHECK(cudaEventRecord(timer->finished_event(),mfq_get_current_cuda_stream()));
+    request->prefill_timers.push_back(std::move(timer));
+    if (!finished) return {};
+    const auto token = next.item<int64_t>();
+    double milliseconds = 0;
+    for (const auto& measured : request->prefill_timers) milliseconds += measured->elapsed_ms();
+    request->prefill_timers.clear();
+    request->prefill_ids = {};
+    return {std::move(next),token,{request->prompt.size(),milliseconds,0.0,milliseconds}};
+}
+void FlashNextBatchOperations::activate(const std::shared_ptr<Request>& request, const Sample& sampled) {
+    accept(request,sampled);
+}
+void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& request) {
+    if (graph_) graph_->clear();
+    finish_moe_expert_exchanges(execution_.moe_expert_cache);
+    request->cache.reset(); request->prefill_ids = {}; request->prefill_timers.clear();
+}
+void FlashNextBatchOperations::retire(const std::vector<std::shared_ptr<Request>>& retired,int64_t) {
+    for (const auto& request : retired) discard_prefill(request);
+}
+FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state) {
+    MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    std::vector<Qwen4BatchRequestState*> caches;
+    std::vector<int64_t> tokens;
+    for (const auto& request : state.active) {
+        request->decode_row = -1;
+        if (!request->eligible) continue;
+        request->decode_row = static_cast<int64_t>(tokens.size());
+        MFQ_RUNTIME_CHECK(request->cache && request->cache->position() == request->cache_length,
+                          "Flash-Next batch decode position mismatch");
+        caches.push_back(request->cache.get()); tokens.push_back(request->pending_token);
+    }
+    auto host_ids = mfq_tensor_backend::tensor(tokens,
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).reshape({-1,1});
+    auto ids = host_ids.to(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
+                                                   execution_.layer_placement.primary_device()));
+    MoeContinuousBatchCacheScope moe_cache_scope(execution_,tokens.size() > 8);
+    auto captured = graph_ ? graph_->run(caches,ids,host_ids) : std::optional<Tensor>{};
+    auto logits = captured ? std::move(*captured) : qwen4_batch_decode(model_,caches,std::move(ids),host_ids);
+    ++decode_batches_; decode_tokens_ += tokens.size();
+    return {std::move(logits)};
+}
+FlashNextBatchOperations::Sample FlashNextBatchOperations::sample(
+        const std::shared_ptr<Request>& request,const Decoded& decoded) {
+    MFQ_RUNTIME_CHECK(request->decode_row >= 0,"Flash-Next sampled an inactive row");
+    auto next = sample_logits(*request->sampler,decoded.logits.narrow(0,request->decode_row,1),
+                             request->counts,request->token_constraint);
+    const auto token = next.item<int64_t>();
+    return {std::move(next),token,{}};
+}
+void FlashNextBatchOperations::accept(const std::shared_ptr<Request>& request,const Sample& sampled) {
+    if (request->counts.defined()) sample_token_counts_add_cuda(request->counts,sampled.next.contiguous());
+}
+void FlashNextBatchOperations::recover(State& state) {
+    for (const auto& request : state.active) discard_prefill(request);
+    for (const auto& request : state.prefilling) discard_prefill(request);
 }
 } // namespace mfq::cuda

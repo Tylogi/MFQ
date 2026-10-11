@@ -1136,6 +1136,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         // Warm the allocation/workspace shape, then capture exactly the same
         // body. Plans disable every expert during this preparation.
+        // Initialize persistent format caches before lending temporaries to
+        // the graph pool; first-use caches otherwise consume warmed blocks.
+        launch_body(cell,execution);
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));cell.output={};
         {mfq::cuda::GraphWarmupScope warmup(cache_->pipeline_pool_context_,stream_);launch_body(cell,execution);}
         MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));cell.output={};
         std::string error;

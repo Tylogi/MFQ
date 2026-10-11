@@ -16,13 +16,14 @@ from mfq.formats.header import FileHeader
 from mfq.formats.nint import NintSpec, NintTensor
 
 
-def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) -> tuple[Path, Path]:
+def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
+            context_size=64, quantized_experts=False) -> tuple[Path, Path]:
     rng = np.random.default_rng(20261001)
     hidden, streams, experts, intermediate = 128, 2, 2, 32
     qsa = qsa or ple_layer == 3
     config = dict(
         model_type="qwen4_exp_text", vocab_size=32, hidden_size=hidden,
-        num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=64,
+        num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=context_size,
         num_attention_heads=24 if wide else 2, num_key_value_heads=2 if wide else 1,
         head_dim=256 if wide else 64,
         full_attention_interval=2,
@@ -151,6 +152,23 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) ->
         fp8[name] = np.array([0x00, 0x30, 0x38, 0x3C], dtype=np.uint8)[
             codes.reshape(rows, -1)[:, :width]].view(io.Float8E4M3Array)
     asset = model_config_asset({"model_type": "qwen4_exp", "text_config": config})
+    if quantized_experts:
+        from mfq.formats.mfe import MfePool, MfeTensor
+        from mfq.quantize.nint_quant import quantize
+        for values in (fp8, nint):
+            for name, weight in list(values.items()):
+                if ".mlp.experts.gate_up.weight" in name:
+                    gate, up = np.split(weight, 2, axis=1)
+                    values[name.replace("gate_up.weight", "gate.weight")] = gate
+                    values[name.replace("gate_up.weight", "up.weight")] = up
+                    del values[name]
+            for name, weight in list(values.items()):
+                if ".mlp.experts." not in name:
+                    continue
+                experts, output, width = weight.shape
+                packed = quantize(weight.reshape(experts * output, width), NintSpec(4, 8, 6))
+                values[name] = MfeTensor(shape=weight.shape, pools=(
+                    MfePool(expert_ids=np.arange(experts, dtype=np.int32), tensor=packed),))
     paths = (tmp_path / "fp8.mfq", tmp_path / "nintv2.mfq")
     for path, values in zip(paths, (fp8, nint), strict=True):
         values[asset.name] = asset.data
@@ -462,6 +480,90 @@ def _cuda_models(tmp_path):
     baseline = tmp_path / "dense.mfq"
     io.save(baseline, header, tensors)
     return baseline, nint
+
+
+@pytest.mark.parametrize("requests", [2, 32])
+@pytest.mark.parametrize("quantized_experts", [False, True])
+def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, requests, quantized_experts):
+    executable = os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
+    if not executable:
+        pytest.skip("MFQ_NINT_PLE_CUDA_DECODE must point to CUDA mfq-diagnostics")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512,
+                      quantized_experts=quantized_experts)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+                       MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    process = subprocess.run([
+        executable, "--model", str(model), "--ctx-size", "512",
+        "--check-continuous-batching", "--continuous-batching-check-requests", str(requests),
+        "--moe-gpu-cache-gb", "0.1" if quantized_experts else "0",
+    ], capture_output=True, text=True, timeout=90, env=environment)
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "continuous_batching_check PASS" in process.stdout
+    if requests == 32:
+        assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in process.stdout
+    state = next(line for line in process.stdout.splitlines()
+                 if line.startswith("continuous_batching_state_check"))
+    metrics = dict(field.split("=", 1) for field in state.split()[1:])
+    assert int(metrics["captures"]) > 0
+    assert int(metrics["replays"]) > int(metrics["captures"])
+
+
+@pytest.mark.parametrize("requests", [2, 32])
+def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512,
+                      quantized_experts=True)
+    # Token 0 is the fixture tokenizer's ordinary "a" token. Keep the worker
+    # producing long enough for both requests to overlap, without EOS timing.
+    header, weights = io.load(model)
+    weights["model.output.weight"].fill(0)
+    io.save(model,header,weights)
+    tokenizer = _worker_tokenizer(tmp_path)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+                       MFQ_MOE_HOST_CACHE_BYTES="8388608")
+
+    async def run():
+        with (tmp_path / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(executable,"--model",str(model),
+                "--tokenizer",str(tokenizer),"--transport","stdio","--ctx-size","512",
+                "--continuous-batching","32","--moe-gpu-cache-gb","0.00004",
+                stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=log,env=environment)
+            client = StdioRuntimeClient(process,control_timeout_seconds=10)
+            try:
+                await client.status()
+                async def generate(content):
+                    async with client.generate({"messages":[{"role":"user","content":content}],
+                            "temperature":0,"top_k":1,"max_tokens":32,"stream":True}) as events:
+                        return [event async for event in events if event is not None]
+                prompts = ["ab" * (4 + row % 5 * 8) for row in range(requests)]
+                reference = [await generate(prompt) for prompt in prompts]
+                parallel = await asyncio.gather(*(generate(prompt) for prompt in prompts))
+                def text(events):
+                    return "".join(choice.get("delta",{}).get("content","")
+                        for event in events for choice in event.get("choices",[]))
+                assert list(map(text,parallel)) == list(map(text,reference))
+                assert list(map(text,parallel)) == ["a"*32] * requests
+                status = await client.status()
+                (tmp_path / "worker-status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")
+                assert status["continuous_batching_admissions"] == 2 * requests
+                assert status["continuous_batching_cuda_graph_replays"] > 0
+                assert status["continuous_batching_decode_tokens"] > status["continuous_batching_decode_batches"]
+                assert status["continuous_batching_active"] == 0
+                assert status["kv_cache_bytes"] == 0
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await process.wait()
+
+    asyncio.run(asyncio.wait_for(run(),30))
 
 
 def test_cuda_dense_fixture_matches_canonical_nint_rows(tmp_path):

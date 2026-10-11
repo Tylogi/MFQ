@@ -139,6 +139,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_text_session_state = false;
     bool check_qwen35_mtp = false;
     bool check_continuous_batching = false;
+    int check_continuous_batching_requests = 2;
     bool check_engine_isolation = false;
     bool check_flash_next = false;
     bool check_qwen4_decode_hidden = false;
@@ -583,11 +584,12 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     auto t0, auto t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
-                return run_cuda_continuous_batching_check(model);
+            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm> ||
+                          std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+                return run_cuda_continuous_batching_check(model,check_continuous_batching_requests);
             }
             throw std::runtime_error(
-                "continuous batching requires Qwen35CausalLm");
+                "continuous batching requires Qwen3.5 or Flash-Next");
         }
         if (check_qwen4_decode_hidden) {
             if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
@@ -1144,6 +1146,7 @@ void print_diagnostics_help() {
         << "  --check-qwen4-decode-hidden     check decode graph raw hidden and KV transitions\n"
         << "  --check-flash-next-mtp          check Flash-Next MTP\n"
         << "  --check-continuous-batching     check continuous batching\n"
+        << "  --continuous-batching-check-requests N  check 2..32 concurrent requests\n"
         << "  --check-engine-isolation        check two concurrent CUDA engines\n"
         << "  --check-backend-bf16-add        check backend BF16 add\n"
         << "  --check-backend-argmax          check backend argmax\n"
@@ -1259,6 +1262,10 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         }
         if (parse_cuda_load_option(option, args, result) ||
                 parse_token_input_option(option, args, result)) {
+            continue;
+        }
+        if (option == "--continuous-batching-check-requests") {
+            result.check_continuous_batching_requests = integer<int>(args.value(option),option);
             continue;
         }
         if (option == "--minicpmo-eval-batch") result.minicpmo_eval_batch = true;

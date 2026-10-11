@@ -30,6 +30,8 @@ void finalize_moe_expert_cache(
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
+// Target, predictor and request batches share the MFE pool on their compute stream.
+bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.
 // Lend decode staging/workspace capacity to the upcoming long prefill.
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);

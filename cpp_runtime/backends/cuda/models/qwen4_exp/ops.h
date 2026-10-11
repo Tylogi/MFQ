@@ -15,6 +15,42 @@ struct MtpModule;
 
 namespace mfq::cuda {
 struct Qwen4DecodeGraph;
+class Qwen4BatchDecodeGraph;
+// A request owns recurrent, positional and attention state; weights stay shared.
+class Qwen4BatchRequestState {
+  public:
+    explicit Qwen4BatchRequestState(Qwen4CausalLm&);
+    ~Qwen4BatchRequestState();
+    Qwen4BatchRequestState(const Qwen4BatchRequestState&) = delete;
+    Qwen4BatchRequestState& operator=(const Qwen4BatchRequestState&) = delete;
+    mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor);
+    int64_t position() const;
+    std::size_t resident_bytes() const;
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> state_;
+    friend class Qwen4BatchDecodeGraph;
+    friend mfq_tensor_backend::Tensor qwen4_batch_decode(
+        Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
+        mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&);
+};
+mfq_tensor_backend::Tensor qwen4_batch_decode(
+    Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
+    mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids);
+class Qwen4BatchDecodeGraph {
+  public:
+    explicit Qwen4BatchDecodeGraph(Qwen4CausalLm&);
+    ~Qwen4BatchDecodeGraph();
+    std::optional<mfq_tensor_backend::Tensor> run(
+        const std::vector<Qwen4BatchRequestState*>&,
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
+    void clear();
+    int64_t captures() const;
+    int64_t replays() const;
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> graph_;
+};
 void qwen4_begin_router_lookahead_audit(Qwen4CausalLm&,int samples);
 void qwen4_finish_router_lookahead_audit(Qwen4CausalLm&,const std::string& prefix);
 void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
@@ -45,6 +81,7 @@ struct Qwen4Model : CausalResources {
     int64_t batch = 0;
     std::optional<bool> router_lookahead;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    std::function<void(std::size_t)> reserve_kv_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
         if (ids.dim()==2 && ids.size(0)==1 &&

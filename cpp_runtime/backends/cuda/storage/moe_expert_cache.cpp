@@ -1387,6 +1387,18 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     cache->pipeline_prefetched_keys_.clear();cache->transfer_ready_recorded_=false;
 }
 
+bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) {
+    if (!cache || !moe_expert_cache_has_sources(cache)) return false;
+    const auto stream = mfq_current_cuda_stream();
+    if (!cache->pipeline_pool_context_) {
+        cache->pipeline_pool_context_ = mfq::cuda::default_context(mfq_current_cuda_device());
+        cache->pipeline_pool_stream_ = stream;
+        cache->pipeline_pool_context_->begin_graph_pool(stream);
+    } else if (cache->pipeline_pool_stream_ != stream)
+        throw std::runtime_error("MFE graph memory pool changed its CUDA stream");
+    return true;
+}
+
 
 void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
     if(!cache || !cache->complete_residency_ || cache->config_.moe_residency_adapt ||

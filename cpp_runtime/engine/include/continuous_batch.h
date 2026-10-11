@@ -137,11 +137,23 @@ template <class Ops> class ContinuousBatch {
             auto it = requests.find(id);
             if (it != requests.end() && it->second->prefill) { prefill = it; break; }
         }
-        const bool has_decode = std::any_of(state.active.begin(), state.active.end(),
+        const bool rows_ready = std::all_of(state.active.begin(), state.active.end(),
+            [&](const auto& request) {
+                return std::find(eligible.begin(), eligible.end(), request->id) == eligible.end() ||
+                    requests.at(request->id)->decode;
+            });
+        // Let eligible peers consume their previous sample and schedule the
+        // next decode before executing it. Otherwise staggered coroutines
+        // alternate single-row decodes and never form a stable batch.
+        const bool has_decode = rows_ready && std::any_of(state.active.begin(), state.active.end(),
             [](const auto& request) { return request->eligible; });
+        bool prefilling_operation = false;
+        bool decoding_operation = false;
         try {
             if (has_decode && (prefill == requests.end() || decode_next)) {
+                decoding_operation = true;
                 auto decoded = operations.decode(state);
+                decoding_operation = false;
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
@@ -154,7 +166,9 @@ template <class Ops> class ContinuousBatch {
                 const auto chunk = *work.prefill;
                 operations.suspend_decode();
                 PrefillActivity prefill_activity;
+                prefilling_operation = true;
                 auto sample = operations.prefill(request, chunk);
+                prefilling_operation = false;
                 request->prefill_offset = chunk.offset + chunk.count;
                 ++prefill_chunks;
                 if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
@@ -170,6 +184,43 @@ template <class Ops> class ContinuousBatch {
             }
             decode_next = !decode_next;
         } catch (...) {
+            if constexpr (requires { Ops::isolate_context_growth_failures; }) {
+                bool capacity_failure = false;
+                try { throw; }
+                catch (const InferenceInputError& error) {
+                    capacity_failure = error.code == InferenceInputErrorCode::ContextLength;
+                } catch (...) {}
+                if (Ops::isolate_context_growth_failures && decoding_operation && capacity_failure) {
+                    // Capacity checks run before numerical decode. Release the
+                    // newest eligible request while preserving established rows.
+                    const auto victim = std::find_if(state.active.rbegin(),state.active.rend(),
+                        [](const auto& request) { return request->eligible; });
+                    if (victim != state.active.rend()) {
+                        auto request = *victim;
+                        auto& work = *requests.at(request->id);
+                        work.failure = std::current_exception(); work.decode = false;
+                        std::erase(state.active,request);
+                        try {
+                            operations.retire({request},cache_position());
+                            work.active = false;
+                            return;
+                        } catch (...) { recover(std::current_exception()); throw; }
+                    }
+                }
+            }
+            if constexpr (requires { Ops::isolate_prefill_failures; }) {
+                if (Ops::isolate_prefill_failures && prefilling_operation && prefill != requests.end()) {
+                    auto& work = *prefill->second;
+                    work.failure = std::current_exception();
+                    work.prefill.reset();
+                    work.decode = false;
+                    try {
+                        operations.discard_prefill(work.request);
+                        operations.resume_decode(cache_position());
+                        return;
+                    } catch (...) { recover(std::current_exception()); throw; }
+                }
+            }
             recover(std::current_exception());
             throw;
         }

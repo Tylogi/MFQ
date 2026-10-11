@@ -32,7 +32,7 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
+    std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
@@ -47,14 +47,34 @@ struct CudaEngineState {
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
         if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
-                batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
+            if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
+                batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
                     language, *execution, config.continuous_batch);
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+            language.reserve_kv_workspace = [this](std::size_t bytes) {
+                const auto device = execution->layer_placement.primary_device();
+                auto context = mfq::cuda::default_context(device);
+                if (context->available_memory() >= bytes) return;
+                std::size_t hot = 0;
+                for (const auto& [name,value] : cache.metrics())
+                    if (name == "prefix_cache_hot_bytes") hot = std::size_t(value);
+                const auto shortage = bytes - context->available_memory();
+                cache.trim_hot(hot > shortage ? hot - shortage : 0);
+                context->reclaim_idle_memory();
+                if (context->available_memory() < bytes)
+                    throw InferenceInputError(InferenceInputErrorCode::ContextLength,
+                        "insufficient VRAM for context growth; reduce concurrent requests or prompt length");
+            };
+        }
+#endif
     }
     bool can_batch(const EngineRequest& request) const {
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
+            return batching && !request.input.media && request.input.cache_plan.session_id.empty();
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     bool exclusive() const { return duplex_active; }
@@ -89,6 +109,7 @@ struct CudaEngineState {
             size_t free = 0, total = 0;
             MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
             auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
+            const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
             Metrics metrics{{"device_free_bytes", double(free)}, {"device_total_bytes", double(total)},
                 {"cuda_allocated_bytes", double(memory.allocated_bytes)}, {"cuda_reserved_bytes", double(memory.reserved_bytes)},
@@ -105,6 +126,13 @@ struct CudaEngineState {
                 {"ssd_ple_enabled",ple>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple)}});
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
                 auto cache_memory=qwen4_cache_memory_metrics(language,components.mtp.get());
+                for (auto& [name,value] : cache_memory)
+                    for (const auto& [batch_name,batch_value] : batch_metrics) {
+                        if (name == "kv_cache_bytes" && batch_name == "continuous_batching_request_kv_bytes")
+                            value += batch_value;
+                        if (name == "kv_cache_contexts" && batch_name == "continuous_batching_request_contexts")
+                            value += batch_value;
+                    }
                 metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
                 std::size_t kv_bytes=0,hot_bytes=0;
                 for(const auto& metric:cache_memory)
@@ -127,7 +155,7 @@ struct CudaEngineState {
                 metrics.emplace_back("mtp_predictor_graph_replays",double(components.mtp->graph_replay_count()));
             }
             if (batching) {
-                auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
+                metrics.insert(metrics.end(), batch_metrics.begin(), batch_metrics.end());
             }
             return metrics;
         } else {

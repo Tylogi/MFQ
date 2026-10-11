@@ -763,6 +763,7 @@ private:
     friend class MoeResidencyManager;
     friend void release_moe_prefill_buffers(MoeExpertCache* cache);
     friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+    friend bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
     friend struct MoeResidencyTestAccess;
     friend void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>&,bool);
     friend void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>&,bool,bool);

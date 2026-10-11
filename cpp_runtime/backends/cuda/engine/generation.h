@@ -19,7 +19,7 @@ mfq::engine::Generation generate(
     const CudaRuntimeConfig& config, mfq::engine::InferenceRequest& request,
     mfq::engine::InferenceOutput& output, MtpModule* mtp = nullptr,
     std::optional<CudaPreparedPrompt> prepared = {},
-    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching = nullptr,
+    mfq::engine::ContinuousBatch<CudaBatchOperations<Model>>* batching = nullptr,
     std::string request_id = {});
 } // namespace mfq::cuda::internal
 

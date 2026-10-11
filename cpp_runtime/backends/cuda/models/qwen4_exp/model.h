@@ -583,6 +583,34 @@ class Qsa {
         }
     }
     int64_t position() const { return offload_ ? offloaded_kv_->position() : keys_.position(); }
+    std::unique_ptr<Qsa> fork_empty() const {
+        return std::make_unique<Qsa>(w_, c_, rotary_, fused_projection_, grouped_projection_, offload_);
+    }
+    std::size_t growth_bytes(int64_t tokens) const {
+        if (offload_) return 0;
+        const auto required = position() + tokens;
+        MFQ_RUNTIME_CHECK(tokens > 0 && required <= c_.maximum, "QSA growth exceeds max_context");
+        std::size_t bytes = 0;
+        for (const auto* cache : {&keys_, &values_, &index_}) {
+            const auto& storage = cache->storage();
+            const int64_t current = storage.defined() ? storage.size(1) : 0;
+            if (required <= current) continue;
+            int64_t capacity = current ? current : std::min<int64_t>(16, c_.maximum);
+            while (capacity < required)
+                capacity = std::min(c_.maximum, capacity > c_.maximum / 2 ? c_.maximum : capacity * 2);
+            const auto width = cache == &index_ ? c_.index_width : c_.kv_heads * c_.width;
+            bytes += std::size_t(capacity) * width * 2;
+        }
+        return bytes;
+    }
+    std::size_t graph_growth_bytes(int64_t capacity) const {
+        if (graph_keys_.defined()) return 0;
+        auto bytes = std::size_t(capacity) * 2 * c_.kv_heads * c_.width * 2;
+        if (!index_.storage().defined() || index_.storage().size(1) != capacity)
+            bytes += std::size_t(capacity) * c_.index_width * 2;
+        bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
+        return bytes;
+    }
     bool supports_session() const { return !offload_; }
     void capture_session(Qwen4BlockSessionState& state,int64_t count,std::size_t& bytes) const {
         MFQ_RUNTIME_CHECK(!offload_ && count>0 && count<=position(),"invalid Qwen4 QSA session boundary");

@@ -62,7 +62,7 @@ CAUSAL_LM += SHARED_MODELS
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
-    assert "ContinuousBatch<QwenBatchOperations>" in BATCHING_CHECK
+    assert "ContinuousBatch<CudaBatchOperations<Model>>" in BATCHING_CHECK
     assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
