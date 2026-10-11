@@ -1,4 +1,5 @@
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,7 +24,18 @@
 #endif
 
 namespace mfq::cuda {
+namespace { thread_local bool resident_allocations=false; }
+ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
+    :previous_(resident_allocations) {resident_allocations=enabled;}
+void ResidentAllocationScope::finish() noexcept {
+    if(active_){resident_allocations=previous_;active_=false;}
+}
+
 struct AllocationBudget {
+    std::mutex graph_memory_mutex;
+    // Retired pools remain visible until their persistent request tensors die.
+    std::unordered_map<cudaMemPool_t,bool> graph_memory_pools;
+    cudaMemPool_t resident_memory_pool=nullptr;
     std::size_t limit = 0;
     std::atomic<std::size_t> allocated{},peak{};
 #ifdef _WIN32
@@ -652,15 +664,42 @@ std::size_t Context::local_memory_usage() const {
 std::size_t Context::resident_memory_usage() const {
     DeviceGuard guard(device_);
     auto bytes=memory_stats().allocated;
-    if(pool_) {
-        std::uint64_t used=0,reserved=0;
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&used));
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&reserved));
-        // Allocated bytes already include live pool and graph allocations.
-        // Add only unused pages, never device-wide usage from other processes.
-        if(reserved>used)bytes+=reserved-used;
-    }
+    const auto [used,reserved]=pool_memory_stats();
+    // Allocated bytes already include live pool and graph allocations.
+    // Add only unused pages, never device-wide usage from other processes.
+    if(reserved>used)bytes+=reserved-used;
     return std::max(bytes,local_memory_usage());
+}
+
+std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
+    DeviceGuard guard(device_);
+    std::uint64_t used=0,reserved=0;
+    const auto add=[&](cudaMemPool_t memory) {
+        if(!memory)return;
+        std::uint64_t current_used=0,current_reserved=0;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&current_used));
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrReservedMemCurrent,&current_reserved));
+        used+=current_used;reserved+=current_reserved;
+    };
+    add(pool_);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(const auto& [memory,retired]:allocation_budget_->graph_memory_pools)add(memory);
+    return {used,reserved};
+}
+
+void Context::trim_pool_pages() const {
+    if(pool_)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(auto entry=allocation_budget_->graph_memory_pools.begin();entry!=allocation_budget_->graph_memory_pools.end();) {
+        const auto [memory,retired]=*entry;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(memory,0));
+        std::uint64_t used=0;
+        if(retired)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&used));
+        if(retired && !used) {
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(memory));
+            entry=allocation_budget_->graph_memory_pools.erase(entry);
+        } else ++entry;
+    }
 }
 
 std::size_t Context::available_memory() const {
@@ -680,7 +719,7 @@ void Context::reclaim_idle_memory() {
     // Phase transitions must retire frees on all compute/transfer streams.
     // Trimming unused pages leaves live graph-pool allocations untouched.
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
-    if(pool_)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+    trim_pool_pages();
 }
 
 void Context::check_memory_limit(std::size_t additional) const {
@@ -690,15 +729,11 @@ void Context::check_memory_limit(std::size_t additional) const {
     // WDDM. Release those pages before pricing a new allocation against the
     // process limit; the logical allocation budget remains checked separately.
     if(async_allocations_ && pool_ && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+        trim_pool_pages();
         usage=local_memory_usage();
     }
     if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
-        std::uint64_t pool_used=0,pool_reserved=0;
-        if(pool_) {
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&pool_used));
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&pool_reserved));
-        }
+        const auto [pool_used,pool_reserved]=pool_memory_stats();
         throw Error("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
             " requested="+std::to_string(additional)+" limit="+std::to_string(allocation_budget_->limit)+
             " owned="+std::to_string(memory_stats().allocated)+" pool_used="+std::to_string(pool_used)+
@@ -714,10 +749,12 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
     bool capture_pool_miss = false,pooled_allocation=false;
+    cudaMemPool_t allocation_pool=pool_;
     {
         std::lock_guard lock(graph_pool_mutex_);
         if (auto pool = graph_pools_.find(allocation_stream);
             pool != graph_pools_.end() && (pool->second.warming || pool->second.capturing)) {
+            if(pool->second.memory)allocation_pool=pool->second.memory;
             pooled_allocation=true;
             auto available = pool->second.available.find(bytes);
             if (available != pool->second.available.end() &&
@@ -735,17 +772,37 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             std::to_string(bytes) + " bytes");
     }
     void* pointer = nullptr;
+    const bool async=async_allocations_;
+    if(async && resident_allocations && !pooled_allocation) {
+        // Pack the many small recurrent tensors into their own pages instead
+        // of paying cudaMalloc's WDDM allocation granularity for every layer.
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        auto& memory=allocation_budget_->resident_memory_pool;
+        if(!memory) {
+            cudaMemPoolProps properties{};
+            properties.allocType=cudaMemAllocationTypePinned;
+            properties.location.type=cudaMemLocationTypeDevice;
+            properties.location.id=device_;
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            try {
+                std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+                allocation_budget_->graph_memory_pools.emplace(memory,false);
+            } catch(...) {(void)cudaMemPoolDestroy(memory);memory=nullptr;throw;}
+        }
+        allocation_pool=memory;
+    }
     bool verify_pool_reuse=false;
     if(allocation_budget_->limit) {
         cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
         MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream,&capture));
         if(capture==cudaStreamCaptureStatusNone) {
             const auto usage=local_memory_usage();
-            if(async_allocations_ && pool_ && usage<=allocation_budget_->limit &&
+            if(async && allocation_pool && usage<=allocation_budget_->limit &&
                     bytes>allocation_budget_->limit-usage) {
                 std::uint64_t used=0,reserved=0;
-                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&used));
-                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&reserved));
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrUsedMemCurrent,&used));
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
                 // Reusing existing pages need not increase WDDM's charge.
                 // Check the actual charge after malloc and roll back if the
                 // allocator had to grow the pool instead.
@@ -757,12 +814,12 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     allocation_budget_->acquire(bytes);
     try {
-        auto result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
+        auto result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
             : cudaMalloc(&pointer,bytes);
         if(result==cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             reclaim_idle_memory();
-            result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
+            result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
                 : cudaMalloc(&pointer,bytes);
         }
         if(result==cudaErrorMemoryAllocation)
@@ -824,6 +881,44 @@ void Context::begin_graph_pool(cudaStream_t stream) {
     if (!inserted) {
         throw Error("CUDA graph memory pool is already active on this stream");
     }
+    if(async_allocations_) {
+        // Graph scratch has a short lifetime compared with resident model
+        // weights. Keep its backing pages separate so retiring a window can
+        // return all of them despite live allocations in the default pool.
+        DeviceGuard guard(device_);
+        cudaMemPoolProps properties{};
+        properties.allocType=cudaMemAllocationTypePinned;
+        properties.location.type=cudaMemLocationTypeDevice;
+        properties.location.id=device_;
+        cudaMemPool_t memory=nullptr;
+        try {
+            // A workspace may outlive its graph by one operation. Reap its
+            // retired pool once its async free completes; pool handles are a
+            // finite driver resource even when their pages have been trimmed.
+            {
+                std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+                for(auto entry=allocation_budget_->graph_memory_pools.begin();
+                        entry!=allocation_budget_->graph_memory_pools.end();) {
+                    std::uint64_t used=0;
+                    if(entry->second)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
+                        entry->first,cudaMemPoolAttrUsedMemCurrent,&used));
+                    if(entry->second && !used) {
+                        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(entry->first));
+                        entry=allocation_budget_->graph_memory_pools.erase(entry);
+                    } else ++entry;
+                }
+            }
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+            std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+            allocation_budget_->graph_memory_pools.emplace(memory,false);
+            graph_pools_.at(stream).memory=memory;
+        } catch(...) {
+            if(memory)(void)cudaMemPoolDestroy(memory);
+            graph_pools_.erase(stream);throw;
+        }
+    }
 }
 
 void Context::begin_graph_capture(cudaStream_t stream) {
@@ -880,6 +975,16 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         if (async_allocations_) {
             (void)cudaStreamSynchronize(stream);
         }
+        // Request workspaces can outlive their graph. Keep that CUDA pool
+        // registered until their asynchronous releases finish as well.
+        if(pool.memory) {
+            std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+            std::uint64_t used=0;
+            if(cudaMemPoolGetAttribute(pool.memory,cudaMemPoolAttrUsedMemCurrent,&used)==cudaSuccess && !used) {
+                allocation_budget_->graph_memory_pools.erase(pool.memory);
+                (void)cudaMemPoolDestroy(pool.memory);
+            } else allocation_budget_->graph_memory_pools.at(pool.memory)=true;
+        }
     });
 }
 
@@ -893,7 +998,7 @@ void Context::trim() {
     stream_.synchronize();
     if (async_allocations_) {
         DeviceGuard guard(device_);
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_, 0));
+        trim_pool_pages();
     }
     check_memory_limit();
 }

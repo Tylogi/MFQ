@@ -641,6 +641,27 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
 #endif
     }
 
+    void handle_prefill_failure() {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        // A quota rejection does not invalidate CUDA execution. Retire the
+        // partial prefill's scratch; its request state is discarded by the
+        // scheduler. Driver and numerical failures still poison the session.
+        try { std::rethrow_exception(std::current_exception()); }
+        catch(const mfq::cuda::Error& error) {
+            const std::string message=error.what();
+            if(message.starts_with("CUDA process VRAM limit exceeded:") ||
+                    message.starts_with("CUDA VRAM limit exceeded:")) {
+                try {
+                    release_moe_prefill_buffers(cache_);
+                    mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+                    return;
+                } catch(...) {}
+            }
+        } catch(...) {}
+#endif
+        failed_=true;
+    }
+
     void initialize_prefill_layer(CudaExecutionContext& execution,const tb::Tensor& ids) {
         if(prefill_layer_)return;
         if(!cache_->pipeline_prefill_layer_layout_)
@@ -974,10 +995,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cell.phased_transfer=cell.transfer_cache && !cell.mapped_copy &&
             execution.config.moe_ffn_transfer_phases.value_or(mfq::cuda::runtime_options::phased_transfer());
         cell.mapped_overlap=cell.mapped_copy && mfq::cuda::runtime_options::mapped_copy_overlap();
+        // Eight-row tiles need eight route lists. Large windows trade some
+        // cached history for smaller staging arenas, retaining every route.
+        const int decode_history_slots=window && execution.continuous_batch_ffn_tiles>2 ? 96 : 128;
         if(cell.transfer_cache)for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_) {
             // Share one capacity across M=9..32; changing concurrency must not
             // retain a separate weight staging arena for every batch size.
-            auto& arena=stage(p,cohort,std::max(128,(cell.tokens>8?32:8)*cell.routes));
+            auto& arena=stage(p,cohort,std::max(decode_history_slots,(cell.tokens>8?32:8)*cell.routes));
             if(!arena.book)arena.book=std::make_unique<mfq::MoeCacheSlotBook>(arena.slots);
             cell.binding[p].stages.push_back(&arena);
         }
@@ -988,7 +1012,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 runtime->neuron_len=source.cpu_->neuron_len;runtime->partial_experts=true;
             }
             for(auto& cohort:source.cohorts_) {
-                auto& temporary=stage(projection,cohort,cell.tokens<=8?std::max(128,8*cell.routes):experts_);binding.stages.push_back(&temporary);
+                auto& temporary=stage(projection,cohort,cell.tokens<=8?std::max(decode_history_slots,8*cell.routes):experts_);binding.stages.push_back(&temporary);
                 auto hot=cohort.active;hot.expert_local=tb::full({experts_},-1,cell.ids.options());
                 auto transfer=fields_pool(cohort.active,temporary.fields,temporary.slots,source.cpu_->out_per_expert);
                 transfer.expert_local=tb::full({experts_},-1,cell.ids.options());
@@ -2484,7 +2508,7 @@ public:
                 cache_->pipeline_ram_registered_bytes_>0 && execution.kl_mmq.mode==KlMmqMode::Default) {
             if(cache_->moe_residency_)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
             try {return whole_layer_prefill(execution,input,ids,weights);}
-            catch(...) {failed_=true;throw;}
+            catch(...) {handle_prefill_failure();throw;}
         }
         if(!cache_->moe_residency_)cache_->moe_residency_=std::make_unique<MoeResidencyManager>(cache_);
         if(!window)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
@@ -2493,7 +2517,7 @@ public:
                 cache_->pipeline_ram_registered_bytes_>0 && cache_->pipeline_dispatch_replay_.empty() &&
                 execution.kl_mmq.mode==KlMmqMode::Default) {
             try {return streamed_prefill(execution,input,ids,weights);}
-            catch(...) {failed_=true;throw;}
+            catch(...) {handle_prefill_failure();throw;}
         }
         const auto tile=execution.continuous_batch_ffn_tile;
         const bool final_tile=tile+1==execution.continuous_batch_ffn_tiles;

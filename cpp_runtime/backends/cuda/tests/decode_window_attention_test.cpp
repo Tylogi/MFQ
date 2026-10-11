@@ -118,6 +118,10 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     int64_t capacity=std::min(maximum,16);
     const auto allocation_before=default_context()->memory_stats().allocated;
     actual.prepare_graph(history,capacity);
+    if(actual.resident_cache_tensors()[0].defined() || actual.resident_cache_tensors()[1].defined())
+        throw std::runtime_error("QSA graph retained duplicate legacy KV storage");
+    if(actual.growth_bytes(1)!=0)
+        throw std::runtime_error("QSA growth ignored the active graph KV storage");
     if(default_context()->memory_stats().allocated>allocation_before+(1<<20))
         throw std::runtime_error("small QSA graph allocated KV for the context ceiling");
     std::map<int,std::unique_ptr<Cell>> cells;
@@ -147,6 +151,34 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     equal(actual.forward(execution,inputs.narrow(1,16,1),pos,history,true),
         oracle.forward(execution,inputs.narrow(1,16,1),pos,history,true),"QSA graph to ordinary cache");
 }
+void quota_recovery_case() {
+    auto input=tb::full({16},0.5,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32));
+    Tensor output;
+    bool rejected=false;
+    {
+        DecodeWindow failed(mfq_current_cuda_stream());
+        int calls=0;
+        try {
+            failed.capture([&] {
+                if(++calls==3)throw Error("CUDA VRAM limit exceeded: injected during graph recording");
+                output=input+1;
+            },[]{},[&]{output={};});
+        } catch(const Error& error) {
+            rejected=std::string(error.what()).starts_with("CUDA VRAM limit exceeded:");
+        }
+        if(!rejected || failed.valid())throw std::runtime_error("graph recording lost the recoverable quota error");
+    }
+    {
+        DecodeWindow healthy(mfq_current_cuda_stream());
+        healthy.capture([&]{output=input+2;},[]{},[&]{output={};});
+        healthy.run();
+        auto actual=output.to(tb::kCPU);
+        for(int i=0;i<16;++i)if(actual.data_ptr<float>()[i]!=2.5f)
+            throw std::runtime_error("a quota rejection damaged subsequent graph execution");
+    }
+    std::cout<<"decode_window_quota type_preserved=PASS subsequent_capture=PASS output=PASS\n";
+}
+
 void layer_profile_case() {
     auto input=data({1,1,2560},29);auto output=tb::empty_like(input);
     DecodeWindow window(mfq_current_cuda_stream(),true);
@@ -411,6 +443,65 @@ void gdn_core_case(bool inplace=false) {
     std::cout<<"GDN complete core inplace="<<inplace<<" ordinary="<<ordinary<<" changing_graph="<<changing
         <<" output/conv/FP32state bytes exact; reused counters reset; widths32/64/128, batch1/2, layouts2, strided Half/Float gates PASS\n";
 }
+void gdn_batch_core_benchmark() {
+    constexpr int nk=16,nv=48,width=128,channels=(2*nk+nv)*width,taps=4,replays=256;
+    const auto stream=mfq_current_cuda_stream();
+    auto context=default_context(mfq_current_cuda_device());
+    GdnTileScope setting(4);
+    for(int batch:{2,4,6,8,16,32}) {
+        auto qkv=data({batch,1,channels},151,.4f),gate=data({batch,1,nv*width},152,.5f);
+        auto alpha=data({batch,1,nv},153,.5f),beta=data({batch,1,nv},154,.5f);
+        auto conv=data({batch,taps-1,channels},155,.3f).to(tb::kFloat32);
+        auto state=data({batch,nv,width,width},156,.17f).to(tb::kFloat32);
+        auto weight=data({channels,1,taps},157,.19f).to(tb::kFloat32);
+        auto bias=data({nv},158,1.3f).to(tb::kFloat32),a=data({nv},159,.3f).to(tb::kFloat32);
+        auto norm=data({width},160,1.3f).to(tb::kFloat32);
+        auto workspace=tb::zeros({batch,nv,width+1},conv.options());
+        const auto initial_state=state.clone(),initial_conv=conv.clone();
+        std::vector<Tensor> outputs;
+        const auto compute=[&](bool batched) {
+            outputs.clear();
+            if(batched) {
+                auto r=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,a,norm,
+                    nk,nv,width,1e-6,1e-6,false,true,true,workspace,true);
+                // Independent requests still own separate convolution rows.
+                for(int row=0;row<batch;++row)conv.narrow(0,row,1).copy_(r[1].narrow(0,row,1));
+                outputs.push_back(r[0]);
+            } else for(int row=0;row<batch;++row) {
+                auto r=gdn_decode_core_cuda(qkv.narrow(0,row,1),gate.narrow(0,row,1),
+                    alpha.narrow(0,row,1),beta.narrow(0,row,1),conv.narrow(0,row,1),state.narrow(0,row,1),
+                    weight,bias,a,norm,nk,nv,width,1e-6,1e-6,false,true,true,workspace.narrow(0,row,1),true);
+                conv.narrow(0,row,1).copy_(r[1]);outputs.push_back(r[0]);
+            }
+        };
+        compute(false);auto expected=tb::cat(outputs,0).to(tb::kCPU).contiguous();
+        const auto expected_state=state.to(tb::kCPU).contiguous(),expected_conv=conv.to(tb::kCPU).contiguous();
+        state.copy_(initial_state);conv.copy_(initial_conv);compute(true);
+        const auto check=[&](const Tensor& actual,const Tensor& reference) {
+            auto host=actual.to(tb::kCPU).contiguous();
+            if(host.sizes()!=reference.sizes() || std::memcmp(host.data_ptr(),reference.data_ptr(),host.numel()*host.element_size()))
+                throw std::runtime_error("batched GDN core differs from independent recurrence");
+        };
+        check(outputs[0],expected);check(state,expected_state);check(conv,expected_conv);
+        const auto measure=[&](bool batched) {
+            state.copy_(initial_state);conv.copy_(initial_conv);
+            {GraphWarmupScope warmup(context,stream);compute(batched);}
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));outputs.clear();
+            Graph graph;graph.capture_begin_shared();compute(batched);graph.capture_end();
+            for(int i=0;i<16;++i)graph.replay();
+            Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(stream);
+            for(int i=0;i<replays;++i)graph.replay();
+            end.record(stream);end.synchronize();
+            float elapsed_ms=0;
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,begin.get(),end.get()));
+            return 1000.f*elapsed_ms/replays;
+        };
+        const auto serial_us=measure(false),batch_us=measure(true);
+        std::cout<<"GDN independent_batch rows="<<batch<<" serial_us="<<serial_us
+            <<" batch_us="<<batch_us<<" state/conv/output=EXACT\n";
+    }
+}
+
 void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) {
     constexpr int nk=16,nv=48,width=128,channels=(2*nk+nv)*width,taps=4,replays=1024;
     auto qkv=data({1,1,channels},151,.4f),gate=data({1,1,nv*width},152,.5f);
@@ -695,6 +786,7 @@ int main(int argc,char** argv)try {
     } else if(argc==2 && std::string(argv[1])=="--gdn-core-bench")gdn_core_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-fixed-bench")gdn_core_benchmark(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-inplace-bench")gdn_core_benchmark(false,true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-batch-bench")gdn_batch_core_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-default-check")gdn_prefill_pipeline_case(true);
@@ -710,6 +802,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-select-check")qsa_selection_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-select-bench")qsa_selection_benchmark();
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
+    else if(argc==2 && std::string(argv[1])=="--quota-recovery-check")quota_recovery_case();
     else if(argc==1) {
         layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");

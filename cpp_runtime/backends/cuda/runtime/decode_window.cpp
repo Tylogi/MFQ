@@ -208,7 +208,13 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         const auto warm_tasks=tasks_.size();tasks_.clear();
         checkpoint("record");
         std::string error;
-        if(!graphs_.record(0,1,body,error))throw std::runtime_error(error);
+        if(!graphs_.record(0,1,body,error)) {
+            // Preserve quota errors so admission can discard this request
+            // without marking the entire backend unhealthy.
+            if(error.starts_with("CUDA process VRAM limit exceeded:") ||
+                    error.starts_with("CUDA VRAM limit exceeded:"))throw Error(error);
+            throw std::runtime_error(error);
+        }
         if(tasks_.size()!=warm_tasks)throw std::logic_error("MFQ window task order changed during capture");
         checkpoint("restore");
         restore();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));

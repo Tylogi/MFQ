@@ -35,6 +35,7 @@ bool batch_attention_projections();
 bool batch_packed_prefill();
 int batch_packed_prefill_token_budget();
 bool nint_compressed_decode_batch();
+bool nint_compressed_large_batch(bool vocabulary=false);
 bool nint_large_output_tiling();
 int continuous_batch_kv_initial_capacity();
 std::size_t workspace_reserve_bytes();

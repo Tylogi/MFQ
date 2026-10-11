@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <sstream>
 #include <filesystem>
@@ -150,6 +151,11 @@ int batch_packed_prefill_token_budget() {
 bool nint_compressed_decode_batch() {
     // Keep the faster GEMM dispatch while tuning the online Tensor Core path.
     return exact_one("MFQ_NINT_COMPRESSED_DECODE_BATCH");
+}
+bool nint_compressed_large_batch(bool vocabulary) {
+    const auto* value=std::getenv("MFQ_NINT_COMPRESSED_LARGE_BATCH");
+    if(!value || std::strcmp(value,"head")==0)return vocabulary;
+    return value[0]!='0';
 }
 bool nint_large_output_tiling() {
     const auto* value=std::getenv("MFQ_NINT_LARGE_OUTPUT_TILING");
@@ -1071,12 +1077,7 @@ void report_cuda_memory(
     // WDDM budget. Report those separately when diagnosing residency pressure.
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto native=context->memory_stats();
-    std::uint64_t pool_used=0,pool_reserved=0;
-    cudaMemPool_t pool=nullptr;
-    if(cudaDeviceGetDefaultMemPool(&pool,mfq_current_cuda_device())==cudaSuccess) {
-        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&pool_used));
-        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&pool_reserved));
-    } else (void)cudaGetLastError();
+    const auto [pool_used,pool_reserved]=context->pool_memory_stats();
     std::cout<<"native_memory_stage="<<stage<<" owned_mib="<<native.allocated/mib
              <<" peak_mib="<<native.peak/mib<<" limit_mib="<<native.limit/mib
              <<" local_usage_mib="<<context->local_memory_usage()/mib

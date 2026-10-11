@@ -496,6 +496,16 @@ void FlashNextBatchOperations::initialize_prefill(
     if (!request->cache) {
         MFQ_RUNTIME_CHECK(chunk.offset == 0,"Flash-Next batch lost request state");
         std::erase_if(requests_,[](const auto& weak) { return weak.expired(); });
+        const bool active=std::any_of(requests_.begin(),requests_.end(),[](const auto& weak) {
+            const auto row=weak.lock();return row && row->cache;
+        });
+        if(!active) {
+            // The preceding exclusive request's global KV/recurrent state is
+            // unused while independent batch rows own their own context.
+            model_.reset(1);
+            release_moe_decode_buffers(execution_.moe_expert_cache);
+            default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
+        }
         requests_.push_back(request);
         request->cache = std::make_unique<Qwen4BatchRequestState>(model_);
         request->prefill_ids = mfq_tensor_backend::tensor(request->prompt,

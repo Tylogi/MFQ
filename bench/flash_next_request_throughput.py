@@ -55,6 +55,8 @@ async def main():
                 log_start = (RESULTS / "worker.log").stat().st_size
 
                 async def generate(row):
+                    if row and (arrival_delay := case.get("arrival_delay_s", 0)):
+                        await asyncio.sleep(arrival_delay)
                     prompt = "请从一开始连续列出数字，用逗号分隔，至少列出1000个数字。"
                     if case.get("heterogeneous"):
                         prompt = f"本次请求编号{row}。" + "请按要求回答。" * (row % 7) + prompt
@@ -105,13 +107,15 @@ async def main():
                         errors.append("early stop invalidates throughput measurement")
                     if not outputs or not all(out["text"] for out in outputs):
                         errors.append("no ordinary text output")
-                    if not case.get("heterogeneous") and not case.get("mtp"):
+                    if not case.get("heterogeneous"):
                         if not all(out["text"][:len(reference)] == reference[:len(out["text"])]
                                    for out in outputs):
                             errors.append("batch output differs from the verified serial response")
                     if reference_tag := case.get("reference_tag"):
                         expected = json.loads((RESULTS / f"{reference_tag}.json").read_text(encoding="utf-8"))["outputs"]
-                        if [out["text"] for out in outputs] != [out["text"] for out in expected]:
+                        expected_rows = {out["row"]: out["text"] for out in expected}
+                        if any(out["row"] not in expected_rows or out["text"] != expected_rows[out["row"]]
+                               for out in outputs):
                             errors.append("heterogeneous batch output differs from its serial oracle")
                     metric_delta = {key: value - before.get(key, 0) for key, value in after.items()
                                     if isinstance(value, (int, float)) and

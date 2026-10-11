@@ -1,6 +1,7 @@
 #include "../../runtime/execution_options.h"
 #pragma once
 #include "cuda_execution.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "mfq_cuda_linear_attention_ops.h"
 #include "mfq_cuda_norm_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
@@ -68,9 +69,25 @@ class Gdn {
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
+    void initialize_request_cache() {
+        // Recurrence is allocated on first use, outside temporary pool pages.
+        // Keep the reusable decode counters out of graph scratch as well.
+        request_state_storage_=true;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        ResidentAllocationScope resident;
+#endif
+        auto options=w_.norm.options().dtype(tb::kFloat32);
+        if(fused_core_ && fused_decode_ && fused_preparation_ && fused_output_ && transposed_state_)
+            core_workspace_=tb::zeros({1,nv_,d_+1},options);
+    }
     std::size_t growth_bytes() const {
         return (conv_.defined() ? 0 : std::size_t(kernel_-1)*(2*nk_+nv_)*d_*sizeof(float)) +
             (state_.defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
+    }
+    std::size_t request_cache_growth_bytes() const {
+        return growth_bytes() + (fused_core_ && fused_decode_ && fused_preparation_ &&
+            fused_output_ && transposed_state_ && !core_workspace_.defined()
+            ? std::size_t(nv_)*(d_+1)*sizeof(float) : 0);
     }
     void restore_session(const Tensor& convolution,const Tensor& recurrent) {
         MFQ_RUNTIME_CHECK(convolution.defined() && recurrent.defined(),"missing Qwen4 GDN session state");
@@ -322,8 +339,20 @@ class Gdn {
                 return result;
             },
             [&](const auto &convolution, const Tensor &next) {
-                if(conv_.defined())conv_.copy_(convolution[3]);else conv_=convolution[3];
-                if(state_.defined())state_.copy_(next);else state_=next;
+                if(conv_.defined())conv_.copy_(convolution[3]);
+                else {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+                    ResidentAllocationScope resident(request_state_storage_);
+#endif
+                    conv_=request_state_storage_?convolution[3].clone():convolution[3];
+                }
+                if(state_.defined())state_.copy_(next);
+                else {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+                    ResidentAllocationScope resident(request_state_storage_);
+#endif
+                    state_=request_state_storage_?next.clone():next;
+                }
             });
     }
 
@@ -332,6 +361,7 @@ class Gdn {
     int64_t nk_, nv_, d_, kernel_;
     double eps_;
     bool silu_gate_, fused_decode_,transposed_state_,fused_output_,grouped_projection_,fused_preparation_,fused_core_;
+    bool request_state_storage_=false;
     Tensor conv_, state_, saved_conv_, saved_state_,core_workspace_;
 };
 
@@ -587,6 +617,10 @@ class Qsa {
                               c_.width > 0 && c_.index_heads > 0 && c_.pool > 0 && c_.budget > 0 &&
                               c_.budget % c_.pool == 0 && rotary_,
                           "invalid Qwen4 QSA configuration");
+        // Share immutable FP32 norm coefficients across request states.
+        // BF16 sources otherwise record repeated casts in each row's graph.
+        for(auto* weight:{&w_.query_norm,&w_.key_norm,&w_.index_query_norm,&w_.index_key_norm})
+            if(weight->defined())*weight=weight->to(tb::kFloat32).contiguous();
         offload_ = std::move(offload);
         if (offload_) {
             offloaded_kv_ = std::make_unique<KvOffloadSequence>(offload_, 2 * c_.kv_heads * c_.width, c_.pool);
@@ -612,7 +646,8 @@ class Qsa {
         std::size_t bytes = 0;
         for (const auto* cache : {&keys_, &values_, &index_}) {
             const auto& storage = cache->storage();
-            const int64_t current = storage.defined() ? storage.size(1) : 0;
+            const int64_t current = graph_keys_.defined() && cache != &index_
+                ? graph_keys_.size(2) : (storage.defined() ? storage.size(1) : 0);
             if (required <= current) continue;
             int64_t capacity = current ? current : std::min<int64_t>(16, c_.maximum);
             while (capacity < required)
@@ -686,19 +721,24 @@ class Qsa {
             "QSA graph requires a prefilled single sequence");
         const auto n=position();
         MFQ_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
-        graph_keys_=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
-        graph_values_=tb::zeros_like(graph_keys_);
-        graph_keys_.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
-        graph_values_.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
+        auto graph_keys=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
+        auto graph_values=tb::zeros_like(graph_keys);
+        graph_keys.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
+        graph_values.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
         index_.prepare_fixed(capacity);
-        graph_pooled_=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
+        auto graph_pooled=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
         const auto pools=n/c_.pool;
         if(pools) {
             auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
             pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
             auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
-            graph_pooled_.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
+            graph_pooled.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
         }
+        // Commit only after all allocation/copy submissions succeed. Replay
+        // reads graph KV; retaining the old layout duplicates the full prefix
+        // at every growth boundary. leave_graph recreates it when needed.
+        graph_keys_=std::move(graph_keys);graph_values_=std::move(graph_values);graph_pooled_=std::move(graph_pooled);
+        keys_.release_storage();values_.release_storage();
     }
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
                          const Tensor& positions,const Tensor& cache_positions,

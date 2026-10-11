@@ -1,4 +1,5 @@
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
 
 #include <cuda_runtime_api.h>
 
@@ -117,6 +118,112 @@ int memory_telemetry_case() {
     return 0;
 }
 
+int graph_pool_isolation_case() {
+    constexpr auto mib=std::size_t(1024)*1024;
+    auto context=std::make_shared<mfq::cuda::Context>(0);
+    auto observer=std::make_shared<mfq::cuda::Context>(0);
+    const auto stream=context->stream().get();
+    mfq::cuda::StreamGuard active(mfq::cuda::StreamHandle(0,stream));
+    mfq::cuda::Buffer resident(context,16*mib);
+    context->stream().synchronize();
+    cudaMemPool_t default_pool=nullptr;
+    MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&default_pool,0));
+    std::uint64_t baseline=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(default_pool,cudaMemPoolAttrUsedMemCurrent,&baseline));
+    context->begin_graph_pool(stream);
+    {
+        mfq::cuda::Buffer outside_capture(context,8*mib);context->stream().synchronize();
+        std::uint64_t ordinary=0;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(default_pool,cudaMemPoolAttrUsedMemCurrent,&ordinary));
+        if(ordinary<baseline+8*mib)
+            throw std::runtime_error("ordinary request storage entered the graph scratch pool");
+    }
+    std::unique_ptr<mfq::cuda::Buffer> persistent;
+    void* warmed=nullptr;
+    {
+        mfq::cuda::GraphWarmupScope warm(context,stream);
+        persistent=std::make_unique<mfq::cuda::Buffer>(context,32*mib);
+        mfq::cuda::Buffer scratch(context,16*mib);warmed=scratch.data();
+    }
+    context->stream().synchronize();
+    std::uint64_t current=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(default_pool,cudaMemPoolAttrUsedMemCurrent,&current));
+    const auto [used,reserved]=observer->pool_memory_stats();
+    if(current!=baseline || used<baseline+48*mib || reserved<used)
+        throw std::runtime_error("graph pages were mixed with resident weights or omitted across contexts");
+    context->reclaim_idle_memory();context->begin_graph_capture(stream);
+    {
+        mfq::cuda::Buffer reuse(context,16*mib);
+        if(reuse.data()!=warmed)throw std::runtime_error("private graph pool lost warmed storage");
+        MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(reuse.data(),0,reuse.size(),stream));
+    }
+    context->end_graph_capture(stream);context->stream().synchronize();
+    context->end_graph_pool(stream);
+    // Persistent request workspaces can outlive a membership change.
+    MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(persistent->data(),0x35,4,stream));
+    std::uint32_t value=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(&value,persistent->data(),4,cudaMemcpyDeviceToHost,stream));
+    context->stream().synchronize();
+    if(value!=0x35353535 || context->memory_stats().allocated!=48*mib)
+        throw std::runtime_error("retiring graph pages damaged a persistent request workspace");
+    persistent.reset();context->reclaim_idle_memory();
+    if(context->memory_stats().allocated!=16*mib)
+        throw std::runtime_error("private graph pool leaked its allocation budget");
+    for(int i=0;i<128;++i) {
+        context->begin_graph_pool(stream);
+        {mfq::cuda::GraphWarmupScope warmup(context,stream);
+            persistent=std::make_unique<mfq::cuda::Buffer>(context,mib);}
+        context->end_graph_pool(stream);
+        persistent.reset();context->stream().synchronize();
+    }
+    context->reclaim_idle_memory();
+    if(context->memory_stats().allocated!=16*mib)
+        throw std::runtime_error("retired graph pools leaked after repeated captures");
+    std::cout<<"cuda_graph_pool_isolation default_pool_unchanged=PASS shared_telemetry=PASS persistent_lifetime=PASS repeated_pools=128\n";
+    return 0;
+}
+
+int resident_allocation_case() {
+    constexpr auto mib=std::size_t(1024)*1024;
+    auto context=std::make_shared<mfq::cuda::Context>(0);
+    const auto stream=context->stream().get();
+    mfq::cuda::StreamGuard active(mfq::cuda::StreamHandle(0,stream));
+    context->reclaim_idle_memory();
+    cudaMemPool_t temporary_pool=nullptr;
+    MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&temporary_pool,0));
+    const auto temporary_used=[&] {
+        std::uint64_t used=0;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(temporary_pool,cudaMemPoolAttrUsedMemCurrent,&used));
+        return used;
+    };
+    const auto baseline=temporary_used();
+    std::unique_ptr<mfq::cuda::Buffer> resident;
+    {
+        mfq::cuda::ResidentAllocationScope load;
+        resident=std::make_unique<mfq::cuda::Buffer>(context,16*mib);
+        context->stream().synchronize();
+        if(temporary_used()!=baseline || context->pool_memory_stats().first<baseline+16*mib)
+            throw std::runtime_error("resident allocation entered the temporary pool");
+        {
+            mfq::cuda::ResidentAllocationScope temporary(false);
+            mfq::cuda::Buffer dynamic(context,8*mib);context->stream().synchronize();
+            if(temporary_used()<baseline+8*mib)
+                throw std::runtime_error("nested allocation scope did not restore the async path");
+        }
+        mfq::cuda::Buffer nested(context,4*mib);context->stream().synchronize();
+        if(context->memory_stats().allocated!=20*mib)
+            throw std::runtime_error("resident allocation budget is incorrect");
+    }
+    MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(resident->data(),0x39,4,stream));
+    std::uint32_t value=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(&value,resident->data(),4,cudaMemcpyDeviceToHost,stream));
+    context->stream().synchronize();resident.reset();context->reclaim_idle_memory();
+    if(value!=0x39393939 || context->memory_stats().allocated)
+        throw std::runtime_error("resident storage or stream-ordered release is invalid");
+    std::cout<<"cuda_resident_allocation pool_isolation=PASS nested_scope=PASS async_release=PASS\n";
+    return 0;
+}
+
 int main(int argc,char** argv) {
     int devices = 0;
     MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceCount(&devices));
@@ -126,6 +233,14 @@ int main(int argc,char** argv) {
     if(argc==2 && std::string(argv[1])=="--memory-limit")return memory_limit_cases();
     if(argc==2 && std::string(argv[1])=="--memory-pool-reuse")return memory_pool_reuse_case();
     if(argc==2 && std::string(argv[1])=="--memory-telemetry")return memory_telemetry_case();
+    if(argc==2 && std::string(argv[1])=="--graph-pool-isolation") {
+        try {return graph_pool_isolation_case();}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc==2 && std::string(argv[1])=="--resident-allocation") {
+        try {return resident_allocation_case();}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
 
     auto context = std::make_shared<mfq::cuda::Context>(0);
     mfq::cuda::Buffer device(context, sizeof(std::uint32_t) * 4);

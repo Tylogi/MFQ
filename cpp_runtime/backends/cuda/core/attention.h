@@ -33,6 +33,8 @@ public:
     void reset() { values_ = Tensor(); position_ = 0; }
     int64_t position() const { return position_; }
     const Tensor& storage() const { return values_; }
+    // Graph KV owns the values while this cache still tracks their position.
+    void release_storage() { values_=Tensor(); }
     void replace_storage(Tensor values) {
         MFQ_RUNTIME_CHECK(values.dim()==3 && values.size(1)>=position_ && values.size(1)<=maximum_ &&
             values.size(2)==width_,"replacement sequence cache geometry mismatch");

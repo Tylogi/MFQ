@@ -1725,6 +1725,72 @@ void verify_router_lookahead_inputs() {
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
 #include "mfe_token_group_test.h"
+void verify_prefill_quota_recovery(const std::filesystem::path& root) {
+    struct Setting {
+        std::string previous;
+        Setting() {
+            if(const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER"))previous=value;
+            set("1");
+        }
+        static void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s("MFQ_MOE_PREFILL_LAYER",value);
+#else
+            if(*value)setenv("MFQ_MOE_PREFILL_LAYER",value,1);else unsetenv("MFQ_MOE_PREFILL_LAYER");
+#endif
+        }
+        ~Setting(){set(previous.c_str());}
+    } setting;
+    for(const std::string format:{"nint5","nvq3j-512"}) {
+        CudaExecutionContext execution;
+        execution.config.moe_pipeline=true;execution.config.moe_preload_all=true;
+        execution.config.moe_ram_pcie=true;execution.config.moe_ram_pcie_fraction=1;
+        execution.config.moe_direct_ram=true;execution.config.moe_residency_adapt=false;
+        std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources={
+            source(root/(format+"-640-2560.mfq")),source(root/(format+"-640-2560.mfq")),
+            source(root/(format+"-2560-640.mfq"))};
+        std::size_t bundle=0;for(const auto& s:sources)bundle+=bytes(s->metadata()->pools[0]);
+        execution.config.moe_host_cache_bytes=12*bundle;
+        auto cache=make_moe_expert_cache(2*bundle,execution.config);
+        std::vector<std::shared_ptr<MfeWeight>> gu,down;
+        const std::array<std::string,3> roles={"gate","up","down"};
+        for(int p=0;p<3;++p) {
+            auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,roles[p],sources[p],1,0,roles[p]));
+            (p==2?down:gu).push_back(std::move(weight));
+        }
+        bool inject=true,fatal=false;int shared_calls=0;
+        auto ffn=make_moe_ffn_pipeline(gu,down,[&](CudaExecutionContext&,const tb::Tensor&) {
+            ++shared_calls;
+            if(inject)throw mfq::cuda::Error("CUDA VRAM limit exceeded: injected after prefill transfer submission");
+            if(fatal)throw std::runtime_error("injected non-quota prefill failure");
+            return tb::Tensor{};
+        });
+        finalize_moe_expert_cache(cache);
+        auto x=tb::full({16,2560},.0001,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto ids=tb::arange(3,x.options().dtype(tb::kInt32)).unsqueeze(0).expand({16,3}).contiguous();
+        auto weights=tb::ones({16,3},x.options().dtype(tb::kFloat32));
+        bool rejected=false;
+        try {(void)ffn(execution,x,ids,weights);}
+        catch(const mfq::cuda::Error& error) {rejected=std::string(error.what()).starts_with("CUDA VRAM limit exceeded:");}
+        if(!rejected || shared_calls!=1)throw std::runtime_error("prefill quota fixture did not reach the eager transfer path");
+        inject=false;
+        auto first=ffn(execution,x,ids,weights).to(tb::kCPU).contiguous();
+        auto second=ffn(execution,x,ids,weights).to(tb::kCPU).contiguous();
+        if(shared_calls!=3 || first.sizes()!=second.sizes() ||
+                std::memcmp(first.data_ptr(),second.data_ptr(),tensor_nbytes(first)))
+            throw std::runtime_error("prefill quota recovery changed subsequent FFN execution");
+        fatal=true;bool fatal_rejected=false;
+        try {(void)ffn(execution,x,ids,weights);}
+        catch(const std::runtime_error& error) {fatal_rejected=std::string(error.what())=="injected non-quota prefill failure";}
+        fatal=false;bool poisoned=false;
+        try {(void)ffn(execution,x,ids,weights);}
+        catch(const std::runtime_error& error) {poisoned=std::string(error.what()).starts_with("MFQ FFN session requires recovery");}
+        if(!fatal_rejected || !poisoned)throw std::runtime_error("prefill recovery suppressed a non-quota failure");
+        release_moe_decode_buffers(cache);
+        std::cout<<"prefill_quota_recovery format="<<format<<" subsequent_requests=2 output=PASS fatal_error_preserved=PASS\n";
+    }
+}
+
 void verify_memory_phase_reuse(const std::filesystem::path& root) {
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     int cases=0;
@@ -1782,6 +1848,7 @@ int main(int argc,char** argv)try {
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
         if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
+        if(std::string(argv[2])=="--prefill-quota-recovery-check") {verify_prefill_quota_recovery(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-pipeline-check") {
             for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,true);

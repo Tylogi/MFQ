@@ -189,6 +189,7 @@ public:
     BlasHandle& blas() noexcept { return blas_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
     DeviceMemoryStats memory_stats() const noexcept;
+    std::pair<std::uint64_t,std::uint64_t> pool_memory_stats() const;
     std::size_t local_memory_usage() const;
     // Process-owned pages, including idle allocator pages and CUDA libraries.
     std::size_t resident_memory_usage() const;
@@ -211,6 +212,7 @@ public:
 
 private:
     struct GraphPool {
+        cudaMemPool_t memory = nullptr;
         bool capturing = false;
         bool warming = false;
         std::unordered_map<std::size_t, std::vector<void*>> available;
@@ -223,6 +225,7 @@ private:
     cudaMemPool_t pool_ = nullptr;
     bool async_allocations_ = false;
     std::shared_ptr<AllocationBudget> allocation_budget_;
+    void trim_pool_pages() const;
     std::mutex graph_pool_mutex_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };

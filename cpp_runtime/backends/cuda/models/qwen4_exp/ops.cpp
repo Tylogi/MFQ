@@ -1298,11 +1298,18 @@ Qwen4BatchRequestState::Qwen4BatchRequestState(Qwen4CausalLm& model)
                           "Flash-Next continuous batching requires one CUDA device");
         const auto& block = static_cast<const qwen4_exp::Qwen4Block&>(*base);
         Impl::Layer layer;
-        if (block.gdn) { layer.gdn = std::make_unique<qwen4_exp::Gdn>(*block.gdn); layer.gdn->reset(); }
+        if (block.gdn) {
+            layer.gdn = std::make_unique<qwen4_exp::Gdn>(*block.gdn);
+            layer.gdn->reset();
+        }
         if (block.qsa) layer.qsa = block.qsa->fork_empty();
         if (block.ple) { layer.ple = std::make_unique<qwen4_exp::Ple>(*block.ple); layer.ple->reset(); }
         state_->layers.push_back(std::move(layer));
     }
+    std::size_t fixed=0;
+    for(const auto& layer:state_->layers)if(layer.gdn)fixed+=layer.gdn->request_cache_growth_bytes();
+    if(fixed && model.reserve_kv_workspace)model.reserve_kv_workspace(fixed+(std::size_t(64)<<20));
+    for(auto& layer:state_->layers)if(layer.gdn)layer.gdn->initialize_request_cache();
 }
 Qwen4BatchRequestState::~Qwen4BatchRequestState() = default;
 int64_t Qwen4BatchRequestState::position() const { return state_->cache_position; }
@@ -1399,7 +1406,13 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
     bool reuse = graph.requests == requests && graph.window && graph.greedy == greedy;
     if (reuse) for (int64_t row = 0; row < batch; ++row)
         reuse = reuse && requests[row]->position() + 1 <= graph.capacities[row];
-    if (!reuse) graph.clear();
+    if (!reuse) {
+        graph.clear();
+        // Prefill and previous widths leave asynchronously freed pool pages
+        // charged to WDDM. Retire transfers and trim before preparing a graph.
+        finish_moe_expert_exchanges(model.execution->moe_expert_cache);
+        default_context(model.execution->layer_placement.primary_device())->reclaim_idle_memory();
+    }
     graph.greedy = greedy;
     if (!graph.window) {
         graph.requests = requests;
@@ -1408,11 +1421,15 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             const auto maximum = model.max_position_embeddings();
             const auto required = request->position() + 1;
             MFQ_RUNTIME_CHECK(required <= maximum,"Flash-Next batch graph exceeds max_context");
-            // Keep the established capture interval by default. Large-batch
-            // experiments can trade fixed cache padding for more recaptures.
+            // Keep the initial capture interval. Large independent batches
+            // subsequently grow by 128 tokens instead of doubling every
+            // request's KV allocation at once under a tight device budget.
             int64_t capacity = std::min<int64_t>(batch>8 ?
                 runtime_options::continuous_batch_kv_initial_capacity() : 256,maximum);
-            while (capacity < required)
+            if(batch>16 && capacity<required) {
+                const auto chunks=1+(required-1)/128;
+                capacity=chunks>maximum/128?maximum:chunks*128;
+            } else while (capacity < required)
                 capacity = std::min(maximum,capacity > maximum/2 ? maximum : capacity*2);
             graph.capacities.push_back(capacity);
             for (const auto& layer : request->state_->layers)

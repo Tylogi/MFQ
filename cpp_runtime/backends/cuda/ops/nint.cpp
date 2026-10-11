@@ -1,5 +1,6 @@
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "nint.h"
 #include "nint_prefill_cache.h"
 #include "cuda_execution.h"
@@ -29,6 +30,12 @@ struct NintPrefillDecodeCacheState {
     NintPrefillDecodeCacheState* previous=nullptr;
 };
 namespace {
+Workspace& resident_nint_workspace(const NintWeight& weight,int rows) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    mfq::cuda::ResidentAllocationScope resident;
+#endif
+    return weight.workspace(rows);
+}
 thread_local NintPrefillDecodeCacheState* nint_prefill_decode_cache=nullptr;
 NintPrefillDecodeCacheState::Key nint_prefill_decode_key(const NintWeight& w) {
     return {reinterpret_cast<uintptr_t>(w.q_packed.data_ptr()),
@@ -443,9 +450,10 @@ namespace {
 bool nint_packed_decode_rows(const NintWeight& w,int64_t rows) {
     // Batched decode projects directly from packed weights. Preserve
     // prefill's GEMM path and its layer decode cache.
-    return !w.q8_zero && (rows <= 8 || (rows <= 32 &&
+    return !w.q8_zero && (rows <= 8 || (rows <= 32 && w.gs>=4 && w.gs<=64 &&
         !nint_prefill_decode_cache && mfq::cuda::DecodeWindow::recording() &&
-        mfq::cuda::runtime_options::nint_compressed_decode_batch()));
+        (mfq::cuda::runtime_options::nint_compressed_decode_batch() ||
+         (rows>16 && mfq::cuda::runtime_options::nint_compressed_large_batch(w.out>=65536)))));
 }
 }
 mfq_tensor_backend::Tensor nint_matmul(
@@ -454,7 +462,8 @@ mfq_tensor_backend::Tensor nint_matmul(
         mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous();
-    if (!w.q8_zero && w.out>=65536 && x.size(0)>8 && x.size(0)<=32 &&
+    const bool packed_rows=nint_packed_decode_rows(w,x.size(0));
+    if (!packed_rows && !w.q8_zero && w.out>=65536 && x.size(0)>8 && x.size(0)<=32 &&
         !nint_prefill_decode_cache && mfq::cuda::runtime_options::nint_large_output_tiling()) {
         // Large vocabulary heads otherwise materialize over a GiB of FP16
         // weights. Reuse compressed GEMV across up to eight activation rows.
@@ -466,7 +475,6 @@ mfq_tensor_backend::Tensor nint_matmul(
             return mfq_tensor_backend::cat(output,0);
         });
     }
-    const bool packed_rows=nint_packed_decode_rows(w,x.size(0));
     if (x.size(0) > 8 || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
             x.scalar_type() != mfq_tensor_backend::kFloat32))
         x = x.to(mfq_tensor_backend::kFloat16);
@@ -480,7 +488,7 @@ mfq_tensor_backend::Tensor nint_matmul(
             });
         }
         if (M <= 8) {
-            Workspace & ws = w.workspace(M);
+            Workspace & ws = resident_nint_workspace(w,M);
             return profiler.measure("nint.matmul", [&]() {
                 if (w.aligned_q8) {
                     return nint_matmul_q8_ws_cuda(
@@ -514,7 +522,7 @@ mfq_tensor_backend::Tensor nint_matmul(
         });
     }
     if (M <= 8) {
-        Workspace & ws = w.workspace(M);
+        Workspace & ws = resident_nint_workspace(w,M);
         return profiler.measure("nint8_zero.gemv", [&]() {
             return nint8_zero_gemv_ws_cuda(
                 w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
@@ -639,7 +647,7 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     if (!w.q8_zero && x.size(0) <= 8) {
-        Workspace & ws = w.workspace(static_cast<int>(x.size(0)));
+        Workspace & ws = resident_nint_workspace(w,static_cast<int>(x.size(0)));
         return profiler.measure("nint.matmul.input_mul", [&]() {
             if (w.aligned_q8) {
                 return nint_matmul_input_mul_q8_ws_cuda(
