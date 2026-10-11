@@ -58,8 +58,15 @@ def _ensure_msvc() -> None:
 def ext():
     global _module
     if _module is None:
+        import torch
+
+        if torch.version.hip:
+            # AMD ROCm host: build the hipify-translated kernels instead.
+            from mfq.quantize.hip._ext import ext as _hip_ext
+
+            _module = _hip_ext()
+            return _module
         _ensure_msvc()
-        import torch  # noqa: F401
         from torch.utils.cpp_extension import load
 
         _module = load(
