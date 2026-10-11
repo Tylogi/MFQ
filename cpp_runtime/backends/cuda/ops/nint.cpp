@@ -6,10 +6,13 @@
 #include "format.h"
 #include "packed_nint.h"
 #include "cpu_projection_rows.h"
+#include "../runtime/decode_window.h"
+#include "../runtime/execution_options.h"
 
 #include <cstring>
 #include <limits>
 #include <array>
+#include <algorithm>
 #include <map>
 
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -436,18 +439,34 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     });
     return result;
 }
+namespace {
+bool nint_packed_decode_rows(const NintWeight& w,int64_t rows) {
+    // Batched decode projects directly from packed weights. Preserve
+    // prefill's GEMM path and its layer decode cache.
+    return !w.q8_zero && (rows <= 8 || (rows <= 32 &&
+        !nint_prefill_decode_cache && mfq::cuda::DecodeWindow::recording() &&
+        mfq::cuda::runtime_options::nint_compressed_decode_batch()));
+}
+}
 mfq_tensor_backend::Tensor nint_matmul(
         CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous();
+    const bool packed_rows=nint_packed_decode_rows(w,x.size(0));
     if (x.size(0) > 8 || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
             x.scalar_type() != mfq_tensor_backend::kFloat32))
         x = x.to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (!w.q8_zero) {
+        if(packed_rows && M>8) {
+            return profiler.measure("nint.matmul.online_f16",[&] {
+                return nint_matmul_online_f16_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,w.gs);
+            });
+        }
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
             return profiler.measure("nint.matmul", [&]() {

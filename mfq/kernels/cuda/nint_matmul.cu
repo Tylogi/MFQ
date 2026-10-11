@@ -3,7 +3,8 @@
 // Every ordinary NINT tensor is normalized at the loader boundary to one
 // row-major bitstream plus per-neuron q metadata.  Uniform presets and
 // adaptive q/k allocations therefore execute through exactly the same
-// kernels.  Large-M execution uses the same row decoder followed by GEMM.
+// kernels.  Small batched decode can stage decoded tiles in shared memory
+// for Tensor Core projection; large prefill retains its GEMM dispatch.
 
 // NINT8-0 is a separate symmetric format.  It retains one small-M packed
 // kernel; larger batches use its row decoder followed by GEMM.
@@ -226,7 +227,7 @@ constexpr int kNintPrefillStrideK = 72;
 constexpr int kNintPrefillWarps = 8;
 
 
-template <bool AsyncCopy, int TileM>
+template <bool AsyncCopy, int TileM, bool Dense = false>
 __device__ __forceinline__ void nint_prefill_load_activation_tile(
         const __half * __restrict__ input,
         const int32_t * __restrict__ ids_dst,
@@ -249,8 +250,8 @@ __device__ __forceinline__ void nint_prefill_load_activation_tile(
         const int compact = first + matrix_row;
         int source_row = -1;
         if (compact < last) {
-            const int pair = ids_dst[compact];
-            source_row = routed_input ? pair : pair / routes;
+            const int pair = Dense ? compact : ids_dst[compact];
+            source_row = Dense || routed_input ? pair : pair / routes;
         }
         __half * destination = activation_tile +
             matrix_row * kNintPrefillStrideK + vector * vector_width;
@@ -431,7 +432,7 @@ __device__ __forceinline__ void nint_prefill_load_weight_tile(
 // consume the same heterogeneous row metadata and execute the same tiled
 // decoder.  Keeping the plain projection separate prevents it from reserving
 // a second accumulator set that it can never use.
-template <int TileM, bool AsyncActivation, bool FusedGlu>
+template <int TileM, bool AsyncActivation, bool FusedGlu, bool Dense = false>
 __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -456,7 +457,10 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         int q_expert_stride,
         int pool_phase,
         int epilogue_mode,
-        bool routed_input) {
+        bool routed_input,
+        int dense_rows,
+        int split_k,
+        float* __restrict__ dense_partial) {
     static_assert(
         TileM == 16 || TileM == 32 || TileM == 64 || TileM == 128);
     constexpr int matrix_tiles_m = TileM / 16;
@@ -484,7 +488,7 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
     constexpr int projections = FusedGlu ? 2 : 1;
     const int output_tiles =
         (result_rows + kNintPrefillTileN - 1) / kNintPrefillTileN;
-    const int total_tiles = tile_bounds[experts];
+    const int total_tiles = Dense ? (dense_rows + TileM - 1) / TileM : tile_bounds[experts];
     const int64_t total_tasks =
         static_cast<int64_t>(total_tiles) * output_tiles;
 
@@ -508,14 +512,14 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         const int tile = static_cast<int>(task / output_tiles);
         const int output_tile = static_cast<int>(
             task - static_cast<int64_t>(tile) * output_tiles);
-        const int expert = tile_experts[tile];
-        const int local_expert = expert_local[expert];
+        const int expert = Dense ? 0 : tile_experts[tile];
+        const int local_expert = Dense ? 0 : expert_local[expert];
         if (local_expert < 0) {
             continue;
         }
-        const int local_tile = tile - tile_bounds[expert];
-        const int first = expert_bounds[expert] + local_tile * TileM;
-        const int last = min(first + TileM, expert_bounds[expert + 1]);
+        const int local_tile = Dense ? tile : tile - tile_bounds[expert];
+        const int first = Dense ? local_tile * TileM : expert_bounds[expert] + local_tile * TileM;
+        const int last = min(first + TileM, Dense ? dense_rows : expert_bounds[expert + 1]);
         const int result_row_base = output_tile * kNintPrefillTileN;
         const uint8_t * expert_stream = bitstream +
             static_cast<size_t>(local_expert) * q_expert_stride;
@@ -531,9 +535,13 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
             }
         }
 
-        for (int column_base = 0; column_base < input_width;
+        const int split_columns = ((input_width + kNintPrefillTileK*split_k - 1) /
+            (kNintPrefillTileK*split_k))*kNintPrefillTileK;
+        const int column_begin = Dense ? int(blockIdx.y)*split_columns : 0;
+        const int column_end = Dense ? min(input_width,column_begin+split_columns) : input_width;
+        for (int column_base = column_begin; column_base < column_end;
              column_base += kNintPrefillTileK) {
-            nint_prefill_load_activation_tile<AsyncActivation, TileM>(
+            nint_prefill_load_activation_tile<AsyncActivation, TileM, Dense>(
                 input, ids_dst, activation_tile, first, last, routes,
                 input_width, column_base, routed_input, thread);
             if constexpr (AsyncActivation) {
@@ -655,7 +663,7 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                 const int result_row =
                     result_row_base + warp_n * 16 + column;
                 if (compact < last && result_row < result_rows) {
-                    const int pair = ids_dst[compact];
+                    const int pair = Dense ? compact : ids_dst[compact];
                     float value = first_projection[element];
                     if constexpr (FusedGlu) {
                         const float gate = __half2float(
@@ -665,8 +673,10 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                         value = mfq_glu_runtime(
                             gate, up, epilogue_mode == 2 ? 1 : 0);
                     }
-                    output[static_cast<size_t>(pair) * result_rows +
-                        result_row] = __float2half_rn(value);
+                    if constexpr(Dense) {
+                        if(split_k>1)dense_partial[(size_t(blockIdx.y)*dense_rows+pair)*result_rows+result_row]=value;
+                        else output[static_cast<size_t>(pair)*result_rows+result_row]=__float2half_rn(value);
+                    } else output[static_cast<size_t>(pair)*result_rows+result_row]=__float2half_rn(value);
                 }
             }
             __syncwarp();
@@ -2073,7 +2083,7 @@ void launch_nint_matmul_routed_cuda(
                 tile_experts.data_ptr<int32_t>(), \
                 routes, experts, output_rows, groups, group_size, \
                 input_width, q_expert_stride, pool_phase, epilogue_mode, \
-                routed_input)
+                routed_input, 0, 1, nullptr)
         if (route_tile_m == 128 && epilogue_mode == 0) {
             MFQ_LAUNCH_NINT_TILED_PREFILL(128, false);
         } else if (route_tile_m == 128) {
@@ -2736,6 +2746,69 @@ mfq_tensor_backend::Tensor nint_matmul_q8_ws_cuda(
         input, nullptr, 0, group_size, quantized_input, input_scale, true);
 }
 
+
+__global__ void nint_online_reduce_kernel(const float* partial,__half* output,int elements,int splits) {
+    for(int index=int(blockIdx.x)*blockDim.x+threadIdx.x;index<elements;index+=blockDim.x*gridDim.x) {
+        float sum=0;
+        for(int split=0;split<splits;++split)sum+=partial[size_t(split)*elements+index];
+        output[index]=__float2half_rn(sum);
+    }
+}
+
+mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
+        mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,int64_t group_size) {
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
+        input.scalar_type()==mfq_tensor_backend::kFloat16 && input.size(0)>8 && input.size(0)<=32,
+        "NINT online projection requires contiguous CUDA FP16 input with 9..32 rows");
+    for(const auto* tensor:{&bitstream,&row_q_bits,&row_q_bit_offsets,&subgroup_scale,
+            &subgroup_minimum,&neuron_scale,&neuron_minimum}) {
+        MFQ_RUNTIME_CHECK(tensor->is_cuda() && tensor->is_contiguous() && tensor->device()==input.device(),
+            "NINT online projection tensors must share the input CUDA device");
+    }
+    MFQ_RUNTIME_CHECK(bitstream.scalar_type()==mfq_tensor_backend::kUInt8 && bitstream.dim()==1 &&
+        row_q_bits.scalar_type()==mfq_tensor_backend::kUInt8 && row_q_bits.dim()==1 &&
+        row_q_bit_offsets.scalar_type()==mfq_tensor_backend::kInt64 && row_q_bit_offsets.dim()==1 &&
+        subgroup_scale.scalar_type()==mfq_tensor_backend::kUInt8 && subgroup_scale.dim()==2 &&
+        subgroup_minimum.scalar_type()==mfq_tensor_backend::kUInt8 && subgroup_minimum.sizes()==subgroup_scale.sizes() &&
+        neuron_scale.scalar_type()==mfq_tensor_backend::kFloat32 && neuron_minimum.scalar_type()==mfq_tensor_backend::kFloat32,
+        "NINT online projection metadata types are invalid");
+    const int rows=int(input.size(0)),outputs=int(subgroup_scale.size(0)),groups=int(subgroup_scale.size(1));
+    MFQ_RUNTIME_CHECK(outputs>0 && groups>0 && group_size>=4 && group_size<=64 &&
+        input.size(1)>0 && input.size(1)<=int64_t(groups)*group_size && row_q_bits.numel()==outputs &&
+        row_q_bit_offsets.numel()==outputs && neuron_scale.numel()==outputs && neuron_minimum.numel()==outputs,
+        "NINT online projection metadata dimensions are invalid");
+    auto output=mfq_tensor_backend::empty({rows,outputs},input.options());
+    const int output_tiles=(outputs+kNintPrefillTileN-1)/kNintPrefillTileN;
+    int split=1;
+    static thread_local int cached_device=-1,processors=1;
+    if(cached_device!=input.get_device()) {
+        MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&processors,cudaDevAttrMultiProcessorCount,input.get_device()));
+        cached_device=input.get_device();
+    }
+    while(split<8 && output_tiles*split<processors*2 && input.size(1)>=int64_t(split*2)*kNintPrefillTileK)split*=2;
+    auto partial=split>1 ? mfq_tensor_backend::empty({split,rows,outputs},input.options().dtype(mfq_tensor_backend::kFloat32))
+        : mfq_tensor_backend::Tensor();
+    const auto launch=[&](auto row_tile) {
+        nint_matmul_tiled_prefill_kernel<decltype(row_tile)::value,true,false,true><<<
+            dim3(output_tiles,split),dim3(32,kNintPrefillWarps),0,mfq_current_cuda_stream()>>>(
+                bitstream.data_ptr<uint8_t>(),row_q_bits.data_ptr<uint8_t>(),row_q_bit_offsets.data_ptr<int64_t>(),
+                subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),
+                neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),
+                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                nullptr,nullptr,nullptr,nullptr,nullptr,
+                1,1,outputs,groups,int(group_size),int(input.size(1)),0,0,0,true,rows,split,
+                split>1 ? partial.data_ptr<float>() : nullptr);
+    };
+    if(rows<=16)launch(std::integral_constant<int,16>{});
+    else launch(std::integral_constant<int,32>{});
+    if(split>1)nint_online_reduce_kernel<<<(rows*outputs+255)/256,256,0,mfq_current_cuda_stream()>>>(
+        partial.data_ptr<float>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),rows*outputs,split);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
 
 mfq_tensor_backend::Tensor nint_matmul_input_mul_ws_cuda(
         mfq_tensor_backend::Tensor bitstream,

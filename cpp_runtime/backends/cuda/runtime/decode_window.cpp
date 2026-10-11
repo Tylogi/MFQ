@@ -88,11 +88,12 @@ void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout
 namespace { thread_local DecodeWindow* active=nullptr; }
 struct DecodeWindow::LayerPoint {
     int layer;
+    int tile;
     std::string phase;
     cudaEvent_t event=nullptr;
     uint64_t samples=0;
     int64_t total_ns=0,min_ns=0,max_ns=0;
-    LayerPoint(int l,const char* p):layer(l),phase(p) {MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&event));}
+    LayerPoint(int l,int t,const char* p):layer(l),tile(t),phase(p) {MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&event));}
     ~LayerPoint(){if(event)cudaEventDestroy(event);}
 };
 DecodeWindow* DecodeWindow::recording() noexcept { return active; }
@@ -116,10 +117,10 @@ void DecodeWindow::mark(int layer,const char* phase) {
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;})))return;
     }
     if(active!=this)throw std::logic_error("MFQ layer timing outside window recording");
-    const auto key=std::make_pair(layer,std::string(phase));
+    const auto key=std::make_tuple(layer,profile_tile_,std::string(phase));
     auto found=layer_point_index_.find(key);
     if(found==layer_point_index_.end()) {
-        auto point=std::make_unique<LayerPoint>(layer,phase);
+        auto point=std::make_unique<LayerPoint>(layer,profile_tile_,phase);
         found=layer_point_index_.emplace(key,point.get()).first;layer_points_.push_back(std::move(point));
     }
     cudaStreamCaptureStatus capture;
@@ -141,7 +142,7 @@ std::vector<DecodeWindow::GpuPhase> DecodeWindow::gpu_phases() const {
     for(std::size_t i=1;i<layer_points_.size();++i) {
         const auto& previous=*layer_points_[i-1];const auto& current=*layer_points_[i];
         phases.push_back({previous.layer,current.layer,previous.phase,current.phase,
-            current.samples,current.total_ns,current.min_ns,current.max_ns});
+            current.samples,current.total_ns,current.min_ns,current.max_ns,previous.tile,current.tile});
     }
     return phases;
 }
@@ -160,7 +161,8 @@ DecodeWindow::~DecodeWindow() {
     for(const auto& phase:gpu_phases())if(phase.samples)
         std::cerr<<"native_layer_gpu from_layer="<<phase.from_layer<<" layer="<<phase.layer
             <<" from="<<phase.from<<" to="<<phase.to<<" samples="<<phase.samples
-            <<" total_ns="<<phase.total_ns<<" min_ns="<<phase.min_ns<<" max_ns="<<phase.max_ns<<std::endl;
+            <<" total_ns="<<phase.total_ns<<" min_ns="<<phase.min_ns<<" max_ns="<<phase.max_ns
+            <<" from_tile="<<phase.from_tile<<" tile="<<phase.tile<<std::endl;
 }
 void DecodeWindow::enroll(Task task) {
     if(active!=this)throw std::logic_error("MFQ task outside window capture");

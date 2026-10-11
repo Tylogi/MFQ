@@ -32,6 +32,8 @@ float residency_heat_retention();
 int residency_interval();
 bool router_lookahead();
 bool batch_attention_projections();
+bool nint_compressed_decode_batch();
+int continuous_batch_kv_initial_capacity();
 std::size_t workspace_reserve_bytes();
 bool phased_transfer();
 bool mapped_copy_overlap();

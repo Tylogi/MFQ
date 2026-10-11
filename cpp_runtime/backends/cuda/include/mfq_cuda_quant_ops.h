@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <vector>
 
+mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,int64_t group_size);
+
 void nint_moe_grouped_matmul_hetero_cuda(
     mfq_tensor_backend::Tensor weight_ptrs,mfq_tensor_backend::Tensor pool_params,
     mfq_tensor_backend::Tensor expert_pool,mfq_tensor_backend::Tensor expert_local,

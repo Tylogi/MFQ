@@ -492,15 +492,21 @@ struct Qwen4Block final : Block {
     Tensor batch_ffn(CudaExecutionContext& execution,const Tensor& input) {
         constexpr int64_t rows=8;
         if(input.size(0)<=rows)return ffn(execution,input);
+        auto* window=DecodeWindow::recording();
+        const int previous_profile_tile=window ? window->set_profile_tile(-1) : -1;
         struct TileScope {
             CudaExecutionContext& execution;
             int tile,tiles;
-            ~TileScope() {execution.continuous_batch_ffn_tile=tile;execution.continuous_batch_ffn_tiles=tiles;}
-        } scope{execution,execution.continuous_batch_ffn_tile,execution.continuous_batch_ffn_tiles};
+            DecodeWindow* window;
+            int profile_tile;
+            ~TileScope() {execution.continuous_batch_ffn_tile=tile;execution.continuous_batch_ffn_tiles=tiles;
+                if(window)window->set_profile_tile(profile_tile);}
+        } scope{execution,execution.continuous_batch_ffn_tile,execution.continuous_batch_ffn_tiles,window,previous_profile_tile};
         execution.continuous_batch_ffn_tiles=int((input.size(0)+rows-1)/rows);
         std::vector<Tensor> outputs;
         for(int64_t start=0;start<input.size(0);start+=rows) {
             execution.continuous_batch_ffn_tile=int(start/rows);
+            if(window)window->set_profile_tile(int(start/rows));
             outputs.push_back(ffn(execution,input.narrow(0,start,std::min(rows,input.size(0)-start))));
         }
         return tb::cat(outputs,0);
@@ -1396,7 +1402,10 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             const auto maximum = model.max_position_embeddings();
             const auto required = request->position() + 1;
             MFQ_RUNTIME_CHECK(required <= maximum,"Flash-Next batch graph exceeds max_context");
-            int64_t capacity = std::min<int64_t>(256,maximum);
+            // Keep the established capture interval by default. Large-batch
+            // experiments can trade fixed cache padding for more recaptures.
+            int64_t capacity = std::min<int64_t>(batch>8 ?
+                runtime_options::continuous_batch_kv_initial_capacity() : 256,maximum);
             while (capacity < required)
                 capacity = std::min(maximum,capacity > maximum/2 ? maximum : capacity*2);
             graph.capacities.push_back(capacity);
@@ -1424,7 +1433,8 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             graph.memory_pool->prepare_memory();
             default_context(mfq_current_cuda_device())->end_graph_warmup(mfq_current_cuda_stream());
         }
-        graph.window = std::make_unique<DecodeWindow>(mfq_current_cuda_stream());
+        graph.window = std::make_unique<DecodeWindow>(
+            mfq_current_cuda_stream(),mfq::cuda::runtime_options::layer_timings());
     }
     graph.ids.copy_(ids);
     std::vector<std::pair<qwen4_exp::Ple*,qwen4_exp::NgramEmbedding::Context>> ple_contexts;

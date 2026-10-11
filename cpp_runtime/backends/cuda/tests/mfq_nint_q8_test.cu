@@ -11,6 +11,7 @@
 
 namespace {
 using namespace mfq::cuda;
+bool benchmark_online=false;
 void single_path(bool enabled) {
 #ifdef _WIN32
     _putenv_s("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0");
@@ -73,9 +74,11 @@ void grouped_half(const Tensor &actual, const Tensor &expected) {
         const double difference = std::abs(double(av[i]) - bv[i]);
         // Integer group dots reassociate the FP32 reduction before FP16 storage.
         // Keep a bounded numerical check; exact quantizer/legacy checks remain separate.
-        require(std::isfinite(av[i]) && std::isfinite(bv[i]) &&
-            difference <= 0.002 + 0.002 * std::abs(double(bv[i])),
-            "NINT grouped output exceeds FP16 reduction tolerance");
+        if(!std::isfinite(av[i]) || !std::isfinite(bv[i]) ||
+                difference > 0.002 + 0.002 * std::abs(double(bv[i]))) {
+            std::cerr<<"NINT comparison index="<<i<<" actual="<<av[i]<<" expected="<<bv[i]<<std::endl;
+            throw std::runtime_error("NINT grouped output exceeds FP16 reduction tolerance");
+        }
         error += difference * difference;
         signal += double(bv[i]) * bv[i];
         grouped_max_absolute = std::max(grouped_max_absolute, difference);
@@ -163,7 +166,7 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
         ++graphs;
     }
 }
-void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false,int rows=1) {
+void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false,int rows=1,bool online=false) {
     const Device gpu{DeviceType::cuda,0};
     const int ng=(width+gs-1)/gs,k=ng*gs;
     std::vector<std::uint8_t> row_bits(n);
@@ -193,13 +196,23 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
     auto x=tensor(input).reshape({rows,width}).to(gpu,kFloat16);
     const auto options=TensorOptions().device(gpu);
     auto qx=empty({rows,k},options.dtype(kInt8)),xs=empty({rows,ng},options.dtype(kFloat32));
-    const auto run=[&]{return nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
+    const auto run=[&]{return online ? nint_matmul_online_f16_cuda(q,bits,off,s,mn,ns,nm,x,gs)
+        : nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
+    // Keep the FP16 operands while using an FP32 GEMM reference; a long FP16
+    // GEMM may use reduced-precision intermediate reductions in cuBLAS.
+    const auto reference=[&]{return online ? matmul(x.to(kFloat32),
+        nint_decode_cuda(q,bits,off,s,mn,ns,nm,width,gs).to(kFloat32).transpose(0,1)).to(kFloat16) : run();};
     exact_batch_path(false);
-    single_path(false);group_path(rows>1);whole_path(rows==1);auto expected=run();
+    single_path(false);group_path(rows>1);whole_path(rows==1);auto expected=reference();
     exact_batch_path(true);
     whole_path(true);
     single_path(true);group_path(grouped);auto actual=run();
-    const auto compare=grouped && rows==1 ? grouped_half : exact_half;compare(actual,expected);++cases;
+    const auto compare=[&](const Tensor& a,const Tensor& b) {
+        try {if(online || (grouped && rows==1))grouped_half(a,b);else exact_half(a,b);}
+        catch(...) {std::cerr<<"NINT case gs="<<gs<<" width="<<width<<" preset="<<preset<<" offset="<<storage_offset
+            <<" padding="<<padding<<" outputs="<<n<<" rows="<<rows<<" online="<<online<<std::endl;throw;}
+    };
+    compare(actual,expected);++cases;
     const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
     MfqCudaGraph graph;mfq_prepare_cuda_graph_memory(graph);
     actual=run();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));actual=Tensor{};
@@ -208,13 +221,34 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
         for(int column=0;column<rows*width;++column)input[column]=std::sin(float(column+step*31)*.173f)*.13f;
         x.copy_(tensor(input).reshape({rows,width}).to(gpu,kFloat16));
         exact_batch_path(false);
-        single_path(false);group_path(rows>1);whole_path(rows==1);expected=run();
+        single_path(false);group_path(rows>1);whole_path(rows==1);expected=reference();
         exact_batch_path(true);
         graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));compare(actual,expected);++cases;
     }
     single_path(false);
     group_path(false);
     whole_path(true);
+    if(online && benchmark_online && n>128) {
+        const auto measure=[&](MfqCudaGraph& measured) {
+            struct Events {cudaEvent_t start{},end{};~Events(){if(start)cudaEventDestroy(start);if(end)cudaEventDestroy(end);}} events;
+            MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&events.start));MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&events.end));
+            MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(events.start,stream.stream()));
+            for(int i=0;i<128;++i)measured.replay();
+            MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(events.end,stream.stream()));
+            MFQ_NATIVE_CUDA_CHECK(cudaEventSynchronize(events.end));
+            float milliseconds=0;MFQ_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&milliseconds,events.start,events.end));
+            return milliseconds*1000/128;
+        };
+        const float online_us=measure(graph);
+        actual={};expected={};graph.reset();
+        const auto expanded=[&]{return matmul(x,nint_decode_cuda(q,bits,off,s,mn,ns,nm,width,gs).transpose(0,1));};
+        MfqCudaGraph baseline;mfq_prepare_cuda_graph_memory(baseline);
+        auto baseline_output=expanded();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));baseline_output={};
+        baseline.capture_begin();baseline_output=expanded();baseline.capture_end();
+        const float expanded_us=measure(baseline);
+        std::cout<<"NINT online_benchmark rows="<<rows<<" outputs="<<n<<" width="<<width<<" gs="<<gs
+            <<" online_us="<<online_us<<" expanded_us="<<expanded_us<<std::endl;
+    }
 }
 
 void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& changing) {
@@ -300,8 +334,9 @@ void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& chan
 }
 }  // namespace
 
-int main() {
+int main(int argc,char** argv) {
     try {
+        benchmark_online=argc>1 && std::strcmp(argv[1],"--benchmark-online")==0;
         int devices = 0;
         const auto status = cudaGetDeviceCount(&devices);
         if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver ||
@@ -337,6 +372,16 @@ int main() {
         for(int gs:{5,24,28,32,48,64})for(int width:{77,640})for(int rows:{2,3,4,5,6})
             check_single(gs,width,0,0,8,9,exact_capacity_cases,true,rows);
         std::cout<<"NINT exact batch capacity original Half/changing graphs cases="<<exact_capacity_cases<<" PASS\n";
+        int online_cases=0;
+        for(int gs:{5,24,28,32,48,64})for(int width:{53,640,2560})for(int rows:{9,16,17,32})
+            for(int preset:{0,5,8})for(int offset:{0,1})for(int padding:{0,8})
+                check_single(gs,width,preset,offset,padding,9,online_cases,false,rows,true);
+        check_single(28,2560,5,0,8,640,online_cases,false,16,true);
+        check_single(24,640,0,0,8,2560,online_cases,false,32,true);
+        check_single(28,2560,5,0,8,6144,online_cases,false,32,true);
+        check_single(24,6144,6,0,8,2560,online_cases,false,16,true);
+        check_single(24,6144,6,0,8,2560,online_cases,false,32,true);
+        std::cout<<"NINT online Tensor Core projection dense-reference/changing graphs cases="<<online_cases<<" PASS\n";
         for (int gs : {4, 12, 28, 32, 48, 64, 5, 47, 63}) {
             for (int ng : {1, 3, 22}) {
                 for (int m = 1; m <= 8; ++m) {

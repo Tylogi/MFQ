@@ -490,7 +490,7 @@ def _cuda_models(tmp_path):
     return baseline, nint
 
 
-@pytest.mark.parametrize("requests", [2, 4, 6, 8, 16, 32])
+@pytest.mark.parametrize("requests", [2, 4, 6, 8, 9, 16, 17, 32])
 @pytest.mark.parametrize("quantized_experts", [False, True, "nvq"])
 def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, requests, quantized_experts):
     executable = os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
@@ -501,6 +501,9 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
                        MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
                        MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    if requests == 17 and quantized_experts == "nvq":
+        environment["MFQ_TRACE_LAYER_TIMINGS"] = "3"
+        environment["MFQ_CONTINUOUS_BATCH_KV_INITIAL_CAPACITY"] = "64"
     process = subprocess.run([
         executable, "--model", str(model), "--ctx-size", "512",
         "--check-continuous-batching", "--continuous-batching-check-requests", str(requests),
@@ -508,6 +511,11 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     ], capture_output=True, text=True, timeout=90, env=environment)
     assert process.returncode == 0, process.stdout + process.stderr
     assert "continuous_batching_check PASS" in process.stdout
+    if requests == 17 and quantized_experts == "nvq":
+        phases = [dict(field.split("=", 1) for field in line.split()[1:])
+                  for line in process.stderr.splitlines() if line.startswith("native_layer_gpu ")]
+        assert {phase["tile"] for phase in phases if phase["from"] == "hot_begin"
+                and phase["to"] == "hot_end"} >= {"0", "1", "2"}
     if requests == 32:
         assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in process.stdout
     state = next(line for line in process.stdout.splitlines()

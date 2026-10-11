@@ -5,6 +5,7 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace mfq::cuda {
@@ -28,6 +29,7 @@ public:
         std::string from,to;
         uint64_t samples;
         int64_t total_ns,min_ns,max_ns;
+        int from_tile=-1,tile=-1;
     };
     explicit DecodeWindow(cudaStream_t stream,bool layer_profile=false);
     ~DecodeWindow();
@@ -39,6 +41,7 @@ public:
     void enroll(Task task);
     void run();
     void mark(int layer,const char* phase);
+    int set_profile_tile(int tile) noexcept {const int previous=profile_tile_;profile_tile_=tile;return previous;}
     std::vector<GpuPhase> gpu_phases() const;
     std::size_t nodes() const { return graphs_.find(0,1)->nodes(); }
     bool valid() const { return graphs_.find(0,1)!=nullptr; }
@@ -48,7 +51,8 @@ private:
     GraphRegistry graphs_;
     struct LayerPoint;
     std::vector<std::unique_ptr<LayerPoint>> layer_points_;
-    std::map<std::pair<int,std::string>,LayerPoint*> layer_point_index_;
+    std::map<std::tuple<int,int,std::string>,LayerPoint*> layer_point_index_;
+    int profile_tile_=-1;
     bool layer_profile_;
     void observe_layers();
     std::vector<Task> tasks_;
