@@ -316,6 +316,70 @@ set_target_properties(mfq-eval PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
+if(BUILD_TESTING)
+    # The CUDA backend's test sources compile directly as HIP translation
+    # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the
+    # cuda_* runtime API names onto hip.
+    set(MFQ_HIP_TEST_INCLUDES
+        ${MFQ_HIP_ROOT}/tests/cuda_compat
+        ${MFQ_REPOSITORY_ROOT}/cpp_runtime/components/ggml/src/ggml-hip/vendors
+        ${MFQ_REPOSITORY_ROOT}
+        ${MFQ_HIP_ROOT}
+        ${MFQ_HIP_ROOT}/include
+        ${MFQ_HIP_ROOT}/ops/include
+        ${MFQ_HIP_ROOT}/storage
+        ${MFQ_HIP_KERNEL_ROOT}
+    )
+    function(mfq_add_hip_test target source)
+        add_executable(${target} ${source})
+        set_source_files_properties(${source} PROPERTIES LANGUAGE HIP)
+        target_include_directories(${target} PRIVATE ${MFQ_HIP_TEST_INCLUDES})
+        target_compile_definitions(${target} PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        set_target_properties(${target} PROPERTIES
+            HIP_STANDARD 20
+            HIP_STANDARD_REQUIRED ON
+            HIP_ARCHITECTURES "${MFQ_HIP_ARCHITECTURES}"
+            RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/hip-tests"
+        )
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
+    endfunction()
+
+    mfq_add_hip_test(mfq-hip-context-test
+        ${MFQ_HIP_ROOT}/tests/mfq_cuda_context_test.cu)
+    target_link_libraries(mfq-hip-context-test PRIVATE mfq-hip-core)
+
+    mfq_add_hip_test(mfq-hip-activation-test
+        ${MFQ_HIP_ROOT}/tests/mfq_cuda_activation_test.cu)
+    target_link_libraries(mfq-hip-activation-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels)
+
+    mfq_add_hip_test(mfq-hip-native-tensor-test
+        ${MFQ_HIP_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
+    target_link_libraries(mfq-hip-native-tensor-test PRIVATE mfq-hip-core)
+
+    mfq_add_hip_test(mfq-hip-nint-q8-test
+        ${MFQ_HIP_ROOT}/tests/mfq_nint_q8_test.cu)
+    target_link_libraries(mfq-hip-nint-q8-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels)
+
+    mfq_add_hip_test(mfq-hip-nint-rows-test
+        ${MFQ_HIP_ROOT}/tests/mfq_nint_rows_test.cu)
+    target_link_libraries(mfq-hip-nint-rows-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels mfq-core)
+
+    mfq_add_hip_test(mfq-hip-packed-prefill-test
+        ${MFQ_HIP_ROOT}/tests/mfq_packed_prefill_test.cu)
+    target_link_libraries(mfq-hip-packed-prefill-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels mfq-core)
+
+    mfq_add_hip_test(mfq-hip-paged-kv-test
+        ${MFQ_HIP_ROOT}/tests/mfq_paged_kv_test.cu)
+    target_link_libraries(mfq-hip-paged-kv-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels)
+endif()
+
 set(MFQ_SYSTEM_RUNTIME_DIR
     "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" CACHE PATH
     "directory containing the host libstdc++ runtime")
