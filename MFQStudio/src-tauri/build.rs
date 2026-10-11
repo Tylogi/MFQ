@@ -123,6 +123,28 @@ fn write_icons(directory: &Path) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../src");
+    println!("cargo:rerun-if-changed=../package.json");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).output().ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    for file in ["HEAD", "index", "packed-refs", "refs/tags"] {
+        let path = git(&["rev-parse", "--path-format=absolute", "--git-path", file]);
+        if !path.is_empty() { println!("cargo:rerun-if-changed={path}"); }
+    }
+    let revision = git(&["rev-parse", "--short=8", "HEAD"]);
+    let modified = !git(&["status", "--porcelain", "--untracked-files=normal"]).is_empty();
+    let release = !modified && git(&["tag", "--points-at", "HEAD"]).lines().any(|tag| tag == format!("v{version}"));
+    let identity = if release { version } else {
+        format!("{version}+dev.{}{}", if revision.is_empty() { "local" } else { &revision }, if modified { ".modified" } else { "" })
+    };
+    println!("cargo:rustc-env=MFQ_STUDIO_VERSION={identity}");
+    println!("cargo:rustc-env=MFQ_STUDIO_RELEASE={release}");
     let directory = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("icons");
     write_icons(&directory);
     tauri_build::build()

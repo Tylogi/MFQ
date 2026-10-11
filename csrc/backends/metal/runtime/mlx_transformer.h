@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlx_resource_telemetry.h"
+#include "mlx_kv_quantization.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +19,13 @@ struct MlxYarnScaling {
     double beta_fast = 32.0;
     double beta_slow = 1.0;
     std::int64_t original_max_position_embeddings = 0;
+    double attention_factor = 1.0;
 };
+
+std::int64_t qwen_yarn_capacity(std::int64_t native_context, double maximum_factor);
+MlxYarnScaling qwen_yarn_scaling(const MlxYarnScaling& settings,
+    std::int64_t native_context, std::int64_t requested_context, double maximum_factor);
+double yarn_frequency(int pair, int dimension, double theta, const MlxYarnScaling& scaling);
 
 // Model-neutral adjacent-pair RoPE primitives. Architecture adapters provide
 // the configured YaRN parameters but do not own the table builder or kernel.
@@ -51,6 +58,7 @@ struct MlxKvCacheSnapshot {
     mlx::core::Dtype dtype = mlx::core::float16;
     mlx::core::array key = mlx::core::array(0.0f);
     mlx::core::array value = mlx::core::array(0.0f);
+    MlxKvQuantization quantization;
 
     std::size_t nbytes() const noexcept {
         return key.nbytes() + value.nbytes();
@@ -87,7 +95,8 @@ mlx::core::array apply_rope(
     const mlx::core::array& input,
     int rotary_dimension,
     float base,
-    int offset);
+    int offset,
+    const MlxYarnScaling& scaling = {});
 
 // Apply rotate-half RoPE using explicit token positions. positions accepts
 // [tokens], [1,tokens], or [3,tokens]. Three-axis positions select temporal,
@@ -100,7 +109,8 @@ mlx::core::array apply_rope(
     int rotary_dimension,
     float base,
     const std::vector<std::int64_t>& sections = {},
-    bool interleaved = false);
+    bool interleaved = false,
+    const MlxYarnScaling& scaling = {});
 
 mlx::core::array scaled_dot_product_attention(
     const mlx::core::array& query,
@@ -125,7 +135,8 @@ public:
         int maximum_sequence,
         int head_dimension,
         int initial_capacity = 16,
-        mlx::core::Dtype dtype = mlx::core::float16);
+        mlx::core::Dtype dtype = mlx::core::float16,
+        bool quantization_allowed = false);
 
     void reset() noexcept {
         position_ = 0;
@@ -136,6 +147,11 @@ public:
     std::pair<mlx::core::array, mlx::core::array> append(
         const mlx::core::array& key,
         const mlx::core::array& value);
+    void append_only(const mlx::core::array& key, const mlx::core::array& value);
+    bool quantized() const noexcept { return quantization_.enabled(); }
+    mlx::core::array attention(const mlx::core::array& query, bool causal = true) const;
+    mlx::core::array sparse_attention(const mlx::core::array& query,
+        const std::optional<mlx::core::array>& blocks, int query_offset, int ratio, int budget) const;
 
     // Reserve cache rows without materializing an indexed update. Specialized
     // decode primitives use this when the projection/post-processing kernel
@@ -173,12 +189,14 @@ public:
 
 private:
     void ensure_capacity(int required);
+    std::pair<mlx::core::array, mlx::core::array> physical_view() const;
 
     int batch_;
     int heads_;
     int maximum_sequence_;
     int head_dimension_;
     mlx::core::Dtype dtype_;
+    MlxKvQuantization quantization_;
     mlx::core::array key_;
     mlx::core::array value_;
     int position_ = 0;

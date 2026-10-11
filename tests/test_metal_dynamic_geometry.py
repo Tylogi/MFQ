@@ -39,8 +39,7 @@ def test_request_lengths_do_not_enter_kernel_template_keys(filename, forbidden):
         ("ops/mlx_mx.cpp", "kMxMatmul", "x_shape[0]"),
         ("ops/mlx_mx.cpp", "kMxEmbedding", "x_shape[0]"),
         ("ops/mlx_mx.cpp", "kWeightedRmsRopeMxfp8SimSource", "cos_values_shape[0]"),
-        ("ops/mlx_fp8_sq.cpp", "kMxfp8SqMatmul", "expert_ids_shape[0]"),
-        ("ops/mlx_fp8_sq.cpp", "kFp8_128SqMatmul", "expert_ids_shape[0]"),
+        ("ops/mlx_fp8_sq.cpp", "kFp8SqMatmul", "expert_ids_shape[0]"),
         ("ops/mlx_mxfp4_sq.cpp", "kSqMatmul", "expert_ids_shape[0]"),
     ],
 )
@@ -48,6 +47,12 @@ def test_quantized_kernels_read_runtime_shapes(filename, kernel, shape):
     source = (METAL / filename).read_text()
     body = source.split(f"constexpr const char* {kernel} =", 1)[1].split(')METAL"', 1)[0]
     assert shape in body
+
+
+def test_both_fp8_sq_formats_use_the_shared_shape_driven_kernel():
+    source = (METAL / "ops/mlx_fp8_sq.cpp").read_text()
+    assert '"mfq_cpp_mxfp8_sq_matmul", kFp8SqMatmul, true' in source
+    assert '"mfq_cpp_fp8_128_sq_matmul", kFp8SqMatmul, true' in source
 
 
 def test_mfe_shared_body_has_no_custom_kernel_shape_dependencies():

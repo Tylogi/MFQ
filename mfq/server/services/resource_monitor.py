@@ -54,16 +54,27 @@ def _gpu_usage() -> list[dict[str, Any]]:
             devices.append({"name": card.name, "utilization_percent": _percent(value)})
         if devices:
             return devices
-    rows = _command(["nvidia-smi", "--query-gpu=name,utilization.gpu", "--format=csv,noheader,nounits"])
+    rows = _command(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"])
     devices = []
     for row in rows.splitlines():
-        name, _, value = row.rpartition(",")
+        columns = [value.strip() for value in row.split(",")]
+        if len(columns) not in {2, 5}:
+            continue
+        name, value = columns[:2]
         try:
             utilization = _percent(float(value.strip()))
         except ValueError:
             utilization = None
         if name.strip():
-            devices.append({"name": name.strip(), "utilization_percent": utilization})
+            device = {"name": name.strip(), "utilization_percent": utilization}
+            if len(columns) == 5:
+                for key, counter in zip(("memory_total_bytes", "memory_used_bytes", "memory_available_bytes"), columns[2:]):
+                    try:
+                        number = _number(float(counter))
+                    except ValueError:
+                        number = None
+                    device[key] = int(number * (1 << 20)) if number is not None else None
+            devices.append(device)
     if not devices:
         devices = [{"name": name, "utilization_percent": None} for name in hardware_identity().gpu_names]
     return devices
@@ -113,6 +124,14 @@ class ResourceMonitor:
             self._cpu = (total, idle)
         except (OSError, psutil.Error):
             self._cpu = None
+        memory_total = memory_used = memory_available = None
+        try:
+            memory = psutil.virtual_memory()
+            memory_total = int(memory.total)
+            memory_available = min(memory_total, max(0, int(memory.available)))
+            memory_used = memory_total - memory_available
+        except (OSError, psutil.Error):
+            pass
         disks = []
         current = {}
         try:
@@ -148,6 +167,9 @@ class ResourceMonitor:
         return {"sampled_at": time.time(), "interval_seconds": elapsed,
                 "cpu_name": hardware.cpu_name, "cpu_cores": hardware.cpu_cores,
                 "cpu_utilization_percent": cpu, "gpus": gpus, "disks": disks,
+                "memory_total_bytes": memory_total,
+                "memory_used_bytes": memory_used,
+                "memory_available_bytes": memory_available,
                 "memory_bandwidth_bytes_per_second": None,
                 "memory_bandwidth_limit_bytes_per_second": hardware.memory_bandwidth_bytes_per_second,
                 "memory_bandwidth_utilization_percent": None}
@@ -159,11 +181,13 @@ class ResourceMonitor:
         for status in statuses:
             key = str(status.get("instance_id") or status.get("model"))
             counters = {}
-            for label, field in (("experts", "ssd_expert_bytes_read"), ("ple", "ple_source_bytes_read"), ("engram", "engram_bytes_read")):
+            for label, field in (("experts", "ssd_expert_bytes_read"), ("ple", "ple_source_bytes_read"), ("engram", "engram_bytes_read"),
+                ("kv_read", "qsa_kv_ssd_read_bytes"), ("kv_write", "qsa_kv_ssd_written_bytes")):
                 value = _number(status.get(field))
                 if value is not None:
                     counters[label] = value
-                elif status.get({"experts": "ssd_expert_enabled", "ple": "ssd_ple_enabled"}.get(label, "")) == 0:
+                elif status.get({"experts": "ssd_expert_enabled", "ple": "ssd_ple_enabled",
+                    "kv_read": "qsa_kv_offload_enabled", "kv_write": "qsa_kv_offload_enabled"}.get(label, "")) == 0:
                     counters[label] = 0.0
             previous = self._weights.get(key)
             rates = {}
@@ -174,7 +198,9 @@ class ResourceMonitor:
             result.append({"instance_id": key, "model": status.get("model", key),
                            "expert_read_bytes_per_second": rates.get("experts"),
                            "ple_read_bytes_per_second": rates.get("ple"),
-                           "engram_read_bytes_per_second": rates.get("engram")})
+                           "engram_read_bytes_per_second": rates.get("engram"),
+                           "kv_read_bytes_per_second": rates.get("kv_read"),
+                           "kv_write_bytes_per_second": rates.get("kv_write")})
         self._weights = current
         return result
 
@@ -187,9 +213,8 @@ class ResourceMonitor:
                 if instance.state not in {"ready", "busy"}:
                     return None
                 try:
-                    async with asyncio.timeout(1.0):
-                        return await service.runtime_status(instance.id)
-                except (TimeoutError, RuntimeError):
+                    return await asyncio.wait_for(service.runtime_status(instance.id), timeout=1.0)
+                except (TimeoutError, asyncio.TimeoutError, RuntimeError):
                     return {"instance_id": str(instance.id), "model": instance.model}
             host, statuses = await asyncio.gather(
                 asyncio.to_thread(self._host_sample),

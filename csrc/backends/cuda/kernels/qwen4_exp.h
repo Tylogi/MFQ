@@ -7,6 +7,8 @@
 
 namespace mfq_qwen4_exp {
 using mfq_tensor_backend::Tensor;
+void fill_decode_positions(const Tensor& cache_positions, const Tensor& positions,
+    int64_t start, int64_t delta=0);
 
 Tensor grouped_rms_norm(const Tensor&, const Tensor&, int64_t group_size, double eps);
 Tensor gated_residual_bottleneck(const Tensor&, int64_t streams);
@@ -29,6 +31,10 @@ Tensor dense_gqa_attention(
     const Tensor&, const Tensor&, const Tensor&, int64_t offset);
 Tensor sparse_gqa_attention(
     const Tensor&, const Tensor&, const Tensor&, const Tensor& indices);
+Tensor sparse_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
+    const Tensor& indices, const Tensor& gate, bool half_output);
+Tensor qsa_selected_tokens(const Tensor& blocks, const Tensor& positions,
+    int64_t pool, int64_t budget);
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output);
 Tensor causal_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
     const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output);

@@ -2,7 +2,7 @@
  * MFQ Studio 页面导航定义，统一维护桌面端与浏览器端共用的路由路径。
  */
 
-export type ViewName = 'chat' | 'dashboard' | 'lab';
+export type ViewName = 'chat' | 'dashboard' | 'lab' | 'applications' | 'versions';
 export type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs' | 'settings';
 export type LabPage = 'models' | 'evaluations' | 'quantization' | 'analysis';
 
@@ -22,6 +22,8 @@ export const STUDIO_PATHS = {
   evaluations: '/evaluations',
   quantization: '/quantization',
   analysis: '/analysis',
+  applications: '/applications',
+  versions: '/versions',
   logs: '/logs',
   settings: '/settings',
 } as const;
@@ -55,6 +57,12 @@ export function isStudioPath(pathname: string): boolean {
 /** 根据当前 URL 解析 Studio 应展示的业务页面。 */
 export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);
+  if (normalizedPath === STUDIO_PATHS.versions) {
+    return { view: 'versions', dashboardPage: 'overview', labPage: 'models' };
+  }
+  if (normalizedPath === STUDIO_PATHS.applications) {
+    return { view: 'applications', dashboardPage: 'overview', labPage: 'models' };
+  }
   if (normalizedPath === STUDIO_PATHS.chat) {
     return { view: 'chat', dashboardPage: 'overview', labPage: 'models' };
   }

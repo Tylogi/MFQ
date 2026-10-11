@@ -33,7 +33,7 @@ export interface StudioRelease {
   published_at?: string | null;
   page_url: string;
   prerelease: boolean;
-  asset: StudioReleaseAsset;
+  asset: StudioReleaseAsset | null;
 }
 
 /** 本地缓存或当前运行中的 Studio 版本。 */
@@ -44,12 +44,16 @@ export interface InstalledStudioVersion {
   ready: boolean;
   byte_size: number;
   installed_at_epoch_seconds: number;
+  notes?: string;
+  prerelease?: boolean;
 }
 
 /** 桌面更新检查、缓存版本和平台能力的统一快照。 */
 export interface StudioUpdateStatus {
   current_version: string;
+  current_release: boolean;
   automatic_check: boolean;
+  automatic_download: boolean;
   checked_at_epoch_seconds?: number | null;
   update_available: boolean;
   platform_supported: boolean;
@@ -145,6 +149,10 @@ function trustedExternalUrl(value: string): string {
     'www.huggingface.co',
     'modelscope.cn',
     'www.modelscope.cn',
+    'www.deepseek.com',
+    'opencode.ai',
+    'code.claude.com',
+    'openclaw.ai',
   ]);
   if (
     parsed.protocol !== 'https:' ||
@@ -190,6 +198,12 @@ export async function setAutomaticStudioUpdates(
   const tauri = internals();
   if (!tauri) throw new Error('MFQ Studio runtime is unavailable');
   return tauri.invoke<StudioUpdateStatus>('studio_update_set_automatic', { enabled });
+}
+
+export async function setAutomaticStudioDownloads(enabled: boolean): Promise<StudioUpdateStatus> {
+  const tauri = internals();
+  if (!tauri) throw new Error('MFQ Studio runtime is unavailable');
+  return tauri.invoke<StudioUpdateStatus>('studio_update_set_download', { enabled });
 }
 
 /** 下载、校验并缓存指定 Release。 */

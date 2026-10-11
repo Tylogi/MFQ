@@ -1188,45 +1188,7 @@ struct MatrixHeader {
     std::uint32_t output_size = 0;
 };
 
-struct CanonicalVq {
-    detail::StagingVector<std::uint8_t> indices;
-    detail::StagingVector<std::uint8_t> states_packed;
-    detail::StagingVector<std::uint8_t> auxiliary;
-    detail::StagingVector<float> anchors;
-    detail::StagingVector<std::int8_t> codebooks;
-    detail::StagingVector<float> scales;
-    detail::StagingVector<std::uint8_t> state_to_codebank;
-    detail::StagingVector<std::uint8_t> bank_ids;
-    detail::StagingVector<std::int8_t> rotation_signs;
-    detail::StagingVector<float> residual_codebook;
-    detail::StagingVector<std::int16_t> residual_first;
-    detail::StagingVector<std::int16_t> residual_second;
-    float parameter = 0.0f;
-    std::string label;
-    std::vector<int> output_shape;
-    int input_size = 0;
-    int output_size = 0;
-    int group_size = 0;
-    int groups = 0;
-    int vector_size = 0;
-    int vectors = 0;
-    int index_bits = 0;
-    int state_bits = 0;
-    int states = 0;
-    int entries = 0;
-    int code_banks = 0;
-    int aux_mode = kAuxNone;
-    int code_bank_mode = kCodeBankFixed;
-    int execution_layout = kExecutionStreams;
-    int table_banks = 1;
-    int groups_per_supergroup = 0;
-    int supergroups = 1;
-    int rotation_block = 0;
-    std::uint64_t rotation_seed = 0;
-    int residual_position_bits = 0;
-    int residual_block_vectors = 0;
-    int residual_blocks_per_row = 0;
-};
+using CanonicalVq = detail::ParsedVqStorage;
 
 bool magic_is(
     const std::array<char, 4>& value,
@@ -1293,9 +1255,14 @@ detail::StagingVector<std::uint8_t> padded_stream(
     BlobCursor& cursor,
     std::size_t count,
     int bits,
-    const char* name) {
+    const char* name,
+    std::span<const std::uint8_t>* borrowed = nullptr) {
     const auto size = packed_nbytes(count, bits);
     const auto* source = cursor.view(size, name);
+    if (borrowed) {
+        *borrowed = {source, size};
+        return detail::StagingVector<std::uint8_t>(8, 0);
+    }
     detail::StagingVector<std::uint8_t> result;
     result.reserve(size + 8);
     result.insert(result.end(), source, source + size);
@@ -1327,27 +1294,7 @@ detail::StagingVector<std::uint16_t> unpack_u16_stream(
 }
 
 float half_to_float(std::uint16_t bits) {
-    const bool negative = (bits & 0x8000u) != 0;
-    const auto exponent =
-        static_cast<unsigned>((bits >> 10) & 0x1fu);
-    const auto mantissa =
-        static_cast<unsigned>(bits & 0x03ffu);
-    float value = 0.0f;
-    if (exponent == 0) {
-        value = std::ldexp(
-            static_cast<float>(mantissa),
-            -24);
-    } else if (exponent == 31) {
-        value = mantissa == 0
-            ? std::numeric_limits<float>::infinity()
-            : std::numeric_limits<float>::quiet_NaN();
-    } else {
-        value = std::ldexp(
-            1.0f
-                + static_cast<float>(mantissa) / 1024.0f,
-            static_cast<int>(exponent) - 15);
-    }
-    return negative ? -value : value;
+    return static_cast<float>(std::bit_cast<_Float16>(bits));
 }
 
 detail::StagingVector<float> read_half_values(
@@ -1687,7 +1634,7 @@ std::string expected_nvq_dtype(
 }
 
 CanonicalVq parse_nvq(
-    std::span<const std::uint8_t> blob) {
+    std::span<const std::uint8_t> blob, bool borrow_streams) {
     constexpr std::uint8_t kIndexParity = 0x80;
     constexpr std::uint8_t kCustomCodebook = 0x40;
     constexpr std::uint8_t kJsc = 0x20;
@@ -1872,6 +1819,10 @@ CanonicalVq parse_nvq(
         result.code_bank_mode = kCodeBankFixed;
     }
 
+    borrow_streams = borrow_streams && (result.execution_layout == kExecutionGroup64 ||
+        detail::vq_native_jsc(result.execution_layout, result.group_size, result.state_bits,
+            result.table_banks, result.index_bits, result.vector_size, result.input_size,
+            result.aux_mode, result.code_bank_mode));
     result.anchors = read_half_values(
         cursor,
         static_cast<std::size_t>(result.output_size),
@@ -1884,13 +1835,16 @@ CanonicalVq parse_nvq(
         const auto stream_size = checked_product(
             records, std::size_t{8}, "group64 stream size");
         const auto* stream = cursor.view(stream_size, "group64 stream");
-        result.indices.reserve(stream_size + 2);
-        result.indices.insert(result.indices.end(), stream, stream + stream_size);
+        if (borrow_streams) result.borrowed_indices = {stream, stream_size};
+        else {
+            result.indices.reserve(stream_size + 2);
+            result.indices.insert(result.indices.end(), stream, stream + stream_size);
+        }
         for (std::size_t record = 0; record < records; ++record) {
             std::uint64_t packed{};
             std::memcpy(
                 &packed,
-                result.indices.data() + record * 8,
+                stream + record * 8,
                 sizeof(packed));
             const auto group = record
                 % static_cast<std::size_t>(result.groups);
@@ -1923,7 +1877,7 @@ CanonicalVq parse_nvq(
                 static_cast<std::size_t>(result.groups),
                 "state count"),
             result.state_bits,
-            "state stream");
+            "state stream", borrow_streams ? &result.borrowed_state : nullptr);
         result.indices = padded_stream(
             cursor,
             checked_product(
@@ -1931,7 +1885,7 @@ CanonicalVq parse_nvq(
                 static_cast<std::size_t>(result.vectors),
                 "index count"),
             result.index_bits,
-            "index stream");
+            "index stream", borrow_streams ? &result.borrowed_indices : nullptr);
         const int signs =
             (result.input_size + 7) / 8;
         result.auxiliary = padded_stream(
@@ -1941,7 +1895,7 @@ CanonicalVq parse_nvq(
                 static_cast<std::size_t>(signs),
                 "sign count"),
             7,
-            "sign stream");
+            "sign stream", borrow_streams ? &result.borrowed_auxiliary : nullptr);
     }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
@@ -1952,7 +1906,7 @@ CanonicalVq parse_nvq(
 }
 
 CanonicalVq parse_nvq1_l(
-    std::span<const std::uint8_t> blob) {
+    std::span<const std::uint8_t> blob, bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("NVQ1-L magic");
     if (!magic_is(magic, "NQ1L")) {
@@ -1992,6 +1946,9 @@ CanonicalVq parse_nvq1_l(
     result.groups_per_supergroup = result.groups;
     result.supergroups = 1;
     result.parameter = 0.125f;
+    borrow_streams = borrow_streams && detail::vq_native_nvq1(result.execution_layout,
+        result.group_size, result.vector_size, result.label, result.index_bits, result.state_bits,
+        result.code_bank_mode, result.aux_mode, result.table_banks);
     result.scales.resize(
         static_cast<std::size_t>(result.states));
     for (int state = 0; state < result.states; ++state) {
@@ -2028,7 +1985,7 @@ CanonicalVq parse_nvq1_l(
         cursor,
         state_count,
         result.state_bits,
-        "NVQ1-L state stream");
+        "NVQ1-L state stream", borrow_streams ? &result.borrowed_state : nullptr);
     result.indices = padded_stream(
         cursor,
         checked_product(
@@ -2036,12 +1993,12 @@ CanonicalVq parse_nvq1_l(
             static_cast<std::size_t>(result.vectors),
             "NVQ1-L index count"),
         result.index_bits,
-        "NVQ1-L index stream");
+        "NVQ1-L index stream", borrow_streams ? &result.borrowed_indices : nullptr);
     result.auxiliary = padded_stream(
         cursor,
         state_count,
         1,
-        "NVQ1-L delta stream");
+        "NVQ1-L delta stream", borrow_streams ? &result.borrowed_auxiliary : nullptr);
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
             "invalid NVQ1-L tensor tail");
@@ -2051,7 +2008,7 @@ CanonicalVq parse_nvq1_l(
 }
 
 CanonicalVq parse_nvq1_s(
-    std::span<const std::uint8_t> blob) {
+    std::span<const std::uint8_t> blob, bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("NVQ1-S magic");
     if (!magic_is(magic, "NQ1S")) {
@@ -2122,7 +2079,7 @@ CanonicalVq parse_nvq1_s(
         cursor,
         state_count,
         4,
-        "NVQ1-S state stream");
+        "NVQ1-S state stream", borrow_streams ? &result.borrowed_state : nullptr);
     result.indices = padded_stream(
         cursor,
         checked_product(
@@ -2130,12 +2087,12 @@ CanonicalVq parse_nvq1_s(
             static_cast<std::size_t>(result.vectors),
             "NVQ1-S index count"),
         9,
-        "NVQ1-S index stream");
+        "NVQ1-S index stream", borrow_streams ? &result.borrowed_indices : nullptr);
     result.auxiliary = padded_stream(
         cursor,
         state_count,
         1,
-        "NVQ1-S delta stream");
+        "NVQ1-S delta stream", borrow_streams ? &result.borrowed_auxiliary : nullptr);
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
             "invalid NVQ1-S tensor tail");
@@ -2890,7 +2847,8 @@ VqTensorMetadata inspect_nepq_header(
 CanonicalVq parse_vq(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
-    std::span<const std::uint8_t> runtime_payload) {
+    std::span<const std::uint8_t> runtime_payload,
+    bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("VQ payload magic");
     if (dtype == mfq::kNpqDtype) {
@@ -2917,13 +2875,13 @@ CanonicalVq parse_vq(
                 "unexpected NVQ runtime metadata");
         }
         if (magic_is(magic, "NQ1L")) {
-            return parse_nvq1_l(blob);
+            return parse_nvq1_l(blob, borrow_streams);
         }
         if (magic_is(magic, "NQ1S")) {
-            return parse_nvq1_s(blob);
+            return parse_nvq1_s(blob, borrow_streams);
         }
         if (magic_is(magic, "NVQ1") || magic_is(magic, "NIQ1")) {
-            return parse_nvq(blob);
+            return parse_nvq(blob, borrow_streams);
         }
         throw std::runtime_error("invalid NVQ payload magic");
     }
@@ -3247,6 +3205,30 @@ common_templates(
 
 } // namespace
 
+detail::ParsedVqStorage detail::parse_vq_blob(std::string_view dtype,
+    std::span<const std::uint8_t> blob, std::span<const std::uint8_t> runtime_payload,
+    bool borrow_streams) {
+    return parse_vq(mfq::canonical_format_dtype(dtype), blob, runtime_payload, borrow_streams);
+}
+
+bool detail::vq_native_jsc(int layout, int group_size, int state_bits, int table_banks,
+    int index_bits, int vector_size, int input_size, int aux_mode, int bank_mode) noexcept {
+    return layout == 0 && group_size == 24 && state_bits == 4 && table_banks == 1
+        && ((index_bits == 8 && (vector_size == 4 || vector_size == 8)
+                && input_size % vector_size == 0 && (aux_mode == 1 || aux_mode == 2) && bank_mode != 2)
+            || (((vector_size == 4 && (index_bits == 9 || index_bits == 10))
+                    || (vector_size == 8 && (index_bits == 10 || index_bits == 12)))
+                && aux_mode == 1 && bank_mode == 1));
+}
+
+bool detail::vq_native_nvq1(int layout, int group_size, int vector_size, std::string_view label,
+    int index_bits, int state_bits, int bank_mode, int aux_mode, int table_banks) noexcept {
+    return layout == 0 && group_size == 24 && vector_size == 8
+        && ((label == "NVQ1-S" && index_bits == 9 && state_bits == 4 && bank_mode == 2)
+            || (label == "NVQ1-L" && index_bits == 11 && state_bits == 3 && bank_mode == 0))
+        && aux_mode == 3 && table_banks == 1;
+}
+
 std::string_view detail::vq_gemv_metal_header() noexcept {
     return kBitstreamHeader;
 }
@@ -3364,10 +3346,7 @@ MlxVqWeight MlxVqWeight::from_blob(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
-    auto parsed = parse_vq(
-        mfq::canonical_format_dtype(dtype),
-        blob,
-        runtime_payload);
+    auto parsed = detail::parse_vq_blob(dtype, blob, runtime_payload);
     auto rotations = parsed.rotation_signs;
     if (rotations.empty()) {
         rotations.push_back(1);

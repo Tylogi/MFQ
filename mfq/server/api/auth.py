@@ -73,7 +73,7 @@ class ApiKeyManager:
 def required_scope(method: str, path: str) -> ApiKeyScope:
     if path.startswith("/api/v1/runtime/cache/entries") or path == "/api/v1/runtime/cache/purge":
         return "admin"
-    if path in {"/api/v1/runtime/listener", "/api/v1/runtime/memory-policy", "/api/v1/runtime/model-aliases"} and method != "GET":
+    if path in {"/api/v1/runtime/listener", "/api/v1/runtime/memory-policy", "/api/v1/runtime/model-aliases", "/api/v1/runtime/context-policy"} and method != "GET":
         return "admin"
     if path.startswith("/api/v1/auth/"):
         return "admin"
@@ -87,6 +87,4 @@ def required_scope(method: str, path: str) -> ApiKeyScope:
         ("/api/v1/jobs", "/api/v1/artifacts", "/api/v1/datasets", "/api/v1/evaluations", "/api/v1/quantization")
     ):
         return "jobs"
-    if path.startswith("/api/v1/mcp/") and method != "GET":
-        return "admin"
     return "inference"

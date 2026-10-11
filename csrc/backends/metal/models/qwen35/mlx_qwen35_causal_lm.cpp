@@ -329,16 +329,19 @@ void MlxQwen35MtpModule::restore_cache(const std::vector<MlxKvCacheSnapshot>& st
 }
 
 MlxQwen35CausalLm MlxQwen35CausalLm::load(
-    const MfqContainer& model) {
+    const MfqContainer& model, int requested_context) {
     const auto graph = effective_model_graph(model);
     if (graph.graph_kind != "causal_lm" || graph.backbone != "qwen3_5" ||
         !graph.has_component("text")) {
         throw std::runtime_error(
             "model graph does not describe a Qwen3.5 causal runtime");
     }
-    const auto config = adapt_qwen35_config_for_storage(
+    auto config = adapt_qwen35_config_for_storage(
         Qwen35Config::from_mfq(model),
         model.legacy_tensor_layout().qwen_gdn_gguf_layout);
+    if (requested_context == 0) requested_context = static_cast<int>(config.max_position_embeddings);
+    config.yarn = qwen_yarn_scaling(config.yarn, config.max_position_embeddings, requested_context, config.yarn_max_factor);
+    config.max_position_embeddings = requested_context;
     auto runtime = load(model, config, Qwen35TensorNames::canonical());
     const bool predictor_declared = graph.has_component("predictor");
     if (predictor_declared != runtime.mtp_.has_value()) {

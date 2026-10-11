@@ -1,4 +1,5 @@
 #include "qwen4_ops.h"
+#include "mlx_nint_metadata.h"
 #include "mlx_kernel_prepare.h"
 
 #include "mlx_transformer.h"
@@ -116,7 +117,7 @@ private:
     int dimension_;
 };
 
-constexpr const char* kGatedHcWeightHeader = R"METAL(
+const std::string kGatedHcWeightHeader = std::string(detail::kNintMetadataSource) + R"METAL(
 inline uint mfq_hc_load_u32(device const uchar* stream, uint byte) {
     const packed_uchar4 values =
         *reinterpret_cast<device const packed_uchar4*>(stream + byte);
@@ -170,15 +171,18 @@ inline void mfq_hc_dot_groups(
     uint row_base, uint begin, uint end, uint first_group, uint group_stride,
     Input input, uint input_origin, thread float* accumulators) {
     uint bits[NR], offsets[NR], shifts[NR];
+    uint sub_offsets[NR], sub_shifts[NR], sub_bits[NR];
     float neuron_scales[NR], neuron_minima[NR];
     for (uint row = 0u; row < uint(NR); ++row) {
-        const uint base = (row_base + row) * 4u;
-        const uint layout = rows[base];
-        bits[row] = layout & 15u;
-        shifts[row] = layout >> 4u;
-        offsets[row] = rows[base + 1u];
-        neuron_scales[row] = as_type<float>(rows[base + 2u]);
-        neuron_minima[row] = as_type<float>(rows[base + 3u]);
+        const MfqNintRow metadata = mfq_nint_row(rows, row_base + row);
+        bits[row] = metadata.q_bits;
+        shifts[row] = metadata.q_shift;
+        offsets[row] = metadata.q_offset;
+        sub_offsets[row] = metadata.sub_offset;
+        sub_shifts[row] = metadata.sub_shift;
+        sub_bits[row] = metadata.sub_bits;
+        neuron_scales[row] = metadata.scale;
+        neuron_minima[row] = metadata.minimum;
     }
     for (uint group = first_group; group * uint(GS) < end; group += group_stride) {
         uint column = max(begin, group * uint(GS));
@@ -228,9 +232,10 @@ inline void mfq_hc_dot_groups(
             }
         }
         for (uint row = 0u; row < uint(NR); ++row) {
-            const uint index = (row_base + row) * uint(NG) + group;
-            const float scale = neuron_scales[row] * float(scales[index]);
-            const float minimum = neuron_minima[row] * float(minima[index]);
+            const float scale = neuron_scales[row] * float(mfq_nint_sub_value(
+                scales, sub_offsets[row], sub_shifts[row], sub_bits[row], group));
+            const float minimum = neuron_minima[row] * float(mfq_nint_sub_value(
+                minima, sub_offsets[row], sub_shifts[row], sub_bits[row], group));
             accumulators[row] = fma(scale, quantized_dots[row],
                 fma(-minimum, activation_sum, accumulators[row]));
         }

@@ -41,7 +41,7 @@ from mfq.server.runtime.host_memory import (
     metal_recommended_working_set_size,
     total_physical_memory,
 )
-from mfq.server.services.hardware import hardware_identity
+from mfq.server.services.hardware import hardware_identity, memory_topology
 from mfq.server.services.hub_metadata import estimated_resident_weight_bytes, read_mfq_metadata
 from mfq.server.services.model_parameters import parameter_breakdown
 from mfq.server.services.model_memory import cache_profile
@@ -113,7 +113,7 @@ def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(_METADATA_TIMEOUT, connect=4.0),
         follow_redirects=True, trust_env=False, verify=verify,
-        transport=_DirectFirstTransport(proxy, verify) if proxy else None, **kwargs,
+        proxy=proxy, **kwargs,
     )
 
 
@@ -286,6 +286,8 @@ def system_profile(
     hardware = hardware_identity()
     snapshot = host_memory_snapshot()
     physical = snapshot.total if snapshot is not None else total_physical_memory() or hardware.physical_memory_bytes
+    if physical is None:
+        physical = memory_topology()['host_memory_total_bytes']
     available = snapshot.reclaimable(active_ratio=0.35) if snapshot is not None else None
     if backend == "metal":
         recommended = metal_recommended_working_set_size()
@@ -505,6 +507,10 @@ def _model_variants(
         estimated = sum(estimated_resident_weight_bytes(
             item.weight_bytes or 0, item.weight_bytes_by_dtype,
         ) for item in group) if inspected else estimated_resident_weight_bytes(size, {})
+        roles = {role: sum(item.estimated_weight_bytes_by_role[role] for item in group)
+                 for role in ('dense', 'experts', 'embedding')} if all(
+            all(role in item.estimated_weight_bytes_by_role for role in ('dense', 'experts', 'embedding'))
+            for item in group) else {}
         configuration = _configuration_status(
             estimated, profile, supported=runtime_compatible,
             unsupported_reason="This model architecture is not registered in MFQ.",
@@ -520,6 +526,7 @@ def _model_variants(
                     byte_size=size,
                     resident_weight_bytes=weights,
                     estimated_resident_weight_bytes=estimated,
+                    estimated_weight_bytes_by_role=roles,
                     ssd_ple_bytes=ple,
                     configuration=configuration,
                 )
@@ -715,14 +722,15 @@ class HubCatalog:
         self, provider: HubProvider, repo_id: str, revision: str | None,
         profile: HubSystemProfile,
     ) -> HubModelInfo:
+        async def fetch() -> HubModelInfo:
+            if provider == "huggingface":
+                info = await self._info_huggingface(repo_id, revision, profile)
+            else:
+                info = await self._info_modelscope(repo_id, revision, profile)
+            return await self._inspect_mfq_files(info, profile)
         try:
-            async with asyncio.timeout(_METADATA_DEADLINE):
-                if provider == "huggingface":
-                    info = await self._info_huggingface(repo_id, revision, profile)
-                else:
-                    info = await self._info_modelscope(repo_id, revision, profile)
-                return await self._inspect_mfq_files(info, profile)
-        except TimeoutError as error:
+            return await asyncio.wait_for(fetch(), timeout=_METADATA_DEADLINE)
+        except asyncio.TimeoutError as error:
             raise HubError("Model repository metadata request timed out.") from error
 
     @staticmethod
@@ -745,7 +753,8 @@ class HubCatalog:
                     async with semaphore:
                         metadata = await read_mfq_metadata(client, url, params, item.byte_size)
                     files[index] = item.model_copy(update={'weight_bytes': metadata.weight_bytes,
-                        'weight_bytes_by_dtype': metadata.weight_bytes_by_dtype, 'ssd_ple_bytes': metadata.ssd_ple_bytes})
+                        'weight_bytes_by_dtype': metadata.weight_bytes_by_dtype, 'ssd_ple_bytes': metadata.ssd_ple_bytes,
+                        'estimated_weight_bytes_by_role': metadata.estimated_weight_bytes_by_role})
                     if metadata.config:
                         configs.append(metadata.config)
                     if metadata.architecture:
@@ -755,9 +764,8 @@ class HubCatalog:
                 except (httpx.HTTPError, ValueError, UnicodeError):
                     pass
             try:
-                async with asyncio.timeout(6):
-                    await asyncio.gather(*(inspect(index, item) for index, item in candidates[:256]))
-            except TimeoutError:
+                await asyncio.wait_for(asyncio.gather(*(inspect(index, item) for index, item in candidates[:256])), timeout=6)
+            except asyncio.TimeoutError:
                 pass
         config = configs[0] if configs else {}
         text = config.get('text_config', config)
@@ -837,9 +845,8 @@ class HubCatalog:
 
         async def discover(provider: HubProvider) -> None:
             try:
-                async with asyncio.timeout(_METADATA_DEADLINE):
-                    repos = await self._discover_official(provider)
-            except (HubError, TimeoutError):
+                repos = await asyncio.wait_for(self._discover_official(provider), timeout=_METADATA_DEADLINE)
+            except (HubError, asyncio.TimeoutError):
                 return
             additions = {(provider, repo) for repo in repos if self._is_official_repo(repo)} - sources
             self._discovered_sources.update(additions)
@@ -1130,14 +1137,18 @@ class HubCatalog:
         repo_id: str, revision: str | None, profile: HubSystemProfile
     ) -> HubModelInfo:
         try:
-            from modelscope_hub.config import get_default_config
-
-            config = get_default_config()
-            endpoint = str(config.endpoint).rstrip("/")
-            headers = {"Authorization": f"Bearer {config.token}"} if config.token else {}
+            try:
+                from modelscope_hub.config import get_default_config
+            except ImportError:
+                endpoint = os.environ.get('MODELSCOPE_ENDPOINT', 'https://modelscope.cn').rstrip('/')
+                token = os.environ.get('MODELSCOPE_API_TOKEN') or os.environ.get('MODELSCOPE_TOKEN')
+            else:
+                config = get_default_config()
+                endpoint, token = str(config.endpoint).rstrip('/'), config.token
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
             cookies = httpx.Cookies()
-            if config.token:
-                cookies.set("m_session_id", config.token, domain=urlparse(endpoint).hostname)
+            if token:
+                cookies.set("m_session_id", token, domain=urlparse(endpoint).hostname)
             async with _metadata_client(endpoint, headers=headers, cookies=cookies) as client:
                 async def metadata() -> dict[str, Any]:
                     response = await client.get(f"{endpoint}/openapi/v1/models/{repo_id}")
@@ -1163,10 +1174,14 @@ class HubCatalog:
                         data = data.get("Files", data.get("files", []))
                     return data
 
-                async with asyncio.TaskGroup() as group:
-                    model_task = group.create_task(metadata())
-                    entries_task = group.create_task(listing())
-                model, entries = model_task.result(), entries_task.result()
+                tasks = [asyncio.create_task(metadata()), asyncio.create_task(listing())]
+                try:
+                    model, entries = await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
             files = [
                 HubModelFile(
                     name=item.get("Path") or item.get("path") or item.get("Name") or "",

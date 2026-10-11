@@ -125,13 +125,7 @@ export function useModelCatalog() {
       }
     }
   }, [jobs]);
-  const filteredInstances = useMemo(
-    () =>
-      instances.filter((item) =>
-        item.model.toLowerCase().includes(modelFilter.trim().toLowerCase()),
-      ),
-    [instances, modelFilter],
-  );
+  const filteredInstances = instances;
   const filteredArtifacts = useMemo(
     () =>
       artifacts.filter((item) =>

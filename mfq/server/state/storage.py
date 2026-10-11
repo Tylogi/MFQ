@@ -24,7 +24,6 @@ from mfq.server.protocol.models import (
     CreateApiKeyRequest,
     CreateDatasetRequest,
     CreateGenerationPresetRequest,
-    CreateMcpServerRequest,
     CreateRemoteNodeRequest,
     CreateRuntimeProfileRequest,
     CreateSessionRequest,
@@ -40,8 +39,6 @@ from mfq.server.protocol.models import (
     JobEventType,
     JobResource,
     JobStatus,
-    McpServerResource,
-    McpTransport,
     MediaRef,
     MediaResource,
     Message,
@@ -68,7 +65,7 @@ from mfq.server.protocol.models import (
     UpdateSessionRequest,
 )
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
 _MAX_RUNTIME_METRICS = 20_000
 
@@ -280,23 +277,13 @@ class SessionStore:
                     created_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS mcp_servers (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    transport TEXT NOT NULL,
-                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-                    config_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS generation_presets (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,
                     model TEXT,
                     mode TEXT,
                     settings_json TEXT NOT NULL,
-                    context_size INTEGER NOT NULL CHECK (context_size >= 512),
+                    context_size INTEGER CHECK (context_size >= 512),
                     metadata_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -453,8 +440,9 @@ class SessionStore:
                     (str(SCHEMA_VERSION),),
                 )
             elif int(existing["value"]) in {
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
             }:
+                connection.execute("BEGIN")
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(responses)")
                 }
@@ -484,6 +472,22 @@ class SessionStore:
                     connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
                 if "progress_data_json" not in job_columns:
                     connection.execute("ALTER TABLE jobs ADD COLUMN progress_data_json TEXT NOT NULL DEFAULT '{}'")
+                connection.execute("""
+                    CREATE TABLE generation_presets_nullable (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                        model TEXT, mode TEXT, settings_json TEXT NOT NULL,
+                        context_size INTEGER CHECK (context_size >= 512),
+                        metadata_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                connection.execute("""
+                    INSERT INTO generation_presets_nullable
+                    SELECT id, name, model, mode, settings_json, context_size,
+                        metadata_json, created_at, updated_at FROM generation_presets
+                """)
+                connection.execute("DROP TABLE generation_presets")
+                connection.execute("ALTER TABLE generation_presets_nullable RENAME TO generation_presets")
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -651,80 +655,6 @@ class SessionStore:
             extractor=row["extractor"],
             created_at=datetime.fromisoformat(row["created_at"]),
         )
-
-    def create_mcp_server(
-        self,
-        request: CreateMcpServerRequest,
-        *,
-        server_id: UUID | None = None,
-        now: datetime | None = None,
-    ) -> McpServerResource:
-        identifier = server_id or uuid4()
-        created_at = now or _utcnow()
-        config = request.model_dump(mode="json", exclude={"name", "transport", "enabled"})
-        try:
-            with self._connection() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO mcp_servers(
-                        id, name, transport, enabled, config_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(identifier),
-                        request.name,
-                        request.transport.value,
-                        int(request.enabled),
-                        json.dumps(config, separators=(",", ":"), sort_keys=True),
-                        _timestamp(created_at),
-                        _timestamp(created_at),
-                    ),
-                )
-        except sqlite3.IntegrityError as error:
-            raise StorageError(f"MCP server already exists: {request.name}") from error
-        return self.get_mcp_server(identifier)
-
-    def get_mcp_server(self, server_id: UUID) -> McpServerResource:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM mcp_servers WHERE id = ?", (str(server_id),)
-            ).fetchone()
-        if row is None:
-            raise MediaNotFoundError(f"MCP server was not found: {server_id}")
-        return self._mcp_server_from_row(row)
-
-    def list_mcp_servers(self, *, enabled_only: bool = False) -> list[McpServerResource]:
-        query = "SELECT * FROM mcp_servers"
-        values: tuple[object, ...] = ()
-        if enabled_only:
-            query += " WHERE enabled = ?"
-            values = (1,)
-        query += " ORDER BY name"
-        with self._connection() as connection:
-            rows = connection.execute(query, values).fetchall()
-        return [self._mcp_server_from_row(row) for row in rows]
-
-    def set_mcp_server_enabled(
-        self,
-        server_id: UUID,
-        enabled: bool,
-        *,
-        now: datetime | None = None,
-    ) -> McpServerResource:
-        with self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE mcp_servers SET enabled = ?, updated_at = ? WHERE id = ?",
-                (int(enabled), _timestamp(now or _utcnow()), str(server_id)),
-            )
-        if cursor.rowcount != 1:
-            raise MediaNotFoundError(f"MCP server was not found: {server_id}")
-        return self.get_mcp_server(server_id)
-
-    def delete_mcp_server(self, server_id: UUID) -> None:
-        with self._connection() as connection:
-            cursor = connection.execute("DELETE FROM mcp_servers WHERE id = ?", (str(server_id),))
-        if cursor.rowcount != 1:
-            raise MediaNotFoundError(f"MCP server was not found: {server_id}")
 
     def create_generation_preset(
         self,
@@ -2174,6 +2104,15 @@ class SessionStore:
             row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_memory_policy'").fetchone()
         return json.loads(row["value"]) if row else {}
 
+    def runtime_context_policy(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_context_policy'").fetchone()
+        return json.loads(row["value"]) if row else {}
+
+    def save_runtime_context_policy(self, policy: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES ('runtime_context_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(policy),))
+
     def runtime_model_aliases(self) -> dict[str, str]:
         with self._connection() as connection:
             row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_model_aliases'").fetchone()
@@ -2705,23 +2644,6 @@ class SessionStore:
         )
 
     @staticmethod
-    def _mcp_server_from_row(row: sqlite3.Row) -> McpServerResource:
-        config = json.loads(row["config_json"])
-        return McpServerResource(
-            id=UUID(row["id"]),
-            name=row["name"],
-            transport=McpTransport(row["transport"]),
-            enabled=bool(row["enabled"]),
-            url=config.get("url"),
-            command=config.get("command"),
-            args=config.get("args") or [],
-            header_env=config.get("header_env") or {},
-            timeout_seconds=float(config.get("timeout_seconds", 30.0)),
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
-
-    @staticmethod
     def _generation_preset_from_row(row: sqlite3.Row) -> GenerationPresetResource:
         return GenerationPresetResource(
             id=UUID(row["id"]),
@@ -2729,7 +2651,7 @@ class SessionStore:
             model=row["model"],
             mode=SessionMode(row["mode"]) if row["mode"] else None,
             settings=ResponseRequestSettings.model_validate_json(row["settings_json"]),
-            context_size=int(row["context_size"]),
+            context_size=int(row["context_size"]) if row["context_size"] is not None else None,
             metadata=json.loads(row["metadata_json"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),

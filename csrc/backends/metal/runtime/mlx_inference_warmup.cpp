@@ -26,7 +26,7 @@ void warm_mlx_inference(const std::vector<std::int64_t>& prompt,
     if (prompt.empty() || context < 1 || chunk_size < 1)
         throw std::invalid_argument("invalid inference warmup configuration");
     const auto started = std::chrono::steady_clock::now();
-    const int rows = std::min({32, static_cast<int>(prompt.size()), std::max(1, context - 8)});
+    const int rows = std::min({32, chunk_size, static_cast<int>(prompt.size()), std::max(1, context - 8)});
     const std::vector<std::int64_t> short_prompt(prompt.begin(), prompt.begin() + rows);
     const int limit = std::min(8, context - rows + 1);
     const int depth = mtp ? std::max(0, std::min(5, limit - 2)) : 0;

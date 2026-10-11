@@ -170,6 +170,29 @@ def test_stdio_cache_budget_supports_independent_disk_limit() -> None:
     asyncio.run(run())
 
 
+def test_stdio_runtime_client_cancels_timed_out_control_request() -> None:
+    async def run() -> None:
+        requests: list[dict[str, Any]] = []
+
+        def handler(request: dict[str, Any]) -> list[dict[str, Any]]:
+            requests.append(request)
+            return []
+
+        client = _client(handler, control_timeout_seconds=0.01)
+        try:
+            with pytest.raises(BackendError) as raised:
+                await client.health()
+            assert raised.value.code == "backend_timeout"
+            assert raised.value.retryable
+            assert requests[-1]["op"] == "request.cancel"
+            assert requests[-1]["params"]["target_id"] == requests[0]["id"]
+            assert not client._pending
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_stdio_runtime_client_fails_pending_requests_on_eof() -> None:
     async def run() -> None:
         client = _client(lambda _request: [])

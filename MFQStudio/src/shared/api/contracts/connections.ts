@@ -15,34 +15,3 @@ export interface RemoteNode {
   created_at: string;
   updated_at: string;
 }
-
-export interface McpServerResource {
-  id: string;
-  name: string;
-  transport: 'stdio' | 'streamable_http';
-  enabled: boolean;
-  url?: string | null;
-  command?: string | null;
-  args: string[];
-  header_env: Record<string, string>;
-  timeout_seconds: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface McpToolResource {
-  server_id: string;
-  server: string;
-  name: string;
-  qualified_name: string;
-  description?: string | null;
-  input_schema: Record<string, unknown>;
-}
-
-export interface McpToolCallResult {
-  server: string;
-  name: string;
-  content: Array<Record<string, unknown>>;
-  structured_content?: Record<string, unknown> | null;
-  is_error: boolean;
-}

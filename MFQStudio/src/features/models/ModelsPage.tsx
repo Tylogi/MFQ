@@ -10,7 +10,7 @@ import { formatBytes } from '../../app/formatters';
 export function ModelsPage() {
   const catalog = useModelCatalog();
   const { tr } = useSettings();
-  const { artifacts, busy, availableModelNames, modelFilter, setModelFilter,
+  const { artifacts, busy, availableModelNames,
     openStudioPage, chooseModelDirectory, modelFolderPath } = catalog;
   const totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.total_bytes, 0);
   return (
@@ -60,13 +60,6 @@ export function ModelsPage() {
           <h2>{tr('模型资产', 'Model assets')}</h2>
           <span>{tr('管理本地资产与已载入模型', 'Manage local assets and loaded models')}</span>
         </div>
-        <label>
-          <span aria-hidden="true">/</span>
-          <input aria-label={tr('筛选模型', 'Filter models')}
-            onChange={(event) => setModelFilter(event.target.value)}
-            placeholder={tr('按名称筛选', 'Filter by name')}
-            value={modelFilter} />
-        </label>
       </div>
       <LoadedModels catalog={catalog} />
       <ModelLoadPolicy catalog={catalog} />

@@ -35,7 +35,7 @@ export function parameterLabel(value: number): string {
 
 export function precisionColor(value: number, min: number, max: number): string {
   const amount = Math.max(0, Math.min(1, (value - min) / (max - min || 1)));
-  const low = [224, 236, 251], high = [27, 75, 144];
+  const low = [245, 234, 216], high = [126, 70, 29];
   return `rgb(${low.map((channel, index) => Math.round(channel + (high[index] - channel) * amount)).join(',')})`;
 }
 

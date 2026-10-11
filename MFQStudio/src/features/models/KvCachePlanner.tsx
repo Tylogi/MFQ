@@ -41,7 +41,7 @@ export function plannedConfiguration(variants: HubModelVariant[], fallback: Mode
 }
 
 function CacheRows({ items, depth = 0, tr }: { items: CacheBreakdown[]; depth?: number; tr: Translate }) {
-  return items.map(item => <Fragment key={item.id}><tr className={depth === 0 ? 'kv-cache-group-row' : undefined}>
+  return items.filter(item => item.name !== 'indexer_tail').map(item => <Fragment key={item.id}><tr className={depth === 0 ? 'kv-cache-group-row' : undefined}>
     <th scope="row" style={{ paddingLeft: `${12 + depth * 16}px` }}>{depth === 0 ? `${item.name} ${tr('总缓存', 'total cache')}` : cacheComponentLabel(item, tr)}
       {depth === 0 && item.layers != null && <small>{item.layers} {tr('层', 'layers')}</small>}</th>
     <td>{memoryLabel(item.usage)}</td><td>{memoryLabel(item.budget)}</td>
@@ -70,7 +70,8 @@ export function KvCachePlanner({ profile: sourceProfile, appliedContext, onApply
   if (ticks[ticks.length - 1] !== end) ticks.push(end);
   const groups = profile && valid ? cacheBreakdown(profile, context) : [];
   const selected = groups.find(item => item.id === selectedGroup) ?? (groups.length === 1 ? groups[0] : null);
-  const children = selected ? selected.children.length > 1 ? selected.children : [] : groups;
+  const children = (selected ? selected.children.length > 1 ? selected.children : [] : groups)
+    .filter(item => item.name !== 'indexer_tail');
   const colors = ['var(--accent)', '#b56b79', '#498875', '#a58745', '#8272ad'];
   const curves = [{ id: 'total', label: tr('总缓存', 'Total cache'), color: colors[0] }, ...children.map((item, index) => ({ id: item.id,
     label: selected ? cacheComponentLabel(item, tr) : item.name, color: colors[(index % (colors.length - 1)) + 1] }))];
@@ -78,7 +79,8 @@ export function KvCachePlanner({ profile: sourceProfile, appliedContext, onApply
     if (!profile) return [];
     const values = cacheBreakdown(profile, tokens);
     const group = selected ? values.find(item => item.id === selected.id) : null;
-    const items = group ? group.children.length > 1 ? group.children : [] : values;
+    const items = (group ? group.children.length > 1 ? group.children : [] : values)
+      .filter(item => item.name !== 'indexer_tail');
     return [group?.usage ?? cacheUsageBytes(profile, tokens), ...items.map(item => item.usage)];
   }
   const samples = profile ? Array.from({ length: 129 }, (_, index) => {

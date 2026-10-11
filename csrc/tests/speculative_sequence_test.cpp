@@ -160,10 +160,61 @@ void run(bool dspark) {
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
 }
+
+void run_target_initialization() {
+    struct InitializingOps : Ops {
+        int* observations;
+        bool take_target_maintenance() { ++*observations;return true; }
+    };
+    Model model;Predictor mtp;int observations=0;
+    InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=32;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"mtp-initialization-test");
+    auto generation=speculative_sequence(InitializingOps{{model,mtp},&observations},request,output,512,0,Tensor{},nullptr);
+    std::vector<int64_t> tokens;
+    while(auto step=generation.next())if(step.value)
+        if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+            tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+    if(tokens!=std::vector<int64_t>(32,0) || model.cache_pos!=34 || observations==0)
+        throw std::runtime_error("target initialization changed token/cache boundaries");
+    for(double ms:output.metrics.mtp.measured_depth_ms)if(ms!=0)
+        throw std::runtime_error("target initialization entered steady MTP timing");
+}
+
+void run_batched_greedy(bool penalties) {
+    struct BatchedOps : Ops {
+        int* batches;
+        bool use_penalties;
+        void initialize(const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling) {
+            Ops::initialize(prompt, sampling);
+            this->penalties = use_penalties;
+        }
+        std::vector<int32_t> greedy_tokens(Tensor logits) {
+            ++*batches;
+            return std::vector<int32_t>(size(logits, 0), 0);
+        }
+    };
+    Model model; Predictor mtp; mtp.legacy = true; int batches = 0;
+    InferenceRequest request; request.chat = false; request.prompt = {0, 0, 0};
+    request.sampling.max_tokens = 32; request.sampling.mtp_max_draft_tokens = 3;
+    InferenceOutput output(request, nullptr, "mtp-batched-greedy-test");
+    auto generation = speculative_sequence(BatchedOps{{model, mtp}, &batches, penalties},
+        request, output, 512, 0, Tensor{}, nullptr);
+    std::vector<int64_t> tokens;
+    while (auto step = generation.next()) if (step.value)
+        if (const auto* delta = std::get_if<TokenOutput>(&*step.value))
+            tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+    if (tokens != std::vector<int64_t>(32, 0) || model.cache_pos != 34 ||
+        (penalties ? batches != 0 : batches == 0))
+        throw std::runtime_error("batched greedy sampling changed rejection/cache/penalty behavior");
+}
 }
 
 int main() {
     run(false);
     run(true);
+    run_target_initialization();
+    run_batched_greedy(false);
+    run_batched_greedy(true);
     std::cout << "shared speculative sequence output/cache/dispatch tests passed\n";
 }

@@ -17,7 +17,8 @@ class HfSafetensorsSource final : public ModelSource {
 public:
     explicit HfSafetensorsSource(
         std::filesystem::path root,
-        std::unordered_map<std::string, std::string> canonical_to_source = {});
+        std::unordered_map<std::string, std::string> canonical_to_source = {},
+        std::string source_prefix = {});
     ~HfSafetensorsSource() override;
 
     HfSafetensorsSource(HfSafetensorsSource&&) noexcept;

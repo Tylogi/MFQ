@@ -1,4 +1,21 @@
+import re
+
 from mfq.formats.compat import canonical_dtype
+
+
+def weight_role(name: str) -> str:
+    if re.search(r'\.mlp\.experts\.(?:\d+\.)?(?:gate|up|down|gate_up)(?:_proj)?\.(?:weight|weight_scale)$', name) or any(
+        marker in name for marker in ('.ffn_gate_exps.', '.ffn_up_exps.', '.ffn_gate_up_exps.', '.ffn_down_exps.')
+    ):
+        return 'experts'
+    if name.startswith(('model.token_embedding.', 'token_embd.')) or '.embed_tokens.' in name or name == 'embed_tokens.weight':
+        return 'embedding'
+    return 'dense'
+
+
+def estimated_weight_roles(by_role: dict[str, dict[str, int]]) -> dict[str, int]:
+    return {role: estimated_resident_weight_bytes(sum(dtypes.values()), dtypes)
+            for role, dtypes in by_role.items()}
 
 
 def estimated_resident_weight_bytes(

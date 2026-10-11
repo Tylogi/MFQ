@@ -12,7 +12,7 @@ namespace mfq {
 // model loaders do not branch on checkpoint format.
 class HfModelSource final : public ModelSource {
 public:
-    explicit HfModelSource(std::filesystem::path root);
+    explicit HfModelSource(std::filesystem::path root, std::string source_prefix = {});
     ~HfModelSource() override;
 
     HfModelSource(HfModelSource&&) noexcept;

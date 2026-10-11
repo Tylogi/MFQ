@@ -1134,6 +1134,32 @@ array glu_split(
 
 } // namespace
 
+std::optional<array> moe_route_groups_host(
+    std::span<const std::int32_t> ids, int tokens, int routes) {
+    if (tokens < 1 || routes < 1 || routes > kMaximumRoutes
+        || ids.size() != static_cast<std::size_t>(tokens) * routes)
+        throw std::invalid_argument("host MoE routes have invalid geometry");
+    if (tokens == 1 || tokens > 6) return std::nullopt;
+    std::vector<std::int32_t> groups(ids.size() * 8, -1);
+    std::vector<std::int32_t> matches;
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        if (groups[index * 8 + 1] != -1) continue;
+        matches.clear();
+        for (std::size_t other = index; other < ids.size(); ++other)
+            if (ids[other] == ids[index]) matches.push_back(static_cast<std::int32_t>(other));
+        for (std::size_t begin = 0; begin < matches.size(); begin += 6) {
+            const auto count = std::min<std::size_t>(6, matches.size() - begin);
+            for (std::size_t member = 0; member < count; ++member) {
+                auto* group = groups.data() + matches[begin + member] * 8;
+                group[0] = ids[index];
+                group[1] = static_cast<std::int32_t>(count);
+                std::copy_n(matches.begin() + begin, count, group + 2);
+            }
+        }
+    }
+    return array(groups.begin(), Shape{tokens, routes, 8});
+}
+
 MlxMoeTopKResult moe_topk(
     const array& logits,
     int top_k,

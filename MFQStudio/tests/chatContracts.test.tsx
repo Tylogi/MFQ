@@ -9,7 +9,6 @@ import { useConversationStore } from '../src/features/chat/state/conversationSto
 import { GenerationController } from '../src/features/chat/state/generationController';
 import { DEFAULT_SETTINGS } from '../src/features/settings/configuration';
 import { sessionsApi } from '../src/shared/api/resources/sessions';
-import { connectionsApi } from '../src/shared/api/resources/connections';
 import { mediaApi } from '../src/shared/api/resources/media';
 import type { Message, Session, StreamRequest, ResponseResource } from '../src/shared/api/types';
 
@@ -55,7 +54,6 @@ beforeEach(() => {
   vi.spyOn(sessionsApi, 'listSessions').mockResolvedValue([session]);
   vi.spyOn(sessionsApi, 'listMessages').mockResolvedValue([previous]);
   vi.spyOn(sessionsApi, 'listResponses').mockResolvedValue([]);
-  vi.spyOn(connectionsApi, 'mcpTools').mockResolvedValue({ data: [], errors: {} });
 });
 
 it('运行时未就绪时不加载会话或发送，就绪并加载历史后才开放输入', async () => {

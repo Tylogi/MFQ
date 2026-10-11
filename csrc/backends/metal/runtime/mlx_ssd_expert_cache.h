@@ -26,6 +26,7 @@ struct MlxSsdExpertCacheStats {
     std::uint64_t coalesced = 0;
     std::uint64_t evictions = 0;
     std::uint64_t loads = 0;
+    std::uint64_t packed_reuses = 0;
     std::uint64_t failures = 0;
     std::uint64_t bytes_read = 0;
     std::uint64_t read_calls = 0;

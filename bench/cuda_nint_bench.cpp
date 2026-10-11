@@ -12,10 +12,11 @@
 namespace {
 using namespace mfq::cuda;
 void select(bool enabled) {
+    const char* key="MFQ_NINT_SINGLE_ROW";
 #ifdef _WIN32
-    _putenv_s("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0");
+    _putenv_s(key,enabled ? "1" : "0");
 #else
-    setenv("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0",1);
+    setenv(key,enabled ? "1" : "0",1);
 #endif
 }
 void exact(const Tensor& output,const Tensor& reference) {
@@ -52,7 +53,9 @@ struct Weight {
         qx=empty({1,k},options.dtype(kInt8));xscale=empty({1,groups},options.dtype(kFloat32));
         bytes=payload.size()+off.size()*8+std::size_t(rows)+s.size()+mn.size()+(ns.size()+nm.size())*4;
     }
-    Tensor run() {return nint_matmul_ws_cuda(q,bits,offsets,scale,minimum,outer,outer_min,x,gs,qx,xscale);}
+    Tensor run() {
+        return nint_matmul_ws_cuda(q,bits,offsets,scale,minimum,outer,outer_min,x,gs,qx,xscale);
+    }
 };
 class Replay {
     StreamHandle stream_=mfq_get_stream_from_pool(false);

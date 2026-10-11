@@ -19,11 +19,26 @@ class MlxMfeWeight;
 class MlxNintSwiGluPair;
 class MlxNintWeight;
 
+struct MlxMfeKernelProfile {
+    std::uint32_t family_mask = 0;
+    std::uint32_t vq_profile_mask = 0;
+    std::uint64_t vq_layouts = 0;
+    std::shared_ptr<const std::vector<int>> nint_group_sizes;
+    bool vq_execution_layout = false;
+};
+
 struct MlxMfeProjectionInfo {
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
     std::vector<std::int32_t> available_experts;
+};
+
+struct MlxMfeCacheReuseStats {
+    std::size_t expert_loads = 0;
+    std::size_t expert_hits = 0;
+    std::size_t packed_hits = 0;
+    std::size_t load_waits = 0;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -56,6 +71,8 @@ public:
     }
     bool can_group_mfe(const std::string& name);
     void activate_record(const std::string& name);
+    void prepare_projection(
+        const std::string& name, bool shared_input, bool fused_swiglu = false);
     std::size_t backing_payload_bytes() const;
 
     MlxMfeProjectionInfo projection_info(
@@ -69,11 +86,17 @@ public:
     // MXFP8 reuse their existing packed kernels after paging.
     MlxMfeWeight grouped_mfe(
         const std::string& name,
-        const std::vector<std::int32_t>& active_experts);
+        const std::vector<std::int32_t>& active_experts,
+        std::span<const std::uint32_t> activation_counts = {});
+
+    std::optional<std::vector<MlxMfeWeight>> layer_mfe(
+        std::span<const std::string> names,
+        std::span<const std::int32_t> active_experts = {});
 
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
+    MlxMfeCacheReuseStats reuse_stats() const;
     std::size_t set_cache_limit(std::size_t bytes);
 
     // Atomically forget one parsed projection and all of its resident
@@ -117,6 +140,8 @@ class MlxMfeWeight {
 public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_nint_blob(
+        std::span<const std::uint8_t> blob);
 
     // Load compatible packed projections into one final arena, without
     // separate Gate/Up arenas or model-sized staging vectors. Standalone
@@ -142,6 +167,9 @@ public:
     // introduced for SSD residency.
     static MlxMfeWeight concatenate_experts(
         const std::vector<MlxMfeWeight>& weights);
+
+    MlxMfeWeight select_experts(
+        std::span<const std::int32_t> experts) const;
 
     // Return a shared-storage view with automatic large-M MLX gather-QMM
     // selection enabled or disabled. Explicit environment forcing remains
@@ -193,7 +221,8 @@ public:
         const MlxMfeWeight& up,
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
-        float limit = 0.0f) const;
+        float limit = 0.0f,
+        const mlx::core::array* route_groups = nullptr) const;
     // One through six rows of heterogeneous MoE in two Metal launches after
     // routing. The first runs routed and shared Gate/Up; the second runs
     // routed and shared Down in parallel and combines them in-threadgroup.
@@ -282,6 +311,14 @@ public:
 
 private:
     struct Impl;
+
+    friend class MlxMfeOffloadCache;
+    MlxMfeWeight with_kernel_profile(
+        std::shared_ptr<const MlxMfeKernelProfile> profile) const;
+
+    static MlxMfeWeight from_projection_blobs_impl(
+        std::span<const std::span<const std::uint8_t>> blobs,
+        bool nint_tensor);
 
     explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 

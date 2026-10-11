@@ -284,8 +284,8 @@ struct HfModelSource::Impl {
         std::vector<Segment> segments;
     };
 
-    explicit Impl(std::filesystem::path root)
-        : source(std::move(root)) {}
+    explicit Impl(std::filesystem::path root, std::string source_prefix)
+        : source(std::move(root), {}, std::move(source_prefix)) {}
 
     HfSafetensorsSource source;
     MfqLegacyTensorAliases legacy_tensor_compatibility;
@@ -294,14 +294,20 @@ struct HfModelSource::Impl {
     std::unordered_map<std::string, Record> records;
 };
 
-HfModelSource::HfModelSource(std::filesystem::path root)
-    : impl_(std::make_unique<Impl>(std::move(root))) {
+HfModelSource::HfModelSource(std::filesystem::path root, std::string source_prefix)
+    : impl_(std::make_unique<Impl>(std::move(root), source_prefix)) {
     const bool has_explicit_source_map =
         impl_->source.has_asset(kHfSourceMapAsset);
     impl_->legacy_tensor_compatibility =
         source_compatibility(impl_->source);
     auto& canonical_to_source =
         impl_->legacy_tensor_compatibility.canonical_to_stored;
+    if (!source_prefix.empty()) {
+        for (auto it = canonical_to_source.begin(); it != canonical_to_source.end();) {
+            if (it->second.rfind(source_prefix, 0) != 0) it = canonical_to_source.erase(it);
+            else ++it;
+        }
+    }
     if (canonical_to_source.empty()) {
         for (const auto& tensor : impl_->source.tensors()) {
             canonical_to_source.emplace(tensor.name, tensor.name);

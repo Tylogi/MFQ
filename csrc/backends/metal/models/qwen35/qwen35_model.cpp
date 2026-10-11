@@ -509,6 +509,16 @@ Qwen35Config Qwen35Config::from_json(std::string_view payload) {
         required_integer(text, "num_key_value_heads");
     config.max_position_embeddings =
         required_integer(text, "max_position_embeddings");
+    auto yarn_rope = full_rope.empty() ? rope_parameters : full_rope;
+    if (yarn_rope.empty() && text.contains("rope_scaling")) yarn_rope = text.at("rope_scaling");
+    const auto rope_type = optional_string(yarn_rope, "rope_type", optional_string(yarn_rope, "type", "default"));
+    config.yarn_max_factor = rope_type == "default" || rope_type == "yarn"
+        ? optional_number(yarn_rope, "factor", 4.0) : 1.0;
+    config.yarn.beta_fast = optional_number(yarn_rope, "beta_fast", 32.0);
+    config.yarn.beta_slow = optional_number(yarn_rope, "beta_slow", 1.0);
+    if (rope_type == "yarn") config.max_position_embeddings = optional_integer(yarn_rope,
+        "original_max_position_embeddings", config.max_position_embeddings);
+    (void)qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
     const auto default_head_dim =
         config.hidden_size % config.num_attention_heads == 0
         ? config.hidden_size / config.num_attention_heads

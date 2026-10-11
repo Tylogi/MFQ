@@ -47,7 +47,7 @@
 .evaluation-fields-mode { grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)); }
 .evaluation-fields label { display: grid; min-width: 0; gap: 9px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .evaluation-fields input, .evaluation-fields select, .evaluation-fields textarea { box-sizing: border-box; width: 100%; min-width: 0; min-height: 40px; border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 13px; }
-.evaluation-fields select.evaluation-primary-select { min-height: 48px; padding: 12px 14px; }
+.evaluation-model-fields { max-width: 660px; }
 .evaluation-fields input[readonly] { border-color: var(--line-soft); color: var(--muted); background: var(--panel-control); }
 .evaluation-fields textarea { resize: vertical; line-height: 1.6; }
 .evaluation-wide { grid-column: 1 / -1; }
@@ -64,13 +64,17 @@
 .evaluation-workbench button:disabled { opacity: .45; cursor: default; }
 .evaluation-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .evaluation-job-list { display: grid; margin-top: 20px; border: 1px solid var(--line); border-radius: 10px; padding: 0 18px; }
-.evaluation-job-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; color: var(--ink-soft); font-size: 13px; font-weight: 550; cursor: pointer; }
+.evaluation-job-heading { display: flex; align-items: center; gap: 10px; color: var(--ink-soft); font-size: 13px; font-weight: 550; cursor: pointer; list-style: none; }
+.evaluation-job-heading::-webkit-details-marker { display: none; }
+.evaluation-job-heading > small { margin-left: auto; }
+.evaluation-disclosure-arrow { flex-shrink: 0; color: var(--muted); transition: transform .15s; }
+details[open] > .evaluation-job-heading .evaluation-disclosure-arrow { transform: rotate(90deg); }
 .evaluation-job-heading small { color: var(--muted); font-size: 12px; font-weight: 400; }
 .evaluation-job-list > div { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(100px, 2fr) auto; align-items: center; gap: 20px; padding: 18px 0; border-top: 1px solid var(--line-soft); }
 .evaluation-job-list > div:first-child { border-top: 0; }
 .evaluation-job-list strong, .evaluation-job-list small { display: block; font-size: 12px; }
 .evaluation-job-list small { margin-top: 4px; color: var(--muted); font-size: 11px; }
-.evaluation-job-list progress { width: 100%; height: 5px; accent-color: var(--accent); }
+.evaluation-job-list progress { width: 100%; height: 5px; accent-color: var(--bar-fill); }
 .evaluation-job-list p { grid-column: 1 / -1; margin: 0; color: var(--danger); font-size: 11.5px; }
 .evaluation-history > .evaluation-answer-filter { margin-top: 20px; }
 .evaluation-results { display: grid; gap: 22px; margin: 24px 0; }
@@ -128,7 +132,7 @@
 .evaluation-library-grid details code { font: 11px/1.8 ui-monospace, SFMono-Regular, monospace; color: var(--ink-soft); overflow-wrap: anywhere; }
 .evaluation-library-grid footer { display: flex; justify-content: space-between; align-items: center; gap: 18px; border-top: 1px solid var(--line-soft); margin-top: 22px; padding-top: 18px; }
 .evaluation-library-grid footer button { display: inline-flex; align-items: center; gap: 7px; }
-.evaluation-library-grid progress { width: 100%; height: 4px; margin-top: 12px; accent-color: var(--accent); }
+.evaluation-library-grid progress { width: 100%; height: 4px; margin-top: 12px; accent-color: var(--bar-fill); }
 @media (max-width: 1000px) { .evaluation-setup { grid-template-columns: 160px minmax(0, 1fr); gap: 18px; } .evaluation-configuration { padding-left: 18px; } .evaluation-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } .evaluation-fields-mode > label:first-child { grid-column: 1 / -1; } }
 @media (max-width: 1100px) { .evaluation-setup { grid-template-columns: 1fr; } .evaluation-catalog { gap: 18px; } .evaluation-catalog-group { grid-template-columns: repeat(2, minmax(0, 1fr)); } .evaluation-catalog-subgroup + .evaluation-catalog-subgroup { margin-top: 0; } .evaluation-catalog-group h3 { grid-column: 1 / -1; } .evaluation-catalog-group + .evaluation-catalog-group { margin-top: 0; padding-top: 18px; } .evaluation-configuration { border-left: 0; border-top: 1px solid var(--line-soft); padding-left: 0; padding-top: 24px; } }
 @media (max-width: 760px) { .evaluation-catalog button > svg { display: none; } .evaluation-library-grid { grid-template-columns: 1fr; } }

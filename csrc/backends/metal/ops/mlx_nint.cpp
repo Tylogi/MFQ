@@ -1053,6 +1053,13 @@ public:
         return blob_.size() - offset_;
     }
 
+    std::span<const std::uint8_t> view(std::size_t count, const char* name) {
+        require(count, name);
+        const auto result = blob_.subspan(offset_, count);
+        offset_ += count;
+        return result;
+    }
+
 private:
     void require(std::size_t count, const char* name) {
         if (count > blob_.size() - offset_) {
@@ -1137,25 +1144,6 @@ detail::StagingVector<std::uint8_t> read_old_values(
         result[index] = static_cast<std::uint8_t>(value);
     }
     return result;
-}
-
-float half_to_float(std::uint16_t bits) {
-    const bool negative = (bits & 0x8000u) != 0;
-    const auto exponent = static_cast<unsigned>((bits >> 10) & 0x1fu);
-    const auto mantissa = static_cast<unsigned>(bits & 0x03ffu);
-    float value = 0.0f;
-    if (exponent == 0) {
-        value = std::ldexp(static_cast<float>(mantissa), -24);
-    } else if (exponent == 31) {
-        value = mantissa == 0
-            ? std::numeric_limits<float>::infinity()
-            : std::numeric_limits<float>::quiet_NaN();
-    } else {
-        value = std::ldexp(
-            1.0f + static_cast<float>(mantissa) / 1024.0f,
-            static_cast<int>(exponent) - 15);
-    }
-    return negative ? -value : value;
 }
 
 template <typename T, typename Allocator>
@@ -1606,8 +1594,8 @@ MlxNintWeight::MlxNintWeight(
       descriptor_(descriptor),
       uniform_q_bits_(uniform_q_bits) {}
 
-MlxNintWeight MlxNintWeight::from_blob(
-    std::span<const std::uint8_t> blob) {
+detail::ParsedNintStorage detail::parse_nint_blob(
+    std::span<const std::uint8_t> blob, bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto raw_bits = cursor.scalar<std::uint8_t>("bits");
     const bool adaptive_storage = mfq::nint_has_adaptive_storage(raw_bits);
@@ -1618,7 +1606,7 @@ MlxNintWeight MlxNintWeight::from_blob(
     const int input_size = cursor.scalar<std::int32_t>("input size");
     const auto dimensions = cursor.scalar<std::uint32_t>("dimension count");
     if (bits <= 0 || bits > 8 || sub_bits <= 0 || sub_bits > 8 ||
-        group_size <= 0 || input_size <= 0 || dimensions != 2 || axis != 0) {
+        group_size <= 0 || input_size <= 0 || (dimensions != 2 && dimensions != 3) || axis != 0) {
         throw std::runtime_error("unsupported NINT Metal dimensions");
     }
 
@@ -1628,7 +1616,14 @@ MlxNintWeight MlxNintWeight::from_blob(
     }
     const auto output_size = cursor.scalar<std::uint32_t>("output size");
     const auto groups = cursor.scalar<std::uint32_t>("group count");
-    if (shape[0] != output_size || shape[1] != input_size || groups == 0 ||
+    std::uint64_t rows = 1;
+    for (std::size_t i = 0; i + 1 < shape.size(); ++i) {
+        if (shape[i] <= 0 || static_cast<std::uint64_t>(shape[i]) >
+            std::numeric_limits<std::uint32_t>::max() / rows)
+            throw std::runtime_error("inconsistent NINT Metal row dimensions");
+        rows *= static_cast<std::uint64_t>(shape[i]);
+    }
+    if (rows != output_size || shape.back() != input_size || groups == 0 ||
         static_cast<std::uint64_t>(input_size) >
             static_cast<std::uint64_t>(groups) * group_size) {
         throw std::runtime_error("inconsistent NINT Metal dimensions");
@@ -1638,14 +1633,14 @@ MlxNintWeight MlxNintWeight::from_blob(
     for (std::size_t row = 0; row < output_size; ++row) {
         const auto value = cursor.scalar<std::uint16_t>("neuron scale");
         neuron_packed[row] = value;
-        if (!std::isfinite(half_to_float(value))) {
+        if ((value & 0x7c00u) == 0x7c00u) {
             throw std::runtime_error("NINT neuron metadata must be finite");
         }
     }
     for (std::size_t row = 0; row < output_size; ++row) {
         const auto value = cursor.scalar<std::uint16_t>("neuron minimum");
         neuron_packed[row] |= std::uint32_t(value) << 16u;
-        if (!std::isfinite(half_to_float(value))) {
+        if ((value & 0x7c00u) == 0x7c00u) {
             throw std::runtime_error("NINT neuron metadata must be finite");
         }
     }
@@ -1662,6 +1657,9 @@ MlxNintWeight MlxNintWeight::from_blob(
     const auto old_tail = 2 * metadata_count + q_count;
     const bool old_unpacked_storage =
         !adaptive_storage && cursor.remaining() == old_tail;
+    borrow_streams = borrow_streams && !old_unpacked_storage;
+    std::span<const std::uint8_t> borrowed_q;
+    std::vector<std::span<const std::uint8_t>> borrowed_sub_scale, borrowed_sub_min;
 
     detail::StagingVector<std::uint8_t> sub_scale;
     detail::StagingVector<std::uint8_t> sub_min;
@@ -1676,6 +1674,7 @@ MlxNintWeight MlxNintWeight::from_blob(
             cursor.bytes(selector_bytes, "sub-bit selectors"),
             output_size,
             kSubSelectorBits);
+        std::size_t sub_stream_offset = 0;
         for (int selector = 0; selector < (1 << kSubSelectorBits); ++selector) {
             const int row_bits = sub_bits - 1 + selector;
             const auto selected_rows = static_cast<std::size_t>(std::count(
@@ -1689,11 +1688,17 @@ MlxNintWeight MlxNintWeight::from_blob(
             }
             const auto selected_values = selected_rows * groups;
             const auto stream_bytes = packed_size(selected_values, row_bits);
-            const auto stream_offset = sub_scale.size();
-            const auto scales = cursor.bytes(stream_bytes, "sub scale");
-            const auto minima = cursor.bytes(stream_bytes, "sub minimum");
-            sub_scale.insert(sub_scale.end(), scales.begin(), scales.end());
-            sub_min.insert(sub_min.end(), minima.begin(), minima.end());
+            const auto stream_offset = sub_stream_offset;
+            const auto scales = cursor.view(stream_bytes, "sub scale");
+            const auto minima = cursor.view(stream_bytes, "sub minimum");
+            if (borrow_streams) {
+                borrowed_sub_scale.push_back(scales);
+                borrowed_sub_min.push_back(minima);
+            } else {
+                sub_scale.insert(sub_scale.end(), scales.begin(), scales.end());
+                sub_min.insert(sub_min.end(), minima.begin(), minima.end());
+            }
+            sub_stream_offset += stream_bytes;
             std::size_t local_row = 0;
             for (std::size_t row = 0; row < output_size; ++row) {
                 if (selectors[row] != selector) {
@@ -1725,8 +1730,13 @@ MlxNintWeight MlxNintWeight::from_blob(
         if (cursor.remaining() != packed_tail) {
             throw std::runtime_error("invalid NINT packed payload length");
         }
-        sub_scale = cursor.bytes(packed_metadata_bytes, "sub scale");
-        sub_min = cursor.bytes(packed_metadata_bytes, "sub minimum");
+        if (borrow_streams) {
+            borrowed_sub_scale.push_back(cursor.view(packed_metadata_bytes, "sub scale"));
+            borrowed_sub_min.push_back(cursor.view(packed_metadata_bytes, "sub minimum"));
+        } else {
+            sub_scale = cursor.bytes(packed_metadata_bytes, "sub scale");
+            sub_min = cursor.bytes(packed_metadata_bytes, "sub minimum");
+        }
         for (std::size_t row = 0; row < output_size; ++row) {
             const auto bit_offset = row * groups * sub_bits;
             if (bit_offset / 8u > std::numeric_limits<std::uint32_t>::max()) {
@@ -1779,9 +1789,11 @@ MlxNintWeight MlxNintWeight::from_blob(
             }
             stream_offset += stream_bytes;
         }
-        q_packed = cursor.bytes(stream_offset, "q values", 4);
+        if (borrow_streams) borrowed_q = cursor.view(stream_offset, "q values");
+        else q_packed = cursor.bytes(stream_offset, "q values", 4);
     } else {
-        q_packed = old_unpacked_storage
+        if (borrow_streams) borrowed_q = cursor.view(packed_q_bytes, "q values");
+        else q_packed = old_unpacked_storage
             ? pack_values(
                   read_old_values(cursor, q_count, 1, "quantized value"),
                   bits, 4)
@@ -1840,24 +1852,45 @@ MlxNintWeight MlxNintWeight::from_blob(
         row_metadata[base + 2u] = neuron_packed[row];
         row_metadata[base + 3u] = row_sub_offsets[row];
     }
-    return MlxNintWeight(
-        make_array(q_packed, Shape{checked_shape(q_packed.size(), "q bytes")}),
-        make_array(
-            sub_scale,
-            Shape{checked_shape(sub_scale.size(), "sub scale bytes")}),
-        make_array(
-            sub_min,
-            Shape{checked_shape(sub_min.size(), "sub minimum bytes")}),
-        make_array(
-            row_metadata,
-            Shape{checked_shape(output_size, "output size"), 4}),
+    return {
+        std::move(q_packed),
+        std::move(sub_scale),
+        std::move(sub_min),
+        std::move(row_metadata),
         bits,
         group_size,
         static_cast<int>(groups),
         input_size,
-        static_cast<int>(output_size),
+        checked_shape(output_size, "output size"),
         descriptor,
-        uniform_q_bits);
+        uniform_q_bits,
+        borrowed_q,
+        std::move(borrowed_sub_scale),
+        std::move(borrowed_sub_min),
+    };
+}
+
+MlxNintWeight MlxNintWeight::from_blob(
+    std::span<const std::uint8_t> blob) {
+    auto storage = detail::parse_nint_blob(blob);
+    return MlxNintWeight(
+        make_array(storage.q_packed, Shape{checked_shape(storage.q_packed.size(), "q bytes")}),
+        make_array(
+            storage.sub_scale,
+            Shape{checked_shape(storage.sub_scale.size(), "sub scale bytes")}),
+        make_array(
+            storage.sub_min,
+            Shape{checked_shape(storage.sub_min.size(), "sub minimum bytes")}),
+        make_array(
+            storage.row_metadata,
+            Shape{storage.output_size, 4}),
+        storage.bits,
+        storage.group_size,
+        storage.groups,
+        storage.input_size,
+        storage.output_size,
+        storage.descriptor,
+        storage.uniform_q_bits);
 }
 
 array MlxNintWeight::matmul(const array& input) const {

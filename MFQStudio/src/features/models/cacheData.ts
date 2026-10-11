@@ -1,6 +1,19 @@
 import type { ModelCacheProfile } from '../../shared/api/types';
+import type { KvQuantizationSettings } from '../../shared/api/resources/runtime';
 
 type Component = ModelCacheProfile['components'][number];
+
+export function quantizedCacheProfile(profile: ModelCacheProfile, settings: KvQuantizationSettings): ModelCacheProfile | null {
+  if (!settings.enabled) return profile;
+  const raw = profile.components.filter(item => item.name === 'raw_kv' && (item.group === 'QSA' || item.group === 'GQA'));
+  if (!raw.length || raw.some(item => !item.head_dimension || !item.kv_heads || !item.layers)) return null;
+  return { ...profile, components: profile.components.map(item => {
+    if (!raw.includes(item)) return item;
+    const width = 2 ** Math.ceil(Math.log2(item.head_dimension!));
+    const words = Math.ceil(width * Math.floor(settings.bits) / 32) + Math.ceil(width * Math.ceil(settings.bits) / 32) + 2;
+    return { ...item, bytes_per_row: item.layers! * item.kv_heads! * words * 4 };
+  }) };
+}
 
 export interface CacheBreakdown {
   id: string;
@@ -43,6 +56,35 @@ export function kvOnlyProfile(profile: ModelCacheProfile): ModelCacheProfile {
     fixed_components: fixed.filter(item => !excluded.has(item.group)), components: profile.components.filter(item => !excluded.has(item.group ?? '')) };
 }
 
+export function contextCacheEstimate(source: ModelCacheProfile, context: number): { total: number; raw: number; indexer: number } | null {
+  if (!Number.isSafeInteger(context) || context < 1) return null;
+  const profile = { ...kvOnlyProfile(source), max_context: context };
+  let indexer = (profile.fixed_components ?? []).filter(item => item.name.startsWith('indexer')).reduce((sum, item) => sum + item.bytes, 0);
+  let raw = profile.fixed_bytes - indexer;
+  for (const component of profile.components) {
+    const bytes = componentBytes(profile, component, context, true);
+    if (component.subgroup === 'indexer' || component.name?.startsWith('indexer')) indexer += bytes;
+    else raw += bytes;
+  }
+  return { total: raw + indexer, raw, indexer };
+}
+
+export function streamingCacheEstimate(profile: ModelCacheProfile, context: number, budget: number): {
+  indexerLimit: number; rawFloor: number; requiredIndexer: number; indexerReadPerToken: number; rawReadPerToken: number | null;
+} | null {
+  if (!Number.isSafeInteger(budget) || budget <= 0) return null;
+  const full = contextCacheEstimate(profile, context);
+  if (!full) return null;
+  const buffer = Math.min(64 * 2 ** 20, Math.floor(budget / 4));
+  const raw = profile.components.filter(component => component.group === 'QSA' && component.name === 'raw_kv');
+  const rawReadPerToken = raw.length && raw.every(component => Number.isSafeInteger(component.max_read_rows_per_token)
+    && component.max_read_rows_per_token! > 0)
+    ? raw.reduce((sum, component) => sum + component.bytes_per_row * component.max_read_rows_per_token!, 0) : null;
+  return { indexerLimit: Math.min(budget, full.indexer),
+    rawFloor: Math.min(full.raw, Math.max(0, budget - buffer - full.indexer)), requiredIndexer: full.indexer,
+    indexerReadPerToken: Math.max(0, full.indexer - budget), rawReadPerToken };
+}
+
 export function cacheBreakdown(profile: ModelCacheProfile, context: number): CacheBreakdown[] {
   const groups = new Map<string, CacheBreakdown>();
   function group(name: string, layers?: number | null) {
@@ -77,6 +119,7 @@ export function cacheComponentLabel(item: Pick<CacheBreakdown, 'name' | 'ratio'>
   const labels: Record<string, [string, string]> = {
     raw_kv: ['原始 KV Cache', 'Raw KV cache'], indexer: ['Indexer Cache', 'Indexer cache'],
     indexer_key: ['Indexer Key Cache', 'Indexer key cache'], indexer_pooled: ['Indexer 压缩块 Cache', 'Indexer pooled cache'],
+    indexer_tail: ['Indexer 尾部状态', 'Indexer tail state'],
     compressed_kv: ['压缩 KV Cache', 'Compressed KV cache'], sliding_window: ['滑动窗口 KV Cache', 'Sliding-window KV cache'],
     compression_state_4: ['压缩状态（×4）', 'Compression state (×4)'], compression_state_128: ['压缩状态（×128）', 'Compression state (×128)'],
     fixed_cache: ['固定缓存', 'Fixed cache'],

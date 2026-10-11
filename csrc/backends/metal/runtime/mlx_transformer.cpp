@@ -127,10 +127,14 @@ constexpr const char* kMropeSource = R"METAL(
         : positions[axis * uint(TOKENS) + token];
     float exponent =
         -2.0f * float(pair) / float(ROTARY_DIM);
-    float angle =
-        float(position) * pow(params[0], exponent);
+    float frequency = pow(params[0], exponent);
+    if (YARN != 0) {
+        frequency = params[2 + pair];
+    }
+    float angle = float(position) * frequency;
     float cosine = cos(angle);
     float sine = sin(angle);
+    if (YARN != 0) { cosine *= params[1]; sine *= params[1]; }
 
     uint row_offset = row * uint(DIM);
     float first = float(x[row_offset + pair]);
@@ -225,6 +229,49 @@ void require_attention_shape(const array& value, const char* name) {
 }
 
 } // namespace
+
+std::int64_t qwen_yarn_capacity(std::int64_t native_context, double maximum_factor) {
+    if (native_context <= 0 || !std::isfinite(maximum_factor) || maximum_factor < 1.0 ||
+        maximum_factor * native_context > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("invalid Qwen YaRN context limit");
+    }
+    return static_cast<std::int64_t>(std::floor(native_context * maximum_factor));
+}
+
+MlxYarnScaling qwen_yarn_scaling(const MlxYarnScaling& settings,
+    std::int64_t native_context, std::int64_t requested_context, double maximum_factor) {
+    if (requested_context <= 0 || requested_context > qwen_yarn_capacity(native_context, maximum_factor)) {
+        throw std::invalid_argument("context exceeds the YaRN extension limit");
+    }
+    auto result = settings;
+    result.original_max_position_embeddings = native_context;
+    result.enabled = requested_context > native_context;
+    result.factor = std::max(1.0, double(requested_context) / native_context);
+    result.attention_factor = result.enabled ? 1.0 + 0.1 * std::log(result.factor) : 1.0;
+    return result;
+}
+
+double yarn_frequency(int pair, int dimension, double theta, const MlxYarnScaling& scaling) {
+    if (dimension <= 0 || dimension % 2 || pair < 0 || pair >= dimension / 2 ||
+        !std::isfinite(theta) || theta <= 1.0) throw std::invalid_argument("invalid YaRN frequency");
+    double frequency = std::pow(theta, -2.0 * pair / dimension);
+    if (!scaling.enabled) return frequency;
+    if (!std::isfinite(scaling.factor) || scaling.factor < 1.0 ||
+        scaling.original_max_position_embeddings <= 0 ||
+        !std::isfinite(scaling.beta_fast) || !std::isfinite(scaling.beta_slow) ||
+        scaling.beta_slow <= 0.0 || scaling.beta_fast <= scaling.beta_slow ||
+        !std::isfinite(scaling.attention_factor) || scaling.attention_factor <= 0.0) {
+        throw std::invalid_argument("invalid YaRN scaling");
+    }
+    const auto correction = [&](double rotations) {
+        return dimension * std::log(scaling.original_max_position_embeddings / (rotations * 2.0 * std::acos(-1.0))) / (2.0 * std::log(theta));
+    };
+    const double low = std::max(0.0, std::floor(correction(scaling.beta_fast)));
+    double high = std::min(double(dimension - 1), std::ceil(correction(scaling.beta_slow)));
+    if (low == high) high += 0.001;
+    const double ramp = std::clamp((pair - low) / (high - low), 0.0, 1.0);
+    return frequency * (1.0 - ramp + ramp / scaling.factor);
+}
 
 std::pair<array, array> mlx_yarn_tables(
     int dimension,
@@ -433,7 +480,8 @@ array apply_rope(
     const array& input,
     int rotary_dimension,
     float base,
-    int offset) {
+    int offset,
+    const MlxYarnScaling& scaling) {
     if (input.ndim() < 2 ||
         rotary_dimension <= 0 ||
         rotary_dimension > input.shape(-1) ||
@@ -442,6 +490,10 @@ array apply_rope(
         base <= 0.0f ||
         offset < 0) {
         throw std::runtime_error("invalid RoPE input or parameters");
+    }
+    if (scaling.enabled) {
+        return apply_rope(input, mlx::core::arange(offset, offset + input.shape(-2), mlx::core::int32),
+            rotary_dimension, base, {}, false, scaling);
     }
     auto source = input;
     if (source.dtype() != mlx::core::float16 &&
@@ -464,7 +516,8 @@ array apply_rope(
     int rotary_dimension,
     float base,
     const std::vector<std::int64_t>& sections,
-    bool interleaved) {
+    bool interleaved,
+    const MlxYarnScaling& scaling) {
     if (input.ndim() < 2 ||
         input.shape(-2) <= 0 ||
         input.shape(-1) <= 0 ||
@@ -548,7 +601,13 @@ array apply_rope(
             "explicit-position RoPE Metal grid exceeds MLX limits");
     }
     const int size = static_cast<int>(source.size());
-    const array parameters({base}, Shape{1});
+    std::vector<float> rope_parameters{base};
+    if (scaling.enabled) {
+        rope_parameters.push_back(static_cast<float>(scaling.attention_factor));
+        for (int pair = 0; pair < rotary_dimension / 2; ++pair)
+            rope_parameters.push_back(static_cast<float>(yarn_frequency(pair, rotary_dimension, base, scaling)));
+    }
+    const array parameters(rope_parameters.begin(), Shape{static_cast<int>(rope_parameters.size())});
     std::vector<std::pair<
         std::string,
         mlx::core::fast::TemplateArg>> templates{
@@ -562,6 +621,7 @@ array apply_rope(
         {"S1", section_values[1]},
         {"S2", section_values[2]},
         {"INTERLEAVED", static_cast<int>(interleaved)},
+        {"YARN", static_cast<int>(scaling.enabled)},
     };
     auto outputs = mrope_kernel()(
         {
@@ -653,21 +713,24 @@ MlxKvCache::MlxKvCache(
     int maximum_sequence,
     int head_dimension,
     int initial_capacity,
-    mlx::core::Dtype dtype)
+    mlx::core::Dtype dtype,
+    bool quantization_allowed)
     : batch_(batch),
       heads_(heads),
       maximum_sequence_(maximum_sequence),
       head_dimension_(head_dimension),
       dtype_(dtype),
+      quantization_(quantization_allowed ? mlx_kv_quantization() : MlxKvQuantization{}),
       key_(mlx::core::zeros(
           Shape{
               batch,
               heads,
               std::min(std::max(initial_capacity, 0), maximum_sequence),
-              head_dimension,
+              quantization_.enabled() ? mlx_kv_packed_width(head_dimension, quantization_.key_bits()) : head_dimension,
           },
-          dtype)),
-      value_(mlx::core::zeros(key_.shape(), dtype)) {
+          quantization_.enabled() ? mlx::core::uint32 : dtype)),
+      value_(mlx::core::zeros(Shape{batch, heads, key_.shape(2),
+          quantization_.enabled() ? mlx_kv_packed_width(head_dimension, quantization_.value_bits()) : head_dimension}, key_.dtype())) {
     if (batch_ <= 0 || heads_ <= 0 ||
         maximum_sequence_ <= 0 || head_dimension_ <= 0 ||
         initial_capacity < 0 ||
@@ -703,19 +766,20 @@ void MlxKvCache::ensure_capacity(int required) {
         batch_,
         heads_,
         next_capacity,
-        head_dimension_,
+        key_.shape(3),
     };
-    MlxResidentBudgetScope::reserve(std::size_t(batch_) * heads_ * next_capacity * head_dimension_ *
-        mlx::core::size_of(dtype_) * 2);
-    auto next_key = mlx::core::zeros(next_shape, dtype_);
-    auto next_value = mlx::core::zeros(next_shape, dtype_);
+    MlxResidentBudgetScope::reserve(std::size_t(batch_) * heads_ * next_capacity *
+        (key_.shape(3) + value_.shape(3)) * key_.dtype().size());
+    auto next_key = mlx::core::zeros(next_shape, key_.dtype());
+    auto next_value_shape = next_shape; next_value_shape[3] = value_.shape(3);
+    auto next_value = mlx::core::zeros(next_value_shape, value_.dtype());
     if (capacity() > 0) {
         const Shape start{0, 0, 0, 0};
         const Shape stop{
             batch_,
             heads_,
             capacity(),
-            head_dimension_,
+            key_.shape(3),
         };
         next_key = mlx::core::slice_update(
             next_key,
@@ -726,7 +790,7 @@ void MlxKvCache::ensure_capacity(int required) {
             next_value,
             value_,
             start,
-            stop);
+            Shape{batch_, heads_, capacity(), value_.shape(3)});
     }
     key_ = std::move(next_key);
     value_ = std::move(next_value);
@@ -736,6 +800,11 @@ void MlxKvCache::ensure_capacity(int required) {
 std::pair<array, array> MlxKvCache::append(
     const array& key,
     const array& value) {
+    append_only(key, value);
+    return view();
+}
+
+void MlxKvCache::append_only(const array& key, const array& value) {
     require_attention_shape(key, "KV key");
     require_attention_shape(value, "KV value");
     if (key.shape() != value.shape() ||
@@ -755,24 +824,24 @@ std::pair<array, array> MlxKvCache::append(
             batch_,
             heads_,
             position_ + tokens,
-            head_dimension_,
+            key_.shape(3),
         };
         key_ = mlx::core::slice_update(
             key_,
-            floating(key, dtype_),
+            quantized() ? mlx_kv_encode(floating(key, dtype_), quantization_.key_bits(), false) : floating(key, dtype_),
             start,
             stop);
         value_ = mlx::core::slice_update(
             value_,
-            floating(value, dtype_),
+            quantized() ? mlx_kv_encode(floating(value, dtype_), quantization_.value_bits(), true) : floating(value, dtype_),
             start,
-            stop);
+            Shape{batch_, heads_, position_ + tokens, value_.shape(3)});
         position_ += tokens;
     }
-    return view();
 }
 
 void MlxKvCache::reserve_append(int tokens) {
+    if (quantized()) throw std::runtime_error("direct KV writes cannot target a quantized cache");
     if (tokens <= 0 || position_ > maximum_sequence_ - tokens) {
         throw std::runtime_error("invalid KV cache reservation");
     }
@@ -788,16 +857,23 @@ void MlxKvCache::trim(int tokens) {
 }
 
 std::pair<array, array> MlxKvCache::view() const {
+    auto result = physical_view();
+    if (quantized()) return {mlx_kv_decode(result.first, head_dimension_, quantization_.key_bits(), false, dtype_),
+        mlx_kv_decode(result.second, head_dimension_, quantization_.value_bits(), true, dtype_)};
+    return result;
+}
+
+std::pair<array, array> MlxKvCache::physical_view() const {
     const Shape start{0, 0, 0, 0};
     const Shape stop{
         batch_,
         heads_,
         position_,
-        head_dimension_,
+        key_.shape(3),
     };
     return {
         mlx::core::slice(key_, start, stop),
-        mlx::core::slice(value_, start, stop),
+        mlx::core::slice(value_, start, Shape{batch_, heads_, position_, value_.shape(3)}),
     };
 }
 
@@ -806,7 +882,7 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
         throw std::runtime_error(
             "cannot snapshot an empty or inconsistent KV cache");
     }
-    auto visible = view();
+    auto visible = physical_view();
     auto key = detached ? detached_copy(visible.first) : visible.first;
     auto value = detached ? detached_copy(visible.second) : visible.second;
     mlx::core::eval(key, value);
@@ -817,9 +893,10 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
         head_dimension_,
         capacity(),
         position_,
-        dtype_,
+        key_.dtype(),
         std::move(key),
         std::move(value),
+        quantization_,
     };
 }
 
@@ -828,31 +905,32 @@ void MlxKvCache::restore_snapshot(
     if (snapshot.batch != batch_ || snapshot.heads != heads_ ||
         snapshot.maximum_sequence != maximum_sequence_ ||
         snapshot.head_dimension != head_dimension_ ||
-        snapshot.dtype != dtype_ || snapshot.capacity <= 0 ||
+        snapshot.quantization != quantization_ || snapshot.dtype != key_.dtype() || snapshot.capacity <= 0 ||
         snapshot.capacity > maximum_sequence_ || snapshot.position <= 0 ||
         snapshot.position > snapshot.capacity || snapshot.key.ndim() != 4 ||
-        snapshot.value.shape() != snapshot.key.shape() ||
+        snapshot.value.shape() != Shape{batch_, heads_, snapshot.position, value_.shape(3)} ||
         snapshot.key.shape() != Shape{
-            batch_, heads_, snapshot.position, head_dimension_} ||
-        snapshot.key.dtype() != dtype_ || snapshot.value.dtype() != dtype_) {
+            batch_, heads_, snapshot.position, key_.shape(3)} ||
+        snapshot.key.dtype() != key_.dtype() || snapshot.value.dtype() != value_.dtype()) {
         throw std::runtime_error("KV cache snapshot topology mismatch");
     }
     const Shape allocation_shape{
-        batch_, heads_, snapshot.capacity, head_dimension_};
-    MlxResidentBudgetScope::reserve(static_cast<std::size_t>(batch_) * heads_ * snapshot.capacity * head_dimension_ * dtype_.size() * 2
+        batch_, heads_, snapshot.capacity, key_.shape(3)};
+    MlxResidentBudgetScope::reserve(static_cast<std::size_t>(batch_) * heads_ * snapshot.capacity *
+        (key_.shape(3) + value_.shape(3)) * key_.dtype().size()
         + snapshot.key.nbytes() + snapshot.value.nbytes());
-    auto key = mlx::core::zeros(allocation_shape, dtype_);
-    auto value = mlx::core::zeros(allocation_shape, dtype_);
+    auto key = mlx::core::zeros(allocation_shape, key_.dtype());
+    auto value = mlx::core::zeros(Shape{batch_, heads_, snapshot.capacity, value_.shape(3)}, value_.dtype());
     key = mlx::core::slice_update(
         key,
         detached_copy(snapshot.key),
         Shape{0, 0, 0, 0},
-        Shape{batch_, heads_, snapshot.position, head_dimension_});
+        Shape{batch_, heads_, snapshot.position, key_.shape(3)});
     value = mlx::core::slice_update(
         value,
         detached_copy(snapshot.value),
         Shape{0, 0, 0, 0},
-        Shape{batch_, heads_, snapshot.position, head_dimension_});
+        Shape{batch_, heads_, snapshot.position, value_.shape(3)});
     mlx::core::eval(key, value);
     key_ = std::move(key);
     value_ = std::move(value);
@@ -864,19 +942,82 @@ void MlxKvCache::restore_snapshot(MlxKvCacheSnapshot&& snapshot) {
     if (snapshot.batch != batch_ || snapshot.heads != heads_ ||
         snapshot.maximum_sequence != maximum_sequence_ ||
         snapshot.head_dimension != head_dimension_ ||
-        snapshot.dtype != dtype_ || snapshot.capacity <= 0 ||
+        snapshot.quantization != quantization_ || snapshot.dtype != key_.dtype() || snapshot.capacity <= 0 ||
         snapshot.capacity > maximum_sequence_ || snapshot.position <= 0 ||
         snapshot.position > snapshot.capacity || snapshot.key.ndim() != 4 ||
-        snapshot.value.shape() != snapshot.key.shape() ||
+        snapshot.value.shape() != Shape{batch_, heads_, snapshot.position, value_.shape(3)} ||
         snapshot.key.shape() != Shape{
-            batch_, heads_, snapshot.position, head_dimension_} ||
-        snapshot.key.dtype() != dtype_ || snapshot.value.dtype() != dtype_) {
+            batch_, heads_, snapshot.position, key_.shape(3)} ||
+        snapshot.key.dtype() != key_.dtype() || snapshot.value.dtype() != value_.dtype()) {
         throw std::runtime_error("KV cache snapshot topology mismatch");
     }
     key_ = std::move(snapshot.key);
     value_ = std::move(snapshot.value);
     position_ = snapshot.position;
     resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
+}
+
+array MlxKvCache::attention(const array& query, bool causal) const {
+    if (!quantized()) {
+        const auto cached = view();
+        return scaled_dot_product_attention(query, cached.first, cached.second, causal);
+    }
+    if (query.ndim() != 4 || query.shape(0) != batch_ || query.shape(1) % heads_ ||
+        query.shape(3) != head_dimension_ || query.shape(2) > position_)
+        throw std::invalid_argument("quantized dense KV attention topology mismatch");
+    const int tokens = query.shape(2), groups = query.shape(1) / heads_, offset = position_ - tokens;
+    std::vector<array> outputs;
+    for (int begin = 0; begin < tokens; begin += 32) {
+        const int count = std::min(32, tokens - begin);
+        auto q = mlx::core::reshape(mlx::core::astype(mlx::core::slice(query, Shape{0, 0, begin, 0},
+            Shape{batch_, query.shape(1), begin + count, head_dimension_}), mlx::core::float32),
+            Shape{batch_, heads_, groups, count, head_dimension_});
+        std::optional<array> maximum, norm, weighted;
+        const int end = causal ? offset + begin + count : position_;
+        for (int start = 0; start < end; start += 1024) {
+            const int rows = std::min(1024, end - start);
+            auto decode = [&](const array& source, bool value) {
+                auto packed = mlx::core::slice(source, Shape{0, 0, start, 0}, Shape{batch_, heads_, start + rows, source.shape(3)});
+                return mlx::core::expand_dims(mlx_kv_decode(packed, head_dimension_,
+                    value ? quantization_.value_bits() : quantization_.key_bits(), value, mlx::core::float32), 2);
+            };
+            auto scores = mlx::core::matmul(q, mlx::core::swapaxes(decode(key_, false), -1, -2)) /
+                std::sqrt(static_cast<float>(head_dimension_));
+            if (causal) {
+                auto visible = mlx::core::reshape(mlx::core::arange(offset + begin + 1, offset + begin + count + 1, mlx::core::int32),
+                    Shape{1, 1, 1, count, 1});
+                scores = mlx::core::where(mlx::core::less(mlx::core::arange(start, start + rows, mlx::core::int32), visible),
+                    scores, array(-std::numeric_limits<float>::infinity()));
+            }
+            auto local_max = mlx::core::max(scores, -1, true);
+            auto safe_max = mlx::core::where(mlx::core::isfinite(local_max), local_max, array(0.0f));
+            auto probabilities = mlx::core::exp(scores - safe_max);
+            auto local_norm = mlx::core::sum(probabilities, -1, true);
+            auto local_weighted = mlx::core::matmul(probabilities, decode(value_, true));
+            if (maximum) {
+                auto next_max = mlx::core::maximum(*maximum, local_max);
+                auto current_scale = mlx::core::exp(safe_max - next_max);
+                auto previous_scale = mlx::core::exp(*maximum - next_max);
+                norm = *norm * previous_scale + local_norm * current_scale;
+                weighted = *weighted * previous_scale + local_weighted * current_scale;
+                maximum = std::move(next_max);
+            } else {
+                maximum = std::move(local_max); norm = std::move(local_norm); weighted = std::move(local_weighted);
+            }
+            mlx::core::eval(*maximum, *norm, *weighted);
+        }
+        auto output = mlx::core::reshape(mlx::core::astype(*weighted / *norm, query.dtype()),
+            Shape{batch_, query.shape(1), count, head_dimension_});
+        output.eval(); outputs.push_back(std::move(output));
+    }
+    return outputs.size() == 1 ? outputs.front() : mlx::core::concatenate(outputs, 2);
+}
+
+array MlxKvCache::sparse_attention(const array& query, const std::optional<array>& blocks,
+    int query_offset, int ratio, int budget) const {
+    if (query.ndim() != 4 || query.shape(0) != batch_ || query.shape(3) != head_dimension_)
+        throw std::invalid_argument("compressed QSA query topology mismatch");
+    return mlx_kv_sparse_attention(query, key_, value_, blocks, quantization_, position_, query_offset, ratio, budget);
 }
 
 MlxSequenceCache::MlxSequenceCache(

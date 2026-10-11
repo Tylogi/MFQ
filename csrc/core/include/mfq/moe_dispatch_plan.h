@@ -75,6 +75,56 @@ inline double measured_pcie_share(double gbps) {
     return full_rate_share * std::min(gbps / reference_gbps, 1.0);
 }
 
+// Placement can change each token without rebuilding the ordered groups.
+// The caller has already classified residents and computed its cold quota.
+template<class TransferEligible>
+void assign_moe_transfer_quota(MoeDispatchPlan& plan, std::size_t quota,
+        TransferEligible transfer_eligible) {
+    for (auto at = plan.groups.rbegin(); at != plan.groups.rend() && quota; ++at) {
+        if (at->kind != MoeDispatchKind::Cpu || !transfer_eligible(at->expert)) continue;
+        at->kind = MoeDispatchKind::GpuTransfer;
+        --quota;
+    }
+    for (const auto& group : plan.groups)
+        for (const auto position : group.positions) plan.kinds[position] = group.kind;
+}
+
+struct MoeDispatchWorkspace {
+    std::vector<std::size_t> group_for;
+};
+
+// Reuse the per-group position buffers for the common fixed top-k decode.
+// Group order, reverse cold quota and complete-input validation match the
+// allocating planner below. No residency result survives a new invocation.
+template<class Resident, class TransferEligible>
+void plan_moe_dispatch_reuse(MoeDispatchPlan& plan, MoeDispatchWorkspace& workspace,
+        const std::vector<std::int32_t>& ids, int experts, std::size_t transfer_quota,
+        Resident resident, TransferEligible transfer_eligible) {
+    if (experts < 1) throw std::invalid_argument("expert count must be positive");
+    for (const auto id : ids)
+        if (id < 0 || id >= experts) throw std::out_of_range("MoE expert ID is out of range");
+    plan.kinds.resize(ids.size());
+    workspace.group_for.assign(static_cast<std::size_t>(experts), ids.size());
+    plan.groups.reserve(std::min(ids.size(), static_cast<std::size_t>(experts)));
+    std::size_t count = 0;
+    for (std::size_t position = 0; position < ids.size(); ++position) {
+        auto& index = workspace.group_for[static_cast<std::size_t>(ids[position])];
+        if (index == ids.size()) {
+            index = count++;
+            if (index == plan.groups.size()) plan.groups.push_back({});
+            auto& group = plan.groups[index];
+            group.expert = ids[position];
+            group.kind = MoeDispatchKind::Cpu;
+            group.positions.clear();
+        }
+        plan.groups[index].positions.push_back(position);
+    }
+    plan.groups.resize(count);
+    for (auto& group : plan.groups)
+        if (resident(group.expert)) group.kind = MoeDispatchKind::GpuResident;
+    assign_moe_transfer_quota(plan, transfer_quota, transfer_eligible);
+}
+
 template<class Resident, class TransferEligible>
 MoeDispatchPlan plan_moe_dispatch(const std::vector<std::int32_t>& ids,
         int experts, std::size_t transfer_quota, Resident resident,

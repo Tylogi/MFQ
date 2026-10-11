@@ -70,7 +70,7 @@ struct MlxPagedSessionCodec<MlxQwen4TextSessionState> {
     static constexpr bool available = true;
     static constexpr bool refresh_final_block = true;
     static constexpr bool supports_tail_blocks = true;
-    static constexpr std::string_view name = "qwen4-hybrid-qsa-ple-v1";
+    static constexpr std::string_view name = "qwen4-hybrid-qsa-ple-v2";
 
     static MlxPagedPayload encode_block(const MlxQwen4TextSessionState& state,
         std::size_t block_size, std::size_t block_index);

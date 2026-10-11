@@ -38,15 +38,17 @@ public:
             values.size(2)==width_,"replacement sequence cache geometry mismatch");
         values_=std::move(values);
     }
-    void prepare_fixed() {
+    void prepare_fixed(int64_t capacity) {
         MFQ_RUNTIME_CHECK(values_.defined(), "fixed sequence cache requires a prefilled state");
-        if(values_.size(1)==maximum_)return;
-        auto expanded=tb::zeros({values_.size(0),maximum_,width_},values_.options());
+        MFQ_RUNTIME_CHECK(capacity>=position_ && capacity<=maximum_, "invalid fixed sequence cache capacity");
+        if(values_.size(1)==capacity)return;
+        auto expanded=tb::zeros({values_.size(0),capacity,width_},values_.options());
         if(position_)expanded.narrow(1,0,position_).copy_(values_.narrow(1,0,position_));
         values_=std::move(expanded);
     }
     Tensor append_fixed(const Tensor& value,const Tensor& positions) {
-        MFQ_RUNTIME_CHECK(values_.defined() && values_.size(1)==maximum_ && value.dim()==3 &&
+        MFQ_RUNTIME_CHECK(values_.defined() && values_.size(1)<=maximum_ && value.dim()==3 &&
+            value.size(1)<=values_.size(1)-position_ &&
             value.size(0)==values_.size(0) && value.size(2)==width_ && positions.dim()==1 &&
             positions.size(0)==value.size(1), "fixed sequence cache append geometry mismatch");
         values_.index_copy_(1,positions.to(tb::kInt64),value.to(tb::kFloat16));

@@ -28,6 +28,16 @@ namespace mfq::metal {
 void set_mlx_predequantize_fp16(bool enabled) noexcept;
 bool mlx_predequantize_fp16_enabled() noexcept;
 
+class MlxFp16WeightScope {
+public:
+    explicit MlxFp16WeightScope(bool enabled) noexcept;
+    ~MlxFp16WeightScope();
+    MlxFp16WeightScope(const MlxFp16WeightScope&) = delete;
+    MlxFp16WeightScope& operator=(const MlxFp16WeightScope&) = delete;
+private:
+    bool enabled_;
+};
+
 mlx::core::array load_dense_array(
     const std::string& dtype,
     std::span<const std::uint8_t> blob);

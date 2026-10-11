@@ -6,6 +6,7 @@ class NintRowStage {
 public:
     ~NintRowStage();
     mfq_tensor_backend::Tensor output() const;
+    bool mapped_rows() const;
     void decode();
 private:
     friend class NintRowPipeline;

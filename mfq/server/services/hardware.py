@@ -8,10 +8,15 @@ import platform
 import plistlib
 import re
 import subprocess
+import psutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from xml.parsers.expat import ExpatError
+
+
+def _unified_gpu_name(name: str) -> bool:
+    return bool(re.search(r"\bGB10\b|\bMI300A\b|\bRadeon\s+(?:80[456]0S|8065S)\b", name, re.IGNORECASE))
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,40 @@ class HardwareIdentity:
     unified_memory: bool = False
     memory_bandwidth_bytes_per_second: int | None = None
     gpu_memory: tuple[GpuMemory, ...] = ()
+
+    @property
+    def memory_architecture(self) -> str:
+        # CUDA managed allocations do not imply physically shared memory.
+        # GB10 and other UMA devices are identified independently of backend.
+        if self.gpu_memory:
+            return "unified" if all(item.unified or _unified_gpu_name(item.name) for item in self.gpu_memory) else "discrete"
+        if self.unified_memory:
+            return "unified"
+        if self.gpu_names:
+            return "unified" if all(_unified_gpu_name(name) for name in self.gpu_names) else "discrete"
+        return "unknown"
+
+
+def memory_topology() -> dict[str, Any]:
+    hardware = hardware_identity()
+    architecture = hardware.memory_architecture
+    capacities = [item.capacity_bytes for item in hardware.gpu_memory if not item.unified and not _unified_gpu_name(item.name)]
+    return {
+        "memory_architecture": architecture,
+        "unified_memory": architecture == "unified" if architecture != "unknown" else None,
+        "host_memory_total_bytes": hardware.physical_memory_bytes or host_memory_capacity()[0],
+        "device_memory_total_bytes": sum(capacities) if capacities and all(value is not None for value in capacities) else None,
+        "prefix_cache_hot_tier": "vram" if architecture == "discrete" else "ram" if architecture == "unified" else None,
+        "prefix_cache_cold_tier": "ssd",
+    }
+
+
+def host_memory_capacity() -> tuple[int | None, int | None]:
+    try:
+        memory = psutil.virtual_memory()
+        return int(memory.total), int(memory.available)
+    except (OSError, psutil.Error):
+        return None, None
 
 
 def _command(argv: list[str]) -> str:
@@ -210,4 +249,5 @@ def hardware_identity() -> HardwareIdentity:
                 names = [item.name for item in gpu_memory]
         except ValueError:
             pass
+    gpu_memory = tuple(replace(item, unified=True) if _unified_gpu_name(item.name) else item for item in gpu_memory)
     return replace(identity, gpu_names=tuple(names) or identity.gpu_names, gpu_memory=gpu_memory)

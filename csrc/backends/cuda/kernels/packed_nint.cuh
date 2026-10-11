@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include "glu.cuh"
+#include "warp_multi_sum.cuh"
 
 namespace mfq::cuda::packed_nint {
 __device__ __forceinline__ uint8_t unpack_nint_code(
@@ -96,6 +97,123 @@ __device__ __forceinline__ int load_i8x4(const int8_t * source) {
     return static_cast<int>(packed);
 }
 
+
+__device__ __forceinline__ int unpack_nint_codes4_aligned(
+        const uint8_t* stream,uint64_t bit,int bits,uint64_t bytes) {
+    const uint64_t byte=(bit>>3)&~uint64_t(3);
+    if((reinterpret_cast<uintptr_t>(stream)&3u) || byte+8>bytes)
+        return unpack_nint_codes4(stream,bit,bits);
+    const auto* words=reinterpret_cast<const uint32_t*>(stream+byte);
+    const uint32_t packed=__funnelshift_r(words[0],words[1],int(bit&31u));
+    const uint32_t pairs=__byte_perm(packed,packed>>(2*bits),0x5410);
+    return int(__byte_perm(pairs,pairs>>bits,0x6240)&(((1u<<bits)-1u)*0x01010101u));
+}
+
+__device__ __forceinline__ int2 unpack_nint_codes8_aligned(
+        const uint8_t* stream,uint64_t bit,int bits,uint64_t bytes) {
+    const uint64_t byte=(bit>>3)&~uint64_t(3);
+    if((reinterpret_cast<uintptr_t>(stream)&3u) || byte+12>bytes)
+        return make_int2(unpack_nint_codes4_aligned(stream,bit,bits,bytes),
+            unpack_nint_codes4_aligned(stream,bit+4*bits,bits,bytes));
+    const auto* words=reinterpret_cast<const uint32_t*>(stream+byte);
+    const int shift=int(bit&31u);
+    const uint32_t low=__funnelshift_r(words[0],words[1],shift);
+    const uint32_t high=__funnelshift_r(words[1],words[2],shift);
+    const uint32_t second=__funnelshift_rc(low,high,4*bits);
+    const uint32_t a=__byte_perm(low,low>>(2*bits),0x5410);
+    const uint32_t b=__byte_perm(second,second>>(2*bits),0x5410);
+    const uint32_t mask=((1u<<bits)-1u)*0x01010101u;
+    return make_int2(int(__byte_perm(a,a>>bits,0x6240)&mask),
+        int(__byte_perm(b,b>>bits,0x6240)&mask));
+}
+
+__device__ __forceinline__ int2 unpack_nint4_codes8(
+        const uint8_t* stream,uint64_t bit,uint64_t bytes) {
+    const uint64_t byte=(bit>>3)&~uint64_t(3);
+    if((reinterpret_cast<uintptr_t>(stream)&3u) || byte+8>bytes)
+        return unpack_nint_codes8_aligned(stream,bit,4,bytes);
+    const auto* words=reinterpret_cast<const uint32_t*>(stream+byte);
+    const uint32_t low=__funnelshift_r(words[0],words[1],int(bit&31u)),high=low>>16;
+    return make_int2(int(__byte_perm(low,low>>4,0x5140)&0x0f0f0f0fu),
+        int(__byte_perm(high,high>>4,0x5140)&0x0f0f0f0fu));
+}
+
+// Whole-group integer dots for two routed output rows. Lanes=16 gives each
+// half warp its own row; Lanes=32 shares activation loads across both rows.
+// Packed row bit widths remain dynamic, including unsigned eight-bit codes.
+template<int GroupSize,int Lanes,int Rows=2,int FixedBits=0>
+__device__ __forceinline__ void nint_grouped_routed_pair(
+        const uint8_t* stream,const uint8_t* bits,const int64_t* offsets,
+        const uint8_t* subscale,const uint8_t* submin,
+        const float* outer_scale,const float* outer_min,
+        const int8_t* input,const float* input_scale,
+        int local,int first,int output_rows,int groups,int stride,float* result,bool multi_sum=false) {
+    static_assert(Lanes==32 || Rows==2);
+    constexpr int accumulators=Lanes==16?1:Rows;
+    const int lane=threadIdx.x&(Lanes-1);
+    const int first_row=Lanes==16 ? int(threadIdx.x)>>4 : 0;
+    const auto* packed=stream+size_t(local)*stride;
+    float partial[accumulators]{},scale[accumulators]{},minimum[accumulators]{};
+    int qbits[accumulators]{},neuron[accumulators]{};
+    uint64_t row_bit[accumulators]{};
+#pragma unroll
+    for(int a=0;a<accumulators;++a)if(first+first_row+a<output_rows) {
+        neuron[a]=local*output_rows+first+first_row+a;
+        qbits[a]=FixedBits?FixedBits:bits[neuron[a]];row_bit[a]=uint64_t(offsets[neuron[a]]);
+        scale[a]=outer_scale[neuron[a]];minimum[a]=outer_min[neuron[a]];
+    }
+    for(int group=lane;group<groups;group+=Lanes) {
+        int dot[accumulators]{},sum=0;
+#pragma unroll
+        for(int chunk=0;chunk<GroupSize/8;++chunk) {
+            const int column=group*GroupSize+chunk*8;
+            const int2 x=make_int2(load_i8x4(input+column),load_i8x4(input+column+4));
+            sum=__dp4a(0x01010101,x.y,__dp4a(0x01010101,x.x,sum));
+#pragma unroll
+            for(int a=0;a<accumulators;++a)if(first+first_row+a<output_rows) {
+                int2 w;
+                if constexpr(FixedBits==4)w=unpack_nint4_codes8(packed,row_bit[a]+uint64_t(column)*4,stride);
+                else w=unpack_nint_codes8_aligned(packed,row_bit[a]+uint64_t(column)*qbits[a],qbits[a],stride);
+                if(qbits[a]==8){w.x^=int(0x80808080u);w.y^=int(0x80808080u);}
+                dot[a]=__dp4a(w.y,x.y,__dp4a(w.x,x.x,dot[a]));
+            }
+        }
+        if constexpr(GroupSize%8==4) {
+            const int column=group*GroupSize+GroupSize-4,x=load_i8x4(input+column);
+            sum=__dp4a(0x01010101,x,sum);
+#pragma unroll
+            for(int a=0;a<accumulators;++a)if(first+first_row+a<output_rows) {
+                int w=unpack_nint_codes4_aligned(packed,row_bit[a]+uint64_t(column)*qbits[a],qbits[a],stride);
+                if(qbits[a]==8)w^=int(0x80808080u);
+                dot[a]=__dp4a(w,x,dot[a]);
+            }
+        }
+        const float xs=input_scale[group];
+#pragma unroll
+        for(int a=0;a<accumulators;++a)if(first+first_row+a<output_rows) {
+            const size_t meta=size_t(neuron[a])*groups+group;
+            if(qbits[a]==8)dot[a]+=128*sum;
+            partial[a]+=xs*(scale[a]*float(subscale[meta])*float(dot[a])-
+                minimum[a]*float(submin[meta])*float(sum));
+        }
+    }
+    if(multi_sum && Lanes==32)warp_multi_sum::broadcast(partial,lane);
+    else {
+#pragma unroll
+        for(int a=0;a<accumulators;++a) {
+#pragma unroll
+            for(int offset=Lanes/2;offset>0;offset>>=1)
+                partial[a]+=__shfl_xor_sync(0xffffffffu,partial[a],offset,Lanes);
+        }
+    }
+    if constexpr(Lanes==16) {
+        result[0]=__shfl_sync(0xffffffffu,partial[0],0);
+        result[1]=__shfl_sync(0xffffffffu,partial[0],16);
+    } else {
+#pragma unroll
+        for(int a=0;a<accumulators;++a)result[a]=partial[a];
+    }
+}
 
 template <bool ReturnValues = false>
 __device__ __forceinline__ void nint_matmul_routed_pair(

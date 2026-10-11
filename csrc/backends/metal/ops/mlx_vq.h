@@ -9,11 +9,65 @@
 
 #include <mlx/mlx.h>
 
+#include "mlx_staging_allocator.h"
+
 namespace mfq::metal {
 
 namespace detail {
 std::string_view vq_gemv_metal_header() noexcept;
 std::string_view vq_gemv_metal_body() noexcept;
+
+bool vq_native_jsc(int layout, int group_size, int state_bits, int table_banks,
+    int index_bits, int vector_size, int input_size, int aux_mode, int bank_mode) noexcept;
+bool vq_native_nvq1(int layout, int group_size, int vector_size, std::string_view label,
+    int index_bits, int state_bits, int bank_mode, int aux_mode, int table_banks) noexcept;
+
+struct ParsedVqStorage {
+    StagingVector<std::uint8_t> indices;
+    StagingVector<std::uint8_t> states_packed;
+    StagingVector<std::uint8_t> auxiliary;
+    StagingVector<float> anchors;
+    StagingVector<std::int8_t> codebooks;
+    StagingVector<float> scales;
+    StagingVector<std::uint8_t> state_to_codebank;
+    StagingVector<std::uint8_t> bank_ids;
+    StagingVector<std::int8_t> rotation_signs;
+    StagingVector<float> residual_codebook;
+    StagingVector<std::int16_t> residual_first;
+    StagingVector<std::int16_t> residual_second;
+    float parameter = 0.0f;
+    std::string label;
+    std::vector<int> output_shape;
+    int input_size = 0;
+    int output_size = 0;
+    int group_size = 0;
+    int groups = 0;
+    int vector_size = 0;
+    int vectors = 0;
+    int index_bits = 0;
+    int state_bits = 0;
+    int states = 0;
+    int entries = 0;
+    int code_banks = 0;
+    int aux_mode = 0;
+    int code_bank_mode = 0;
+    int execution_layout = 0;
+    int table_banks = 1;
+    int groups_per_supergroup = 0;
+    int supergroups = 1;
+    int rotation_block = 0;
+    std::uint64_t rotation_seed = 0;
+    int residual_position_bits = 0;
+    int residual_block_vectors = 0;
+    int residual_blocks_per_row = 0;
+    std::span<const std::uint8_t> borrowed_indices;
+    std::span<const std::uint8_t> borrowed_state;
+    std::span<const std::uint8_t> borrowed_auxiliary;
+};
+
+ParsedVqStorage parse_vq_blob(std::string_view dtype,
+    std::span<const std::uint8_t> blob, std::span<const std::uint8_t> runtime_payload,
+    bool borrow_streams = false);
 }
 
 bool is_vq_dtype(std::string_view dtype) noexcept;
@@ -131,22 +185,12 @@ public:
         return indices_packed_;
     }
     bool uses_native_jsc() const noexcept {
-        return execution_layout_ == 0 && group_size_ == 24 && state_bits_ == 4
-            && table_banks_ == 1
-            && ((index_bits_ == 8 && (vector_size_ == 4 || vector_size_ == 8)
-                    && input_size_ % vector_size_ == 0
-                    && (aux_mode_ == 1 || aux_mode_ == 2) && code_bank_mode_ != 2)
-                || (((vector_size_ == 4 && (index_bits_ == 9 || index_bits_ == 10))
-                        || (vector_size_ == 8 && (index_bits_ == 10 || index_bits_ == 12)))
-                    && aux_mode_ == 1 && code_bank_mode_ == 1));
+        return detail::vq_native_jsc(execution_layout_, group_size_, state_bits_, table_banks_,
+            index_bits_, vector_size_, input_size_, aux_mode_, code_bank_mode_);
     }
     bool uses_native_nvq1() const noexcept {
-        return execution_layout_ == 0 && group_size_ == 24 && vector_size_ == 8
-            && ((format_label_ == "NVQ1-S" && index_bits_ == 9 && state_bits_ == 4
-                    && code_bank_mode_ == 2)
-                || (format_label_ == "NVQ1-L" && index_bits_ == 11 && state_bits_ == 3
-                    && code_bank_mode_ == 0))
-            && aux_mode_ == 3 && table_banks_ == 1;
+        return detail::vq_native_nvq1(execution_layout_, group_size_, vector_size_, format_label_,
+            index_bits_, state_bits_, code_bank_mode_, aux_mode_, table_banks_);
     }
     const mlx::core::array* jsc_execution_records() const noexcept {
         return execution_layout_ == 1 ? &indices_packed_ : nullptr;

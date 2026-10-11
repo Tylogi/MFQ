@@ -83,6 +83,13 @@ public:
             throw std::bad_array_new_length();
         }
         const auto bytes = count * sizeof(T);
+        if (bytes < mapping_threshold) {
+            if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+                return static_cast<T*>(::operator new(bytes, std::align_val_t{alignof(T)}));
+            } else {
+                return static_cast<T*>(::operator new(bytes));
+            }
+        }
         void* mapping = ::mmap(
             nullptr,
             bytes,
@@ -97,14 +104,27 @@ public:
     }
 
     void deallocate(T* pointer, std::size_t count) noexcept {
-        if (pointer != nullptr && count != 0) {
-            ::munmap(pointer, count * sizeof(T));
+        if (pointer == nullptr || count == 0) {
+            return;
+        }
+        const auto bytes = count * sizeof(T);
+        if (bytes < mapping_threshold) {
+            if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+                ::operator delete(pointer, std::align_val_t{alignof(T)});
+            } else {
+                ::operator delete(pointer);
+            }
+        } else {
+            ::munmap(pointer, bytes);
         }
     }
 
     constexpr std::size_t max_size() const noexcept {
         return std::numeric_limits<std::size_t>::max() / sizeof(T);
     }
+
+private:
+    static constexpr std::size_t mapping_threshold = 64 * 1024;
 };
 
 template <typename T, typename U>

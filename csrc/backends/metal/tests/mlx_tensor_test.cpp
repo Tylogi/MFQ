@@ -432,6 +432,24 @@ void test_large_packed_storage_layout() {
 int main() {
     try {
         using namespace mlx::core;
+        for (const std::size_t count : {std::size_t{1}, std::size_t{16383}, std::size_t{16384}, std::size_t{16385}}) {
+            mfq::metal::detail::StagingVector<std::uint32_t> values(count, 0x12345678u);
+            values.reserve(count * 2);
+            require(values.front() == 0x12345678u && values.back() == 0x12345678u,
+                "staging allocator lost values across allocation boundaries");
+        }
+        struct alignas(128) AlignedValue { std::uint8_t data[128]; };
+        for (const std::size_t count : {std::size_t{1}, std::size_t{512}}) {
+            mfq::metal::detail::StagingVector<AlignedValue> values(count);
+            require(reinterpret_cast<std::uintptr_t>(values.data()) % alignof(AlignedValue) == 0,
+                "staging allocator lost over-aligned storage alignment");
+        }
+        mfq::metal::detail::MmapAllocator<std::uint32_t> allocator;
+        require(allocator.allocate(0) == nullptr, "zero-sized staging allocation is not empty");
+        bool rejected = false;
+        try { (void)allocator.allocate(allocator.max_size() + 1); }
+        catch (const std::bad_array_new_length&) { rejected = true; }
+        require(rejected, "overflowing staging allocation was not rejected");
         const auto dense =
             mfq::metal::load_dense_array("F32", dense_blob());
         const mfq::metal::MlxLinear linear(dense);

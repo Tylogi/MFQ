@@ -1,0 +1,22 @@
+.list-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 20px 0; min-width: 0; }
+.list-search { display: flex; flex: 0 1 320px; align-items: center; gap: 10px; min-width: 0; height: 42px; border: 1px solid var(--line); border-radius: 10px; padding: 0 12px; color: var(--muted-light); background: var(--surface-control); }
+.list-search:focus-within { border-color: var(--accent-border); }
+.list-search > svg { flex-shrink: 0; }
+.list-search input { width: 100%; min-width: 0; height: 100%; border: 0; padding: 0; outline: none; color: var(--ink-soft); background: transparent; font: inherit; font-size: 12px; }
+.list-search input::placeholder { color: var(--muted-light); }
+.list-filters { position: relative; flex-shrink: 0; }
+.list-filters > summary { display: flex; align-items: center; gap: 8px; min-height: 36px; border: 1px solid var(--line); border-radius: 9px; padding: 7px 11px; color: var(--muted); background: var(--surface-control); font-size: 12px; cursor: pointer; list-style: none; }
+.list-filters > summary::-webkit-details-marker { display: none; }
+.list-filters > summary > b { min-width: 15px; text-align: center; color: var(--accent); font-size: 11px; font-weight: 500; }
+.list-filters[open] > summary { border-color: var(--line-strong); color: var(--ink-soft); }
+.list-filter-fields { position: absolute; z-index: 20; inset: calc(100% + 8px) 0 auto auto; display: grid; gap: 16px; width: 260px; max-width: calc(100vw - 48px); padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-surface); box-shadow: 0 8px 28px rgb(0 0 0 / .08); }
+.list-filter-fields > label { display: grid; gap: 8px; min-width: 0; color: var(--muted); font-size: 11.5px; }
+.list-filter-fields select:not([multiple]):not([size]) { width: 100%; max-width: 100%; min-height: 36px; height: 36px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 30px 6px 12px; color: var(--ink-soft); background-color: var(--surface-control); font: inherit; font-size: 12px; }
+.list-filter-fields > button { justify-self: end; width: auto; min-height: 32px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; color: var(--muted); background: var(--surface-control); font: inherit; font-size: 11.5px; }
+.list-match-count { margin-left: auto; color: var(--muted-light); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.list-no-matches { padding: 24px 16px; color: var(--muted-light); font-size: 12px; text-align: center; }
+@media (max-width: 600px) {
+  .list-toolbar { gap: 10px; }
+  .list-search { flex: 1 1 100%; }
+  .list-filter-fields { inset-inline: 0 auto; }
+}

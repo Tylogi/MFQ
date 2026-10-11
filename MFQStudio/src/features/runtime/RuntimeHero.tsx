@@ -115,7 +115,7 @@ export function RuntimeHero() {
           <Icon name="folder" size={15} />
           {tr('模型', 'Models')}
         </button>
-        <button className={modelHero.state === 'ready' ? 'primary' : undefined} onClick={openChatPage} type="button">
+        <button className={modelHero.state === 'ready' ? 'primary runtime-hero-chat' : undefined} onClick={openChatPage} type="button">
           <Icon name="chat" size={15} />
           {tr('对话', 'Chat')}
         </button>

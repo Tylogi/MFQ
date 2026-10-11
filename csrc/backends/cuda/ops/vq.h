@@ -19,6 +19,13 @@ struct NvqWeight {
     mfq_tensor_backend::Tensor sub_scale_packed;
     mfq_tensor_backend::Tensor neuron_scale;
     mfq_tensor_backend::Tensor codebook;
+    // Optional decode-only int8 digits: NVQ1-L 8*v+delta, S 32*v+5*delta.
+    // Canonical books retain the dense/CPU and reference decode contract.
+    mfq_tensor_backend::Tensor integer_codebook;
+    // Complete NVQ1 GS24 records (S 4B, L 5B), aliasing indices_packed.
+    mfq_tensor_backend::Tensor decode_records;
+    // One byte-preserving group stream replaces indices/aux/states.
+    bool dense_groups = false;
     int64_t format = 0;
     int64_t kernel_format = 0;
     int64_t sign_mode = 0;
@@ -47,6 +54,9 @@ struct NvqWeight {
 };
 
 bool nvq_fusion_enabled(const CudaExecutionConfig& config);
+void prepare_nvq_integer_codebook(NvqWeight& weight);
+void prepare_nvq_decode_records(NvqWeight& weight,bool immutable=false);
+bool prepare_nvq_dense_groups(NvqWeight& weight);
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
     CudaProfiler& profiler,
     const NvqWeight& first,

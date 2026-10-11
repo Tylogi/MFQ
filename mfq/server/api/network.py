@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import ssl
 import urllib.request
 from collections.abc import Mapping
 from urllib.request import getproxies
@@ -115,8 +114,6 @@ def install_system_proxy_environment() -> None:
 
 
 async def download_environment(endpoint: str, *, direct: bool = False) -> tuple[dict[str, str], bool]:
-    import httpx
-
     environment = system_proxy_environment()
     direct_environment = dict(environment)
     for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
@@ -129,12 +126,4 @@ async def download_environment(endpoint: str, *, direct: bool = False) -> tuple[
     bypass = urllib.request.proxy_bypass_environment(parsed.hostname or "", {"no": environment["NO_PROXY"]})
     if direct or not proxy or bypass:
         return direct_environment, False
-    verify: ssl.SSLContext | bool = True
-    if environment.get("SSL_CERT_FILE") or environment.get("SSL_CERT_DIR"):
-        verify = ssl.create_default_context(cafile=environment.get("SSL_CERT_FILE"), capath=environment.get("SSL_CERT_DIR"))
-    try:
-        async with httpx.AsyncClient(trust_env=False, verify=verify, timeout=4.0) as client:
-            await client.head(endpoint)
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError):
-        return environment, True
-    return direct_environment, False
+    return environment, True

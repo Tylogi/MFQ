@@ -1,4 +1,5 @@
 #include "tensor_ops_common.cuh"
+#include "../kernels/mfq_native_matmul_rows.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +14,9 @@
 namespace mfq::cuda {
 using namespace native_ops_detail;
 namespace {
+thread_local std::int64_t preserving_gemm_rows=0;
+thread_local int preserving_gemm_streams=1;
+thread_local cublasHandle_t row_pipeline_handle=nullptr;
 cudaDataType_t cuda_data_type(ScalarType type) {
     switch (type) {
         case kFloat16: return CUDA_R_16F;
@@ -164,6 +168,55 @@ ParallelBatchMatmulContext& parallel_batch_matmul_context(int device) {
 
 }  // namespace
 
+MatmulRowsScope::MatmulRowsScope(std::int64_t rows,int streams):
+    previous_rows_(preserving_gemm_rows),previous_streams_(preserving_gemm_streams) {
+    preserving_gemm_rows=rows;
+    preserving_gemm_streams=std::clamp(streams,1,4);
+}
+MatmulRowsScope::~MatmulRowsScope() noexcept {
+    preserving_gemm_rows=previous_rows_;preserving_gemm_streams=previous_streams_;
+}
+
+void submit_parallel_rows(int device,std::int64_t begin,std::int64_t rows,
+        std::int64_t chunk,int streams,const std::function<void(std::int64_t,std::int64_t)>& submit) {
+    if(begin<0 || begin>rows || chunk<=0 || !submit || row_pipeline_handle)
+        throw std::invalid_argument("invalid or nested parallel row pipeline");
+    if(begin==rows)return;
+    DeviceGuard device_guard(device);
+    const auto main=current_stream(device).stream();
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(main,&capture));
+    if(capture!=cudaStreamCaptureStatusNone)
+        throw std::invalid_argument("parallel row pipeline requires eager prefill");
+    const int count=int(std::min<std::int64_t>(std::clamp(streams,1,4),(rows-begin+chunk-1)/chunk));
+    auto& parallel=parallel_batch_matmul_context(device);
+    std::lock_guard<std::mutex> lock(parallel.mutex);
+    parallel.ready.record(main);
+    for(int worker=0;worker<count;++worker)parallel.streams[worker].wait(parallel.ready);
+    struct HandleRestore {
+        cublasHandle_t previous=row_pipeline_handle;
+        ~HandleRestore(){row_pipeline_handle=previous;}
+    } restore;
+    try {
+        int iteration=0;
+        for(auto offset=begin;offset<rows;offset+=chunk,++iteration) {
+            const int worker=iteration%count;
+            const StreamGuard stream_guard(StreamHandle(device,parallel.streams[worker].get()));
+            row_pipeline_handle=parallel.handles[worker].get();
+            submit(offset,std::min(chunk,rows-offset));
+        }
+    } catch(...) {
+        // Keep input/cache lifetimes valid if host allocation or submission
+        // fails after another worker has already begun reading those tensors.
+        for(int worker=0;worker<count;++worker)(void)cudaStreamSynchronize(parallel.streams[worker].get());
+        throw;
+    }
+    for(int worker=0;worker<count;++worker) {
+        parallel.done[worker].record(parallel.streams[worker].get());
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(main,parallel.done[worker].get(),0));
+    }
+}
+
 Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
     if (!left_source.defined() || !right_source.defined() ||
         !left_source.is_cuda() || !right_source.is_cuda()) {
@@ -208,8 +261,8 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
     DeviceGuard guard(left.get_device());
     auto context = default_context(left.get_device());
     const auto stream = current_stream(left.get_device()).stream();
-    context->blas().set_stream(stream);
-    const auto handle = context->blas().get();
+    if(!row_pipeline_handle)context->blas().set_stream(stream);
+    const auto handle = row_pipeline_handle?row_pipeline_handle:context->blas().get();
     const auto data_type = cuda_data_type(left.scalar_type());
 
     const bool left_row_major = left.stride(-1) == 1;
@@ -228,6 +281,34 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
         output.zero_();
         if (left_vector) output = output.squeeze(-2);
         if (right_vector) output = output.squeeze(-1);
+        return output;
+    }
+    if(!row_pipeline_handle && preserving_gemm_rows>8 && rows>preserving_gemm_rows && batches==1 &&
+            left_row_major && left.scalar_type()!=kFloat64) {
+        auto& parallel=parallel_batch_matmul_context(left.get_device());
+        std::lock_guard<std::mutex> lock(parallel.mutex);
+        parallel.ready.record(stream);
+        const int workers=preserving_gemm_streams;
+        for(int worker=0;worker<workers;++worker)parallel.streams[worker].wait(parallel.ready);
+        const float alpha=1.f,beta=0.f;
+        std::int64_t chunk=0;
+        for(std::int64_t begin=0;begin<rows;begin+=preserving_gemm_rows,++chunk) {
+            const int count=int(std::min(preserving_gemm_rows,rows-begin));
+            const auto* input=static_cast<const std::byte*>(left.data_ptr())+
+                begin*left.stride(-2)*left.element_size();
+            auto* destination=static_cast<std::byte*>(output.data_ptr())+
+                begin*columns*output.element_size();
+            MFQ_NATIVE_CUDA_CHECK(cublasGemmEx(parallel.handles[chunk%workers].get(),
+                right_operation,left_operation,int(columns),count,int(contraction),
+                &alpha,right.data_ptr(),data_type,right_leading,
+                input,data_type,left_leading,&beta,destination,data_type,int(columns),
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+        }
+        for(int worker=0;worker<workers;++worker) {
+            parallel.done[worker].record(parallel.streams[worker].get());
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(stream,parallel.done[worker].get(),0));
+        }
+        if(right_vector)output=output.squeeze(-1);
         return output;
     }
     const auto left_batch_stride = regular_batch_stride(left, batch_shape);
@@ -258,7 +339,7 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
         std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL");
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool parallel_batch_eligible =
-        batches >= static_cast<std::int64_t>(
+        !row_pipeline_handle && batches >= static_cast<std::int64_t>(
             ParallelBatchMatmulContext::kStreams) &&
         rows >= 32 &&
         (parallel_batch_disabled == nullptr ||

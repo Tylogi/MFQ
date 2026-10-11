@@ -16,10 +16,22 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <system_error>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <cerrno>
 #endif
 
 namespace mfq {
@@ -29,6 +41,75 @@ constexpr std::uint64_t kMaxStringBytes = std::uint64_t{64} << 20;
 constexpr std::uint32_t kMaxMetadataEntries = std::uint32_t{1} << 16;
 constexpr std::uint32_t kMaxRecordEntries = std::uint32_t{1} << 20;
 constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
+
+class MappedTensorRange {
+    void* view_=nullptr;
+    std::size_t mapped_bytes_=0,prefix_=0;
+    std::uint64_t bytes_=0;
+#ifdef _WIN32
+    HANDLE file_=INVALID_HANDLE_VALUE,mapping_=nullptr;
+#else
+    int file_=-1;
+#endif
+    void close() noexcept {
+#ifdef _WIN32
+        if(view_)UnmapViewOfFile(view_);
+        if(mapping_)CloseHandle(mapping_);
+        if(file_!=INVALID_HANDLE_VALUE)CloseHandle(file_);
+#else
+        if(view_)::munmap(view_,mapped_bytes_);
+        if(file_>=0)::close(file_);
+#endif
+    }
+public:
+    explicit MappedTensorRange(const MfqStoredRecord& record):bytes_(record.tensor.nbytes) {
+        if(!bytes_)return;
+        try {
+            std::uint64_t granularity=0,file_bytes=0;
+#ifdef _WIN32
+            file_=CreateFileW(record.source_path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_RANDOM_ACCESS,nullptr);
+            if(file_==INVALID_HANDLE_VALUE)throw std::system_error(GetLastError(),std::system_category(),"open mapped tensor");
+            LARGE_INTEGER size{};
+            if(!GetFileSizeEx(file_,&size) || size.QuadPart<0)throw std::runtime_error("mapped tensor file size unavailable");
+            file_bytes=static_cast<std::uint64_t>(size.QuadPart);
+            SYSTEM_INFO info{};GetSystemInfo(&info);granularity=info.dwAllocationGranularity;
+#else
+            file_=::open(record.source_path.c_str(),O_RDONLY);
+            if(file_<0)throw std::system_error(errno,std::generic_category(),"open mapped tensor");
+            struct stat size{};
+            if(::fstat(file_,&size) || size.st_size<0)throw std::runtime_error("mapped tensor file size unavailable");
+            file_bytes=static_cast<std::uint64_t>(size.st_size);
+            const auto page=::sysconf(_SC_PAGESIZE);
+            if(page<=0)throw std::runtime_error("mapped tensor page size unavailable");
+            granularity=static_cast<std::uint64_t>(page);
+#endif
+            if(record.offset>file_bytes || bytes_>file_bytes-record.offset)throw std::out_of_range("mapped tensor exceeds file");
+            const auto base=record.offset/granularity*granularity;
+            prefix_=static_cast<std::size_t>(record.offset-base);
+            if(bytes_>std::numeric_limits<std::size_t>::max()-prefix_)throw std::overflow_error("mapped tensor exceeds address space");
+            mapped_bytes_=prefix_+static_cast<std::size_t>(bytes_);
+#ifdef _WIN32
+            mapping_=CreateFileMappingW(file_,nullptr,PAGE_READONLY,0,0,nullptr);
+            if(!mapping_)throw std::system_error(GetLastError(),std::system_category(),"create tensor mapping");
+            view_=MapViewOfFile(mapping_,FILE_MAP_READ,static_cast<DWORD>(base>>32),static_cast<DWORD>(base),mapped_bytes_);
+            if(!view_)throw std::system_error(GetLastError(),std::system_category(),"map tensor view");
+#else
+            if(base>static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))throw std::overflow_error("mapped tensor offset exceeds platform range");
+            view_=::mmap(nullptr,mapped_bytes_,PROT_READ,MAP_SHARED,file_,static_cast<off_t>(base));
+            if(view_==MAP_FAILED){view_=nullptr;throw std::system_error(errno,std::generic_category(),"map tensor view");}
+#endif
+        }catch(...){close();throw;}
+    }
+    ~MappedTensorRange(){close();}
+    MappedTensorRange(const MappedTensorRange&)=delete;
+    MappedTensorRange& operator=(const MappedTensorRange&)=delete;
+    void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
+        if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
+        if(!size)return;
+        if(!destination)throw std::invalid_argument("mapped tensor destination is null");
+        std::memcpy(destination,static_cast<const std::byte*>(view_)+prefix_+static_cast<std::size_t>(offset),size);
+    }
+};
 
 std::filesystem::path stable_path(const std::filesystem::path& path) {
     std::error_code error;
@@ -552,6 +633,18 @@ ModelSource::TensorReader MfqModelSource::tensor_reader(std::string_view name) c
         range->stream.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(size));
         if (!range->stream) throw std::runtime_error("MFQ row source was truncated");
     };
+}
+
+ModelSource::TensorReader MfqModelSource::mapped_tensor_reader(std::string_view name) const {
+    auto found=impl_->records_by_name.find(std::string(name));
+    if(found==impl_->records_by_name.end()) {
+        const auto alias=impl_->legacy_tensor_compatibility.canonical_to_stored.find(std::string(name));
+        if(alias!=impl_->legacy_tensor_compatibility.canonical_to_stored.end())found=impl_->records_by_name.find(alias->second);
+    }
+    if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
+        throw std::runtime_error("mapped model tensor not found: "+std::string(name));
+    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    return [range](std::uint64_t offset,std::byte* destination,std::size_t size){range->read(offset,destination,size);};
 }
 
 bool MfqModelSource::supports_parallel_tensor_reads() const noexcept {

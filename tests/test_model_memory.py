@@ -11,19 +11,26 @@ def test_flash_next_profile_includes_gdn_ple_and_qsa_index_caches():
               'ngram_size': 3, 'hc_count': 4, 'hidden_size': 2560}
     config['layer_types'] *= 12
     profile = cache_profile(config)
-    assert profile.fixed_bytes == 36 * (48 * 128 * 128 + 3 * 10240) * 4 + 9 * 10240 * 4
-    assert [component.bytes_per_row for component in profile.components] == [24576, 3072, 6144]
-    assert [component.tokens_per_row for component in profile.components] == [1, 1, 4]
+    tail = 12 * (9 * 128 * 2 + 2)
+    assert profile.fixed_bytes == 36 * (48 * 128 * 128 + 3 * 10240) * 4 + 9 * 10240 * 4 + tail
+    assert [component.bytes_per_row for component in profile.components] == [24576, 6144]
+    assert [component.tokens_per_row for component in profile.components] == [1, 4]
     assert all(component.allocation == 'power_of_two' and component.minimum_rows == 16 for component in profile.components)
     assert sum(item.bytes for item in profile.fixed_components) == profile.fixed_bytes
-    assert [item.name for item in profile.components] == ['raw_kv', 'indexer_key', 'indexer_pooled']
+    assert [item.name for item in profile.components] == ['raw_kv', 'indexer_pooled']
     assert profile.components[-1].row_rounding == 'floor'
-    assert profile.components[-1].active_after == 2048
+    assert profile.components[-1].active_after == 0
     kv = cache_profile(config, include_recurrent=False)
-    assert kv.fixed_bytes == 0 and kv.fixed_components == []
+    assert kv.fixed_bytes == tail and [item.name for item in kv.fixed_components] == ['indexer_tail']
     assert {item.group for item in kv.components} == {'QSA'}
     assert kv.components == profile.components
     assert cache_profile({'text_config': config}) == profile
+    assert profile.components[0].max_read_rows_per_token is None
+    for selected in (1024, 2048, 4096):
+        selected_profile = cache_profile({**config, 'indexer_budget': selected}, predictor_layers=1)
+        raw = selected_profile.components[0]
+        assert raw.max_read_rows_per_token == selected
+        assert raw.bytes_per_row * selected == 13 * 2048 * selected
 
 
 def test_deepseek_compressed_latents_are_not_double_counted_as_full_k_and_v():
@@ -42,6 +49,7 @@ def test_regular_gqa_uses_kv_heads_and_two_byte_storage():
                              'num_key_value_heads': 8, 'hidden_size': 4096, 'max_position_embeddings': 8192})
     assert profile.fixed_bytes == 0
     assert profile.components[0].bytes_per_row == 32 * 8 * 128 * 2 * 2
+    assert profile.components[0].max_read_rows_per_token is None
 
 
 def test_incomplete_unknown_and_invalid_configs_do_not_fabricate_cache_estimates():

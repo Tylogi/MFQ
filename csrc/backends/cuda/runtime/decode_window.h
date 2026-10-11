@@ -11,6 +11,7 @@ namespace mfq::cuda {
 void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout_ms=60000);
 void publish_mapped_flag(uint32_t* flag) noexcept;
 void check_stream_progress(cudaStream_t stream);
+void check_route_submission(cudaStream_t stream);
 // A captured window submits the model once. Each expert operator records its
 // GPU body and supplies the corresponding host task; replay serves those tasks
 // in graph order without launching a graph or synchronizing at every layer.

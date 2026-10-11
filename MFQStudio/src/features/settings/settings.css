@@ -63,7 +63,7 @@
 .settings-range + .settings-range { border-top: 1px solid var(--line-soft); padding-top: 14px; }
 .settings-range > span { display: flex; justify-content: space-between; gap: 14px; }
 .settings-range output { color: var(--ink-soft); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.settings-range input { width: 100%; accent-color: var(--accent); }
+.settings-range input { width: 100%; accent-color: var(--bar-fill); }
 .settings-inline-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; border-top: 1px solid var(--line-soft); padding-top: 14px; }
 .settings-inline-fields label { display: grid; gap: 6px; }
 .settings-number-input { width: 112px !important; text-align: right; }

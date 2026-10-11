@@ -714,7 +714,7 @@ class StdioRuntimeClient:
                     f"unexpected stdio response for {op}: {frame_type!r}"
                 )
             return frame["data"]
-        except TimeoutError as error:
+        except asyncio.TimeoutError as error:
             with suppress(Exception):
                 await self._notify("request.cancel", {"target_id": request_id})
             raise BackendError("backend_timeout", f"stdio {op} timed out", retryable=True) from error

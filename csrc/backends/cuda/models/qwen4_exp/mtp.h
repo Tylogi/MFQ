@@ -8,6 +8,7 @@ namespace mfq::cuda::qwen4_exp {
 using attention_ops::Linear;
 struct Gr;
 struct Qwen4Block;
+struct Qwen4MtpGraph;
 
 struct Qwen4ExpMtp final : MtpModule {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -21,6 +22,11 @@ struct Qwen4ExpMtp final : MtpModule {
     std::vector<int64_t> lengths;
     CudaExecutionContext *execution = nullptr;
     int64_t batch = 0;
+    std::unique_ptr<Qwen4MtpGraph> graph_registry;
+    uint64_t graph_replays = 0;
+    bool graph_initialized = false;
+    bool take_graph_initialization() noexcept override { return std::exchange(graph_initialized,false); }
+    uint64_t graph_replay_count() const noexcept override { return graph_replays; }
 
     Qwen4ExpMtp();
     ~Qwen4ExpMtp() override;

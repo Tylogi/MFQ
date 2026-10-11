@@ -171,6 +171,7 @@ struct MlxMtpEngineCallbacks {
     std::function<void(const MlxMtpDraftContext&)> committed_target;
     mfq::engine::mtp::PolicyState* policy_state = nullptr;
     std::function<MlxMtpTargetBatch(std::int32_t)> decode_target;
+    std::function<void(const mlx::core::array&, int, double)> verified_round;
 
 };
 

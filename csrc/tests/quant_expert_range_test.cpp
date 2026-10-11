@@ -1,4 +1,5 @@
 #include "mfq/mfe_quant_expert_store.h"
+#include "mfq/packed_nint_expert_store.h"
 #include "mfq/model_source.h"
 #include "nint_row_fixture.h"
 
@@ -74,6 +75,30 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
         }};
 }
 void self_test() {
+    const auto flat = mfq::test::fixture(52, 53, 5, 6).blob;
+    auto packed = std::make_shared<std::vector<std::uint8_t>>(flat.begin(), flat.begin() + 14);
+    mfq::test::append<std::uint32_t>(*packed, 3);
+    for (std::int64_t dimension : {4, 13, 53}) mfq::test::append<std::int64_t>(*packed, dimension);
+    packed->insert(packed->end(), flat.begin() + 34, flat.end());
+    auto packed_reads = std::make_shared<std::size_t>(0);
+    auto read_packed = [packed, packed_reads](std::size_t offset, std::uint8_t* out, std::size_t count) {
+        require(offset <= packed->size() && count <= packed->size() - offset, "packed NINT read exceeded source");
+        *packed_reads += count;
+        std::memcpy(out, packed->data() + offset, count);
+    };
+    const auto packed_store = mfq::make_packed_nint_expert_store(packed->size(), read_packed);
+    require(packed_store->num_experts() == 4 && packed_store->out_per_expert() == 13 && packed_store->neuron_len() == 53,
+        "packed NINT expert geometry changed");
+    require(*packed_reads < packed->size() / 4, "packed NINT index read weight payloads");
+    mfq::NintRows flat_rows(flat.data(), flat.size());
+    for (int expert = 0; expert < 4; ++expert)
+        require(packed_store->read_expert(expert).payload == flat_rows.slice_rows_blob(expert * 13, (expert + 1) * 13),
+            "packed NINT expert bytes changed");
+    rejected([&] { mfq::make_packed_nint_expert_store(49, read_packed); });
+    (*packed)[14] = 2;
+    rejected([&] { mfq::make_packed_nint_expert_store(packed->size(), read_packed); });
+    (*packed)[14] = 3;
+
     const auto original=mixed();
     auto bytes=std::make_shared<std::atomic<std::size_t>>(0);
     const auto store=memory_store(original,bytes);

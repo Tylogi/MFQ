@@ -261,7 +261,8 @@ struct HfSafetensorsSource::Impl {
 
 HfSafetensorsSource::HfSafetensorsSource(
     std::filesystem::path requested_root,
-    std::unordered_map<std::string, std::string> canonical_to_source)
+    std::unordered_map<std::string, std::string> canonical_to_source,
+    std::string source_prefix)
     : impl_(std::make_unique<Impl>()) {
     std::error_code error;
     impl_->root = std::filesystem::canonical(std::move(requested_root), error);
@@ -283,6 +284,7 @@ HfSafetensorsSource::HfSafetensorsSource(
                 index_path.string());
         }
         for (const auto& [name, shard] : weight_map->items()) {
+            if (!source_prefix.empty() && name.rfind(source_prefix, 0) != 0) continue;
             if (!shard.is_string()) {
                 throw std::runtime_error(
                     "Safetensors weight_map value is not a string: " + name);
@@ -353,6 +355,7 @@ HfSafetensorsSource::HfSafetensorsSource(
             }
         }
         for (const auto& name : names) {
+            if (!source_prefix.empty() && name.rfind(source_prefix, 0) != 0) continue;
             const auto found = metadata.find(name);
             if (found == metadata.end() || !found->is_object()) {
                 throw std::runtime_error(

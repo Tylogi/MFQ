@@ -187,7 +187,9 @@ struct Call {
             const auto selected=ids.to(tb::kCPU).contiguous();
             for(int t=0;t<tokens;++t)for(int r=0;r<routes;++r) {
                 const int e=selected.data_ptr<int32_t>()[t*routes+r];if(e<0 || e>=experts)continue;
-                exact(f.narrow(0,t,1).narrow(1,r,1),oracle_hidden.narrow(0,t,1).narrow(1,r,1),label+" activation");
+                exact(f.narrow(0,t,1).narrow(1,r,1),oracle_hidden.narrow(0,t,1).narrow(1,r,1),
+                    label+" activation token="+std::to_string(t)+" route="+std::to_string(r)+" expert="+std::to_string(e)+
+                    " up_nint_gs="+std::to_string(e<bank.groups*3?bank.projections[1].pools[e/3].nint.gs:-1));
             }
         }
     }
@@ -224,7 +226,9 @@ public:
             const char* name=nullptr;MFQ_CUDA_CHECK(cudaFuncGetName(&name,params.func));if(!name)continue;
             cudaFuncAttributes attrs{};MFQ_CUDA_CHECK(cudaFuncGetAttributes(&attrs,params.func));
             if(std::strstr(name,"mfe_ffn_prepare_kernel"))++prepare;
-            if(std::strstr(name,"mfe_ffn_gate_up_kernel")){++first;stage1_registers=attrs.numRegs;stage1_local=int(attrs.localSizeBytes);}
+            if(std::strstr(name,"mfe_ffn_gate_up_kernel") || std::strstr(name,"mfe_ffn_parallel_gate_up_kernel")) {
+                ++first;stage1_registers=attrs.numRegs;stage1_local=int(attrs.localSizeBytes);
+            }
             if(std::strstr(name,"mfe_ffn_down_reduce_kernel")) {
                 ++second;stage2_registers=attrs.numRegs;stage2_local=int(attrs.localSizeBytes);
                 stage2_warps=int(params.blockDim.y);

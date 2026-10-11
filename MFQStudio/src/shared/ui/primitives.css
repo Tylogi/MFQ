@@ -43,10 +43,11 @@ button.studio-switch:disabled {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: var(--on-accent);
+  background: #ffffff;
   transition: transform 120ms ease;
 }
 .studio-switch-thumb[data-state='checked'] {
+  background: var(--on-accent);
   transform: translateX(12px);
 }
 @media (prefers-reduced-motion: reduce) {

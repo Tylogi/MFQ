@@ -1,4 +1,5 @@
 #pragma once
+namespace mfq::cuda { class KvOffloadStore; }
 
 #include "../native/tensor_backend.h"
 #include "tensor_parallel.h"
@@ -227,7 +228,7 @@ struct CudaExecutionConfig {
     bool decode_branch_parallel = true;
     bool tensor_parallel_shard_native_float = false;
     bool nvq_fusion = true;
-    bool nvq2_exec = true;
+    bool nvq2_exec = false;
     bool nvq_extended_group_exec = false;
     bool moe_nvq_heterogeneous = true;
     bool moe_nvq_heterogeneous_decode = true;
@@ -344,6 +345,7 @@ struct CudaExecutionContext {
     LayerPlacementConfig layer_placement;
     // Engine-owned load resource; cached model/MTP weights share its lifetime.
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
+    std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
     void reset() noexcept;

@@ -427,7 +427,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         const auto* ids = global_ids.data<std::int32_t>();
         std::vector<std::int32_t> active;
         active.reserve(global_ids.size());
-        std::vector<std::uint8_t> seen(
+        std::vector<std::uint32_t> seen(
             static_cast<std::size_t>(experts_), 0);
         for (std::size_t index = 0; index < global_ids.size(); ++index) {
             const auto expert = ids[index];
@@ -439,9 +439,9 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                     "DeepSeek-V4.1 routed expert ID is out of range");
             }
             if (seen[static_cast<std::size_t>(expert)] == 0) {
-                seen[static_cast<std::size_t>(expert)] = 1;
                 active.push_back(expert);
             }
+            ++seen[static_cast<std::size_t>(expert)];
         }
         if (active.empty()) {
             throw std::runtime_error(
@@ -458,12 +458,14 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 global_to_local.begin(),
                 Shape{static_cast<int>(global_to_local.size())}),
             global_ids + array(1, mlx::core::int32));
+        std::vector<std::uint32_t> activation_counts;
+        for (const auto expert : active) activation_counts.push_back(seen[expert]);
         auto gate = mfe_offload_cache_->grouped_mfe(
-            streamed_gate_up_name_, active);
+            streamed_gate_up_name_, active, activation_counts);
         array routed_hidden = [&]() {
             if (streamed_up_name_) {
                 auto up = mfe_offload_cache_->grouped_mfe(
-                    *streamed_up_name_, active);
+                    *streamed_up_name_, active, activation_counts);
                 return gate.routed_swiglu_pair(
                     up, source, local_ids, swiglu_limit_);
             }
@@ -471,7 +473,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 source, local_ids, swiglu_limit_);
         }();
         auto down = mfe_offload_cache_->grouped_mfe(
-            streamed_down_name_, active);
+            streamed_down_name_, active, activation_counts);
         routed = down.routed_matmul_reduce(
             routed_hidden,
             local_ids,

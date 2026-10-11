@@ -326,7 +326,7 @@ void MlxQwen35FullAttentionBlock::reset_cache(
             config_.max_position_embeddings,
             "max_position_embeddings"),
         checked_int(config_.head_dim, "head_dim"),
-        capacity);
+        capacity, mlx::core::float16, true);
     cache_batch_ = batch;
 }
 
@@ -558,36 +558,39 @@ array MlxQwen35FullAttentionBlock::forward_impl(
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
             config_.rope_sections,
-            config_.mrope_interleaved);
+            config_.mrope_interleaved, config_.yarn);
         key = apply_rope(
             key,
             *positions,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
             config_.rope_sections,
-            config_.mrope_interleaved);
+            config_.mrope_interleaved, config_.yarn);
     } else {
         query = apply_rope(
             query,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            position_offset);
+            position_offset, config_.yarn);
         key = apply_rope(
             key,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            position_offset);
+            position_offset, config_.yarn);
     }
 
     array key_cache = key;
     array value_cache = value;
     if (use_cache) {
-        auto cached = cache_->append(key, value);
-        key_cache = std::move(cached.first);
-        value_cache = std::move(cached.second);
+        cache_->append_only(key, value);
+        if (!cache_->quantized()) {
+            auto cached = cache_->view();
+            key_cache = std::move(cached.first);
+            value_cache = std::move(cached.second);
+        }
     }
 
-    auto attended = scaled_dot_product_attention(
+    auto attended = use_cache && cache_->quantized() ? cache_->attention(query) : scaled_dot_product_attention(
         query,
         key_cache,
         value_cache,

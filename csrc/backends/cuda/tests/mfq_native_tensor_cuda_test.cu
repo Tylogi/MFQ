@@ -1,5 +1,7 @@
 #include "../native/context.h"
 #include "../native/tensor.h"
+#include "../kernels/mfq_native_matmul_rows.h"
+#include <cstring>
 
 #include <cuda_runtime_api.h>
 
@@ -54,9 +56,10 @@ void set_test_environment(const char* name, const char* value) {
 #endif
 }
 
+#include "matmul_rows_test.h"
 }  // namespace
 
-int main() try {
+int main(int argc,char** argv) try {
     int devices = 0;
     const auto device_status = cudaGetDeviceCount(&devices);
     if (device_status != cudaSuccess || devices == 0) {
@@ -66,6 +69,13 @@ int main() try {
 
     using namespace mfq::cuda;
     const Device cuda_device{DeviceType::cuda, 0};
+    if(argc==2 && std::string(argv[1])=="--matmul-rows-check") {
+        verify_matmul_rows();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--parallel-row-chain-check") {
+        verify_parallel_row_chains();return 0;
+    }
+    if(argc!=1)throw std::invalid_argument("unknown native tensor check");
 
     auto empty_host_blob = from_blob(
         static_cast<void*>(nullptr), {0}, TensorOptions{}.dtype(kFloat32));

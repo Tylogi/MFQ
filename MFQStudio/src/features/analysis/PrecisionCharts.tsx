@@ -26,7 +26,7 @@ export function ExpertHeatmap({ analysis, projection, range, tr }: {
     if (!context) return;
     element.width = Math.max(1, analysis.expert_count * 2);
     element.height = Math.max(1, analysis.layer_count * rowHeight);
-    context.fillStyle = '#e9edf2';
+    context.fillStyle = '#e9e7e3';
     context.fillRect(0, 0, element.width, element.height);
     for (const item of points.values()) {
       context.fillStyle = precisionColor(item.bpw, ...range);

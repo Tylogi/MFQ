@@ -1,96 +1,46 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useRuntime } from '../src/app/RuntimeProvider';
-import { ModelContextSettings } from '../src/features/runtime/ModelContextSettings';
-import { MemorySettingsPanel } from '../src/features/connections/MemorySettingsPanel';
-import { toast } from '../src/stores/toastStore';
-import type { RuntimeInstance, RuntimeStatus } from '../src/shared/api/types';
+import { useSettings } from '../src/features/settings/SettingsProvider';
+import { DEFAULT_SETTINGS } from '../src/features/settings/configuration';
+import { SettingsRoute } from '../src/features/settings/SettingsRoute';
+import { runtimeApi } from '../src/shared/api/resources/runtime';
+import { studioConfirm } from '../src/studio';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
-vi.mock('../src/stores/toastStore', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
-vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({
-  contextSize: 32768, setContextSize: vi.fn(), tr: (_zh: string, en: string) => en,
-}) }));
+vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: vi.fn() }));
+vi.mock('../src/shared/api/resources/runtime', () => ({ runtimeApi: { reloadRuntime: vi.fn() } }));
+vi.mock('../src/studio', () => ({ studioConfirm: vi.fn() }));
+vi.mock('../src/features/chat/hooks/useActiveSessionMode', () => ({ useActiveSessionMode: () => 'text' }));
+vi.mock('../src/features/settings/useGenerationPresets', () => ({
+  useGenerationPresets: () => ({ presets: [], setPresets: vi.fn(), clearSelection: vi.fn(), manager: null }),
+}));
 
-const reloadModelContext = vi.fn();
-const instances = [
-  { id: 'flash', model: 'Qwen3.8-Flash-S4-L', state: 'ready', context_size: 32768, context_capacity: 131072,
-    memory: { resident_weight_bytes: 78.6 * 2 ** 30 } },
-  { id: 'dense', model: 'Qwen3.8-27B-S4-M', state: 'ready', context_size: 16384, context_capacity: 262144,
-    memory: { resident_weight_bytes: 17.7 * 2 ** 30 } },
-] as RuntimeInstance[];
-const state = (patch = {}) => ({
-  runtime: { instance_id: 'dense', model: instances[1].model, mlx_active_bytes: 17.7 * 2 ** 30 },
-  instances, reloadingInstances: {}, reloadModelContext, ...patch,
-} as unknown as ReturnType<typeof useRuntime>);
+const refreshRuntime = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
-  reloadModelContext.mockResolvedValue({ max_context: 8192 });
-  vi.mocked(useRuntime).mockReturnValue(state());
+  refreshRuntime.mockResolvedValue(true);
+  vi.mocked(useSettings).mockReturnValue({
+    settings: { ...DEFAULT_SETTINGS, inheritModelDefaults: false },
+    contextSize: 8192, setContextSize: vi.fn(), replaceSettings: vi.fn(),
+    tr: (_zh: string, en: string) => en,
+  } as unknown as ReturnType<typeof useSettings>);
+  vi.mocked(useRuntime).mockReturnValue({
+    runtime: { instance_id: 'chosen-instance', context_capacity: 32768 },
+    realtime: null, selectedModel: 'chosen-model', studio: null,
+    ready: true, refreshRuntime, instances: [], capabilities: null,
+  } as unknown as ReturnType<typeof useRuntime>);
 });
 
-it('同时展示每个模型的独立 ctx 和架构上限', () => {
-  render(<ModelContextSettings />);
-  expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' })).toHaveValue(32768);
-  expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveValue(16384);
-  expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' })).toHaveAttribute('max', '131072');
-  expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveAttribute('max', '262144');
-});
-
-it('点击直接重载指定模型，刷新和模型选择变化不覆盖另一个 ctx 草稿', async () => {
-  const user = userEvent.setup();
-  const view = render(<ModelContextSettings />);
-  const flash = screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' });
-  fireEvent.change(flash, { target: { value: '8192' } });
-  fireEvent.change(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' }), { target: { value: '65536' } });
-  await user.click(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }));
-  expect(reloadModelContext).toHaveBeenCalledExactlyOnceWith('flash', 8192);
-  vi.mocked(useRuntime).mockReturnValue(state({ runtime: { instance_id: 'flash', max_context: 8192 } }));
-  view.rerender(<ModelContextSettings />);
-  expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveValue(65536);
-});
-
-it('重载中立即显示状态，只禁用对应模型，完成后显示实际 ctx', async () => {
-  let complete!: (result: RuntimeStatus) => void;
-  reloadModelContext.mockReturnValue(new Promise((resolve) => { complete = resolve; }));
-  const view = render(<ModelContextSettings />);
-  fireEvent.click(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }));
-  vi.mocked(useRuntime).mockReturnValue(state({ reloadingInstances: { flash: 32768 } }));
-  view.rerender(<ModelContextSettings />);
-  expect(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toBeDisabled();
-  expect(screen.getByText('Reloading…')).toBeVisible();
-  expect(screen.getByRole('button', { name: 'Reload Qwen3.8-27B-S4-M' })).toBeEnabled();
-  await act(async () => { complete({ max_context: 16384 }); });
-  await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' })).toHaveValue(16384));
-});
-
-it.each(['', '0', '512.5', '131073'])('无效 ctx %s 不发送重载请求', (value) => {
-  render(<ModelContextSettings />);
-  fireEvent.change(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' }), { target: { value } });
-  expect(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toBeDisabled();
-  expect(reloadModelContext).not.toHaveBeenCalled();
-});
-
-it('模型总驻留汇总两个实例，不随当前模型变成单个模型大小', () => {
-  render(<MemorySettingsPanel />);
-  const row = screen.getByText(/Current weight residency/).closest('.memory-budget-actions')!;
-  expect(row).toHaveTextContent('96.3');
-  expect(row).not.toHaveTextContent('17.7');
-});
-
-it.each(['success', 'failure'])('does not show a stale context reload %s after leaving settings', async (result) => {
-  let resolve!: (value: RuntimeStatus) => void;
-  let reject!: (cause: Error) => void;
-  reloadModelContext.mockReturnValueOnce(new Promise((done, fail) => { resolve = done; reject = fail; }));
-  const view = render(<ModelContextSettings />);
-  fireEvent.click(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }));
-  view.unmount();
-  await act(async () => {
-    if (result === 'success') resolve({ max_context: 8192 });
-    else reject(new Error('Old server failed'));
-  });
-  expect(toast.success).not.toHaveBeenCalled();
-  expect(toast.error).not.toHaveBeenCalled();
+it('keeps context editing in service management instead of duplicating it in settings', () => {
+  render(<MemoryRouter><SettingsRoute /></MemoryRouter>);
+  expect(screen.queryByText('Context', { exact: true })).not.toBeInTheDocument();
+  expect(screen.queryByRole('spinbutton', { name: 'Global context cap' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reload model with this context' })).not.toBeInTheDocument();
+  expect(screen.getByText('Appearance', { exact: true })).toBeInTheDocument();
+  expect(studioConfirm).not.toHaveBeenCalled();
+  expect(runtimeApi.reloadRuntime).not.toHaveBeenCalled();
+  expect(refreshRuntime).not.toHaveBeenCalled();
 });

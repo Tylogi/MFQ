@@ -6,6 +6,7 @@ import json
 import math
 import os
 import socket
+import struct
 import subprocess
 import time
 import urllib.error
@@ -20,7 +21,8 @@ from mfq.formats.assets import (
     MODEL_CONFIG_ASSET,
     TOKENIZER_GGUF_ASSET,
 )
-from mfq.formats.io import open_mmap
+from mfq.formats.io import inspect_mfe_header, open_mmap
+from mfq.server.state.model_weights import weight_role
 from mfq.server.runtime.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
@@ -33,6 +35,38 @@ class NativeRuntimeError(RuntimeError):
 
 
 _NATIVE_DEFAULT_PREFILL_CHUNK_SIZE = 2048
+
+
+def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
+    """Inspect expert headers without decoding or copying their weight payloads."""
+    found = False
+    try:
+        with open_mmap(model) as store:
+            for name, record in store.records.items():
+                if weight_role(name) != "experts":
+                    continue
+                if record.dtype == "NINT":
+                    view = store.blob_view(record)
+                    try:
+                        if len(view) < 50 or struct.unpack_from("<I", view, 14)[0] != 3:
+                            return False
+                    finally:
+                        view.release()
+                    found = True
+                    continue
+                if record.dtype != "MFE":
+                    return False
+                view = store.blob_view(record)
+                try:
+                    _, pools = inspect_mfe_header(view)
+                    if any(pool.dtype not in {"NINT", "NVQ", "NPQ"} for pool in pools):
+                        return False
+                finally:
+                    view.release()
+                found = True
+    except (OSError, ValueError):
+        return False
+    return found
 
 
 def append_native_prefill_chunk_override(
@@ -114,8 +148,6 @@ def native_tokenizer_arguments(model: str | Path, backend: str) -> list[str]:
     if model_path.is_dir():
         tokenizer = ensure_hf_tokenizer_gguf(model_path)
     elif model_path.is_file():
-        if backend != "metal":
-            return []
         with open_mmap(model_path) as store:
             has_embedded_tokenizer = (
                 TOKENIZER_GGUF_ASSET in store.records

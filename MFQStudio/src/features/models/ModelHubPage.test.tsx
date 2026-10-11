@@ -46,7 +46,25 @@ it('keeps a submitted download on this page, animates into the circle and opens 
   fireEvent.click(screen.getByRole('button', { name: 'Download queue' }));
   expect(screen.getByRole('tab', { name: 'Download queue' })).toHaveAttribute('aria-selected', 'true');
   expect(screen.getByText(source.repo_id)).toBeInTheDocument();
+  expect(container.querySelector('.download-item-heading strong')).toHaveTextContent('S4');
   expect(screen.getByText('Queued')).toBeInTheDocument();
+});
+
+it('distinguishes two precisions of one repository by their file paths and lists all shards', () => {
+  const first = 'S2-L/model-00001-of-00002.mfq';
+  const second = 'S2-L/model-00002-of-00002.mfq';
+  const other = 'V4-XS/model-00001-of-00002.mfq';
+  useJobStore.getState().setJobs([
+    { ...download('s2'), payload: { ...download().payload, include: [first, second, '*.json', 'tokenizer*'] } },
+    { ...download('v4'), payload: { ...download().payload, include: [other, 'V4-XS/model-00002-of-00002.mfq', '*.json'] } },
+  ]);
+  const { container } = render(<ModelHubPage />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Download queue' }));
+  expect(Array.from(container.querySelectorAll('.download-item-heading strong'), (title) => title.textContent)).toEqual([first, other]);
+  const shards = container.querySelector('[data-job-id="s2"] .download-item-files')!;
+  expect(shards.querySelector('summary')).toHaveTextContent('View 2 files');
+  expect(Array.from(shards.querySelectorAll('li'), (file) => file.textContent)).toEqual([first, second]);
+  expect(screen.queryByText('*.json')).not.toBeInTheDocument();
 });
 
 it('filters model-load and quantization jobs, retains downloads across remount and updates live progress', async () => {

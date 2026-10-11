@@ -1,6 +1,8 @@
 #pragma once
 
 #include <optional>
+#include <cstdint>
+#include <span>
 
 #include <mlx/mlx.h>
 
@@ -11,6 +13,9 @@ struct MlxMoeTopKResult {
     mlx::core::array weights;
     std::optional<mlx::core::array> groups;
 };
+
+std::optional<mlx::core::array> moe_route_groups_host(
+    std::span<const std::int32_t> ids, int tokens, int routes);
 
 MlxMoeTopKResult moe_topk(
     const mlx::core::array& logits,

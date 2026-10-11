@@ -6,6 +6,9 @@
 #include "batch_execution.h"
 #include "models/qwen35/batch_state.h"
 #include "storage/weight_loader.h"
+#include "storage/moe_expert_cache.h"
+#include "runtime/kv_offload.h"
+#include "runtime/execution_options.h"
 #include "storage/text_session_cache.h"
 #include "mtp_metrics.h"
 #include "request_executor.h"
@@ -88,14 +91,16 @@ struct CudaEngineState {
           cache(config.session_cache, config.prefix_cache,
               make_cuda_paged_prefix_cache(*language.source, language.max_position_embeddings(),
                   language.supports_paged_text_session_state(), config.prefix_cache),
-                language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
+                language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
+                cuda_has_separate_memory()) {
         if (config.continuous_batch.max_sequences && !supports_batch)
             throw std::invalid_argument("continuous batching is unavailable for this model");
         prepare_memory(memory_limit);
         if constexpr (supports_batch) {
             if (config.continuous_batch.max_sequences)
                 batching = std::make_unique<Batch>(config.generation.prefill_chunk_size,
-                    config.continuous_batch.prefill_token_budget, language, *execution, config.continuous_batch);
+                    config.continuous_batch.prefill_token_budget, language, *execution,
+                    config.continuous_batch);
         }
     }
     bool can_overlap(const EngineRequest&) const {
@@ -228,7 +233,27 @@ struct CudaEngineState {
                 metrics.emplace_back(prefix + "_reserved_bytes", memory.used()[device]);
                 metrics.emplace_back(prefix + "_request_bytes", request_bytes[device]);
             }
-            if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
+            auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
+            metrics.insert(metrics.end(), experts.begin(), experts.end());
+            metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
+                {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
+            if (execution->qsa_kv_store) {
+                auto kv = execution->qsa_kv_store->metrics();
+                metrics.insert(metrics.end(), kv.begin(), kv.end());
+                for (const auto& value : kv)
+                    if (value.first == "qsa_kv_resident_bytes")
+                        metrics.emplace_back("kv_cache_bytes", value.second);
+                metrics.emplace_back("kv_cache_contexts", language.cache_pos > 0 ? 1.0 : 0.0);
+            } else {
+                metrics.insert(metrics.end(), {{"qsa_kv_offload_enabled", 0.0},
+                    {"qsa_kv_ram_enabled", 0.0}, {"qsa_kv_ram_bytes", 0.0},
+                    {"qsa_kv_ssd_bytes", 0.0}});
+            }
+            if (components.mtp) {
+                mtp::append_generation_metrics(metrics, components.mtp->last_stats);
+                metrics.emplace_back("mtp_predictor_graph_replays",
+                    double(components.mtp->graph_replay_count()));
+            }
             if constexpr (supports_batch) if (batching) {
                 auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
             }
@@ -293,10 +318,23 @@ struct CudaBackend {
         execution->profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
+        const auto kv_options = runtime_options::qsa_kv_offload();
+        if (kv_options.gpu_budget_bytes) {
+            KvOffloadConfig kv;
+            kv.gpu_budget_bytes = kv_options.gpu_budget_bytes;
+            kv.ram_budget_bytes = cuda_has_separate_memory() ? kv_options.ram_budget_bytes : 0;
+            kv.buffer_bytes = std::min<std::size_t>(kv.buffer_bytes, kv.gpu_budget_bytes / 4);
+            kv.directory = kv_options.directory;
+            execution->qsa_kv_store = std::make_shared<KvOffloadStore>(std::move(kv));
+        }
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
-                return std::make_unique<BoundState<Model>>(execution, std::move(model), std::move(components), config, options.memory_budget_bytes);
+                if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
+                    if (execution->qsa_kv_store)
+                        throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+                return std::make_unique<BoundState<Model>>(execution, std::move(model),
+                    std::move(components), config, options.memory_budget_bytes);
             });
         return visit([&](auto& state) {
             EngineInfo info;

@@ -284,6 +284,8 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "std::uint64_t trim_hot(" in PAGED_HEADER
     assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
     assert 'server.Post("/runtime/cache/trim"' in SERVER
+    assert 'server.Post("/runtime/cache/budget"' in SERVER
+    assert 'operation == "cache.budget"' in SERVER
     assert "SessionCommand::Kind::trim" in SERVER
     assert "session_cache->trim_hot(command.bytes)" in METAL_DECODE
     assert "cache.trim_hot(command.bytes)" in DECODE

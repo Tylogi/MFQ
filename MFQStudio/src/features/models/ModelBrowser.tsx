@@ -19,7 +19,8 @@ import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
-import { ModelMemoryPressure } from './ModelMemoryPressure';
+import { ModelPressureBars } from './ModelMemoryPressure';
+import { variantMemoryPressureRows, type PressureRow } from './memoryPressure';
 import { RepositoryFiles } from './RepositoryFiles';
 import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemory } from './KvCachePlanner';
 
@@ -185,7 +186,16 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
   return Array.from(new Set([...weights, ...SUPPORT_FILES]));
 }
 
-function ConfigurationDetails({ status, planned = false, tr }: { status: ModelConfigurationStatus; planned?: boolean; tr: Translate }) {
+function ConfigurationDetails({ status, planned = false, rows, tr }: { status: ModelConfigurationStatus; planned?: boolean; rows?: PressureRow[]; tr: Translate }) {
+  if (rows && rows.some(row => row.kind !== 'shared')) {
+    return <div className="configuration-details">{rows.map(row => <div key={row.kind}>
+      <span>{row.kind === 'vram' ? tr('最低档预计显存常驻 / 显存容量', 'Smallest tier VRAM residency / capacity')
+        : tr('最低档预计 RAM 常驻 / RAM 容量', 'Smallest tier RAM residency / capacity')}</span>
+      <strong>{formatBytes(row.required)} / {formatBytes(row.available)}</strong>
+    </div>)}<p>{rows.length > 1
+      ? tr('显存按稠密权重和已应用的 KV 计算；RAM 按路由专家和 Embedding 计算。SSD PLE 单独计算。', 'VRAM includes dense weights and applied KV; RAM includes routed experts and embedding. SSD PLE is separate.')
+      : tr('显存按整模权重和已应用的 KV 计算，已扣除 SSD PLE。', 'VRAM includes model weights and applied KV, excluding SSD PLE.')}</p></div>;
+  }
   return (
     <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
@@ -207,12 +217,16 @@ function VariantList({
   tr,
   variants,
   cacheBytes = 0,
+  system,
+  moe = false,
 }: {
   disabled: boolean;
   onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
   tr: Translate;
   variants: HubModelVariant[];
   cacheBytes?: number;
+  system?: HubSystemProfile;
+  moe?: boolean;
 }) {
   if (!variants.length) {
     return <div className="model-browser-empty compact">{tr("仓库暂未返回可下载权重。", "No downloadable weights were returned by this repository.")}</div>;
@@ -227,10 +241,12 @@ function VariantList({
               <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.estimated_resident_weight_bytes != null ? tr("预计权重常驻", "est. resident weights") : variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes))}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
               {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
-            <ModelMemoryPressure required={variant.configuration.required_memory_bytes}
+            <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
+                ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes)}
+              roles={variant.estimated_weight_bytes_by_role} system={system} cacheBytes={cacheBytes} moe={moe}
               available={variant.configuration.available_memory_bytes}
               label={tr("预计占当前推理预算", "Estimated share of runtime budget")}
-              emptyLabel={tr('无可用内存', 'No available memory')} />
+              tr={tr} />
             <button disabled={disabled} onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               onDownload(variant, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
@@ -479,7 +495,9 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
               <aside className="model-detail-panel">
                 <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><div className="model-identity-trailing"><ModelVendorMark name={selectedOfficial.name} architecture={selectedOfficial.architecture} size={30} /></div></div>
                 <p>{tr(selectedOfficial.description_zh, selectedOfficial.description)}</p>
-                <ConfigurationDetails status={officialConfiguration!} planned={officialCacheBytes > 0} tr={tr} />
+                <ConfigurationDetails status={officialConfiguration!} planned={officialCacheBytes > 0} tr={tr}
+                  rows={variantMemoryPressureRows(plannedOfficialVariants[0], official?.system, officialCacheBytes,
+                    (parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE'))} />
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{selectedOfficial.architecture}</dd></div>
                   <div className="model-parameter-row"><dt>{tr("参数", "Parameters")}</dt><dd title={tr("主模型逻辑参数，含视觉模块；不含 MTP 辅助权重与量化元数据。", "Main-model logical parameters, including vision; excludes auxiliary MTP weights and quantization metadata.")}><ParameterValue parameters={parameters} label={selectedOfficial.parameter_label} tr={tr} /></dd></div>
@@ -494,7 +512,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} />
+                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(officialSourceInfo!, {
@@ -535,7 +553,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 </dl>
                 <KvCachePlanner key={`kv:${communityPlanKey}`} profile={communityModel.cache_profile} appliedContext={communityContext} onApply={(context) => applyPlan(communityPlanKey, context)} tr={tr} />
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} />
+                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} system={official?.system} moe={(communityModel.parameter_breakdown?.routed_experts ?? 0) > 0} />
                 <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}
                   disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(communityModel, {

@@ -1,3 +1,4 @@
+/** 模型文件夹偏好按服务器隔离；没有设置时从文件系统根目录开始。 */
 import { getApiBaseUrl } from '../../shared/api/client';
 
 function storageKey() {
@@ -15,5 +16,7 @@ export function readModelDirectory(): string {
 export function saveModelDirectory(path: string): void {
   try {
     localStorage.setItem(storageKey(), path);
-  } catch {}
+  } catch {
+    // 禁用浏览器存储不应阻止本次选择或模型注册。
+  }
 }

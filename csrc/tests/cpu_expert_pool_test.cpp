@@ -5,8 +5,54 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <iostream>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+namespace {
+void verify_host_placement() {
+    const auto first=mfq::cpu::detect_cpu_topology(true);
+    const auto last=mfq::cpu::detect_cpu_topology(true,mfq::cpu::PoolAffinity::All,mfq::cpu::HostCore::Last);
+    assert(first.worker_cores.size()==last.worker_cores.size());
+    if(first.is_hybrid)assert(first.host_core==last.host_core);
+#ifdef _WIN32
+    const auto selected=[] {
+        ULONG count=0;
+        if(!GetThreadSelectedCpuSets(GetCurrentThread(),nullptr,0,&count) &&
+                GetLastError()!=ERROR_INSUFFICIENT_BUFFER)throw std::runtime_error("cannot inspect caller CPU Sets");
+        std::vector<ULONG> ids(count);
+        if(count && !GetThreadSelectedCpuSets(GetCurrentThread(),ids.data(),count,&count))
+            throw std::runtime_error("cannot read caller CPU Sets");
+        ids.resize(count);return ids;
+    };
+    const auto original=selected();GROUP_AFFINITY original_group{};
+    assert(GetThreadGroupAffinity(GetCurrentThread(),&original_group));
+    {
+        mfq::cpu::ScopedHostAffinity outer(last.host_core);
+        const auto outer_sets=selected();assert(outer_sets.size()==1);
+        {mfq::cpu::ScopedHostAffinity inner(first.host_core);assert(selected().size()==1);}
+        assert(selected()==outer_sets);
+        {mfq::cpu::ScopedHostAffinity noop(-1);assert(selected()==outer_sets);}
+        assert(!mfq::cpu::pin_current_thread(100000).valid);assert(selected()==outer_sets);
+        GROUP_AFFINITY current{};assert(GetThreadGroupAffinity(GetCurrentThread(),&current));
+        assert(current.Group==original_group.Group && current.Mask==original_group.Mask);
+    }
+    assert(selected()==original);
+    try {mfq::cpu::ScopedHostAffinity guard(last.host_core);throw std::runtime_error("placement unwind");}
+    catch(const std::runtime_error&) {}
+    assert(selected()==original);
+    GROUP_AFFINITY restored{};assert(GetThreadGroupAffinity(GetCurrentThread(),&restored));
+    assert(restored.Group==original_group.Group && restored.Mask==original_group.Mask);
+    std::cout<<"Windows caller CPU Sets: nested/default/invalid/exception restoration and hard group mask unchanged PASS\n";
+#endif
+}
+}
 
 int main() {
+    verify_host_placement();
     // Alternate tiny and large batches to catch stale callback publication.
 #ifdef _WIN32
     _putenv_s("MFQ_EXPERT_POOL_SPIN_US","0");

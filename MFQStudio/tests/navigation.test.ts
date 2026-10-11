@@ -21,6 +21,8 @@ describe('Studio 页面路由', () => {
     ['/quantization', 'lab', 'quantization'],
     ['/analysis', 'lab', 'analysis'],
     ['/chat', 'chat', 'overview'],
+    ['/applications', 'applications', 'overview'],
+    ['/versions', 'versions', 'overview'],
   ])('解析深链接 %s', (path, view, page) => {
     const location = resolveStudioLocation(path);
     expect(location.view).toBe(view);
@@ -38,6 +40,7 @@ describe('Studio 页面路由', () => {
   it('未知地址不会被视为业务页面', () => {
     expect(isStudioPath('/chat')).toBe(true);
     expect(isStudioPath('/chat/')).toBe(true);
+    expect(isStudioPath('/applications/')).toBe(true);
     expect(isStudioPath('/missing')).toBe(false);
     expect(isStudioPath('/chat/extra')).toBe(false);
   });

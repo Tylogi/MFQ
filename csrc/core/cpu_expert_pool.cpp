@@ -11,6 +11,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "cpu_affinity_win.h"
 #elif defined(__linux__)
 #include <sched.h>
 #include <unistd.h>
@@ -88,7 +89,7 @@ std::vector<Core> os_cores() {
 }
 }
 
-CpuTopology detect_cpu_topology(bool reserve_caller, PoolAffinity affinity) {
+CpuTopology detect_cpu_topology(bool reserve_caller, PoolAffinity affinity,HostCore host) {
     const auto cores = os_cores();
     const auto maximum = std::max_element(cores.begin(), cores.end(),
         [](const Core& a, const Core& b) { return a.performance < b.performance; })->performance;
@@ -102,10 +103,41 @@ CpuTopology detect_cpu_topology(bool reserve_caller, PoolAffinity affinity) {
     }
     result.is_hybrid = result.e_cores != 0;
     if (reserve_caller && !result.worker_cores.empty()) {
-        result.host_core = result.worker_cores.front();
-        result.worker_cores.erase(result.worker_cores.begin());
+        if(host==HostCore::Last && !result.is_hybrid) {
+            result.host_core=result.worker_cores.back();result.worker_cores.pop_back();
+        } else {
+            result.host_core = result.worker_cores.front();
+            result.worker_cores.erase(result.worker_cores.begin());
+        }
     }
     return result;
+}
+namespace {
+HostCore host_core_setting() {
+    const auto* value=std::getenv("MFQ_CPU_HOST_CORE");
+    if(!value || std::string(value)=="first")return HostCore::First;
+    if(std::string(value)=="last")return HostCore::Last;
+    throw std::invalid_argument("MFQ_CPU_HOST_CORE must be first or last");
+}
+void pin_worker_thread(int core) {
+#ifdef _WIN32
+    GROUP_AFFINITY target{};target.Group=static_cast<WORD>(core/64);
+    target.Mask=KAFFINITY(1)<<(core&63);
+    (void)SetThreadGroupAffinity(GetCurrentThread(),&target,nullptr);
+#else
+    (void)pin_current_thread(core);
+#endif
+}
+}
+int planned_host_core() {
+    const auto requested=host_core_setting();
+    thread_local HostCore cached_setting=HostCore::First;
+    thread_local int cached_core=-1;
+    if(cached_core<0 || requested!=cached_setting) {
+        cached_core=detect_cpu_topology(true,PoolAffinity::All,requested).host_core;
+        cached_setting=requested;
+    }
+    return cached_core;
 }
 std::vector<int> physical_cores(bool reserve_caller, PoolAffinity affinity) {
     return detect_cpu_topology(reserve_caller, affinity).worker_cores;
@@ -115,15 +147,10 @@ ThreadAffinity pin_current_thread(int core) {
     ThreadAffinity previous;
     if (core < 0) return previous;
 #ifdef _WIN32
-    GROUP_AFFINITY saved{}, selected{};
-    selected.Group = static_cast<WORD>(core / 64);
-    selected.Mask = KAFFINITY(1) << (core % 64);
-    previous.native.resize(2);
-    if (SetThreadGroupAffinity(GetCurrentThread(), &selected, &saved)) {
-        previous.native[0] = saved.Group;
-        previous.native[1] = saved.Mask;
-        previous.valid = true;
-    }
+    ULONG target=0;
+    if(!detail::thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core,target))return {};
+    if(previous.cpu_sets.size()==1 && previous.cpu_sets[0]==target)return {};
+    previous.valid=SetThreadSelectedCpuSets(GetCurrentThread(),&target,1)!=0;
 #elif defined(__linux__)
     const auto count = std::max<long>(sysconf(_SC_NPROCESSORS_CONF), core + 1);
     const auto bytes = CPU_ALLOC_SIZE(count);
@@ -141,10 +168,8 @@ ThreadAffinity pin_current_thread(int core) {
 void restore_thread_affinity(const ThreadAffinity& previous) {
     if (!previous.valid) return;
 #ifdef _WIN32
-    GROUP_AFFINITY saved{};
-    saved.Group = static_cast<WORD>(previous.native[0]);
-    saved.Mask = static_cast<KAFFINITY>(previous.native[1]);
-    SetThreadGroupAffinity(GetCurrentThread(), &saved, nullptr);
+    (void)SetThreadSelectedCpuSets(GetCurrentThread(),previous.cpu_sets.empty()?nullptr:previous.cpu_sets.data(),
+        static_cast<ULONG>(previous.cpu_sets.size()));
 #elif defined(__linux__)
     sched_setaffinity(0, previous.native.size() * sizeof(std::uint64_t),
         reinterpret_cast<const cpu_set_t*>(previous.native.data()));
@@ -152,14 +177,14 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 }
 
 ExpertPool::ExpertPool(int workers, bool pin)
-    : topology_(detect_cpu_topology(true)), pin_(pin) {
+    : topology_(detect_cpu_topology(true,PoolAffinity::All,host_core_setting())), pin_(pin) {
     if (workers < 0) throw std::invalid_argument("negative CPU worker count");
     if (!workers) workers = static_cast<int>(topology_.worker_cores.size());
     participants_ = workers + 1;
     const auto placements = topology_.worker_cores;
     pool_ = std::make_unique<mfq::HostParallelPool>([placements, pin](std::size_t index) {
         if (pin && index < placements.size()) {
-            try { (void)pin_current_thread(placements[index]); }
+            try { pin_worker_thread(placements[index]); }
             catch (const std::bad_alloc&) {} // Optional worker placement.
         }
     },false);

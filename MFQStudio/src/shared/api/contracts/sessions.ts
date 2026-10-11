@@ -169,7 +169,7 @@ export interface GenerationPresetResource {
     tool_choice: 'auto' | 'none' | 'required' | Record<string, unknown>;
     response_format: { type: 'text' | 'json_object' | 'json_schema'; [key: string]: unknown };
   };
-  context_size: number;
+  context_size: number | null;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;

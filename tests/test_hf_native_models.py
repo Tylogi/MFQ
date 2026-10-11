@@ -572,7 +572,7 @@ def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
     arguments = native_tokenizer_arguments(model, "metal")
     assert arguments == ["--tokenizer", str(tokenizer)]
-    assert native_tokenizer_arguments(model, "cuda") == []
+    assert native_tokenizer_arguments(model, "cuda") == arguments
 
 
 def test_minicpmo_native_runtime_materializes_exact_resampler_asset(

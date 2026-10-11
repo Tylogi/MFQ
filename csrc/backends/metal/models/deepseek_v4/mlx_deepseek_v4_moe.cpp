@@ -2201,6 +2201,12 @@ MlxDeepseekV4Moe::forward_branches(
             std::sort(
                 selected.begin(),
                 selected.end());
+            std::vector<std::uint32_t> activation_counts;
+            for (std::size_t index = 0; index < selected.size();) {
+                const auto last = std::upper_bound(selected.begin() + index, selected.end(), selected[index]);
+                activation_counts.push_back(static_cast<std::uint32_t>(last - selected.begin() - index));
+                index = static_cast<std::size_t>(last - selected.begin());
+            }
             selected.erase(
                 std::unique(
                     selected.begin(),
@@ -2241,9 +2247,9 @@ MlxDeepseekV4Moe::forward_branches(
                 array routed_hidden = [&]() {
                     if (!streamed_gate_name_.empty()) {
                         auto gate_weight = expert_offload_->grouped_mfe(
-                            streamed_gate_name_, selected);
+                            streamed_gate_name_, selected, activation_counts);
                         auto up_weight = expert_offload_->grouped_mfe(
-                            streamed_up_name_, selected);
+                            streamed_up_name_, selected, activation_counts);
                         return gate_weight.routed_swiglu_pair(
                             up_weight,
                             chunk_source,
@@ -2251,14 +2257,14 @@ MlxDeepseekV4Moe::forward_branches(
                             static_cast<float>(config_.swiglu_limit));
                     }
                     auto gate_weight = expert_offload_->grouped_mfe(
-                        streamed_gate_up_name_, selected);
+                        streamed_gate_up_name_, selected, activation_counts);
                     return gate_weight.routed_swiglu(
                         chunk_source,
                         local_ids,
                         static_cast<float>(config_.swiglu_limit));
                 }();
                 auto down_weight = expert_offload_->grouped_mfe(
-                    streamed_down_name_, selected);
+                    streamed_down_name_, selected, activation_counts);
                 return down_weight.routed_matmul_reduce(
                     routed_hidden,
                     local_ids,

@@ -1020,12 +1020,10 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -1193,7 +1191,6 @@
             "type": "string"
           },
           "graph": {
-            "additionalProperties": true,
             "title": "Graph",
             "type": "object"
           },
@@ -1350,6 +1347,46 @@
         "title": "CompareEvaluationsRequest",
         "type": "object"
       },
+      "ConfigureQsaKvOffloadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "budget_bytes": {
+            "default": 2147483648,
+            "maximum": 1125899906842624.0,
+            "minimum": 1.0,
+            "title": "Budget Bytes",
+            "type": "integer"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "instance_id": {
+            "format": "uuid",
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "ram_budget_bytes": {
+            "anyOf": [
+              {
+                "maximum": 1125899906842624.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Budget Bytes"
+          }
+        },
+        "required": [
+          "instance_id"
+        ],
+        "title": "ConfigureQsaKvOffloadRequest",
+        "type": "object"
+      },
       "CreateApiKeyRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1426,7 +1463,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1494,13 +1530,18 @@
         "additionalProperties": false,
         "properties": {
           "context_size": {
-            "default": 32768,
-            "minimum": 512.0,
-            "title": "Context Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1534,7 +1575,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
           }
         },
         "required": [
@@ -1553,7 +1594,6 @@
             "type": "string"
           },
           "payload": {
-            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           }
@@ -1562,76 +1602,6 @@
           "kind"
         ],
         "title": "CreateJobRequest",
-        "type": "object"
-      },
-      "CreateMcpServerRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "args": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 128,
-            "title": "Args",
-            "type": "array"
-          },
-          "command": {
-            "anyOf": [
-              {
-                "maxLength": 1024,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Command"
-          },
-          "enabled": {
-            "default": false,
-            "title": "Enabled",
-            "type": "boolean"
-          },
-          "header_env": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Header Env",
-            "type": "object"
-          },
-          "name": {
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
-            "title": "Name",
-            "type": "string"
-          },
-          "timeout_seconds": {
-            "default": 30.0,
-            "exclusiveMinimum": 0.0,
-            "maximum": 300.0,
-            "title": "Timeout Seconds",
-            "type": "number"
-          },
-          "transport": {
-            "$ref": "#/components/schemas/McpTransport"
-          },
-          "url": {
-            "anyOf": [
-              {
-                "maxLength": 2048,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url"
-          }
-        },
-        "required": [
-          "name",
-          "transport"
-        ],
-        "title": "CreateMcpServerRequest",
         "type": "object"
       },
       "CreateRemoteNodeRequest": {
@@ -1853,7 +1823,6 @@
         "additionalProperties": false,
         "properties": {
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1934,7 +1903,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2085,7 +2053,6 @@
             "type": "string"
           },
           "details": {
-            "additionalProperties": true,
             "title": "Details",
             "type": "object"
           },
@@ -2259,12 +2226,10 @@
             "title": "Dataset Id"
           },
           "dataset_manifest": {
-            "additionalProperties": true,
             "title": "Dataset Manifest",
             "type": "object"
           },
           "hardware_identity": {
-            "additionalProperties": true,
             "title": "Hardware Identity",
             "type": "object"
           },
@@ -2289,7 +2254,6 @@
             "type": "string"
           },
           "metrics": {
-            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -2300,12 +2264,10 @@
             "type": "string"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
           "runtime_identity": {
-            "additionalProperties": true,
             "title": "Runtime Identity",
             "type": "object"
           }
@@ -2348,7 +2310,6 @@
           },
           "task_benchmarks": {
             "additionalProperties": {
-              "additionalProperties": true,
               "type": "object"
             },
             "title": "Task Benchmarks",
@@ -2488,9 +2449,16 @@
         "additionalProperties": false,
         "properties": {
           "context_size": {
-            "minimum": 512.0,
-            "title": "Context Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
           },
           "created_at": {
             "format": "date-time",
@@ -2503,7 +2471,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2533,7 +2500,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Output"
           },
           "updated_at": {
             "format": "date-time",
@@ -2545,7 +2512,6 @@
           "id",
           "name",
           "settings",
-          "context_size",
           "created_at",
           "updated_at"
         ],
@@ -2615,6 +2581,21 @@
             "minimum": 0.0,
             "title": "Byte Size",
             "type": "integer"
+          },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
           },
           "name": {
             "maxLength": 1024,
@@ -3056,6 +3037,21 @@
             ],
             "title": "Estimated Resident Weight Bytes"
           },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
+          },
           "files": {
             "items": {
               "type": "string"
@@ -3430,7 +3426,6 @@
             "type": "string"
           },
           "data": {
-            "additionalProperties": true,
             "title": "Data",
             "type": "object"
           },
@@ -3521,7 +3516,6 @@
             "type": "string"
           },
           "payload_schema": {
-            "additionalProperties": true,
             "title": "Payload Schema",
             "type": "object"
           }
@@ -3595,7 +3589,6 @@
             "type": "string"
           },
           "payload": {
-            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           },
@@ -3606,14 +3599,12 @@
             "type": "number"
           },
           "progress_data": {
-            "additionalProperties": true,
             "title": "Progress Data",
             "type": "object"
           },
           "result": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -3702,7 +3693,6 @@
             "type": "string"
           },
           "schema": {
-            "additionalProperties": true,
             "title": "Schema",
             "type": "object"
           },
@@ -3738,252 +3728,36 @@
         "title": "JsonSchemaResponseFormat",
         "type": "object"
       },
-      "McpServerList": {
+      "KvQuantizationSettings": {
         "additionalProperties": false,
         "properties": {
-          "data": {
-            "items": {
-              "$ref": "#/components/schemas/McpServerResource"
-            },
-            "title": "Data",
-            "type": "array"
-          }
-        },
-        "required": [
-          "data"
-        ],
-        "title": "McpServerList",
-        "type": "object"
-      },
-      "McpServerResource": {
-        "additionalProperties": false,
-        "properties": {
-          "args": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Args",
-            "type": "array"
-          },
-          "command": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Command"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
+          "algorithm": {
+            "const": "turboquant",
+            "default": "turboquant",
+            "title": "Algorithm",
             "type": "string"
+          },
+          "bits": {
+            "default": 4,
+            "enum": [
+              2,
+              2.5,
+              3,
+              3.5,
+              4,
+              6,
+              8
+            ],
+            "title": "Bits"
           },
           "enabled": {
+            "default": false,
             "title": "Enabled",
             "type": "boolean"
-          },
-          "header_env": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Header Env",
-            "type": "object"
-          },
-          "id": {
-            "format": "uuid",
-            "title": "Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "timeout_seconds": {
-            "title": "Timeout Seconds",
-            "type": "number"
-          },
-          "transport": {
-            "$ref": "#/components/schemas/McpTransport"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "title": "Updated At",
-            "type": "string"
-          },
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url"
           }
         },
-        "required": [
-          "id",
-          "name",
-          "transport",
-          "enabled",
-          "timeout_seconds",
-          "created_at",
-          "updated_at"
-        ],
-        "title": "McpServerResource",
+        "title": "KvQuantizationSettings",
         "type": "object"
-      },
-      "McpToolCallRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "arguments": {
-            "additionalProperties": true,
-            "title": "Arguments",
-            "type": "object"
-          },
-          "confirm": {
-            "default": false,
-            "title": "Confirm",
-            "type": "boolean"
-          },
-          "name": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Name",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name"
-        ],
-        "title": "McpToolCallRequest",
-        "type": "object"
-      },
-      "McpToolCallResult": {
-        "additionalProperties": false,
-        "properties": {
-          "content": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Content",
-            "type": "array"
-          },
-          "is_error": {
-            "default": false,
-            "title": "Is Error",
-            "type": "boolean"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "server": {
-            "title": "Server",
-            "type": "string"
-          },
-          "structured_content": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Structured Content"
-          }
-        },
-        "required": [
-          "server",
-          "name"
-        ],
-        "title": "McpToolCallResult",
-        "type": "object"
-      },
-      "McpToolList": {
-        "additionalProperties": false,
-        "properties": {
-          "data": {
-            "items": {
-              "$ref": "#/components/schemas/McpToolResource"
-            },
-            "title": "Data",
-            "type": "array"
-          },
-          "errors": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Errors",
-            "type": "object"
-          }
-        },
-        "required": [
-          "data"
-        ],
-        "title": "McpToolList",
-        "type": "object"
-      },
-      "McpToolResource": {
-        "additionalProperties": false,
-        "properties": {
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description"
-          },
-          "input_schema": {
-            "additionalProperties": true,
-            "title": "Input Schema",
-            "type": "object"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "qualified_name": {
-            "title": "Qualified Name",
-            "type": "string"
-          },
-          "server": {
-            "title": "Server",
-            "type": "string"
-          },
-          "server_id": {
-            "format": "uuid",
-            "title": "Server Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "server_id",
-          "server",
-          "name",
-          "qualified_name"
-        ],
-        "title": "McpToolResource",
-        "type": "object"
-      },
-      "McpTransport": {
-        "enum": [
-          "stdio",
-          "streamable_http"
-        ],
-        "title": "McpTransport",
-        "type": "string"
       },
       "MediaRef": {
         "additionalProperties": false,
@@ -4187,6 +3961,18 @@
             "title": "Complete",
             "type": "boolean"
           },
+          "context_capacity": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Capacity"
+          },
           "dtypes": {
             "items": {
               "type": "string"
@@ -4216,6 +4002,21 @@
               }
             ],
             "title": "Estimated Resident Weight Bytes"
+          },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
           },
           "format": {
             "default": "mfq",
@@ -4283,6 +4084,30 @@
             "minimum": 0.0,
             "title": "Total Bytes",
             "type": "integer"
+          },
+          "yarn_context_capacity": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yarn Context Capacity"
+          },
+          "yarn_max_factor": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yarn Max Factor"
           }
         },
         "required": [
@@ -4334,6 +4159,30 @@
             ],
             "title": "Group"
           },
+          "head_dimension": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Dimension"
+          },
+          "kv_heads": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Heads"
+          },
           "layers": {
             "anyOf": [
               {
@@ -4345,6 +4194,18 @@
               }
             ],
             "title": "Layers"
+          },
+          "max_read_rows_per_token": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Read Rows Per Token"
           },
           "minimum_rows": {
             "default": 0,
@@ -4749,10 +4610,17 @@
             "title": "Artifact Uri"
           },
           "context_size": {
-            "default": 32768,
-            "minimum": 512.0,
-            "title": "Context Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 2147483647.0,
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
           },
           "device_ids": {
             "items": {
@@ -4772,6 +4640,9 @@
               }
             ],
             "title": "Idle Ttl Seconds"
+          },
+          "kv_quantization": {
+            "$ref": "#/components/schemas/KvQuantizationSettings"
           },
           "model": {
             "maxLength": 255,
@@ -4892,6 +4763,9 @@
             ],
             "title": "Prefix Cache Pending Bytes"
           },
+          "qsa_kv_offload": {
+            "$ref": "#/components/schemas/QsaKvOffloadPolicy"
+          },
           "sampling_defaults": {
             "anyOf": [
               {
@@ -4901,6 +4775,17 @@
                 "type": "null"
               }
             ]
+          },
+          "yarn_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yarn Enabled"
           }
         },
         "required": [
@@ -5463,7 +5348,6 @@
           "document": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -5492,7 +5376,81 @@
         "title": "PortableMedia",
         "type": "object"
       },
-      "PortableMessage": {
+      "PortableMessage-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "parts": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "audio": "#/components/schemas/AudioPart",
+                  "document": "#/components/schemas/DocumentPart",
+                  "generated_audio": "#/components/schemas/GeneratedAudioPart",
+                  "image": "#/components/schemas/ImagePart",
+                  "reasoning": "#/components/schemas/ReasoningPart",
+                  "text": "#/components/schemas/TextPart",
+                  "tool_call": "#/components/schemas/ToolCallPart",
+                  "tool_result": "#/components/schemas/ToolResultPart",
+                  "transcript": "#/components/schemas/TranscriptPart",
+                  "video": "#/components/schemas/VideoPart"
+                },
+                "propertyName": "type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TextPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ReasoningPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ImagePart"
+                },
+                {
+                  "$ref": "#/components/schemas/VideoPart"
+                },
+                {
+                  "$ref": "#/components/schemas/AudioPart"
+                },
+                {
+                  "$ref": "#/components/schemas/TranscriptPart"
+                },
+                {
+                  "$ref": "#/components/schemas/DocumentPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCallPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultPart"
+                },
+                {
+                  "$ref": "#/components/schemas/GeneratedAudioPart"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Parts",
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MessageRole"
+          }
+        },
+        "required": [
+          "role",
+          "parts",
+          "created_at"
+        ],
+        "title": "PortableMessage",
+        "type": "object"
+      },
+      "PortableMessage-Output": {
         "additionalProperties": false,
         "properties": {
           "created_at": {
@@ -5673,6 +5631,77 @@
           "tokenization"
         ],
         "title": "ProbabilityScoreResult",
+        "type": "object"
+      },
+      "QsaKvOffloadPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "budget_bytes": {
+            "default": 2147483648,
+            "maximum": 1125899906842624.0,
+            "minimum": 1.0,
+            "title": "Budget Bytes",
+            "type": "integer"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "ram_budget_bytes": {
+            "anyOf": [
+              {
+                "maximum": 1125899906842624.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Budget Bytes"
+          },
+          "target_context": {
+            "default": 262144,
+            "maximum": 2147483647.0,
+            "minimum": 512.0,
+            "title": "Target Context",
+            "type": "integer"
+          }
+        },
+        "title": "QsaKvOffloadPolicy",
+        "type": "object"
+      },
+      "QsaKvStorageSettings": {
+        "additionalProperties": false,
+        "properties": {
+          "budget_bytes": {
+            "default": 2147483648,
+            "maximum": 1125899906842624.0,
+            "minimum": 1.0,
+            "title": "Budget Bytes",
+            "type": "integer"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "ram_budget_bytes": {
+            "anyOf": [
+              {
+                "maximum": 1125899906842624.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Budget Bytes"
+          }
+        },
+        "title": "QsaKvStorageSettings",
         "type": "object"
       },
       "QuantizationDirectories": {
@@ -6117,7 +6146,6 @@
             "title": "Last Checked At"
           },
           "metrics": {
-            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -6598,7 +6626,91 @@
         "title": "ResponseReasoningDelta",
         "type": "object"
       },
-      "ResponseRequestSettings": {
+      "ResponseRequestSettings-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "include_reasoning_history": {
+            "default": true,
+            "title": "Include Reasoning History",
+            "type": "boolean"
+          },
+          "input_role": {
+            "default": "user",
+            "enum": [
+              "user",
+              "tool"
+            ],
+            "title": "Input Role",
+            "type": "string"
+          },
+          "response_format": {
+            "discriminator": {
+              "mapping": {
+                "json_object": "#/components/schemas/JsonObjectResponseFormat",
+                "json_schema": "#/components/schemas/JsonSchemaResponseFormat",
+                "text": "#/components/schemas/TextResponseFormat"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TextResponseFormat"
+              },
+              {
+                "$ref": "#/components/schemas/JsonObjectResponseFormat"
+              },
+              {
+                "$ref": "#/components/schemas/JsonSchemaResponseFormat"
+              }
+            ],
+            "title": "Response Format"
+          },
+          "sampling": {
+            "$ref": "#/components/schemas/SamplingParams"
+          },
+          "system_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Prompt"
+          },
+          "tool_choice": {
+            "anyOf": [
+              {
+                "enum": [
+                  "auto",
+                  "none",
+                  "required"
+                ],
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/NamedToolChoice"
+              }
+            ],
+            "default": "auto",
+            "title": "Tool Choice"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/ToolDefinition"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sampling"
+        ],
+        "title": "ResponseRequestSettings",
+        "type": "object"
+      },
+      "ResponseRequestSettings-Output": {
         "additionalProperties": false,
         "properties": {
           "include_reasoning_history": {
@@ -6816,7 +6928,7 @@
           "settings": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/ResponseRequestSettings"
+                "$ref": "#/components/schemas/ResponseRequestSettings-Output"
               },
               {
                 "type": "null"
@@ -7052,6 +7164,63 @@
         "title": "RuntimeCapabilitiesResource",
         "type": "object"
       },
+      "RuntimeContextPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "fallback_context_size": {
+            "default": 32768,
+            "maximum": 2147483647.0,
+            "minimum": 512.0,
+            "title": "Fallback Context Size",
+            "type": "integer"
+          },
+          "max_context_size": {
+            "anyOf": [
+              {
+                "maximum": 2147483647.0,
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Context Size"
+          },
+          "model_kv_quantization": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/KvQuantizationSettings"
+            },
+            "title": "Model Kv Quantization",
+            "type": "object"
+          },
+          "model_overrides": {
+            "additionalProperties": {
+              "maximum": 2147483647.0,
+              "minimum": 512.0,
+              "type": "integer"
+            },
+            "title": "Model Overrides",
+            "type": "object"
+          },
+          "model_qsa_kv_offload": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/QsaKvStorageSettings"
+            },
+            "title": "Model Qsa Kv Offload",
+            "type": "object"
+          },
+          "model_yarn_enabled": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Model Yarn Enabled",
+            "type": "object"
+          }
+        },
+        "title": "RuntimeContextPolicy",
+        "type": "object"
+      },
       "RuntimeDiskTraffic": {
         "additionalProperties": false,
         "properties": {
@@ -7130,6 +7299,42 @@
               }
             ],
             "title": "Core Count"
+          },
+          "memory_available_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Available Bytes"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "memory_used_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Used Bytes"
           },
           "name": {
             "title": "Name",
@@ -7333,6 +7538,14 @@
             ],
             "title": "Kv Bytes"
           },
+          "kv_quantization": {
+            "$ref": "#/components/schemas/KvQuantizationSettings"
+          },
+          "kv_quantization_supported": {
+            "default": false,
+            "title": "Kv Quantization Supported",
+            "type": "boolean"
+          },
           "last_used_at": {
             "anyOf": [
               {
@@ -7372,6 +7585,14 @@
           "pinned": {
             "default": false,
             "title": "Pinned",
+            "type": "boolean"
+          },
+          "qsa_kv_offload": {
+            "$ref": "#/components/schemas/QsaKvOffloadPolicy"
+          },
+          "qsa_kv_offload_supported": {
+            "default": false,
+            "title": "Qsa Kv Offload Supported",
             "type": "boolean"
           },
           "queued_requests": {
@@ -7437,6 +7658,15 @@
             "minimum": 1.0,
             "title": "Port",
             "type": "integer"
+          },
+          "protocol": {
+            "default": "openai",
+            "enum": [
+              "openai",
+              "anthropic"
+            ],
+            "title": "Protocol",
+            "type": "string"
           }
         },
         "required": [
@@ -7454,7 +7684,6 @@
             "type": "string"
           },
           "fields": {
-            "additionalProperties": true,
             "title": "Fields",
             "type": "object"
           },
@@ -7651,6 +7880,64 @@
             ],
             "title": "Prefix Cache Limit Bytes"
           },
+          "ram_expert_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Expert Bytes"
+          },
+          "ram_experts": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Experts"
+          },
+          "ram_kv": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Kv"
+          },
+          "ram_kv_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Kv Bytes"
+          },
+          "ram_kv_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Kv Limit Bytes"
+          },
           "resident_weight_bytes": {
             "anyOf": [
               {
@@ -7686,6 +7973,77 @@
             ],
             "title": "Ssd Experts"
           },
+          "ssd_kv": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv"
+          },
+          "ssd_kv_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv Bytes"
+          },
+          "ssd_kv_hits": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv Hits"
+          },
+          "ssd_kv_read_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv Read Bytes"
+          },
+          "ssd_kv_reads": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv Reads"
+          },
+          "ssd_kv_written_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Kv Written Bytes"
+          },
           "ssd_ple": {
             "anyOf": [
               {
@@ -7708,6 +8066,42 @@
               }
             ],
             "title": "Ssd Ple Bytes"
+          },
+          "streaming_kv_budget_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Streaming Kv Budget Bytes"
+          },
+          "streaming_kv_pending_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Streaming Kv Pending Bytes"
+          },
+          "streaming_kv_resident_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Streaming Kv Resident Bytes"
           },
           "wired_available": {
             "anyOf": [
@@ -7803,7 +8197,6 @@
             "type": "integer"
           },
           "values": {
-            "additionalProperties": true,
             "title": "Values",
             "type": "object"
           }
@@ -8012,9 +8405,17 @@
         "additionalProperties": false,
         "properties": {
           "context_size": {
-            "minimum": 512.0,
-            "title": "Context Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 2147483647.0,
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
           },
           "instance_id": {
             "anyOf": [
@@ -8027,11 +8428,39 @@
               }
             ],
             "title": "Instance Id"
+          },
+          "kv_quantization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KvQuantizationSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "qsa_kv_offload": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QsaKvStorageSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "yarn_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yarn Enabled"
           }
         },
-        "required": [
-          "context_size"
-        ],
         "title": "RuntimeReloadRequest",
         "type": "object"
       },
@@ -8100,6 +8529,18 @@
             ],
             "title": "Interval Seconds"
           },
+          "memory_available_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Available Bytes"
+          },
           "memory_bandwidth_bytes_per_second": {
             "anyOf": [
               {
@@ -8136,6 +8577,30 @@
               }
             ],
             "title": "Memory Bandwidth Utilization Percent"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "memory_used_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Used Bytes"
           },
           "sampled_at": {
             "minimum": 0.0,
@@ -8189,6 +8654,30 @@
           "instance_id": {
             "title": "Instance Id",
             "type": "string"
+          },
+          "kv_read_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Read Bytes Per Second"
+          },
+          "kv_write_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Write Bytes Per Second"
           },
           "model": {
             "title": "Model",
@@ -8315,7 +8804,7 @@
         "title": "SamplingParams",
         "type": "object"
       },
-      "SessionArchive": {
+      "SessionArchive-Input": {
         "additionalProperties": false,
         "properties": {
           "format": {
@@ -8333,7 +8822,41 @@
           },
           "messages": {
             "items": {
-              "$ref": "#/components/schemas/PortableMessage"
+              "$ref": "#/components/schemas/PortableMessage-Input"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionResource"
+          }
+        },
+        "required": [
+          "session",
+          "messages"
+        ],
+        "title": "SessionArchive",
+        "type": "object"
+      },
+      "SessionArchive-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "const": "mfq-session-v1",
+            "default": "mfq-session-v1",
+            "title": "Format",
+            "type": "string"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/PortableMedia"
+            },
+            "title": "Media",
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/PortableMessage-Output"
             },
             "title": "Messages",
             "type": "array"
@@ -8414,7 +8937,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -8665,7 +9187,6 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "additionalProperties": true,
             "title": "Arguments",
             "type": "object"
           },
@@ -8735,7 +9256,6 @@
             "type": "string"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -8850,13 +9370,18 @@
         "additionalProperties": false,
         "properties": {
           "context_size": {
-            "default": 32768,
-            "minimum": 512.0,
-            "title": "Context Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -8890,7 +9415,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
           }
         },
         "required": [
@@ -8898,20 +9423,6 @@
           "settings"
         ],
         "title": "UpdateGenerationPresetRequest",
-        "type": "object"
-      },
-      "UpdateMcpServerRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "title": "Enabled",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "enabled"
-        ],
-        "title": "UpdateMcpServerRequest",
         "type": "object"
       },
       "UpdateRemoteNodeRequest": {
@@ -9008,7 +9519,6 @@
           "metadata": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -9287,7 +9797,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Delete Workspace Artifact Api V1 Artifacts Remove Post",
                   "type": "object"
                 }
@@ -10545,7 +11054,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Voice Output Component Status Api V1 Components Voice Output Get",
                   "type": "object"
                 }
@@ -10678,7 +11186,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Activate Voice Output Component Api V1 Components Voice Output Activate Post",
                   "type": "object"
                 }
@@ -14470,835 +14977,6 @@
         ]
       }
     },
-    "/api/v1/mcp/servers": {
-      "get": {
-        "operationId": "list_mcp_servers_api_v1_mcp_servers_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerList"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "List Mcp Servers",
-        "tags": [
-          "mcp"
-        ]
-      },
-      "post": {
-        "operationId": "create_mcp_server_api_v1_mcp_servers_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateMcpServerRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerResource"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "Create Mcp Server",
-        "tags": [
-          "mcp"
-        ]
-      }
-    },
-    "/api/v1/mcp/servers/{server_id}": {
-      "delete": {
-        "operationId": "delete_mcp_server_api_v1_mcp_servers__server_id__delete",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "server_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Server Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "Delete Mcp Server",
-        "tags": [
-          "mcp"
-        ]
-      },
-      "patch": {
-        "operationId": "update_mcp_server_api_v1_mcp_servers__server_id__patch",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "server_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Server Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateMcpServerRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerResource"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "Update Mcp Server",
-        "tags": [
-          "mcp"
-        ]
-      }
-    },
-    "/api/v1/mcp/tools": {
-      "get": {
-        "operationId": "list_mcp_tools_api_v1_mcp_tools_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpToolList"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "List Mcp Tools",
-        "tags": [
-          "mcp"
-        ]
-      }
-    },
-    "/api/v1/mcp/tools/call": {
-      "post": {
-        "operationId": "call_mcp_tool_api_v1_mcp_tools_call_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/McpToolCallRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpToolCallResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Request Entity Too Large"
-          },
-          "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "501": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Implemented"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "summary": "Call Mcp Tool",
-        "tags": [
-          "mcp"
-        ]
-      }
-    },
     "/api/v1/media": {
       "post": {
         "operationId": "upload_media_api_v1_media_post",
@@ -16616,6 +16294,156 @@
           }
         },
         "summary": "Checkpoint Analysis",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/models/{model_id}/cache-profile": {
+      "get": {
+        "operationId": "model_cache_profile_api_v1_models__model_id__cache_profile_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ModelCacheProfile"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Model Cache Profile Api V1 Models  Model Id  Cache Profile Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Model Cache Profile",
         "tags": [
           "models"
         ]
@@ -18188,7 +18016,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Clear Runtime Cache Api V1 Runtime Cache Clear Post",
                   "type": "object"
                 }
@@ -18356,6 +18183,78 @@
               "title": "Limit",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "query",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Query",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_in",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "all",
+                "text",
+                "id"
+              ],
+              "title": "Search In",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "text_filter",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "all",
+                "saved",
+                "missing"
+              ],
+              "title": "Text Filter",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "chain_filter",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "all",
+                "complete",
+                "incomplete"
+              ],
+              "title": "Chain Filter",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "recent",
+              "enum": [
+                "recent",
+                "oldest",
+                "length",
+                "size"
+              ],
+              "title": "Sort",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -18363,7 +18262,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Prefix Cache Entries Api V1 Runtime Cache Entries Get",
                   "type": "object"
                 }
@@ -18539,7 +18437,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Prefix Cache Text Api V1 Runtime Cache Entries  Namespace   Block  Text Get",
                   "type": "object"
                 }
@@ -18682,7 +18579,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Purge Prefix Cache Api V1 Runtime Cache Purge Post",
                   "type": "object"
                 }
@@ -18832,7 +18728,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Trim Runtime Cache Api V1 Runtime Cache Trim Post",
                   "type": "object"
                 }
@@ -19102,6 +18997,417 @@
           }
         },
         "summary": "Runtime Capabilities",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/context": {
+      "post": {
+        "operationId": "configure_context_api_v1_runtime_context_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeReloadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Configure Context",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/context-policy": {
+      "get": {
+        "operationId": "context_policy_api_v1_runtime_context_policy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeContextPolicy"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Context Policy",
+        "tags": [
+          "runtime"
+        ]
+      },
+      "put": {
+        "operationId": "configure_context_policy_api_v1_runtime_context_policy_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeContextPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeContextPolicy"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Configure Context Policy",
         "tags": [
           "runtime"
         ]
@@ -19669,7 +19975,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Listener Api V1 Runtime Listener Get",
                   "type": "object"
                 }
@@ -19810,7 +20115,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Configure Runtime Listener Api V1 Runtime Listener Put",
                   "type": "object"
                 }
@@ -20138,7 +20442,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Memory Policy Api V1 Runtime Memory Policy Get",
                   "type": "object"
                 }
@@ -20859,7 +21162,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Models Api V1 Runtime Models Get",
                   "type": "object"
                 }
@@ -21835,6 +22137,309 @@
         ]
       }
     },
+    "/api/v1/runtime/qsa-kv": {
+      "put": {
+        "operationId": "configure_qsa_kv_offload_api_v1_runtime_qsa_kv_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigureQsaKvOffloadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Configure Qsa Kv Offload",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/qsa-kv/{instance_id}": {
+      "get": {
+        "operationId": "qsa_kv_offload_info_api_v1_runtime_qsa_kv__instance_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "instance_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Instance Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_context",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 512,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Context"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Qsa Kv Offload Info Api V1 Runtime Qsa Kv  Instance Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Qsa Kv Offload Info",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
     "/api/v1/runtime/realtime/capabilities": {
       "get": {
         "operationId": "realtime_capabilities_api_v1_runtime_realtime_capabilities_get",
@@ -21843,7 +22448,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Realtime Capabilities Api V1 Runtime Realtime Capabilities Get",
                   "type": "object"
                 }
@@ -21986,7 +22590,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Reload Runtime Api V1 Runtime Reload Post",
                   "type": "object"
                 }
@@ -22269,7 +22872,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Status Api V1 Runtime Status Get",
                   "type": "object"
                 }
@@ -22389,6 +22991,150 @@
           }
         },
         "summary": "Runtime Status",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/yarn/{instance_id}": {
+      "get": {
+        "operationId": "yarn_context_info_api_v1_runtime_yarn__instance_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "instance_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Instance Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Yarn Context Info Api V1 Runtime Yarn  Instance Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Yarn Context Info",
         "tags": [
           "runtime"
         ]
@@ -22696,7 +23442,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SessionArchive"
+                "$ref": "#/components/schemas/SessionArchive-Input"
               }
             }
           },
@@ -23278,7 +24024,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionArchive"
+                  "$ref": "#/components/schemas/SessionArchive-Output"
                 }
               }
             },

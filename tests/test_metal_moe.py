@@ -57,6 +57,19 @@ def _array(value: mx.array) -> np.ndarray:
     return np.asarray(value)
 
 
+def test_nint_3d_routed_bank():
+    from dataclasses import replace
+    rng = np.random.default_rng(20261010)
+    values = rng.normal(scale=.1, size=(3, 12, 16)).astype(np.float32)
+    flat = quantize(values.reshape(-1, 16), NintSpec(8, 48, 7))
+    tensor = io.unpack_nint(io.pack_nint(replace(flat, shape=values.shape)))
+    layer = MlxNintModel({'experts': tensor}).routed('experts')
+    source = rng.normal(size=(2, 16)).astype(np.float16)
+    ids = np.array([[0, 2], [1, 0]], np.int32)
+    expected = np.einsum('mroi,mi->mro', dequantize(tensor)[ids], source.astype(np.float32))
+    np.testing.assert_allclose(_array(layer(mx.array(source), mx.array(ids))), expected, atol=.003, rtol=.003)
+
+
 def _mfe_nint(
     dense: np.ndarray,
     cohorts: tuple[tuple[int, ...], ...],

@@ -397,7 +397,7 @@ def write_glm_fixture(path,config,weights,predictor=False):
 
 
 def diagnostics_binary(bridge):
-    path=Path(bridge).with_name("mfq-diagnostics")
+    path=Path(bridge).with_name("mfq-diagnostics"+Path(bridge).suffix)
     return path if path.is_file() else path.parent.parent/path.name
 
 
@@ -805,6 +805,24 @@ def qwen_model_reference(config,w,positions=None,mtp=None,return_hidden=False):
     return (sample,x) if mtp is not None or return_hidden else lin(sample,"model.output")
 
 
+def independent_qwen_attention(config, weights):
+    result = dict(weights)
+    c = config['text_config']
+    kw = c['linear_num_key_heads'] * c['linear_key_head_dim']
+    heads, width = c['num_attention_heads'], c['head_dim']
+    for name, value in weights.items():
+        if name.endswith('.linear_attention.qkv.weight'):
+            prefix = name.removesuffix('.qkv.weight')
+            for key, matrix in zip(('query','key','value'), np.split(value, [kw, 2*kw], axis=0)):
+                result[prefix+f'.{key}.weight'] = matrix.copy()
+            del result[name]
+        elif name.endswith('.attention.query.weight'):
+            pair = value.reshape(heads, 2*width, -1)
+            result[name] = pair[:, :width].reshape(heads*width, -1).copy()
+            result[name.removesuffix('.query.weight')+'.gate.weight'] = pair[:, width:].reshape(heads*width, -1).copy()
+    return result
+
+
 def write_qwen_fixture(path,config,weights,predictor=False):
     from mfq.formats.io import save
     from mfq.formats.header import FileHeader
@@ -822,11 +840,12 @@ def write_qwen_fixture(path,config,weights,predictor=False):
 
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,False),(2,True),(3,True)])
 @pytest.mark.parametrize("silu_gate",[False,True])
-def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate):
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent):
     c,w=qwen_model_fixture(interval,silu_gate,ple);expected=qwen_model_reference(c,w)
     positions=np.stack((np.arange(7),np.arange(7)+2,np.arange(7)+4))
     axis_expected=qwen_model_reference(c,w,positions)
-    path=tmp_path/"qwen-graph.mfq";write_qwen_fixture(path,c,w)
+    path=tmp_path/"qwen-graph.mfq";write_qwen_fixture(path,c,independent_qwen_attention(c,w) if independent else w)
     process=run_glm_fixture(path);assert process.returncode==0,process.stdout+process.stderr
     raw=json.loads(next(line.removeprefix("flash_next_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_check ")))
     assert raw.pop("architecture")=="qwen4_exp"
@@ -843,6 +862,68 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate):
         np.testing.assert_allclose(got[action],got[action+"_reference"],atol=2e-3,rtol=2e-3)
 
 
+@pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
+@pytest.mark.parametrize("quantized_gr",[False,True,"shared-q8","shared-nint","shared-up"])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr):
+    from mfq.formats.nint import NintSpec
+    from mfq.formats.mfe import MfePool,MfeTensor
+    from mfq.quantize.nint_quant import quantize
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    config,weights=qwen_model_fixture(interval,True,ple)
+    if isinstance(quantized_gr,str):
+        from mfq.formats.io import BFloat16Array
+        config["text_config"]["hc_lowrank"]=16
+        stream_repeat=2 if quantized_gr=="shared-up" else 1
+        if stream_repeat==2:config["text_config"]["hc_count"]=4
+        for name,value in list(weights.items()):
+            if ".mhc." not in name:continue
+            if name.endswith(".down.weight"):weights[name]=np.tile(value,(4,stream_repeat))/2
+            elif name.endswith(".up.weight"):weights[name]=np.tile(value,(stream_repeat,4))/2
+            elif name.endswith(".inject.weight"):
+                value=np.tile(value,(stream_repeat,stream_repeat))
+                weights[name]=(np.ascontiguousarray(value).view(np.uint32)>>16).astype(np.uint16).view(BFloat16Array) if quantized_gr=="shared-q8" else value
+            elif name.endswith(".norm.weight"):weights[name]=np.tile(value,stream_repeat)
+        if stream_repeat==2:
+            for name,value in list(weights.items()):
+                if ".position_embedding." not in name:continue
+                if name.endswith(".key.weight"):weights[name]=np.tile(value,(2,1))
+                elif name.endswith((".key_norm.weight",".query_norm.weight",".conv_norm.weight")):
+                    weights[name]=np.tile(value,2)
+                elif name.endswith(".conv.weight"):weights[name]=np.tile(value,(2,1,1))
+    for name,value in list(weights.items()):
+        if quantized_gr and ".mhc." in name and name.endswith((".down.weight",".up.weight",".inject.weight")):
+            if quantized_gr=="shared-q8" and name.endswith(".inject.weight"):continue
+            weights[name]=quantize(value,NintSpec(8,32 if isinstance(quantized_gr,str) else 8,6))
+            continue
+        if name.endswith(".experts.gate_up.weight"):
+            for role,matrix in zip(("gate","up"),np.split(value,2,axis=1)):
+                weights[name.replace("gate_up",role)]=matrix.copy()
+            del weights[name]
+    for name,value in list(weights.items()):
+        if ".experts." in name:
+            experts,output,width=value.shape
+            packed=quantize(value.reshape(experts*output,width),NintSpec(4,8,6))
+            weights[name]=MfeTensor(value.shape,(MfePool(np.arange(experts,dtype=np.int32),packed),))
+        elif ".ngram.shard." in name:
+            weights[name]=quantize(value,NintSpec(4,8,6))
+        elif ".shared_expert." in name and not name.endswith(".router.weight"):
+            weights[name]=quantize(value,NintSpec(4,8,6))
+    path=tmp_path/"qwen-decode-hidden.mfq"
+    write_qwen_fixture(path,config,weights)
+    env={**os.environ,"MFQ_MOE_PIPELINE":"1","MFQ_MOE_ROUTER_LOOKAHEAD":"0",
+        "MFQ_DISABLE_MOE_SSD_RANGES":"0","MFQ_MOE_PREFILL_LAYER":"0",
+        "MFQ_MOE_PREFILL_GRAPH":"0",
+        "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
+        "MFQ_MOE_HOST_CACHE_BYTES":"1048576"}
+    process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
+        "--ctx-size","32","--moe-gpu-cache-gb","0.01","--check-qwen4-decode-hidden"],
+        text=True,capture_output=True,timeout=90,env=env)
+    assert process.returncode==0,process.stdout+process.stderr
+    assert "qwen4_decode_hidden_check PASS graph_steps=18 retained_steps=20" in process.stdout
+    assert "qwen4_mtp_graph_check PASS transactions=20" in process.stdout
+
+
 @pytest.mark.parametrize("error",["schedule","rotary","ple","linear_width","pool","norm","topk","mtp"])
 def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     config,w=qwen_model_fixture();c=config["text_config"]
@@ -856,6 +937,51 @@ def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     elif error=="mtp":c.update(mtp_num_hidden_layers=2,mtp={"num_hidden_layers":1})
     path=tmp_path/"invalid-qwen.mfq";write_qwen_fixture(path,config,w)
     result=run_glm_fixture(path);assert result.returncode!=0 and "flash_next_check " not in result.stdout
+
+
+@pytest.mark.parametrize("graph_enabled",[False,True])
+@pytest.mark.parametrize("layout",["separate","combined-hot","combined-gpu","combined-cpu",
+    "combined-e8-hot","combined-e8-gpu","combined-e8-cpu"])
+def test_qwen_mtp_graph_quantized_predictor(tmp_path,graph_enabled,layout):
+    from mfq.formats.nint import NintSpec
+    from mfq.formats.mfe import MfePool,MfeTensor
+    from mfq.quantize.nint_quant import quantize
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    config,weights=mtp_fixture("qwen",1)
+    combined_predictor=layout!="separate"
+    for name,value in list(weights.items()):
+        if name.endswith(".experts.gate_up.weight") and not (combined_predictor and name.startswith("predictor.")):
+            for role,matrix in zip(("gate","up"),np.split(value,2,axis=1)):
+                weights[name.replace("gate_up",role)]=matrix.copy()
+            del weights[name]
+    for name,value in list(weights.items()):
+        if ".experts." in name:
+            experts,output,width=value.shape
+            if name.startswith("predictor.") and "-e8-" in layout:
+                from tests.mixed_family_fixtures import make_flat_family
+                packed=make_flat_family("NVQ2J-L",rows=experts*output,neuron_len=width,seed=711)
+            else:
+                packed=quantize(value.reshape(experts*output,width),NintSpec(4,8,6))
+            weights[name]=MfeTensor(value.shape,(MfePool(np.arange(experts,dtype=np.int32),packed),))
+        elif ".mhc." in name and name.endswith((".down.weight",".up.weight",".inject.weight")):
+            weights[name]=quantize(value,NintSpec(8,8,6))
+        elif ".ngram.shard." in name or (".shared_expert." in name and not name.endswith(".router.weight")):
+            weights[name]=quantize(value,NintSpec(4,8,6))
+    path=tmp_path/"qwen-mtp-graph.mfq";write_qwen_fixture(path,config,weights,True)
+    env={**os.environ,"MFQ_MOE_PIPELINE":"1","MFQ_MOE_ROUTER_LOOKAHEAD":"0",
+        "MFQ_DISABLE_MOE_SSD_RANGES":"0","MFQ_MOE_PREFILL_LAYER":"0",
+        "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
+        "MFQ_MOE_HOST_CACHE_BYTES":"1048576","MFQ_MOE_PREFILL_GRAPH":"0",
+        "MFQ_MOE_RAM_PCIE":"1","MFQ_MOE_RAM_PCIE_FRACTION":"0" if layout.endswith("-cpu") else "1",
+        "MFQ_MTP_PREDICTOR_GRAPH":str(int(graph_enabled))}
+    process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
+        "--ctx-size","32","--moe-gpu-cache-gb","0.00001" if layout.endswith(("-gpu","-cpu")) else "0.01","--check-flash-next-mtp"],
+        text=True,capture_output=True,timeout=90,env=env)
+    assert process.returncode==0,process.stdout+process.stderr
+    raw=json.loads(next(line.removeprefix("flash_next_mtp_check ") for line in process.stdout.splitlines()
+        if line.startswith("flash_next_mtp_check ")))
+    assert bool(raw["predictor_graph_replays"])==graph_enabled
 
 
 def test_qwen_native_disabled_predictor_retains_source_config(tmp_path):
@@ -902,8 +1028,12 @@ def run_mtp_fixture(path):
 
 @pytest.mark.parametrize("family",["qwen","glm"])
 @pytest.mark.parametrize("layers",[1,2])
-def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers):
+@pytest.mark.parametrize('independent', [False, True])
+def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent):
+    if independent and family != 'qwen': pytest.skip('independent Qwen projections')
     config,w=mtp_fixture(family,layers);path=tmp_path/"predictor.mfq"
+    reference_weights = w
+    if independent: w = independent_qwen_attention(config, w)
     (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
     process=run_mtp_fixture(path);assert process.returncode==0,process.stdout+process.stderr
     raw=json.loads(next(line.removeprefix("flash_next_mtp_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_mtp_check ")))
@@ -911,7 +1041,7 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     previous=array(raw["previous"]);ids=np.arange(1,8,dtype=np.int64)[None]
     reference=qwen_model_reference if family=="qwen" else glm_model_reference
     for i,row in enumerate(raw["layers"]):
-        expected=reference(config,w,mtp=(ids,previous,i,None))
+        expected=reference(config,reference_weights,mtp=(ids,previous,i,None))
         for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
         np.testing.assert_allclose(array(row["logits"]),expected[0]@w["model.output.weight"].T,atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
@@ -920,14 +1050,15 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
         positions=np.arange(7)+3
         if family=="qwen":
             positions=np.stack((positions,positions+2,positions+4))
-            axis=reference(config,w,positions=positions,mtp=(ids,previous,i,None))[0]
+            axis=reference(config,reference_weights,positions=positions,mtp=(ids,previous,i,None))[0]
         else:axis=reference(config,w,mtp=(ids,previous,i,positions))[0]
         np.testing.assert_allclose(array(row["axis"]),axis,atol=2e-3,rtol=2e-3)
-    target=reference(config,w,return_hidden=True)
+    target=reference(config,reference_weights,return_hidden=True)
     np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
     np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
     assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0
-    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=2
+    # The throughput controller can park after its first depth-3 probe.
+    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=1
 
 
 @pytest.mark.parametrize("family",["qwen","glm"])

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request, Response, WebSocket, WebSocketDisconnect
@@ -18,6 +18,7 @@ from mfq.server.api.dependencies import (
 from mfq.server.api.routes import ERROR_RESPONSES
 from mfq.server.protocol.models import (
     CreateRuntimeProfileRequest,
+    JobResource,
     OperationAccepted,
     RuntimeCacheClearRequest,
     RuntimeCacheTrimRequest,
@@ -36,6 +37,8 @@ from mfq.server.protocol.models import (
     RuntimeListenerRequest,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
+    ConfigureQsaKvOffloadRequest,
+    RuntimeContextPolicy,
     RuntimeModelAliases,
     UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
@@ -43,6 +46,38 @@ from mfq.server.protocol.models import (
 
 profile_router = APIRouter()
 router = APIRouter()
+
+
+@router.get("/api/v1/runtime/context-policy", response_model=RuntimeContextPolicy, responses=ERROR_RESPONSES, tags=["runtime"])
+async def context_policy(service: ServiceDependency) -> RuntimeContextPolicy:
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "context_policy"):
+        raise ServiceError(501, "context_policy_unavailable", "runtime context policy is unavailable")
+    return service.runtime_manager.context_policy
+
+
+@router.get("/api/v1/runtime/yarn/{instance_id}", responses=ERROR_RESPONSES, tags=["runtime"])
+async def yarn_context_info(service: ServiceDependency, instance_id: UUID) -> dict[str, Any]:
+    from mfq.server.runtime.backend import BackendError
+    from mfq.server.services.service import ServiceError
+    try:
+        return await service.runtime_manager.yarn_context_info(instance_id)
+    except BackendError as error:
+        raise ServiceError(error.status_code or 400, error.code, str(error)) from error
+
+
+@router.put("/api/v1/runtime/context-policy", response_model=RuntimeContextPolicy, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_context_policy(service: ServiceDependency, body: RuntimeContextPolicy) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "configure_context_policy"):
+        raise ServiceError(501, "context_policy_unavailable", "runtime context policy is unavailable")
+    return await service.runtime_manager.configure_context_policy(body)
+
+
+@router.post("/api/v1/runtime/context", response_model=JobResource, status_code=202, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_context(service: ServiceDependency, body: RuntimeReloadRequest) -> JobResource:
+    from mfq.server.protocol.models import CreateJobRequest
+    return await service.create_job(CreateJobRequest(kind="runtime.context.configure", payload=body.model_dump(mode="json")))
 
 
 @router.get("/api/v1/runtime/resources", response_model=RuntimeResourceSnapshot, responses=ERROR_RESPONSES, tags=["runtime"])
@@ -96,6 +131,35 @@ async def configure_memory_policy(service: ServiceDependency, body: RuntimeMemor
     return OperationAccepted(operation_id=job.id, status="accepted")
 
 
+@router.get("/api/v1/runtime/qsa-kv/{instance_id}", responses=ERROR_RESPONSES, tags=["runtime"])
+async def qsa_kv_offload_info(service: ServiceDependency, instance_id: UUID,
+    target_context: int | None = Query(default=None, ge=512, le=2147483647)) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    from mfq.server.services.jobs import JobExecutionError
+    from mfq.server.runtime.client import BackendError
+    if not hasattr(service.runtime_manager, "qsa_kv_offload_info"):
+        raise ServiceError(501, "qsa_kv_offload_unavailable", "QSA KV offload is unavailable")
+    try:
+        return await service.runtime_manager.qsa_kv_offload_info(instance_id, target_context)
+    except BackendError as error:
+        raise ServiceError(error.status_code or 400, error.code, str(error), retryable=error.retryable) from error
+    except JobExecutionError as error:
+        raise ServiceError(400, error.detail.code, error.detail.message, retryable=error.detail.retryable) from error
+
+
+@router.put("/api/v1/runtime/qsa-kv", response_model=OperationAccepted, status_code=202, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_qsa_kv_offload(service: ServiceDependency, body: ConfigureQsaKvOffloadRequest) -> OperationAccepted:
+    from mfq.server.protocol.models import CreateJobRequest
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "qsa_kv_offload_info"):
+        raise ServiceError(501, "qsa_kv_offload_unavailable", "QSA KV offload is unavailable")
+    info = await qsa_kv_offload_info(service, body.instance_id)
+    if not info["supported"]:
+        raise ServiceError(400, "qsa_kv_offload_unsupported", "the model or backend does not support QSA KV offload")
+    job = await service.create_job(CreateJobRequest(kind="runtime.qsa-kv.configure", payload=body.model_dump(mode="json")))
+    return OperationAccepted(operation_id=job.id, status="accepted")
+
+
 @router.get("/api/v1/runtime/listener", responses=ERROR_RESPONSES, tags=["runtime"])
 async def runtime_listener(request: Request) -> dict[str, Any]:
     listener = getattr(request.app.state, "listener", None)
@@ -112,7 +176,7 @@ async def configure_runtime_listener(request: Request, body: RuntimeListenerRequ
     if listener is None:
         raise ServiceError(409, "listener_not_managed", "server listener is managed externally")
     try:
-        return await listener.change_port(body.port)
+        return await listener.change_port(body.port, body.protocol)
     except OSError as error:
         raise ServiceError(409, "listener_change_failed", str(error)) from error
     except RuntimeError as error:
@@ -311,17 +375,22 @@ async def reload_runtime(service: ServiceDependency, body: RuntimeReloadRequest)
     return await service.reload_runtime(
         body.context_size,
         instance_id=body.instance_id,
+        yarn_enabled=body.yarn_enabled,
     )
 
 
 @router.get("/api/v1/runtime/cache/entries", responses=ERROR_RESPONSES, tags=["runtime"])
 async def prefix_cache_entries(service: ServiceDependency, namespace: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
-    offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200)) -> dict[str, Any]:
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200),
+    query: str = Query(default='', max_length=200), search_in: Literal['all', 'text', 'id'] = 'all',
+    text_filter: Literal['all', 'saved', 'missing'] = 'all', chain_filter: Literal['all', 'complete', 'incomplete'] = 'all',
+    sort: Literal['recent', 'oldest', 'length', 'size'] = 'recent') -> dict[str, Any]:
     from mfq.server.services.service import ServiceError
     manager = service.runtime_manager
     if not hasattr(manager, "inspect_prefix_cache"):
         raise ServiceError(501, "cache_management_unavailable", "prefix cache management is unavailable")
-    return await manager.inspect_prefix_cache(namespace, offset=offset, limit=limit)
+    return await manager.inspect_prefix_cache(namespace, offset=offset, limit=limit,
+        query=query, search_in=search_in, text_filter=text_filter, chain_filter=chain_filter, sort=sort)
 
 
 @router.get("/api/v1/runtime/cache/entries/{namespace}/{block}/text", responses=ERROR_RESPONSES, tags=["runtime"])

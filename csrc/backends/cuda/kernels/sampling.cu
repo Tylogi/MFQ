@@ -222,7 +222,8 @@ __device__ __forceinline__ void sample_argmax_block_finish(
     float best_value,
     int best_index,
     int64_t* out,
-    int row)
+    int row,
+    float* out_values = nullptr)
 {
     constexpr int warps = SAMPLE_BD / 32;
     __shared__ float warp_values[warps];
@@ -239,7 +240,10 @@ __device__ __forceinline__ void sample_argmax_block_finish(
         best_value = lane < warps ? warp_values[lane] : -FLT_MAX;
         best_index = lane < warps ? warp_indices[lane] : INT_MAX;
         sample_argmax_warp_reduce(best_value, best_index);
-        if (lane == 0) out[row] = best_index == INT_MAX ? 0 : best_index;
+        if (lane == 0) {
+            out[row] = best_index == INT_MAX ? 0 : best_index;
+            if (out_values) out_values[row] = best_value;
+        }
     }
 }
 
@@ -280,6 +284,63 @@ __global__ void sample_greedy_pair_kernel(
         const float2 values = sample_pair_to_float2(row_logits[pair]);
         sample_argmax_update(values.x, pair * 2, best, best_i);
         sample_argmax_update(values.y, pair * 2 + 1, best, best_i);
+    }
+    sample_argmax_block_finish(best, best_i, out, row);
+}
+
+constexpr int SAMPLE_GREEDY_CHUNK = 4096;
+
+template <typename scalar_t>
+__global__ void sample_greedy_chunks_kernel(
+    const scalar_t* __restrict__ logits,
+    float* __restrict__ values,
+    int64_t* __restrict__ indices,
+    int V,
+    int chunks)
+{
+    const int row = blockIdx.y;
+    const int begin = blockIdx.x * SAMPLE_GREEDY_CHUNK;
+    const int end = min(begin + SAMPLE_GREEDY_CHUNK, V);
+    float best = -FLT_MAX;
+    int best_i = 0;
+    for (int i = begin + threadIdx.x; i < end; i += SAMPLE_BD)
+        sample_argmax_update(sample_load(logits, (size_t)row * V + i), i, best, best_i);
+    sample_argmax_block_finish(best, best_i, indices, row * chunks + blockIdx.x, values);
+}
+
+template <typename pair_t>
+__global__ void sample_greedy_pair_chunks_kernel(
+    const pair_t* __restrict__ logits,
+    float* __restrict__ values,
+    int64_t* __restrict__ indices,
+    int V,
+    int chunks)
+{
+    const int row = blockIdx.y;
+    const int begin = blockIdx.x * (SAMPLE_GREEDY_CHUNK / 2);
+    const int end = min(begin + SAMPLE_GREEDY_CHUNK / 2, V / 2);
+    float best = -FLT_MAX;
+    int best_i = 0;
+    for (int pair = begin + threadIdx.x; pair < end; pair += SAMPLE_BD) {
+        const float2 v = sample_pair_to_float2(logits[(size_t)row * (V / 2) + pair]);
+        sample_argmax_update(v.x, pair * 2, best, best_i);
+        sample_argmax_update(v.y, pair * 2 + 1, best, best_i);
+    }
+    sample_argmax_block_finish(best, best_i, indices, row * chunks + blockIdx.x, values);
+}
+
+__global__ void sample_greedy_chunks_finish_kernel(
+    const float* __restrict__ values,
+    const int64_t* __restrict__ indices,
+    int64_t* __restrict__ out,
+    int chunks)
+{
+    const int row = blockIdx.x;
+    float best = -FLT_MAX;
+    int best_i = 0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += SAMPLE_BD) {
+        const int offset = row * chunks + chunk;
+        sample_argmax_update(values[offset], (int)indices[offset], best, best_i);
     }
     sample_argmax_block_finish(best, best_i, out, row);
 }
@@ -476,6 +537,31 @@ mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
         logits.data_ptr());
     const bool pair_aligned =
         (logits_address & (alignof(half2) - 1)) == 0;
+    if (V >= 16384 && B <= 65535) {
+        // Large vocabularies with a few rows need multiple CTAs per row.
+        const int chunks = (V + SAMPLE_GREEDY_CHUNK - 1) / SAMPLE_GREEDY_CHUNK;
+        auto values = mfq_tensor_backend::empty({B, chunks}, logits.options().dtype(mfq_tensor_backend::kFloat32));
+        auto indices = mfq_tensor_backend::empty({B, chunks}, logits.options().dtype(mfq_tensor_backend::kInt64));
+        const dim3 grid(chunks, B);
+        if ((V & 1) == 0 && pair_aligned && logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+            sample_greedy_pair_chunks_kernel<half2><<<grid, SAMPLE_BD, 0, stream>>>(
+                reinterpret_cast<const half2*>(logits.data_ptr<mfq_half>()),
+                values.data_ptr<float>(), indices.data_ptr<int64_t>(), V, chunks);
+        } else if ((V & 1) == 0 && pair_aligned && logits.scalar_type() == mfq_tensor_backend::kBFloat16) {
+            sample_greedy_pair_chunks_kernel<__nv_bfloat162><<<grid, SAMPLE_BD, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(logits.data_ptr<mfq_bfloat16>()),
+                values.data_ptr<float>(), indices.data_ptr<int64_t>(), V, chunks);
+        } else {
+            MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half, mfq_dispatch_bfloat16,
+                logits.scalar_type(), "sample_greedy_chunks_cuda", [&] {
+                sample_greedy_chunks_kernel<scalar_t><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), values.data_ptr<float>(), indices.data_ptr<int64_t>(), V, chunks);
+            });
+        }
+        sample_greedy_chunks_finish_kernel<<<B, SAMPLE_BD, 0, stream>>>(
+            values.data_ptr<float>(), indices.data_ptr<int64_t>(), out.data_ptr<int64_t>(), chunks);
+        return out;
+    }
     if ((V & 1) == 0 &&
         pair_aligned &&
         logits.scalar_type() == mfq_tensor_backend::kFloat16) {

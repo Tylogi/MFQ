@@ -125,9 +125,9 @@ void launch_row_mean(
     else launch.template operator()<256>();
 }
 
-template <int Threads>
-__global__ void argmax_last_contiguous_bf16_kernel(
-    const __nv_bfloat16* input,
+template <typename Value, int Threads>
+__global__ void argmax_last_contiguous_kernel(
+    const Value* input,
     std::int64_t* output,
     std::int64_t rows,
     std::int64_t columns) {
@@ -137,15 +137,19 @@ __global__ void argmax_last_contiguous_bf16_kernel(
     const auto row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) return;
     const auto* row_input = input + row * columns;
-    float best_value = 0.0f;
+    // BF16 retains its existing comparison contract. FP16/FP32 match the
+    // generic reduction: ignore NaNs and values no greater than lowest(),
+    // return zero when no candidate wins, and select the first equal maximum.
+    constexpr bool generic = !std::is_same_v<Value, __nv_bfloat16>;
+    float best_value = generic ? std::numeric_limits<float>::lowest() : 0.0f;
     std::int64_t best_index = invalid_index;
     for (std::int64_t column = threadIdx.x;
          column < columns;
          column += Threads) {
-        const float value = __bfloat162float(row_input[column]);
-        if (best_index == invalid_index ||
+        const float value = static_cast<float>(load_number(row_input, column));
+        if ((!generic && best_index == invalid_index) ||
             value > best_value ||
-            (value == best_value && column < best_index)) {
+            (value == best_value && best_index != invalid_index && column < best_index)) {
             best_value = value;
             best_index = column;
         }
@@ -168,7 +172,7 @@ __global__ void argmax_last_contiguous_bf16_kernel(
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) output[row] = indices[0];
+    if (threadIdx.x == 0) output[row] = indices[0] == invalid_index ? 0 : indices[0];
 }
 
 ScalarType reduction_type(ScalarType input, int operation) {
@@ -254,15 +258,21 @@ Tensor reduce_cuda(
         return output;
     }
     if (operation == 3 &&
-        source.scalar_type() == kBFloat16 &&
+        (source.scalar_type() == kBFloat16 ||
+         (reduced >= 256 && (source.scalar_type() == kFloat16 || source.scalar_type() == kFloat32))) &&
         source.is_contiguous() &&
         outer <= std::numeric_limits<unsigned int>::max() &&
         selected + 1 == static_cast<std::size_t>(source.dim())) {
         constexpr int threads = 256;
-        argmax_last_contiguous_bf16_kernel<threads>
-            <<<static_cast<unsigned int>(outer), threads, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(source.data_ptr()),
-                output.data_ptr<std::int64_t>(), outer, reduced);
+        const auto launch = [&]<typename Value>() {
+            argmax_last_contiguous_kernel<Value, threads>
+                <<<static_cast<unsigned int>(outer), threads, 0, stream>>>(
+                    static_cast<const Value*>(source.data_ptr()),
+                    output.data_ptr<std::int64_t>(), outer, reduced);
+        };
+        if (source.scalar_type() == kFloat16) launch.template operator()<__half>();
+        else if (source.scalar_type() == kFloat32) launch.template operator()<float>();
+        else launch.template operator()<__nv_bfloat16>();
         MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
         return output;
     }

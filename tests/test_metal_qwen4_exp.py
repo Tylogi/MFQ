@@ -66,7 +66,8 @@ def _canonical_tensors(tensors: dict, *, text_layers: int = 1) -> dict:
     return tensors.__class__(mapped)
 
 
-def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen4_gdn_cached_chunks_match_full_sequence(independent) -> None:
     rng = np.random.default_rng(3801)
     hidden = dimension = 128
     key_heads, value_heads = 1, 2
@@ -103,6 +104,11 @@ def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
 
     full = MlxQwen4ExpGdn(MlxNintModel(tensors), config, prefix)
     expected = full(source, use_cache=False)
+    if independent:
+        tensors = dict(tensors)
+        q, k, v = np.split(tensors.pop(prefix + '.qkv.weight'), [key_width, 2*key_width], axis=0)
+        for name, matrix in zip(('query', 'key', 'value'), (q, k, v)):
+            tensors[prefix + f'.{name}.weight'] = matrix.copy()
 
     cached = MlxQwen4ExpGdn(MlxNintModel(tensors), config, prefix)
     cached.reset_cache(1)
@@ -491,7 +497,8 @@ def test_qwen4_ple_reject_rollback_restores_convolution_and_ngram_history() -> N
     )
 
 
-def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
+@pytest.mark.parametrize('independent', [False, True])
+def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence(independent) -> None:
     rng = np.random.default_rng(3802)
     hidden = dimension = 128
     heads, kv_heads, index_heads = 2, 1, 2
@@ -527,18 +534,23 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         indexer_budget=4,
         indexer_compress_ratio=2,
     )
-    source = mx.array(_random(rng, (1, 6, hidden), 0.2)).astype(mx.float16)
-    positions = mx.arange(6, dtype=mx.int32)
+    source = mx.array(_random(rng, (1, 37, hidden), 0.2)).astype(mx.float16)
+    positions = mx.arange(37, dtype=mx.int32)
 
-    full = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 16)
+    full = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 64)
     expected = full(
         source,
         positions,
         positions,
         use_cache=False,
     )
+    if independent:
+        tensors = dict(tensors)
+        pair = tensors[prefix + '.query.weight'].reshape(heads, 2*dimension, hidden)
+        tensors[prefix + '.query.weight'] = pair[:, :dimension].reshape(heads*dimension, hidden).copy()
+        tensors[prefix + '.gate.weight'] = pair[:, dimension:].reshape(heads*dimension, hidden).copy()
 
-    cached = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 16)
+    cached = MlxQwen4ExpQsa(MlxNintModel(tensors), config, prefix, 64)
     cached.reset_cache(1)
     first = cached(
         source[:, :2],
@@ -554,6 +566,9 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
     )
     actual = mx.concatenate((first, second), axis=1)
     mx.eval(expected, actual)
+    assert cached.index_tail.shape[1] <= config.indexer_compress_ratio + 5
+    assert cached.index_start + cached.index_tail.shape[1] == 37
+    assert cached.pooled_index_cache.position == 37 // config.indexer_compress_ratio
 
     np.testing.assert_allclose(
         np.asarray(actual),
@@ -561,6 +576,11 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         rtol=1.5e-2,
         atol=1.5e-2,
     )
+    cached.cache.pos = 35
+    cached.trim_index_cache(35)
+    continued = cached(source[:, 35:], positions[35:], positions, use_cache=True)
+    mx.eval(continued)
+    np.testing.assert_allclose(np.asarray(continued), np.asarray(expected[:, 35:]), rtol=1.5e-2, atol=1.5e-2)
 
 
 def test_qwen4_mtp_cached_chunks_match_full_multistream_sequence() -> None:

@@ -47,21 +47,31 @@ template <class Model> struct CudaMtpOps {
   MtpTarget target;
   bool transformed_prompt;
   int position_axes;
+  int64_t prefill_compute_chunk;
+  InferenceOutput* output;
   const mfq_tensor_backend::TensorOptions options =
       mfq_tensor_backend::TensorOptions()
           .device(mfq_tensor_backend::kCUDA)
           .dtype(mfq_tensor_backend::kInt64);
   Tensor input_ids, counts;
+  Tensor known_ids_host, known_ids_device;
+  Tensor projected_target_hidden, projected_target_logits;
+  Tensor projected_predictor_hidden, projected_predictor_logits;
+  int32_t projected_predictor_greedy=-1;
+  std::vector<int32_t> projected_target_greedy;
   std::optional<mfq::cuda::Sampler> sampler_;
   bool penalties = false;
+  bool target_maintenance = false;
+  bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
 
-  CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared)
+  CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
+             int64_t compute_chunk, InferenceOutput* output)
       : model(model), mtp(mtp), prepared(prepared), target(model),
         transformed_prompt(prepared && prepared->transformed()),
         position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
-                          : 1) {}
+                          : 1), prefill_compute_chunk(compute_chunk), output(output) {}
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
@@ -93,10 +103,28 @@ template <class Model> struct CudaMtpOps {
   }
   Tensor target_forward(Tensor ids, Tensor *raw = nullptr,
                         int64_t confirmed = 0) {
+    projected_target_hidden = {}; projected_target_logits = {};
+    projected_target_greedy.clear();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!transformed_prompt) {
+        bool initialized=false;
+        const auto host_ids = known_ids_device.defined() &&
+            ids.data_ptr() == known_ids_device.data_ptr() && ids.sizes() == known_ids_device.sizes()
+            ? known_ids_host : Tensor{};
+        Tensor logits;
+        if(auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids,raw,confirmed,&initialized,host_ids,&logits,&projected_target_greedy)) {
+          target_maintenance=target_maintenance || initialized;
+          projected_target_hidden = *hidden; projected_target_logits = std::move(logits);
+          return std::move(*hidden);
+        }
+      }
+    }
     return model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
                                 mfq_nullopt, raw, confirmed);
   }
   Tensor target_suffix(Tensor ids, Tensor *raw) {
+    projected_target_hidden = {}; projected_target_logits = {};
+    projected_target_greedy.clear();
     return model.hidden_forward_speculative_suffix(ids, raw);
   }
   struct PrefillResult {
@@ -107,6 +135,14 @@ template <class Model> struct CudaMtpOps {
     PrefillCudaTimer timer;
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!transformed_prompt && mfq::cuda::qwen4_layer_major_prefill_eligible(model,chunk.count)) {
+        auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,false,
+            [&] { return output && output->stopped(); }, &raw);
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+        return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
+      }
+    }
     auto hidden =
         transformed_prompt
             ? model.hidden_forward_inputs(
@@ -122,9 +158,10 @@ template <class Model> struct CudaMtpOps {
     return {std::move(hidden), std::move(raw), timer.elapsed_ms()};
   }
   Tensor ids_for(std::vector<int64_t> tokens) {
-    return mfq_tensor_backend::tensor(tokens, options)
-        .reshape({1, -1})
-        .contiguous();
+    known_ids_host = mfq_tensor_backend::tensor(tokens, options.device(mfq_tensor_backend::kCPU))
+        .reshape({1, -1}).contiguous();
+    known_ids_device = known_ids_host.to(mfq_tensor_backend::kCUDA);
+    return known_ids_device;
   }
   Tensor decode_positions(int64_t cache_start, int64_t tokens) {
     MFQ_RUNTIME_CHECK(tokens > 0, "CUDA MTP position span must be positive");
@@ -141,20 +178,46 @@ template <class Model> struct CudaMtpOps {
                : result;
   }
   MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
-    return positions.defined()
+    auto result=positions.defined()
                ? mtp.step_positioned(target, std::move(hidden), std::move(ids),
                                      std::move(positions))
                : mtp.step(target, std::move(hidden), std::move(ids));
+    const bool initialized=mtp.take_graph_initialization();
+    target_maintenance=target_maintenance || initialized;
+    projected_predictor_logits = result.sample_logits;
+    projected_predictor_greedy = result.greedy_token;
+    projected_predictor_hidden = result.sample_logits.defined()
+        ? result.sample_hidden.narrow(1, result.sample_hidden.size(1)-1, 1).contiguous() : Tensor{};
+    return result;
   }
   int32_t sample_normal(Tensor logits, Tensor token_counts) {
+    if(sampler().greedy() && !penalties) {
+      if(projected_predictor_greedy>=0 && projected_predictor_logits.defined() &&
+          logits.data_ptr()==projected_predictor_logits.data_ptr() && logits.numel()==projected_predictor_logits.numel())
+        return projected_predictor_greedy;
+      if(projected_target_greedy.size()==1 && projected_target_logits.defined() &&
+          logits.data_ptr()==projected_target_logits.data_ptr() && logits.numel()==projected_target_logits.numel())
+        return projected_target_greedy.front();
+    }
     if (penalties)
       logits = logits.clone();
     return static_cast<int32_t>(
         mfq::cuda::sample_logits(sampler(), std::move(logits), token_counts)
             .template item<int64_t>());
   }
+  std::vector<int32_t> greedy_tokens(Tensor logits) {
+    MFQ_RUNTIME_CHECK(!penalties && sampler().greedy() && logits.dim() == 2,
+                      "batched greedy MTP sampling geometry is invalid");
+    if(!projected_target_greedy.empty() && projected_target_logits.defined() &&
+        logits.data_ptr()==projected_target_logits.data_ptr() && logits.numel()==projected_target_logits.numel())
+      return projected_target_greedy;
+    auto host = sampler().ops().sample_greedy(logits.contiguous()).cpu().contiguous();
+    const auto* tokens = host.template data_ptr<int64_t>();
+    return std::vector<int32_t>(tokens, tokens + host.numel());
+  }
   int32_t sample_constrained(Tensor logits, Tensor token_counts,
                              const MfqTokenConstraintPtr &constraint) {
+    if(!constraint && sampler().greedy() && !penalties) return sample_normal(logits,token_counts);
     if (penalties)
       logits = logits.clone();
     auto sampler_constraint =
@@ -237,6 +300,11 @@ template <class Model> struct CudaMtpOps {
     return result;
   }
   Tensor logits_for(Tensor normalized) {
+    const auto matches = [&](const Tensor& hidden) {
+        return hidden.defined() && hidden.data_ptr()==normalized.data_ptr() && hidden.sizes()==normalized.sizes();
+    };
+    if(matches(projected_predictor_hidden)) return projected_predictor_logits;
+    if(matches(projected_target_hidden)) return projected_target_logits;
     return model.logits_from_hidden(
         (mtp.preserve_output_dtype()
              ? normalized
@@ -252,9 +320,15 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    std::size_t reused_tokens,
                    mfq_tensor_backend::Tensor restored_last_hidden,
                    mfq_tensor_backend::Tensor *session_last_hidden) {
+  auto logical_chunk=prefill_chunk_size;
+  if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
+        mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
+      logical_chunk=request.prompt.size();
+  }
   return mfq::engine::speculative_sequence(
-      CudaMtpOps<Model>{model, mtp, prepared}, request, output,
-      prefill_chunk_size, reused_tokens, std::move(restored_last_hidden),
+      CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
+      logical_chunk, reused_tokens, std::move(restored_last_hidden),
       session_last_hidden);
 }
 #define MFQ_INSTANTIATE_MTP(MODEL)                                             \

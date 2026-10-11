@@ -32,6 +32,43 @@ def mfq_index(records, config=None):
     return data, len(data) + sum(size for _, _, size in records)
 
 
+def test_moe_role_estimates_keep_embedding_in_ram_and_ple_on_ssd():
+    data, size = mfq_index([
+        ('model.token_embedding.weight', 'BF16', 1000),
+        ('model.block.0.mlp.experts.gate_up.weight', 'MFE', 6000),
+        ('model.block.0.attention.query.weight', 'NINT', 100),
+        ('model.block.0.position_embedding.ngram.shard.0.weight', 'NINT', 3000),
+    ])
+    result = inspect_mfq_header(data, size)
+    assert result.estimated_weight_bytes_by_role == {'dense': 110, 'experts': 6600, 'embedding': 1000}
+    profile = system_profile()
+    variant = _model_variants([HubModelFile(name='model.mfq', byte_size=size,
+        weight_bytes=result.weight_bytes, weight_bytes_by_dtype=result.weight_bytes_by_dtype,
+        ssd_ple_bytes=result.ssd_ple_bytes, estimated_weight_bytes_by_role=result.estimated_weight_bytes_by_role)], profile)[0]
+    assert variant.estimated_weight_bytes_by_role == result.estimated_weight_bytes_by_role
+    assert variant.estimated_resident_weight_bytes == 7710 and variant.ssd_ple_bytes == 3000
+
+
+def test_local_and_remote_dense_ple_estimates_match(tmp_path):
+    import numpy as np
+    from mfq.formats.header import FileHeader
+    from mfq.formats.io import save
+    from mfq.server.state.catalog import ModelCatalog
+
+    path = tmp_path / 'model.mfq'
+    save(path, FileHeader(model_arch='test', version=2), {
+        'model.token_embedding.weight': np.ones((10, 8), dtype=np.float16),
+        'model.block.0.attention.query.weight': np.ones((8, 8), dtype=np.float16),
+        'model.block.0.position_embedding.ngram.shard.0.weight': np.ones((100, 8), dtype=np.float16),
+    })
+    local = ModelCatalog._inspect(tmp_path, path).resource
+    remote = inspect_mfq_header(path.read_bytes(), path.stat().st_size)
+    assert local.estimated_weight_bytes_by_role == remote.estimated_weight_bytes_by_role
+    assert local.estimated_resident_weight_bytes == remote.weight_bytes == 328
+    assert remote.estimated_weight_bytes_by_role == {'dense': 148, 'experts': 0, 'embedding': 180}
+    assert local.ssd_ple_bytes == remote.ssd_ple_bytes == 1620
+
+
 def test_mfq_index_excludes_assets_and_streamed_ple_without_reading_payloads():
     data, size = mfq_index([
         ('__mfq_asset__/hf/tokenizer.json', 'BLOB', 1024),

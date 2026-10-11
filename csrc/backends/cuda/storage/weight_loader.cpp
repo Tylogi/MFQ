@@ -1,6 +1,8 @@
+#include "../runtime/execution_options.h"
 #include "weight_loader.h"
 #include "../ops/format.h"
 #include "../ops/float_projection.h"
+#include "../ops/gated_residual_fused.h"
 #include "../kernels/mfq_cuda_quant_ops.h"
 #include "../kernels/selected_attention.h"
 #include "mfq/mxfp4_sq_decode.h"
@@ -15,6 +17,9 @@
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
+#include "mfq/packed_nint_expert_store.h"
+#include <cstdlib>
+#include <cstdio>
 
 const mfq::TensorMetadata& require_tensor(
         const mfq::ModelSource& source,
@@ -725,10 +730,22 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
         "NINT row table size overflow");
     auto read = source.tensor_reader(name);
+    bool parallel=source.supports_parallel_tensor_reads();
+    auto batch=source.tensor_batch_reader(name);
+    bool mapped_file=false;
+    const auto mapped=mfq::cuda::runtime_options::ple_file_map();
+    if(mapped.value_or(false)) {
+        if(auto mapping=source.mapped_tensor_reader(name)) {
+            read=std::move(mapping);parallel=true;batch={};mapped_file=true;
+        }
+    }
+    if(const auto trace=mfq::cuda::runtime_options::trace_ple_timings();trace && *trace)
+        std::fprintf(stderr,"nint_row_source mapped_file=%d nbytes=%llu name=%s\n",int(mapped_file),
+            static_cast<unsigned long long>(metadata.nbytes),name.c_str());
     return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
         [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
             read(offset, reinterpret_cast<std::byte*>(out), count);
-        }, source.supports_parallel_tensor_reads(),source.tensor_batch_reader(name));
+        }, parallel,std::move(batch));
 }
 
 MfeWeight load_mfe_gpu(
@@ -749,6 +766,15 @@ MfeWeight load_mfe_gpu(
             // Sources without retained readers keep the existing CPU loader.
         }
         if (reader) {
+            if (record.dtype == "NINT") {
+                auto store = mfq::make_packed_nint_expert_store(record.nbytes,
+                    [reader](std::size_t offset, std::uint8_t* output, std::size_t bytes) {
+                        reader(offset, reinterpret_cast<std::byte*>(output), bytes);
+                    });
+                const int minimum = std::min(execution.moe_cache_registration_min_slots, store->num_experts());
+                return cache_quant_moe_weight(cache, name,
+                    std::make_shared<MoeQuantRangeSource>(std::move(store)), minimum, layer_id, projection_role);
+            }
             try {
                 auto store =
                     std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
@@ -933,6 +959,10 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
             weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
             weight->dense.dim()==2 && weight->dense.size(0)>0 && weight->dense.size(0)<=4;
         auto prepared_right=prepare_injection?(promoted.defined()?promoted:right.to(tb::kFloat32)):Tensor{};
+        const auto vector_setting=mfq::cuda::runtime_options::gr_dense_vector();
+        if(prepare_injection && (!vector_setting || *vector_setting) &&
+                !promoted.defined() && right.size(0)%4==0)
+            prepared_right=prepare_gr_dense_vector_right(prepared_right);
         Linear forward=[right=std::move(right),promoted=std::move(promoted)](
                 CudaExecutionContext& execution,const Tensor& input) {
             const auto dtype=input.scalar_type()==right.scalar_type()?input.scalar_type():tb::kFloat32;
@@ -993,6 +1023,9 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
         };
     }
+    // Predictor layers have their own expert images and must not share the
+    // backbone's layer-zero transfer range or prefill lookahead.
+    if(name.starts_with("predictor."))layer=-1-layer;
     auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,role));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "routed tensor shape mismatch: ",name);
@@ -1011,8 +1044,8 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     const bool has_gate=has_tensor(file, gate_name),has_up=has_tensor(file, up_name);
     MFQ_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
     if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,role);
-    auto gate=routed(execution,file,gate_name,layer,experts,width,input,role);
-    auto up=routed(execution,file,up_name,layer,experts,width,input,role);
+    auto gate=routed(execution,file,gate_name,layer,experts,width,input,"gate");
+    auto up=routed(execution,file,up_name,layer,experts,width,input,"up");
     auto projections=gate.projections;
     projections.insert(projections.end(),up.projections.begin(),up.projections.end());
     Routed result=[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {

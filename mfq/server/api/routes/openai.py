@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mfq.server.api.dependencies import ServiceDependency
+from mfq.server.api.anthropic_compat import error_body as anthropic_error_body, is_anthropic_request
 from mfq.server.api.openai_compat import (
     OpenAIRequestError,
     backend_error_status,
@@ -34,20 +35,41 @@ async def health() -> dict[str, str]:
 
 
 @router.get("/v1", include_in_schema=False)
-async def openai_root() -> dict[str, Any]:
+async def openai_root(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "mfq-server",
-        "endpoints": ["/v1/models", "/v1/chat/completions"],
+        "endpoints": ["/v1/models", "/v1/messages"] if is_anthropic_request(request) else ["/v1/models", "/v1/chat/completions"],
     }
 
 
 @router.get("/v1/models", include_in_schema=False)
 async def openai_models(
-    service: ServiceDependency,
-) -> dict[str, Any]:
+    service: ServiceDependency, request: Request,
+) -> Any:
     models = await service.advertised_models()
     data = models.get("data") if isinstance(models, dict) else None
+    if is_anthropic_request(request):
+        items = [{"id": item["id"], "type": "model", "display_name": item["id"],
+                  "created_at": "1970-01-01T00:00:00Z"}
+                 for item in (data if isinstance(data, list) else [])
+                 if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]]
+        try:
+            limit = int(request.query_params.get("limit", "20"))
+            if not 1 <= limit <= 1000:
+                raise ValueError("limit must be between 1 and 1000")
+            for key in ("after_id", "before_id"):
+                cursor = request.query_params.get(key)
+                if cursor:
+                    offset = next((index for index, item in enumerate(items) if item["id"] == cursor), None)
+                    if offset is None:
+                        raise ValueError(f"unknown {key}")
+                    items = items[offset + 1:] if key == "after_id" else items[:offset]
+        except ValueError as error:
+            return JSONResponse(status_code=400, content=anthropic_error_body(str(error)))
+        page = items[:limit]
+        return {"data": page, "has_more": len(items) > limit,
+                "first_id": page[0]["id"] if page else None, "last_id": page[-1]["id"] if page else None}
     return {
         "object": "list",
         "data": [

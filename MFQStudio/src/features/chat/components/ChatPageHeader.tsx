@@ -7,6 +7,7 @@ import { ModelVendorMark } from '../../../app/ModelVendorMark';
 import { useRef, useState } from 'react';
 import { Dialog } from '../../../shared/ui/Dialog';
 import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel';
+import { CaretRightIcon } from '@phosphor-icons/react';
 
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
@@ -20,6 +21,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
     <header className="chat-screen-header">
       <div className="chat-screen-title">
         <button
+          aria-controls="chat-conversations"
           aria-expanded={chatSessionsOpen}
           aria-label={chatSessionsOpen
             ? tr('收起会话列表', 'Collapse conversations')
@@ -31,7 +33,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
             : tr('展开会话列表', 'Expand conversations')}
           type="button"
         >
-          <span aria-hidden="true">{chatSessionsOpen ? '‹' : '›'}</span>
+          <CaretRightIcon size={12} weight="fill" aria-hidden="true" />
         </button>
         <h1>{active?.title || tr('对话', 'Chat')}</h1>
       </div>

@@ -139,6 +139,36 @@ def test_gpu_statistics_missing_is_not_idle(monkeypatch):
                                    {"name": "GPU 2", "core_count": None, "utilization_percent": None}]
 
 
+def test_discrete_gpu_memory_is_measured_separately_from_host_ram(monkeypatch):
+    monkeypatch.setattr(module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(module, "_command", lambda _: "NVIDIA RTX 3090 Ti, 50, 24576, 2048, 22528\nNVIDIA GB10, N/A, N/A, N/A, N/A")
+    values = module._gpu_usage()
+    assert values[0]["memory_total_bytes"] == 24 << 30
+    assert values[0]["memory_used_bytes"] == 2 << 30
+    assert values[0]["memory_available_bytes"] == 22 << 30
+    assert values[1]["memory_total_bytes"] is None and values[1]["utilization_percent"] is None
+
+
+def test_streamed_kv_rates_track_completed_file_io_per_instance(monkeypatch):
+    clock = iter([10, 12, 14, 16, 18, 30, 32])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+    monitor = ResourceMonitor()
+    def status(identifier="a", read=0, written=0):
+        return {"instance_id": identifier, "model": "Qwen", "qsa_kv_offload_enabled": 1,
+            "qsa_kv_ssd_read_bytes": read, "qsa_kv_ssd_written_bytes": written}
+    assert monitor._weight_sample([status()])[0]["kv_read_bytes_per_second"] is None
+    rates = monitor._weight_sample([status(read=4096, written=8192), status("b", 100000, 200000)])
+    assert rates[0]["kv_read_bytes_per_second"] == 2048
+    assert rates[0]["kv_write_bytes_per_second"] == 4096
+    assert rates[1]["kv_read_bytes_per_second"] is None
+    missing = monitor._weight_sample([{"instance_id": "a", "model": "Qwen"}])[0]
+    assert missing["kv_read_bytes_per_second"] is None and missing["kv_write_bytes_per_second"] is None
+    assert monitor._weight_sample([status(read=8192, written=16384)])[0]["kv_read_bytes_per_second"] is None
+    assert monitor._weight_sample([status()])[0]["kv_read_bytes_per_second"] is None
+    assert monitor._weight_sample([status(read=100000, written=200000)])[0]["kv_write_bytes_per_second"] is None
+    assert monitor._weight_sample([status(read=104096, written=208192)])[0]["kv_write_bytes_per_second"] == 4096
+
+
 @pytest.mark.parametrize("statistics", ["unavailable", [], 17, False])
 def test_macos_gpu_statistics_with_unexpected_shape_keep_identity_without_invented_usage(monkeypatch, statistics):
     monkeypatch.setattr(module.platform, "system", lambda: "Darwin")
@@ -215,7 +245,8 @@ def test_unavailable_runtime_counters_keep_loaded_models_without_invented_rates(
         result = await monitor.sample(SimpleNamespace(runtime_instances=instances, runtime_status=status))
         assert result["weights"] == [{"instance_id": "instance-a", "model": "busy-model",
             "expert_read_bytes_per_second": None, "ple_read_bytes_per_second": None,
-            "engram_read_bytes_per_second": None}]
+            "engram_read_bytes_per_second": None, "kv_read_bytes_per_second": None,
+            "kv_write_bytes_per_second": None}]
     asyncio.run(run())
 
 

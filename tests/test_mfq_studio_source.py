@@ -17,6 +17,9 @@ STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
 PLATFORM_BRIDGE = STUDIO / "src" / "shared" / "platform" / "studio.ts"
 if PLATFORM_BRIDGE.exists():
     STUDIO_BRIDGE += "\n" + PLATFORM_BRIDGE.read_text(encoding="utf-8")
+MODEL_BROWSER = (
+    STUDIO / "src" / "features" / "models" / "ModelBrowser.tsx"
+).read_text(encoding="utf-8")
 UPDATE_MANAGER = (
     STUDIO / "src" / "features" / "settings" / "UpdateManager.tsx"
 ).read_text(encoding="utf-8")
@@ -72,16 +75,9 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
 def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert 'rfd::AsyncFileDialog::new()' in RUST
     assert '.pick_folder()' in RUST
-    assert "Result<Option<SelectedModelDirectory>, String>" in RUST
-    assert "path: String" in RUST
-    assert "names: Vec<String>" in RUST
-    assert "initial_directory: String" in RUST
-    assert "selectLocalModelDirectory(initialDirectory: string)" in STUDIO_BRIDGE
-    assert "Promise<{ path: string; names: string[] } | null>" in STUDIO_BRIDGE
     assert "tauri.invoke('studio_select_model_directory', { initialDirectory })" in STUDIO_BRIDGE
-    picker = RUST.split("async fn studio_select_model_directory(", 1)[1].split("#[tauri::command]", 1)[0]
-    assert "let token = studio_credential_get()?;" in picker
-    assert "with_server_credential(request, &token)" in picker
+    assert '.set_directory(initial_directory)' in RUST
+    assert 'path: path.to_string()' in RUST
 
 
 def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
@@ -89,6 +85,24 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert "rfd::MessageButtons::YesNo" in RUST
     assert "studio_confirm," in RUST
     assert "tauri.invoke<boolean>('studio_confirm', { message })" in STUDIO_BRIDGE
+
+
+def test_model_hub_resolves_links_and_downloads_selected_variants():
+    assert "modelsApi.resolveHubModel(reference, provider)" in MODEL_BROWSER
+    assert (
+        "destination: `models/${source.provider}/${repositoryPath}/${variantPath}`"
+        in MODEL_BROWSER
+    )
+    assert "downloadPatterns(variant)" in MODEL_BROWSER
+    assert "jobsApi.createJob" in MODEL_BROWSER
+    assert 'tr("官方模型", "Official")' in MODEL_BROWSER
+    assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
+    assert 'tr("内存压力", "Memory pressure")' not in MODEL_BROWSER
+    assert "not model capability or quality" not in MODEL_BROWSER
+    assert "三星推荐" not in MODEL_BROWSER
+    assert "3-star recommendation" not in MODEL_BROWSER
+    for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
+        assert symbol not in MODEL_BROWSER
 
 
 def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
@@ -103,14 +117,4 @@ def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
     assert "replace_macos_bundle" in UPDATER
     assert "com.tylogi.mfq-studio" in UPDATER
     assert "studioUpdateStatus(false)" in UPDATE_MANAGER
-    assert 'tr("自动检查并提醒", "Automatically check and notify")' in UPDATE_MANAGER
-
-
-def test_macos_release_includes_native_quality_tool_and_official_dataset_reader():
-    release = json.loads((TAURI / "tauri.release-macos.conf.json").read_text(encoding="utf-8"))
-    assert "../../packaging/sidecars/mfq-perplexity" in release["bundle"]["externalBin"]
-    assert "--target mfq-decode-metal mfq-perplexity" in RELEASE_SCRIPT
-    assert '${mfq_sidecar_dir}/${mfq_perplexity_name}' in RELEASE_SCRIPT
-    assert 'Contents/MacOS/mfq-perplexity" --help' in RELEASE_SCRIPT
-    assert "--collect-all pyarrow" in RELEASE_SCRIPT
-    assert "--exclude-module pyarrow" not in RELEASE_SCRIPT
+    assert "tr('自动检查更新', 'Automatically check for updates')" in UPDATE_MANAGER

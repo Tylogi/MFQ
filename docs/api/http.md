@@ -47,11 +47,11 @@ additional scopes:
 
 | Route area | Required scope |
 |---|---|
-| Sessions, presets, media, documents, and MCP reads | `inference` |
+| Sessions, presets, media, and documents | `inference` |
 | `GET` operations under `/models`, `/runtime`, and `/hub` | `inference` |
 | Model or runtime mutations | `models` |
 | Jobs, lineage, datasets, and evaluations | `jobs` |
-| MCP mutations, key management, and cluster nodes | `admin` |
+| Key management and cluster nodes | `admin` |
 
 The `admin` scope permits every operation. `/health` is outside `/api/` and
 never requires a bearer credential.
@@ -170,22 +170,7 @@ parameters and field constraints.
 | `POST` | `/api/v1/media` | Raw bytes | `201 MediaResource` |
 | `GET` | `/api/v1/media/{media_id}` | — | `200` raw bytes |
 
-### 2.5 MCP
-
-| Method | Path | Request | Success |
-|---|---|---|---|
-| `GET` | `/api/v1/mcp/servers` | — | `200 McpServerList` |
-| `POST` | `/api/v1/mcp/servers` | `CreateMcpServerRequest` | `201 McpServerResource` |
-| `PATCH` | `/api/v1/mcp/servers/{server_id}` | `UpdateMcpServerRequest` | `200 McpServerResource` |
-| `DELETE` | `/api/v1/mcp/servers/{server_id}` | — | `204` |
-| `GET` | `/api/v1/mcp/tools` | — | `200 McpToolList` |
-| `POST` | `/api/v1/mcp/tools/call` | `McpToolCallRequest` | `200 McpToolCallResult` |
-
-Tool calls require `confirm: true`. Server definitions support `stdio` and
-`streamable_http`; secret header values are read from environment variables and
-are not stored in the server definition.
-
-### 2.6 Jobs
+### 2.5 Jobs
 
 | Method | Path | Request | Success |
 |---|---|---|---|
@@ -205,7 +190,7 @@ job kinds registered by the current deployment and includes each kind's
 payload JSON Schema. Do not assume every deployment registers the same tool
 jobs.
 
-### 2.7 Models, hubs, and artifacts
+### 2.6 Models, hubs, and artifacts
 
 | Method | Path | Request | Success |
 |---|---|---|---|
@@ -223,7 +208,7 @@ Hub providers are `huggingface` and `modelscope`. Artifact removal accepts only
 restricted `workspace://` URIs; it does not delete arbitrary host paths or
 model roots.
 
-### 2.8 Datasets and evaluations
+### 2.7 Datasets and evaluations
 
 | Method | Path | Request | Success |
 |---|---|---|---|
@@ -235,7 +220,7 @@ model roots.
 
 Only evaluations with compatible kinds and comparison keys can be compared.
 
-### 2.9 Cluster nodes
+### 2.8 Cluster nodes
 
 | Method | Path | Request | Success |
 |---|---|---|---|
@@ -247,7 +232,7 @@ Only evaluations with compatible kinds and comparison keys can be compared.
 `PUT` replaces the complete node definition. Remote credentials are referenced
 by environment-variable name and are not persisted as plaintext values.
 
-### 2.10 Runtime
+### 2.9 Runtime
 
 | Method | Path | Request | Success |
 |---|---|---|---|

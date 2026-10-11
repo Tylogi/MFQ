@@ -34,17 +34,20 @@ public:
     std::uint64_t cpu_projections() const { return cpu_projections_.load(); }
     void record_cpu_projections(std::size_t experts) const { cpu_projections_.fetch_add(experts); }
     std::uint64_t materializations() const { return materializations_.load(); }
+    std::uint64_t dense_materializations() const { return dense_materializations_.load(); }
     std::uint64_t expert_disk_reads_after_preload() const { return disk_reads_after_preload_.load(); }
 private:
     std::shared_ptr<mfq::MfeQuantExpertStore> store_;
     std::shared_ptr<MixedMoeRuntime> metadata_;
     std::vector<std::int64_t> q_strides_;
     std::vector<std::size_t> field_bytes_;
+    bool dense_groups_=false;
     std::shared_ptr<MoeHostExpertCache> host_cache_;
     int source_id_=-1;
     std::unique_ptr<std::atomic_bool[]> gpu_resident_;
     mutable std::atomic<std::uint64_t> cpu_projections_{0};
     mutable std::atomic<std::uint64_t> materializations_{0};
+    mutable std::atomic<std::uint64_t> dense_materializations_{0};
     std::atomic_bool disk_sealed_{false};
     mutable std::atomic<std::uint64_t> sealed_disk_attempts_{0};
     std::atomic_bool preloaded_{false};

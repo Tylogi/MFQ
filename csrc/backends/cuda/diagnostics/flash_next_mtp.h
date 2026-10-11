@@ -60,6 +60,35 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     model.reset(1);tb::Tensor raw;
     auto normalized=model.hidden_forward(ids,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
     result["target_raw"]=json_tensor(raw);result["target_normalized"]=json_tensor(normalized);
+    if constexpr(requires { mtp.graph_replays; }) {
+        double maximum_error=0;
+        for(int tokens=1;tokens<=6;++tokens) {
+            const auto prime=[&] {
+                mtp.reset();(void)mtp.evaluate(target,previous.narrow(1,0,2),ids.narrow(1,0,2));
+            };
+            prime();auto expected=mtp.evaluate(target,previous.narrow(1,1,tokens),ids.narrow(1,1,tokens));
+            prime();auto actual=mtp.step(target,previous.narrow(1,1,tokens),ids.narrow(1,1,tokens));
+            std::vector<std::pair<tb::Tensor,tb::Tensor>> pairs{
+                {actual.sample_hidden,expected.first},{actual.chain_hidden,expected.second}};
+            if(actual.sample_logits.defined()) {
+                pairs.emplace_back(actual.sample_logits,
+                    target.logits(expected.first.narrow(1,tokens-1,1).contiguous()));
+                MFQ_RUNTIME_CHECK(actual.greedy_token==actual.sample_logits.argmax(-1).template item<int64_t>(),
+                    "MTP predictor graph returned stale greedy token");
+            }
+            for(const auto& [value,reference]:pairs) {
+                auto a=value.to(tb::kFloat32).contiguous().cpu(),b=reference.to(tb::kFloat32).contiguous().cpu();
+                MFQ_RUNTIME_CHECK(a.sizes()==b.sizes(),"MTP predictor graph changed its output shape");
+                for(int64_t i=0;i<a.numel();++i) {
+                    const double error=std::abs(double(a.template data_ptr<float>()[i])-b.template data_ptr<float>()[i]);
+                    maximum_error=std::max(maximum_error,error);
+                    MFQ_RUNTIME_CHECK(std::isfinite(error) && error<=.003+.003*std::abs(b.template data_ptr<float>()[i]),
+                        "MTP predictor graph differs from eager evaluation");
+                }
+            }
+        }
+        result["predictor_graph_max_abs_error"]=maximum_error;
+    }
     // Exercise the production runtime generation path, target rollback and
     // step output limits. The two architectures retain distinct head equations.
     MfqSamplingParams sampling;sampling.max_tokens=12;sampling.temperature=0;sampling.top_k=1;
@@ -77,6 +106,7 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     result["drafted"]=mtp.last_stats.drafted_tokens;
     result["selected_depth"]=mtp.last_stats.selected_depth;
     result["depth_cycles"]=mtp.last_stats.depth_cycles;
+    if constexpr(requires { mtp.graph_replays; })result["predictor_graph_replays"]=mtp.graph_replays;
     generated.clear();
     generated=mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling,3);
     const auto stopped=generated.size();

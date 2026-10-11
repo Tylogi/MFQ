@@ -26,6 +26,7 @@ from mfq.server.protocol.models import (
     HubModelSearchResult,
     HubReferenceRequest,
     ModelArtifactList,
+    ModelCacheProfile,
     ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
@@ -179,6 +180,12 @@ async def register_model_directory(
 )
 async def model_artifact_directory(service: ServiceDependency, model_id: str) -> ModelDirectoryList:
     return await service.model_artifact_directory(model_id)
+
+
+@router.get("/api/v1/models/{model_id}/cache-profile", response_model=ModelCacheProfile | None,
+            responses=ERROR_RESPONSES, tags=["models"])
+async def model_cache_profile(service: ServiceDependency, model_id: str) -> ModelCacheProfile | None:
+    return await service.model_cache_profile(model_id)
 
 
 @router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,

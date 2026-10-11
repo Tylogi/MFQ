@@ -26,7 +26,6 @@ import pytest
         ("documents", "services"),
         ("hub", "services"),
         ("jobs", "services"),
-        ("mcp", "services"),
         ("service", "services"),
         ("tool_jobs", "services"),
         ("models", "protocol"),
@@ -62,7 +61,6 @@ def test_api_routes_are_split_by_feature() -> None:
     expected = {
         "auth.py",
         "jobs.py",
-        "mcp.py",
         "media.py",
         "models.py",
         "openai.py",

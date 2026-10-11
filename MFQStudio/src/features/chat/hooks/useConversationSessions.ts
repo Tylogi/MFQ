@@ -5,6 +5,7 @@ import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { errorMessage } from '../../../app/formatters';
 import { useConversationStore } from '../state/conversationStore';
+import { useDraftStore } from '../state/draftStore';
 
 /** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
@@ -43,6 +44,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     store.reset();
     const epoch = useConversationStore.getState().epoch;
     setError(null);
+    setTransitioning(false);
     if (!ready || !enabled) return;
   void sessionsApi
       .listSessions()
@@ -140,6 +142,19 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     [selectedModel, transitioning, setSessions, setActiveId],
   );
 
+  const removeSessions = useCallback((ids: string[]) => {
+    const deleted = new Set(ids);
+    const state = useConversationStore.getState();
+    const remaining = state.sessions.filter((session) => !deleted.has(session.id));
+    setSessions(remaining);
+    for (const id of ids) useDraftStore.getState().setDraft(id, '');
+    if (state.activeId && deleted.has(state.activeId)) {
+      const next = remaining[0];
+      if (next) setSelectedModel(next.model);
+      setActiveId(next?.id ?? null);
+    }
+  }, [setSessions, setSelectedModel, setActiveId]);
+
   /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
   const deleteSession = useCallback(
     async (id: string): Promise<boolean> => {
@@ -151,14 +166,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
       try {
         await sessionsApi.deleteSession(id);
         if (request !== version.current || epoch !== useConversationStore.getState().epoch) return false;
-        const state = useConversationStore.getState();
-        const remaining = state.sessions.filter((session) => session.id !== id);
-        setSessions(remaining);
-        if (state.activeId === id) {
-          const next = remaining[0];
-          if (next) setSelectedModel(next.model);
-          setActiveId(next?.id ?? null);
-        }
+        removeSessions([id]);
         return true;
       } catch (cause) {
         if (request === version.current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
@@ -167,8 +175,65 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (request === version.current) setTransitioning(false);
       }
     },
-    [generationBusy, transitioning, setSessions, setActiveId, setSelectedModel],
+    [generationBusy, transitioning, removeSessions],
   );
+
+  const deleteAllSessions = useCallback(async (): Promise<string[]> => {
+    if (generationBusy || transitioning || !useConversationStore.getState().sessions.length) return [];
+    const request = version.current;
+    const epoch = useConversationStore.getState().epoch;
+    const isCurrent = () => request === version.current && epoch === useConversationStore.getState().epoch;
+    const deleted: string[] = [];
+    setTransitioning(true);
+    setError(null);
+    try {
+      const ids = new Set<string>();
+      let offset = 0;
+      while (isCurrent()) {
+        const page = await sessionsApi.listSessions(offset);
+        if (!isCurrent()) return [];
+        for (const session of page) ids.add(session.id);
+        if (page.length < 200) break;
+        offset += page.length;
+      }
+      for (const id of ids) {
+        if (!isCurrent()) return [];
+        await sessionsApi.deleteSession(id);
+        if (!isCurrent()) return [];
+        deleted.push(id);
+      }
+    } catch (cause) {
+      if (isCurrent()) setError(errorMessage(cause));
+    } finally {
+      if (isCurrent()) {
+        if (deleted.length) removeSessions(deleted);
+        setTransitioning(false);
+      }
+    }
+    return isCurrent() ? deleted : [];
+  }, [generationBusy, transitioning, removeSessions]);
+
+  const renameSession = useCallback(async (id: string, title: string): Promise<boolean> => {
+    const name = title.trim();
+    const session = useConversationStore.getState().sessions.find((item) => item.id === id);
+    if (generationBusy || transitioning || !session || !name || name.length > 512) return false;
+    if (name === session.title) return true;
+    const request = version.current;
+    const epoch = useConversationStore.getState().epoch;
+    setTransitioning(true);
+    setError(null);
+    try {
+      const updated = await sessionsApi.updateSession(id, { title: name });
+      if (request !== version.current || epoch !== useConversationStore.getState().epoch) return false;
+      setSessions((current) => current.map((item) => item.id === id ? updated : item));
+      return true;
+    } catch (cause) {
+      if (request === version.current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
+      return false;
+    } finally {
+      if (request === version.current) setTransitioning(false);
+    }
+  }, [generationBusy, transitioning, setSessions]);
 
   return {
     sessions,
@@ -187,8 +252,10 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     selectSession,
     createSession,
     deleteSession,
+    deleteAllSessions,
+    renameSession,
     conversationReady: Boolean(
-      active && modelAvailable && active.model === selectedModel && historyLoadedId === activeId,
+      !transitioning && active && modelAvailable && active.model === selectedModel && historyLoadedId === activeId,
     ),
     modelAvailable,
   };

@@ -19,6 +19,14 @@ public:
         std::uint64_t batched=0,batch_device_bytes=0,batch_descriptor_copies=0;
         std::uint64_t async_publish=0,async_publish_ns=0,decode_async_publish_ns=0;
         std::uint64_t window_prepares=0;
+        std::uint64_t cached_copy_bytes=0,cached_copy_fields=0;
+        std::uint64_t expert_fence_waits=0;
+        std::uint64_t cached_copy_batches=0;
+        std::uint64_t expert_fence_wait_ns=0,backup_submit_ns=0,refill_submit_ns=0;
+        std::uint64_t cached_copy_dma_bytes=0,cached_copy_dma_fields=0;
+        std::uint64_t direct_exchange_rounds=0,direct_exchange_bytes=0,direct_exchange_ns=0;
+        std::uint64_t cached_copy_descriptors=0,cached_copy_blocks=0;
+        std::uint64_t exchange_defaults=0;
     };
     using Observer=std::function<void(const char*,std::size_t)>;
     using MemoryProbe=std::function<MemorySample()>;
@@ -28,6 +36,7 @@ public:
     void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false);
     bool prepare_during_window() const noexcept;
     void finish_window(int layer);
+    void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
     Stats stats() const noexcept;
 private:
@@ -35,6 +44,7 @@ private:
     std::unique_ptr<Impl> impl_;
     void prepare();
     void prepare_batched(std::int64_t bytes);
+    void prepare_direct_exchange();
     void publish_pending();
     void rollback();
 };

@@ -46,6 +46,29 @@ def test_older_worker_does_not_fabricate_weight_bytes_or_ssd_modes():
     assert memory.context_count is None
     assert memory.ssd_experts is None
     assert memory.ssd_ple is None
+    assert memory.ssd_kv is None
+    assert memory.ssd_kv_bytes is None
+
+
+def test_streamed_kv_reports_storage_and_traffic_separately_from_resident_kv():
+    memory = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
+        "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 50, "qsa_kv_offload_enabled": 1,
+        "qsa_kv_ssd_bytes": 4096, "qsa_kv_resident_bytes": 150, "qsa_kv_budget_bytes": 2048,
+        "qsa_kv_pending_bytes": 20, "qsa_kv_ssd_read_bytes": 8192,
+        "qsa_kv_ssd_written_bytes": 12288, "qsa_kv_ssd_reads": 2, "qsa_kv_ram_hits": 6})
+    assert memory.ssd_kv is True and memory.ssd_kv_bytes == 4096
+    assert memory.streaming_kv_resident_bytes == 150 and memory.streaming_kv_budget_bytes == 2048
+    assert memory.streaming_kv_pending_bytes == 20
+    assert memory.ssd_kv_read_bytes == 8192 and memory.ssd_kv_written_bytes == 12288
+    assert memory.ssd_kv_reads == 2 and memory.ssd_kv_hits == 6
+    assert memory.kv_bytes == 250 and memory.resident_weight_bytes == 1024
+    assert RuntimePool._memory_resources({}, memory) == memory
+    zero = RuntimePool._memory_resources({"qsa_kv_offload_enabled": 0, "qsa_kv_ssd_bytes": 0})
+    assert zero.ssd_kv is False and zero.ssd_kv_bytes == 0
+    invalid = RuntimePool._memory_resources({"qsa_kv_ssd_bytes": math.nan,
+        "qsa_kv_ssd_read_bytes": -1, "qsa_kv_ssd_reads": True, "qsa_kv_offload_enabled": 2})
+    assert invalid.ssd_kv is None and invalid.ssd_kv_bytes is None and invalid.ssd_kv_reads is None
+    assert invalid.ssd_kv_read_bytes is None
 
 
 def test_disk_only_prefix_contexts_are_not_counted_as_resident():
@@ -56,6 +79,23 @@ def test_disk_only_prefix_contexts_are_not_counted_as_resident():
     partial = RuntimePool._memory_resources({"kv_cache_bytes": 100, "kv_cache_contexts": 1,
         "prefix_cache_hot_bytes": 50, "prefix_cache_sessions": 20, "prefix_cache_hot_blocks": 1})
     assert partial.context_count is None
+
+
+def test_ram_streaming_tiers_are_reported_separately_from_vram_and_ssd():
+    memory = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
+        "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 50, "ram_expert_enabled": 1,
+        "ram_expert_payload_bytes": 3000, "qsa_kv_ram_enabled": 1,
+        "qsa_kv_ram_bytes": 4000, "qsa_kv_ram_limit_bytes": 8192, "qsa_kv_ssd_bytes": 5000})
+    assert memory.ram_experts is True and memory.ram_expert_bytes == 3000
+    assert memory.ram_kv is True and memory.ram_kv_bytes == 4000 and memory.ram_kv_limit_bytes == 8192
+    assert memory.resident_weight_bytes == 1024 and memory.kv_bytes == 250 and memory.ssd_kv_bytes == 5000
+
+
+def test_discrete_gpu_budget_does_not_count_host_ram_as_vram():
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {"cuda_allocated_bytes": 2 << 30,
+        "cuda_reserved_bytes": 3 << 30}, separate_memory=True) == 3 << 30
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {"cuda_allocated_bytes": 2 << 30}) == 32 << 30
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {}, separate_memory=True) is None
 
 
 def test_invalid_measurements_are_unknown_but_explicit_zero_is_valid():

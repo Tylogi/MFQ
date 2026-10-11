@@ -26,18 +26,7 @@
 .node-list small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .node-list button { border: 0; color: var(--muted); background: transparent; font-size: 10.5px; }
 
-.mcp-panel { margin-top: 10px; }
 .cluster-panel { margin-top: 10px; }
-.mcp-form { display: grid; grid-template-columns: minmax(110px, .3fr) auto minmax(240px, 1fr) auto; gap: 7px; margin-top: 12px; }
-.mcp-form input, .mcp-form select { min-width: 0; border: 1px solid var(--panel-line); border-radius: 7px; padding: 7px 9px; color: var(--ink-soft); background: var(--panel-control); font-size: 11px; }
-.mcp-form button { min-width: 64px; border: 1px solid var(--accent); border-radius: 7px; padding: 7px 11px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 700; }
-.mcp-form button:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
-.mcp-server-list { display: grid; gap: 4px; margin-top: 10px; }
-.mcp-server { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; border-top: 1px solid var(--panel-line); padding: 8px 0; }
-.mcp-server div { display: grid; min-width: 0; gap: 2px; }
-.mcp-server strong { color: var(--ink-soft); font-size: 11px; }
-.mcp-server small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.mcp-server button { border: 0; color: var(--muted); background: transparent; font-size: 10.5px; }
 
 .panel-action { width: 100%; border: 1px solid var(--line); border-radius: 9px; margin-top: 7px; padding: 8px 10px; color: var(--muted); background: var(--panel-control); font-size: 11px; }
 .panel-action:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }

@@ -93,5 +93,14 @@ Copyright © 2023-2025 Apple Inc.
 License: MIT (`LICENSES/MLX-MIT.txt`)
 Source: https://github.com/ml-explore/mlx
 
+Strata
+------
+MFQ's CUDA multi-row warp reduction in `mfq/kernels/cuda/warp_multi_sum.cuh`
+is adapted from Strata's s26_tsum.cuh, with MFQ-specific dispatch and packed
+weight integration.
+Copyright (c) 2026 Niko1221 and the Strata contributors
+License: MIT (`LICENSES/Strata-MIT.txt`)
+Source: https://github.com/Niko1221/strata
+
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.

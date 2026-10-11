@@ -5,6 +5,7 @@
 html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
 body { overflow: hidden; }
 button, input, textarea, select { font: inherit; }
+progress, input[type="range"] { accent-color: var(--bar-fill); }
 button { cursor: pointer; }
 button:not(:disabled):active { opacity: 0.8; }
 button:disabled { cursor: not-allowed; opacity: 0.45; }
@@ -14,10 +15,10 @@ button, input, textarea, select {
 }
 button:focus-visible, input:focus-visible, textarea:focus-visible,
 select:focus-visible, summary:focus-visible {
-  outline: 2px solid rgb(10 132 255 / 42%);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-::selection { color: #fff; background: #0a84ff; }
+::selection { color: var(--on-accent); background: var(--accent); }
 * { scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
 
 @media (prefers-reduced-motion: reduce) {

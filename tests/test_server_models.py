@@ -1298,7 +1298,12 @@ def test_common_server_rejects_directories_without_mfq_models(tmp_path: Path) ->
     asyncio.run(run())
 
 
-def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
+def test_empty_runtime_pool_reports_idle_state(tmp_path: Path, monkeypatch) -> None:
+    from mfq.server.runtime import runtime_pool
+    topology = {'memory_architecture': 'discrete', 'unified_memory': False,
+                'host_memory_total_bytes': 64 << 30, 'device_memory_total_bytes': 24 << 30,
+                'prefix_cache_hot_tier': 'vram', 'prefix_cache_cold_tier': 'ssd'}
+    monkeypatch.setattr(runtime_pool, 'memory_topology', lambda: topology)
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
@@ -1312,6 +1317,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
         status = await pool.runtime_status()
         assert status.pop("prefix_cache_total_disk_max_bytes") > 0
         assert status == {
+            **topology,
             "mtp_service_enabled": True,
             "prefix_cache_total_hot_bytes": 0,
             "prefix_cache_total_hot_max_bytes": 2 << 30,
@@ -1546,6 +1552,58 @@ def test_catalog_registered_shard_resolves_its_complete_external_family(tmp_path
         assert [item.name for item in result.data] == ["manual"]
         assert result.data[0].complete
         assert result.data[0].shard_count == 2
+
+    asyncio.run(run())
+
+
+def test_managed_runtime_retries_timed_out_startup_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mfq.server.runtime.backend import OpenAIChatBackend
+
+    async def run() -> None:
+        _model(tmp_path / "tiny.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime.py"
+        _fake_runtime(executable)
+        pool = RuntimePool(
+            ModelCatalog([tmp_path], cache_seconds=0), executable,
+            startup_timeout_seconds=5, automatic_memory_budget=False,
+        )
+        pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
+        launch = pool._launch_configuration
+
+        def launch_python(*args, **kwargs):
+            command, environment = launch(*args, **kwargs)
+            return [sys.executable, *command], environment
+
+        monkeypatch.setattr(pool, "_launch_configuration", launch_python)
+        original_capabilities = OpenAIChatBackend.capabilities
+        probes = 0
+        cancelled = False
+
+        async def delayed_capabilities(self, *args, **kwargs):
+            nonlocal probes, cancelled
+            probes += 1
+            if probes == 1:
+                try:
+                    await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+            return await original_capabilities(self, *args, **kwargs)
+
+        monkeypatch.setattr(OpenAIChatBackend, "capabilities", delayed_capabilities)
+        context = _TestJobContext()
+        try:
+            result = await pool.load(context, {"model": "tiny", "context_size": 4096})
+            instances = (await pool.instances()).data
+            assert cancelled and probes >= 2
+            assert len(instances) == 1
+            assert instances[0].state == RuntimeInstanceState.READY
+            assert str(instances[0].id) == result["instance_id"]
+        finally:
+            await context.cleanup()
+            await pool.aclose()
 
     asyncio.run(run())
 
@@ -2409,10 +2467,10 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         assert first.context_size == 4096
         assert second.context_capacity == 32768
         assert pool._load_requests["second"].context_size == 8192
-        with pytest.raises(BackendError) as over_capacity:
-            await pool.reload_runtime(65536, second.id)
-        assert over_capacity.value.code == "context_size_exceeded"
-        assert second_backend.reloads == [8192]
+        over_capacity = await pool.reload_runtime(65536, second.id)
+        assert over_capacity['warning'] == "context_size_exceeded"
+        assert over_capacity['max_context'] == 32768
+        assert second_backend.reloads == [8192, 32768]
         with pytest.raises(BackendError) as missing:
             await pool.clear_runtime_cache(uuid4())
         assert missing.value.code == "runtime_instance_not_found"

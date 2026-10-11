@@ -178,6 +178,16 @@ __device__ __forceinline__ uint32_t load_packed_sign_group3(
     return (word >> shift) & 0x1fffffu;
 }
 
+__device__ __forceinline__ uint32_t load_packed_sign_group3_words(
+        const uint8_t* data,int64_t bit,int64_t nbytes) {
+    const int64_t aligned=(bit>>3)&~int64_t(3);
+    if((reinterpret_cast<uintptr_t>(data)&3u)==0 && aligned+8<=nbytes) {
+        const auto* words=reinterpret_cast<const uint32_t*>(data+aligned);
+        return __funnelshift_r(words[0],words[1],int(bit&31))&0x1fffffu;
+    }
+    return load_packed_sign_group3(data,bit,nbytes);
+}
+
 __device__ __forceinline__ uint32_t load_packed_4(
     const uint8_t * data, int64_t linear) {
     return (data[linear >> 1] >> ((linear & 1) * 4)) & 0x0fu;
@@ -235,13 +245,63 @@ __device__ __forceinline__ int parity7(uint32_t mask) {
 }
 
 __device__ __forceinline__ int sign_bytes4(uint32_t mask8, int base) {
-    int result = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int negative = (mask8 >> (base + i)) & 1u;
-        result |= (negative ? 0xff : 0x00) << (8 * i);
+    // Multiplication places nibble bit i at byte i's low bit. Expanding
+    // those four independent 0/1 bytes needs no lookup or scalar bit loop.
+    const uint32_t nibble = (mask8 >> base) & 15u;
+    const uint32_t ones = (nibble * 0x00204081u) & 0x01010101u;
+    return static_cast<int>(ones * 255u);
+}
+
+// NVQ1 complete GS24 records are selected by an empty delta stream. The
+// State and delta are included, so the execution layout has no auxiliary streams.
+template<int Format>
+__device__ __forceinline__ uint64_t load_nvq1_record64(
+        const uint8_t* records,int64_t bytes,int row,int group,int groups) {
+    constexpr int record_bytes=Format==kNvq1S?4:5;
+    const int64_t byte=(int64_t(row)*groups+group)*record_bytes;
+    if((reinterpret_cast<uintptr_t>(records)&3u)==0) {
+        if constexpr(Format==kNvq1S)return reinterpret_cast<const uint32_t*>(records+byte)[0];
+        else {
+            const int64_t aligned=byte&~int64_t(3);const int shift=int(byte&3)*8;
+            if(aligned+8<=bytes) {
+                const auto* words=reinterpret_cast<const uint32_t*>(records+aligned);
+                return uint64_t(__funnelshift_r(words[0],words[1],shift))|
+                    (uint64_t(words[1]>>shift)<<32);
+            }
+        }
     }
-    return result;
+    uint64_t packed=0;
+#pragma unroll
+    for(int i=0;i<record_bytes;++i)packed|=uint64_t(records[byte+i])<<(8*i);
+    return packed;
+}
+struct Nvq1RecordVector {int2 values;int delta;bool valid;};
+template<int Format>
+__device__ __forceinline__ uint32_t load_nvq_state(
+        const uint8_t* indices,int64_t index_bytes,const uint8_t* states,
+        int64_t state_bytes,int64_t linear,int bits,int groups) {
+    if constexpr(Format==kNvq1L || Format==kNvq1S)if(state_bytes==0) {
+        const auto record=load_nvq1_record64<Format>(indices,index_bytes,
+            int(linear/groups),int(linear%groups),groups);
+        return uint32_t(record>>(Format==kNvq1S?27:33))&(Format==kNvq1S?15u:7u);
+    }
+    if constexpr(Format==kNvq2JscXLGroupExec)if(state_bytes==0)
+        return indices[linear*8+7]>>4;
+    if constexpr(Format==kNvq3JscLGroupExec)if(state_bytes==0)
+        return indices[linear*12+10]>>4;
+    return bits==4?load_packed_4(states,linear):load_packed_bits(states,linear*bits,bits,state_bytes);
+}
+template<int Format>
+__device__ __forceinline__ Nvq1RecordVector load_nvq1_record_vec8(
+        const uint8_t* records,int64_t bytes,const int8_t* book,
+        int row,int segment,int group,int groups,int vectors) {
+    if(segment>=vectors)return {make_int2(0,0),0,false};
+    constexpr int bits=Format==kNvq1S?9:11;
+    const auto packed=load_nvq1_record64<Format>(records,bytes,row,group,groups);
+    const int negative=int((packed>>(Format==kNvq1S?31:36))&1u);
+    const uint32_t index=uint32_t(packed>>((segment-group*3)*bits))&((1u<<bits)-1u);
+    const auto* bank=book+(Format==kNvq1S?negative*kNvq1SBankBytes:0);
+    return {reinterpret_cast<const int2*>(bank)[index],negative?-1:1,true};
 }
 
 __device__ __forceinline__ int apply_sign4(int values, uint32_t mask8, int base) {
@@ -317,6 +377,15 @@ __device__ __forceinline__ int decode_chunk4(
     int ng,
     int sign_mode,
     uint32_t state) {
+    if constexpr(FORMAT==kNvq1L || FORMAT==kNvq1S)if(aux_nbytes==0) {
+        const auto value=load_nvq1_record_vec8<FORMAT>(indices,indices_nbytes,codebook,
+            row,group*3+(chunk>>1),group,ng,nvec);
+        if(!value.valid)return 0;
+        const int digits=(chunk&1)?value.values.y:value.values.x;
+        if constexpr(FORMAT==kNvq1S)return nvq1_s_scale_delta4(digits,value.delta);
+        else return nvq1_l_scale_delta4(digits,value.delta);
+    }
+
     const int vector8 = group * 3 + (chunk >> 1);
     if constexpr (FORMAT == kNvq2JscXLGroupExec) {
         if (vector8 >= nvec || vector8 >= nsign) return 0;
@@ -561,6 +630,12 @@ __device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_vec8(
     int nsign,
     int sign_mode,
     uint32_t state) {
+    if constexpr(FORMAT==kNvq1L || FORMAT==kNvq1S)if(aux_nbytes==0) {
+        const auto value=load_nvq1_record_vec8<FORMAT>(indices,indices_nbytes,codebook,
+            row,segment,group,ng,nvec);
+        return {value.values,value.delta,value.valid};
+    }
+
     if constexpr (FORMAT == kNvq2JscXLGroupExec) {
         if (segment >= nsign) return {make_int2(0, 0), 0, false};
         const int local = segment - group * 3;
@@ -754,6 +829,12 @@ __device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_group_vec8(
     uint64_t group_exec64,
     const uint32_t * group_exec96,
     int group_delta) {
+    if constexpr(FORMAT==kNvq1L || FORMAT==kNvq1S)if(aux_nbytes==0) {
+        const auto value=load_nvq1_record_vec8<FORMAT>(indices,indices_nbytes,codebook,
+            row,group*3+segment_local,group,ng,nvec);
+        return {value.values,value.delta,value.valid};
+    }
+
     const int segment = group * 3 + segment_local;
     if constexpr (FORMAT == kNvq2JscXLGroupExec) {
         if (segment >= nsign) return {make_int2(0, 0), 0, false};

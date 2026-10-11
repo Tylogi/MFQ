@@ -547,7 +547,7 @@ class ToolJobHandlers:
             else:
                 argv.extend(["--exclude", *request.exclude])
         env, proxy = await download_environment("https://modelscope.cn", direct=request.direct)
-        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
+        await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
         await self._run_download(context, argv, env, destination, request.expected_bytes)
         return await self._download_result(
@@ -592,7 +592,7 @@ class ToolJobHandlers:
             argv.extend(["--exclude", pattern])
         await context.progress(0.01, message="Starting Hugging Face download")
         env, proxy = await download_environment(os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
-        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
+        await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await self._run_download(context, argv, env, destination, request.expected_bytes)
         return await self._download_result(
             context,

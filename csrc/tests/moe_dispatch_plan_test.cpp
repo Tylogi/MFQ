@@ -2,6 +2,7 @@
 #include "moe_residency_rank_checks.h"
 #include <limits>
 #include "moe_cpu_cost_checks.h"
+#include "moe_dispatch_reuse_checks.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -65,6 +66,7 @@ int main() try {
        mfq::select_moe_cpu_work({{100,100,true}},{1,0,10000,true})!=std::vector<bool>{false})
         throw std::runtime_error("CPU transfer budget admitted slow or cached work");
     std::cout<<"MFQ CPU transfer budget boundary cases=4 PASS\n";
+    std::cout<<"MFQ reused dispatch changing routes/tiers/eligibility, duplicate positions, quotas, invalid guards and allocation reuse cases="<<dispatch_reuse_checks()<<" PASS\n";
     for(auto rates:{mfq::MoeDispatchRates{0,0,0},mfq::MoeDispatchRates{1,-1,0},
                    mfq::MoeDispatchRates{1,0,-1}}) {
         bool rejected=false;

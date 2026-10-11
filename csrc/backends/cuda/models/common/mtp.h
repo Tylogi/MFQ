@@ -26,6 +26,9 @@ struct MtpTarget {
 struct MtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
     mfq_tensor_backend::Tensor chain_hidden;
+    // Optional last-row vocabulary projection computed in the predictor graph.
+    mfq_tensor_backend::Tensor sample_logits;
+    int32_t greedy_token=-1;
 };
 
 // Architecture-specific predictors implement device math and cache state only.
@@ -61,6 +64,8 @@ struct MtpModule {
     virtual bool teacher_forced_prompt_prime() const noexcept = 0;
     virtual bool target_bootstrap_decode() const noexcept = 0;
     virtual bool preserve_output_dtype() const noexcept = 0;
+    virtual bool take_graph_initialization() noexcept { return false; }
+    virtual uint64_t graph_replay_count() const noexcept { return 0; }
     virtual int maximum_draft_depth() const noexcept {
         return mfq::engine::mtp::kMaximumDraftDepth;
     }

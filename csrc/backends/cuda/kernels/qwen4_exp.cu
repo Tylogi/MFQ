@@ -4,11 +4,40 @@
 #include "selected_attention.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <type_traits>
 
 namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
+
+namespace {
+template<class Position>
+__global__ void fill_decode_positions_kernel(int64_t* cache,Position* positions,
+    int64_t tokens,int64_t entries,int64_t start,int64_t delta) {
+    for(int64_t i=threadIdx.x;i<entries;i+=blockDim.x) {
+        positions[i]=static_cast<Position>(start+i%tokens+delta);
+        if(i<tokens)cache[i]=start+i;
+    }
+}
+}
+
+void fill_decode_positions(const Tensor& cache,const Tensor& positions,int64_t start,int64_t delta) {
+    MFQ_RUNTIME_CHECK(cache.is_cuda() && positions.is_cuda() && cache.is_contiguous() &&
+        positions.is_contiguous() && cache.scalar_type()==tb::kInt64 && cache.numel()>0 &&
+        positions.numel()%cache.numel()==0 && positions.numel()>=cache.numel(),
+        "decode position buffers have incompatible geometry");
+    const auto launch=[&](auto* output) {
+        fill_decode_positions_kernel<<<1,32,0,mfq_current_cuda_stream()>>>(cache.data_ptr<int64_t>(),output,
+            cache.numel(),positions.numel(),start,delta);
+    };
+    if(positions.scalar_type()==tb::kInt32)launch(positions.data_ptr<int32_t>());
+    else {
+        MFQ_RUNTIME_CHECK(positions.scalar_type()==tb::kInt64,"decode positions must use int32 or int64");
+        launch(positions.data_ptr<int64_t>());
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 namespace {
 template<class Value, bool Injection>
@@ -276,6 +305,15 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
     mfq_selected_attention::values({&query, &pooled});
     MfqCudaGuard guard(query.device());
+    const auto* option=std::getenv("MFQ_QSA_PREFILL_SCORE_GEMM");
+    if(query.size(1)>=32 && option && option[0]=='1') {
+        // Each index head owns a token matrix. This replaces thousands of
+        // four-row GEMMs with a few large GEMMs and retains head reduction.
+        auto q=query.to(tb::kFloat32).permute({0,2,1,3}).contiguous();
+        auto keys=pooled.to(tb::kFloat32).transpose(-1,-2).unsqueeze(1);
+        auto products=tb::matmul(q,keys).permute({0,2,1,3}).clamp_min(0.0);
+        return products.sum(-2)/std::sqrt(double(query.size(-1)));
+    }
     return mfq_selected_attention::dots(query, pooled).sum(-2) /
         std::sqrt(double(query.size(-1)));
 }
@@ -326,6 +364,17 @@ Tensor sparse_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output) {
     return mfq_selected_attention::gated(attended, gate, half_output);
+}
+
+Tensor sparse_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,
+    const Tensor& indices, const Tensor& gate, bool half_output) {
+    return mfq_selected_attention::sparse_gated(q, k, v, indices, gate,
+        1.0 / std::sqrt(double(q.size(3))), half_output);
+}
+
+Tensor qsa_selected_tokens(const Tensor& blocks, const Tensor& positions,
+    int64_t pool, int64_t budget) {
+    return mfq_selected_attention::block_indices_to_tokens(blocks, positions, pool, budget);
 }
 
 Tensor causal_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,

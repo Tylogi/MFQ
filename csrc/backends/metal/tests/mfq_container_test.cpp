@@ -244,6 +244,17 @@ void test_load_progress(const std::filesystem::path& root) {
     model.stop_load_observation();
     (void)shared.read("third");
     require(progress.size() == 2, "load progress remained active during runtime reads");
+    progress.clear();
+    model.observe_load_records([&](auto completed, auto total) {
+        progress.emplace_back(completed, total);
+    });
+    auto reloaded = model;
+    (void)reloaded.read("alias");
+    (void)reloaded.map_record("second");
+    (void)reloaded.read("third");
+    require(progress == std::vector<std::pair<std::size_t, std::size_t>>{{1, 3}, {2, 3}, {3, 3}},
+            "reload progress reused the previous load's counters");
+    model.stop_load_observation();
 }
 
 void test_malformed_tables(

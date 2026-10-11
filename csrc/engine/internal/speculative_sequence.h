@@ -357,8 +357,12 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 auto delta = output.append(std::vector<int64_t>{next});
                 accept(delta);
                 ++mtp.last_stats.standard_tokens;
+                bool time_sample=!maintenance;
+                if constexpr(requires { ops.take_target_maintenance(); }) {
+                    const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
+                }
                 depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
-                    Clock::now()-cycle_started).count(), !maintenance);
+                    Clock::now()-cycle_started).count(), time_sample);
                 mtp.last_stats.selected_depth = depth_controller.depth();
                 mtp.last_stats.reentry_probes = depth_controller.reentries();
                 pending = next;
@@ -413,13 +417,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 result = {0, ops.sample_normal(ops.slice(targets, 0, 0, 1), row_counts), true};
             } else if (greedy) {
                 std::vector<int32_t> target_tokens;
-                target_tokens.reserve(static_cast<size_t>(draft_count + 1));
-                for (int row = 0; row <= draft_count; ++row) {
-                    target_tokens.push_back(
-                        ops.sample_normal(ops.slice(targets, 0, row, 1), row_counts));
-                    if (row < draft_count && penalties) {
-                        ops.add_counts(
-                            row_counts, ops.ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                if constexpr (requires { ops.greedy_tokens(targets); }) {
+                    if (!penalties) target_tokens = ops.greedy_tokens(targets);
+                }
+                if (target_tokens.empty()) {
+                    target_tokens.reserve(static_cast<size_t>(draft_count + 1));
+                    for (int row = 0; row <= draft_count; ++row) {
+                        target_tokens.push_back(
+                            ops.sample_normal(ops.slice(targets, 0, row, 1), row_counts));
+                        if (row < draft_count && penalties) {
+                            ops.add_counts(
+                                row_counts, ops.ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                        }
                     }
                 }
                 result = policy::verify_greedy(draft.tokens, target_tokens);
@@ -547,7 +556,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
 
             const double cycle_ms =
                 std::chrono::duration<double, std::milli>(Clock::now() - cycle_started).count();
-            depth_controller.observe(draft_count, accepted, cycle_ms, !maintenance);
+            bool time_sample=!maintenance;
+            if constexpr(requires { ops.take_target_maintenance(); }) {
+                const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
+            }
+            depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
             mtp.last_stats.park_count = depth_controller.parks();
             mtp.last_stats.selected_depth = depth_controller.depth();
             for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {

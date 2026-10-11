@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type Context,
   type ReactNode,
 } from 'react';
 import { useLocation } from 'react-router';
@@ -30,7 +31,6 @@ import { useMessageActions } from './hooks/useMessageActions';
 import { useVoiceConversation } from '../voice/useVoiceConversation';
 import { isGenerationBusy } from './state/generationController';
 import { conversationActions } from './state/conversationStore';
-import { ChatToolsProvider, useChatTools } from './ChatToolsProvider';
 
 /** 按聊天访问惰性加载数据，生成和语音控制器不会因为切换其他页面而丢失。 */
 function useChatDomain() {
@@ -75,7 +75,6 @@ function useChatDomain() {
   const attachmentError = useChatAttachmentError();
   const [operationBusy, setBusy] = useState(false);
   const [voiceComponentBusy, setVoiceComponentBusy] = useState(false);
-  const { mcpTools, selectedTools, error: toolsError } = useChatTools();
   const revisionRef = useRef(connectionRevision);
   revisionRef.current = connectionRevision;
   const busy = operationBusy || isGenerationBusy(generationPhase);
@@ -85,16 +84,9 @@ function useChatDomain() {
     setBusy(false);
   }, [activeId, connectionRevision, generation]);
   useEffect(() => {
-    if (toolsError) setError(toolsError);
-  }, [toolsError, setError]);
-  useEffect(() => {
     if (attachmentError) setError(attachmentError);
   }, [attachmentError, setError]);
 
-  const selectedToolsRef = useRef(selectedTools);
-  selectedToolsRef.current = selectedTools;
-  const mcpToolsRef = useRef(mcpTools);
-  mcpToolsRef.current = mcpTools;
   const inferenceRef = useRef(inference);
   inferenceRef.current = inference;
   const voiceRef = voice.voiceRef;
@@ -145,8 +137,6 @@ function useChatDomain() {
             created_at: new Date().toISOString(),
           },
         ]);
-      const currentSelected = selectedToolsRef.current;
-      const currentMcpTools = mcpToolsRef.current;
       const inference = inferenceRef.current;
       await generation.start(session.id, {
         request_id: crypto.randomUUID(),
@@ -156,17 +146,8 @@ function useChatDomain() {
         sampling: inference.sampling,
         system_prompt: inference.effectiveSettings.systemPrompt.trim(),
         include_reasoning_history: !inference.effectiveSettings.excludeReasoning,
-        tools: currentMcpTools
-          .filter((tool) => currentSelected.includes(tool.qualified_name))
-          .map((tool) => ({
-            type: 'function' as const,
-            function: {
-              name: tool.qualified_name,
-              description: tool.description,
-              parameters: tool.input_schema,
-            },
-          })),
-        tool_choice: currentSelected.length ? 'auto' : 'none',
+        tools: [],
+        tool_choice: 'none',
         stream: true,
       }, onAccepted);
       void refreshRuntime();
@@ -268,6 +249,7 @@ function useChatDomain() {
       selectSession: conversation.selectSession,
       createSession: conversation.createSession,
       deleteSession: conversation.deleteSession,
+      renameSession: conversation.renameSession,
       conversationReady: conversation.conversationReady,
       modelAvailable: conversation.modelAvailable,
     }),
@@ -278,6 +260,7 @@ function useChatDomain() {
       conversation.selectSession,
       conversation.createSession,
       conversation.deleteSession,
+      conversation.renameSession,
       conversation.conversationReady,
       conversation.modelAvailable,
     ],
@@ -296,6 +279,17 @@ function useChatDomain() {
       setVoiceMessages((current) => current.filter((message) => message.sessionId !== id));
     }
   }, [conversation.sessions, conversation.transitioning, conversation.deleteSession, busy, setVoiceMessages]);
+
+  const deleteAllConversations = useCallback(async () => {
+    if (busy || conversation.transitioning || !conversation.sessions.length) return;
+    const revision = revisionRef.current;
+    if (!(await studioConfirm(trRef.current(
+      '删除此服务中的全部对话？包括消息与未发送的草稿，此操作无法撤销。',
+      'Delete all conversations on this server, including messages and unsent drafts? This cannot be undone.',
+    ))) || revision !== revisionRef.current) return;
+    const deleted = new Set(await conversation.deleteAllSessions());
+    if (deleted.size) setVoiceMessages((current) => current.filter((message) => !deleted.has(message.sessionId)));
+  }, [busy, conversation.transitioning, conversation.sessions.length, conversation.deleteAllSessions, setVoiceMessages]);
 
   /** 用户确认后用新会话替换旧会话，同时移除对应语音历史。 */
   const clearActiveConversation = useCallback(async () => {
@@ -394,6 +388,7 @@ function useChatDomain() {
       send,
       clearActiveConversation,
       deleteConversation,
+      deleteAllConversations,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,
@@ -411,6 +406,7 @@ function useChatDomain() {
       send,
       clearActiveConversation,
       deleteConversation,
+      deleteAllConversations,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,
@@ -419,7 +415,9 @@ function useChatDomain() {
   );
 }
 
-const ChatContext = createContext<ReturnType<typeof useChatDomain> | null>(null);
+const ChatContext: Context<ReturnType<typeof useChatDomain> | null> =
+  import.meta.hot?.data?.chatContext ?? createContext<ReturnType<typeof useChatDomain> | null>(null);
+if (import.meta.hot?.data) import.meta.hot.data.chatContext = ChatContext;
 
 /**
  * 维持聊天领域实例，页面卸载不会取消正在进行的文本生成。
@@ -429,9 +427,7 @@ const ChatContext = createContext<ReturnType<typeof useChatDomain> | null>(null)
 export function ChatProvider({ children }: { children: ReactNode }) {
   return (
     <ChatAttachmentsProvider>
-      <ChatToolsProvider>
-        <ChatLifecycleProvider>{children}</ChatLifecycleProvider>
-      </ChatToolsProvider>
+      <ChatLifecycleProvider>{children}</ChatLifecycleProvider>
     </ChatAttachmentsProvider>
   );
 }
@@ -445,7 +441,7 @@ function ChatLifecycleProvider({ children }: { children: ReactNode }) {
 /**
  * 从聊天页面或工具栏读取聊天领域接口。
  *
- * @returns 聊天领域上下文，包含会话、推理、语音、生成与工具操作
+ * @returns 聊天领域上下文，包含会话、推理、语音与生成操作
  */
 export function useChat() {
   const value = useContext(ChatContext);

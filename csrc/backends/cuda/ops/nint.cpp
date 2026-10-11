@@ -1,6 +1,7 @@
 #include "../kernels/mfq_cuda_activation_ops.h"
 #include "../kernels/mfq_cuda_quant_ops.h"
 #include "nint.h"
+#include "nint_prefill_cache.h"
 #include "cuda_execution.h"
 #include "format.h"
 #include "packed_nint.h"
@@ -8,6 +9,8 @@
 
 #include <cstring>
 #include <limits>
+#include <array>
+#include <map>
 
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
@@ -16,6 +19,37 @@
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
+
+struct NintPrefillDecodeCacheState {
+    using Key=std::array<uintptr_t,11>;
+    std::map<Key,mfq_tensor_backend::Tensor> decoded;
+    NintPrefillDecodeCacheState* previous=nullptr;
+};
+namespace {
+thread_local NintPrefillDecodeCacheState* nint_prefill_decode_cache=nullptr;
+NintPrefillDecodeCacheState::Key nint_prefill_decode_key(const NintWeight& w) {
+    return {reinterpret_cast<uintptr_t>(w.q_packed.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.row_q_bits.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.row_q_bit_offsets.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.sub_scale.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.sub_min.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.neuron_scale.data_ptr()),
+        reinterpret_cast<uintptr_t>(w.neuron_min.data_ptr()),
+        uintptr_t(w.neuron_len),uintptr_t(w.gs),uintptr_t(w.out),uintptr_t(w.q_packed.get_device())};
+}
+}
+NintPrefillDecodeCacheScope::NintPrefillDecodeCacheScope(bool enabled) {
+    if(!enabled)return;
+    state_=std::make_unique<NintPrefillDecodeCacheState>();
+    state_->previous=nint_prefill_decode_cache;
+    nint_prefill_decode_cache=state_.get();
+}
+NintPrefillDecodeCacheScope::~NintPrefillDecodeCacheScope() {
+    if(state_)nint_prefill_decode_cache=state_->previous;
+}
+void NintPrefillDecodeCacheScope::clear() {
+    if(state_)state_->decoded.clear();
+}
 
 mfq_tensor_backend::Tensor nint_row_embedding_lookup(
         const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids) {
@@ -429,12 +463,21 @@ mfq_tensor_backend::Tensor nint_matmul(
                     x, w.gs, ws.qx, ws.xscale);
             });
         }
-        auto dense = profiler.measure("nint.dequant", [&]() {
-            return nint_decode_cuda(
+        const auto decode=[&] {
+            return profiler.measure("nint.dequant", [&]() {return nint_decode_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                w.neuron_len, w.gs);
-        });
+                w.neuron_len, w.gs);});
+        };
+        mfq_tensor_backend::Tensor dense;
+        if(nint_prefill_decode_cache) {
+            const auto key=nint_prefill_decode_key(w);
+            const auto found=nint_prefill_decode_cache->decoded.find(key);
+            if(found!=nint_prefill_decode_cache->decoded.end())dense=found->second;
+            else {
+                dense=decode();nint_prefill_decode_cache->decoded.emplace(key,dense);
+            }
+        } else dense=decode();
         return profiler.measure("nint.gemm", [&]() {
             return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
@@ -694,9 +737,13 @@ NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
     }
     const int64_t expected_groups =
         (static_cast<int64_t>(t.neuron_len) + t.gs - 1) / t.gs;
+    const bool routed_shape = ndim == 3 && t.axis == 0 &&
+        t.shape[0] <= std::numeric_limits<int>::max() &&
+        t.shape[1] <= std::numeric_limits<int>::max() &&
+        t.shape[0] * t.shape[1] == t.out && t.shape[2] == t.neuron_len;
     if (t.out <= 0 || t.ng <= 0 ||
-            t.shape[static_cast<size_t>(t.axis)] != t.out ||
-            flattened_neuron_len != t.neuron_len ||
+            (!routed_shape && (t.shape[static_cast<size_t>(t.axis)] != t.out ||
+             flattened_neuron_len != t.neuron_len)) ||
             expected_groups != t.ng) {
         throw std::runtime_error("inconsistent NINT tensor dimensions");
     }

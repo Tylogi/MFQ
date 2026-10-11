@@ -9,6 +9,8 @@
 
 #include <mlx/mlx.h>
 
+#include "mlx_staging_allocator.h"
+
 namespace mfq::metal {
 
 bool is_nint_dtype(std::string_view dtype) noexcept;
@@ -23,6 +25,28 @@ struct NintDescriptor {
     double aggregate_bpw = 0.0;
     double distribution_entropy = 0.0;
 };
+
+namespace detail {
+struct ParsedNintStorage {
+    StagingVector<std::uint8_t> q_packed;
+    StagingVector<std::uint8_t> sub_scale;
+    StagingVector<std::uint8_t> sub_min;
+    StagingVector<std::uint32_t> row_metadata;
+    int bits;
+    int group_size;
+    int groups;
+    int input_size;
+    int output_size;
+    NintDescriptor descriptor;
+    bool uniform_q_bits;
+    std::span<const std::uint8_t> borrowed_q;
+    std::vector<std::span<const std::uint8_t>> borrowed_sub_scale;
+    std::vector<std::span<const std::uint8_t>> borrowed_sub_min;
+};
+
+ParsedNintStorage parse_nint_blob(std::span<const std::uint8_t> blob,
+    bool borrow_streams = false);
+}
 
 class MlxNintWeight {
 public:

@@ -153,12 +153,15 @@ def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
     assert '<< " shared_chain_node_us="' in check
 
 
-def test_native_bf16_argmax_uses_bounded_contiguous_last_dimension_path() -> None:
-    assert "argmax_last_contiguous_bf16_kernel" in NATIVE_OPS_SOURCE
+def test_native_argmax_uses_bounded_contiguous_last_dimension_path() -> None:
+    assert "argmax_last_contiguous_kernel" in NATIVE_OPS_SOURCE
     selection = NATIVE_OPS_SOURCE.split("if (operation == 3 &&", 1)[1].split(
         "auto launch =", 1
     )[0]
     assert "source.scalar_type() == kBFloat16" in selection
+    assert "source.scalar_type() == kFloat16" in selection
+    assert "source.scalar_type() == kFloat32" in selection
+    assert "reduced >= 256" in selection
     assert "source.is_contiguous()" in selection
     assert "outer <= std::numeric_limits<unsigned int>::max()" in selection
     assert "selected + 1 == static_cast<std::size_t>(source.dim())" in selection

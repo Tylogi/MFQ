@@ -8,6 +8,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SOURCE))
 from mfq.formats import io
 from mfq.formats.header import FileHeader
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nint import NintSpec, NintTensor
 from mfq.formats.nvq import (NvqJscTensor, NVQ2_E8, NVQ2_E8_1024,
     NVQ2_E8_4096, NVQ3_D4, NVQ3_D4_512, NVQ3_D4_1024, codebook_for)
@@ -17,8 +18,11 @@ from mfq.quantize.nvq1_l_quant import dequantize as decode_l
 from mfq.quantize.nvq1_s_quant import dequantize as decode_s
 from mfq.quantize.nvq_jsc import dequantize_nvq_jsc
 
-if len(sys.argv) != 2:
-    raise SystemExit('usage: make_cpu_quant_fixtures.py OUTPUT_DIRECTORY')
+if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != '--experts'):
+    raise SystemExit('usage: make_cpu_quant_fixtures.py OUTPUT_DIRECTORY [--experts N]')
+EXPERTS = int(sys.argv[3]) if len(sys.argv) == 4 else 1
+if EXPERTS < 1:
+    raise SystemExit('expert count must be positive')
 ROOT = Path(sys.argv[1]).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 random = np.random.default_rng(20261005)
@@ -75,16 +79,18 @@ cases=[]
 for label,create in profiles:
     for n,k in [(640,2560),(2560,640)]:
         name=f'{label}-{n}-{k}'
-        tensor=create(n,k)
+        tensor=create(n*EXPERTS,k)
         dtype,blob=io.pack_tensor_payload(tensor)
         frozen=io.unpack_tensor_payload(dtype,blob)
-        io.save(ROOT/(name+'.mfq'),FileHeader(version=2,model_arch='cpu-quant-oracle'),{'linear.weight':frozen})
+        stored = frozen if EXPERTS == 1 else MfeTensor(
+            (EXPERTS,n,k), (MfePool(np.arange(EXPERTS,dtype=np.int32),frozen),))
+        io.save(ROOT/(name+'.mfq'),FileHeader(version=2,model_arch='cpu-quant-oracle'),{'linear.weight':stored})
         input=random.uniform(-.15,.15,(3,k)).astype(np.float32)
         input[1]=0
         input[2,k//2]=.00003
         reference=(input.astype(np.float64)@decoded(frozen).astype(np.float64).T).astype(np.float32)
         input.tofile(ROOT/(name+'.input.f32'))
         reference.tofile(ROOT/(name+'.expected.f32'))
-        cases.append(f'{name} {n} {k} 3')
+        cases.append(f'{name} {n*EXPERTS} {k} 3')
         print(name,flush=True)
 (ROOT/'cases.txt').write_text('\n'.join(cases)+'\n',encoding='utf-8')

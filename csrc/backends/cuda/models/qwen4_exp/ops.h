@@ -7,6 +7,8 @@
 #include "../../ops/quant_linear.h"
 
 #include <memory>
+#include <functional>
+#include <iosfwd>
 
 namespace mfq::cuda::qwen4_exp { struct Gr; }
 
@@ -18,6 +20,16 @@ void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
 void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
+std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor* raw_hidden,int64_t confirmed=0,
+    bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
+    mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
+void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
+bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
+mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
+    Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,
+    bool last_only = true, const std::function<bool()>& cancelled = {},
+    mfq_tensor_backend::Tensor* raw_hidden = nullptr);
 
 struct Qwen4Model : CausalResources {
     Qwen4Model();
@@ -33,6 +45,14 @@ struct Qwen4Model : CausalResources {
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
+        if (ids.dim()==2 && ids.size(0)==1 &&
+            qwen4_layer_major_prefill_eligible(model,ids.size(1))) {
+            auto hidden=qwen4_layer_major_prefill_hidden(model,std::move(ids),1024,kind!=0);
+            if(kind==2)return model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
+            if(kind==1)return model.apply_final_logit_softcap(
+                model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))));
+            return model.logits_from_hidden(std::move(hidden));
+        }
         return qwen4_decode_graph_logits(model,std::move(ids),kind);
     }
 

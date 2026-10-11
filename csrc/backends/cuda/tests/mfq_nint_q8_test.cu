@@ -26,6 +26,20 @@ void group_path(bool enabled) {
     setenv("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0", 1);
 #endif
 }
+void whole_path(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0");
+#else
+    setenv("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0", 1);
+#endif
+}
+void exact_batch_path(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0");
+#else
+    setenv("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0",1);
+#endif
+}
 
 double grouped_max_nrmse = 0.0;
 double grouped_max_absolute = 0.0;
@@ -120,7 +134,9 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
             : nint_matmul_input_mul_ws_cuda(
                 q, bits, off, s, mn, ns, nm, x, gate, mode, gs, qx, xs);
     };
+    exact_batch_path(false);
     const auto expected = run(false);
+    exact_batch_path(true);
     const auto actual = run(true);
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
     exact_half(actual, expected);
@@ -147,7 +163,7 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
         ++graphs;
     }
 }
-void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false) {
+void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false,int rows=1) {
     const Device gpu{DeviceType::cuda,0};
     const int ng=(width+gs-1)/gs,k=ng*gs;
     std::vector<std::uint8_t> row_bits(n);
@@ -168,30 +184,37 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
     auto q=tensor(bytes).to(gpu).narrow(0,storage_offset,packed_bytes);
     auto bits=tensor(row_bits).to(gpu),off=tensor(offsets).to(gpu);
     std::vector<std::uint8_t> scales(n*ng),minima(n*ng);
-    std::vector<float> outer(n),minimum(n),input(width);
+    std::vector<float> outer(n),minimum(n),input(rows*width);
     for(int i=0;i<n*ng;++i){scales[i]=std::uint8_t((i*13)%37);minima[i]=std::uint8_t(i%19);}
     for(int row=0;row<n;++row){outer[row]=.000123f*float(row%13-6);minimum[row]=.004731f*float(row%5-2);}
-    for(int column=0;column<width;++column)input[column]=std::sin(float(column+7)*.193f)*.31f;
+    for(int column=0;column<rows*width;++column)input[column]=std::sin(float(column+7)*.193f)*.31f;
     auto s=tensor(scales).reshape({n,ng}).to(gpu),mn=tensor(minima).reshape({n,ng}).to(gpu);
     auto ns=tensor(outer).to(gpu),nm=tensor(minimum).to(gpu);
-    auto x=tensor(input).reshape({1,width}).to(gpu,kFloat16);
+    auto x=tensor(input).reshape({rows,width}).to(gpu,kFloat16);
     const auto options=TensorOptions().device(gpu);
-    auto qx=empty({1,k},options.dtype(kInt8)),xs=empty({1,ng},options.dtype(kFloat32));
+    auto qx=empty({rows,k},options.dtype(kInt8)),xs=empty({rows,ng},options.dtype(kFloat32));
     const auto run=[&]{return nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
-    single_path(false);group_path(false);auto expected=run();
+    exact_batch_path(false);
+    single_path(false);group_path(rows>1);whole_path(rows==1);auto expected=run();
+    exact_batch_path(true);
+    whole_path(true);
     single_path(true);group_path(grouped);auto actual=run();
-    const auto compare=grouped ? grouped_half : exact_half;compare(actual,expected);++cases;
+    const auto compare=grouped && rows==1 ? grouped_half : exact_half;compare(actual,expected);++cases;
     const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
     MfqCudaGraph graph;mfq_prepare_cuda_graph_memory(graph);
     actual=run();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));actual=Tensor{};
     graph.capture_begin();actual=run();graph.capture_end();
     for(int step=0;step<2;++step) {
-        for(int column=0;column<width;++column)input[column]=std::sin(float(column+step*31)*.173f)*.13f;
-        x.copy_(tensor(input).reshape({1,width}).to(gpu,kFloat16));
-        single_path(false);group_path(false);expected=run();
+        for(int column=0;column<rows*width;++column)input[column]=std::sin(float(column+step*31)*.173f)*.13f;
+        x.copy_(tensor(input).reshape({rows,width}).to(gpu,kFloat16));
+        exact_batch_path(false);
+        single_path(false);group_path(rows>1);whole_path(rows==1);expected=run();
+        exact_batch_path(true);
         graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));compare(actual,expected);++cases;
     }
     single_path(false);
+    group_path(false);
+    whole_path(true);
 }
 
 void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& changing) {
@@ -305,6 +328,15 @@ int main() {
             check_single(gs,2560,5,0,8,6144,single_cases);
         }
         std::cout<<"NINT single-row original Half bits ordinary/changing graphs cases="<<single_cases<<" PASS\n";
+        int batch_whole_cases=0;
+        for(int gs:{24,28})for(int width:{1536,2560})for(int rows:{2,3,4,5,6,7,8})
+            for(int preset:{0,4,5,8})for(int padding:{0,8})
+                check_single(gs,width,preset,0,padding,9,batch_whole_cases,true,rows);
+        std::cout<<"NINT batched whole-group exact Half/changing graphs cases="<<batch_whole_cases<<" PASS\n";
+        int exact_capacity_cases=0;
+        for(int gs:{5,24,28,32,48,64})for(int width:{77,640})for(int rows:{2,3,4,5,6})
+            check_single(gs,width,0,0,8,9,exact_capacity_cases,true,rows);
+        std::cout<<"NINT exact batch capacity original Half/changing graphs cases="<<exact_capacity_cases<<" PASS\n";
         for (int gs : {4, 12, 28, 32, 48, 64, 5, 47, 63}) {
             for (int ng : {1, 3, 22}) {
                 for (int m = 1; m <= 8; ++m) {

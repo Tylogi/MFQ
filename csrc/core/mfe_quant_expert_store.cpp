@@ -1,6 +1,8 @@
 #include "mfq/mfe_quant_expert_store.h"
+#include "mfq/packed_nint_expert_store.h"
 #include "mfq_format_compat.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -13,6 +15,58 @@ template<class T> T value(const std::vector<std::uint8_t>& data,std::size_t offs
         throw std::runtime_error("truncated mixed expert metadata");
     T result; std::memcpy(&result,data.data()+offset,sizeof(result)); return result;
 }
+}
+
+std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
+        std::size_t bytes, MfeQuantExpertStore::Read read) {
+    if (!read || bytes < 50) throw std::runtime_error("truncated packed NINT expert header");
+    std::vector<std::uint8_t> original(50);
+    read(0, original.data(), original.size());
+    const auto experts = value<std::int64_t>(original, 18);
+    const auto output = value<std::int64_t>(original, 26);
+    const auto width = value<std::int64_t>(original, 34);
+    if (value<std::uint32_t>(original, 14) != 3 || experts <= 0 || output <= 0 || width <= 0 ||
+            experts > std::numeric_limits<int>::max() / output ||
+            width > std::numeric_limits<int>::max() ||
+            experts * output > (bytes - 50) / 4 ||
+            value<std::int32_t>(original, 6) != 0 ||
+            value<std::int32_t>(original, 10) != width ||
+            value<std::uint32_t>(original, 42) != experts * output)
+        throw std::runtime_error("invalid packed NINT expert geometry");
+    auto prefix = std::make_shared<std::vector<std::uint8_t>>();
+    auto append = [&](auto scalar) {
+        const auto offset = prefix->size();
+        prefix->resize(offset + sizeof(scalar));
+        std::memcpy(prefix->data() + offset, &scalar, sizeof(scalar));
+    };
+    prefix->insert(prefix->end(), {'M', 'F', 'E', '1'});
+    for (auto dimension : {experts, output, width, std::int64_t(1)})
+        append(static_cast<std::uint32_t>(dimension));
+    append(static_cast<std::uint32_t>(experts));
+    append(std::uint32_t(4));
+    append(static_cast<std::uint64_t>(bytes - 8));
+    append(std::uint64_t(0));
+    for (std::int32_t expert = 0; expert < experts; ++expert) append(expert);
+    prefix->insert(prefix->end(), {'N', 'I', 'N', 'T'});
+    prefix->insert(prefix->end(), original.begin(), original.begin() + 14);
+    append(std::uint32_t(2));
+    append(static_cast<std::int64_t>(experts * output));
+    append(width);
+    prefix->insert(prefix->end(), original.begin() + 42, original.end());
+    if (bytes - 50 > std::numeric_limits<std::size_t>::max() - prefix->size())
+        throw std::overflow_error("packed NINT expert source size overflow");
+    const auto size = prefix->size() + bytes - 50;
+    return std::make_shared<MfeQuantExpertStore>(size,
+        [prefix, read = std::move(read), size](std::size_t offset, std::uint8_t* out, std::size_t count) {
+            if (offset > size || count > size - offset)
+                throw std::runtime_error("packed NINT expert read exceeds source");
+            if (offset < prefix->size()) {
+                const auto copied = std::min(count, prefix->size() - offset);
+                std::memcpy(out, prefix->data() + offset, copied);
+                offset += copied; out += copied; count -= copied;
+            }
+            if (count) read(offset - prefix->size() + 50, out, count);
+        });
 }
 
 MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(std::move(reader)),bytes_(bytes) {
