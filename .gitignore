@@ -71,6 +71,8 @@ models/
 !cpp_runtime/models/**
 !cpp_runtime/backends/cuda/models/
 !cpp_runtime/backends/cuda/models/**
+!cpp_runtime/backends/hip/models/
+!cpp_runtime/backends/hip/models/**
 data/*
 !data/wikitext-2-raw/
 data/wikitext-2-raw/*
