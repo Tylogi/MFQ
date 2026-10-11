@@ -1381,6 +1381,9 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
         cache->pipeline_pool_context_->end_graph_pool(cache->pipeline_pool_stream_);
         cache->pipeline_pool_context_.reset();cache->pipeline_pool_stream_=nullptr;
     }
+    // Adaptation caches arena pointers independently of captured FFN cells.
+    // Keep its heat history, but retire those pointers before freeing arenas.
+    if(cache->moe_residency_)cache->moe_residency_->release_transfer_stages();
     cache->pipeline_stages_.clear();
     cache->pipeline_wire_gpu_={};cache->pipeline_prefetch_wire_gpu_={};
     cache->pipeline_prefetch_host_stage_={};

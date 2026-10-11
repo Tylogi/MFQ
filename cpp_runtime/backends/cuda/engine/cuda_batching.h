@@ -93,7 +93,7 @@ class FlashNextBatchOperations {
     using Request = FlashNextBatchRequest;
     using State = mfq::engine::BatchState<Request>;
     using Sample = QwenBatchOperations::Sample;
-    struct Decoded { Tensor logits; };
+    struct Decoded { Tensor logits, greedy_tokens; };
     FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig);
     ~FlashNextBatchOperations();
     int64_t vocab_size() const;
@@ -117,7 +117,7 @@ class FlashNextBatchOperations {
     CudaContinuousBatchConfig config_;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
-    int64_t decode_batches_ = 0, decode_tokens_ = 0;
+    int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<
     std::is_same_v<Model,Qwen4CausalLm>, FlashNextBatchOperations, QwenBatchOperations>;

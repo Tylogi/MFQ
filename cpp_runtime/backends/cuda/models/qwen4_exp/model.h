@@ -76,6 +76,13 @@ class Gdn {
         return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
     }
     std::vector<Tensor*> graph_state() { return {&conv_,&state_}; }
+    std::vector<Tensor> project_inputs(CudaExecutionContext& execution,const Tensor& x) const {
+        if(grouped_projection_ && w_.input_projection)return w_.input_projection(execution,x);
+        return {w_.qkv(execution,x),w_.gate(execution,x),w_.alpha(execution,x),w_.beta(execution,x)};
+    }
+    Tensor project_output(CudaExecutionContext& execution,const Tensor& x) const {
+        return w_.output(execution,x);
+    }
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,int64_t confirmed,
                          Tensor& checkpoint_conv,Tensor& checkpoint_state) {
         if(!confirmed)return forward_chunk(execution,x,true);
@@ -453,6 +460,7 @@ class Ple {
     std::vector<Tensor*> graph_state() { return {&conv_}; }
     bool graph_supported() const { return embedding_.graph_supported(); }
     const NgramEmbedding::Context& session_context() const { return embedding_.context(); }
+    void restore_graph_context(NgramEmbedding::Context context) { embedding_.restore(std::move(context)); }
     void restore_session(const Tensor& convolution,NgramEmbedding::Context context) {
         MFQ_RUNTIME_CHECK(convolution.defined(),"missing Qwen4 PLE session state");
         reset();conv_=convolution.clone();embedding_.restore(std::move(context));
@@ -586,6 +594,13 @@ class Qsa {
     std::unique_ptr<Qsa> fork_empty() const {
         return std::make_unique<Qsa>(w_, c_, rotary_, fused_projection_, grouped_projection_, offload_);
     }
+    std::vector<Tensor> project_inputs(CudaExecutionContext& execution,const Tensor& x) const {
+        if(grouped_projection_ && w_.input_projection)return w_.input_projection(execution,x);
+        return {w_.query(execution,x),w_.key(execution,x),w_.value(execution,x),w_.index_query_key(execution,x)};
+    }
+    Tensor project_output(CudaExecutionContext& execution,const Tensor& x) const {
+        return w_.output(execution,x);
+    }
     std::size_t growth_bytes(int64_t tokens) const {
         if (offload_) return 0;
         const auto required = position() + tokens;
@@ -682,12 +697,18 @@ class Qsa {
         }
     }
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
-                         const Tensor& positions,const Tensor& cache_positions) {
+                         const Tensor& positions,const Tensor& cache_positions,
+                         std::vector<Tensor> projections={},bool project_output=true) {
         MFQ_RUNTIME_CHECK(graph_keys_.defined() && hidden.size(0)==1 && cache_positions.dim()==1,
             "QSA graph cache is not prepared");
         const auto t=hidden.size(1),pools=graph_pooled_.size(1);
         const bool dense_capacity=graph_keys_.size(2)<=c_.budget;
-        auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_);
+        auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_,
+                       std::move(projections));
+        const auto finish=[&](Tensor output) {
+            output=output.reshape({1,t,c_.heads*c_.width});
+            return project_output?w_.output(execution,output):output;
+        };
         if (!p.cache_written) {
             graph_keys_.index_copy_(2,cache_positions,p.key.permute({0,2,1,3}).to(tb::kFloat16));
             graph_values_.index_copy_(2,cache_positions,p.value.permute({0,2,1,3}).to(tb::kFloat16));
@@ -699,14 +720,14 @@ class Qsa {
                 (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
                 auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,graph_keys_,graph_values_,
                     cache_positions,p.gate,columns,hidden.scalar_type()==tb::kFloat16);
-                return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
+                return finish(std::move(gated));
             }
             auto absolute=cache_positions.reshape({1,t,1});
             auto indices=tb::arange(columns,cache_positions.options()).reshape({1,1,columns}).expand({1,t,columns});
             indices=tb::where(indices<=absolute,indices,tb::full_like(indices,-1)).to(tb::kInt32).contiguous();
             auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,indices);
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32));
-            return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}).to(hidden.scalar_type()));
+            return finish(gated.to(hidden.scalar_type()));
         }
         auto block=(cache_positions/c_.pool).to(tb::kInt64);
         auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
@@ -759,7 +780,7 @@ class Qsa {
             auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected);
             gated=(attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
         }
-        return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
+        return finish(std::move(gated));
     }
     void advance_graph(int64_t tokens) {keys_.advance_fixed(tokens);values_.advance_fixed(tokens);index_.advance_fixed(tokens);}
     void truncate(int64_t keep) {
@@ -952,13 +973,13 @@ class Qsa {
     }
     Projection project(CudaExecutionContext& execution,const Tensor& hidden,const Tensor& positions,
                        bool index_query_needed=true,const Tensor& cache_positions={},
-                       const Tensor& key_cache={},const Tensor& value_cache={}) {
+                       const Tensor& key_cache={},const Tensor& value_cache={},
+                       std::vector<Tensor> projections={}) {
         const auto b=hidden.size(0),t=hidden.size(1);
-        std::vector<Tensor> projections;
-        if(grouped_projection_ && w_.input_projection) {
+        if(projections.empty() && grouped_projection_ && w_.input_projection) {
             projections=w_.input_projection(execution,hidden);
-            MFQ_RUNTIME_CHECK(projections.size()==4,"QSA input projection count mismatch");
         }
+        MFQ_RUNTIME_CHECK(projections.empty() || projections.size()==4,"QSA input projection count mismatch");
         auto pair=(projections.empty()?w_.query(execution,hidden):projections[0]).reshape({b,t,c_.heads,2*c_.width});
         auto gate=pair.narrow(-1,c_.width,c_.width);
         auto key_source=(projections.empty()?w_.key(execution,hidden):projections[1]).reshape({b,t,c_.kv_heads,c_.width});

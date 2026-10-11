@@ -632,7 +632,7 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "std::unique_ptr<Engine> load_cuda_engine" in CUDA_ENGINE_SOURCE
     assert "CudaEngine::" not in CUDA_ENGINE_SOURCE
     assert "CudaEngineMetadata" not in CUDA_BACKEND_SOURCE
-    assert "ContinuousBatch<QwenBatchOperations>" in CUDA_ENGINE_SOURCE
+    assert "ContinuousBatch<CudaBatchOperations<Model>>" in CUDA_ENGINE_SOURCE
     assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
     assert "current.generation.next()" in SHARED_EXECUTOR
     assert "EngineInstance<CudaBackend>" in CUDA_ENGINE_SOURCE

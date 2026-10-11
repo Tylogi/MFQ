@@ -253,7 +253,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     MoeFfnShared shared_;
     MoeFfnSharedWeights shared_weights_;
     MoeFfnDispatchObserver observer_;
-    std::map<std::tuple<int,int,const void*,bool>,std::unique_ptr<Cell>> cells_;
+    std::map<std::tuple<int,int,const void*,bool,int>,std::unique_ptr<Cell>> cells_;
+    struct WindowRoutes {std::vector<int32_t> ids;int tokens=0;};
+    std::map<const void*,std::shared_ptr<WindowRoutes>> window_routes_;
     struct PredictionCell {
         Mapped flags{128};
         tb::Tensor aborted=tb::zeros({1},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
@@ -2422,7 +2424,7 @@ public:
     void register_idle_reclaimer() {
         cache_->pipeline_decode_release_.push_back([owner=weak_from_this()] {
             if(auto pipeline=owner.lock()) {
-                pipeline->cells_.clear();pipeline->prediction_cells_.clear();
+                pipeline->cells_.clear();pipeline->prediction_cells_.clear();pipeline->window_routes_.clear();
             }
         });
     }
@@ -2493,7 +2495,9 @@ public:
             try {return streamed_prefill(execution,input,ids,weights);}
             catch(...) {failed_=true;throw;}
         }
-        auto& cell=cells_[{tokens,routes,window,batch_decode}];
+        const auto tile=execution.continuous_batch_ffn_tile;
+        const bool final_tile=tile+1==execution.continuous_batch_ffn_tiles;
+        auto& cell=cells_[{tokens,routes,window,batch_decode,tile}];
         if(!cell) {
             const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
             const bool eager=!window && !batch_decode && prefill_graph && *prefill_graph==0;
@@ -2502,35 +2506,53 @@ public:
         }
         if(window) {
             auto* captured=cell.get();
+            std::shared_ptr<WindowRoutes> grouped;
+            if(execution.continuous_batch_ffn_tiles>1) {
+                auto& group=window_routes_[window];
+                if(!group)group=std::make_shared<WindowRoutes>();
+                grouped=group;
+            }
             window->enroll({captured,
-                [this,captured,owner=shared_from_this()] {
+                [this,captured,grouped,tile,owner=shared_from_this()] {
                     if(failed_)throw std::runtime_error("MFQ FFN session requires recovery");
-                    cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
+                    if(!tile) {
+                        cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
+                        if(grouped){grouped->ids.clear();grouped->tokens=0;}
+                    }
                     std::memset(captured->flags.host,0,captured->flags.bytes);
                 },
-                [this,captured] {
+                [this,captured,grouped,final_tile] {
                     serve(*captured);
-                    if(cache_->moe_residency_->prepare_during_window()) {
+                    if(grouped) {
+                        grouped->ids.insert(grouped->ids.end(),captured->host_ids.h<int32_t>(),
+                            captured->host_ids.h<int32_t>()+captured->entries);
+                        grouped->tokens+=captured->tokens;
+                    }
+                    if(final_tile && cache_->moe_residency_->prepare_during_window()) {
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
-                        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,captured->tokens,true);
+                        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,true);
                     }
                 },
-                [this,captured] {
+                [this,captured,grouped,final_tile] {
                     observe_gpu(*captured);
+                    if(!final_tile)return;
                     cache_->pipeline_dma_leases_.clear();
                     if(cache_->moe_residency_->prepare_during_window())cache_->moe_residency_->finish_window(sources_[0]->layer_id_);
                     else {
                         cache_->record_compute_use();
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
-                        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,captured->tokens);
+                        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens);
                     }
                 },
-                [this,captured] {
+                [this,captured,final_tile] {
                     publish(captured->flags.h<uint32_t>()+64);publish(captured->flags.h<uint32_t>()+80);for(int i=1;i<4;++i)publish(captured->flags.h<uint32_t>()+16*i);
-                    cache_->moe_residency_->finish_window(sources_[0]->layer_id_);
+                    if(final_tile)cache_->moe_residency_->finish_window(sources_[0]->layer_id_);
                 },
-                [this,key=std::make_tuple(tokens,routes,static_cast<const void*>(window),batch_decode)] {
+                [this,window,final_tile,key=std::make_tuple(tokens,routes,static_cast<const void*>(window),batch_decode,tile)] {
                     (void)cudaStreamSynchronize(cache_->weight_stream_);cells_.erase(key);
+                    if(final_tile)window_routes_.erase(window);
                 },[captured] {captured->output={};}});
             cell->window_input_views=cell->two_stage && mfq::cuda::runtime_options::window_input_views() &&
                 input.is_contiguous() && ids.is_contiguous() && weights.is_contiguous() && weights.is_cuda() &&
@@ -2540,7 +2562,7 @@ public:
                 cell->input.copy_(input);cell->ids.copy_(ids);cell->weights.copy_(weights);
                 launch_body(*cell,execution);
             }
-            cache_->moe_residency_->record_window_expert_fence(sources_[0]->layer_id_,stream_);
+            if(final_tile)cache_->moe_residency_->record_window_expert_fence(sources_[0]->layer_id_,stream_);
             return cell->output;
         }
         const auto* graph=cell->graphs->find(1,tokens);

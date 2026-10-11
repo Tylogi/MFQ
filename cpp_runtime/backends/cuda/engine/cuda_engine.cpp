@@ -101,7 +101,14 @@ struct CudaEngineState {
                                   batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if (request.batched) graph.invalidate();
+        if (request.batched) {
+            graph.invalidate();
+            if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+                // Exclusive MTP generation has ended before a batch starts.
+                // Its graph consumers must retire before idle batch buffers.
+                if (components.mtp) components.mtp->reset(1);
+            }
+        }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     template <class T> ControlResult control(T value) {

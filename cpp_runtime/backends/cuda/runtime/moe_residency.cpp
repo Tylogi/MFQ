@@ -321,6 +321,10 @@ MoeResidencyManager::~MoeResidencyManager() {
     if(impl_->window_done)cudaEventDestroy(impl_->window_done);
     if(impl_->stream)cudaStreamDestroy(impl_->stream);
 }
+void MoeResidencyManager::release_transfer_stages() {
+    apply_pending();
+    for(auto& stages:impl_->transfer_stages)for(auto& stage:stages)stage.arena=nullptr;
+}
 void MoeResidencyManager::before_layer(int layer) {
     auto& s=*impl_;if(layer!=s.first)return;
     apply_pending();

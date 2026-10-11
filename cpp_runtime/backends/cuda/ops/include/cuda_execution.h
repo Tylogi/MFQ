@@ -332,6 +332,8 @@ struct CudaExecutionContext {
     bool decode_graph_serial_branches = false;
     bool decode_graph_tp_projection_major = false;
     bool continuous_batch_cache_serial = false;
+    int continuous_batch_ffn_tile = 0;
+    int continuous_batch_ffn_tiles = 1;
     int moe_cache_registration_min_slots = 8;
     int gemma_trace_layer = -1;
     std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*

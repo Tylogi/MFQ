@@ -31,6 +31,7 @@ bool warp_multi_sum();
 float residency_heat_retention();
 int residency_interval();
 bool router_lookahead();
+bool batch_attention_projections();
 std::size_t workspace_reserve_bytes();
 bool phased_transfer();
 bool mapped_copy_overlap();

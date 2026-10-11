@@ -489,6 +489,22 @@ struct Qwen4Block final : Block {
     std::unique_ptr<Gdn> gdn;
     std::unique_ptr<Qsa> qsa;
     std::unique_ptr<Ple> ple;
+    Tensor batch_ffn(CudaExecutionContext& execution,const Tensor& input) {
+        constexpr int64_t rows=8;
+        if(input.size(0)<=rows)return ffn(execution,input);
+        struct TileScope {
+            CudaExecutionContext& execution;
+            int tile,tiles;
+            ~TileScope() {execution.continuous_batch_ffn_tile=tile;execution.continuous_batch_ffn_tiles=tiles;}
+        } scope{execution,execution.continuous_batch_ffn_tile,execution.continuous_batch_ffn_tiles};
+        execution.continuous_batch_ffn_tiles=int((input.size(0)+rows-1)/rows);
+        std::vector<Tensor> outputs;
+        for(int64_t start=0;start<input.size(0);start+=rows) {
+            execution.continuous_batch_ffn_tile=int(start/rows);
+            outputs.push_back(ffn(execution,input.narrow(0,start,std::min(rows,input.size(0)-start))));
+        }
+        return tb::cat(outputs,0);
+    }
     Qwen4Block(CudaExecutionContext &execution, const mfq::ModelSource &file,
                const Config &c, int layer, bool predictor = false) {
         BlockLoader loader{{execution, file, "qwen4_exp"},&router,&prefetch};
@@ -1324,17 +1340,25 @@ struct Qwen4BatchDecodeGraph::Impl {
     std::vector<Tensor> positions, cache_positions;
     std::vector<std::vector<std::shared_ptr<NintRowStage>>> ple;
     Tensor ids, logits;
+    bool greedy = false;
     int64_t captures = 0, replays = 0;
     explicit Impl(Qwen4CausalLm& owner) : model(owner), stream(mfq_get_current_cuda_stream()) {}
     void clear() {
         if (requests.empty() && !window) return;
         finish_moe_expert_exchanges(model.execution->moe_expert_cache);
         window.reset();
+        memory_pool.reset();
+        if(!model.graph_registry) {
+            // Membership changes retire every batch graph consumer. Release
+            // its scratch before converting caches or capturing a new width.
+            // Otherwise arrivals retain scratch for every previous row count.
+            release_moe_decode_buffers(model.execution->moe_expert_cache);
+            default_context(model.execution->layer_placement.primary_device())->reclaim_idle_memory();
+        }
         for (auto* request : requests)
             for (auto& layer : request->state_->layers) if (layer.qsa) layer.qsa->leave_graph();
         requests.clear(); capacities.clear(); positions.clear(); cache_positions.clear(); ple.clear();
         ids = {}; logits = {};
-        memory_pool.reset();
     }
 };
 Qwen4BatchDecodeGraph::Qwen4BatchDecodeGraph(Qwen4CausalLm& model)
@@ -1345,21 +1369,26 @@ int64_t Qwen4BatchDecodeGraph::captures() const { return graph_->captures; }
 int64_t Qwen4BatchDecodeGraph::replays() const { return graph_->replays; }
 std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         const std::vector<Qwen4BatchRequestState*>& requests,
-        const mfq_tensor_backend::Tensor& ids,const mfq_tensor_backend::Tensor& host_ids) {
+        const mfq_tensor_backend::Tensor& ids,const mfq_tensor_backend::Tensor& host_ids,bool greedy) {
     namespace tb = mfq_tensor_backend;
     auto& graph = *graph_;
     auto& model = graph.model;
     if (model.execution->qsa_kv_store || !mfq_cuda_graph_capture_supported()) return {};
     for (auto* request : requests) for (const auto& layer : request->state_->layers)
         if (layer.ple && !layer.ple->graph_supported()) return {};
+    // Whole-layer prefill snapshots the GPU/RAM expert maps. Adaptive decode
+    // can exchange those experts, so retire the snapshots before replay just
+    // as the single-request window does.
+    release_moe_prefill_buffers(model.execution->moe_expert_cache);
     const auto batch = static_cast<int64_t>(requests.size());
     graph.ready.record(mfq_get_current_cuda_stream());
     MfqCudaStreamGuard stream_guard(graph.stream);
     MFQ_CUDA_CHECK(cudaStreamWaitEvent(graph.stream.stream(),graph.ready.get(),0));
-    bool reuse = graph.requests == requests && graph.window;
+    bool reuse = graph.requests == requests && graph.window && graph.greedy == greedy;
     if (reuse) for (int64_t row = 0; row < batch; ++row)
         reuse = reuse && requests[row]->position() + 1 <= graph.capacities[row];
     if (!reuse) graph.clear();
+    graph.greedy = greedy;
     if (!graph.window) {
         graph.requests = requests;
         std::size_t growth = 0;
@@ -1398,30 +1427,40 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         graph.window = std::make_unique<DecodeWindow>(mfq_current_cuda_stream());
     }
     graph.ids.copy_(ids);
+    std::vector<std::pair<qwen4_exp::Ple*,qwen4_exp::NgramEmbedding::Context>> ple_contexts;
     for (int64_t row = 0; row < batch; ++row) {
         auto& state = *requests[row]->state_;
         mfq_qwen4_exp::fill_decode_positions(graph.cache_positions[row],graph.positions[row],
                                             state.cache_position,model.decode_position_delta);
-        for (std::size_t i = 0; i < state.layers.size(); ++i) if (state.layers[i].ple)
+        for (std::size_t i = 0; i < state.layers.size(); ++i) if (state.layers[i].ple) {
+            if(!graph.window->valid())ple_contexts.emplace_back(state.layers[i].ple.get(),state.layers[i].ple->session_context());
             state.layers[i].ple->upload_graph(host_ids.narrow(0,row,1),*graph.ple[row][i]);
+        }
     }
     if (!graph.window->valid()) {
         struct Saved { tb::Tensor* tensor; tb::Tensor snapshot; };
         std::vector<Saved> recurrent;
+        const auto save=[&](tb::Tensor* tensor) {
+            // Capture restores these values after warmup. They are never read
+            // by replay, so large batches can keep this temporary copy in RAM.
+            if(tensor->defined())recurrent.push_back({tensor,batch>8 ? tensor->to(tb::kCPU) : tensor->clone()});
+        };
         for (auto* request : requests) for (auto& layer : request->state_->layers) {
             if (layer.gdn) for (auto* tensor : layer.gdn->graph_state())
-                if (tensor->defined()) recurrent.push_back({tensor,tensor->clone()});
+                save(tensor);
             if (layer.ple) for (auto* tensor : layer.ple->graph_state())
-                if (tensor->defined()) recurrent.push_back({tensor,tensor->clone()});
+                save(tensor);
         }
         DecodeGraphBranchScope branch_scope(model.execution->decode_graph_serial_branches);
-        graph.window->capture([&] {
+        try { graph.window->capture([&] {
             auto& execution = *model.execution;
+            graph.window->mark(-1,"window_begin");
             auto hidden = model.adapter_prepare_hidden(model.embed_tokens(graph.ids),batch,1);
             for (std::size_t i = 0; i < model.blocks.size(); ++i) {
                 graph.window->mark(static_cast<int>(i),"block_begin");
                 auto& block = static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
                 if (block.ple) {
+                    graph.window->mark(static_cast<int>(i),"ple_begin");
                     std::vector<tb::Tensor> positional;
                     for (int64_t row = 0; row < batch; ++row) {
                         auto x = hidden.narrow(0,row,1);
@@ -1431,23 +1470,49 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                             execution,x,graph.ids.narrow(0,row,1),true,{},rows));
                     }
                     hidden = tb::cat(positional,0);
+                    graph.window->mark(static_cast<int>(i),"ple_end");
                 }
                 auto mix = block.attention_gr.pre(execution,hidden);
+                graph.window->mark(static_cast<int>(i),"attention_core_begin");
+                const bool project_batch=batch>1 && runtime_options::batch_attention_projections();
+                const auto projections=project_batch ? (block.gdn ? block.gdn->project_inputs(execution,mix[0])
+                    : block.qsa->project_inputs(execution,mix[0])) : std::vector<tb::Tensor>{};
                 std::vector<tb::Tensor> attended;
                 for (int64_t row = 0; row < batch; ++row) {
                     auto& layer = requests[row]->state_->layers[i];
                     auto branch = mix[0].narrow(0,row,1);
-                    attended.push_back(layer.gdn ? layer.gdn->forward_chunk(execution,branch,true)
-                        : layer.qsa->forward_graph(execution,branch,graph.positions[row],graph.cache_positions[row]));
+                    std::vector<tb::Tensor> projected;
+                    for(const auto& value:projections)projected.push_back(value.narrow(0,row,1));
+                    attended.push_back(layer.gdn ? layer.gdn->forward_chunk(execution,branch,true,std::move(projected),!project_batch)
+                        : layer.qsa->forward_graph(execution,branch,graph.positions[row],graph.cache_positions[row],
+                            std::move(projected),!project_batch));
                 }
-                auto ffn_mix = block.ffn_gr.pre_after(execution,tb::cat(attended,0),mix);
-                hidden = block.ffn_gr.post(block.ffn(execution,ffn_mix[0]),ffn_mix);
+                auto attention=tb::cat(attended,0);
+                if(project_batch)attention=block.gdn ? block.gdn->project_output(execution,attention)
+                    : block.qsa->project_output(execution,attention);
+                graph.window->mark(static_cast<int>(i),"attention_core_end");
+                auto ffn_mix = block.ffn_gr.pre_after(execution,std::move(attention),mix);
+                graph.window->mark(static_cast<int>(i),"ffn_pre_end");
+                hidden = block.ffn_gr.post(block.batch_ffn(execution,ffn_mix[0]),ffn_mix);
                 graph.window->mark(static_cast<int>(i),"block_end");
             }
-            graph.logits = model.logits_from_hidden(model.finalize_hidden(std::move(hidden),batch,1))
-                .reshape({batch,-1});
+            auto finalized=model.finalize_hidden(std::move(hidden),batch,1);
+            graph.logits = greedy ? model.adapter_next_token(model.lm_head,model.last_hidden(std::move(finalized)))
+                .reshape({batch,1}) : model.logits_from_hidden(std::move(finalized)).reshape({batch,-1});
+            graph.window->mark(-1,"window_end");
         },[&] { for (const auto& saved : recurrent) saved.tensor->copy_(saved.snapshot); },
-        [&] { graph.logits = {}; });
+        [&] { graph.logits = {}; }); }
+        catch(const Error& error) {
+            const std::string message=error.what();
+            if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
+               !message.starts_with("CUDA VRAM limit exceeded:"))throw;
+            // Capture has not accepted a token. Retire its consumers before
+            // restoring state, then let admission reject only the newest row.
+            graph.clear();
+            for(const auto& saved:recurrent)saved.tensor->copy_(saved.snapshot);
+            for(auto& [layer,context]:ple_contexts)layer->restore_graph_context(std::move(context));
+            throw;
+        }
         ++graph.captures;
     }
     graph.window->run();
@@ -1496,16 +1561,22 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
             hidden = tb::cat(positional,0);
         }
         auto mix = block.attention_gr.pre(execution,hidden);
+        const bool project_batch=batch>1 && block.gdn && runtime_options::batch_attention_projections();
+        const auto projections=project_batch ? block.gdn->project_inputs(execution,mix[0]) : std::vector<tb::Tensor>{};
         std::vector<tb::Tensor> attended;
         for (int64_t row = 0; row < batch; ++row) {
             auto& layer = requests[row]->state_->layers[i];
             auto branch = mix[0].narrow(0,row,1);
-            attended.push_back(layer.gdn ? layer.gdn->forward(execution,branch,true)
+            std::vector<tb::Tensor> projected;
+            for(const auto& value:projections)projected.push_back(value.narrow(0,row,1));
+            attended.push_back(layer.gdn ? layer.gdn->forward_chunk(execution,branch,true,std::move(projected),!project_batch)
                 : layer.qsa->forward(execution,branch,current[row],full[row],true));
         }
-        auto ffn_mix = block.ffn_gr.pre_after(execution,tb::cat(attended,0),mix);
-        // One routing/transfer/decode pass covers every eligible request.
-        hidden = block.ffn_gr.post(block.ffn(execution,ffn_mix[0]),ffn_mix);
+        auto attention=tb::cat(attended,0);
+        if(project_batch)attention=block.gdn->project_output(execution,attention);
+        auto ffn_mix = block.ffn_gr.pre_after(execution,std::move(attention),mix);
+        // Tiles share the expert transfer cache across all eligible rows.
+        hidden = block.ffn_gr.post(block.batch_ffn(execution,ffn_mix[0]),ffn_mix);
     }
     auto logits = model.logits_from_hidden(model.finalize_hidden(std::move(hidden),batch,1)).reshape({batch,-1});
     for (int64_t row = 0; row < batch; ++row) {

@@ -43,7 +43,7 @@ class Qwen4BatchDecodeGraph {
     ~Qwen4BatchDecodeGraph();
     std::optional<mfq_tensor_backend::Tensor> run(
         const std::vector<Qwen4BatchRequestState*>&,
-        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,bool greedy=false);
     void clear();
     int64_t captures() const;
     int64_t replays() const;

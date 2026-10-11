@@ -136,6 +136,10 @@ int residency_interval() {
     return environment_int("MFQ_MOE_RESIDENCY_INTERVAL",1,1,1024);
 }
 bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
+bool batch_attention_projections() {
+    const auto* value=std::getenv("MFQ_BATCH_ATTENTION_PROJECTIONS");
+    return !value || value[0]!='0';
+}
 std::size_t workspace_reserve_bytes() {
     std::size_t reserve = std::size_t(4) * 1024 * 1024 * 1024;
     if (const auto* value = std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {

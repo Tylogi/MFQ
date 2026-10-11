@@ -466,6 +466,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
     }
     return {{"continuous_batching_decode_batches",double(decode_batches_)},
         {"continuous_batching_decode_tokens",double(decode_tokens_)},
+        {"continuous_batching_batched_greedy_batches",double(greedy_batches_)},
         {"continuous_batching_moe_cached_row_serial",0.0},
         {"continuous_batching_cuda_graph_captures",double(graph_ ? graph_->captures() : 0)},
         {"continuous_batching_cuda_graph_replays",double(graph_ ? graph_->replays() : 0)},
@@ -518,6 +519,16 @@ void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& r
 }
 void FlashNextBatchOperations::retire(const std::vector<std::shared_ptr<Request>>& retired,int64_t) {
     for (const auto& request : retired) discard_prefill(request);
+    const bool active = std::any_of(requests_.begin(),requests_.end(),[](const auto& weak) {
+        const auto request = weak.lock();
+        return request && request->cache;
+    });
+    if (!active && !model_.graph_registry) {
+        // Batch widths have distinct transfer arenas and graph scratch. Return
+        // them at idle while preserving resident experts and adaptation heat.
+        release_moe_decode_buffers(execution_.moe_expert_cache);
+        default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
+    }
 }
 FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state) {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
@@ -536,14 +547,32 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
     auto ids = host_ids.to(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
                                                    execution_.layer_placement.primary_device()));
     MoeContinuousBatchCacheScope moe_cache_scope(execution_,tokens.size() > 8);
-    auto captured = graph_ ? graph_->run(caches,ids,host_ids) : std::optional<Tensor>{};
+    const bool greedy = config_.greedy && std::all_of(state.active.begin(),state.active.end(),[](const auto& request) {
+        return !request->eligible || (request->sampler->greedy() && !request->sampler->has_penalties() && !request->token_constraint);
+    });
+    std::optional<Tensor> captured;
+    try { if(graph_)captured=graph_->run(caches,ids,host_ids,greedy); }
+    catch(const Error& error) {
+        const std::string message=error.what();
+        if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
+           !message.starts_with("CUDA VRAM limit exceeded:"))throw;
+        throw mfq::engine::InferenceInputError(mfq::engine::InferenceInputErrorCode::ContextLength,
+            "insufficient VRAM for the batch decode workspace; reduce concurrent requests");
+    }
     auto logits = captured ? std::move(*captured) : qwen4_batch_decode(model_,caches,std::move(ids),host_ids);
+    Tensor greedy_tokens;
+    if (greedy) {
+        greedy_tokens = captured ? logits.to(mfq_tensor_backend::kCPU).contiguous()
+            : sample_greedy_cuda(logits.contiguous()).to(mfq_tensor_backend::kCPU).contiguous();
+        ++greedy_batches_;
+    }
     ++decode_batches_; decode_tokens_ += tokens.size();
-    return {std::move(logits)};
+    return {std::move(logits),std::move(greedy_tokens)};
 }
 FlashNextBatchOperations::Sample FlashNextBatchOperations::sample(
         const std::shared_ptr<Request>& request,const Decoded& decoded) {
     MFQ_RUNTIME_CHECK(request->decode_row >= 0,"Flash-Next sampled an inactive row");
+    if(decoded.greedy_tokens.defined())return {{},decoded.greedy_tokens.data_ptr<int64_t>()[request->decode_row],{}};
     auto next = sample_logits(*request->sampler,decoded.logits.narrow(0,request->decode_row,1),
                              request->counts,request->token_constraint);
     const auto token = next.item<int64_t>();

@@ -38,6 +38,7 @@ public:
     void finish_window(int layer);
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
+    void release_transfer_stages();
     Stats stats() const noexcept;
 private:
     struct Impl;

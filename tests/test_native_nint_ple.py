@@ -166,9 +166,17 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
                 if ".mlp.experts." not in name:
                     continue
                 experts, output, width = weight.shape
-                packed = quantize(weight.reshape(experts * output, width), NintSpec(4, 8, 6))
-                values[name] = MfeTensor(shape=weight.shape, pools=(
-                    MfePool(expert_ids=np.arange(experts, dtype=np.int32), tensor=packed),))
+                if quantized_experts == "nvq":
+                    from mfq.formats.nvq import NvqSpec
+                    from mfq.quantize.nvq_quant import quantize as quantize_nvq
+                    values[name] = MfeTensor(shape=weight.shape, pools=tuple(
+                        MfePool(expert_ids=np.array([expert], dtype=np.int32), tensor=quantize_nvq(
+                            weight[expert], NvqSpec("e8_256" if expert == 0 else "d4_256", groupsize=24),
+                            search_steps=3, group_chunk=128)) for expert in range(experts)))
+                else:
+                    packed = quantize(weight.reshape(experts * output, width), NintSpec(4, 8, 6))
+                    values[name] = MfeTensor(shape=weight.shape, pools=(
+                        MfePool(expert_ids=np.arange(experts, dtype=np.int32), tensor=packed),))
     paths = (tmp_path / "fp8.mfq", tmp_path / "nintv2.mfq")
     for path, values in zip(paths, (fp8, nint), strict=True):
         values[asset.name] = asset.data
@@ -482,8 +490,8 @@ def _cuda_models(tmp_path):
     return baseline, nint
 
 
-@pytest.mark.parametrize("requests", [2, 32])
-@pytest.mark.parametrize("quantized_experts", [False, True])
+@pytest.mark.parametrize("requests", [2, 4, 6, 8, 16, 32])
+@pytest.mark.parametrize("quantized_experts", [False, True, "nvq"])
 def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, requests, quantized_experts):
     executable = os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
     if not executable:
@@ -496,7 +504,7 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     process = subprocess.run([
         executable, "--model", str(model), "--ctx-size", "512",
         "--check-continuous-batching", "--continuous-batching-check-requests", str(requests),
-        "--moe-gpu-cache-gb", "0.1" if quantized_experts else "0",
+        "--moe-gpu-cache-gb", "0.00004" if quantized_experts == "nvq" else ("0.1" if quantized_experts else "0"),
     ], capture_output=True, text=True, timeout=90, env=environment)
     assert process.returncode == 0, process.stdout + process.stderr
     assert "continuous_batching_check PASS" in process.stdout
@@ -537,22 +545,24 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
             client = StdioRuntimeClient(process,control_timeout_seconds=10)
             try:
                 await client.status()
-                async def generate(content):
+                async def generate(content, penalty=False):
                     async with client.generate({"messages":[{"role":"user","content":content}],
-                            "temperature":0,"top_k":1,"max_tokens":32,"stream":True}) as events:
+                            "temperature":0,"top_k":1,"max_tokens":32,"stream":True,
+                            "presence_penalty":-0.01 if penalty else 0}) as events:
                         return [event async for event in events if event is not None]
                 prompts = ["ab" * (4 + row % 5 * 8) for row in range(requests)]
-                reference = [await generate(prompt) for prompt in prompts]
-                parallel = await asyncio.gather(*(generate(prompt) for prompt in prompts))
+                reference = [await generate(prompt,row == 0) for row,prompt in enumerate(prompts)]
+                parallel = await asyncio.gather(*(generate(prompt,row == 0) for row,prompt in enumerate(prompts)))
                 def text(events):
                     return "".join(choice.get("delta",{}).get("content","")
                         for event in events for choice in event.get("choices",[]))
                 assert list(map(text,parallel)) == list(map(text,reference))
-                assert list(map(text,parallel)) == ["a"*32] * requests
+                assert list(map(text,parallel)) == ["ab"*32] + ["a"*32] * (requests-1)
                 status = await client.status()
                 (tmp_path / "worker-status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")
                 assert status["continuous_batching_admissions"] == 2 * requests
                 assert status["continuous_batching_cuda_graph_replays"] > 0
+                assert status["continuous_batching_batched_greedy_batches"] > 0
                 assert status["continuous_batching_decode_tokens"] > status["continuous_batching_decode_batches"]
                 assert status["continuous_batching_active"] == 0
                 assert status["kv_cache_bytes"] == 0
