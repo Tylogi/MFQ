@@ -454,6 +454,18 @@ mfq_tensor_backend::Tensor nint_matmul(
         mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous();
+    if (!w.q8_zero && w.out>=65536 && x.size(0)>8 && x.size(0)<=32 &&
+        !nint_prefill_decode_cache && mfq::cuda::runtime_options::nint_large_output_tiling()) {
+        // Large vocabulary heads otherwise materialize over a GiB of FP16
+        // weights. Reuse compressed GEMV across up to eight activation rows.
+        x=x.to(mfq_tensor_backend::kFloat16);
+        return profiler.measure("nint.matmul.tiled_output",[&] {
+            std::vector<mfq_tensor_backend::Tensor> output;
+            for(int64_t row=0;row<x.size(0);row+=8)
+                output.push_back(nint_matmul(profiler,w,x.narrow(0,row,std::min<int64_t>(8,x.size(0)-row))));
+            return mfq_tensor_backend::cat(output,0);
+        });
+    }
     const bool packed_rows=nint_packed_decode_rows(w,x.size(0));
     if (x.size(0) > 8 || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
             x.scalar_type() != mfq_tensor_backend::kFloat32))

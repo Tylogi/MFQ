@@ -17,12 +17,12 @@ from mfq.formats.nint import NintSpec, NintTensor
 
 
 def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
-            context_size=64, quantized_experts=False) -> tuple[Path, Path]:
+            context_size=64, quantized_experts=False, vocab_size=32) -> tuple[Path, Path]:
     rng = np.random.default_rng(20261001)
     hidden, streams, experts, intermediate = 128, 2, 2, 32
     qsa = qsa or ple_layer == 3
     config = dict(
-        model_type="qwen4_exp_text", vocab_size=32, hidden_size=hidden,
+        model_type="qwen4_exp_text", vocab_size=vocab_size, hidden_size=hidden,
         num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=context_size,
         num_attention_heads=24 if wide else 2, num_key_value_heads=2 if wide else 1,
         head_dim=256 if wide else 64,
@@ -56,8 +56,8 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
         if injection:
             weight(root + ".post.inject.weight", (streams, streams * hidden))
 
-    weight("model.token_embedding.weight", (32, hidden))
-    weight("model.output.weight", (32, hidden))
+    weight("model.token_embedding.weight", (vocab_size, hidden))
+    weight("model.output.weight", (vocab_size, hidden))
     mixer("model.mhc", False)
     block = "model.block.0"
     mixer(block + ".attention.mhc", True)
@@ -586,6 +586,30 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                 await process.wait()
 
     asyncio.run(asyncio.wait_for(run(),30))
+
+
+@pytest.mark.parametrize("requests",[9,16,17,32])
+def test_cuda_flash_next_large_nint_head_matches_serial_batches(tmp_path,requests):
+    from mfq.quantize.nint_quant import quantize
+
+    executable=os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
+    if not executable:
+        pytest.skip("MFQ_NINT_PLE_CUDA_DECODE must point to CUDA mfq-diagnostics")
+    _,model=_models(tmp_path,qsa=True,ple_layer=3,context_size=512,
+        quantized_experts=True,vocab_size=65536)
+    header,weights=io.load(model)
+    output=weights["model.output.weight"].copy()
+    output[-32:]*=8
+    weights["model.output.weight"]=quantize(output,NintSpec(4,8,6))
+    io.save(model,header,weights)
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    process=subprocess.run([executable,"--model",str(model),"--ctx-size","512",
+        "--check-continuous-batching","--continuous-batching-check-requests",str(requests),
+        "--moe-gpu-cache-gb","0.1"],capture_output=True,text=True,env=environment,timeout=30)
+    assert process.returncode==0,process.stdout+process.stderr
+    assert "continuous_batching_check PASS" in process.stdout
+    assert f"continuous_batching_growth_check requests={requests} boundary=256 PASS" in process.stdout
 
 
 @pytest.mark.parametrize("cancel",[False,True])

@@ -151,6 +151,10 @@ bool nint_compressed_decode_batch() {
     // Keep the faster GEMM dispatch while tuning the online Tensor Core path.
     return exact_one("MFQ_NINT_COMPRESSED_DECODE_BATCH");
 }
+bool nint_large_output_tiling() {
+    const auto* value=std::getenv("MFQ_NINT_LARGE_OUTPUT_TILING");
+    return !value || value[0]!='0';
+}
 int continuous_batch_kv_initial_capacity() {
     return environment_int("MFQ_CONTINUOUS_BATCH_KV_INITIAL_CAPACITY",256,16,4096);
 }
