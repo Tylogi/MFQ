@@ -173,7 +173,15 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
     if requested == "auto":
         if system == "Darwin" and machine in {"arm64", "aarch64"}:
             return "metal"
-        if system in {"Linux", "Windows"}:
+        if system == "Linux":
+            from mfq.commands.build import _cuda_compiler, _hip_compiler
+
+            if _cuda_compiler() is not None:
+                return "cuda"
+            if _hip_compiler() is not None:
+                return "hip"
+            return "cuda"
+        if system == "Windows":
             return "cuda"
         raise BuildError(f"no prebuilt MFQ runtime backend is supported on {system} {machine}")
     if requested == "metal":
@@ -184,6 +192,10 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
         if system not in {"Linux", "Windows"}:
             raise BuildError("the CUDA runtime is supported on Linux and Windows")
         return "cuda"
+    if requested == "hip":
+        if system != "Linux":
+            raise BuildError("the HIP runtime is supported on Linux")
+        return "hip"
     raise BuildError(f"unsupported inference backend: {requested}")
 
 
@@ -488,7 +500,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=True,
         help="emit one HTTP access-log line per request (default: enabled)",
     )
-    parser.add_argument("--backend", choices=("auto", "cuda", "metal"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "cuda", "hip", "metal"), default="auto")
     parser.add_argument(
         "--transport",
         type=str.lower,
