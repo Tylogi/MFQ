@@ -179,6 +179,9 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
 .download-item-heading strong { min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
 .download-item-heading > span { flex-shrink: 0; color: var(--muted); font-size: 11px; }
 .download-item-body > small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.download-item-files { min-width: 0; color: var(--muted); font-size: 11px; }
+.download-item-files summary { cursor: pointer; }
+.download-item-files ul { display: grid; gap: 5px; margin: 7px 0 0; padding: 0; list-style: none; overflow-wrap: anywhere; }
 .download-item-progress { display: flex; align-items: center; gap: 10px; }
 .download-item-progress progress { flex: 1; width: 0; height: 5px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line-soft); accent-color: var(--bar-fill); }
 .download-item-progress progress::-webkit-progress-bar { background: var(--line-soft); }
