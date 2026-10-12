@@ -39,6 +39,17 @@
 #define __ballot_sync(mask, predicate) ((unsigned)__ballot(predicate))
 #endif
 
+// cuBLAS enum names left behind by partial hipify passes map onto the
+// hipBLAS equivalents (identical values).
+#if !defined(MFQ_HIP_COMPAT_CUBLAS_ENUMS)
+#define MFQ_HIP_COMPAT_CUBLAS_ENUMS
+#define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
+#define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
+#define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
+#define CUBLAS_OP_N HIPBLAS_OP_N
+#define CUBLAS_OP_T HIPBLAS_OP_T
+#endif
+
 // ROCm does not provide CUDA's __dp4a intrinsic; emulate it in device code.
 #if !defined(MFQ_HIP_COMPAT_DP4A)
 #define MFQ_HIP_COMPAT_DP4A

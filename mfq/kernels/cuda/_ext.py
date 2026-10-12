@@ -85,10 +85,16 @@ def _ensure_msvc() -> None:
 
 
 def ext():
-    """Trigger the (first) build and return the cached extension module."""
-
     global _module
     if _module is None:
+        import torch
+
+        if torch.version.hip:
+            # AMD ROCm host: build the hipify-translated kernels instead.
+            from mfq.kernels.hip._ext import ext as _hip_ext
+
+            _module = _hip_ext()
+            return _module
         _ensure_msvc()
         import torch  # noqa: F401  ensure torch imported (cpp_extension depends on it)
         from torch.utils.cpp_extension import load
@@ -104,7 +110,6 @@ def ext():
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,
             ],
-            # Shared native tensor views require C++20 (span and comparisons).
             extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
             extra_cuda_cflags=[
                 "-O3",
