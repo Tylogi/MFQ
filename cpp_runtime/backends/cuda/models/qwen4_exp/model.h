@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -69,7 +70,7 @@ class Gdn {
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
-    void initialize_request_cache() {
+    void initialize_request_cache(bool allocate_counters=true) {
         // Recurrence is allocated on first use, outside temporary pool pages.
         // Keep the reusable decode counters out of graph scratch as well.
         request_state_storage_=true;
@@ -77,7 +78,8 @@ class Gdn {
         ResidentAllocationScope resident;
 #endif
         auto options=w_.norm.options().dtype(tb::kFloat32);
-        if(fused_core_ && fused_decode_ && fused_preparation_ && fused_output_ && transposed_state_)
+        if(allocate_counters && !core_workspace_.defined() && fused_core_ && fused_decode_ &&
+            fused_preparation_ && fused_output_ && transposed_state_)
             core_workspace_=tb::zeros({1,nv_,d_+1},options);
     }
     std::size_t growth_bytes() const {
@@ -103,6 +105,69 @@ class Gdn {
     }
     Tensor project_output(CudaExecutionContext& execution,const Tensor& x) const {
         return w_.output(execution,x);
+    }
+    static Tensor prepare_independent_batch(const std::vector<Gdn*>& rows) {
+        if(rows.size()<2 || rows.size()>32)return {};
+        const auto inplace=mfq::cuda::runtime_options::gdn_inplace_state();
+        if(inplace && !*inplace)return {};
+        const auto& first=*rows.front();
+        const auto eligible=[](const Gdn& row) {
+            return row.fused_core_ && row.fused_decode_ && row.fused_preparation_ &&
+                row.fused_output_ && row.transposed_state_ &&
+                (row.d_==32 || row.d_==64 || row.d_==128) &&
+                row.conv_.defined() && row.state_.defined() && row.core_workspace_.defined() &&
+                row.conv_.is_cuda() && row.state_.is_cuda() && row.core_workspace_.is_cuda() &&
+                row.conv_.is_contiguous() && row.state_.is_contiguous() && row.core_workspace_.is_contiguous() &&
+                row.conv_.scalar_type()==tb::kFloat32 && row.state_.scalar_type()==tb::kFloat32 &&
+                row.core_workspace_.scalar_type()==tb::kFloat32 &&
+                row.conv_.sizes().vec()==std::vector<int64_t>({1,row.kernel_-1,(2*row.nk_+row.nv_)*row.d_}) &&
+                row.state_.sizes().vec()==std::vector<int64_t>({1,row.nv_,row.d_,row.d_}) &&
+                row.core_workspace_.sizes().vec()==std::vector<int64_t>({1,row.nv_,row.d_+1});
+        };
+        if(mfq::cuda::runtime_options::gdn_independent_batch_trace())
+            std::fprintf(stderr,"gdn_batch_state eligible=%d flags=%d%d%d%d%d conv=%d state=%d counters=%d geometry=%lld/%lld/%lld/%lld\n",
+                int(eligible(first)),int(first.fused_core_),int(first.fused_decode_),int(first.fused_preparation_),
+                int(first.fused_output_),int(first.transposed_state_),int(first.conv_.defined()),int(first.state_.defined()),
+                int(first.core_workspace_.defined()),(long long)first.nk_,(long long)first.nv_,(long long)first.d_,(long long)first.kernel_);
+        if(!eligible(first))return {};
+        for(const auto* row:rows)if(!eligible(*row) || row->nk_!=first.nk_ || row->nv_!=first.nv_ ||
+            row->d_!=first.d_ || row->kernel_!=first.kernel_ || row->eps_!=first.eps_ ||
+            row->silu_gate_!=first.silu_gate_ || row->state_.device()!=first.state_.device() ||
+            row->conv_.device()!=first.state_.device() || row->core_workspace_.device()!=first.state_.device() ||
+            row->w_.conv.data_ptr()!=first.w_.conv.data_ptr() || row->w_.norm.data_ptr()!=first.w_.norm.data_ptr() ||
+            row->w_.dt_bias.data_ptr()!=first.w_.dt_bias.data_ptr() || row->w_.a_log.data_ptr()!=first.w_.a_log.data_ptr())return {};
+        auto addresses=tb::empty({int64_t(rows.size()),3},first.state_.options().device(tb::kCPU).dtype(tb::kInt64));
+        auto* values=addresses.data_ptr<int64_t>();
+        for(std::size_t i=0;i<rows.size();++i) {
+            values[3*i]=reinterpret_cast<int64_t>(rows[i]->conv_.data_ptr());
+            values[3*i+1]=reinterpret_cast<int64_t>(rows[i]->state_.data_ptr());
+            values[3*i+2]=reinterpret_cast<int64_t>(rows[i]->core_workspace_.data_ptr());
+        }
+        return addresses.to(first.state_.device());
+    }
+    Tensor forward_independent_batch(const Tensor& x,const std::vector<Tensor>& projections,
+                                     const Tensor& addresses) {
+        if(mfq::cuda::runtime_options::gdn_independent_batch_trace() && projections.size()==4)
+            std::fprintf(stderr,"gdn_batch_projection input=%d qkv=%d gate=%d alpha=%d beta=%d rows=%lld\n",
+                int(x.scalar_type()),int(projections[0].scalar_type()),int(projections[1].scalar_type()),
+                int(projections[2].scalar_type()),int(projections[3].scalar_type()),(long long)x.size(0));
+        if(!addresses.defined() || projections.size()!=4 || x.size(1)!=1 ||
+            (x.scalar_type()!=tb::kFloat16 && x.scalar_type()!=tb::kFloat32) ||
+            projections[0].scalar_type()!=tb::kFloat16 ||
+            projections[1].scalar_type()!=projections[2].scalar_type() ||
+            projections[2].scalar_type()!=projections[3].scalar_type() ||
+            (projections[1].scalar_type()!=tb::kFloat16 && projections[1].scalar_type()!=tb::kFloat32))return {};
+        if(mfq::cuda::runtime_options::gdn_independent_batch_trace())
+            std::fprintf(stderr,"gdn_batch_core rows=%lld\n",(long long)x.size(0));
+        auto weight=w_.conv.to(tb::kFloat32).contiguous();
+        if(weight.dim()==2 && weight.size(0)==(2*nk_+nv_)*d_ && weight.size(1)==kernel_)
+            weight=weight.reshape({(2*nk_+nv_)*d_,1,kernel_});
+        auto result=gdn_decode_core_cuda(projections[0].contiguous(),projections[1].contiguous(),
+            projections[2].reshape({x.size(0),1,nv_}),projections[3].reshape({x.size(0),1,nv_}),
+            conv_,state_,weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
+            w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
+            x.scalar_type()==tb::kFloat16,true,core_workspace_,true,addresses);
+        return result[0];
     }
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,int64_t confirmed,
                          Tensor& checkpoint_conv,Tensor& checkpoint_state) {

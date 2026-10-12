@@ -501,6 +501,9 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
                        MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
                        MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    trace_gdn = requests == 32 and quantized_experts == "nvq"
+    if trace_gdn:
+        environment["MFQ_TRACE_GDN_BATCH"] = "1"
     if requests == 17 and quantized_experts == "nvq":
         environment["MFQ_TRACE_LAYER_TIMINGS"] = "3"
         environment["MFQ_CONTINUOUS_BATCH_KV_INITIAL_CAPACITY"] = "64"
@@ -511,6 +514,9 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     ], capture_output=True, text=True, timeout=90, env=environment)
     assert process.returncode == 0, process.stdout + process.stderr
     assert "continuous_batching_check PASS" in process.stdout
+    if trace_gdn:
+        assert "gdn_batch_state eligible=1" in process.stderr
+        assert "gdn_batch_core rows=32" in process.stderr
     if requests == 17 and quantized_experts == "nvq":
         phases = [dict(field.split("=", 1) for field in line.split()[1:])
                   for line in process.stderr.splitlines() if line.startswith("native_layer_gpu ")]

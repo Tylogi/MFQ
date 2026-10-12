@@ -63,6 +63,18 @@ when leaving the graph. Batches above 16 requests grow graph capacity in
 the previous doubling policy. The configured context limit remains a ceiling,
 with no full-context allocation at admission.
 
+Eligible GDN layers process independent requests in one decode core launch.
+A small address table points to each request's existing convolution, recurrent
+state and counters; recurrence stays in those allocations. One subsequent
+kernel commits convolution rows after all readers finish. Membership changes
+rebuild the table with the graph. No second full batch of recurrent state is
+allocated. `MFQ_GDN_INDEPENDENT_BATCH=0` restores the per-request core calls.
+This dispatch requires batched attention projections and supported fused GDN
+geometry. Unsupported layers retain their per-request path.
+Request decode counters are prepared after prefill, before graph recording,
+and are included in the growth reservation. `MFQ_TRACE_GDN_BATCH=1` reports
+state eligibility, projection dtypes and actual batch core selection.
+
 Quota errors during prefill or graph capture reject the affected request
 without poisoning the backend. Other CUDA failures retain their existing
 fatal-error behavior. Native tests inject failures after transfer submission
@@ -96,3 +108,18 @@ After both 32-request cases, 1024-token ordinary decoding measured 50.30 tok/s
 and MTP measured 74.05 tok/s from streamed output after the first token.
 Both continuations match the serial text reference. Cold MTP is slower;
 these measurements describe the warmed process and do not establish a speedup.
+
+With indirect GDN enabled under the same configuration, the 32 × 256 case
+completed all 8192 tokens at 89.20 tok/s total and 101.71 tok/s graph throughput.
+The distinct-prompt case measured 98.83 tok/s graph throughput; 16 staggered
+requests completed all 2048 tokens at 111.94 tok/s graph throughput. Ordinary
+decoding and MTP afterwards measured 50.40 and 73.27 tok/s from streamed output.
+All outputs match their serial references. Independent-run variations should
+not be treated as isolated speedup measurements.
+
+The S2-L graph shrinks from 13,438 to 10,054 nodes, including a reduction from
+3,200 to 896 copy nodes. A same-process GDN primitive comparison at 32 rows
+measured 442.03 µs for independent launches and 289.92 µs for indirect batching.
+Output, convolution and recurrence are byte-exact. Tests exercise changing
+inputs and state address order at 2, 4, 6, 8, 16 and 32 rows with 4, 2 and 1
+column tiles. The model fixture also asserts that 32 rows enter the new core.

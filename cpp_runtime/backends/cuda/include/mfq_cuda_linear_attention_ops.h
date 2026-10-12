@@ -41,6 +41,9 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_decode_cuda(
 // Workspace counters start at zero and reset after each completed decode.
 // With inplace_state, every CTA owns disjoint recurrent columns and returns the
 // updated input storage. The caller must exclusively own that recurrent state.
+// Optional CUDA int64 [B,3] addresses select independently owned convolution,
+// recurrent states and counters. This requires inplace_state; convolution is committed
+// after every core CTA completes, and the returned state aliases row zero.
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     mfq_tensor_backend::Tensor qkv, mfq_tensor_backend::Tensor output_gate,
     mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,
@@ -50,4 +53,5 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     int64_t key_heads, int64_t value_heads, int64_t width,
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
-    mfq_tensor_backend::Tensor workspace={},bool inplace_state=false);
+    mfq_tensor_backend::Tensor workspace={},bool inplace_state=false,
+    mfq_tensor_backend::Tensor state_addresses={});

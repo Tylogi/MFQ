@@ -461,11 +461,19 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     Output* output,float* convolution_out,float* recurrent_out,int key_heads,int value_heads,
     int width,int taps,int layout,float convolution_eps,double norm_eps,bool silu_gate,
     bool transposed_state,int64_t as0,int64_t as2,int64_t bs0,int64_t bs2,
-    float* workspace) {
+    float* workspace,const int64_t* state_addresses) {
     if constexpr(FixedWidth>0)width=FixedWidth;
     if constexpr(FixedTaps>0)taps=FixedTaps;
     const int bh=blockIdx.x/tiles,tile=blockIdx.x%tiles;
     const int batch=bh/value_heads,head=bh%value_heads;
+    const int state_batch=state_addresses?0:batch;
+    if(state_addresses) {
+        convolution_state=reinterpret_cast<const float*>(state_addresses[3*batch]);
+        recurrent_state=reinterpret_cast<const float*>(state_addresses[3*batch+1]);
+        recurrent_out=reinterpret_cast<float*>(state_addresses[3*batch+1]);
+        workspace=reinterpret_cast<float*>(state_addresses[3*batch+2]);
+    }
+    const int workspace_head=state_addresses?head:bh;
     const int key_head=head/(value_heads/key_heads),tid=threadIdx.x;
     const int qk_width=2*key_heads*width,channels=qk_width+value_heads*width;
     __shared__ float query[128],key[128],value[128],attended[128];
@@ -475,13 +483,14 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     if(tid<width) {
         const int qc=key_head*width+tid,kc=key_heads*width+qc,vc=qk_width+head*width+tid;
         const size_t state_base=size_t(batch)*(taps-1)*channels;
+        const size_t input_base=size_t(state_batch)*(taps-1)*channels;
         for(int tap=0;tap<taps-1;++tap) {
             const size_t wq=layout==0?size_t(qc)*taps+tap:size_t(tap)*channels+qc;
             const size_t wk=layout==0?size_t(kc)*taps+tap:size_t(tap)*channels+kc;
             const size_t wv=layout==0?size_t(vc)*taps+tap:size_t(tap)*channels+vc;
-            q+=convolution_state[state_base+size_t(tap)*channels+qc]*convolution_weight[wq];
-            k+=convolution_state[state_base+size_t(tap)*channels+kc]*convolution_weight[wk];
-            v+=convolution_state[state_base+size_t(tap)*channels+vc]*convolution_weight[wv];
+            q+=convolution_state[input_base+size_t(tap)*channels+qc]*convolution_weight[wq];
+            k+=convolution_state[input_base+size_t(tap)*channels+kc]*convolution_weight[wk];
+            v+=convolution_state[input_base+size_t(tap)*channels+vc]*convolution_weight[wv];
         }
         const float q_current=__half2float(qkv[size_t(batch)*channels+qc]);
         const float k_current=__half2float(qkv[size_t(batch)*channels+kc]);
@@ -496,10 +505,10 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         query[tid]=q;key[tid]=k;value[tid]=v;
         for(int tap=0;tap<taps-2;++tap) {
             if(tile==0 && head%(value_heads/key_heads)==0) {
-                convolution_out[state_base+size_t(tap)*channels+qc]=convolution_state[state_base+size_t(tap+1)*channels+qc];
-                convolution_out[state_base+size_t(tap)*channels+kc]=convolution_state[state_base+size_t(tap+1)*channels+kc];
+                convolution_out[state_base+size_t(tap)*channels+qc]=convolution_state[input_base+size_t(tap+1)*channels+qc];
+                convolution_out[state_base+size_t(tap)*channels+kc]=convolution_state[input_base+size_t(tap+1)*channels+kc];
             }
-            if(tile==0)convolution_out[state_base+size_t(tap)*channels+vc]=convolution_state[state_base+size_t(tap+1)*channels+vc];
+            if(tile==0)convolution_out[state_base+size_t(tap)*channels+vc]=convolution_state[input_base+size_t(tap+1)*channels+vc];
         }
         if(tile==0 && head%(value_heads/key_heads)==0) {
             convolution_out[state_base+size_t(taps-2)*channels+qc]=q_current;
@@ -539,7 +548,7 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     __syncthreads();
     const int lane=tid&31,warp=tid>>5,warps=blockDim.x>>5;
     const int rows=(width+31)/32;
-    const size_t state_head=(size_t(batch)*value_heads+head)*width*width;
+    const size_t state_head=(size_t(state_batch)*value_heads+head)*width*width;
     const float decay=decay_value,bt=beta_value,scale=1.f/sqrtf(float(width));
     const int columns_per_tile=(width+tiles-1)/tiles;
     const int column_end=min(width,(tile+1)*columns_per_tile);
@@ -574,20 +583,20 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         if(lane==0) {
             const float computed=result*scale;
             if(tiles==1)attended[column]=computed;
-            else workspace[size_t(bh)*(width+1)+column]=computed;
+            else workspace[size_t(workspace_head)*(width+1)+column]=computed;
         }
     }
     if(tiles>1) {
         __threadfence();
         __syncthreads();
         if(tid==0) {
-            auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(bh)*(width+1)+width);
+            auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(workspace_head)*(width+1)+width);
             cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
             final_tile=progress.fetch_add(1u,cuda::std::memory_order_acq_rel)==unsigned(tiles-1);
         }
         __syncthreads();
         if(!final_tile)return;
-        if(tid<width)attended[tid]=workspace[size_t(bh)*(width+1)+tid];
+        if(tid<width)attended[tid]=workspace[size_t(workspace_head)*(width+1)+tid];
     }
     __syncthreads();
     if(tid<width)norm_sum[tid]=__fadd_rn(0.f,__fmul_rn(attended[tid],attended[tid]));
@@ -620,11 +629,19 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     if(tiles>1) {
         __syncthreads();
         if(tid==0) {
-            auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(bh)*(width+1)+width);
+            auto* counter=reinterpret_cast<uint32_t*>(workspace+size_t(workspace_head)*(width+1)+width);
             cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
             progress.store(0u,cuda::std::memory_order_release);
         }
     }
+}
+
+__global__ void gdn_commit_independent_convolution(const float* values,
+    const int64_t* state_addresses,int64_t row_elements) {
+    const int row=blockIdx.y;
+    const int64_t column=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(column<row_elements)
+        reinterpret_cast<float*>(state_addresses[3*row])[column]=values[int64_t(row)*row_elements+column];
 }
 
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
@@ -635,7 +652,8 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     mfq_tensor_backend::Tensor a_log,mfq_tensor_backend::Tensor norm_weight,
     int64_t key_heads,int64_t value_heads,int64_t width,
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
-    bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state) {
+    bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state,
+    mfq_tensor_backend::Tensor state_addresses) {
     constexpr int threads=256;
     const int tiles=[] {
         const char* value=std::getenv("MFQ_GDN_DECODE_TILES");
@@ -661,10 +679,17 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
         qkv.sizes().vec()==std::vector<int64_t>({batch,1,channels}),"GDN decode core qkv disagrees");
     const auto device=qkv.device();
     const auto real=[&](const tb::Tensor& t){return t.is_cuda() && t.device()==device && t.is_contiguous() && t.scalar_type()==tb::kFloat32;};
+    const bool independent=state_addresses.defined();
+    MFQ_RUNTIME_CHECK(!independent || (inplace_state && state_addresses.is_cuda() &&
+        state_addresses.device()==device && state_addresses.is_contiguous() &&
+        state_addresses.scalar_type()==tb::kInt64 &&
+        state_addresses.sizes().vec()==std::vector<int64_t>({batch,3})),
+        "GDN independent state addresses require inplace CUDA int64 [B,3]");
     MFQ_RUNTIME_CHECK(real(convolution_state) && real(recurrent_state) && real(convolution_weight) &&
         real(dt_bias) && real(a_log) && real(norm_weight),"GDN decode core parameters disagree");
-    MFQ_RUNTIME_CHECK(convolution_state.sizes().vec()==std::vector<int64_t>({batch,taps-1,channels}) &&
-        recurrent_state.sizes().vec()==std::vector<int64_t>({batch,value_heads,width,width}),"GDN decode core state shape disagrees");
+    const int64_t state_batch=independent?1:batch;
+    MFQ_RUNTIME_CHECK(convolution_state.sizes().vec()==std::vector<int64_t>({state_batch,taps-1,channels}) &&
+        recurrent_state.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width,width}),"GDN decode core state shape disagrees");
     const bool channels_first=convolution_weight.sizes().vec()==std::vector<int64_t>({channels,1,taps});
     MFQ_RUNTIME_CHECK(channels_first || convolution_weight.sizes().vec()==std::vector<int64_t>({taps,channels}),"GDN decode core conv weight disagrees");
     MFQ_RUNTIME_CHECK(output_gate.is_cuda() && alpha.is_cuda() && beta.is_cuda() &&
@@ -677,11 +702,11 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
         "GDN decode core vector width disagrees");
     MfqCudaGuard guard(device);
     auto output=tb::empty({batch,1,value_heads*width},qkv.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
-    auto conv=tb::empty_like(convolution_state);
+    auto conv=tb::empty({batch,taps-1,channels},convolution_state.options());
     auto state=inplace_state?recurrent_state:tb::empty_like(recurrent_state);
-    if(tiles>1 && !workspace.defined())workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
+    if(tiles>1 && !workspace.defined() && !independent)workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
     MFQ_RUNTIME_CHECK(!workspace.defined() || (real(workspace) &&
-        workspace.sizes().vec()==std::vector<int64_t>({batch,value_heads,width+1})),
+        workspace.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width+1})),
         "GDN decode core workspace shape/device/dtype disagrees");
     const auto launch=[&]<int Tiles,class Gate,class Output,int FixedWidth=0,int FixedTaps=0>() {
         gdn_decode_core_kernel<Tiles,Gate,Output,FixedWidth,FixedTaps><<<unsigned(batch*value_heads*Tiles),threads,0,mfq_current_cuda_stream()>>>(
@@ -690,7 +715,8 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
             dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<Output>(),
             conv.data_ptr<float>(),state.data_ptr<float>(),int(key_heads),int(value_heads),int(width),int(taps),channels_first?0:1,
             float(convolution_eps),norm_eps,silu_gate,transposed_state,alpha.stride(0),alpha.stride(2),beta.stride(0),beta.stride(2),
-            workspace.defined()?workspace.data_ptr<float>():nullptr);
+            workspace.defined()?workspace.data_ptr<float>():nullptr,
+            independent?state_addresses.data_ptr<int64_t>():nullptr);
     };
     const auto select_geometry=[&]<int Tiles,class Gate,class Output>() {
         const char* fixed=std::getenv("MFQ_GDN_FIXED_GEOMETRY");
@@ -713,5 +739,11 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     else if(tiles==2)select_types.template operator()<2>();
     else select_types.template operator()<4>();
     MFQ_CUDA_CHECK(cudaGetLastError());
+    if(independent) {
+        const int64_t elements=(taps-1)*channels;
+        gdn_commit_independent_convolution<<<dim3(unsigned((elements+255)/256),unsigned(batch)),256,0,mfq_current_cuda_stream()>>>(
+            conv.data_ptr<float>(),state_addresses.data_ptr<int64_t>(),elements);
+        MFQ_CUDA_CHECK(cudaGetLastError());
+    }
     return {output,conv,state};
 }

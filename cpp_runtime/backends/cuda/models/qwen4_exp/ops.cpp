@@ -1309,7 +1309,7 @@ Qwen4BatchRequestState::Qwen4BatchRequestState(Qwen4CausalLm& model)
     std::size_t fixed=0;
     for(const auto& layer:state_->layers)if(layer.gdn)fixed+=layer.gdn->request_cache_growth_bytes();
     if(fixed && model.reserve_kv_workspace)model.reserve_kv_workspace(fixed+(std::size_t(64)<<20));
-    for(auto& layer:state_->layers)if(layer.gdn)layer.gdn->initialize_request_cache();
+    for(auto& layer:state_->layers)if(layer.gdn)layer.gdn->initialize_request_cache(false);
 }
 Qwen4BatchRequestState::~Qwen4BatchRequestState() = default;
 int64_t Qwen4BatchRequestState::position() const { return state_->cache_position; }
@@ -1357,6 +1357,7 @@ struct Qwen4BatchDecodeGraph::Impl {
     std::vector<Qwen4BatchRequestState*> requests;
     std::vector<int64_t> capacities;
     std::vector<Tensor> positions, cache_positions;
+    std::vector<Tensor> gdn_addresses;
     std::vector<std::vector<std::shared_ptr<NintRowStage>>> ple;
     Tensor ids, logits;
     bool greedy = false;
@@ -1376,7 +1377,7 @@ struct Qwen4BatchDecodeGraph::Impl {
         }
         for (auto* request : requests)
             for (auto& layer : request->state_->layers) if (layer.qsa) layer.qsa->leave_graph();
-        requests.clear(); capacities.clear(); positions.clear(); cache_positions.clear(); ple.clear();
+        requests.clear(); capacities.clear(); positions.clear(); cache_positions.clear(); ple.clear();gdn_addresses.clear();
         ids = {}; logits = {};
     }
 };
@@ -1432,8 +1433,10 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             } else while (capacity < required)
                 capacity = std::min(maximum,capacity > maximum/2 ? maximum : capacity*2);
             graph.capacities.push_back(capacity);
-            for (const auto& layer : request->state_->layers)
+            for (const auto& layer : request->state_->layers) {
                 if (layer.qsa) growth += layer.qsa->graph_growth_bytes(capacity);
+                if (layer.gdn) growth += layer.gdn->request_cache_growth_bytes();
+            }
         }
         if (model.reserve_kv_workspace) model.reserve_kv_workspace(growth + (std::size_t(64) << 20));
         graph.ids = tb::empty_like(ids);
@@ -1445,10 +1448,19 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             graph.ple[row].resize(state.layers.size());
             for (std::size_t i = 0; i < state.layers.size(); ++i) {
                 auto& layer = state.layers[i];
+                if (layer.gdn) layer.gdn->initialize_request_cache();
                 if (layer.qsa) layer.qsa->prepare_graph(state.positions,graph.capacities[row]);
                 if (layer.ple) graph.ple[row][i] = layer.ple->graph_stage(1,ids.device());
             }
         }
+        graph.gdn_addresses.resize(model.blocks.size());
+        if(batch>1 && runtime_options::batch_attention_projections() && runtime_options::gdn_independent_batch())
+            for(std::size_t i=0;i<model.blocks.size();++i) {
+                std::vector<qwen4_exp::Gdn*> rows;
+                for(auto* request:requests)if(request->state_->layers[i].gdn)
+                    rows.push_back(request->state_->layers[i].gdn.get());
+                if(rows.size()==requests.size())graph.gdn_addresses[i]=qwen4_exp::Gdn::prepare_independent_batch(rows);
+            }
         // Cached MFE owns its graph pool and initializes it during preparation.
         // Dense fixtures need a pool owned by this decoder instead.
         if (!prepare_moe_graph_pool(model.execution->moe_expert_cache)) {
@@ -1511,7 +1523,10 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                 const auto projections=project_batch ? (block.gdn ? block.gdn->project_inputs(execution,mix[0])
                     : block.qsa->project_inputs(execution,mix[0])) : std::vector<tb::Tensor>{};
                 std::vector<tb::Tensor> attended;
-                for (int64_t row = 0; row < batch; ++row) {
+                Tensor attention;
+                if(project_batch && block.gdn && graph.gdn_addresses[i].defined())
+                    attention=requests[0]->state_->layers[i].gdn->forward_independent_batch(mix[0],projections,graph.gdn_addresses[i]);
+                if(!attention.defined())for (int64_t row = 0; row < batch; ++row) {
                     auto& layer = requests[row]->state_->layers[i];
                     auto branch = mix[0].narrow(0,row,1);
                     std::vector<tb::Tensor> projected;
@@ -1520,7 +1535,7 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                         : layer.qsa->forward_graph(execution,branch,graph.positions[row],graph.cache_positions[row],
                             std::move(projected),!project_batch));
                 }
-                auto attention=tb::cat(attended,0);
+                if(!attention.defined())attention=tb::cat(attended,0);
                 if(project_batch)attention=block.gdn ? block.gdn->project_output(execution,attention)
                     : block.qsa->project_output(execution,attention);
                 graph.window->mark(static_cast<int>(i),"attention_core_end");

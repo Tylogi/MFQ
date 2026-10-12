@@ -141,6 +141,11 @@ bool batch_attention_projections() {
     const auto* value=std::getenv("MFQ_BATCH_ATTENTION_PROJECTIONS");
     return !value || value[0]!='0';
 }
+bool gdn_independent_batch() {
+    const auto* value=std::getenv("MFQ_GDN_INDEPENDENT_BATCH");
+    return !value || value[0]!='0';
+}
+bool gdn_independent_batch_trace() { return exact_one("MFQ_TRACE_GDN_BATCH"); }
 bool batch_packed_prefill() {
     const auto* value=std::getenv("MFQ_BATCH_PACKED_PREFILL");
     return !value || value[0]!='0';

@@ -443,6 +443,83 @@ void gdn_core_case(bool inplace=false) {
     std::cout<<"GDN complete core inplace="<<inplace<<" ordinary="<<ordinary<<" changing_graph="<<changing
         <<" output/conv/FP32state bytes exact; reused counters reset; widths32/64/128, batch1/2, layouts2, strided Half/Float gates PASS\n";
 }
+void gdn_independent_state_case() {
+    int cases=0,replays=0;
+    const auto bits=[](const Tensor& actual,const Tensor& expected) {
+        auto a=actual.contiguous().cpu(),b=expected.contiguous().cpu();
+        if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+            std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size()))
+            throw std::runtime_error("independent GDN graph output/state bytes differ");
+    };
+    for(int width:{32,64,128})for(int batch:{2,4,6,8,16,32})for(bool float_gate:{false,true}) {
+        constexpr int nk=2,nv=6;
+        const int taps=width==64?7:4,channels=(2*nk+nv)*width;
+        const auto dtype=float_gate?tb::kFloat32:tb::kFloat16;
+        auto qkv=data({batch,1,channels},180,.4f);
+        auto gate=data({batch,1,nv*width},181,.5f).to(dtype);
+        auto alpha=data({batch,1,nv},182,.3f).to(dtype),beta=data({batch,1,nv},183,.2f).to(dtype);
+        auto weight=data({channels,1,taps},184,.19f).to(tb::kFloat32);
+        auto bias=data({nv},185,1.3f).to(tb::kFloat32),a=data({nv},186,.3f).to(tb::kFloat32);
+        auto norm=data({width},187,1.3f).to(tb::kFloat32);
+        std::vector<Tensor> conv,state,counters,expected_conv,expected_state,expected_counters;
+        for(int row=0;row<batch;++row) {
+            expected_conv.push_back(data({1,taps-1,channels},190+row,.3f).to(tb::kFloat32));
+            expected_state.push_back(data({1,nv,width,width},230+row,.17f).to(tb::kFloat32));
+            conv.push_back(expected_conv.back().clone());state.push_back(expected_state.back().clone());
+            counters.push_back(tb::zeros({1,nv,width+1},conv.back().options()));
+            expected_counters.push_back(tb::zeros_like(counters.back()));
+        }
+        auto host=tb::empty({batch,3},state[0].options().device(tb::kCPU).dtype(tb::kInt64));
+        auto addresses=host.to(state[0].device());
+        const auto set_order=[&](bool reversed) {
+            for(int row=0;row<batch;++row) {
+                const int owner=reversed?batch-1-row:row;
+                host.data_ptr<int64_t>()[3*row]=reinterpret_cast<int64_t>(conv[owner].data_ptr());
+                host.data_ptr<int64_t>()[3*row+1]=reinterpret_cast<int64_t>(state[owner].data_ptr());
+                host.data_ptr<int64_t>()[3*row+2]=reinterpret_cast<int64_t>(counters[owner].data_ptr());
+            }
+            addresses.copy_(host);
+        };
+        set_order(false);
+        Tensor output;
+        DecodeWindow window(mfq_current_cuda_stream());
+        const bool silu=float_gate,half=width!=64,transposed=width!=32;
+        window.capture([&] {
+            auto result=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv[0],state[0],weight,bias,a,norm,
+                nk,nv,width,1e-6,.013456789123,silu,half,transposed,counters[0],true,addresses);
+            if(result[2].data_ptr()!=state[0].data_ptr())throw std::runtime_error("independent GDN replaced row-zero state");
+            output=result[0];
+        },[&] {
+            for(int row=0;row<batch;++row) {
+                conv[row].copy_(expected_conv[row]);state[row].copy_(expected_state[row]);counters[row].fill_(0);
+            }
+        },[&]{output={};});
+        for(int step=0;step<3;++step) {
+            const bool reversed=step==1;set_order(reversed);
+            qkv.copy_(data(qkv.sizes().vec(),270+step,step==0?0.f:step==1?.7f:8.f));
+            gate.copy_(data(gate.sizes().vec(),274+step,.8f).to(dtype));
+            alpha.copy_(data(alpha.sizes().vec(),278+step,88.f).to(dtype));
+            beta.copy_(data(beta.sizes().vec(),282+step,88.f).to(dtype));
+            std::vector<Tensor> expected_output;
+            for(int row=0;row<batch;++row) {
+                const int owner=reversed?batch-1-row:row;
+                auto r=gdn_decode_core_cuda(qkv.narrow(0,row,1),gate.narrow(0,row,1),
+                    alpha.narrow(0,row,1),beta.narrow(0,row,1),expected_conv[owner],expected_state[owner],
+                    weight,bias,a,norm,nk,nv,width,1e-6,.013456789123,silu,half,transposed,expected_counters[owner],true);
+                expected_conv[owner].copy_(r[1]);expected_output.push_back(r[0]);
+            }
+            window.run();bits(output,tb::cat(expected_output,0));
+            bits(tb::cat(conv,0),tb::cat(expected_conv,0));bits(tb::cat(state,0),tb::cat(expected_state,0));
+            for(int row=0;row<batch;++row)bits(counters[row].select(-1,width),
+                expected_counters[row].select(-1,width));
+            ++replays;
+        }
+        ++cases;
+    }
+    std::cout<<"GDN independent state cases="<<cases<<" changing_graph="<<replays
+        <<" rows2/4/6/8/16/32, Half/Float gates, widths32/64/128, changing state addresses and zeroed counters EXACT PASS\n";
+}
+
 void gdn_batch_core_benchmark() {
     constexpr int nk=16,nv=48,width=128,channels=(2*nk+nv)*width,taps=4,replays=256;
     const auto stream=mfq_current_cuda_stream();
@@ -458,10 +535,22 @@ void gdn_batch_core_benchmark() {
         auto norm=data({width},160,1.3f).to(tb::kFloat32);
         auto workspace=tb::zeros({batch,nv,width+1},conv.options());
         const auto initial_state=state.clone(),initial_conv=conv.clone();
+        auto host=tb::empty({batch,3},state.options().device(tb::kCPU).dtype(tb::kInt64));
+        for(int row=0;row<batch;++row) {
+            host.data_ptr<int64_t>()[3*row]=reinterpret_cast<int64_t>(conv.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+1]=reinterpret_cast<int64_t>(state.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+2]=reinterpret_cast<int64_t>(workspace.narrow(0,row,1).data_ptr());
+        }
+        auto addresses=host.to(state.device());
         std::vector<Tensor> outputs;
-        const auto compute=[&](bool batched) {
+        const auto compute=[&](int mode) {
             outputs.clear();
-            if(batched) {
+            if(mode==2) {
+                auto r=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv.narrow(0,0,1),state.narrow(0,0,1),
+                    weight,bias,a,norm,nk,nv,width,1e-6,1e-6,false,true,true,
+                    workspace.narrow(0,0,1),true,addresses);
+                outputs.push_back(r[0]);
+            } else if(mode==1) {
                 auto r=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,a,norm,
                     nk,nv,width,1e-6,1e-6,false,true,true,workspace,true);
                 // Independent requests still own separate convolution rows.
@@ -476,18 +565,20 @@ void gdn_batch_core_benchmark() {
         };
         compute(false);auto expected=tb::cat(outputs,0).to(tb::kCPU).contiguous();
         const auto expected_state=state.to(tb::kCPU).contiguous(),expected_conv=conv.to(tb::kCPU).contiguous();
-        state.copy_(initial_state);conv.copy_(initial_conv);compute(true);
+        state.copy_(initial_state);conv.copy_(initial_conv);compute(1);
         const auto check=[&](const Tensor& actual,const Tensor& reference) {
             auto host=actual.to(tb::kCPU).contiguous();
             if(host.sizes()!=reference.sizes() || std::memcmp(host.data_ptr(),reference.data_ptr(),host.numel()*host.element_size()))
                 throw std::runtime_error("batched GDN core differs from independent recurrence");
         };
         check(outputs[0],expected);check(state,expected_state);check(conv,expected_conv);
-        const auto measure=[&](bool batched) {
+        state.copy_(initial_state);conv.copy_(initial_conv);compute(2);
+        check(outputs[0],expected);check(state,expected_state);check(conv,expected_conv);
+        const auto measure=[&](int mode) {
             state.copy_(initial_state);conv.copy_(initial_conv);
-            {GraphWarmupScope warmup(context,stream);compute(batched);}
+            {GraphWarmupScope warmup(context,stream);compute(mode);}
             MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));outputs.clear();
-            Graph graph;graph.capture_begin_shared();compute(batched);graph.capture_end();
+            Graph graph;graph.capture_begin_shared();compute(mode);graph.capture_end();
             for(int i=0;i<16;++i)graph.replay();
             Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(stream);
             for(int i=0;i<replays;++i)graph.replay();
@@ -496,9 +587,9 @@ void gdn_batch_core_benchmark() {
             MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,begin.get(),end.get()));
             return 1000.f*elapsed_ms/replays;
         };
-        const auto serial_us=measure(false),batch_us=measure(true);
+        const auto serial_us=measure(0),batch_us=measure(1),independent_us=measure(2);
         std::cout<<"GDN independent_batch rows="<<batch<<" serial_us="<<serial_us
-            <<" batch_us="<<batch_us<<" state/conv/output=EXACT\n";
+            <<" batch_us="<<batch_us<<" independent_us="<<independent_us<<" state/conv/output=EXACT\n";
     }
 }
 
@@ -787,6 +878,9 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-fixed-bench")gdn_core_benchmark(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-inplace-bench")gdn_core_benchmark(false,true);
     else if(argc==2 && std::string(argv[1])=="--gdn-batch-bench")gdn_batch_core_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--gdn-independent-check") {
+        for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
+    }
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-default-check")gdn_prefill_pipeline_case(true);
