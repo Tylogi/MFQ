@@ -3,7 +3,7 @@
 #include "mfq_mfe_bench.cpp"
 #undef main
 
-static void bind_compact_production(Call& call) {
+static void bind_compact_production(Call& call,int group_hint=0) {
     auto projections=call.layer.projections;
     for(auto& projection:projections)for(auto& pool:projection.pools) {
         if(pool.family!=MixedMoeFamily::Nvq)continue;
@@ -19,7 +19,7 @@ static void bind_compact_production(Call& call) {
     if(call.shared_gate.defined())for(int p=0;p<3;++p)shared[p]=&call.layer.shared[p].nint;
     call.fused=std::make_unique<MfeFfnRuntime>(
         std::array<MixedMoeRuntime*,3>{&projections[0],&projections[1],&projections[2]},
-        call.x,call.ids,call.weights,call.table,shared,call.shared_gate);
+        call.x,call.ids,call.weights,call.table,shared,call.shared_gate,0,0,nullptr,false,false,group_hint);
     call.fused->run();
 }
 
@@ -37,10 +37,10 @@ static void bank_map_option(bool enabled) {
 #endif
 }
 
-static std::unique_ptr<Call> bank_call(Layer& layer,bool shared,int tokens,bool enabled) {
+static std::unique_ptr<Call> bank_call(Layer& layer,bool shared,int tokens,bool enabled,int group_hint=0) {
     bank_map_option(enabled);
     auto call=std::make_unique<Call>(layer,shared,tokens);
-    bind_compact_production(*call);
+    bind_compact_production(*call,group_hint);
     return call;
 }
 
@@ -68,11 +68,12 @@ int main(int argc,char** argv)try {
     for(bool shared:{false,true}) {
         std::vector<std::unique_ptr<Call>> baseline,cached;
         for(auto& layer:layers) {
-            if(capacity)group_option("2");
+            if(capacity)group_option("");
             baseline.push_back(bank_call(*layer,shared,tokens,capacity));
-            if(capacity)group_option("8");
-            cached.push_back(bank_call(*layer,shared,tokens,true));
+            cached.push_back(bank_call(*layer,shared,tokens,true,capacity?8:0));
             const auto& batch=cached.back()->fused->batch();
+            if(capacity && (baseline.back()->fused->batch().token_group_capacity!=2 ||
+                batch.token_group_capacity!=8))throw std::runtime_error("group hint did not select actual capacities");
             std::vector<mfq::cuda::MfePackedProjection> views(batch.projection_counts[0]+
                 batch.projection_counts[1]+batch.projection_counts[2]);
             fb::check(cudaMemcpyAsync(views.data(),batch.projections,views.size()*sizeof(views[0]),

@@ -23,7 +23,7 @@ public:
         const std::array<const NintWeight*,3>& shared={},const mfq_tensor_backend::Tensor& shared_gate={},
         int output_columns=0,int intermediate_columns=0,
         const std::array<std::vector<int32_t>,3>* cohort_by_expert=nullptr,bool output_pairs=false,
-        bool combined_gate_up=false);
+        bool combined_gate_up=false,int token_group_capacity_hint=0);
     mfq::cuda::MfePackedProjection projection_view(int projection,mfq::cuda::MfePackedProjection view)const;
     void cpu_results(const mfq_tensor_backend::Tensor& kinds,const mfq_tensor_backend::Tensor& pairs,
         const uint32_t* ready=nullptr);

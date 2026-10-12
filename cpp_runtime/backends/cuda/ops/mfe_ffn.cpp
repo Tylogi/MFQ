@@ -66,7 +66,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights,const tb::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared,const tb::Tensor& shared_gate,
         int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs,
-        bool combined_gate_up)
+        bool combined_gate_up,int token_group_capacity_hint)
         :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights),combined_gate_up_(combined_gate_up) {
     if(!projections[0] || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
         input.scalar_type()!=tb::kFloat16 || !input.is_contiguous() || ids.dim()!=2 || ids.scalar_type()!=tb::kInt32 ||
@@ -240,12 +240,15 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     batch_.hidden=reinterpret_cast<__half*>(hidden_.data_ptr());batch_.hidden_quantized=quantized_.data_ptr<int8_t>();
     batch_.hidden_scales=scales_.data_ptr<float>();batch_.completion=reinterpret_cast<uint32_t*>(completion_.data_ptr<int32_t>());
     batch_.output=output_.data_ptr();
-    // Pure NINT small batches retain the measured faster routed kernels;
-    // mixed NVQ/NINT batches share decoded NINT chunks with their NVQ routes.
-    if(batch_.tokens>=2 && batch_.tokens<=32 && (batch_.nvq_format_mask || batch_.tokens>8)) {
+    // Pure NINT speculative batches retain the measured faster routed kernels;
+    // independent eight-row decode tiles may request expert reuse explicitly.
+    if(batch_.tokens>=2 && batch_.tokens<=32 &&
+       (batch_.nvq_format_mask || batch_.tokens>8 || token_group_capacity_hint>=4)) {
         // Small speculative batches favor two accumulators and more CTAs;
         // larger decode batches amortize decoding across up to eight rows.
         batch_.token_group_capacity=batch_.tokens<=8?2:8;
+        if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
+            batch_.token_group_capacity=token_group_capacity_hint;
         if(const auto* capacity=std::getenv("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
             if(std::strcmp(capacity,"2")==0)batch_.token_group_capacity=2;
             else if(std::strcmp(capacity,"4")==0)batch_.token_group_capacity=4;
@@ -382,10 +385,11 @@ void MfeFfnRuntime::trace_dispatch() {
     const bool gu_requested=mfq::cuda::mfe_ffn_e8_narrow_requested(batch_,false);
     const bool down_requested=mfq::cuda::mfe_ffn_e8_narrow_requested(batch_,true);
     const bool eligible=batch_.e8_narrow && batch_.default_math && group_dot;
-    std::fprintf(stderr,"mfe_compact_dispatch runtime=%p scope=first_prepare bounds=%d gu_requested=%d down_requested=%d mask=%u async=%d\n",
+    std::fprintf(stderr,"mfe_compact_dispatch runtime=%p scope=first_prepare bounds=%d gu_requested=%d down_requested=%d mask=%u async=%d tokens=%d token_capacity=%d\n",
         static_cast<void*>(this),int(batch_.compact_nvq),
         int(mfq::cuda::mfe_ffn_compact_requested(batch_,false)),
-        int(mfq::cuda::mfe_ffn_compact_requested(batch_,true)),batch_.nvq_format_mask,int(batch_.plan_ready!=nullptr));
+        int(mfq::cuda::mfe_ffn_compact_requested(batch_,true)),batch_.nvq_format_mask,int(batch_.plan_ready!=nullptr),
+        batch_.tokens,batch_.token_group_capacity);
     // Report the host launch decision after all asynchronous resources have
     // been bound. One record describes a runtime, not token/route execution
     // counts; graph replay does not call this method again.

@@ -159,3 +159,21 @@ The complete-model regression finishes 32 × 256 tokens without errors at
 tok/s and warm MTP measures 75.32 tok/s from streamed output; the earlier two
 warm MTP runs measure 73.65 and 73.94 tok/s. All continuations match the
 reference, including the separate serial oracles for 32 distinct prompts.
+
+Independent request decoding now gives eight-row FFN tiles an eight-row
+expert reuse hint. Previously the tile size selected the two-row speculative
+heuristic even when the original request batch contained 16 or 32 rows.
+The hint also enables grouping for pure NINT tiles. Speculative verification
+at 2–6 rows retains its existing dispatch, and an explicit
+`MFQ_MFE_TOKEN_GROUP_CAPACITY=2` overrides the hint for comparisons.
+
+An actual S2-L complete FFN comparison at eight rows measures 423.77 µs with
+two-row reuse and 350.61 µs with eight-row reuse, including shared experts.
+Changing graph inputs and routes match byte for byte in 36 cases. The full
+native grouping fixture passes 162 cases across NINT, NVQ, shared experts,
+repeated routes and distinct routes; 24 request-state cases also pass.
+The S2-L 32 × 256 regression completes all 8192 tokens at 90.92 tok/s total
+and 103.92 tok/s graph throughput, with actual eight-row dispatch confirmed
+by the runtime trace. Ordinary decode afterwards measures 50.27 tok/s and
+MTP 73.57 tok/s from streamed output. All references match, including 32
+distinct prompts. Whole-model measurements remain independent-run observations.

@@ -968,7 +968,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             }
             cell.fused=std::make_unique<MfeFfnRuntime>(std::array<MixedMoeRuntime*,3>{&cell.fused_projections[0],
                 &cell.fused_projections[1],&cell.fused_projections[2]},cell.input,cell.ids,cell.weights,
-                cache_->pipeline_sigmoid_table_,shared,cell.shared_gate,width_,ff_,&mapping,!shared_,combined_gate_up_);
+                cache_->pipeline_sigmoid_table_,shared,cell.shared_gate,width_,ff_,&mapping,!shared_,combined_gate_up_,
+                execution.continuous_batch_cache_serial && cell.tokens==8?8:0);
             cell.transfer_index=std::make_unique<Mapped>(std::size_t(experts_)*sizeof(int32_t));
             std::memset(cell.transfer_index->host,0xff,cell.transfer_index->bytes);
             cell.transfer_descriptors=std::make_unique<Mapped>(std::size_t(cell.entries)*3*sizeof(mfq::cuda::MfePackedProjection));

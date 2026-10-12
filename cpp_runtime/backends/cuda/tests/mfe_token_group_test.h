@@ -113,7 +113,9 @@ void verify_mfe_token_groups(const std::filesystem::path& root) {
             }
             auto shared_gate=shared?tb::sigmoid(x.mean(1)):tb::Tensor{};
             MfeFfnRuntime runtime({&projections[0],&projections[1],&projections[2]},x,selected,route_weights,
-                sigmoid,shared_views,shared_gate,2560,640);
+                sigmoid,shared_views,shared_gate,2560,640,nullptr,false,false,tokens==8?8:0);
+            if(tokens==8 && runtime.batch().token_group_capacity!=8)
+                throw std::runtime_error("independent decode hint did not prepare eight-row expert groups");
             std::array<double,2> elapsed{};
             std::array<std::array<double,2>,2> stages{};
             tb::Tensor expected,expected_hidden;
