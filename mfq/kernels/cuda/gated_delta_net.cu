@@ -374,8 +374,10 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     const char* warp_env = std::getenv("MFQ_GDN_WARP");
     bool use_warp = transposed_state || !(warp_env && warp_env[0] == '0');
     const char* columns_env = std::getenv("MFQ_GDN_PREFILL_COLUMNS");
-    const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? 4 : 0);
-    if (use_warp && !kda && D == 128 && T > 8 && (columns == 2 || columns == 4)) {
+    const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? (T==2?2:4) : 0);
+    const auto* short_option=std::getenv("MFQ_GDN_SHORT_COLUMNS");
+    const bool short_columns=!short_option || short_option[0]!='0';
+    if (use_warp && !kda && D == 128 && (T>8 || (T>1 && short_columns)) && (columns == 2 || columns == 4)) {
         const auto* decay_option=std::getenv("MFQ_GDN_PREFILL_PREPARED_DECAY");
         const bool prepared_decay=T>=128 && (!decay_option || std::atoi(decay_option)!=0);
         mfq_tensor_backend::Tensor decay;

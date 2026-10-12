@@ -123,3 +123,18 @@ measured 442.03 µs for independent launches and 289.92 µs for indirect batchin
 Output, convolution and recurrence are byte-exact. Tests exercise changing
 inputs and state address order at 2, 4, 6, 8, 16 and 32 rows with 4, 2 and 1
 column tiles. The model fixture also asserts that 32 rows enter the new core.
+
+Short GDN verification sequences use two columns at length 2 and four at
+lengths 3–8 for eligible D128 layers. `MFQ_GDN_SHORT_COLUMNS=0` restores the
+previous short-sequence dispatch; an explicit `MFQ_GDN_PREFILL_COLUMNS` value
+retains priority. Single-token decode and long prefill dispatch are unchanged.
+Same-process primitive measurements reduced length-2 recurrence from 7.17 to
+6.51 µs and length-6 recurrence from 14.68 to 13.15 µs. Validation covers 360
+exact multi-column cases, changing graph inputs, recurrence state, prefill to
+decode transitions and the full native window test.
+
+With this dispatch, two warm 1024-token S2-L MTP requests measured 73.95 and
+74.57 tok/s from streamed output; ordinary decode measured 50.19 tok/s.
+A subsequent 16 × 128 request batch completed all 2048 tokens at 93.18 tok/s
+total and 119.54 tok/s graph throughput. All outputs match the reference.
+These observations do not establish an isolated whole-model speedup.

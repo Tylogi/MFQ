@@ -9,11 +9,12 @@ public:
         set(columns);
     }
     static void set(int columns) {
-        const auto value=std::to_string(columns);
+        const auto value=columns<0?std::string():std::to_string(columns);
 #ifdef _WIN32
         if(_putenv_s("MFQ_GDN_PREFILL_COLUMNS",value.c_str()))throw std::runtime_error("GDN columns option");
 #else
-        if(setenv("MFQ_GDN_PREFILL_COLUMNS",value.c_str(),1))throw std::runtime_error("GDN columns option");
+        if(value.empty()?unsetenv("MFQ_GDN_PREFILL_COLUMNS"):setenv("MFQ_GDN_PREFILL_COLUMNS",value.c_str(),1))
+            throw std::runtime_error("GDN columns option");
 #endif
     }
     ~GdnColumnsScope() {
@@ -34,7 +35,7 @@ void gdn_prefill_columns_case() {
             throw std::runtime_error(std::string(label)+" differs");
     };
     int cases=0;
-    for(int batch:{1,2})for(int tokens:{1,8,31,1024})
+    for(int batch:{1,2})for(int tokens:{1,2,3,4,5,6,8,31,1024})
     for(bool transposed:{false,true})for(bool tiled:{false,true})for(bool initial:{false,true}) {
         constexpr int width=128,nk=2,nv=6;
         auto q=data({batch,nk,tokens,width},361,.04f).to(tb::kFloat32);
@@ -99,6 +100,47 @@ void gdn_prefill_columns_case() {
         equal(actual[1],tb::tensor(expected_state).reshape({1,Hv,D,D}),"GDN FP64 state oracle",2e-7f,5e-5f);
     }
     std::cout<<"GDN prefill multi-column exact cases="<<cases<<" plus FP64 output/state oracle PASS\n";
+}
+
+void gdn_short_columns_benchmark() {
+    GdnColumnsScope option(0);
+    constexpr int nk=16,nv=48,width=128,replays=256;
+    const auto stream=mfq_current_cuda_stream();auto context=default_context(mfq_current_cuda_device());
+    const auto bits=[](const Tensor& x,const Tensor& y) {
+        auto a=x.contiguous().cpu(),b=y.contiguous().cpu();
+        if(a.sizes()!=b.sizes() || std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size()))
+            throw std::runtime_error("short GDN column output/state differs");
+    };
+    for(int tokens:{2,3,4,5,6,8}) {
+        auto q=data({1,nk,tokens,width},381,.04f).to(tb::kFloat32),k=data({1,nk,tokens,width},382,.04f).to(tb::kFloat32);
+        auto v=data({1,nv,tokens,width},383,.19f).to(tb::kFloat32);
+        auto g=data({1,nv,tokens},384,.3f).to(tb::kFloat32)-.7f;
+        auto beta=data({1,nv,tokens},385,.3f).to(tb::kFloat32)+.5f;
+        auto state=data({1,nv,width,width},386,.03f).to(tb::kFloat32);
+        GdnColumnsScope::set(0);auto expected=gdn_transposed_cuda(q,k,v,g,beta,state);
+        for(int columns:{0,2,4,-1}) {
+            q.copy_(data(q.sizes().vec(),381,.04f).to(tb::kFloat32));
+            k.copy_(data(k.sizes().vec(),382,.04f).to(tb::kFloat32));
+            GdnColumnsScope::set(columns);std::vector<Tensor> result;
+            const auto compute=[&]{result=gdn_transposed_cuda(q,k,v,g,beta,state);};
+            compute();bits(result[0],expected[0]);bits(result[1],expected[1]);
+            {GraphWarmupScope warmup(context,stream);compute();}
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));result.clear();
+            Graph graph;graph.capture_begin_shared();compute();graph.capture_end();
+            for(int step=0;step<3;++step) {
+                q.copy_(data(q.sizes().vec(),390+step,.02f*(step+1)).to(tb::kFloat32));
+                k.copy_(data(k.sizes().vec(),394+step,.02f*(step+1)).to(tb::kFloat32));
+                GdnColumnsScope::set(0);auto reference=gdn_transposed_cuda(q,k,v,g,beta,state);
+                GdnColumnsScope::set(columns);graph.replay();bits(result[0],reference[0]);bits(result[1],reference[1]);
+            }
+            for(int i=0;i<16;++i)graph.replay();
+            Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(stream);
+            for(int i=0;i<replays;++i)graph.replay();end.record(stream);end.synchronize();
+            float elapsed_ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,begin.get(),end.get()));
+            std::cout<<"gdn_short_columns tokens="<<tokens<<" columns="<<columns
+                <<" microseconds="<<1000.f*elapsed_ms/replays<<" state/output/changing_graph=EXACT\n";
+        }
+    }
 }
 
 void gdn_prefill_columns_benchmark() {
