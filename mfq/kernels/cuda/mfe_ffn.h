@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstddef>
 #include <algorithm>
 
 namespace mfq::cuda {
@@ -27,8 +28,11 @@ struct MfePackedProjection {
     bool dense_narrow=false;
     // Checked fixed-width NINT group decoder; reuses existing descriptor padding.
     bool nint_whole=false;
+    // Sixteen JSC states, two bits per bank; occupies existing padding.
+    std::uint32_t nvq_bank_map=0;
     std::int64_t decode_record_bytes=0;
 };
+static_assert(sizeof(MfePackedProjection)==184 && offsetof(MfePackedProjection,decode_record_bytes)==176);
 struct MfeInputQuantization {
     std::int8_t* values=nullptr;
     float* scales=nullptr;

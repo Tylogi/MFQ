@@ -41,6 +41,8 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
             result.format==12 || result.format==15 || result.format==17;
         result.e8_dense_groups=w.dense_groups && !d4;
         result.d4_dense_groups=w.dense_groups && d4;
+        const auto* bank_map_option=std::getenv("MFQ_MFE_NVQ_BANK_MAP");
+        result.nvq_bank_map=bank_map_option && bank_map_option[0]=='0'?0:w.bank_map;
         result.nvec=(result.input_width+(d4?3:7))/(d4?4:8);result.nsign=(result.input_width+7)/8;
         const std::array<tb::Tensor,5> fields={w.indices_packed,w.aux_packed,w.sub_scale_packed,w.neuron_scale,w.codebook};
         for(int i=0;i<5;++i){result.fields[i]=fields[i].data_ptr();owners.push_back(fields[i]);}

@@ -3,6 +3,7 @@
 #include "nvq_e8_dense_group.cuh"
 #include "nvq_d4_dense_group.cuh"
 #include "nvq_dense_window32.cuh"
+#include "nvq_jsc_bank_map.cuh"
 // Host descriptors prove expert-local bit offsets and exact compact payload extents.
 namespace mfq::cuda {
 namespace {
@@ -14,6 +15,7 @@ __device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& 
     const auto* stream=static_cast<const uint8_t*>(d.fields[0]);
     const auto* anchors=static_cast<const float*>(d.fields[3]);
     const auto* codebook=static_cast<const int8_t*>(d.fields[4]);
+    const uint32_t bank_map=d.nvq_bank_map;
     const int row_bits=d.nvec*(bits+7)+d.groups*4;
     const int expert_bytes=d.output_rows*row_bits/8;
     stream+=int64_t(expert)*expert_bytes;
@@ -29,7 +31,12 @@ __device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& 
             const auto words=packed_nvq::load_dense_window32<4+3*(bits+7)>(stream,expert_bytes,bit);
             const packed_nvq::DenseE8Group<bits> packed{uint64_t(words.x)|(uint64_t(words.y)<<32)};
             const auto state=packed.state();
-            const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
+            const int8_t* bank;
+            if constexpr(Format==packed_nvq::kNvq2Jsc || Format==packed_nvq::kNvq2JscL ||
+                         Format==packed_nvq::kNvq2JscXL) {
+                bank=bank_map?packed_nvq::packed_jsc_codebook<Format>(codebook,bank_map,state)
+                             :packed_nvq::active_codebook<Format>(codebook,state);
+            }else bank=packed_nvq::active_codebook<Format>(codebook,state);
             const float weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
             int dot=0;
 #pragma unroll

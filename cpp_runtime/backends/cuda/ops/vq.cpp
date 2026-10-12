@@ -1731,6 +1731,14 @@ NvqWeight to_device_nvq(
         const int entries = c.format == 1 ? 2048 : (c.format == 8 ? 1024 : 256);
         w.codebook = cpu_i8_tensor(c.codebook, {entries, dims});
     }
+    // Retain the immutable map before upload. Decode and graph capture must
+    // never copy codebook metadata back from the device.
+    if ((w.kernel_format==5 || w.kernel_format==13 || w.kernel_format==14) &&
+        w.codebook.numel()>=64) {
+        const auto* metadata=w.codebook.data_ptr<int8_t>();
+        for(unsigned state=0;state<16;++state)
+            w.bank_map|=uint32_t(uint8_t(metadata[36+state])&3u)<<(2*state);
+    }
     if (cuda) {
         const auto target = mfq_tensor_backend::Device(
             mfq_tensor_backend::kCUDA, mfq_current_cuda_device());

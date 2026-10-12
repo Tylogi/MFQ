@@ -90,8 +90,10 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
         pool.family=MixedMoeFamily::Nvq;
         pool.nvq=to_cpu_nvq(unpack_nvq(encoded.payload,encoded.dtype));
         if(dense_groups_ && prepare_nvq_dense_groups(pool.nvq))++dense_materializations_;
-        if (static_cast<std::size_t>(index)<metadata_->pools.size())
+        if (static_cast<std::size_t>(index)<metadata_->pools.size()) {
             pool.nvq.codebook=metadata_->pools[index].nvq.codebook;
+            pool.nvq.bank_map=metadata_->pools[index].nvq.bank_map;
+        }
     }
     ++materializations_;
     return pool;

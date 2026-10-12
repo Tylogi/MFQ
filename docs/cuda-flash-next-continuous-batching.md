@@ -138,3 +138,24 @@ With this dispatch, two warm 1024-token S2-L MTP requests measured 73.95 and
 A subsequent 16 × 128 request batch completed all 2048 tokens at 93.18 tok/s
 total and 119.54 tok/s graph throughput. All outputs match the reference.
 These observations do not establish an isolated whole-model speedup.
+
+Compact E8 projections retain the immutable JSC state-to-bank map in four
+previously unused descriptor bytes. The map is prepared on the CPU while
+loading weights and follows each shared codebook into expert slices and
+transfer descriptors. This avoids one dependent metadata lookup per group;
+weights, codebook storage and descriptor size stay unchanged. Zero maps retain
+the previous lookup path, including valid single-bank codebooks.
+`MFQ_MFE_NVQ_BANK_MAP=0` selects the previous path when constructing FFN views.
+
+Real S2-L FFN graph checks cover 252 changing-input cases at 1, 2, 3, 4, 5, 6
+and 8 tokens, shared experts, repeated routes and invalid routes. Output and
+active hidden values match byte for byte; the fixture verifies the actual
+compact descriptors contain their codebook maps. Six native metadata fixtures
+also verify every state and expert slice, and eight NVQ request-batching cases
+pass. Same-process complete FFN timings show small gains or variations around
+zero, usually below 1%; these are not a whole-model speedup claim.
+The complete-model regression finishes 32 × 256 tokens without errors at
+101.64 tok/s graph throughput. Subsequent ordinary decode measures 50.00
+tok/s and warm MTP measures 75.32 tok/s from streamed output; the earlier two
+warm MTP runs measure 73.65 and 73.94 tok/s. All continuations match the
+reference, including the separate serial oracles for 32 distinct prompts.

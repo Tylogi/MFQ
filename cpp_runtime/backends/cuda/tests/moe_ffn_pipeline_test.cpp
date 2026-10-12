@@ -40,6 +40,28 @@ QuantLinear linear(const MixedMoePool& pool,int output,int width) {
     else {l.kind=QuantLinearKind::Nvq;l.nvq=pool.nvq;}return l;
 }
 
+void verify_nvq_bank_map(const std::filesystem::path& root) {
+    int cases=0;
+    for(const char* format:{"nvq2j","nvq2j-l","nvq2j-xl"})
+    for(const char* shape:{"-640-2560.mfq","-2560-640.mfq"}) {
+        auto value=source(root/(std::string(format)+shape));
+        for(const auto& pool:value->metadata()->pools) {
+            const auto& weight=pool.nvq;
+            const auto metadata=weight.codebook.cpu().contiguous();
+            const auto* bytes=metadata.data_ptr<int8_t>();
+            for(unsigned state=0;state<16;++state)
+                if(((weight.bank_map>>(2*state))&3u)!=uint8_t(bytes[36+state]))
+                    throw std::runtime_error("cached JSC map differs from immutable codebook");
+            ++cases;
+        }
+        // Expert slices reuse the shared immutable codebook and its map.
+        const auto expert=value->read_expert(0);
+        if(expert.nvq.bank_map!=value->metadata()->pools[0].nvq.bank_map)
+            throw std::runtime_error("expert slice lost cached JSC map");
+    }
+    std::cout<<"nvq_bank_map_cases="<<cases<<" states=16 expert_slices=6 PASS\n";
+}
+
 void verify_nvq_dense_default(const std::filesystem::path& root) {
     struct Environment {
         const char* names[3]={"MFQ_MOE_NVQ_DENSE","MFQ_MOE_PRELOAD_ALL","MFQ_MOE_ASSERT_RESIDENT"};
@@ -1847,6 +1869,7 @@ int main(int argc,char** argv)try {
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
+        if(std::string(argv[2])=="--nvq-bank-map-check") {verify_nvq_bank_map(root);return 0;}
         if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
         if(std::string(argv[2])=="--prefill-quota-recovery-check") {verify_prefill_quota_recovery(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}

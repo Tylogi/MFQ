@@ -26,6 +26,7 @@ struct NvqWeight {
     mfq_tensor_backend::Tensor decode_records;
     // One byte-preserving group stream replaces indices/aux/states.
     bool dense_groups = false;
+    uint32_t bank_map = 0;
     int64_t format = 0;
     int64_t kernel_format = 0;
     int64_t sign_mode = 0;

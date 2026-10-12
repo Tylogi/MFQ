@@ -442,6 +442,11 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-cuda-real-mfe-bench)
     target_compile_definitions(mfq-cuda-real-mfe-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-real-mfe-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-mfe-nvq-bank-map-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_nvq_bank_map_probe.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-mfe-nvq-bank-map-probe)
+    target_compile_definitions(mfq-cuda-mfe-nvq-bank-map-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-mfe-nvq-bank-map-probe PRIVATE mfq-cuda-runtime)
     # Generated device snapshot keeps occupancy experiments out of the runtime.
     # Refresh with bench/cuda_format_comparison/generate_mfe_gu_register_probe.py.
     if(EXISTS "${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_gu_register_probe_body.inc")
