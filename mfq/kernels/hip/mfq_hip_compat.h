@@ -54,6 +54,11 @@
 #if !defined(MFQ_HIP_COMPAT_DP4A)
 #define MFQ_HIP_COMPAT_DP4A
 __device__ __forceinline__ int __dp4a(int a, int b, int c) {
+    // Scalar byte dot product; correct but compute-limited. The hardware
+    // v_dot4_i32_i8 exists on gfx942 but its inline-asm encoding differs
+    // from the documented form (produced wrong results). The OCKL
+    // __ockl_sdot4 intrinsic requires a header chain not on our path.
+    // Closing the ~15% decode gap to BF16 needs the hardware instruction.
     const signed char* av = reinterpret_cast<const signed char*>(&a);
     const signed char* bv = reinterpret_cast<const signed char*>(&b);
     return c + av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2] + av[3] * bv[3];
@@ -85,6 +90,9 @@ __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) 
 #define __float2bfloat16_rn(value) __float2bfloat16(value)
 #endif
 
+
+// OCKL sdot4 takes the packed-byte vectors as raw 32-bit registers.
+__device__ __attribute__((const)) int __ockl_sdot4_pv(int, int, int, bool);
 
 // CUDA SIMD intrinsics absent from HIP's device functions.
 #if !defined(MFQ_HIP_COMPAT_SIMD)
