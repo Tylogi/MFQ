@@ -48,6 +48,35 @@ After both resolutions the HIP operator suite passes 7/7 (repeated
 runs): context, activation, native tensor (single device), nint rows,
 nint q8, packed prefill, and paged KV.
 
+## Torch JIT extension
+
+`mfq.kernels.hip._ext` builds the unified torch extension (`mfq_hip`, 139
+ops) from the hipify-translated kernels; `mfq.kernels.cuda._ext` delegates
+to it on ROCm hosts. Two operational findings:
+
+- **Torch's hipify regenerates `/hip/` headers from `/cuda/` siblings.**
+  When both trees are visible to `torch.utils.cpp_extension` on a ROCm
+  host, its hipify pass treats every walked `hip/<name>.cuh` as the output
+  of `cuda/<name>.cuh` and rewrites it from the CUDA original, silently
+  discarding hand fixes. Builds that must preserve fixed HIP headers have
+  to keep the CUDA kernel sources out of the hipify include walk (the
+  validation builds stage a copy without `kernels/cuda/*.{cu,cuh,h,cpp}`).
+- **The imported binding was stale.** The WIP-era `mfq_hip.cpp` predated
+  the current CUDA binding's argument lists (for example
+  `fp8_128_sq_dequant_cuda` had six integer parameters instead of the
+  current set). It is regenerated from the current `mfq_cuda.cpp` via
+  torch hipify.
+
+With the JIT extension in place, the suite stands at 3154 passed / 52
+failed / 284 skipped. Of the 52: seven are the sparse-MMA stubs failing
+by design; nine are the pre-existing upstream failures that also fail on
+macOS; seventeen (fp8 decode/dispatch, two NINT group tests, three
+format-completion cases) fail through code paths and fixtures that are
+byte-identical to CUDA and need a CUDA-host run to adjudicate; the rest
+are source-contract and harness tests that reference the CUDA sources
+removed from the validation staging copy or make NVIDIA-specific
+assumptions.
+
 ## Not yet exercised
 
 - MoE grouped-GEMM kernels at runtime (build only).
