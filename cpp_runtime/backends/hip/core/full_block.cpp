@@ -503,7 +503,15 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         attn_scale, false);
                                 }
                             } else {
-                                const bool mma_attention_enabled = execution.config.mma_attention;
+                                // The CDNA MFMA attention kernel crashes on
+                                // multi-tile launches (T > 32); allow routing to
+                                // the flash256 FMA fallback via env var.
+                                static const bool disable_mma_attention = [] {
+                                    const char* v = std::getenv("MFQ_DISABLE_MMA_ATTENTION");
+                                    return v != nullptr && std::atoi(v) != 0;
+                                }();
+                                const bool mma_attention_enabled =
+                                    execution.config.mma_attention && !disable_mma_attention;
                                 if (!sliding && T % 256 == 0 && hd == 512 && nh == 8 * nkh &&
                                     mma_attention_enabled) {
                                     a = mfq_attention_mma512_cuda(
