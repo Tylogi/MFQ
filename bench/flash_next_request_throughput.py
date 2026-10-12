@@ -141,14 +141,22 @@ async def main():
                         failed["status"] = await client.status()
                     except Exception as status_error:
                         failed["status_error"] = str(status_error)
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=1)
+                        except asyncio.TimeoutError:
+                            pass
+                    failed["runtime_exit_code"] = process.returncode
                     tag = case.get("tag", f"b{requests}-failed")
                     (RESULTS / f"{tag}.json").write_text(json.dumps(failed,ensure_ascii=False,indent=2),encoding="utf-8")
-                    print(json.dumps({key: failed[key] for key in ("case","error","seconds")}), flush=True)
+                    print(json.dumps({key: failed[key] for key in ("case","error","seconds","runtime_exit_code")}), flush=True)
+                    if process.returncode is not None:
+                        break
         finally:
             await client.aclose()
             if process.returncode is None:
                 process.terminate()
             await process.wait()
+            print(json.dumps({"runtime_exit_code": process.returncode}), flush=True)
 
 
 if __name__ == "__main__":

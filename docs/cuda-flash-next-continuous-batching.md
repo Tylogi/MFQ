@@ -177,3 +177,68 @@ and 103.92 tok/s graph throughput, with actual eight-row dispatch confirmed
 by the runtime trace. Ordinary decode afterwards measures 50.27 tok/s and
 MTP 73.57 tok/s from streamed output. All references match, including 32
 distinct prompts. Whole-model measurements remain independent-run observations.
+
+The same compact E8 bank map now serves the grouped token decoder, including
+short MTP verification and eight-row independent FFN tiles. Real-weight checks
+cover 252 changing-input cases at 1–8 rows and another 36 capacity-eight cases;
+outputs and active hidden values match byte for byte. Complete FFN timings
+remain close to the original path: length three with shared experts measures
+205.16 versus 204.60 µs, and capacity eight with shared experts 349.79 versus
+349.84 µs. These small results do not establish a whole-model gain.
+
+A scope-three profile of 32 × 24 S2-L generation measured 315.79 ms of GPU
+time per replay. Attention-end to FFN-pre accounted for 72.00 ms; the previous
+FFN's transfer-end to next attention-start accounted for 69.08 ms. These
+intervals include GR and boundary work and are not pure kernel timings.
+Resident expert calculation accounted for 54.70 ms and attention cores
+39.28 ms. All 768 generated tokens matched the reference. Profiling adds
+events, and this run also enabled host serving traces; its throughput is not
+the production benchmark. `bench/analyze_decode_window_profile.py` selects
+the largest task-count window by default and keeps tile boundaries separate.
+
+The GR two-stage dispatcher previously accepted at most eight rows. Larger
+independent request batches selected the separate composition; at exactly
+32 rows that composition also selected the GR prefill projection kernel.
+Continuous decode now accepts 9–32 rows and shares each aligned Up decode
+between two rows. Ordinary single-row decode, short verification and prefill
+dispatch retain their existing selection. `MFQ_GR_CONTINUOUS_TWO_STAGE=0`
+restores the previous continuous dispatcher; `MFQ_TRACE_GR_DISPATCH=1`
+reports the selected row counts.
+
+The real-weight GR probe rotates twelve attention/FFN banks from six S2-L
+layers. Half/Float inputs, pre/after composition and three changing graph
+inputs at 9/16/17/32 rows pass 48 cases and 1728 tensor comparisons. At 32
+rows the correctness reference explicitly disables the prefill projection,
+preserving its ordered FP32 alternative. The timing baseline retains the
+old prefill selection. FP32 GR at 16 rows measures 315.18 → 244.05 µs before
+attention and 316.92 → 244.88 µs after attention. At 32 rows it measures
+1462.19 → 449.37 and 1463.42 → 450.50 µs respectively. These complete GR
+measurements are not whole-model throughput claims.
+
+Reproduce with `run_gr_batch_probe.py check` and `run_gr_batch_probe.py bench`
+after building `mfq-cuda-gr-batch-probe`. Its paired graphs share one prepared
+pool across fixture cases, following the native projection fixture workflow.
+An earlier variant which retired separate fixture pools between cases crashed
+during the reference graph's replay; memcheck reported no GPU errors but did
+not finish successfully. That failed run is not accepted as validation.
+The runtime allocator has not been changed by this optimization; full-model
+graph transitions and KV growth are covered by the following regression.
+
+After three MTP requests, the S2-L 32 × 256 run completes all 8192 tokens at
+129.40 tok/s total and 156.56 tok/s graph throughput. The previous uploaded
+checkpoint measured 90.92 and 103.92 respectively; these are independent-run
+observations. Runtime tracing confirms `gr_two_stage rows=32 continuous=1`,
+and the batch graph decreases from 11590 to 10918 nodes. A subsequent
+16 × 128 run completes all 2048 tokens at 129.83 tok/s graph throughput.
+Ordinary 1024-token generation after these batches measures 50.19 tok/s,
+and MTP 73.61 tok/s, from streamed output. All references match, including
+32 distinct prompts checked against their individual serial responses.
+That heterogeneous batch measures 140.61 tok/s graph throughput. The earlier
+two warm 512-token MTP requests measure 70.46 and 73.14 tok/s.
+
+The 32-row test crosses its initial KV capacity without changing the 22.5 GiB
+process limit or 10.66 GiB resident expert budget. It reports no errors;
+request KV is released afterwards and free VRAM is 6.54 GB. Native NVQ
+request-state cases at 2/4/6/8/9/16/17/32 rows pass, along with the 162-case
+MFE grouping suite, full native FP32 projection/GR suite and nine batching
+source checks. The production graph allocator remains unchanged.

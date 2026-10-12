@@ -5,6 +5,7 @@
 #include "mfe_ffn_token_groups.h"
 #include "mfe_ffn_compact.h"
 #include "nvq_dense_window32.cuh"
+#include "nvq_jsc_bank_map.cuh"
 
 namespace mfq::cuda {
 namespace {
@@ -84,6 +85,7 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     const int row_bits=(d4?d.nsign*(2*bits+7):d.nvec*(bits+7))+d.groups*4;
     const int expert_bytes=narrow?d.output_rows*row_bits/8:0;
     const auto* local_stream=stream+int64_t(local)*expert_bytes;
+    const uint32_t bank_map=d.nvq_bank_map;
     const float anchor=first+row<d.output_rows?anchors[neuron]:0.f;
     float partial[Capacity]{};
     for(int group=lane;group<d.groups;group+=Lanes) {
@@ -108,7 +110,12 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
                         (first+row)*row_bits+group*(4+3*(bits+7)));
                     packed={uint64_t(words.x)|(uint64_t(words.y)<<32)};
                 }else packed=packed_nvq::load_dense_e8_group<bits>(stream,d.sizes[0],neuron,group,d.nvec,d.groups);
-                const auto state=packed.state();const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
+                const auto state=packed.state();const int8_t* bank;
+                if constexpr(Format==packed_nvq::kNvq2Jsc || Format==packed_nvq::kNvq2JscL ||
+                             Format==packed_nvq::kNvq2JscXL) {
+                    bank=bank_map?packed_nvq::packed_jsc_codebook<Format>(codebook,bank_map,state)
+                                 :packed_nvq::active_codebook<Format>(codebook,state);
+                }else bank=packed_nvq::active_codebook<Format>(codebook,state);
                 weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
                 weight[0]=packed_nvq::decode_dense_e8_vector<0>(packed,bank,d.sign_mode);
                 weight[1]=packed_nvq::decode_dense_e8_vector<1>(packed,bank,d.sign_mode);

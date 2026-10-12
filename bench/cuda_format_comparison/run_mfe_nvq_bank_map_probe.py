@@ -8,7 +8,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
-parser.add_argument("mode", choices=("check", "bench", "capacity-check", "capacity-bench"))
+parser.add_argument("mode", choices=("check", "bench", "capacity-check", "capacity-bench",
+                                    "capacity4-check", "capacity4-bench", "capacity-sweep",
+                                    "grouped-check", "grouped-bench"))
 parser.add_argument("--model", type=Path)
 args = parser.parse_args()
 mode = args.mode

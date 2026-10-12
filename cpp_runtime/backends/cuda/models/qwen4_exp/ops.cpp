@@ -26,6 +26,7 @@
 #include "mfq_native_matmul_rows.h"
 #endif
 #include <cstdlib>
+#include <cstdio>
 #include <chrono>
 
 namespace mfq::cuda::qwen4_exp {
@@ -78,7 +79,7 @@ struct Gr {
             !execution.config.gr_native_projection_input || !down.weight || !up.weight || !injection.weight ||
             !down.weight->is_nint() || !up.weight->is_nint() || streams<1 || streams>4 ||
             x.dim()<1 || x.size(-1)!=hidden*streams || x.numel()<hidden*streams ||
-            x.numel()/(hidden*streams)>8 || !x.is_cuda() || !x.is_contiguous() ||
+            x.numel()/(hidden*streams)>32 || !x.is_cuda() || !x.is_contiguous() ||
             (x.scalar_type()!=tb::kFloat16 && x.scalar_type()!=tb::kFloat32) ||
             !norm.is_contiguous() || norm.scalar_type()!=tb::kFloat32)return false;
         if(!injection.weight->is_nint() && !(execution.config.gr_two_stage_dense_injection &&
@@ -86,9 +87,23 @@ struct Gr {
             injection.weight->dense.scalar_type()==tb::kBFloat16))return false;
         const auto& w=up.weight->nint;
         const auto rows=x.numel()/(hidden*streams);
+        const auto* continuous=std::getenv("MFQ_GR_CONTINUOUS_TWO_STAGE");
+        if(rows>8 && (!execution.continuous_batch_cache_serial || (continuous && continuous[0]=='0')))
+            return false;
         const auto* batch=std::getenv("MFQ_GR_BATCH_TWO_STAGE");
         if(rows>1 && batch && batch[0]=='0')return false;
-        return w.ng==1 || ((w.out+3)/4)*rows>=nint_float_projection_resident_blocks(x.get_device());
+        const bool selected=w.ng==1 || ((w.out+3)/4)*rows>=nint_float_projection_resident_blocks(x.get_device());
+        const auto* trace=std::getenv("MFQ_TRACE_GR_DISPATCH");
+        if(selected && trace && trace[0]!='0') {
+            static thread_local uint64_t seen[2]{};
+            const int kind=x.scalar_type()==tb::kFloat16?0:1;
+            if(!(seen[kind]&(uint64_t(1)<<rows))) {
+                seen[kind]|=uint64_t(1)<<rows;
+                std::fprintf(stderr,"gr_two_stage rows=%lld half=%d continuous=%d\n",
+                    static_cast<long long>(rows),kind==0,int(execution.continuous_batch_cache_serial));
+            }
+        }
+        return selected;
     }
     std::vector<Tensor> fused(const Tensor& branch,const Tensor& residual,const Tensor& prior,bool after,
         const GatedResidualMarker& marker={})const {

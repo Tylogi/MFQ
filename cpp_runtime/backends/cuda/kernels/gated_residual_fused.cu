@@ -745,7 +745,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
                     d,u,i,normalized.data_ptr(),parts.data_ptr<float>(),mixed.data_ptr(),next_injection.data_ptr(),hidden,int(streams),half,ds,is,dense_projection.defined()?dense_projection.data_ptr<float>():nullptr,rows);
             };
             const auto* shared_up=std::getenv("MFQ_GR_BATCH_SHARED_UP");
-            if constexpr(fixed>0)if(rows>=2 && rows<=8 && (!shared_up ||
+            if constexpr(fixed>0)if(rows>=2 && rows<=32 && (!shared_up ||
                 (shared_up[0]!='0' && (shared_up[0]!='2' || rows%2==0)))) {
                 run(std::integral_constant<int,2>{});return;
             }
