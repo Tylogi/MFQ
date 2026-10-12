@@ -2210,7 +2210,7 @@ __global__ void __launch_bounds__(256) nvq_gemm_f16_gs24_kernel(
                             const int row = e >> 4;
                             const int column = e & 15;
                             float value = accumulators[accumulator][element];
-#pragma unroll
+#pragma unroll 4
                             for (int kk = 0; kk < kWmmaK; ++kk) {
                                 value += __half2float(activation_base[row * kStrideK + kk]) *
                                          __half2float(weight_base[column * kStrideK + kk]);
@@ -2719,7 +2719,7 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
                             const int row = e >> 4;
                             const int column = e & 15;
                             float value = accumulators[accumulator][element];
-#pragma unroll
+#pragma unroll 4
                             for (int kk = 0; kk < kWmmaK; ++kk) {
                                 value += __half2float(activation_base[row * kStrideK + kk]) *
                                          __half2float(weight_base[column * kStrideK + kk]);
@@ -5107,7 +5107,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                             const int row = e >> 4;
                             const int column = e & 15;
                             float value = accumulators[fragment][element];
-#pragma unroll
+#pragma unroll 4
                             for (int kk = 0; kk < 16; ++kk) {
                                 value += __half2float(activation_base[row * kStrideK + kk]) *
                                          __half2float(weight_base[column * kStrideK + kk]);
@@ -5562,7 +5562,7 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
                         const int row = e >> 4;
                         const int column = e & 15;
                         float value = accumulator[element];
-#pragma unroll
+#pragma unroll 4
                         for (int kk = 0; kk < 16; ++kk) {
                             value += __half2float(activation_base[row * kStrideK + kk]) *
                                      __half2float(weight_base[column * kStrideK + kk]);

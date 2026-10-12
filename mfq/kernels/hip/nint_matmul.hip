@@ -561,7 +561,7 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                                 const int col = e - row * 16;
                                 float value =
                                     accumulators[0][accumulator][element];
-#pragma unroll
+#pragma unroll 4
                                 for (int kk = 0; kk < 16; ++kk) {
                                     value += __half2float(
                                         activation_base[row * kNintPrefillStrideK + kk]) *
@@ -608,7 +608,7 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
                                 const int col = e - row * 16;
                                 float value =
                                     accumulators[1][accumulator][element];
-#pragma unroll
+#pragma unroll 4
                                 for (int kk = 0; kk < 16; ++kk) {
                                     value += __half2float(
                                         activation_base[row * kNintPrefillStrideK + kk]) *

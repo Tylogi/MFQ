@@ -115,6 +115,13 @@ target_link_libraries(mfq-hip-native-kernels
     PUBLIC mfq-hip-core
     PRIVATE mfq-core mfq-ggml-internal-headers
 )
+# nvq_matmul's heavily templated tile kernels take ~25 minutes at -O3 for
+# gfx942 with negligible runtime difference on the memory-bound decode path;
+# compile it at -O2 (the later flag wins over the config -O3).
+set_source_files_properties(
+    ${MFQ_HIP_KERNEL_ROOT}/nvq_matmul.hip
+    PROPERTIES COMPILE_OPTIONS "-O2"
+)
 set_target_properties(mfq-hip-native-kernels PROPERTIES
     HIP_STANDARD 20
     HIP_STANDARD_REQUIRED ON
