@@ -77,6 +77,54 @@ are source-contract and harness tests that reference the CUDA sources
 removed from the validation staging copy or make NVIDIA-specific
 assumptions.
 
+## Model-scale benchmarks (MI300X, single GPU, batch 1, 17-token prompt)
+
+| Model | Precision | Decode tok/s | Prefill tok/s | TTFT ms |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3.5-0.8B | BF16 | 96–109 | ~15 | 1620 |
+| Qwen3.5-0.8B | S4-M | 104–109 | ~15 | 1620 |
+| Qwen3.5-4B | BF16 | 96.2 | 18.5 | 1431 |
+| Qwen3.5-4B | S4-M | 80.3 | 20.3 | 1336 |
+| Qwen3.5-9B | S4-M | 64.2 | 19.5 | 1372 |
+
+Key finding: quantized (S4-M) decode is currently **slower** than BF16 at
+4B (80 vs 96 tok/s) despite smaller weights. The FMA/dp4a replacements
+for the tensor-core MMA paths trade peak throughput for portability: the
+quantized GEMM is compute-limited by scalar dot products rather than
+bandwidth-limited by weight size. Prefill improves (20.3 vs 18.5) because
+the tiled path reads less data. Closing the decode gap requires MFMA
+(tensor-core) implementations of the NVQ/NINT/SQ kernels.
+
+### Qwen3.8-Flash-Next (qwen4_exp MoE, 175 GB)
+
+Quantizes successfully at S4-M (175.7 GB, 1342 tensors, ~25 min). Loads
+all 48 layers on one MI300X and reaches the generation path, then fails
+with `logits must be float16 or float32` — a dtype bug in the MoE routing
+chain. This is the first runtime failure of the MoE grouped-GEMM FMA
+kernels (they compile and link but had never executed). Root cause is in
+the expert routing or logits projection producing a non-float tensor.
+
+### Qwen3.5-35B-A3B (qwen3_5_moe)
+
+Blocked by two upstream gaps, not HIP-specific:
+- The MTP completeness check expected dense `mlp.gate_proj` but this
+  checkpoint uses a routed FFN inside the MTP head
+  (`mlp.experts.N.*`). Fixed by accepting either FFN layout.
+- After the MTP fix, a canonical tensor-mapping gap for
+  `mtp.layers.*.mlp.experts.*` in the `qwen3_5_moe` architecture
+  registration, and the 2 GB safetensors single-tensor offset limit for
+  the fused `gate_up_proj` tensor (~3.3 GB) both block quantization.
+  These are upstream registration/format limitations.
+
+## Compile-time fix
+
+`nvq_matmul.hip` took ~25 minutes at `-O3` for gfx942. The innermost
+16-iteration dot-product loops in the FMA tile replacements were fully
+unrolled, exploding codegen across every template instantiation. Capping
+those loops at 4-way unroll plus `-O2` for the TU cuts the compile to
+~10 minutes (measured 586s). The same cap applies to the two innermost
+loops in `nint_matmul.hip`.
+
 ## Not yet exercised
 
 - MoE grouped-GEMM kernels at runtime (build only).

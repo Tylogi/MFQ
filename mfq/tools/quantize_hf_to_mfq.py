@@ -1652,11 +1652,27 @@ def _mtp_inventory_status(
                 prefix + "self_attn.o_proj.weight",
                 prefix + "self_attn.q_norm.weight",
                 prefix + "self_attn.k_norm.weight",
-                prefix + "mlp.gate_proj.weight",
-                prefix + "mlp.up_proj.weight",
-                prefix + "mlp.down_proj.weight",
             }
         )
+        # The FFN inside the MTP head is dense (gate/up/down_proj) or routed
+        # (gate.weight + experts.N.*); accept either layout.
+        if (prefix + "mlp.gate_proj.weight") in names:
+            required.update(
+                {
+                    prefix + "mlp.gate_proj.weight",
+                    prefix + "mlp.up_proj.weight",
+                    prefix + "mlp.down_proj.weight",
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "mlp.gate.weight",
+                    prefix + "mlp.experts.0.gate_proj.weight",
+                    prefix + "mlp.experts.0.up_proj.weight",
+                    prefix + "mlp.experts.0.down_proj.weight",
+                }
+            )
     missing = sorted(required - names)
     if missing:
         raise ValueError("incomplete Qwen MTP head; missing tensors: " + ", ".join(missing[:8]))
