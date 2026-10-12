@@ -70,6 +70,7 @@ set(MFQ_HIP_KERNEL_SOURCES
     ${MFQ_HIP_KERNEL_ROOT}/acc.hip
     ${MFQ_HIP_KERNEL_ROOT}/activation.hip
     ${MFQ_HIP_KERNEL_ROOT}/attention.hip
+    ${MFQ_HIP_KERNEL_ROOT}/attention_mma.hip
     ${MFQ_HIP_KERNEL_ROOT}/embedding.hip
     ${MFQ_HIP_KERNEL_ROOT}/selected_attention.hip
     ${MFQ_HIP_KERNEL_ROOT}/qwen4_exp.hip

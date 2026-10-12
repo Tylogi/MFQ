@@ -116,6 +116,26 @@ Blocked by two upstream gaps, not HIP-specific:
   the fused `gate_up_proj` tensor (~3.3 GB) both block quantization.
   These are upstream registration/format limitations.
 
+## Prefill fix: real attention MMA kernel
+
+The earlier prefill numbers (13-20 tok/s) were an artifact of
+`mfq_attention_mma256_cuda` being a throwing stub: any prompt long
+enough to trigger the tiled attention path failed silently, and the
+"prefill" time was mostly model loading. The kernel's hipified source
+(`attention_mma.hip` -> `mfq_fattn_mma_f16.cuh`) already contains
+ggml's native CDNA MFMA/WMMA paths — it was stubbed only because the
+ggml-hip headers had unresolved identifiers at import time. Fixing the
+remaining SIMD shims (`__vsubss4`, `__vcmpne4`, `__trap`) and the
+`CUBLAS_TF32_TENSOR_OP_MATH` enum, then removing the stub, gives:
+
+- Short prompts (~12 tokens): **391 tok/s prefill** (was 13 with the
+  stub), 83 tok/s decode, 525ms TTFT.
+- Longer prompts (~35+ tokens): `mfq_attention_mma256 launch failed:
+  unspecified launch failure` — the CDNA MFMA tile config for
+  multi-tile attention exceeds a launch limit. This is the next debug
+  target; the short-prompt path proves the kernel logic and the AMD
+  MFMA availability detection are correct.
+
 ## Compile-time fix
 
 `nvq_matmul.hip` took ~25 minutes at `-O3` for gfx942. The innermost

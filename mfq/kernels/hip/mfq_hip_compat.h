@@ -85,4 +85,33 @@ __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) 
 #define __float2bfloat16_rn(value) __float2bfloat16(value)
 #endif
 
+
+// CUDA SIMD intrinsics absent from HIP's device functions.
+#if !defined(MFQ_HIP_COMPAT_SIMD)
+#define MFQ_HIP_COMPAT_SIMD
+__device__ __forceinline__ unsigned int __vsubss4(unsigned int a, unsigned int b) {
+    const unsigned char* av = reinterpret_cast<const unsigned char*>(&a);
+    const unsigned char* bv = reinterpret_cast<const unsigned char*>(&b);
+    unsigned char out[4];
+    for (int i = 0; i < 4; ++i) {
+        int d = int(av[i]) - int(bv[i]);
+        out[i] = static_cast<unsigned char>(d < 0 ? 0 : (d > 255 ? 255 : d));
+    }
+    unsigned int result;
+    __builtin_memcpy(&result, out, sizeof(result));
+    return result;
+}
+__device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    const unsigned char* av = reinterpret_cast<const unsigned char*>(&a);
+    const unsigned char* bv = reinterpret_cast<const unsigned char*>(&b);
+    unsigned int result = 0;
+    for (int i = 0; i < 4; ++i) {
+        result |= (av[i] != bv[i]) ? (0xFFu << (8 * i)) : 0;
+    }
+    return result;
+}
+__device__ __forceinline__ void __trap() {
+    __builtin_trap();
+}
+#endif
 #endif // __HIP_PLATFORM_AMD__

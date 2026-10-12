@@ -18,56 +18,6 @@ mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda( mfq_tensor_backend:
     return {};
 }
 
-mfq_tensor_backend::Tensor mfq_attention_mma128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale) {
-    throw std::runtime_error("mfq_attention_mma128_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale) {
-    throw std::runtime_error("mfq_attention_mma256_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma256_decode_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta) {
-    throw std::runtime_error("mfq_attention_mma256_decode_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma256_swa_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, int64_t window) {
-    throw std::runtime_error("mfq_attention_mma256_swa_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma256_swa_decode_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta) {
-    throw std::runtime_error("mfq_attention_mma256_swa_decode_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma512_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale) {
-    throw std::runtime_error("mfq_attention_mma512_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor mfq_attention_mma512_decode_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta) {
-    throw std::runtime_error("mfq_attention_mma512_decode_cuda is not yet available on HIP");
-    return {};
-}
-
-std::vector<mfq_tensor_backend::Tensor> minicpm_flash128_kv_cast_cuda( mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v) {
-    throw std::runtime_error("minicpm_flash128_kv_cast_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor minicpm_flash128_output_cast_cuda( mfq_tensor_backend::Tensor output) {
-    throw std::runtime_error("minicpm_flash128_output_cast_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda( mfq_tensor_backend::Tensor q) {
-    throw std::runtime_error("minicpm_flash128_q_cast_cuda is not yet available on HIP");
-    return {};
-}
-
 mfq_tensor_backend::Tensor glm_dsa_cache_write_cuda( mfq_tensor_backend::Tensor cache, mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor positions) {
     throw std::runtime_error("glm_dsa_cache_write_cuda is not yet available on HIP");
     return {};
@@ -130,16 +80,6 @@ mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda( mfq_tensor_backend::Tenso
 
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor meta, double scale) {
     throw std::runtime_error("attention_glm_mla_sparse_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor attention_glm_mla576_cached_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, std::int64_t ratio, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, mfq_tensor_backend::Tensor gate, double scale) {
-    throw std::runtime_error("attention_glm_mla576_cached_cuda is not yet available on HIP");
-    return {};
-}
-
-mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda( mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, std::int64_t rope, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, mfq_tensor_backend::Tensor gate) {
-    throw std::runtime_error("attention_glm_mla576_decode_cuda is not yet available on HIP");
     return {};
 }
 
