@@ -1,7 +1,16 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NVQ = (ROOT / "csrc/backends/cuda/kernels/nvq_matmul.cu").read_text()
+NVQ_SOURCES = (
+    "nvq_matmul_impl.cuh",
+    "nvq_matmul.cu",
+    "nvq_moe.cu",
+    "nvq_backward.cu",
+)
+NVQ = "\n".join(
+    (ROOT / "csrc/backends/cuda/kernels" / name).read_text()
+    for name in NVQ_SOURCES
+)
 ASYNC_COPY = (ROOT / "csrc/backends/cuda/kernels/async_copy.cuh").read_text()
 CUDA_OPS = ROOT / "csrc/backends/cuda/ops"
 RUNTIME = "\n".join(
@@ -9,6 +18,14 @@ RUNTIME = "\n".join(
     for path in sorted(CUDA_OPS.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
+
+
+def test_nvq_builds_compile_each_partition() -> None:
+    cmake = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
+    extension = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
+    for name in NVQ_SOURCES[1:]:
+        assert name in cmake
+        assert name in extension
 
 
 def test_nvq_moe_overlaps_activation_loads_with_weight_decode() -> None:

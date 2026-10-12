@@ -43,6 +43,8 @@ _SOURCES = [
     os.path.join(_KERNEL_DIR, "mxfp4_sq.cu"),
     os.path.join(_KERNEL_DIR, "nint_matmul.cu"),
     os.path.join(_KERNEL_DIR, "nvq_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "nvq_moe.cu"),
+    os.path.join(_KERNEL_DIR, "nvq_backward.cu"),
     os.path.join(_KERNEL_DIR, "nepq.cu"),
     os.path.join(_KERNEL_DIR, "nepq_residual.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
