@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 _DIR = Path(__file__).resolve().parent
 _SOURCES = [
     str(_DIR / "nvq_quant_assign.hip"),
@@ -32,9 +31,7 @@ def ext():
         from torch.utils.cpp_extension import load
 
         if not torch.version.hip:
-            raise RuntimeError(
-                "the HIP quantization extension requires a ROCm build of torch"
-            )
+            raise RuntimeError("the HIP quantization extension requires a ROCm build of torch")
         _module = load(
             name="mfq_nvq_quant_hip",
             sources=_SOURCES,

@@ -1,8 +1,8 @@
 # Runtime support
 
-MFQ uses one canonical model graph and shared runtime contracts across its CUDA
-and Metal backends. Support is checkpoint- and component-dependent: validate
-the exact artifact on its deployment backend before release.
+MFQ uses one canonical model graph and shared runtime contracts across its
+CUDA, Metal, and HIP backends. Support is checkpoint- and component-dependent:
+validate the exact artifact on its deployment backend before release.
 
 ## Status terms
 
@@ -16,15 +16,21 @@ the exact artifact on its deployment backend before release.
 
 ## Model and backend matrix
 
-| Architecture family | CUDA C++ | Metal C++ | Current scope |
-| --- | --- | --- | --- |
-| Qwen3.5–3.8 | Native C++ | Native C++ | Hybrid full/GDN attention; graph-declared MTP when predictor weights are present |
-| Qwen Flash-Next / Qwen4-style | Native C++ | Native C++ | Routed MoE, PLE, sparse attention, and graph-declared MTP; bounded expert storage on Metal |
-| DeepSeek V4 Flash Series | Native C++ | Native C++ | Compression, indexer, sparse attention, mHC, and routed MoE; Vision and DSpark availability depends on the artifact and backend |
-| DeepSeek V4.1 Flash | Native C++ | Native C++ | Engram, routed MoE, mHC, and graph-declared DSpark; native Metal Vision and raw-HF loading |
-| MiniCPM-o 4.5 | Native C++ | Native C++ | Text, image, video, audio input, audio output, and duplex serving |
-| GLM5–5.3 | Native C++ | Reference | DSA/KDA and Flash-Next families; Metal production C++ worker integration remains open |
-| Gemma 4 | Native C++ | Reference | Mixed full/sliding attention and MoE; Metal production C++ worker integration remains open |
+| Architecture family | CUDA C++ | Metal C++ | HIP C++ | Current scope |
+| --- | --- | --- | --- | --- |
+| Qwen3.5–3.8 | Native C++ | Native C++ | Native C++ (dense) | Hybrid full/GDN attention; graph-declared MTP when predictor weights are present |
+| Qwen Flash-Next / Qwen4-style | Native C++ | Native C++ | Partial | Routed MoE, PLE, sparse attention, and graph-declared MTP; bounded expert storage on Metal |
+| DeepSeek V4 Flash Series | Native C++ | Native C++ | — | Compression, indexer, sparse attention, mHC, and routed MoE; Vision and DSpark availability depends on the artifact and backend |
+| DeepSeek V4.1 Flash | Native C++ | Native C++ | — | Engram, routed MoE, mHC, and graph-declared DSpark; native Metal Vision and raw-HF loading |
+| MiniCPM-o 4.5 | Native C++ | Native C++ | — | Text, image, video, audio input, audio output, and duplex serving |
+| GLM5–5.3 | Native C++ | Reference | — | DSA/KDA and Flash-Next families; Metal production C++ worker integration remains open |
+| Gemma 4 | Native C++ | Reference | — | Mixed full/sliding attention and MoE; Metal production C++ worker integration remains open |
+
+The HIP column reflects MI300X validation of the early HIP backend: dense
+Qwen3.5–3.8 models (BF16 and quantized `S4` tiers) run end to end, Qwen
+Flash-Next loads but generation is blocked by a known logits-dtype defect, and
+the other families are not yet ported. See
+[hip-native-runtime-validation.md](hip-native-runtime-validation.md).
 
 The top-level architecture family is not used to force optional features on or
 off. Vision and MTP are resolved from the graph, declared weight roots, backend
@@ -89,6 +95,17 @@ bounded expert residency, while DeepSeek V4.1 can stream Engram storage from
 the internal SSD. See the
 [DeepSeek V4.1 raw-HF report](deepseek-v41-raw-hf.md) for a validated large-model
 configuration.
+
+### AMD GPUs and ROCm (HIP)
+
+The HIP worker compiles the CUDA model graph and kernels through ROCm/HIP on
+Linux. Dense Qwen3.5–3.8 models (BF16 and quantized `S4` tiers) are validated
+end to end on MI300X, together with the torch JIT quantization extension.
+Known gaps: multi-tile MFMA attention fails above 32 query tokens, so set
+`MFQ_DISABLE_MMA_ATTENTION=1` to route prefill through the flash FMA path;
+quantized GEMM uses a scalar dot-product fallback ahead of native MFMA ports;
+and several families (DeepSeek V4, GLM DSA sparse, MiniCPM-o 4.5) remain
+stubbed. See the [HIP validation report](hip-native-runtime-validation.md).
 
 MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).

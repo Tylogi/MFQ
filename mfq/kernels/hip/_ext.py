@@ -12,12 +12,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
-_HIP_RUNTIME_INCLUDE = str(
-    Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "hip" / "include"
-)
+_HIP_RUNTIME_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "hip" / "include")
 _CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "core" / "include")
 _GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
@@ -58,9 +55,7 @@ def ext():
         from torch.utils.cpp_extension import load
 
         if not torch.version.hip:
-            raise RuntimeError(
-                "the HIP kernel extension requires a ROCm build of torch"
-            )
+            raise RuntimeError("the HIP kernel extension requires a ROCm build of torch")
         _module = load(
             name="mfq_hip",
             sources=_SOURCES,

@@ -13,14 +13,15 @@
 
 MFQ combines neural-network-aware SQ and VQ formats designed to approach the
 practical rate-distortion frontier, high-quality, fine-grained mixed-precision
-calibration and quantization, and efficient CUDA/Metal inference. The goal is
+calibration and quantization, and efficient CUDA, ROCm (HIP), and Metal
+inference. The goal is
 to deliver the best model quality possible on existing hardware within its
 memory, storage, and latency limits.
 
 <p>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 license">
   <img src="https://img.shields.io/badge/runtime-C%2B%2B-black" alt="C++ runtime">
-  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal-6b57ff" alt="CUDA and Metal">
+  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20ROCm%20%7C%20Metal-6b57ff" alt="CUDA, ROCm and Metal">
 </p>
 
 <p>
@@ -95,7 +96,8 @@ uv run mfq serve \
 ### Build from source
 
 MFQ requires Git, [uv](https://docs.astral.sh/uv/), CMake 3.26+, and a
-C++ toolchain. Use CUDA 12+ on NVIDIA systems or Metal on Apple silicon.
+C++ toolchain. Use CUDA 12+ on NVIDIA systems, ROCm 6+ on AMD systems, or
+Metal on Apple silicon.
 
 ```bash
 git clone https://github.com/Tylogi/TyloQuant.git MFQ
@@ -104,6 +106,10 @@ cd MFQ
 # NVIDIA / CUDA
 uv sync
 uv run mfq build --backend cuda
+
+# AMD / ROCm (HIP)
+uv sync
+uv run mfq build --backend hip
 
 # Apple silicon / Metal
 uv sync --extra metal
@@ -181,9 +187,11 @@ sharded output. See
   and cache policies remain shared runtime capabilities rather than separate
   model-specific serving paths.
 
-- **High-Performance CUDA & Metal Backends.** Backend-specific packed-weight,
+- **High-Performance CUDA, ROCm & Metal Backends.** Backend-specific packed-weight,
   attention, cache, and I/O kernels sit behind a shared C++ model graph and
-  runtime contract. CUDA and Metal are supported today; optimized ROCm and CPU
+  runtime contract. CUDA and Metal are supported today; an early HIP backend
+  covers dense Qwen3.5+ models on MI300X (see
+  [HIP validation](./docs/hip-native-runtime-validation.md)). Optimized CPU
   backends are planned.
 
 | Model | Model size | Expert budget | Precision | Hardware | Prefill | Decode |
@@ -218,7 +226,7 @@ coverage depends on checkpoint revision, embedded components, and backend.
 
 | Architecture group | Backends |
 | --- | --- |
-| Qwen3.5–3.8 | CUDA C++, Metal C++ |
+| Qwen3.5–3.8 | CUDA C++, Metal C++, HIP C++ (dense models) |
 | Qwen Flash-Next / Qwen4-style | CUDA C++, Metal C++ |
 | DeepSeek-V4-Flash Series | CUDA C++, Metal C++ |
 | MiniCPM-o 4.5 | CUDA C++, Metal C++ |
@@ -226,7 +234,9 @@ coverage depends on checkpoint revision, embedded components, and backend.
 | Gemma 4 | CUDA C++; Metal reference runtime |
 
 See the [runtime support matrix](./docs/runtime-support.md) before deploying a
-specific artifact.
+specific artifact. HIP/ROCm support is early; see
+[HIP validation](./docs/hip-native-runtime-validation.md) for validated models
+and known gaps.
 
 ## Tools and APIs
 

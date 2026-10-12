@@ -24,6 +24,7 @@ matches what you want to do.
 - [DeepSeek V4.1 raw-HF validation](deepseek-v41-raw-hf.md)
 - [MiniCPM-o 4.5 multimodal runtime](minicpmo45.md)
 - [CUDA runtime validation](cuda-native-runtime-validation.md)
+- [HIP runtime validation](hip-native-runtime-validation.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 - [Python/C++ runtime transport](runtime-transport.md)
 

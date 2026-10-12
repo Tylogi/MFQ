@@ -64,6 +64,7 @@ runs/
 .remote_modelscope_parallel_download.sh
 .transfer_*
 .mfq/
+packaging/docker/deploy.env
 
 # ---- 模型、校准数据与实验工件 ----
 models/
