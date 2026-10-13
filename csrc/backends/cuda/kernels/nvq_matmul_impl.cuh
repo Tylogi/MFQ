@@ -12,9 +12,8 @@
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
 #include "native/env.h"
+#include "nvq_device.cuh"
 
-#include "nvq_e8_dense_group.cuh"
-#include "nvq_d4_dense_group.cuh"
 #include <cuda_runtime.h>
 #include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_fp16.h>
@@ -69,7 +68,6 @@ __device__ __forceinline__ int2 decode_dense_nvq_vector(
     return decode_dense_nvq_vector<Format,2>(r,bank,sign_mode);
 }
 } // namespace mfq::cuda::packed_nvq
-#include "nvq_routed_reuse.cuh"
 #include "async_copy.cuh"
 
 using namespace nvcuda;

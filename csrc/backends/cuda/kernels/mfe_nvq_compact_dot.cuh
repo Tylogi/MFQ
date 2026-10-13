@@ -1,7 +1,6 @@
 #pragma once
 #include "mfe_ffn.h"
-#include "nvq_e8_dense_group.cuh"
-#include "nvq_d4_dense_group.cuh"
+#include "nvq_device.cuh"
 #include "nvq_dense_window32.cuh"
 // Host descriptors prove expert-local bit offsets and exact compact payload extents.
 namespace mfq::cuda {

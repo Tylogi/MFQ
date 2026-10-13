@@ -1,8 +1,7 @@
 #include "native/env.h"
+#include "nvq_device.cuh"
 
 #include "packed_nvq.cuh"
-#include "nvq_routed_reuse.cuh"
-#include "nvq_byte_signs.cuh"
 namespace mfq::cuda {
 
 // Three canonical E8 indices fit in two aligned words. In the 36-bit case,
@@ -35,7 +34,6 @@ __device__ __forceinline__ uint64_t load_e8_index_window(
 }
 
 }
-#include "nvq_e8_narrow.cuh"
 #include <cstdlib>
 #include <type_traits>
 

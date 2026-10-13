@@ -1,5 +1,5 @@
 #include "e8_dense_group_probe.h"
-#include "csrc/backends/cuda/kernels/nvq_d4_dense_group.cuh"
+#include "csrc/backends/cuda/kernels/nvq_device.cuh"
 #include "csrc/backends/cuda/kernels/nvq_dense_window32.cuh"
 #include <stdexcept>
 
