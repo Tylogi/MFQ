@@ -1,6 +1,6 @@
-#include "env.h"
-#include "tensor_ops_common.cuh"
-#include "matmul_rows.h"
+#include "native/env.h"
+#include "ops_common.cuh"
+#include "native/matmul_rows.h"
 
 #include <cmath>
 #include <cstdlib>

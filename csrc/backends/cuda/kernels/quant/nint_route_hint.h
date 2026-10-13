@@ -1,5 +1,5 @@
 #pragma once
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 
 // Internal view of a validated, fixed-capacity expert pool. The pointer and
 // geometry values share the lifetime of the captured pool/workspace tensors.

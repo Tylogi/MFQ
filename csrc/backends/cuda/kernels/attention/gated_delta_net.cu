@@ -12,7 +12,7 @@
 #include <cuda/atomic>
 #include <cmath>
 #include <limits>
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <vector>
 #include <cstdlib>
 #include <cstring>

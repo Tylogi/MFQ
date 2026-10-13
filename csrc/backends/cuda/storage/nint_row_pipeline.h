@@ -1,5 +1,5 @@
 #pragma once
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 #include "mfq/nint_rows.h"
 #include <memory>
 class NintRowStage {

@@ -1,6 +1,6 @@
 #include "native/env.h"
 #include "native/context.h"
-#include "native/tensor.h"
+#include "native/tensor/tensor.h"
 #include "native/matmul_rows.h"
 #include <cstring>
 

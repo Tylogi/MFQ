@@ -1,7 +1,7 @@
 
 
 #include <cuda.h>
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

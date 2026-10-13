@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 #include <utility>

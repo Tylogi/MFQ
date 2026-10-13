@@ -31,15 +31,15 @@ endif()
 add_library(mfq-cuda-native STATIC
     ${MFQ_CUDA_ROOT}/native/context.cu
     ${MFQ_CUDA_ROOT}/native/env.cpp
-    ${MFQ_CUDA_ROOT}/native/tensor.cpp
-    ${MFQ_CUDA_ROOT}/native/tensor.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_blas.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_creation.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_indexing.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_ops.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_reduction.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_signal.cu
-    ${MFQ_CUDA_ROOT}/native/tensor_sort.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/tensor.cpp
+    ${MFQ_CUDA_ROOT}/native/tensor/tensor.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/blas.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/creation.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/indexing.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/ops.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/reduction.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/signal.cu
+    ${MFQ_CUDA_ROOT}/native/tensor/sort.cu
 )
 add_library(mfq::cuda-native ALIAS mfq-cuda-native)
 target_include_directories(mfq-cuda-native PUBLIC

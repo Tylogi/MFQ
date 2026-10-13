@@ -2,7 +2,7 @@
 
 #include "storage/session_state.h"
 #include "mtp_policy.h"
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 #include "models/common/causal_model_ops.h"
 
 #include <cstdint>

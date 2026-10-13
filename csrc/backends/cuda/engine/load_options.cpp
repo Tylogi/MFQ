@@ -3,7 +3,7 @@
 #include "ops/execution/cuda_execution.h"
 #include "storage/moe/expert_cache.h"
 #include "moe_cache_profile.h"
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>

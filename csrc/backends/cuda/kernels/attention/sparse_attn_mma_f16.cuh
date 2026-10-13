@@ -10,7 +10,7 @@
 #undef MFQ_FATTN_KERNEL_ONLY
 #endif
 
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include "selected_attention.h"
 
 #include <algorithm>

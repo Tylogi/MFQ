@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 #include "models/cuda_model_plan.h"
 #include "mfq/runtime.h"
 #include "models/common/block.h"

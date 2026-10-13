@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 #include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 12080

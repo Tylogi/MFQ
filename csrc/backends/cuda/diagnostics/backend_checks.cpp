@@ -2,7 +2,7 @@
 
 #include "kernels/activation_ops.h"
 #include "kernels/sampling_ops.h"
-#include "native/tensor_backend.h"
+#include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>
 

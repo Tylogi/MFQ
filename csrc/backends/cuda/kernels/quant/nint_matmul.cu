@@ -26,7 +26,7 @@
 
 #include "kernels/cache/async_copy.cuh"
 #include "kernels/glu.cuh"
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include "kernels/quant/nint_route_hint.h"
 #include "packed_backward.cuh"
 #include "packed_nint.cuh"

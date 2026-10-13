@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tensor_view.h"
+#include "view.h"
 
 #include <algorithm>
 #include <atomic>

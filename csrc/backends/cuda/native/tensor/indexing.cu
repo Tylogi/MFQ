@@ -1,4 +1,4 @@
-#include "tensor_ops_common.cuh"
+#include "ops_common.cuh"
 
 #include <cub/cub.cuh>
 
