@@ -1,8 +1,8 @@
-#include "mfq/nint_rows.h"
+#include "mfq/quant/nint_rows.h"
 
-#include "mfq/nint_blob.h"
+#include "mfq/quant/nint_blob.h"
 #include "mfq/host_parallel.h"
-#include "mfq/packed_row_range.h"
+#include "mfq/quant/packed_row_range.h"
 
 #include <algorithm>
 #include <cstring>

@@ -1,6 +1,6 @@
 #pragma once
 #include "ops/moe/mfe_weight.h"
-#include "mfq/moe_dispatch_plan.h"
+#include "mfq/moe/dispatch_plan.h"
 #include "ops/decode_window.h"
 #include <array>
 using MoeFfnShared=std::function<mfq_tensor_backend::Tensor(CudaExecutionContext&,const mfq_tensor_backend::Tensor&)>;

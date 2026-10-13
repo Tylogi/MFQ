@@ -3,7 +3,7 @@
 #include "ffn_pipeline.h"
 #include "cached_source_internal.h"
 #include "ops/quant/cpu_projection_rows.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include "ops/execution/graph_registry.h"
 #include "kernels/moe/pipeline.h"
 #include "kernels/moe/ops.h"

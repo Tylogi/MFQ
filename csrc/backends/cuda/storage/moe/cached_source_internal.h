@@ -8,7 +8,7 @@
 #include "ops/moe/moe.h"
 #include "storage/mfe_expert_store.h"
 #include "quant_range_source.h"
-#include "mfq/moe_cache_policy.h"
+#include "mfq/moe/cache_policy.h"
 #include "kernels/moe/cache_transfer.h"
 #include <algorithm>
 #include <condition_variable>
@@ -28,8 +28,8 @@
 #include "storage/moe/residency.h"
 #include "kernels/cache/dma_copy_batch.h"
 #include "mfq/host_parallel.h"
-#include "mfq/moe_cpu_cost_model.h"
-#include "mfq/moe_cpu_calibration.h"
+#include "mfq/moe/cpu_cost_model.h"
+#include "mfq/moe/cpu_calibration.h"
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -1543,7 +1543,7 @@ private:
         pending_range_reads_;
     bool range_overlap_enabled_ = true;
 };
-#include "mfq/moe_dispatch_plan.h"
+#include "mfq/moe/dispatch_plan.h"
 
 struct MoeCachedCohort {
     int index = -1;

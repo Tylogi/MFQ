@@ -1,7 +1,7 @@
 #include "packed_bench_utils.h"
 #include "nvq_group.h"
 #include "packed_nint.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 
 #include <array>
 #include <chrono>

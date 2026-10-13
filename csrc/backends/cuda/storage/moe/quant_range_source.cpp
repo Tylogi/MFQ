@@ -1,7 +1,7 @@
 #include "ops/execution/execution_options.h"
 #include "quant_range_source.h"
 #include "ops/quant/cpu_projection_rows.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include "ops/quant/quant_linear.h"
 
 #include <algorithm>

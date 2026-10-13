@@ -1,4 +1,4 @@
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>

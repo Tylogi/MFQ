@@ -1,8 +1,8 @@
 #include "storage/weight_loader.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
-#include "mfq/nint_rows.h"
-#include "mfq/nvq_rows.h"
+#include "mfq/quant/nint_rows.h"
+#include "mfq/quant/nvq_rows.h"
 
 #include <cmath>
 #include <algorithm>

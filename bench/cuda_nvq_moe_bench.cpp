@@ -2,7 +2,7 @@
 #include "packed_bench_utils.h"
 #include "kernels/moe/ops.h"
 #include "ops/moe/moe.h"
-#include "mfq/model_source.h"
+#include "mfq/model_source/model_source.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>

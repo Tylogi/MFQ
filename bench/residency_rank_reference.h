@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq/moe_residency_ranker.h"
+#include "mfq/moe/residency_ranker.h"
 #include <map>
 
 namespace mfq::bench {

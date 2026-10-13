@@ -2,7 +2,7 @@
 
 #include "mlx_legacy_tensor_compat.h"
 
-#include "mfq/mfq_model_source.h"
+#include "mfq/model_source/mfq_model_source.h"
 
 #include <algorithm>
 #include <cerrno>

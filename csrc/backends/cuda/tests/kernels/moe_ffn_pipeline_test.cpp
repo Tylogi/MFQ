@@ -11,7 +11,7 @@
 #include "storage/moe/expert_cache.h"
 #include "storage/weight_loader.h"
 #include "ops/moe/moe.h"
-#include "mfq/moe_dispatch_plan.h"
+#include "mfq/moe/dispatch_plan.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

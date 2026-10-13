@@ -1,4 +1,4 @@
-#include "mfq/moe_dispatch_plan.h"
+#include "mfq/moe/dispatch_plan.h"
 #include "moe_residency_rank_checks.h"
 #include <limits>
 #include "moe_cpu_cost_checks.h"

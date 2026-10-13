@@ -1,7 +1,7 @@
-#include "mfq/model_source.h"
+#include "mfq/model_source/model_source.h"
 
-#include "mfq/hf_model_source.h"
-#include "mfq/mfq_model_source.h"
+#include "mfq/model_source/hf_model_source.h"
+#include "mfq/model_source/mfq_model_source.h"
 #include "mfq_legacy_model_graph.h"
 
 #include <cstdlib>

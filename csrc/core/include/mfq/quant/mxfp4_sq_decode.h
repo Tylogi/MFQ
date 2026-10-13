@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq/mxfp4_sq_blob.h"
+#include "mfq/quant/mxfp4_sq_blob.h"
 #include <cmath>
 
 namespace mfq::sq {

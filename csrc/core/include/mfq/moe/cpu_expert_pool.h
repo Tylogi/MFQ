@@ -1,5 +1,5 @@
 #pragma once
-#include "host_parallel.h"
+#include "mfq/host_parallel.h"
 #include <cstdint>
 #include <functional>
 #include <memory>

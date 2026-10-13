@@ -1,27 +1,35 @@
 #pragma once
 
-#include "mfq/hf_safetensors_source.h"
+#include "mfq/model_source/model_source.h"
 
 #include <filesystem>
 #include <memory>
+#include <unordered_map>
 
 namespace mfq {
 
-// Canonical runtime view of an HF checkpoint. Dense and native-MX tensors are
-// exposed with the same logical payload contract as MFQ records, so backend
-// model loaders do not branch on checkpoint format.
-class HfModelSource final : public ModelSource {
+struct HfTensorLocation {
+    std::size_t shard = 0;
+    std::uint64_t offset = 0;
+};
+
+class HfSafetensorsSource final : public ModelSource {
 public:
-    explicit HfModelSource(std::filesystem::path root, std::string source_prefix = {});
-    ~HfModelSource() override;
+    explicit HfSafetensorsSource(
+        std::filesystem::path root,
+        std::unordered_map<std::string, std::string> canonical_to_source = {},
+        std::string source_prefix = {});
+    ~HfSafetensorsSource() override;
 
-    HfModelSource(HfModelSource&&) noexcept;
-    HfModelSource& operator=(HfModelSource&&) noexcept;
-    HfModelSource(const HfModelSource&) = delete;
-    HfModelSource& operator=(const HfModelSource&) = delete;
+    HfSafetensorsSource(HfSafetensorsSource&&) noexcept;
+    HfSafetensorsSource& operator=(HfSafetensorsSource&&) noexcept;
+    HfSafetensorsSource(const HfSafetensorsSource&) = delete;
+    HfSafetensorsSource& operator=(const HfSafetensorsSource&) = delete;
 
+    const std::filesystem::path& root() const noexcept;
     const std::vector<std::filesystem::path>& source_paths()
         const noexcept override;
+    const HfTensorLocation& location(std::string_view name) const;
     void drop_file_cache() const noexcept override;
 
     std::string_view architecture() const noexcept override;
@@ -30,8 +38,6 @@ public:
     const std::vector<TensorMetadata>& tensors() const noexcept override;
     const TensorMetadata* find_tensor(
         std::string_view name) const noexcept override;
-    const MfqLegacyTensorAliases& legacy_tensor_compatibility()
-        const noexcept override;
     void read_range_into(
         std::string_view name,
         std::uint64_t relative_offset,
@@ -41,6 +47,12 @@ public:
     bool has_asset(std::string_view name) const noexcept override;
     std::vector<std::byte> read_asset(std::string_view name) const override;
     std::optional<ModelGraph> model_graph() const override;
+
+    void read_shard_range_into(
+        std::size_t shard,
+        std::uint64_t offset,
+        std::byte* destination,
+        std::size_t size) const;
 
 private:
     struct Impl;

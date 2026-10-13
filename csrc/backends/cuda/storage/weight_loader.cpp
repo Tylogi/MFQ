@@ -5,7 +5,7 @@
 #include "kernels/gated_residual_fused.h"
 #include "kernels/quant_ops.h"
 #include "kernels/attention/selected_attention.h"
-#include "mfq/mxfp4_sq_decode.h"
+#include "mfq/quant/mxfp4_sq_decode.h"
 
 #include <algorithm>
 #include <cstring>
@@ -17,7 +17,7 @@
 #include "moe/expert_cache.h"
 #include "mfe_expert_store.h"
 #include "moe/quant_range_source.h"
-#include "mfq/packed_nint_expert_store.h"
+#include "mfq/quant/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
 #include "storage/moe/weight_loader.h"

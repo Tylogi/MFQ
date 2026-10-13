@@ -1,4 +1,4 @@
-#include "mfq/file_range_reader.h"
+#include "mfq/io/file_range_reader.h"
 #include "mfq/host_parallel.h"
 
 #include <algorithm>

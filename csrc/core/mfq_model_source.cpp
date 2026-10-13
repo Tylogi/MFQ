@@ -1,5 +1,5 @@
-#include "mfq/mfq_model_source.h"
-#include "mfq/async_range_reader.h"
+#include "mfq/model_source/mfq_model_source.h"
+#include "mfq/io/async_range_reader.h"
 
 #include "mfq_format_compat.h"
 #include "mfq_legacy_tensor_names.h"

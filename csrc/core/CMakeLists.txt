@@ -2,7 +2,7 @@
 
 find_package(Threads REQUIRED)
 add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h
-    cpu_expert_pool.cpp include/mfq/cpu_expert_pool.h)
+    cpu_expert_pool.cpp include/mfq/moe/cpu_expert_pool.h)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
 target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
@@ -34,21 +34,21 @@ set_target_properties(mfq-model-graph PROPERTIES
 add_library(mfq-model-source STATIC
     file_range_reader.cpp
     async_range_reader.cpp
-    include/mfq/file_range_reader.h
+    include/mfq/io/file_range_reader.h
     mfe_quant_expert_store.cpp
-    include/mfq/mfe_quant_expert_store.h
+    include/mfq/quant/mfe_expert_store.h
     nint_rows.cpp
-    include/mfq/nint_rows.h
+    include/mfq/quant/nint_rows.h
     nvq_rows.cpp
-    include/mfq/nvq_rows.h
-    include/mfq/packed_row_range.h
+    include/mfq/quant/nvq_rows.h
+    include/mfq/quant/packed_row_range.h
     hf_model_source.cpp
     hf_safetensors_source.cpp
-    include/mfq/hf_model_source.h
-    include/mfq/hf_safetensors_source.h
+    include/mfq/model_source/hf_model_source.h
+    include/mfq/model_source/hf_safetensors_source.h
     include/mfq/model_graph.h
-    include/mfq/model_source.h
-    include/mfq/mfq_model_source.h
+    include/mfq/model_source/model_source.h
+    include/mfq/model_source/mfq_model_source.h
     mfq_model_source.cpp
     model_source.cpp
 )

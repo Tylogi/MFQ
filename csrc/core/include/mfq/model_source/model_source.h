@@ -1,8 +1,8 @@
 #pragma once
 
 #include "mfq/model_graph.h"
-#include "mfq/file_range_reader.h"
-#include "mfq/read_span.h"
+#include "mfq/io/file_range_reader.h"
+#include "mfq/io/read_span.h"
 #include "mfq_legacy_tensor_names.h"
 
 #include <cstddef>

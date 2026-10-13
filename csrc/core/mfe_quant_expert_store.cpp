@@ -1,5 +1,5 @@
-#include "mfq/mfe_quant_expert_store.h"
-#include "mfq/packed_nint_expert_store.h"
+#include "mfq/quant/mfe_expert_store.h"
+#include "mfq/quant/packed_nint_expert_store.h"
 #include "mfq_format_compat.h"
 
 #include <algorithm>

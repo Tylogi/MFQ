@@ -1,6 +1,6 @@
 #include "deepseek_v4_model.h"
 
-#include "mfq/nint_blob.h"
+#include "mfq/quant/nint_blob.h"
 
 #include "nlohmann/json.hpp"
 

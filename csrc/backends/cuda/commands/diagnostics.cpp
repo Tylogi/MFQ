@@ -26,7 +26,7 @@ inline void finish_cuda_activity_trace() noexcept {
 #include "engine/decode_graph.h"
 #include "models/common/full_block.h"
 #include "native/tensor/backend.h"
-#include "mfq/model_source.h"
+#include "mfq/model_source/model_source.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/moe/expert_cache.h"
 #include <cuda_profiler_api.h>

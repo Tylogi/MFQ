@@ -1,5 +1,5 @@
-#include "mfq/file_range_reader.h"
-#include "mfq/async_range_reader.h"
+#include "mfq/io/file_range_reader.h"
+#include "mfq/io/async_range_reader.h"
 
 #include <algorithm>
 #include <chrono>

@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq/nint_rows.h"
+#include "mfq/quant/nint_rows.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>

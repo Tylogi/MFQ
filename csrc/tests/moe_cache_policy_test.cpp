@@ -1,4 +1,4 @@
-#include "mfq/moe_cache_policy.h"
+#include "mfq/moe/cache_policy.h"
 
 #include <cstdint>
 #include <iostream>

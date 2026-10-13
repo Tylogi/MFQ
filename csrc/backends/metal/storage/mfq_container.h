@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/hf_model_source.h"
+#include "mfq/model_source/hf_model_source.h"
 #include "mfq_legacy_tensor_names.h"
 #include "mfq_format_compat.h"
 #include "mfq_model_graph.h"

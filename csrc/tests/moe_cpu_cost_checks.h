@@ -1,6 +1,6 @@
 #pragma once
-#include "mfq/moe_cpu_cost_model.h"
-#include "mfq/moe_cpu_calibration.h"
+#include "mfq/moe/cpu_cost_model.h"
+#include "mfq/moe/cpu_calibration.h"
 #include <memory>
 #include <string>
 

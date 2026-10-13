@@ -3,9 +3,9 @@
 #include "ops/decode_window.h"
 #include "kernels/moe/pipeline.h"
 #include "storage/moe/cached_source_internal.h"
-#include "mfq/cpu_expert_pool.h"
-#include "mfq/host_memory_copy.h"
-#include "mfq/moe_residency_ranker.h"
+#include "mfq/moe/cpu_expert_pool.h"
+#include "mfq/io/host_memory_copy.h"
+#include "mfq/moe/residency_ranker.h"
 #include <algorithm>
 #include <array>
 #include <exception>
