@@ -1,6 +1,7 @@
 #pragma once
 #include "native/env.h"
 #include "ops/mfe_ffn_runtime.h"
+#include "storage/moe_weight_loader.h"
 #include <cstring>
 
 void verify_mfe_token_groups(const std::filesystem::path& root) {

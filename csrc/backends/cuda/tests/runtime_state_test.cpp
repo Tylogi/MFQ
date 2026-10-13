@@ -18,6 +18,7 @@
 #include "storage/mfe_expert_store.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
+#include "storage/moe_weight_loader.h"
 
 #include <chrono>
 #include <cstring>

@@ -18,6 +18,7 @@
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
 #include "mfq/packed_nint_expert_store.h"
+#include "storage/moe_weight_loader.h"
 #include <cstdlib>
 #include <cstdio>
 

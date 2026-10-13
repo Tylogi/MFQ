@@ -10,6 +10,7 @@
 #include "ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "kernels/moe_ops.h"
+#include "storage/moe_weight_loader.h"
 
 #include <cuda_runtime_api.h>
 

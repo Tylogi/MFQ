@@ -372,6 +372,7 @@ set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_ffn_pipeline.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_quant_range_source.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/graph_registry.cpp

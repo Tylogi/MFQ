@@ -3,6 +3,7 @@
 #include "storage/moe_expert_cache.h"
 #include "storage/moe_quant_range_source.h"
 #include "ops/cuda_execution.h"
+#include "storage/moe_weight_loader.h"
 
 #include <algorithm>
 #include <chrono>

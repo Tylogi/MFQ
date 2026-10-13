@@ -4,6 +4,7 @@
 #include "ops/moe.h"
 #include "model_source.h"
 #include "ops/gated_residual.h"
+#include "storage/moe_weight_loader.h"
 
 namespace mfq::cuda {
 class MfeMxfp4ExpertStore;

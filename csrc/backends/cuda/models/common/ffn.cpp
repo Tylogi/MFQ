@@ -6,6 +6,7 @@
 #include "kernels/moe_ops.h"
 #include "kernels/norm_ops.h"
 #include "storage/moe_expert_cache.h"
+#include "storage/moe_weight_loader.h"
 
 #include <algorithm>
 #include <array>

@@ -1,5 +1,6 @@
 #pragma once
 #include "native/env.h"
+#include "storage/moe_weight_loader.h"
 
 void verify_nvq_prefill_k_tiles(const std::filesystem::path& root,bool cohorts=false,bool defaults=false) {
     struct Environment {

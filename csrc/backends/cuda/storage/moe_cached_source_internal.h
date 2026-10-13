@@ -1543,6 +1543,7 @@ private:
     bool range_overlap_enabled_ = true;
 };
 #include "mfq/moe_dispatch_plan.h"
+#include "storage/moe_weight_loader.h"
 
 struct MoeCachedCohort {
     int index = -1;

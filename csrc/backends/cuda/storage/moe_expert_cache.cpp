@@ -1,6 +1,7 @@
 #include "native/env.h"
 #include "ops/execution_options.h"
 #include "moe_cached_source_internal.h"
+#include "storage/moe_weight_loader.h"
 #include <map>
 #include <cmath>
 
