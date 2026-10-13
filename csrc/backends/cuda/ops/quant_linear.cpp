@@ -211,18 +211,18 @@ mfq_tensor_backend::Tensor run_nint_linear(
         const NintWeight& w,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
-        int mode) {
+        InputGateMode mode) {
     if (!x.is_cuda() || !w.q8_zero || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
-            ? nint_matmul_input_mul(profiler, w, x, gate.value(), mode)
+            ? nint_matmul_input_mul(profiler, w, x, gate.value(), static_cast<int>(mode))
             : nint_matmul(profiler, w, x);
     }
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     if (gate.has_value()) {
-        MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NINT input gate mode must be sigmoid or SiLU");
+        MFQ_RUNTIME_CHECK(mode != InputGateMode::None, "NINT input gate mode must be sigmoid or SiLU");
         auto g = gate.value().contiguous().to(mfq_tensor_backend::kFloat16);
         MFQ_RUNTIME_CHECK(x.sizes() == g.sizes(), "NINT x and gate shapes must match");
-        x = mode == 1 ? x * mfq_tensor_backend::sigmoid(g) : x * mfq_tensor_backend::silu(g);
+        x = mode == InputGateMode::Sigmoid ? x * mfq_tensor_backend::sigmoid(g) : x * mfq_tensor_backend::silu(g);
     }
     x = pad_last(x, w.neuron_len);
     const int64_t rows = x.size(0);
@@ -246,18 +246,18 @@ mfq_tensor_backend::Tensor run_nvq_linear(
         const NvqWeight& w,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
-        int mode) {
+        InputGateMode mode) {
     if (!x.is_cuda() || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
-            ? nvq_matmul_input_mul(profiler, w, x, gate.value(), mode)
+            ? nvq_matmul_input_mul(profiler, w, x, gate.value(), static_cast<int>(mode))
             : nvq_matmul(profiler, w, x);
     }
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     if (gate.has_value()) {
-        MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be sigmoid or SiLU");
+        MFQ_RUNTIME_CHECK(mode != InputGateMode::None, "NVQ input gate mode must be sigmoid or SiLU");
         auto g = gate.value().contiguous().to(mfq_tensor_backend::kFloat16);
         MFQ_RUNTIME_CHECK(x.sizes() == g.sizes(), "NVQ x and gate shapes must match");
-        x = mode == 1 ? x * mfq_tensor_backend::sigmoid(g) : x * mfq_tensor_backend::silu(g);
+        x = mode == InputGateMode::Sigmoid ? x * mfq_tensor_backend::sigmoid(g) : x * mfq_tensor_backend::silu(g);
     }
     x = pad_last(x, w.neuron_len);
     MFQ_RUNTIME_CHECK(x.size(0) >= 16, "KLD common NVQ MMQ requires at least 16 activation rows");
@@ -277,15 +277,15 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
         const QuantLinearShard & shard,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
-        int gate_mode) {
+        InputGateMode gate_mode) {
     MfqCudaGuard guard(shard.device);
     if (shard.kind == QuantLinearKind::Mxfp4Sq ||
             shard.kind == QuantLinearKind::Fp8Sq) {
         if (gate.has_value()) {
             MFQ_RUNTIME_CHECK(
-                gate_mode == 1 || gate_mode == 2,
+                gate_mode != InputGateMode::None,
                 "SQ input gate mode must be sigmoid or SiLU");
-            x = x * (gate_mode == 1
+            x = x * (gate_mode == InputGateMode::Sigmoid
                 ? mfq_tensor_backend::sigmoid(gate.value())
                 : mfq_tensor_backend::silu(gate.value()));
         }
@@ -309,10 +309,10 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
         auto local = x.to(shard.dense.scalar_type());
         if (gate.has_value()) {
             MFQ_RUNTIME_CHECK(
-                gate_mode == 1 || gate_mode == 2,
+                gate_mode != InputGateMode::None,
                 "dense input gate mode must be sigmoid or SiLU");
             auto local_gate = gate.value().to(local.scalar_type());
-            local = gate_mode == 1
+            local = gate_mode == InputGateMode::Sigmoid
                 ? local * mfq_tensor_backend::sigmoid(local_gate)
                 : local * mfq_tensor_backend::silu(local_gate);
         }
@@ -1045,7 +1045,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_tensor_parallel_flat(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
-        int gate_mode) const {
+        InputGateMode gate_mode) const {
     MFQ_RUNTIME_CHECK(
         tensor_parallel(),
         "tensor-parallel linear has no shards");
@@ -1158,7 +1158,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward(
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
         auto y = tensor_parallel()
-            ? forward_tensor_parallel_flat(execution, flat, mfq_nullopt, 0)
+            ? forward_tensor_parallel_flat(execution, flat, mfq_nullopt, InputGateMode::None)
             : is_nint() ? run_nint_linear(
                   execution.profiler, execution.kl_mmq, nint, flat)
                         : run_nvq_linear(
@@ -1218,7 +1218,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
-        int mode) const {
+        InputGateMode mode) const {
     if (tensor_parallel() || is_nint() || is_nvq()) {
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
@@ -1235,20 +1235,20 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         return y.reshape(shape);
     }
     if (is_dense()) {
-        MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+        MFQ_RUNTIME_CHECK(mode != InputGateMode::None,
             "dense input gate mode must be sigmoid or SiLU");
         // Match the existing dense shard path, including dtype rounding.
         auto local = x.to(dense.scalar_type());
         auto local_gate = gate.to(dense.scalar_type());
-        auto gated = mode == 1
+        auto gated = mode == InputGateMode::Sigmoid
             ? local * mfq_tensor_backend::sigmoid(local_gate)
             : local * mfq_tensor_backend::silu(local_gate);
         return forward_dense(gated);
     }
-    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+    MFQ_RUNTIME_CHECK(mode != InputGateMode::None,
         "input gate mode must be sigmoid or SiLU");
     auto local_gate = gate.to(x.scalar_type());
-    auto gated = mode == 1
+    auto gated = mode == InputGateMode::Sigmoid
         ? x * mfq_tensor_backend::sigmoid(local_gate)
         : x * mfq_tensor_backend::silu(local_gate);
     return forward(execution, gated);
@@ -1258,7 +1258,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul_f32_kld(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
-        int mode) const {
+        InputGateMode mode) const {
     MFQ_RUNTIME_CHECK(
         !tensor_parallel() && is_nint(),
         "FP32-output KLD down projection requires a local NINT tensor");
@@ -1268,7 +1268,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul_f32_kld(
     auto shape = x.sizes().vec();
     auto y = nint_matmul_input_mul_f32(
         execution.profiler, nint, x.reshape({-1, x.size(-1)}),
-        gate.reshape({-1, gate.size(-1)}), mode);
+        gate.reshape({-1, gate.size(-1)}), static_cast<int>(mode));
     if (nint.q8_zero) ++execution.kl_mmq.dense_calls;
     shape.back() = y.size(-1);
     return y.reshape(shape);

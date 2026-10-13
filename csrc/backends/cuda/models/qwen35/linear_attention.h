@@ -310,7 +310,7 @@ struct LinearAttentionBlock final : ::Block {
                           .reshape({B, T, H});
                 } else {
                   attention_output =
-                      out_proj.forward_input_mul(execution, yf, zf, 2);
+                      out_proj.forward_input_mul(execution, yf, zf, InputGateMode::Silu);
                 }
                 return attention_output;
               });
@@ -698,7 +698,7 @@ struct LinearAttentionBlock final : ::Block {
                   });
                 } else {
                   oo = profiler.measure("linear.out_proj_gate", [&]() {
-                    return out_proj.forward_input_mul(execution, yf, zf, 2);
+                    return out_proj.forward_input_mul(execution, yf, zf, InputGateMode::Silu);
                   });
                 }
                 return oo;

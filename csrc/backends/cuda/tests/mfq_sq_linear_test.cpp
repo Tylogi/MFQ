@@ -119,7 +119,7 @@ int main(int argc, char** argv) try {
             layer.tensor_parallel_shards.push_back(std::move(shard));
         }
         close(layer.forward_tensor_parallel_flat(
-            execution, device_x, mfq_nullopt, 0), expected, 0.002f);
+            execution, device_x, mfq_nullopt, InputGateMode::None), expected, 0.002f);
     }
     std::cout<<"PASS SQ CPU linear and packed input/output shards\n";
     return 0;

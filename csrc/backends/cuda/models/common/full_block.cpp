@@ -717,7 +717,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                             return q_gate.contiguous().reshape({B, T, attn_width});
                         });
                         oo = profiler.measure("full.o_proj_gate", [&]() {
-                            return o.forward_input_mul(execution, af, gf, 1);
+                            return o.forward_input_mul(execution, af, gf, InputGateMode::Sigmoid);
                         });
                     } else {
                         auto af = profiler.measure("full.attn_out_view", [&]() {

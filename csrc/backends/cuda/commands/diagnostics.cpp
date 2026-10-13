@@ -275,9 +275,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             if (model_path.empty()) {
                 throw std::runtime_error("--check-linear-cpu requires --model");
             }
-            int gate_mode = 0;
-            if (check_linear_gate == "sigmoid") gate_mode = 1;
-            else if (check_linear_gate == "silu") gate_mode = 2;
+            auto gate_mode = InputGateMode::None;
+            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
+            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
             else if (!check_linear_gate.empty()) {
                 throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
             }
@@ -287,9 +287,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         }
         if (!check_linear.empty()) {
             if (model_path.empty()) throw std::runtime_error("--check-linear requires --model");
-            int gate_mode = 0;
-            if (check_linear_gate == "sigmoid") gate_mode = 1;
-            else if (check_linear_gate == "silu") gate_mode = 2;
+            auto gate_mode = InputGateMode::None;
+            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
+            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
             else if (!check_linear_gate.empty()) {
                 throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
             }

@@ -33,7 +33,7 @@ int run_linear_check(
     const std::string & model_path,
     const std::string & name,
     int M,
-    int gate_mode,
+    InputGateMode gate_mode,
     int reps) {
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
@@ -47,14 +47,13 @@ int run_linear_check(
     x = (x.remainder(97) - 48) / 512.0;
     auto xh = x.to(mfq_tensor_backend::kFloat16).contiguous();
     mfq_tensor_backend::Tensor gateh;
-    if (gate_mode != 0) {
-        MFQ_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+    if (gate_mode != InputGateMode::None) {
         gateh = ((mfq_tensor_backend::arange((int64_t)M * neuron_len, x.options()).reshape({M, neuron_len})
                     .remainder(53) - 26) / 16.0)
                     .to(mfq_tensor_backend::kFloat16).contiguous();
     }
     auto run = [&]() {
-        return gate_mode == 0
+        return gate_mode == InputGateMode::None
             ? linear.forward(execution, xh)
             : linear.forward_input_mul(
                 execution, xh, gateh, gate_mode);
@@ -64,7 +63,7 @@ int run_linear_check(
     if (check_bf16_output_env != nullptr &&
             check_bf16_output_env[0] == '1') {
         MFQ_RUNTIME_CHECK(
-            gate_mode == 0,
+            gate_mode == InputGateMode::None,
             "direct BF16 linear check does not support input gating");
         auto bf16_input = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         auto reference = linear.forward(execution, bf16_input)
@@ -114,8 +113,8 @@ int run_linear_check(
         ? &linear.mxfp8.weight : nullptr;
     auto ww = quant_linear_reference_weight(linear);
     mfq_tensor_backend::Tensor ref_input = xh;
-    if (gate_mode == 1) ref_input = xh * mfq_tensor_backend::sigmoid(gateh);
-    else if (gate_mode == 2) ref_input = xh * mfq_tensor_backend::silu(gateh);
+    if (gate_mode == InputGateMode::Sigmoid) ref_input = xh * mfq_tensor_backend::sigmoid(gateh);
+    else if (gate_mode == InputGateMode::Silu) ref_input = xh * mfq_tensor_backend::silu(gateh);
     auto y_ref = mfq_tensor_backend::matmul(ref_input, ww.transpose(0, 1)).to(mfq_tensor_backend::kFloat32);
     mfq_cuda_synchronize();
     auto diff = (y_test - y_ref).abs();
@@ -179,7 +178,7 @@ int run_linear_check(
     } else {
         std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";
     }
-    if (gate_mode != 0) std::cout << "gate=" << (gate_mode == 1 ? "sigmoid" : "silu") << "\n";
+    if (gate_mode != InputGateMode::None) std::cout << "gate=" << (gate_mode == InputGateMode::Sigmoid ? "sigmoid" : "silu") << "\n";
     std::cout << "production_ms=" << per_ms << "\n";
     std::cout << "production_weight_gbps=" << weight_bytes / (per_ms * 1.0e6) << "\n";
     std::cout << "production_rel=" << ((y_test - y_ref).norm() / y_ref.norm()).item<float>() << "\n";
@@ -193,7 +192,7 @@ int run_cpu_linear_check(
         const std::string & model_path,
         const std::string & name,
         int rows,
-        int gate_mode,
+        InputGateMode gate_mode,
         int reps) {
     MFQ_RUNTIME_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
@@ -217,8 +216,7 @@ int run_cpu_linear_check(
     x = ((x.remainder(97) - 48) / 512.0)
         .to(mfq_tensor_backend::kFloat16).contiguous();
     mfq_tensor_backend::Tensor gate;
-    if (gate_mode != 0) {
-        MFQ_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+    if (gate_mode != InputGateMode::None) {
         gate = ((mfq_tensor_backend::arange(
             static_cast<int64_t>(rows) * width,
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32))
@@ -226,7 +224,7 @@ int run_cpu_linear_check(
             .to(mfq_tensor_backend::kFloat16).contiguous();
     }
     auto run_cpu = [&]() {
-        return gate_mode == 0
+        return gate_mode == InputGateMode::None
             ? cpu_linear.forward(execution, x)
             : cpu_linear.forward_input_mul(
                 execution, x, gate, gate_mode);
@@ -242,8 +240,8 @@ int run_cpu_linear_check(
 
     auto cuda_x = x.to(mfq_tensor_backend::kCUDA).contiguous();
     mfq_tensor_backend::Tensor cuda_gate;
-    if (gate_mode != 0) cuda_gate = gate.to(mfq_tensor_backend::kCUDA).contiguous();
-    auto reference = gate_mode == 0
+    if (gate_mode != InputGateMode::None) cuda_gate = gate.to(mfq_tensor_backend::kCUDA).contiguous();
+    auto reference = gate_mode == InputGateMode::None
         ? cuda_linear.forward(execution, cuda_x)
         : cuda_linear.forward_input_mul(
             execution, cuda_x, cuda_gate, gate_mode);

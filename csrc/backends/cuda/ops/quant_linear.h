@@ -31,14 +31,20 @@ bool decode_branch_parallel_enabled(
     bool serial_branches,
     std::int64_t rows);
 
+// Gate applied to the input before the projection. The values are the kernel
+// ABI of the fused input-gate launches, which still take a plain int.
+enum class InputGateMode : int { None = 0, Sigmoid = 1, Silu = 2 };
+
 mfq_tensor_backend::Tensor run_nint_linear(
     CudaProfiler& profiler, KlMmqState& kl_mmq,
     const NintWeight& weight, mfq_tensor_backend::Tensor input,
-    MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt, int mode = 0);
+    MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt,
+    InputGateMode mode = InputGateMode::None);
 mfq_tensor_backend::Tensor run_nvq_linear(
     CudaProfiler& profiler, KlMmqState& kl_mmq,
     const NvqWeight& weight, mfq_tensor_backend::Tensor input,
-    MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt, int mode = 0);
+    MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt,
+    InputGateMode mode = InputGateMode::None);
 
 mfq_tensor_backend::Tensor tensor_to_cuda_device(
     ModelParallelCollectiveRuntime& collectives,
@@ -51,7 +57,7 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
     const struct QuantLinearShard& shard,
     mfq_tensor_backend::Tensor input,
     MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt,
-    int gate_mode = 0);
+    InputGateMode gate_mode = InputGateMode::None);
 
 
 struct NintLinearGroup {
@@ -135,7 +141,7 @@ struct QuantLinear {
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             MfqOptional<mfq_tensor_backend::Tensor> gate,
-            int gate_mode) const;
+            InputGateMode gate_mode) const;
 
     mfq_tensor_backend::Tensor forward_dense(mfq_tensor_backend::Tensor x) const;
 
@@ -153,12 +159,12 @@ struct QuantLinear {
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor gate,
-            int mode) const;
+            InputGateMode mode) const;
     mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor gate,
-            int mode) const;
+            InputGateMode mode) const;
     int64_t out() const;
     int64_t neuron_len() const;
 };

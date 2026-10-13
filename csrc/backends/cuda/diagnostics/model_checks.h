@@ -5,10 +5,11 @@
 #include <vector>
 
 enum class TensorParallelAxis;
+enum class InputGateMode : int;
 struct CudaExecutionContext;
 
-int run_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, int gate_mode, int repetitions);
-int run_cpu_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, int gate_mode, int repetitions);
+int run_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
+int run_cpu_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
 int run_tensor_parallel_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, TensorParallelAxis axis, int rows);
 std::vector<std::string> parse_tensor_names(const std::string& value);
 int run_linear_group_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& names, int rows, int repetitions);

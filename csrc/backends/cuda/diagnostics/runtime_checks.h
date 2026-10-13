@@ -824,7 +824,7 @@ static int run_qwen35_mtp_check(
             .reshape({33, 33}).to(dtype);
         const double tolerance = dtype == mfq_tensor_backend::kBFloat16 ? .008
             : dtype == mfq_tensor_backend::kFloat16 ? .001 : 2.e-6;
-        for (int m = 1; m <= 6; ++m) for (int mode : {1, 2}) {
+        for (int m = 1; m <= 6; ++m) for (auto mode : {InputGateMode::Sigmoid, InputGateMode::Silu}) {
             auto actual = linear.forward_input_mul(
                 execution, test_input.narrow(1, 0, m),
                 test_gate.narrow(1, 0, m), mode);
@@ -832,7 +832,7 @@ static int run_qwen35_mtp_check(
                 "dense gate output dtype or shape mismatch");
             auto values = actual.to(mfq_tensor_backend::kFloat32).cpu();
             for (int i = 0; i < m * 33; ++i) {
-                const double activated = (mode == 1 ? 1. : gate[i]) / (1. + std::exp(-double(gate[i])));
+                const double activated = (mode == InputGateMode::Sigmoid ? 1. : gate[i]) / (1. + std::exp(-double(gate[i])));
                 const double reference = double(input[i]) * activated;
                 const double value = values.template data_ptr<float>()[i];
                 MFQ_RUNTIME_CHECK(std::isfinite(value) &&

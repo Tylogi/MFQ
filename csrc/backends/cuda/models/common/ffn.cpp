@@ -216,7 +216,7 @@ mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(CudaExecutionContext 
                       "FP32-output IN diagnostic requires a local dense SiLU FFN");
     auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
     return profiler.measure("ffn.down.fp32_output", [&]() {
-        return down.forward_input_mul_f32_kld(execution, parts[1], parts[0], 2);
+        return down.forward_input_mul_f32_kld(execution, parts[1], parts[0], InputGateMode::Silu);
     });
 }
 
@@ -660,7 +660,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             if (activation != Activation::silu || limit > 0.0 || down.is_dense() || down.is_mxfp8())
                 return {};
             return profiler.measure("ffn.down",
-                                    [&] { return down.forward_input_mul(execution, up, gate, 2); });
+                                    [&] { return down.forward_input_mul(execution, up, gate, InputGateMode::Silu); });
         });
 }
 

@@ -515,7 +515,7 @@ static void check_linear_execution() {
             };
             verify([&](auto x) { return linear->forward(owner, x); });
             verify([&](auto x) { return linear->forward_bf16_output(owner, x); });
-            for (int gate_mode : {1, 2}) {
+            for (auto gate_mode : {InputGateMode::Sigmoid, InputGateMode::Silu}) {
                 verify([&](auto x) { return linear->forward_input_mul(owner, x, x, gate_mode); });
                 if (linear->is_nint() && mode == KlMmqMode::Fp16) {
                     verify([&](auto x) {
