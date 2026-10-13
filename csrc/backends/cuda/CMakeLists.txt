@@ -138,7 +138,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
-    PUBLIC mfq-cuda-native CUDA::cuda_driver
+    PUBLIC mfq-cuda-native CUDA::cuda_driver mfq-ggml
     PRIVATE mfq-core mfq-ggml-internal-headers
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
@@ -369,18 +369,18 @@ target_compile_definitions(mfq-cuda-ops PRIVATE
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
-    ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_ffn_pipeline.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/ffn_pipeline.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/mx_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/sq_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/nint_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/vq_weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_quant_range_source.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_host_expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/quant_range_source.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/graph_registry.cpp
     ${MFQ_CUDA_ROOT}/ops/decode_window.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_residency.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe/residency.cpp
     ${MFQ_CUDA_ROOT}/storage/nint_row_pipeline.cpp
     ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
 )
