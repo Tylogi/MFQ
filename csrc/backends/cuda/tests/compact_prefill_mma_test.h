@@ -1,6 +1,6 @@
 #pragma once
 #include "storage/weight_loader.h"
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 
 void verify_compact_prefill_mma(const std::filesystem::path& root) {
     CudaExecutionContext execution;

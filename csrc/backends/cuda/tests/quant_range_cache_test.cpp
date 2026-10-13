@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_expert_cache.h"
-#include "storage/moe_quant_range_source.h"
+#include "storage/moe/expert_cache.h"
+#include "storage/moe/quant_range_source.h"
 #include "ops/cuda_execution.h"
 
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 
 namespace tb=mfq_tensor_backend;
 namespace {

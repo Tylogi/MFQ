@@ -4,7 +4,7 @@
 #include "ops/execution_options.h"
 #include "storage/mapped_embedding.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include <algorithm>
 #include <iostream>
 #include "models/deepseek_v41/ops.h"

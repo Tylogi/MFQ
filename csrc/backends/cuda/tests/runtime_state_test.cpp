@@ -16,7 +16,7 @@
 #include "storage/session_state.h"
 #include "ops/moe.h"
 #include "storage/mfe_expert_store.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include "storage/weight_loader.h"
 
 #include <chrono>
@@ -24,7 +24,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 #include "storage/quant_weight_loader.h"
 
 using namespace mfq::cuda;

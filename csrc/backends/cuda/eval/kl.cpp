@@ -11,7 +11,7 @@
 #include "storage/weight_loader.h"
 #include "ops/quant_linear.h"
 #include "ops/cuda_execution.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"

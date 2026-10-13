@@ -1,7 +1,7 @@
 #pragma once
 
 #include "native/env.h"
-#include "storage/moe_cached_source_internal.h"
+#include "storage/moe/cached_source_internal.h"
 
 // Seed real compressed transfer-cache fields without launching the unrelated
 // FFN consumer graph; this fixture can also run under Compute Sanitizer.

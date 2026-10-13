@@ -10,7 +10,7 @@
 #include "models/qwen4_exp/ops.h"
 #include "model_components.h"
 #include "load_options.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 
 #include <chrono>
 #include <memory>

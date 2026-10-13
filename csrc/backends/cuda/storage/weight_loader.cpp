@@ -14,13 +14,13 @@
 #include <limits>
 #include <numeric>
 
-#include "moe_expert_cache.h"
+#include "moe/expert_cache.h"
 #include "mfe_expert_store.h"
-#include "moe_quant_range_source.h"
+#include "moe/quant_range_source.h"
 #include "mfq/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 #include "storage/quant_weight_loader.h"
 
 const mfq::TensorMetadata& require_tensor(

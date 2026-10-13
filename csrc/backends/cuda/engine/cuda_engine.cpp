@@ -7,7 +7,7 @@
 #include "batch_execution.h"
 #include "models/qwen35/batch_state.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include "storage/kv_offload.h"
 #include "ops/execution_options.h"
 #include "storage/text_session_cache.h"

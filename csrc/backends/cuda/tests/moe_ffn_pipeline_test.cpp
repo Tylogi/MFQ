@@ -1,14 +1,14 @@
 #include "native/env.h"
-#include "storage/moe_ffn_pipeline.h"
+#include "storage/moe/ffn_pipeline.h"
 #include "ops/decode_window.h"
 #include "ops/execution_options.h"
 #include "kernels/moe_pipeline.h"
 #include "ops/router_lookahead_audit.h"
 #include "kernels/moe_ops.h"
 #include "kernels/moe_cache_transfer.h"
-#include "storage/moe_residency.h"
-#include "storage/moe_quant_range_source.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/residency.h"
+#include "storage/moe/quant_range_source.h"
+#include "storage/moe/expert_cache.h"
 #include "storage/weight_loader.h"
 #include "ops/moe.h"
 #include "mfq/moe_dispatch_plan.h"
@@ -21,7 +21,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 #include "storage/quant_weight_loader.h"
 namespace tb=mfq_tensor_backend;
 namespace {

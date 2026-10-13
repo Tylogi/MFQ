@@ -28,7 +28,7 @@ inline void finish_cuda_activity_trace() noexcept {
 #include "native/tensor_backend.h"
 #include "mfq/model_source.h"
 #include "ops/cuda_execution.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include <cuda_profiler_api.h>
 #include "engine/load_options.h"
 #include "models/qwen4_exp/mtp.h"
@@ -326,7 +326,7 @@ int generate_diagnostic_tokens(
 #include "diagnostics/flash_next_mtp.h"
 #include "minicpmo45.h"
 #include "ops/cuda_execution.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include "ops/execution_options.h"
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"
 

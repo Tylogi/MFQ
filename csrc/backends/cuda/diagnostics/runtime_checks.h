@@ -9,7 +9,7 @@
 #include "models/qwen35/mtp.h"
 #include "ops/quant_linear.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_expert_cache.h"
+#include "storage/moe/expert_cache.h"
 #include "storage/text_session_cache.h"
 #include "ops/cuda_execution.h"
 #include "models/qwen35/linear_attention.h"

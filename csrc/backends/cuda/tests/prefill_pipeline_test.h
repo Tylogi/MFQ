@@ -1,7 +1,7 @@
 #pragma once
 #include "native/env.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_weight_loader.h"
+#include "storage/moe/weight_loader.h"
 
 void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false,bool partial_pin=false) {
     struct Setting {
