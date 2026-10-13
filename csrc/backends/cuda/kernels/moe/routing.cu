@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "csrc/backends/cuda/kernels/moe_cache_transfer.h"
+#include "cache_transfer.h"
 // Copy the aligned body with wide loads even when the field has a short tail.
 // Compact expert fields can have an eight-byte slot stride; requiring a
 // sixteen-byte total length made those whole fields fall back to byte loads.
@@ -54,7 +54,7 @@ __device__ __forceinline__ void mfq_moe_copy_bytes(
     else if(!(alignment&1))mfq_moe_copy_vector_body<unsigned short>(destination,source,bytes,worker,workers);
     else mfq_moe_copy_vector_body<unsigned char>(destination,source,bytes,worker,workers);
 }
-#include "glu.cuh"
+#include "kernels/glu.cuh"
 
 
 void launch_nint_matmul_routed_cuda(

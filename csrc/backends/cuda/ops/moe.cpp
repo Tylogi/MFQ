@@ -1,5 +1,5 @@
 #include "execution_options.h"
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 #include "kernels/quant_ops.h"
 #include "kernels/nint_route_hint.h"
 #include "kernels/nvq1_decode.h"
@@ -8,7 +8,7 @@
 #include "quant_linear.h"
 #include "format.h"
 #include "mfq_format_compat.h"
-#include "kernels/moe_pipeline.h"
+#include "kernels/moe/pipeline.h"
 
 #include <algorithm>
 #include <cstdlib>

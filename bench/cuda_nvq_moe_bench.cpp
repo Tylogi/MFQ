@@ -1,6 +1,6 @@
 #include "storage/weight_loader.h"
 #include "packed_bench_utils.h"
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 #include "ops/moe.h"
 #include "mfq/model_source.h"
 #include <array>

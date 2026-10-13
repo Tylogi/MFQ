@@ -1,6 +1,6 @@
 #include "kernels/quant_ops.h"
 #define MFQ_NVQ_BACKWARD 1
-#include "nvq_matmul_impl.cuh"
+#include "matmul_impl.cuh"
 
 mfq_tensor_backend::Tensor nvq_dequant_cuda(
     mfq_tensor_backend::Tensor indices,

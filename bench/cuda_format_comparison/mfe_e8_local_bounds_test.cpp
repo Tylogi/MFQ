@@ -1,5 +1,5 @@
-#include "csrc/backends/cuda/kernels/mfe_e8_narrow_bounds.h"
-#include "csrc/backends/cuda/kernels/mfe_nvq_dense_bounds.h"
+#include "csrc/backends/cuda/kernels/mfe/e8_narrow_bounds.h"
+#include "csrc/backends/cuda/kernels/mfe/nvq_dense_bounds.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>

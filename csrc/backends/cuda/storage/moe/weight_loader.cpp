@@ -2,7 +2,7 @@
 
 #include "ops/execution_options.h"
 #include "ops/format.h"
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 #include "kernels/quant_ops.h"
 #include "compat/mfq_format_compat.h"
 #include "ops/quant_linear.h"

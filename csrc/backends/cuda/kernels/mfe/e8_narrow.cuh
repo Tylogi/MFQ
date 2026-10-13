@@ -1,5 +1,5 @@
 #pragma once
-#include "nvq_device.cuh"
+#include "kernels/nvq/device.cuh"
 
 namespace mfq::cuda {
 __device__ __forceinline__ uint32_t load_mfe_e8_signs_words32(

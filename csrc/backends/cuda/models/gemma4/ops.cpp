@@ -1,4 +1,4 @@
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 #include "kernels/norm_ops.h"
 #include "storage/weight_loader.h"
 #include "ops.h"

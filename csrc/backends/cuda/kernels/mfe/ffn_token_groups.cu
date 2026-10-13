@@ -2,10 +2,10 @@
 // retain their specialized, inlined dot loops below.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
 #include "native/env.h"
-#include "mfe_ffn_device.cuh"
-#include "mfe_ffn_token_groups.h"
-#include "mfe_ffn_compact.h"
-#include "nvq_dense_window32.cuh"
+#include "ffn_device.cuh"
+#include "ffn_token_groups.h"
+#include "ffn_compact.h"
+#include "kernels/nvq/dense_window32.cuh"
 
 namespace mfq::cuda {
 namespace {

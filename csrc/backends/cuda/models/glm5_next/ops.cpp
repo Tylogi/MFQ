@@ -1,4 +1,4 @@
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"

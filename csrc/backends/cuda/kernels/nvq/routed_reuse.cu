@@ -1,7 +1,7 @@
 #include "native/env.h"
-#include "nvq_device.cuh"
+#include "device.cuh"
 
-#include "packed_nvq.cuh"
+#include "kernels/packed_nvq.cuh"
 namespace mfq::cuda {
 
 // Three canonical E8 indices fit in two aligned words. In the 36-bit case,

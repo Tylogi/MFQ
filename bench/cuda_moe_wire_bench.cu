@@ -1,4 +1,4 @@
-#include "kernels/moe_pipeline.h"
+#include "kernels/moe/pipeline.h"
 #include "packed_bench_utils.h"
 #include <cuda_runtime.h>
 #include <array>

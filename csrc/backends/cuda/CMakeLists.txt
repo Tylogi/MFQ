@@ -79,11 +79,11 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.cpp
+    ${MFQ_CUDA_KERNEL_ROOT}/moe/routing.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.cpp
     ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
@@ -91,10 +91,10 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_moe.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_backward.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/backward.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/routed_reuse.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
@@ -106,27 +106,27 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/moe_pipeline.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/moe/pipeline.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
 
 # Keep the shared packed math in incremental builds even when nvcc's depfile
 # omits headers from a heavily inlined translation unit on Windows.
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nint_whole.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nint_whole.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq_moe.cu
-    PROPERTIES OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq_backward.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_backward.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
+    PROPERTIES OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq/backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_backward.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
 set_source_files_properties(${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu PROPERTIES
     COMPILE_OPTIONS "--maxrregcount=80")
 target_compile_definitions(mfq-cuda-native-kernels PRIVATE
@@ -475,6 +475,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(mfq-cuda-nvq-byte-signs-test
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_byte_signs_test.cu)
+    target_include_directories(mfq-cuda-nvq-byte-signs-test PRIVATE ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-cuda-nvq-byte-signs-test PRIVATE CUDA::cudart)
     set_target_properties(mfq-cuda-nvq-byte-signs-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}" CUDA_STANDARD 17 CUDA_RUNTIME_LIBRARY Shared)

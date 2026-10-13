@@ -6,18 +6,18 @@
 #define MFQ_MFE_PROJECT_INLINE __forceinline__
 #endif
 #if MFQ_MFE_COMPACT_NVQ
-#include "mfe_nvq_compact_dot.cuh"
+#include "nvq_compact_dot.cuh"
 #endif
-#include "mfe_ffn.h"
+#include "ffn.h"
 #include <cuda_bf16.h>
-#include "packed_nint.cuh"
-#include "packed_nvq.cuh"
-#include "mfe_e8_narrow.cuh"
-#include "nvq_device.cuh"
-#include "mfe_ffn_launch.h"
-#include "warp_multi_sum.cuh"
-#include "nint_route_group.cuh"
-#include "mfe_nint_whole.cuh"
+#include "kernels/packed_nint.cuh"
+#include "kernels/packed_nvq.cuh"
+#include "e8_narrow.cuh"
+#include "kernels/nvq/device.cuh"
+#include "ffn_launch.h"
+#include "kernels/warp_multi_sum.cuh"
+#include "kernels/nint_route_group.cuh"
+#include "nint_whole.cuh"
 #include <algorithm>
 #include <cstdlib>
 #include <climits>

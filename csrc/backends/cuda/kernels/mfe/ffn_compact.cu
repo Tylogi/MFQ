@@ -1,7 +1,7 @@
 #define MFQ_MFE_COMPACT_NVQ 1
 #include "native/env.h"
-#include "mfe_ffn_device.cuh"
-#include "mfe_ffn_compact.h"
+#include "ffn_device.cuh"
+#include "ffn_compact.h"
 
 namespace mfq::cuda {
 namespace {

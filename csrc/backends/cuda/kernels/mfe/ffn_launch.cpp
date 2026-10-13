@@ -1,7 +1,7 @@
 #include "native/env.h"
-#include "mfe_ffn_launch.h"
-#include "mfe_ffn.h"
-#include "mfe_ffn_compact.h"
+#include "ffn_launch.h"
+#include "ffn.h"
+#include "ffn_compact.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <array>

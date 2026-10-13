@@ -1,5 +1,5 @@
 #pragma once
-#include "mfe_ffn.h"
+#include "ffn.h"
 
 namespace mfq::cuda {
 bool mfe_ffn_compact_requested(const MfeFfnBatch&,bool down);

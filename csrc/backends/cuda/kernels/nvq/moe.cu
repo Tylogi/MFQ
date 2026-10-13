@@ -1,6 +1,6 @@
 #define MFQ_NVQ_MOE 1
 #include "native/env.h"
-#include "nvq_matmul_impl.cuh"
+#include "matmul_impl.cuh"
 
 mfq_tensor_backend::Tensor nepq_dequant_cuda(
     mfq_tensor_backend::Tensor indices,

@@ -12,7 +12,7 @@
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
 #include "native/env.h"
-#include "nvq_device.cuh"
+#include "device.cuh"
 
 #include <cuda_runtime.h>
 #include "csrc/backends/cuda/native/tensor_backend.h"
@@ -26,9 +26,9 @@
 #include <type_traits>
 
 #if defined(MFQ_NVQ_BACKWARD)
-#include "packed_backward.cuh"
+#include "kernels/packed_backward.cuh"
 #endif
-#include "packed_nvq.cuh"
+#include "kernels/packed_nvq.cuh"
 namespace mfq::cuda::packed_nvq {
 __host__ __device__ constexpr bool dense_nvq_format(int format) {
     return format==5 || format==10 || format==11 || format==12 ||
@@ -68,7 +68,7 @@ __device__ __forceinline__ int2 decode_dense_nvq_vector(
     return decode_dense_nvq_vector<Format,2>(r,bank,sign_mode);
 }
 } // namespace mfq::cuda::packed_nvq
-#include "async_copy.cuh"
+#include "kernels/async_copy.cuh"
 
 using namespace nvcuda;
 

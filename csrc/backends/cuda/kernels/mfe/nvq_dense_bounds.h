@@ -1,6 +1,6 @@
 #pragma once
 #include "native/env.h"
-#include "mfe_ffn.h"
+#include "ffn.h"
 #include <climits>
 #include <cstdlib>
 

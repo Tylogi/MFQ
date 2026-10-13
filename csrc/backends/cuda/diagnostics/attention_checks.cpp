@@ -5,7 +5,7 @@
 #include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"
 #include "kernels/attention_ops.h"
-#include "kernels/moe_ops.h"
+#include "csrc/backends/cuda/kernels/moe/ops.h"
 #include "kernels/norm_ops.h"
 
 #include <cuda_runtime_api.h>

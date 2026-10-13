@@ -9,7 +9,7 @@
 #include "ops/quant_linear.h"
 #include "ops/cuda_execution.h"
 #include "storage/moe/expert_cache.h"
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 
 #include <cuda_runtime_api.h>
 

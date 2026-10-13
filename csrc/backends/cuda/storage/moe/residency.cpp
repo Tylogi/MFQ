@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "storage/moe/residency.h"
 #include "ops/decode_window.h"
-#include "kernels/moe_pipeline.h"
+#include "kernels/moe/pipeline.h"
 #include "storage/moe/cached_source_internal.h"
 #include "mfq/cpu_expert_pool.h"
 #include "mfq/host_memory_copy.h"

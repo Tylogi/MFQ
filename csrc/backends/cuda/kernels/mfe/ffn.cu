@@ -2,9 +2,9 @@
 // compact decode translation unit keeps its fully inlined specializations.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
 #include "native/env.h"
-#include "mfe_ffn_device.cuh"
-#include "mfe_ffn_compact.h"
-#include "mfe_ffn_token_groups.h"
+#include "ffn_device.cuh"
+#include "ffn_compact.h"
+#include "ffn_token_groups.h"
 namespace mfq::cuda {
 namespace {
 bool mfe_group_dot_enabled() {

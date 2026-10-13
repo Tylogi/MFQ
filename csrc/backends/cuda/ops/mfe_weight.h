@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 
 #include "cuda_execution.h"
 #include "fp8_sq.h"

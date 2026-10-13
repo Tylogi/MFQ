@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/moe_ops.h"
+#include "kernels/moe/ops.h"
 
 #include "ops/execution_options.h"
 #include "storage/moe/expert_cache.h"
@@ -9,7 +9,7 @@
 #include "storage/mfe_expert_store.h"
 #include "quant_range_source.h"
 #include "mfq/moe_cache_policy.h"
-#include "kernels/moe_cache_transfer.h"
+#include "kernels/moe/cache_transfer.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstdlib>

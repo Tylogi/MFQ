@@ -1,5 +1,5 @@
 #include "../../csrc/backends/cuda/kernels/packed_nvq.cuh"
-#include "../../csrc/backends/cuda/kernels/nvq_device.cuh"
+#include "../../csrc/backends/cuda/kernels/nvq/device.cuh"
 #include <algorithm>
 #include <array>
 #include <cstdio>
