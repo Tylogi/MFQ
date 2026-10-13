@@ -2,6 +2,7 @@
 #include "generation_flow.h"
 #include "runtime_config.h"
 #include "gguf.h"
+#include "engine_instance.h"
 #include <cstdio>
 
 #include <cassert>

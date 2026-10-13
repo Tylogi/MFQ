@@ -5,6 +5,12 @@ else()
     add_compile_options(-UNDEBUG)
 endif()
 
+find_program(MFQ_PYTHON_EXECUTABLE NAMES python3 python)
+if(MFQ_PYTHON_EXECUTABLE)
+    add_test(NAME mfq-engine-include-graph-test
+        COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_engine_include_graph.py)
+endif()
+
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/tensor_view_test.cpp
 )

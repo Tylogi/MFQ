@@ -14,6 +14,7 @@
 #include "mtp_metrics.h"
 #include "request_executor.h"
 #include "generation_flow.h"
+#include "engine_instance.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
