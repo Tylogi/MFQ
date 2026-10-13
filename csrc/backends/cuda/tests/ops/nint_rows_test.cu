@@ -1,5 +1,5 @@
 #include "kernels/quant_ops.h"
-#include "../../tests/nint_row_fixture.h"
+#include "../../../../tests/quant/nint_row_fixture.h"
 #include <cstring>
 #include <iostream>
 #include <stdexcept>

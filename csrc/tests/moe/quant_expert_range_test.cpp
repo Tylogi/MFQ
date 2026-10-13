@@ -1,7 +1,7 @@
 #include "mfq/quant/mfe_expert_store.h"
 #include "mfq/quant/packed_nint_expert_store.h"
 #include "mfq/model_source/model_source.h"
-#include "nint_row_fixture.h"
+#include "../quant/nint_row_fixture.h"
 
 #include <atomic>
 #include <chrono>
