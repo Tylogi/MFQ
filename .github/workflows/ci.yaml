@@ -32,3 +32,17 @@ jobs:
         run: |
           cmake --build build/csrc --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test
           ctest --test-dir build/csrc --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45)-test$'
+
+  cuda-source-hygiene:
+    name: CUDA source hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Keep the CUDA backend include graph a DAG
+        run: python3 tests/test_cuda_include_graph.py
+      - name: Keep MFQ_* knobs behind the env module
+        run: |
+          ! grep -rn --include='*.cpp' --include='*.cu' --include='*.cuh' --include='*.h' \
+              -E '(std::)?getenv\(|[^_a-z](setenv|unsetenv)\(|_putenv_s\(' csrc/backends/cuda \
+            | grep -v -e 'backends/cuda/native/env\.cpp:' -e 'backends/cuda/commands/runtime\.cpp:'
