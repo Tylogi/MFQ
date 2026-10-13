@@ -11,6 +11,7 @@
 // performs signed int8 dot products with __dp4a or integer MMA. The medium-M
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_fp16.h>
@@ -3978,28 +3979,28 @@ void launch_nepq_by_format(int format, Launch && launch) {
 
 #if defined(MFQ_NVQ_DENSE)
 int aligned_group_rows_per_block(int format) {
-    const char * value = std::getenv(
+    const char * value = mfq::cuda::env_lookup(
         format == kNvq2JscXLGroupExec
             ? "MFQ_NVQ_GROUP_ROWS_E8"
             : "MFQ_NVQ_GROUP_ROWS_D4");
-    if (value == nullptr) value = std::getenv("MFQ_NVQ_GROUP_ROWS");
+    if (value == nullptr) value = mfq::cuda::env_lookup("MFQ_NVQ_GROUP_ROWS");
     if (value != nullptr && value[0] == '4') return 4;
     if (value != nullptr && value[0] == '2') return 2;
     return 1;
 }
 
 int aligned_group_row_tile(int format) {
-    const char * value = std::getenv(
+    const char * value = mfq::cuda::env_lookup(
         format == kNvq2JscXLGroupExec
             ? "MFQ_NVQ_ROW_TILE_E8"
             : "MFQ_NVQ_ROW_TILE_D4");
-    if (value == nullptr) value = std::getenv("MFQ_NVQ_ROW_TILE");
+    if (value == nullptr) value = mfq::cuda::env_lookup("MFQ_NVQ_ROW_TILE");
     return value == nullptr ? 0 : std::atoi(value);
 }
 
 bool aligned_group_e8_down_w32r1_enabled() {
     static const bool value = [] {
-        const char * text = std::getenv("MFQ_NVQ_E8_STAGE_DOWN_W32R1");
+        const char * text = mfq::cuda::env_lookup("MFQ_NVQ_E8_STAGE_DOWN_W32R1");
         return text == nullptr || text[0] != '0';
     }();
     return value;
@@ -4326,7 +4327,7 @@ bool launch_group_vec8(
     mfq_tensor_backend::Tensor& output,
     int M, int N, int ng, int nvec, int nsign, int sub_bits, int sign_mode, cudaStream_t stream) {
     if (M > 4 || ng > 128 || N < 128 || N > 4096 ||
-        (sub_bits != 4 && format != kNvq1L) || std::getenv("MFQ_NVQ_DENSE_REFERENCE")) return false;
+        (sub_bits != 4 && format != kNvq1L) || mfq::cuda::env_lookup("MFQ_NVQ_DENSE_REFERENCE")) return false;
     if (M == 1 && ng > 32 &&
         (format == kNvq2Jsc || format == kNvq3Jsc || format == kNvq3JscL)) return false;
     const NvqDeviceWeight weight{indices.data_ptr<uint8_t>(), indices.numel(),

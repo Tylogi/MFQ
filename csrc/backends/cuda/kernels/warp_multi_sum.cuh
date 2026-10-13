@@ -2,12 +2,13 @@
 // Copyright (c) 2026 Niko1221 and the Strata contributors.
 // MIT license: csrc/third_party/strata.LICENSE.
 #pragma once
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include <cstdlib>
 
 namespace mfq::cuda::warp_multi_sum {
 inline bool enabled() {
-    const auto* setting=std::getenv("MFQ_CUDA_WARP_MULTI_SUM");
+    const auto* setting=mfq::cuda::env_lookup("MFQ_CUDA_WARP_MULTI_SUM");
     return setting && setting[0]=='1' && setting[1]=='\0';
 }
 template<int Offset>

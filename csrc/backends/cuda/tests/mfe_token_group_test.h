@@ -1,24 +1,17 @@
 #pragma once
+#include "native/env.h"
 #include "ops/mfe_ffn_runtime.h"
 #include <cstring>
 
 void verify_mfe_token_groups(const std::filesystem::path& root) {
     struct Environment {
         std::string previous;
-        Environment(){if(const auto* s=std::getenv("MFQ_MFE_TOKEN_GROUPS"))previous=s;}
+        Environment(){if(const auto* s=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUPS"))previous=s;}
         static void select(bool enabled) {
-#ifdef _WIN32
-            _putenv_s("MFQ_MFE_TOKEN_GROUPS",enabled?"1":"0");
-#else
-            setenv("MFQ_MFE_TOKEN_GROUPS",enabled?"1":"0",1);
-#endif
+            mfq::cuda::env_set("MFQ_MFE_TOKEN_GROUPS",enabled?"1":"0");
         }
         ~Environment(){
-#ifdef _WIN32
-            _putenv_s("MFQ_MFE_TOKEN_GROUPS",previous.c_str());
-#else
-            if(previous.empty())unsetenv("MFQ_MFE_TOKEN_GROUPS");else setenv("MFQ_MFE_TOKEN_GROUPS",previous.c_str(),1);
-#endif
+            if(previous.empty())mfq::cuda::env_clear("MFQ_MFE_TOKEN_GROUPS");else mfq::cuda::env_set("MFQ_MFE_TOKEN_GROUPS",previous.c_str());
         }
     } environment;
     CudaExecutionContext execution;

@@ -9,6 +9,7 @@
 // kernel; larger batches use its row decoder followed by GEMM.
 
 
+#include "native/env.h"
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -1823,7 +1824,7 @@ mfq_tensor_backend::Tensor cublas_gemm_nt_f32_output(
 }  // namespace
 
 bool nint_late_scale_enabled(int64_t input_width,int bits,int device) {
-    if(const auto* setting=std::getenv("MFQ_NINT_LATE_SCALE"))return setting[0]!='0';
+    if(const auto* setting=mfq::cuda::env_lookup("MFQ_NINT_LATE_SCALE"))return setting[0]!='0';
     if(input_width<2048 || bits<5 || bits>6)return false;
     thread_local int cached_device=-1,major=0,minor=0;
     if(device!=cached_device) {
@@ -1864,11 +1865,11 @@ static void nint_moe_grouped_matmul_dispatch_cuda(
         reinterpret_cast<__half*>(output.data_ptr()),int(ids.numel()),int(ids.size(1)),int(expert_pool.numel()),
         int(output.size(2)),routed_input,mfq::cuda::warp_multi_sum::enabled());
     };
-    const char* grouped=std::getenv("MFQ_NINT_GROUP_DOT");
-    const char* lanes=std::getenv("MFQ_NINT_ROUTE_LANES");
-    const char* blocks=std::getenv("MFQ_NINT_ROUTE_BLOCKS");
-    const char* rows=std::getenv("MFQ_NINT_ROUTE_ROWS");
-    const char* hint=std::getenv("MFQ_NINT_ROUTE_HINT");
+    const char* grouped=mfq::cuda::env_lookup("MFQ_NINT_GROUP_DOT");
+    const char* lanes=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_LANES");
+    const char* blocks=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_BLOCKS");
+    const char* rows=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_ROWS");
+    const char* hint=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_HINT");
     if((!grouped || grouped[0]!='0') && (!hint || hint[0]!='0') &&
             (group_hint==24 || group_hint==28) && bits_hint>=4 && bits_hint<=6) {
         const auto hinted_warps=[&](auto gs,auto bits,auto warps) {
@@ -1885,7 +1886,7 @@ static void nint_moe_grouped_matmul_dispatch_cuda(
             else launch_scale(std::false_type{});
         };
         const auto hinted=[&](auto gs,auto bits) {
-            const char* warps=std::getenv("MFQ_NINT_ROUTE_WARPS");
+            const char* warps=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_WARPS");
             if(warps && std::atoi(warps)==4)hinted_warps(gs,bits,std::integral_constant<int,4>{});
             else hinted_warps(gs,bits,std::integral_constant<int,1>{});
         };
@@ -1937,10 +1938,10 @@ bool nint_try_single_route_cuda(
         mfq_tensor_backend::Tensor ids,mfq_tensor_backend::Tensor output,
         bool routed_input,int bits_hint,bool metadata_ready) {
     namespace tb=mfq_tensor_backend;
-    const char* setting=std::getenv("MFQ_NINT_DIRECT_POOL");
-    const char* grouped=std::getenv("MFQ_NINT_GROUP_DOT");
-    const char* hint=std::getenv("MFQ_NINT_ROUTE_HINT");
-    const char* warps=std::getenv("MFQ_NINT_ROUTE_WARPS");
+    const char* setting=mfq::cuda::env_lookup("MFQ_NINT_DIRECT_POOL");
+    const char* grouped=mfq::cuda::env_lookup("MFQ_NINT_GROUP_DOT");
+    const char* hint=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_HINT");
+    const char* warps=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_WARPS");
     if((setting && setting[0]=='0') || (grouped && grouped[0]=='0') || (hint && hint[0]=='0') ||
             (warps && std::atoi(warps)==4) || bits_hint<4 || bits_hint>6 ||
             (weight.geometry[1]!=24 && weight.geometry[1]!=28))return false;
@@ -1963,7 +1964,7 @@ bool nint_try_single_route_cuda(
                 reinterpret_cast<__half*>(output.data_ptr()),int(ids.numel()),int(ids.size(1)),
                 int(expert_local.numel()),int(output.size(2)),routed_input,weight,mfq::cuda::warp_multi_sum::enabled());
         };
-        const char* metadata=std::getenv("MFQ_NINT_ROUTE_METADATA");
+        const char* metadata=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_METADATA");
         if(weight.row_metadata && (metadata_ready || (metadata && metadata[0]!='0')))
             launch_metadata(std::true_type{});
         else launch_metadata(std::false_type{});
@@ -2336,7 +2337,7 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
         (total + threads - 1) / threads, 65535));
     if ((group_size == 24 || group_size == 28) && width % 4 == 0 &&
             (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
-            std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
+            mfq::cuda::env_lookup("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
         const auto launch = [&](auto gs) {
             nint_decode_vec4_kernel<decltype(gs)::value><<<
                 dim3((width / 4 + 127) / 128, std::min(rows, 65535)), 128, 0, mfq_current_cuda_stream()>>>(
@@ -2489,12 +2490,12 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             static_cast<int>(activation_mode),
             input.scalar_type() == mfq_tensor_backend::kFloat32,
             gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32);
-    const char* dense_group_setting = std::getenv("MFQ_NINT_GROUP_DOT");
+    const char* dense_group_setting = mfq::cuda::env_lookup("MFQ_NINT_GROUP_DOT");
     if (aligned_q8 && group_size % 4 == 0 &&
         (reinterpret_cast<uintptr_t>(bitstream.data_ptr<uint8_t>()) & 3u) == 0) {
         // Specialize only the proven one-row input, independent of device.
         if (activation_rows == 1) {
-        const char* ordered = std::getenv("MFQ_NINT_Q8_ORDERED");
+        const char* ordered = mfq::cuda::env_lookup("MFQ_NINT_Q8_ORDERED");
         if (group_size == 48 && groups <= 64 && output_rows <= 2048 &&
                 (!ordered || ordered[0] != '0')) {
             nint_q8_ordered_kernel<<<output_rows, dim3(32, 4), 0, stream>>>(
@@ -2536,9 +2537,9 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
     } else if ((group_size == 24 || group_size == 28) &&
             (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
             (!dense_group_setting || dense_group_setting[0] != '0') &&
-            std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
-        const char* whole_setting=std::getenv("MFQ_NINT_WHOLE_GROUP");
-        const char* batch_whole_setting=std::getenv("MFQ_NINT_BATCH_WHOLE_GROUP");
+            mfq::cuda::env_lookup("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
+        const char* whole_setting=mfq::cuda::env_lookup("MFQ_NINT_WHOLE_GROUP");
+        const char* batch_whole_setting=mfq::cuda::env_lookup("MFQ_NINT_BATCH_WHOLE_GROUP");
         if((activation_rows==1 || (activation_rows<=8 && (!batch_whole_setting || batch_whole_setting[0]!='0'))) &&
                 groups>32 && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
                 (!whole_setting || whole_setting[0]!='0')) {
@@ -2554,7 +2555,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
                 if(activation_rows==1)launch_whole(gs,std::integral_constant<int,1>{});
                 else if(activation_rows<=2)launch_whole(gs,std::integral_constant<int,2>{});
                 else if(activation_rows<=4)launch_whole(gs,std::integral_constant<int,4>{});
-                else if(const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");!exact || exact[0]!='0') {
+                else if(const auto* exact=mfq::cuda::env_lookup("MFQ_NINT_EXACT_BATCH");!exact || exact[0]!='0') {
                     if(activation_rows==5)launch_whole(gs,std::integral_constant<int,5>{});
                     else if(activation_rows==6)launch_whole(gs,std::integral_constant<int,6>{});
                     else launch_whole(gs,std::integral_constant<int,8>{});
@@ -2621,7 +2622,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             0,
             false,static_cast<uint64_t>(bitstream.numel()));
     };
-    const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");
+    const auto* exact=mfq::cuda::env_lookup("MFQ_NINT_EXACT_BATCH");
     if constexpr(!decltype(single)::value) {
         if(!exact || exact[0]!='0') {
             if(activation_rows==1)launch_rows(std::integral_constant<int,1>{});
@@ -2635,7 +2636,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
     }
     launch_rows(std::integral_constant<int,8>{});
     };
-    const auto* single=std::getenv("MFQ_NINT_SINGLE_ROW");
+    const auto* single=mfq::cuda::env_lookup("MFQ_NINT_SINGLE_ROW");
     if (activation_rows == 1 && single && std::strcmp(single, "1") == 0 &&
             (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0) {
         const size_t activation_bytes =
@@ -2666,7 +2667,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             use_cache = cache_warps > 1 && shared_bytes <= static_cast<size_t>(shared_limit);
         }
         // At least one warp of groups avoids underfilled lanes.
-        const auto* group_flag=std::getenv("MFQ_NINT_GROUP_DOT");
+        const auto* group_flag=mfq::cuda::env_lookup("MFQ_NINT_GROUP_DOT");
         const bool use_group=(!group_flag || std::strcmp(group_flag,"1")==0) &&
             groups>=32 && group_size>=1 && group_size<=64;
         if (use_cache) {

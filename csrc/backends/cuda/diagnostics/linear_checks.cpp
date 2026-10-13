@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "storage/weight_loader.h"
 #include "model_checks.h"
 
@@ -59,7 +60,7 @@ int run_linear_check(
                 execution, xh, gateh, gate_mode);
     };
     const char * check_bf16_output_env =
-        std::getenv("MFQ_CHECK_LINEAR_BF16_OUTPUT");
+        mfq::cuda::env_lookup("MFQ_CHECK_LINEAR_BF16_OUTPUT");
     if (check_bf16_output_env != nullptr &&
             check_bf16_output_env[0] == '1') {
         MFQ_RUNTIME_CHECK(
@@ -382,11 +383,11 @@ int run_linear_group_check(
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
     const char * preserve_env =
-        std::getenv("MFQ_CHECK_LINEAR_GROUP_PRESERVE");
+        mfq::cuda::env_lookup("MFQ_CHECK_LINEAR_GROUP_PRESERVE");
     const bool preserve_projection_boundaries =
         preserve_env != nullptr && preserve_env[0] == '1';
     const char * bf16_env =
-        std::getenv("MFQ_CHECK_LINEAR_GROUP_BF16");
+        mfq::cuda::env_lookup("MFQ_CHECK_LINEAR_GROUP_BF16");
     const bool check_bf16 =
         bf16_env != nullptr && bf16_env[0] == '1';
     auto group = load_quant_group(execution,
@@ -409,7 +410,7 @@ int run_linear_group_check(
                  .contiguous();
     auto actual = group.forward(execution, x);
     const char * check_bf16_swiglu_env =
-        std::getenv("MFQ_CHECK_BF16_SWIGLU");
+        mfq::cuda::env_lookup("MFQ_CHECK_BF16_SWIGLU");
     if (check_bf16_swiglu_env != nullptr &&
             check_bf16_swiglu_env[0] == '1') {
         MFQ_RUNTIME_CHECK(

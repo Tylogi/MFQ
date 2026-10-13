@@ -1,4 +1,5 @@
 #define MFQ_NVQ_MOE 1
+#include "native/env.h"
 #include "nvq_matmul_impl.cuh"
 
 mfq_tensor_backend::Tensor nepq_dequant_cuda(
@@ -1497,11 +1498,11 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     // A bounded format switch fits the wide G2 task in 64 registers, so two
     // BM128 CTAs can reside together.  Cross-group mixtures keep the full
     // switch, G4 path, and its wider K reuse.
-    const char* wide_rows_option = std::getenv("MFQ_NVQ_PREFILL_M256");
+    const char* wide_rows_option = mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_M256");
     const bool wide_rows = wide_rows_option && std::atoi(wide_rows_option) != 0;
-    const char* narrow_g2_option = std::getenv("MFQ_NVQ_PREFILL_NARROW_G2");
+    const char* narrow_g2_option = mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_NARROW_G2");
     const bool narrow_g2 = narrow_g2_option && std::atoi(narrow_g2_option) != 0;
-    const char* cohorts_option = std::getenv("MFQ_NVQ_PREFILL_COHORTS");
+    const char* cohorts_option = mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_COHORTS");
     const bool cohorts = !cohorts_option || std::atoi(cohorts_option) != 0;
     // Keep the M/N geometry and Tensor Core sum order. A shorter K tile
     // lowers decode liveness and shared storage, allowing three narrow CTAs.
@@ -1701,7 +1702,7 @@ static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
         reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), pairs, routes,   \
         static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
         routed_input)
-    const char* grouped=std::getenv("MFQ_NVQ_MOE_GROUP_DOT");
+    const char* grouped=mfq::cuda::env_lookup("MFQ_NVQ_MOE_GROUP_DOT");
     if(ng<=128 && out_per_expert<=4096 && (!grouped || grouped[0]!='0')) {
         mfq::cuda::NvqRoutedReuseParams reuse;
         reuse.pointers=weight_ptrs.data_ptr<int64_t>();reuse.sizes=weight_sizes.data_ptr<int64_t>();
@@ -1736,7 +1737,7 @@ static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
     else {
         // Keep each row's four-warp accumulation and reduction unchanged.
         // The opt-in sweep varies only the number of rows sharing a CTA.
-        const auto* requested=std::getenv("MFQ_NVQ_MOE_ROW_TILE");
+        const auto* requested=mfq::cuda::env_lookup("MFQ_NVQ_MOE_ROW_TILE");
         const int rows=tokens==1 && requested ? std::atoi(requested) : 2;
         switch(rows) {
             case 1: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,1);break;
@@ -1928,31 +1929,31 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     }
 
     if (tokens <= 8) {
-        const char * rows_env = std::getenv("MFQ_NVQ_MOE_ROWS_PER_BLOCK");
+        const char * rows_env = mfq::cuda::env_lookup("MFQ_NVQ_MOE_ROWS_PER_BLOCK");
         int rows_per_block = rows_env == nullptr ? 2 : std::atoi(rows_env);
         if (rows_per_block != 1 && rows_per_block != 2 &&
                 rows_per_block != 4 && rows_per_block != 8) {
             rows_per_block = 2;
         }
-        const char * warps_env = std::getenv("MFQ_NVQ_MOE_WARPS");
+        const char * warps_env = mfq::cuda::env_lookup("MFQ_NVQ_MOE_WARPS");
         int warps_override = warps_env == nullptr ? 0 : std::atoi(warps_env);
         if (warps_override != 1 && warps_override != 2 &&
                 warps_override != 4 && warps_override != 8) {
             warps_override = 0;
         }
         const char * exact_reduction_env =
-            std::getenv("MFQ_NVQ_MOE_EXACT_REDUCTION");
+            mfq::cuda::env_lookup("MFQ_NVQ_MOE_EXACT_REDUCTION");
         const bool exact_reduction =
             exact_reduction_env != nullptr &&
             std::atoi(exact_reduction_env) != 0;
         const char * exact_physical_env =
-            std::getenv("MFQ_NVQ_MOE_EXACT_PHYSICAL_WARPS");
+            mfq::cuda::env_lookup("MFQ_NVQ_MOE_EXACT_PHYSICAL_WARPS");
         const int exact_physical_warps =
             exact_physical_env != nullptr && std::atoi(exact_physical_env) == 4
             ? 4
             : 2;
         const char * share_group_env =
-            std::getenv("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+            mfq::cuda::env_lookup("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
         const bool share_group_state =
             share_group_env != nullptr && std::atoi(share_group_env) != 0;
 #define NVQ_MOE_SMALL_LAUNCH(NWARPS_VALUE, ROWS_VALUE, SHARE_VALUE)              \
@@ -2002,7 +2003,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
             static_cast<int>(sign_mode), routed_input)
         launch_by_format(static_cast<int>(format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
-            const char* grouped=std::getenv("MFQ_NVQ_MOE_GROUP_DOT");
+            const char* grouped=mfq::cuda::env_lookup("MFQ_NVQ_MOE_GROUP_DOT");
             if(!exact_reduction && ng<=128 && out_per_expert<=4096 && (!grouped || grouped[0]!='0')) {
                 const NvqDeviceWeight w{indices.data_ptr<uint8_t>(),indices.numel(),aux.data_ptr<uint8_t>(),aux.numel(),
                     sub_scale.data_ptr<uint8_t>(),sub_scale.numel(),neuron_scale.data_ptr<float>(),codebook.data_ptr<int8_t>(),

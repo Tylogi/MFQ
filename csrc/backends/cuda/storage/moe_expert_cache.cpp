@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "ops/execution_options.h"
 #include "moe_cached_source_internal.h"
 #include <map>
@@ -511,7 +512,7 @@ void MoeExpertCache::preload_complete_residency() {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
         int64_t registered=ram_allocated;
-        if(const auto* value=std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
+        if(const auto* value=mfq::cuda::env_lookup("MFQ_MOE_RAM_PIN_GIB")) {
             char* end=nullptr;const double gib=std::strtod(value,&end);
             if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
                 throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");

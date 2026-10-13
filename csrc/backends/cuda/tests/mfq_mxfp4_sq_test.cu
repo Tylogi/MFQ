@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "csrc/backends/cuda/kernels/mxfp4_sq.h"
 #include "mfq/mxfp4_sq_decode.h"
 
@@ -285,11 +286,7 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
 } // namespace
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    _putenv_s("MFQ_FORCE_SQ_TENSOR_CORE", "1");
-#else
-    setenv("MFQ_FORCE_SQ_TENSOR_CORE", "1", 1);
-#endif
+    mfq::cuda::env_set("MFQ_FORCE_SQ_TENSOR_CORE", "1");
     if (argc != 2) { std::cerr << "usage: mfq-mxfp4-sq-test FIXTURE_DIRECTORY\n"; return 2; }
     int devices = 0;
     const auto status = cudaGetDeviceCount(&devices);

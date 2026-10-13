@@ -1,3 +1,4 @@
+#include "env.h"
 #include "context.h"
 
 #include <algorithm>
@@ -55,7 +56,7 @@ std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
     auto& budget = allocation_budgets[device];
     if (!budget) {
         auto candidate = std::make_shared<AllocationBudget>();
-        if (const auto* value = std::getenv("MFQ_CUDA_VRAM_LIMIT_GIB")) {
+        if (const auto* value = mfq::cuda::env_lookup("MFQ_CUDA_VRAM_LIMIT_GIB")) {
             char* end = nullptr;
             const double gib = std::strtod(value, &end);
             const long double bytes = static_cast<long double>(gib) * 1024 * 1024 * 1024;
@@ -435,12 +436,12 @@ void Graph::capture_end() {
             pool_streams_[index].stream());
     }
     MFQ_NATIVE_CUDA_CHECK(capture_status);
-    if (const char* dot_path = std::getenv("MFQ_NATIVE_CUDA_GRAPH_DOT");
+    if (const char* dot_path = mfq::cuda::env_lookup("MFQ_NATIVE_CUDA_GRAPH_DOT");
         dot_path != nullptr && dot_path[0] != '\0') {
         MFQ_NATIVE_CUDA_CHECK(cudaGraphDebugDotPrint(
             graph_, dot_path, cudaGraphDebugDotFlagsVerbose));
     }
-    if (const char* trace = std::getenv("MFQ_TRACE_NATIVE_CUDA_GRAPH");
+    if (const char* trace = mfq::cuda::env_lookup("MFQ_TRACE_NATIVE_CUDA_GRAPH");
         trace != nullptr && std::atoi(trace) != 0) {
         std::size_t count = 0;
         MFQ_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &count));
@@ -449,7 +450,7 @@ void Graph::capture_end() {
         std::unordered_set<void*> allocations;
         std::unordered_set<void*> frees;
         std::unordered_set<void*> reported_kernels;
-        const char* resources=std::getenv("MFQ_TRACE_NATIVE_CUDA_KERNEL_RESOURCES");
+        const char* resources=mfq::cuda::env_lookup("MFQ_TRACE_NATIVE_CUDA_KERNEL_RESOURCES");
         std::size_t kernels = 0;
         std::size_t copies = 0;
         for (auto node : nodes) {
@@ -502,7 +503,7 @@ void Graph::capture_end() {
     MFQ_NATIVE_CUDA_CHECK(cudaGraphInstantiate(&executable_, graph_, 0));
     // A first replay may block in the driver while it uploads a large graph.
     // Prepare it before replay can wait for CPU-produced mapped flags.
-    if (const char* upload = std::getenv("MFQ_NATIVE_CUDA_GRAPH_UPLOAD");
+    if (const char* upload = mfq::cuda::env_lookup("MFQ_NATIVE_CUDA_GRAPH_UPLOAD");
         upload == nullptr || std::atoi(upload) != 0) {
         MFQ_NATIVE_CUDA_CHECK(cudaGraphUpload(executable_, stream_.stream()));
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));

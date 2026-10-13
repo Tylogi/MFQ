@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "engine/load_options.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
@@ -212,26 +213,16 @@ class ScopedDiagnosticEnvironment {
     bool present_;
 public:
     explicit ScopedDiagnosticEnvironment(const char* name) : name_(name) {
-        const char* previous = std::getenv(name);
+        const char* previous = mfq::cuda::env_lookup(name);
         present_ = previous != nullptr;
         if (previous) previous_ = previous;
     }
     void set(const char* value) {
-#ifdef _WIN32
-        const int result = _putenv_s(name_.c_str(), value);
-#else
-        const int result = setenv(name_.c_str(), value, 1);
-#endif
-        MFQ_RUNTIME_CHECK(result == 0,
-            "cannot set diagnostic runtime option: ", name_);
+        mfq::cuda::env_set(name_.c_str(), value);
     }
     ~ScopedDiagnosticEnvironment() {
-#ifdef _WIN32
-        (void)_putenv_s(name_.c_str(), present_ ? previous_.c_str() : "");
-#else
-        if (present_) (void)setenv(name_.c_str(), previous_.c_str(), 1);
-        else (void)unsetenv(name_.c_str());
-#endif
+        if (present_) mfq::cuda::env_set(name_.c_str(), previous_.c_str());
+        else mfq::cuda::env_clear(name_.c_str());
     }
 };
 
@@ -603,7 +594,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         }
         if (check_qwen4_decode_hidden) {
             if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-                const auto* variants=std::getenv("MFQ_MTP_GENERATION_VARIANTS");
+                const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_GENERATION_VARIANTS");
                 if(profile && variants && variants[0]=='1') {
                     MFQ_RUNTIME_CHECK(runtime_components.mtp,"MTP variants require a loaded predictor");
                     return run_qwen4_mtp_generation_variants(model,*runtime_components.mtp,
@@ -1023,7 +1014,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             return 0;
         }
         if (prefill_repeat > 0) {
-            const char * trace_env = std::getenv("MFQ_CHECK_PREFILL_REPEAT_TRACE");
+            const char * trace_env = mfq::cuda::env_lookup("MFQ_CHECK_PREFILL_REPEAT_TRACE");
             const bool trace_repeat = trace_env != nullptr && std::atoi(trace_env) != 0;
             std::vector<mfq_tensor_backend::Tensor> reference_trace;
             std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> reference_gemma_trace;

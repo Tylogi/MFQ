@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/decode_window.h"
 #include "ops/nint.h"
@@ -49,11 +50,7 @@ void large_window() {
 int main(int argc,char** argv)try {
     const bool mapped_rows=argc==2 && std::string(argv[1])=="--mapped-rows";
     if(mapped_rows) {
-#ifdef _WIN32
-        _putenv_s("MFQ_PLE_MAPPED_ROWS","1");
-#else
-        setenv("MFQ_PLE_MAPPED_ROWS","1",1);
-#endif
+        mfq::cuda::env_set("MFQ_PLE_MAPPED_ROWS","1");
     }
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);

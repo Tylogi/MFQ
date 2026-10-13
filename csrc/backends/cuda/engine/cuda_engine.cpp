@@ -1,5 +1,6 @@
 #include "load_options.h"
 #include "cuda_runtime_config.h"
+#include "native/env.h"
 #include "ops/cuda_execution.h"
 #include "generation.h"
 #include "model_registry.h"
@@ -16,6 +17,7 @@
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
+#include <iostream>
 #include <variant>
 #include <type_traits>
 
@@ -311,6 +313,11 @@ struct CudaBackend {
         }, state);
     }
     std::pair<EngineInfo, std::unique_ptr<TextProcessor>> load() {
+        // Knobs are consulted from the launch paths, so pin them for the rest of
+        // the process: a graph capture and its replays must see the same values.
+        const bool dump_env = mfq::cuda::env_flag("MFQ_CUDA_ENV_DUMP", false);
+        mfq::cuda::env_freeze();
+        if (dump_env) std::cerr << "cuda knobs at load:\n" << mfq::cuda::env_dump();
         if (!options.context_size) options.context_size = 32768;
         auto execution = std::make_shared<CudaExecutionContext>();
         CudaExecutionScope guard(*execution);
@@ -363,6 +370,8 @@ struct CudaBackend {
         return std::visit([](const auto& state) { return state ? state->available() : 0; }, state);
     }
     void unload() {
+        if (mfq::cuda::env_frozen() && mfq::cuda::env_flag("MFQ_CUDA_ENV_DUMP", false))
+            std::cerr << "cuda knobs in use:\n" << mfq::cuda::env_dump();
         state = State{};
     }
 };

@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "storage/weight_loader.h"
 #include "model_checks.h"
 
@@ -397,33 +398,25 @@ int run_mfe_tensor_check(
                   << "\n";
     }
 
-    const char * warp_ab_env = std::getenv("MFQ_CHECK_NVQ_MOE_WARP_AB");
+    const char * warp_ab_env = mfq::cuda::env_lookup("MFQ_CHECK_NVQ_MOE_WARP_AB");
     if (warp_ab_env != nullptr && std::atoi(warp_ab_env) != 0) {
-        const char * original_env = std::getenv("MFQ_NVQ_MOE_WARPS");
+        const char * original_env = mfq::cuda::env_lookup("MFQ_NVQ_MOE_WARPS");
         const bool had_original_env = original_env != nullptr;
         const std::string original_value = had_original_env ? original_env : "";
         const char * original_exact_env =
-            std::getenv("MFQ_NVQ_MOE_EXACT_REDUCTION");
+            mfq::cuda::env_lookup("MFQ_NVQ_MOE_EXACT_REDUCTION");
         const bool had_original_exact_env = original_exact_env != nullptr;
         const std::string original_exact_value =
             had_original_exact_env ? original_exact_env : "";
         auto set_env = [](const char * name, const char * value) {
-#ifdef _WIN32
-            _putenv_s(name, value);
-#else
-            setenv(name, value, 1);
-#endif
+            mfq::cuda::env_set(name, value);
         };
         auto restore_env = [&](const char * name, bool existed, const std::string & value) {
-#ifdef _WIN32
-            _putenv_s(name, existed ? value.c_str() : "");
-#else
             if (existed) {
-                setenv(name, value.c_str(), 1);
+                mfq::cuda::env_set(name, value.c_str());
             } else {
-                unsetenv(name);
+                mfq::cuda::env_clear(name);
             }
-#endif
         };
         set_env("MFQ_NVQ_MOE_WARPS", "0");
         set_env("MFQ_NVQ_MOE_EXACT_REDUCTION", "1");
@@ -453,7 +446,7 @@ int run_mfe_tensor_check(
     }
 
     const char * clamped_ab_env =
-        std::getenv("MFQ_CHECK_MFE_CLAMPED_SWIGLU_AB");
+        mfq::cuda::env_lookup("MFQ_CHECK_MFE_CLAMPED_SWIGLU_AB");
     if (clamped_ab_env != nullptr && weight.supports_clamped_swiglu()) {
         const double limit = std::atof(clamped_ab_env);
         if (!std::isfinite(limit) || limit <= 0.0) {
@@ -563,7 +556,7 @@ static int run_gemma_moe_check(
     MFQ_RUNTIME_CHECK(routes > 0 && routes <= 8 && experts > routes,
         "Gemma MoE benchmark requires 1..8 routes and more experts than routes");
     const char * dense_reference_env =
-        std::getenv("MFQ_CHECK_GEMMA_MOE_DENSE_REFERENCE");
+        mfq::cuda::env_lookup("MFQ_CHECK_GEMMA_MOE_DENSE_REFERENCE");
     const bool dense_reference_enabled =
         dense_reference_env != nullptr && std::atoi(dense_reference_env) != 0;
     mfq_tensor_backend::Tensor dense_gate_up;
@@ -913,7 +906,7 @@ int run_moe_check(
                   << " tokens_per_second=" << (1000.0 * tokens / cuda_ms)
                   << " checksum=" << checksum << "\n";
 
-        const char * prefill_ab_env = std::getenv("MFQ_CHECK_MOE_PREFILL_MMA_AB");
+        const char * prefill_ab_env = mfq::cuda::env_lookup("MFQ_CHECK_MOE_PREFILL_MMA_AB");
         if (prefill_ab_env != nullptr && std::atoi(prefill_ab_env) != 0 && tokens >= 9) {
             auto candidate = output.clone();
             execution.force_moe_prefill_mma_off = true;
@@ -938,7 +931,7 @@ int run_moe_check(
                       << "\n";
         }
 
-        const char * exact_env = std::getenv("MFQ_CHECK_MOE_POOL_EXACT");
+        const char * exact_env = mfq::cuda::env_lookup("MFQ_CHECK_MOE_POOL_EXACT");
         if (exact_env != nullptr && std::atoi(exact_env) != 0 && tokens <= 8) {
             auto candidate = output;
             execution.force_moe_pool_path = true;

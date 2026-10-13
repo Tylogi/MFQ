@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "float_projection.h"
 #include "qwen4_exp.h"
 #include "gated_residual_fused.h"
@@ -612,23 +613,23 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
         return int(std::min<int64_t>(w.ng,std::max(1,(resident+blocks-1)/blocks)));};
     MFQ_RUNTIME_CHECK(splits(up)==1,"fused residual requires original up projection unsplit");
     const int ds=splits(down);
-    const char* norm_setting=std::getenv("MFQ_GR_SHARE_NORM");
+    const char* norm_setting=mfq::cuda::env_lookup("MFQ_GR_SHARE_NORM");
     const bool share_norm=!norm_setting || norm_setting[0]!='0';
-    const char* group_setting=std::getenv("MFQ_GR_FIXED_GROUPS");
+    const char* group_setting=mfq::cuda::env_lookup("MFQ_GR_FIXED_GROUPS");
     const bool fixed_groups=!group_setting || group_setting[0]=='1';
-    const char* format_setting=std::getenv("MFQ_GR_FIXED_FORMATS");
+    const char* format_setting=mfq::cuda::env_lookup("MFQ_GR_FIXED_FORMATS");
     const bool fixed_formats=!format_setting || format_setting[0]=='1';
-    const char* thread_setting=std::getenv("MFQ_GR_UP_THREADS");
+    const char* thread_setting=mfq::cuda::env_lookup("MFQ_GR_UP_THREADS");
     const int up_threads=thread_setting?std::atoi(thread_setting):512;
     MFQ_RUNTIME_CHECK(up_threads==128 || up_threads==256 || up_threads==512,
         "residual Up threads must be 128, 256 or 512");
-    const char* projection_setting=std::getenv("MFQ_GR_PROJECTION_THREADS");
+    const char* projection_setting=mfq::cuda::env_lookup("MFQ_GR_PROJECTION_THREADS");
     int projection_threads=projection_setting?std::atoi(projection_setting):256;
     MFQ_RUNTIME_CHECK(projection_threads==128 || projection_threads==256 || projection_threads==512,
         "residual projection threads must be 128, 256 or 512");
     if(!share_norm)projection_threads=256;
     const int tile=projection_threads/32;
-    const char* warp_setting=std::getenv("MFQ_GR_DENSE_FUSION");
+    const char* warp_setting=mfq::cuda::env_lookup("MFQ_GR_DENSE_FUSION");
     const bool dense_warp=(!warp_setting || warp_setting[0]!='0') && share_norm &&
         rows<=8 && dense_injection.defined() && prepared_injection_right.defined() &&
         ((down.out+tile-1)/tile)*ds >= (32+(32/streams)-1)/(32/streams);
@@ -639,7 +640,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     auto normalized=tb::empty(residual.sizes().vec(),options),updated=tb::empty(residual.sizes().vec(),options);
     auto shape=residual.sizes().vec();shape.back()=hidden;auto mixed=tb::empty(shape,options);
     shape.back()=streams;auto next_injection=tb::empty(shape,options.dtype(dense_injection.defined() || !half?tb::kFloat32:tb::kFloat16));
-    const char* async_setting=std::getenv("MFQ_GR_ASYNC_NORMALIZED");
+    const char* async_setting=mfq::cuda::env_lookup("MFQ_GR_ASYNC_NORMALIZED");
     const bool asynchronous=share_norm && !half && (!async_setting || async_setting[0]=='1');
     auto promoted_normalized=(dense_injection.defined() || asynchronous) && half?
         tb::empty(residual.sizes().vec(),options.dtype(tb::kFloat32)):tb::Tensor{};
@@ -681,7 +682,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     }
     const auto launch_down=[&](auto group) {
         constexpr int fixed=decltype(group)::value;
-        const auto* batch_setting=std::getenv("MFQ_GR_BATCH_SHARED_DOWN");
+        const auto* batch_setting=mfq::cuda::env_lookup("MFQ_GR_BATCH_SHARED_DOWN");
         if constexpr(fixed>0)if(batch_setting && batch_setting[0]=='1' &&
                 rows>=2 && rows<=8 && share_norm &&
                 (dense_warp || (!dense_injection.defined() && i.aligned && !i.zero))) {
@@ -744,7 +745,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
                 gated_residual_up_kernel<fixed,fixed?4:0,decltype(width)::value,count><<<dim3(unsigned((hidden+threads/32-1)/(threads/32)),unsigned((rows+count-1)/count)),unsigned(threads),unsigned(count*down.out*sizeof(float)),mfq_current_cuda_stream()>>>(
                     d,u,i,normalized.data_ptr(),parts.data_ptr<float>(),mixed.data_ptr(),next_injection.data_ptr(),hidden,int(streams),half,ds,is,dense_projection.defined()?dense_projection.data_ptr<float>():nullptr,rows);
             };
-            const auto* shared_up=std::getenv("MFQ_GR_BATCH_SHARED_UP");
+            const auto* shared_up=mfq::cuda::env_lookup("MFQ_GR_BATCH_SHARED_UP");
             if constexpr(fixed>0)if(rows>=2 && rows<=8 && (!shared_up ||
                 (shared_up[0]!='0' && (shared_up[0]!='2' || rows%2==0)))) {
                 run(std::integral_constant<int,2>{});return;

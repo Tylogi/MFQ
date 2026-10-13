@@ -1,3 +1,4 @@
+#include "env.h"
 #include "tensor.h"
 
 #include "context.h"
@@ -247,7 +248,7 @@ void launch_convert(
             std::is_same_v<Destination, __half> &&
             std::is_same_v<Source, __nv_bfloat16>) {
         const char* disabled =
-            std::getenv("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16");
+            mfq::cuda::env_lookup("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16");
         if (source.is_contiguous() && destination.is_contiguous() &&
                 (disabled == nullptr || disabled[0] != '1')) {
             convert_contiguous_bf16_to_f16_kernel<<<

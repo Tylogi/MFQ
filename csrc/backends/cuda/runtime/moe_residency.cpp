@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "moe_residency.h"
 #include "runtime/decode_window.h"
 #include "kernels/moe_pipeline.h"
@@ -96,17 +97,17 @@ struct MoeResidencyManager::Impl {
         for(const auto* name:{"MFQ_MOE_RESIDENCY_DIRECT_EXCHANGE","MFQ_MOE_RESIDENCY_EXPERT_FENCE",
                 "MFQ_MOE_RESIDENCY_CACHED_REFILL","MFQ_MOE_RESIDENCY_BATCHED",
                 "MFQ_MOE_RESIDENCY_ASYNC_PUBLISH","MFQ_MOE_RESIDENCY_WINDOW_PREPARE"}) {
-            const auto* value=std::getenv(name);if(value && value[0]!='1')return false;
+            const auto* value=mfq::cuda::env_lookup(name);if(value && value[0]!='1')return false;
         }
-        const auto* promotion=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+        const auto* promotion=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
         return !promotion || promotion[0]=='2';
     }();
     const bool promote_transfer=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
         return flag?(flag[0]=='1' || flag[0]=='2'):exchange_defaults;
     }();
     const bool reuse_transfer=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
         return flag?flag[0]=='2':exchange_defaults;
     }();
     std::vector<std::vector<float>> observations;
@@ -115,41 +116,41 @@ struct MoeResidencyManager::Impl {
     std::vector<std::vector<TransferStage>> transfer_stages;
     bool direct=false;
     bool batched=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_BATCHED");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_BATCHED");
         return flag?flag[0]!='0':exchange_defaults;
     }();
     bool async_publish=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_ASYNC_PUBLISH");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_ASYNC_PUBLISH");
         return flag?flag[0]!='0':exchange_defaults;
     }();
     bool window_prepare=[] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_WINDOW_PREPARE");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_WINDOW_PREPARE");
         return !flag || flag[0]!='0';
     }();
     bool expert_fence=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_EXPERT_FENCE");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_EXPERT_FENCE");
         return flag?flag[0]=='1':exchange_defaults;
     }();
     bool cached_refill=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_CACHED_REFILL");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_CACHED_REFILL");
         return flag?flag[0]=='1':exchange_defaults;
     }();
     bool direct_exchange=[this] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_DIRECT_EXCHANGE");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_DIRECT_EXCHANGE");
         return flag?flag[0]=='1':exchange_defaults;
     }();
     std::uint64_t refill_dma_min=[] {
-        const auto* value=std::getenv("MFQ_MOE_RESIDENCY_REFILL_DMA_MIN_BYTES");
+        const auto* value=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_REFILL_DMA_MIN_BYTES");
         return value?std::uint64_t(std::max<long long>(0,std::atoll(value))):std::uint64_t(0);
     }();
     std::uint64_t refill_chunk_bytes=[] {
-        const auto* value=std::getenv("MFQ_MOE_RESIDENCY_REFILL_CHUNK_BYTES");
+        const auto* value=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_REFILL_CHUNK_BYTES");
         if(!value)return std::uint64_t(65536);
         const auto parsed=std::atoll(value);
         return parsed<=0?std::uint64_t(0):std::uint64_t(std::clamp<long long>(parsed,4096,1048576))&~std::uint64_t(15);
     }();
     bool parallel_host=[] {
-        const auto* flag=std::getenv("MFQ_MOE_RESIDENCY_PARALLEL_HOST");
+        const auto* flag=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PARALLEL_HOST");
         return flag && flag[0]!='0';
     }();
     std::atomic<std::uint64_t> observed_routes{0},scheduled_rounds{0},candidate_bundles{0};

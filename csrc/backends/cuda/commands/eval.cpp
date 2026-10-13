@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "engine/load_options.h"
 #include "cli.h"
 #include "engine/model_registry.h"
@@ -85,7 +86,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                 "--kl-reference-n-batch");
         }
         const auto active_env = [](const char * name) {
-            const char * value = std::getenv(name);
+            const char * value = mfq::cuda::env_lookup(name);
             return value != nullptr && value[0] != '\0';
         };
         if (!kl_base.empty() && active_env("MFQ_KL_WINDOW_M")) {

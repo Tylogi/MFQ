@@ -1,21 +1,22 @@
 #define MFQ_MFE_COMPACT_NVQ 1
+#include "native/env.h"
 #include "mfe_ffn_device.cuh"
 #include "mfe_ffn_compact.h"
 
 namespace mfq::cuda {
 namespace {
 bool enabled(const char* name) {
-    const auto* setting=std::getenv(name);
+    const auto* setting=mfq::cuda::env_lookup(name);
     return !setting || setting[0]!='0';
 }
 bool launch_contract(const MfeFfnBatch& b,bool down) {
     if(!mfe_ffn_compact_requested(b,down) || !enabled("MFQ_MFE_GROUP_DOT") ||
             !enabled("MFQ_MFE_GPU_BUNDLE") || !mfe_ffn_format_specialization_enabled())return false;
     if(down) {
-        if(const auto* quad=std::getenv("MFQ_MFE_CANONICAL_QUAD"))if(quad[0]=='1')return false;
+        if(const auto* quad=mfq::cuda::env_lookup("MFQ_MFE_CANONICAL_QUAD"))if(quad[0]=='1')return false;
     }else {
         if(!enabled("MFQ_MFE_PARALLEL_GU"))return false;
-        if(const auto* warps=std::getenv("MFQ_MFE_GU_WARPS"))if(std::atoi(warps)!=8)return false;
+        if(const auto* warps=mfq::cuda::env_lookup("MFQ_MFE_GU_WARPS"))if(std::atoi(warps)!=8)return false;
     }
     return true;
 }

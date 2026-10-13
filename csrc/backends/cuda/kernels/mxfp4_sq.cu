@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "mxfp4_sq.h"
 #include <algorithm>
 #include <cstdint>
@@ -617,8 +618,8 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
     } else {
         const auto* x = reinterpret_cast<const __half*>(input.data_ptr<mfq_half>());
         auto* y = reinterpret_cast<__half*>(out.data_ptr<mfq_half>());
-        const char* disable_tensor_core = std::getenv("MFQ_DISABLE_SQ_TENSOR_CORE");
-        const char* force_tensor_core = std::getenv("MFQ_FORCE_SQ_TENSOR_CORE");
+        const char* disable_tensor_core = mfq::cuda::env_lookup("MFQ_DISABLE_SQ_TENSOR_CORE");
+        const char* force_tensor_core = mfq::cuda::env_lookup("MFQ_FORCE_SQ_TENSOR_CORE");
         // Retained 3090 Ti comparisons show a crossover at M*N=131072 for
         // M>=32; smaller projections lose to the direct packed kernel.
         const bool profitable = rows >= 32 && std::int64_t(rows) * outputs >= 131072;

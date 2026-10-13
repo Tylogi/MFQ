@@ -1,5 +1,6 @@
 #pragma once
 
+#include "native/env.h"
 #include "engine/generation.h"
 #include "generation_result.h"
 #include "models/deepseek_v4/ops.h"
@@ -66,9 +67,9 @@ static int run_prefill_sweep(
     auto all_ids = mfq_tensor_backend::tensor(
         token_ids, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
 
-    if(const auto* chunk_option=std::getenv("MFQ_PREFILL_SWEEP_CHUNKS");chunk_option && chunk_option[0]) {
+    if(const auto* chunk_option=mfq::cuda::env_lookup("MFQ_PREFILL_SWEEP_CHUNKS");chunk_option && chunk_option[0]) {
         const bool profile=execution.profiler.enabled;
-        const auto* variants_option=std::getenv("MFQ_PREFILL_VARIANTS_JSON");
+        const auto* variants_option=mfq::cuda::env_lookup("MFQ_PREFILL_VARIANTS_JSON");
         const auto variants=variants_option?nlohmann::json::parse(variants_option):nlohmann::json::array();
         const bool variant_sweep=!variants.empty();
         if(variant_sweep && (!variants.is_array() || variants.size()>8))
@@ -78,24 +79,20 @@ static int run_prefill_sweep(
             for(const auto& [name,value]:variant.at("environment").items()) {
                 const auto option=value.template get<std::string>();
                 if(name.rfind("MFQ_",0)!=0)throw std::invalid_argument("prefill variant must use MFQ options");
-#ifdef _WIN32
-                if(_putenv_s(name.c_str(),option.c_str()))throw std::runtime_error("prefill variant environment failed");
-#else
-                if(setenv(name.c_str(),option.c_str(),1))throw std::runtime_error("prefill variant environment failed");
-#endif
+                mfq::cuda::env_set(name.c_str(),option.c_str());
             }
         };
-        const auto* flush_sweep_option=std::getenv("MFQ_PREFILL_LAYER_FLUSH_SWEEP");
+        const auto* flush_sweep_option=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_FLUSH_SWEEP");
         const bool flush_sweep=flush_sweep_option && std::atoi(flush_sweep_option)!=0;
-        const auto* async_sweep_option=std::getenv("MFQ_PREFILL_LAYER_ASYNC_SWEEP");
+        const auto* async_sweep_option=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_ASYNC_SWEEP");
         const bool async_sweep=async_sweep_option && std::atoi(async_sweep_option)!=0;
-        const auto* phase_sweep_option=std::getenv("MFQ_PREFILL_LAYER_PHASE_SWEEP");
+        const auto* phase_sweep_option=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_PHASE_SWEEP");
         const bool phase_sweep=phase_sweep_option && std::atoi(phase_sweep_option)!=0;
-        const auto* layer_major_sweep_option=std::getenv("MFQ_PREFILL_LAYER_MAJOR_SWEEP");
+        const auto* layer_major_sweep_option=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_MAJOR_SWEEP");
         const bool layer_major_sweep=layer_major_sweep_option && std::atoi(layer_major_sweep_option)!=0;
-        const auto* layer_major_option=std::getenv("MFQ_MOE_PREFILL_LAYER_MAJOR");
+        const auto* layer_major_option=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_MAJOR");
         const bool layer_major_requested=layer_major_option && std::atoi(layer_major_option)!=0;
-        const auto* kernel_sweep_option=std::getenv("MFQ_PREFILL_KERNEL_SWEEP");
+        const auto* kernel_sweep_option=mfq::cuda::env_lookup("MFQ_PREFILL_KERNEL_SWEEP");
         const bool kernel_sweep=kernel_sweep_option && std::atoi(kernel_sweep_option)!=0;
         const bool gr_gdn_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==2;
         const bool exact_sweep=kernel_sweep && std::atoi(kernel_sweep_option)>=3;
@@ -111,7 +108,7 @@ static int run_prefill_sweep(
         const bool nvq_cohort_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==10;
         const bool nvq_k_pair_sweep=kernel_sweep && (std::atoi(kernel_sweep_option)==9 || nvq_cohort_pair_sweep);
         const char* nvq_trial_option=nvq_cohort_pair_sweep?"MFQ_NVQ_PREFILL_COHORTS":"MFQ_NVQ_PREFILL_NARROW_G2";
-        const auto* chunk_oracle_option=std::getenv("MFQ_PREFILL_CHUNK_SWEEP_ORACLE");
+        const auto* chunk_oracle_option=mfq::cuda::env_lookup("MFQ_PREFILL_CHUNK_SWEEP_ORACLE");
         const bool chunk_sweep_oracle=chunk_oracle_option && std::atoi(chunk_oracle_option)!=0;
         std::vector<int64_t> chunks;
         std::stringstream options(chunk_option);std::string term;
@@ -138,42 +135,27 @@ static int run_prefill_sweep(
                 const bool layer_major=(kernel_sweep?(exact_sweep || repeat%4>0):
                     layer_major_sweep?bool(repeat&1):layer_major_requested) && m>1024;
                 if(kernel_sweep) {
-                    const auto* exact_gr=std::getenv("MFQ_PREFILL_EXACT_GR_KERNEL");
+                    const auto* exact_gr=mfq::cuda::env_lookup("MFQ_PREFILL_EXACT_GR_KERNEL");
                     const auto* gr=gdn_batch_pair_sweep?(exact_gr?exact_gr:"21"):qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(repeat%2?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(repeat%2?(exact_gr?exact_gr:"12"):"6"):quant_pair_sweep?"6":exact_sweep?(repeat%2?(exact_gr?exact_gr:"8"):"1"):(repeat%4==3?"3":"1");
                     const auto* batch=quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":exact_pair_sweep?(repeat%2?"1":"0"):(!gr_gdn_sweep && repeat%4>=2?"1":"0");
                     const auto* columns=exact_sweep || gr_gdn_sweep && repeat%4>=2?"4":"0";
                     const bool use_defaults=default_pair_sweep && repeat%2;
-#ifdef _WIN32
-                    _putenv_s("MFQ_GR_PREFILL_MATMUL",use_defaults?"":gr);
-                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",use_defaults?"":batch);
-                    _putenv_s("MFQ_GDN_PREFILL_COLUMNS",columns);
-#else
                     if(use_defaults) {
-                        unsetenv("MFQ_GR_PREFILL_MATMUL");unsetenv("MFQ_MOE_PREFILL_EXPERT_BATCH");
+                        mfq::cuda::env_clear("MFQ_GR_PREFILL_MATMUL");mfq::cuda::env_clear("MFQ_MOE_PREFILL_EXPERT_BATCH");
                     } else {
-                        setenv("MFQ_GR_PREFILL_MATMUL",gr,1);setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",batch,1);
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL",gr);mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH",batch);
                     }
-                    setenv("MFQ_GDN_PREFILL_COLUMNS",columns,1);
-#endif
+                    mfq::cuda::env_set("MFQ_GDN_PREFILL_COLUMNS",columns);
                     if(quant_pair_sweep) {
                         const auto* wide_rows=repeat%2?"1":"0";
-#ifdef _WIN32
-                        _putenv_s("MFQ_NVQ_PREFILL_M256",wide_rows);
-#else
-                        setenv("MFQ_NVQ_PREFILL_M256",wide_rows,1);
-#endif
+                        mfq::cuda::env_set("MFQ_NVQ_PREFILL_M256",wide_rows);
                         std::cout<<"prefill_quant_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
                             <<" m256="<<wide_rows<<std::endl;
                     }
                     if(nvq_k_pair_sweep) {
                         const auto* narrow_g2=repeat%2?"1":"0";
-#ifdef _WIN32
-                        _putenv_s(nvq_trial_option,narrow_g2);
-                        if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED",narrow_g2);
-#else
-                        setenv(nvq_trial_option,narrow_g2,1);
-                        if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED",narrow_g2,1);
-#endif
+                        mfq::cuda::env_set(nvq_trial_option,narrow_g2);
+                        if(nvq_cohort_pair_sweep)mfq::cuda::env_set("MFQ_GDN_PREFILL_PIPELINED",narrow_g2);
                         std::cout<<(nvq_cohort_pair_sweep?"prefill_nvq_cohort_mode_m=":"prefill_nvq_k_mode_m=")
                             <<m<<" chunk="<<chunk<<" repeat="<<repeat
                             <<(nvq_cohort_pair_sweep?" cohorts=":" narrow_g2=")<<narrow_g2<<std::endl;
@@ -181,14 +163,10 @@ static int run_prefill_sweep(
                             <<" repeat="<<repeat<<" pipelined="<<narrow_g2<<std::endl;
                     }
                     if(gr_mix_pair_sweep) {
-                        const auto* mix_option=std::getenv("MFQ_PREFILL_MIX_KERNEL");
-                        const auto* mix_baseline=std::getenv("MFQ_PREFILL_MIX_BASELINE");
+                        const auto* mix_option=mfq::cuda::env_lookup("MFQ_PREFILL_MIX_KERNEL");
+                        const auto* mix_baseline=mfq::cuda::env_lookup("MFQ_PREFILL_MIX_BASELINE");
                         const auto* mixed=repeat%2?(mix_option?mix_option:"1"):(mix_baseline?mix_baseline:"0");
-#ifdef _WIN32
-                        _putenv_s("MFQ_GR_PREFILL_FUSED_MIX",mixed);
-#else
-                        setenv("MFQ_GR_PREFILL_FUSED_MIX",mixed,1);
-#endif
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",mixed);
                         std::cout<<"prefill_mix_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
                             <<" mode="<<mixed<<std::endl;
                     }
@@ -198,20 +176,20 @@ static int run_prefill_sweep(
                         <<" columns="<<columns<<std::endl;
                     if(gr_vector_pair_sweep) {
 #ifdef _WIN32
-                        _putenv_s("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || repeat%2?"6":"3");
-                        if(qsa_score_pair_sweep)_putenv_s("MFQ_QSA_PREFILL_SCORE_GEMM",repeat%2?"1":"0");
-                        if(gr_batch_pair_sweep)_putenv_s("MFQ_GR_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || repeat%2?"6":"3");
+                        if(qsa_score_pair_sweep)mfq::cuda::env_set("MFQ_QSA_PREFILL_SCORE_GEMM",repeat%2?"1":"0");
+                        if(gr_batch_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
                         if(gdn_batch_pair_sweep) {
-                            _putenv_s("MFQ_GR_PREFILL_LAYER_BATCH","1");
-                            _putenv_s("MFQ_GDN_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
+                            mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH","1");
+                            mfq::cuda::env_set("MFQ_GDN_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
                         }
 #else
-                        setenv("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || repeat%2?"6":"3",1);
-                        if(qsa_score_pair_sweep)setenv("MFQ_QSA_PREFILL_SCORE_GEMM",repeat%2?"1":"0",1);
-                        if(gr_batch_pair_sweep)setenv("MFQ_GR_PREFILL_LAYER_BATCH",repeat%2?"1":"0",1);
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || repeat%2?"6":"3");
+                        if(qsa_score_pair_sweep)mfq::cuda::env_set("MFQ_QSA_PREFILL_SCORE_GEMM",repeat%2?"1":"0");
+                        if(gr_batch_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
                         if(gdn_batch_pair_sweep) {
-                            setenv("MFQ_GR_PREFILL_LAYER_BATCH","1",1);
-                            setenv("MFQ_GDN_PREFILL_LAYER_BATCH",repeat%2?"1":"0",1);
+                            mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH","1");
+                            mfq::cuda::env_set("MFQ_GDN_PREFILL_LAYER_BATCH",repeat%2?"1":"0");
                         }
 #endif
                     }
@@ -221,31 +199,19 @@ static int run_prefill_sweep(
                         <<" layer_major="<<int(layer_major)<<std::endl;
                 if(phase_sweep) {
                     const auto* enabled=(repeat&1)?"1":"0";
-#ifdef _WIN32
-                    _putenv_s("MFQ_MOE_PREFILL_LAYER_PHASED",enabled);
-#else
-                    setenv("MFQ_MOE_PREFILL_LAYER_PHASED",enabled,1);
-#endif
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_LAYER_PHASED",enabled);
                     std::cout<<"prefill_transfer_phase_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
                         <<" phased="<<enabled<<std::endl;
                 }
                 if(async_sweep) {
                     const auto* enabled=(repeat&1)?"1":"0";
-#ifdef _WIN32
-                    _putenv_s("MFQ_MOE_PREFILL_LAYER_ASYNC",enabled);
-#else
-                    setenv("MFQ_MOE_PREFILL_LAYER_ASYNC",enabled,1);
-#endif
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_LAYER_ASYNC",enabled);
                     std::cout<<"prefill_transfer_async_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
                         <<" async="<<enabled<<std::endl;
                 }
                 if(flush_sweep) {
                     const auto* enabled=(repeat&1)?"1":"0";
-#ifdef _WIN32
-                    _putenv_s("MFQ_MOE_PREFILL_LAYER_FLUSH",enabled);
-#else
-                    setenv("MFQ_MOE_PREFILL_LAYER_FLUSH",enabled,1);
-#endif
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_LAYER_FLUSH",enabled);
                     std::cout<<"prefill_transfer_flush_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
                         <<" flush="<<enabled<<std::endl;
                 }
@@ -352,22 +318,17 @@ static int run_prefill_sweep(
                 // Chunk comparisons must time the requested kernels even when
                 // a larger chunk fails the numerical oracle.
                 if(numerical_failure && !chunk_sweep_oracle) {
-#ifdef _WIN32
-                    _putenv_s("MFQ_GR_PREFILL_MATMUL","1");
-                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH","0");
-#else
-                    setenv("MFQ_GR_PREFILL_MATMUL","1",1);
-                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH","0",1);
-#endif
+                    mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL","1");
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH","0");
                 }
                 const auto engine_chunks=chunk_sweep_oracle?chunks:std::vector<int64_t>{chunks.front()};
-                const std::string engine_gr=std::getenv("MFQ_GR_PREFILL_MATMUL")?std::getenv("MFQ_GR_PREFILL_MATMUL"):"17";
-                const std::string engine_batch=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH")?std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH"):"1";
-                const std::string engine_mix=std::getenv("MFQ_PREFILL_MIX_KERNEL")?std::getenv("MFQ_PREFILL_MIX_KERNEL"):"1";
-                const std::string engine_mix_baseline=std::getenv("MFQ_PREFILL_MIX_BASELINE")?std::getenv("MFQ_PREFILL_MIX_BASELINE"):"0";
+                const std::string engine_gr=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL")?mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL"):"17";
+                const std::string engine_batch=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_EXPERT_BATCH")?mfq::cuda::env_lookup("MFQ_MOE_PREFILL_EXPERT_BATCH"):"1";
+                const std::string engine_mix=mfq::cuda::env_lookup("MFQ_PREFILL_MIX_KERNEL")?mfq::cuda::env_lookup("MFQ_PREFILL_MIX_KERNEL"):"1";
+                const std::string engine_mix_baseline=mfq::cuda::env_lookup("MFQ_PREFILL_MIX_BASELINE")?mfq::cuda::env_lookup("MFQ_PREFILL_MIX_BASELINE"):"0";
                 for(const auto engine_chunk:engine_chunks) {
                 std::vector<int64_t> engine_reference_tokens;
-                const auto* public_repeat_option=std::getenv("MFQ_PREFILL_PUBLIC_PAIR_REPEATS");
+                const auto* public_repeat_option=mfq::cuda::env_lookup("MFQ_PREFILL_PUBLIC_PAIR_REPEATS");
                 const int public_repeats=(exact_sweep || chunk_sweep_oracle) && public_repeat_option?std::clamp(std::atoi(public_repeat_option),1,8):1;
                 for(int public_repeat=0;public_repeat<public_repeats;++public_repeat) {
                 for(int engine_order=0;engine_order<(variant_sweep?int(variants.size()):exact_sweep?2:1);++engine_order) {
@@ -385,33 +346,33 @@ static int run_prefill_sweep(
 #endif
                 if(exact_sweep) {
 #ifdef _WIN32
-                    _putenv_s("MFQ_GR_PREFILL_MATMUL",gdn_batch_pair_sweep?engine_gr.c_str():qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(engine_mode?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1");
-                    if(gr_vector_pair_sweep)_putenv_s("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || engine_mode?"6":"3");
-                    if(qsa_score_pair_sweep)_putenv_s("MFQ_QSA_PREFILL_SCORE_GEMM",engine_mode?"1":"0");
-                    if(gr_batch_pair_sweep)_putenv_s("MFQ_GR_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
+                    mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL",gdn_batch_pair_sweep?engine_gr.c_str():qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(engine_mode?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1");
+                    if(gr_vector_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || engine_mode?"6":"3");
+                    if(qsa_score_pair_sweep)mfq::cuda::env_set("MFQ_QSA_PREFILL_SCORE_GEMM",engine_mode?"1":"0");
+                    if(gr_batch_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
                     if(gdn_batch_pair_sweep) {
-                        _putenv_s("MFQ_GR_PREFILL_LAYER_BATCH","1");
-                        _putenv_s("MFQ_GDN_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH","1");
+                        mfq::cuda::env_set("MFQ_GDN_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
                     }
-                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0");
-                    if(nvq_k_pair_sweep)_putenv_s(nvq_trial_option,engine_mode?"1":"0");
-                    if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0");
-                    if(quant_pair_sweep)_putenv_s("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0");
-                    if(gr_mix_pair_sweep)_putenv_s("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str());
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0");
+                    if(nvq_k_pair_sweep)mfq::cuda::env_set(nvq_trial_option,engine_mode?"1":"0");
+                    if(nvq_cohort_pair_sweep)mfq::cuda::env_set("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0");
+                    if(quant_pair_sweep)mfq::cuda::env_set("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0");
+                    if(gr_mix_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str());
 #else
-                    setenv("MFQ_GR_PREFILL_MATMUL",gdn_batch_pair_sweep?engine_gr.c_str():qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(engine_mode?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1",1);
-                    if(gr_vector_pair_sweep)setenv("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || engine_mode?"6":"3",1);
-                    if(qsa_score_pair_sweep)setenv("MFQ_QSA_PREFILL_SCORE_GEMM",engine_mode?"1":"0",1);
-                    if(gr_batch_pair_sweep)setenv("MFQ_GR_PREFILL_LAYER_BATCH",engine_mode?"1":"0",1);
+                    mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL",gdn_batch_pair_sweep?engine_gr.c_str():qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(engine_mode?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1");
+                    if(gr_vector_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",qsa_score_pair_sweep || gr_batch_pair_sweep || gdn_batch_pair_sweep || engine_mode?"6":"3");
+                    if(qsa_score_pair_sweep)mfq::cuda::env_set("MFQ_QSA_PREFILL_SCORE_GEMM",engine_mode?"1":"0");
+                    if(gr_batch_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
                     if(gdn_batch_pair_sweep) {
-                        setenv("MFQ_GR_PREFILL_LAYER_BATCH","1",1);
-                        setenv("MFQ_GDN_PREFILL_LAYER_BATCH",engine_mode?"1":"0",1);
+                        mfq::cuda::env_set("MFQ_GR_PREFILL_LAYER_BATCH","1");
+                        mfq::cuda::env_set("MFQ_GDN_PREFILL_LAYER_BATCH",engine_mode?"1":"0");
                     }
-                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0",1);
-                    if(nvq_k_pair_sweep)setenv(nvq_trial_option,engine_mode?"1":"0",1);
-                    if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0",1);
-                    if(quant_pair_sweep)setenv("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0",1);
-                    if(gr_mix_pair_sweep)setenv("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str(),1);
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0");
+                    if(nvq_k_pair_sweep)mfq::cuda::env_set(nvq_trial_option,engine_mode?"1":"0");
+                    if(nvq_cohort_pair_sweep)mfq::cuda::env_set("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0");
+                    if(quant_pair_sweep)mfq::cuda::env_set("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0");
+                    if(gr_mix_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str());
 #endif
                 }
                 auto config=resolve_cuda_runtime_config({});
@@ -448,23 +409,14 @@ static int run_prefill_sweep(
                 }
                 }
                 if(exact_sweep) {
-#ifdef _WIN32
-                    _putenv_s("MFQ_GR_PREFILL_MATMUL",engine_gr.c_str());
-                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",engine_batch.c_str());
-                    if(gr_mix_pair_sweep)_putenv_s("MFQ_GR_PREFILL_FUSED_MIX",engine_mix.c_str());
-                    if(quant_pair_sweep)_putenv_s("MFQ_NVQ_PREFILL_M256","1");
-                    if(nvq_k_pair_sweep)_putenv_s(nvq_trial_option,"1");
-                    if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED","1");
-#else
-                    setenv("MFQ_GR_PREFILL_MATMUL",engine_gr.c_str(),1);
-                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",engine_batch.c_str(),1);
-                    if(gr_mix_pair_sweep)setenv("MFQ_GR_PREFILL_FUSED_MIX",engine_mix.c_str(),1);
-                    if(quant_pair_sweep)setenv("MFQ_NVQ_PREFILL_M256","1",1);
-                    if(nvq_k_pair_sweep)setenv(nvq_trial_option,"1",1);
-                    if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED","1",1);
-#endif
+                    mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL",engine_gr.c_str());
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH",engine_batch.c_str());
+                    if(gr_mix_pair_sweep)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",engine_mix.c_str());
+                    if(quant_pair_sweep)mfq::cuda::env_set("MFQ_NVQ_PREFILL_M256","1");
+                    if(nvq_k_pair_sweep)mfq::cuda::env_set(nvq_trial_option,"1");
+                    if(nvq_cohort_pair_sweep)mfq::cuda::env_set("MFQ_GDN_PREFILL_PIPELINED","1");
                 }
-                const auto* tail_profile=std::getenv("MFQ_PREFILL_POST_TIMING_PROFILE");
+                const auto* tail_profile=mfq::cuda::env_lookup("MFQ_PREFILL_POST_TIMING_PROFILE");
                 if(tail_profile && std::atoi(tail_profile)!=0) {
                     model.reset(1);execution.profiler.reset();execution.profiler.enabled=true;
                     auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
@@ -474,19 +426,12 @@ static int run_prefill_sweep(
                     execution.profiler.enabled=false;
                     execution.profiler.reset();
                 }
-                const auto* audit=std::getenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT_RUN");
+                const auto* audit=mfq::cuda::env_lookup("MFQ_PREFILL_EXPERT_BATCH_AUDIT_RUN");
                 if(audit && std::atoi(audit)!=0) {
-#ifdef _WIN32
-                    _putenv_s("MFQ_GR_PREFILL_MATMUL","1");
-                    _putenv_s("MFQ_GDN_PREFILL_COLUMNS","0");
-                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH","1");
-                    _putenv_s("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1");
-#else
-                    setenv("MFQ_GR_PREFILL_MATMUL","1",1);
-                    setenv("MFQ_GDN_PREFILL_COLUMNS","0",1);
-                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH","1",1);
-                    setenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1",1);
-#endif
+                    mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL","1");
+                    mfq::cuda::env_set("MFQ_GDN_PREFILL_COLUMNS","0");
+                    mfq::cuda::env_set("MFQ_MOE_PREFILL_EXPERT_BATCH","1");
+                    mfq::cuda::env_set("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1");
                     model.reset(1);
                     auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
                     auto result=model.apply_final_logit_softcap(model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))))
@@ -1220,22 +1165,14 @@ static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
 
     struct MtpProfileEnvironment {
         const char* name;std::string previous;bool present;
-        explicit MtpProfileEnvironment(const char* key):name(key),present(std::getenv(key)!=nullptr) {
-            if(present)previous=std::getenv(key);
+        explicit MtpProfileEnvironment(const char* key):name(key),present(mfq::cuda::env_lookup(key)!=nullptr) {
+            if(present)previous=mfq::cuda::env_lookup(key);
         }
         void set(const char* value) {
-#ifdef _WIN32
-            _putenv_s(name,value?value:"");
-#else
-            if(value)setenv(name,value,1);else unsetenv(name);
-#endif
+            if(value)mfq::cuda::env_set(name,value);else mfq::cuda::env_clear(name);
         }
         ~MtpProfileEnvironment() {
-#ifdef _WIN32
-            _putenv_s(name,present?previous.c_str():"");
-#else
-            if(present)setenv(name,previous.c_str(),1);else unsetenv(name);
-#endif
+            if(present)mfq::cuda::env_set(name,previous.c_str());else mfq::cuda::env_clear(name);
         }
     };
 
@@ -1258,7 +1195,7 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
         {"nint_original","1",nullptr,"1","2","0"},
         {"nint_exact_batch","1",nullptr,"1","2","1"},
         {"nint_original_repeat","1",nullptr,"1","2","0"}};
-    const auto* option=std::getenv("MFQ_MTP_NINT_VARIANTS");
+    const auto* option=mfq::cuda::env_lookup("MFQ_MTP_NINT_VARIANTS");
     const bool nint_only=option && option[0]=='1';
     const auto* active=nint_only?nint_variants:variants;
     const auto variant_count=nint_only?std::size(nint_variants):std::size(variants);
@@ -1346,7 +1283,7 @@ static int run_qwen4_mtp_variant_profile(mfq::cuda::Qwen4CausalLm& model,const s
 }
 
 static int run_qwen4_mtp_profile(mfq::cuda::Qwen4CausalLm& model,const std::vector<int64_t>& prompt_ids) {
-    if(const auto* variants=std::getenv("MFQ_MTP_PROFILE_VARIANTS");variants && variants[0]=='1')
+    if(const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_PROFILE_VARIANTS");variants && variants[0]=='1')
         return run_qwen4_mtp_variant_profile(model,prompt_ids);
     namespace tb=mfq_tensor_backend;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);

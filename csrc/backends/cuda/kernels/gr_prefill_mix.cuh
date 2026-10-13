@@ -1,4 +1,5 @@
 #pragma once
+#include "native/env.h"
 
 // Four stream projections share the activation tile. Products overwrite the
 // decoded tile after the last FMA, then reduce in canonical stream order.
@@ -147,8 +148,8 @@ __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* inpu
 bool gr_prefill_mix_selected(const NintWeight& weight,const mfq_tensor_backend::Tensor& input,
         const mfq_tensor_backend::Tensor& normalized,int64_t streams) {
     namespace tb=mfq_tensor_backend;
-    const auto* option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
-    const auto* projection=std::getenv("MFQ_GR_PREFILL_MATMUL");
+    const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
+    const auto* projection=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL");
     if(projection && (std::atoi(projection)==2 || std::atoi(projection)==3))return false;
     if(!option && (weight.out<weight.neuron_len || input.numel()/input.size(-1)<128))return false;
     const auto supported=[](const tb::Tensor& t){return t.scalar_type()==tb::kFloat16 || t.scalar_type()==tb::kFloat32;};
@@ -172,7 +173,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
         using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
         constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
         {
-            const auto* pipeline_option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
+            const auto* pipeline_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
             if((!pipeline_option || std::atoi(pipeline_option)==10 || std::atoi(pipeline_option)==12) && gr_prefill_pipeline_supported(input)) {
                 launch_gr_prefill_pipeline<true,Input,Value,aligned,zero>(weight,input,normalized,output);return;
             }
@@ -202,7 +203,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
         };
         if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
         else {
-            const auto* option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
+            const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
             const int requested_mode=option?std::atoi(option):(std::is_same_v<Input,__half>?12:10);
             const int mode=requested_mode==10 || requested_mode==12?6:requested_mode;
             if(mode==8)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,2>{});
@@ -220,7 +221,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
             else if(weight.aligned_q8)typed(input_tag,value_tag,std::true_type{},std::false_type{},swizzle_tag);
             else typed(input_tag,value_tag,std::false_type{},std::false_type{},swizzle_tag);
         };
-        const auto* option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
+        const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
         if(option && std::atoi(option)==2)dispatch(std::true_type{});else dispatch(std::false_type{});
     };
     if(input.scalar_type()==tb::kFloat16) {

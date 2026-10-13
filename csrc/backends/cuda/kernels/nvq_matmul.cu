@@ -1,4 +1,5 @@
 #define MFQ_NVQ_DENSE 1
+#include "native/env.h"
 #include "nvq_matmul_impl.cuh"
 
 mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(
@@ -670,8 +671,8 @@ void nvq_ffn_swiglu_quant_ws_cuda(
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), input_qx.data_ptr<int8_t>(),
         input_xscale.data_ptr<float>(), 1, K, ng);
     bool aligned_independent_rows = false;
-    const char * vec4_env = std::getenv("MFQ_NVQ_SWIGLU_VEC4");
-    if (vec4_env == nullptr) vec4_env = std::getenv("MFQ_NIQ_SWIGLU_VEC4");
+    const char * vec4_env = mfq::cuda::env_lookup("MFQ_NVQ_SWIGLU_VEC4");
+    if (vec4_env == nullptr) vec4_env = mfq::cuda::env_lookup("MFQ_NIQ_SWIGLU_VEC4");
     const bool use_vec4 = vec4_env == nullptr || vec4_env[0] != '0';
     if (gate_format == kNvq2JscXLGroupExec &&
         gate_sub_bits == 4 && up_sub_bits == 4) {

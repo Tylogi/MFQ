@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "native/context.h"
 #include "native/tensor.h"
 #include "native/mfq_native_matmul_rows.h"
@@ -45,15 +46,7 @@ std::vector<std::int64_t> host_int64_values(const mfq::cuda::Tensor& value) {
 }
 
 void set_test_environment(const char* name, const char* value) {
-#ifdef _WIN32
-    if (_putenv_s(name, value) != 0) {
-        throw std::runtime_error("failed to set test environment variable");
-    }
-#else
-    if (setenv(name, value, 1) != 0) {
-        throw std::runtime_error("failed to set test environment variable");
-    }
-#endif
+    mfq::cuda::env_set(name, value);
 }
 
 #include "matmul_rows_test.h"

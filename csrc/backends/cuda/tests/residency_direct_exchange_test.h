@@ -1,5 +1,6 @@
 #pragma once
 
+#include "native/env.h"
 #include "storage/moe_cached_source_internal.h"
 
 // Seed real compressed transfer-cache fields without launching the unrelated
@@ -74,8 +75,8 @@ struct MoeResidencyTestAccess {
 
 void verify_direct_exchange(const std::filesystem::path& root) {
     int cases=0,repeats=0;
-    const char* batching_env=std::getenv("MFQ_MOE_RESIDENCY_CACHED_REFILL");
-    const bool defaults=std::getenv("MFQ_TEST_RESIDENCY_EXPECT_DEFAULTS")!=nullptr;
+    const char* batching_env=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_CACHED_REFILL");
+    const bool defaults=mfq::cuda::env_lookup("MFQ_TEST_RESIDENCY_EXPECT_DEFAULTS")!=nullptr;
     const bool batching=defaults || (batching_env && std::string(batching_env)=="1");
     for(const std::string format:{"nint5","nvq3j-512"})
     for(const std::string phase:{"none","direct_backup","direct_refill","direct_refill_batch","upload","map","host","publish","reader","window","cancel"}) {

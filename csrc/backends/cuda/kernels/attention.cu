@@ -8,6 +8,7 @@
 // causal mask follows torch SDPA for Tq != Tk: query tq sees key s iff s <= tq + (Tk - T).
 // q/k/v may be fp16 or fp32; dot/softmax accumulation stays fp32.
 
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_fp16.h>
@@ -385,7 +386,7 @@ static mfq_tensor_backend::Tensor attention_impl_cuda(mfq_tensor_backend::Tensor
     cudaStream_t stream = mfq_current_cuda_stream();
     int parts = 1;
     const int visible_keys = window > 0 ? std::min(Tk, window) : Tk;
-    const char* split_env = std::getenv("MFQ_ATTENTION_SPLITK");
+    const char* split_env = mfq::cuda::env_lookup("MFQ_ATTENTION_SPLITK");
     if (total < 128 && visible_keys >= 512 && !(split_env && split_env[0] == '0')) {
         parts = (visible_keys + 255) / 256;
         parts = parts < 2 ? 1 : parts;

@@ -1,23 +1,24 @@
 // Share generic decoders across the partition/bundle kernel variants. The
 // compact decode translation unit keeps its fully inlined specializations.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
+#include "native/env.h"
 #include "mfe_ffn_device.cuh"
 #include "mfe_ffn_compact.h"
 #include "mfe_ffn_token_groups.h"
 namespace mfq::cuda {
 namespace {
 bool mfe_group_dot_enabled() {
-    const char* setting=std::getenv("MFQ_MFE_GROUP_DOT");
+    const char* setting=mfq::cuda::env_lookup("MFQ_MFE_GROUP_DOT");
     return !setting || setting[0]!='0';
 }
 bool mfe_gpu_bundle_enabled() {
-    const char* setting=std::getenv("MFQ_MFE_GPU_BUNDLE");
+    const char* setting=mfq::cuda::env_lookup("MFQ_MFE_GPU_BUNDLE");
     return !setting || setting[0]!='0';
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 void launch_mfe_down_path(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     if constexpr(Grouped)partition|=16;
-    const char* canonical_quad=std::getenv("MFQ_MFE_CANONICAL_QUAD");
+    const char* canonical_quad=mfq::cuda::env_lookup("MFQ_MFE_CANONICAL_QUAD");
     if(b.shared && (!b.shared_dense_math || (canonical_quad && canonical_quad[0]=='1'))) {
         if(mfe_gpu_bundle_enabled()) {
             const auto warps=mfe_ffn_down_launch_warps(reinterpret_cast<const void*>(mfe_ffn_down_reduce_kernel_quad<true,Grouped,Formats,DefaultMath,E8Narrow>),
@@ -43,17 +44,17 @@ void launch_mfe_down_path(const MfeFfnBatch& b,int partition,cudaStream_t stream
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 void launch_mfe_gate_up_path(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if constexpr(Grouped)partition|=16;
-    const char* setting=std::getenv("MFQ_MFE_PARALLEL_GU");
+    const char* setting=mfq::cuda::env_lookup("MFQ_MFE_PARALLEL_GU");
     const bool parallel=!setting || setting[0]!='0';
     if(parallel) {
-        const char* shared_first=std::getenv("MFQ_MFE_SHARED_FIRST");
-        const char* early=std::getenv("MFQ_MFE_EARLY_GU");
+        const char* shared_first=mfq::cuda::env_lookup("MFQ_MFE_SHARED_FIRST");
+        const char* early=mfq::cuda::env_lookup("MFQ_MFE_EARLY_GU");
         if(b.plan_ready && b.resident_plan_overlap && (!early || early[0]!='0'))partition|=8;
         // Bit 2 changes CTA order; the lower bits retain the transfer partition.
         if(b.shared && (!shared_first || shared_first[0]!='0'))partition|=4;
         const bool bundle=mfe_gpu_bundle_enabled();
         int warps=bundle?8:4;
-        if(const char* requested=std::getenv("MFQ_MFE_GU_WARPS")) {
+        if(const char* requested=mfq::cuda::env_lookup("MFQ_MFE_GU_WARPS")) {
             const int value=std::atoi(requested);
             if(value==4 || value==8 || value==16)warps=value;
         }
@@ -86,7 +87,7 @@ void launch_mfe_gate_up_math(const MfeFfnBatch& b,int partition,int width,cudaSt
 }
 // 1: both stages; 2: Gate/Up only; 3: Down only. Opt-in during evaluation.
 bool mfe_default_math_enabled(const MfeFfnBatch& b,bool down) {
-    const char* setting=std::getenv("MFQ_MFE_DEFAULT_MATH");
+    const char* setting=mfq::cuda::env_lookup("MFQ_MFE_DEFAULT_MATH");
     return b.default_math && setting &&
         (setting[0]=='1' || setting[0]==(down?'3':'2'));
 }

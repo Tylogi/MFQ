@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "nint_row_pipeline.h"
 #include "mfq/nint_row_cache.h"
 #include "kernels/mfq_cuda_quant_ops.h"
@@ -48,7 +49,7 @@ struct NintRowStage::Impl {
         std::vector<int64_t> dimensions,const tb::Device& device,bool use_mapped)
         :source(identity),rows(n),width(w),payload_bytes(capacity),host_bytes(capacity+n*32),
          mapped(use_mapped),shape(std::move(dimensions)),host(host_bytes,use_mapped) {
-        const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
+        const auto* trace=mfq::cuda::env_lookup("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
         const MfqCudaGuard guard(device);
         auto options=tb::TensorOptions().device(device);
         std::vector<int32_t> initial(static_cast<std::size_t>(n)*6,0);
@@ -98,8 +99,8 @@ struct NintRowPipeline::Impl {
     std::vector<int64_t> current_ids,current_shape;
     std::future<Gathered> pending;std::unique_ptr<Gathered> ready;
     explicit Impl(std::vector<std::shared_ptr<mfq::NintRows>> data):tables(std::move(data)) {
-        const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
-        const auto* serial_setting=std::getenv("MFQ_PLE_SERIAL_SMALL_GATHER");
+        const auto* trace=mfq::cuda::env_lookup("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
+        const auto* serial_setting=mfq::cuda::env_lookup("MFQ_PLE_SERIAL_SMALL_GATHER");
         serial_small=serial_setting && serial_setting[0]=='1';
         static std::atomic<uint64_t> next{1};source_id=next.fetch_add(1);
         if(tables.empty() || !tables.front())throw std::invalid_argument("MFQ PLE needs row sources");
@@ -180,7 +181,7 @@ std::shared_ptr<NintRowStage> NintRowPipeline::make_stage(const std::vector<int6
     for(const auto& table:s.tables)row_bytes=std::max(row_bytes,table->selected_row_nbytes_bound());
     if(row_bytes>std::size_t(INT_MAX)/n)throw std::overflow_error("PLE graph payload exceeds bounds");
     const auto capacity=(row_bytes*n+7)&~std::size_t(7);
-    const auto* setting=std::getenv("MFQ_PLE_MAPPED_ROWS");
+    const auto* setting=mfq::cuda::env_lookup("MFQ_PLE_MAPPED_ROWS");
     const bool mapped=setting && setting[0]=='1';
     return std::shared_ptr<NintRowStage>(new NintRowStage(std::make_unique<NintRowStage::Impl>(
         s.source_id,n,s.width,capacity,shape,device,mapped)));

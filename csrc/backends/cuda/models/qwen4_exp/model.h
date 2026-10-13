@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "ops/execution_options.h"
 #pragma once
 #include "ops/cuda_execution.h"
@@ -74,7 +75,7 @@ class Gdn {
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,int64_t confirmed,
                          Tensor& checkpoint_conv,Tensor& checkpoint_state) {
         if(!confirmed)return forward_chunk(execution,x,true);
-        const auto* batch=std::getenv("MFQ_GDN_BATCH_PROJECTION");
+        const auto* batch=mfq::cuda::env_lookup("MFQ_GDN_BATCH_PROJECTION");
         const bool grouped=grouped_projection_ && w_.input_projection && x.size(1)<=8 && (!batch || batch[0]!='0');
         // Only recurrence is split at the confirmation boundary. Both parts
         // share the input projections and one output projection.

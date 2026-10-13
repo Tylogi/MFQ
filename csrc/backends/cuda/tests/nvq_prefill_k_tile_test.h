@@ -1,17 +1,14 @@
 #pragma once
+#include "native/env.h"
 
 void verify_nvq_prefill_k_tiles(const std::filesystem::path& root,bool cohorts=false,bool defaults=false) {
     struct Environment {
         const char* name;
         std::string previous;
         bool present=false;
-        explicit Environment(const char* key):name(key){if(const auto* p=std::getenv(name)){previous=p;present=true;}}
+        explicit Environment(const char* key):name(key){if(const auto* p=mfq::cuda::env_lookup(name)){previous=p;present=true;}}
         void set(const char* p) const {
-#ifdef _WIN32
-            _putenv_s(name,p);
-#else
-            if(*p)setenv(name,p,1);else unsetenv(name);
-#endif
+            if(*p)mfq::cuda::env_set(name,p);else mfq::cuda::env_clear(name);
         }
         ~Environment(){set(present?previous.c_str():"");}
     } environment(cohorts?"MFQ_NVQ_PREFILL_COHORTS":"MFQ_NVQ_PREFILL_NARROW_G2");

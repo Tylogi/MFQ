@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "mfe_ffn_launch.h"
 #include "mfe_ffn.h"
 #include "mfe_ffn_compact.h"
@@ -16,7 +17,7 @@ bool mfe_ffn_compact_requested(const MfeFfnBatch& b,bool down) {
     // This module independently proves default arithmetic. The legacy
     // DEFAULT_MATH flag selects the fallback kernel's code specialization;
     // COMPACT=0 retains that choice exactly.
-    if(const auto* setting=std::getenv("MFQ_MFE_NVQ_COMPACT"))
+    if(const auto* setting=mfq::cuda::env_lookup("MFQ_MFE_NVQ_COMPACT"))
         return setting[0]=='1' || setting[0]==(down?'3':'2');
     thread_local int cached_device=-1;thread_local bool sm86=false;
     int device=0;
@@ -31,7 +32,7 @@ bool mfe_ffn_compact_requested(const MfeFfnBatch& b,bool down) {
     return sm86;
 }
 bool mfe_ffn_nint_whole_requested() {
-    if(const char* setting=std::getenv("MFQ_MFE_NINT_WHOLE"))return setting[0]!='0';
+    if(const char* setting=mfq::cuda::env_lookup("MFQ_MFE_NINT_WHOLE"))return setting[0]!='0';
     thread_local int cached_device=-1;
     thread_local bool sm86=false;
     int device=0;
@@ -46,7 +47,7 @@ bool mfe_ffn_nint_whole_requested() {
     return sm86;
 }
 bool mfe_ffn_e8_narrow_requested(const MfeFfnBatch& b,bool down) {
-    if(const char* setting=std::getenv("MFQ_MFE_E8_NARROW"))
+    if(const char* setting=mfq::cuda::env_lookup("MFQ_MFE_E8_NARROW"))
         return setting[0]=='1' || setting[0]==(down?'3':'2');
     // Expert-local rebasing permits the large asynchronous cache arenas as
     // well as resident pools. Both paths have exact-output checks; ordinary
@@ -69,7 +70,7 @@ bool mfe_ffn_e8_narrow_requested(const MfeFfnBatch& b,bool down) {
 }
 
 bool mfe_ffn_format_specialization_enabled() {
-    if(const char* setting=std::getenv("MFQ_MFE_FORMAT_SPECIALIZE"))return setting[0]!='0';
+    if(const char* setting=mfq::cuda::env_lookup("MFQ_MFE_FORMAT_SPECIALIZE"))return setting[0]!='0';
     thread_local int cached_device=-1;thread_local bool sm86=false;
     int device=0;
     if(cudaGetDevice(&device)!=cudaSuccess)throw std::runtime_error("MFE device query failed");
@@ -83,13 +84,13 @@ bool mfe_ffn_format_specialization_enabled() {
     return sm86;
 }
 int mfe_ffn_down_launch_warps(const void* kernel,int routes,int tokens) {
-    if(const auto* requested=std::getenv("MFQ_MFE_DOWN_WARPS")) {
+    if(const auto* requested=mfq::cuda::env_lookup("MFQ_MFE_DOWN_WARPS")) {
         char* end=nullptr;const auto value=std::strtol(requested,&end,10);
         if(end==requested || *end || value<1 || value>32 || routes<1 || routes>32)
             throw std::invalid_argument("MFE Down warp override must be 1..32 with 1..32 routes");
         return std::min(int(value),routes);
     }
-    const auto* setting=std::getenv("MFQ_MFE_DOWN_PACK_ROUTES");
+    const auto* setting=mfq::cuda::env_lookup("MFQ_MFE_DOWN_PACK_ROUTES");
     if(setting && std::atoi(setting)!=1)return routes;
     if(!setting && (tokens<1 || tokens>8 || (routes!=10 && routes!=11)))return routes;
     if(routes<1 || routes>32)throw std::invalid_argument("MFE Down route count exceeds shared result geometry");

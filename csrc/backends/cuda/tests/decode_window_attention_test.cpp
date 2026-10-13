@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "models/qwen4_exp/model.h"
 #include "runtime/decode_window.h"
 #include "native/context.h"
@@ -18,16 +19,12 @@ class GdnTileScope {
     std::string previous_;
     bool present_;
     static void set(const char* value) {
-#ifdef _WIN32
-        if(_putenv_s("MFQ_GDN_DECODE_TILES",value)!=0)throw std::runtime_error("cannot set GDN tile option");
-#else
-        const int result=*value?setenv("MFQ_GDN_DECODE_TILES",value,1):unsetenv("MFQ_GDN_DECODE_TILES");
-        if(result!=0)throw std::runtime_error("cannot set GDN tile option");
-#endif
+        if (*value) mfq::cuda::env_set("MFQ_GDN_DECODE_TILES", value);
+        else mfq::cuda::env_clear("MFQ_GDN_DECODE_TILES");
     }
 public:
-    explicit GdnTileScope(int tiles):present_(std::getenv("MFQ_GDN_DECODE_TILES")!=nullptr) {
-        if(present_)previous_=std::getenv("MFQ_GDN_DECODE_TILES");
+    explicit GdnTileScope(int tiles):present_(mfq::cuda::env_lookup("MFQ_GDN_DECODE_TILES")!=nullptr) {
+        if(present_)previous_=mfq::cuda::env_lookup("MFQ_GDN_DECODE_TILES");
         set(std::to_string(tiles).c_str());
     }
     ~GdnTileScope(){
@@ -426,16 +423,12 @@ void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) 
     const std::vector<int> tile_cases=(compare_geometry || compare_inplace)?std::vector<int>{4,4,4,4,4,4}:std::vector<int>{4,2,1,1,2,4};
     int arm=0;
     for(int tiles:tile_cases) {
-        const char* fixed_setting=std::getenv("MFQ_GDN_FIXED_GEOMETRY");
+        const char* fixed_setting=mfq::cuda::env_lookup("MFQ_GDN_FIXED_GEOMETRY");
         const bool fixed=compare_geometry?arm%3==1:(!fixed_setting || fixed_setting[0]!='0');
         const bool inplace=compare_inplace && arm%3==1;
         if(compare_inplace){state.copy_(initial_state);conv.copy_(initial_conv);}
         if(compare_geometry) {
-#ifdef _WIN32
-            _putenv_s("MFQ_GDN_FIXED_GEOMETRY",fixed?"1":"0");
-#else
-            setenv("MFQ_GDN_FIXED_GEOMETRY",fixed?"1":"0",1);
-#endif
+            mfq::cuda::env_set("MFQ_GDN_FIXED_GEOMETRY",fixed?"1":"0");
         }
         ++arm;
         GdnTileScope setting(tiles);std::vector<Tensor> result;
@@ -643,11 +636,7 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
             mfq_qwen4_exp::sparse_gqa_attention(query,key,value,indices),gate,true).cpu().contiguous();
         for(bool fused:{false,true,false,false,true,false}) {
             if(compare_query) {
-#ifdef _WIN32
-                _putenv_s("MFQ_QSA_SPARSE_QUERY_FUSED",fused?"1":"0");
-#else
-                setenv("MFQ_QSA_SPARSE_QUERY_FUSED",fused?"1":"0",1);
-#endif
+                mfq::cuda::env_set("MFQ_QSA_SPARSE_QUERY_FUSED",fused?"1":"0");
             }
             Tensor output;
             const auto compute=[&]{output=(fused || compare_query)?

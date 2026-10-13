@@ -6,6 +6,7 @@
 // scale = 1/sqrt(D). Scalar gate and per-dim (KDA) gate; D in {32,64,128} (D=128 needs the
 // 64KB shared-mem opt-in via cudaFuncSetAttribute).
 
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda/atomic>
@@ -370,13 +371,13 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     cudaStream_t stream = mfq_current_cuda_stream();
     int shmem = D * D * (int)sizeof(float);
 
-    const char* col_env = std::getenv("MFQ_GDN_COLUMN");
-    const char* warp_env = std::getenv("MFQ_GDN_WARP");
+    const char* col_env = mfq::cuda::env_lookup("MFQ_GDN_COLUMN");
+    const char* warp_env = mfq::cuda::env_lookup("MFQ_GDN_WARP");
     bool use_warp = transposed_state || !(warp_env && warp_env[0] == '0');
-    const char* columns_env = std::getenv("MFQ_GDN_PREFILL_COLUMNS");
+    const char* columns_env = mfq::cuda::env_lookup("MFQ_GDN_PREFILL_COLUMNS");
     const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? 4 : 0);
     if (use_warp && !kda && D == 128 && T > 8 && (columns == 2 || columns == 4)) {
-        const auto* decay_option=std::getenv("MFQ_GDN_PREFILL_PREPARED_DECAY");
+        const auto* decay_option=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_PREPARED_DECAY");
         const bool prepared_decay=T>=128 && (!decay_option || std::atoi(decay_option)!=0);
         mfq_tensor_backend::Tensor decay;
         if(prepared_decay) {
@@ -638,7 +639,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state) {
     constexpr int threads=256;
     const int tiles=[] {
-        const char* value=std::getenv("MFQ_GDN_DECODE_TILES");
+        const char* value=mfq::cuda::env_lookup("MFQ_GDN_DECODE_TILES");
         if(!value || !*value || std::strcmp(value,"4")==0)return 4;
         if(std::strcmp(value,"2")==0)return 2;
         if(std::strcmp(value,"1")==0)return 1;
@@ -693,7 +694,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
             workspace.defined()?workspace.data_ptr<float>():nullptr);
     };
     const auto select_geometry=[&]<int Tiles,class Gate,class Output>() {
-        const char* fixed=std::getenv("MFQ_GDN_FIXED_GEOMETRY");
+        const char* fixed=mfq::cuda::env_lookup("MFQ_GDN_FIXED_GEOMETRY");
         if((!fixed || fixed[0]!='0') && taps==4) {
             if(width==32)launch.template operator()<Tiles,Gate,Output,32,4>();
             else if(width==64)launch.template operator()<Tiles,Gate,Output,64,4>();

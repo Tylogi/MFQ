@@ -1,6 +1,7 @@
 // The single-entry fallback shares the wide decoder; grouped weight chunks
 // retain their specialized, inlined dot loops below.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
+#include "native/env.h"
 #include "mfe_ffn_device.cuh"
 #include "mfe_ffn_token_groups.h"
 #include "mfe_ffn_compact.h"
@@ -447,15 +448,15 @@ __global__ void token_reduce(MfeFfnBatch b) {
 }
 
 bool enabled(const MfeFfnBatch& b) {
-    const auto* setting=std::getenv("MFQ_MFE_TOKEN_GROUPS");
-    const auto* grouped=std::getenv("MFQ_MFE_GROUP_DOT");
+    const auto* setting=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUPS");
+    const auto* grouped=mfq::cuda::env_lookup("MFQ_MFE_GROUP_DOT");
     return (!setting || setting[0]!='0') && (!grouped || grouped[0]!='0') &&
         b.tokens>=2 && b.tokens<=32 && b.token_group_counts && b.token_group_slots && b.resident_pairs;
 }
 template<int Capacity>
 void launch_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(b.plan_ready && b.resident_plan_overlap) {
-        const auto* early=std::getenv("MFQ_MFE_EARLY_GU");
+        const auto* early=mfq::cuda::env_lookup("MFQ_MFE_EARLY_GU");
         if(!early || early[0]!='0')partition|=8;
     }
     const int groups=mfe_token_group_bound(b,Capacity);

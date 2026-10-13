@@ -1,15 +1,12 @@
 #pragma once
+#include "native/env.h"
 
 void qsa_prefill_scores_case() {
     struct Setting {
         std::string old;
-        Setting(){if(const auto* p=std::getenv("MFQ_QSA_PREFILL_SCORE_GEMM"))old=p;}
+        Setting(){if(const auto* p=mfq::cuda::env_lookup("MFQ_QSA_PREFILL_SCORE_GEMM"))old=p;}
         static void set(const char* value) {
-#ifdef _WIN32
-            _putenv_s("MFQ_QSA_PREFILL_SCORE_GEMM",value);
-#else
-            if(*value)setenv("MFQ_QSA_PREFILL_SCORE_GEMM",value,1);else unsetenv("MFQ_QSA_PREFILL_SCORE_GEMM");
-#endif
+            if(*value)mfq::cuda::env_set("MFQ_QSA_PREFILL_SCORE_GEMM",value);else mfq::cuda::env_clear("MFQ_QSA_PREFILL_SCORE_GEMM");
         }
         ~Setting(){set(old.c_str());}
     } setting;

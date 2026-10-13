@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "nvq_routed_reuse.cuh"
 #include "nvq_byte_signs.cuh"
 #include "nvq_e8_window.cuh"
@@ -188,15 +189,15 @@ __global__ void __launch_bounds__(Warps*32) routed_reuse_kernel(NvqRoutedReusePa
 }
 
 bool nvq_launch_routed_reuse(const NvqRoutedReuseParams& args,cudaStream_t stream) {
-    const char* row_env=std::getenv("MFQ_NVQ_ROUTE_ROWS");
-    const char* lane_env=std::getenv("MFQ_NVQ_ROUTE_LANES");
+    const char* row_env=mfq::cuda::env_lookup("MFQ_NVQ_ROUTE_ROWS");
+    const char* lane_env=mfq::cuda::env_lookup("MFQ_NVQ_ROUTE_LANES");
     const bool explicit_shape=row_env || lane_env;
     const bool canonical=args.pointers || args.format==1 || args.format==8 || args.format==5 ||
         args.format==13 || args.format==14 || args.format==10 || args.format==11 || args.format==12 || args.format==15 ||
         args.format==16 || args.format==17;
     if(!explicit_shape && !canonical)return false;
     const int automatic_rows=!args.pointers && (args.format==1 || args.format==8) && args.weight.ng<=32?2:1;
-    const char* lanes8_env=std::getenv("MFQ_NVQ_ROUTE_LANES8");
+    const char* lanes8_env=mfq::cuda::env_lookup("MFQ_NVQ_ROUTE_LANES8");
     // Latest Metal uses eight K lanes for some single-row compressed decodes.
     // On SM86 only the measured short raw D4 Down geometry benefits; its
     // counterpart long projections retain sixteen lanes.
@@ -206,9 +207,9 @@ bool nvq_launch_routed_reuse(const NvqRoutedReuseParams& args,cudaStream_t strea
     const bool lanes8=lanes8_env?lanes8_env[0]!='0':measured_d4_down;
     const int rows=row_env?std::atoi(row_env):(explicit_shape || lanes8?1:automatic_rows);
     const int lanes=lane_env?std::atoi(lane_env):(lanes8?8:16);
-    const char* byte_signs=std::getenv("MFQ_NVQ_BYTE_SIGNS");
+    const char* byte_signs=mfq::cuda::env_lookup("MFQ_NVQ_BYTE_SIGNS");
     const int fast_signs=byte_signs?(byte_signs[0]=='0'?0:1):-1;
-    const char* warps_env=std::getenv("MFQ_NVQ_ROUTE_WARPS8");
+    const char* warps_env=mfq::cuda::env_lookup("MFQ_NVQ_ROUTE_WARPS8");
     const bool raw_jsc=args.format==5 || args.format==10 || args.format==11 || args.format==12 ||
         args.format==13 || args.format==14 || args.format==15;
     const bool measured_long=!args.down && args.rows==640 && args.weight.ng==107 && raw_jsc;
@@ -217,19 +218,19 @@ bool nvq_launch_routed_reuse(const NvqRoutedReuseParams& args,cudaStream_t strea
     const bool eight_warps=warps_env?warps_env[0]!='0':automatic_warps;
     if(!((rows==2 && (lanes==16 || lanes==32)) || (rows==1 && (lanes==8 || lanes==16)) ||
             (rows==4 && lanes==128)) || args.rows%rows!=0)return false;
-    const char* window_env=std::getenv("MFQ_NVQ_E8_WORD_WINDOW");
+    const char* window_env=mfq::cuda::env_lookup("MFQ_NVQ_E8_WORD_WINDOW");
     // Two aligned words improve the measured ten-expert E8 projections except
     // short E8-4096 Down, whose original instruction schedule remains faster.
     const bool measured_window=!args.pointers && args.pairs==10 &&
         (measured_long || (args.down && args.rows==2560 && args.weight.ng==27 &&
             (args.format==5 || args.format==13)));
     const bool word_window=window_env?window_env[0]!='0':measured_window;
-    const char* static_signs_env=std::getenv("MFQ_NVQ_E8_STATIC_SIGNS");
+    const char* static_signs_env=mfq::cuda::env_lookup("MFQ_NVQ_E8_STATIC_SIGNS");
     // Select the sign algorithm once at launch instead of for every vector.
     const bool measured_signs=!args.pointers && args.pairs==10 &&
         (measured_long || (args.down && args.rows==2560 && args.weight.ng==27));
     const bool static_signs=static_signs_env?static_signs_env[0]!='0':measured_signs;
-    const char* narrow_env=std::getenv("MFQ_NVQ_E8_NARROW");
+    const char* narrow_env=mfq::cuda::env_lookup("MFQ_NVQ_E8_NARROW");
     const bool narrow_requested=narrow_env?narrow_env[0]!='0':measured_signs;
     const bool narrow=narrow_requested && !args.pointers &&
         nvq_e8_narrow_eligible(args.weight,args.rows,args.local_experts,args.format);

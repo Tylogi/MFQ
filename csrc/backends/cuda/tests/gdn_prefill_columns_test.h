@@ -1,28 +1,20 @@
 #pragma once
+#include "native/env.h"
 
 class GdnColumnsScope {
     std::string previous_;
     bool present_;
 public:
-    explicit GdnColumnsScope(int columns):present_(std::getenv("MFQ_GDN_PREFILL_COLUMNS")!=nullptr) {
-        if(present_)previous_=std::getenv("MFQ_GDN_PREFILL_COLUMNS");
+    explicit GdnColumnsScope(int columns):present_(mfq::cuda::env_lookup("MFQ_GDN_PREFILL_COLUMNS")!=nullptr) {
+        if(present_)previous_=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_COLUMNS");
         set(columns);
     }
     static void set(int columns) {
-        const auto value=std::to_string(columns);
-#ifdef _WIN32
-        if(_putenv_s("MFQ_GDN_PREFILL_COLUMNS",value.c_str()))throw std::runtime_error("GDN columns option");
-#else
-        if(setenv("MFQ_GDN_PREFILL_COLUMNS",value.c_str(),1))throw std::runtime_error("GDN columns option");
-#endif
+        mfq::cuda::env_set("MFQ_GDN_PREFILL_COLUMNS", std::to_string(columns).c_str());
     }
     ~GdnColumnsScope() {
-#ifdef _WIN32
-        _putenv_s("MFQ_GDN_PREFILL_COLUMNS",present_?previous_.c_str():"");
-#else
-        if(present_)setenv("MFQ_GDN_PREFILL_COLUMNS",previous_.c_str(),1);
-        else unsetenv("MFQ_GDN_PREFILL_COLUMNS");
-#endif
+        if (present_) mfq::cuda::env_set("MFQ_GDN_PREFILL_COLUMNS", previous_.c_str());
+        else mfq::cuda::env_clear("MFQ_GDN_PREFILL_COLUMNS");
     }
 };
 

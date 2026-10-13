@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "ops/execution_options.h"
 #include "moe_ffn_pipeline.h"
 #include "moe_cached_source_internal.h"
@@ -708,7 +709,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 host_maps.push_back(std::move(cold_map));
             }
             const auto compact=mfq::cuda::runtime_options::moe_prefill_compact_mma();
-            const auto* host_maps_option=std::getenv("MFQ_MOE_PREFILL_HOST_MAPS");
+            const auto* host_maps_option=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_HOST_MAPS");
             initialize_mixed_nvq_dispatch(runtime,execution.config,!compact || *compact!=0,
                 !host_maps_option || host_maps_option[0]!='0'?&host_maps:nullptr);
         }

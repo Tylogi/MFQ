@@ -1,4 +1,5 @@
 #pragma once
+#include "native/env.h"
 
 class GdnPipelineScope {
     std::string old_;
@@ -6,23 +7,15 @@ class GdnPipelineScope {
     const char* key_;
 public:
     explicit GdnPipelineScope(int mode,const char* key="MFQ_GDN_PREFILL_PIPELINED"):
-        present_(std::getenv(key)!=nullptr),key_(key) {
-        if(present_)old_=std::getenv(key);set(mode,key);
+        present_(mfq::cuda::env_lookup(key)!=nullptr),key_(key) {
+        if(present_)old_=mfq::cuda::env_lookup(key);set(mode,key);
     }
     static void set(int mode,const char* key="MFQ_GDN_PREFILL_PIPELINED") {
         const auto value=mode<0?std::string{}:std::to_string(mode);
-#ifdef _WIN32
-        _putenv_s(key,value.c_str());
-#else
-        if(value.empty())unsetenv(key);else setenv(key,value.c_str(),1);
-#endif
+        if(value.empty())mfq::cuda::env_clear(key);else mfq::cuda::env_set(key,value.c_str());
     }
     ~GdnPipelineScope() {
-#ifdef _WIN32
-        _putenv_s(key_,present_?old_.c_str():"");
-#else
-        if(present_)setenv(key_,old_.c_str(),1);else unsetenv(key_);
-#endif
+        if(present_)mfq::cuda::env_set(key_,old_.c_str());else mfq::cuda::env_clear(key_);
     }
 };
 void gdn_prefill_pipeline_case(bool defaults=false,bool prepared_decay=false) {

@@ -1,24 +1,21 @@
 #pragma once
+#include "native/env.h"
 #include "storage/weight_loader.h"
 
 void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false,bool partial_pin=false) {
     struct Setting {
         std::string old;
         std::string old_direct,old_groups,old_group_size,old_mma,old_layer,old_retain,old_pin;
-        Setting(){if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GRAPH"))old=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_DIRECT_RAM"))old_direct=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GROUPS"))old_groups=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE"))old_group_size=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_COMPACT_MMA"))old_mma=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_LAYER"))old_layer=p;
-            if(const auto* p=std::getenv("MFQ_MOE_RAM_PIN_GIB"))old_pin=p;
-            if(const auto* p=std::getenv("MFQ_MOE_PREFILL_POOL_RETAIN"))old_retain=p;}
+        Setting(){if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GRAPH"))old=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_DIRECT_RAM"))old_direct=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GROUPS"))old_groups=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GROUP_SIZE"))old_group_size=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_COMPACT_MMA"))old_mma=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER"))old_layer=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_RAM_PIN_GIB"))old_pin=p;
+            if(const auto* p=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_POOL_RETAIN"))old_retain=p;}
         static void set_env(const char* key,const char* p) {
-#ifdef _WIN32
-            _putenv_s(key,p);
-#else
-            if(*p)setenv(key,p,1);else unsetenv(key);
-#endif
+            if(*p)mfq::cuda::env_set(key,p);else mfq::cuda::env_clear(key);
         }
         static void set(const char* p){set_env("MFQ_MOE_PREFILL_GRAPH",p);}
         ~Setting(){set(old.c_str());set_env("MFQ_MOE_PREFILL_DIRECT_RAM",old_direct.c_str());set_env("MFQ_MOE_PREFILL_GROUPS",old_groups.c_str());set_env("MFQ_MOE_PREFILL_GROUP_SIZE",old_group_size.c_str());set_env("MFQ_MOE_PREFILL_COMPACT_MMA",old_mma.c_str());set_env("MFQ_MOE_PREFILL_LAYER",old_layer.c_str());set_env("MFQ_MOE_PREFILL_POOL_RETAIN",old_retain.c_str());set_env("MFQ_MOE_RAM_PIN_GIB",old_pin.c_str());}
@@ -144,9 +141,9 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
                 for(int layer=0;layer<2;++layer) {
                     // A one-row final chunk uses Q8 decode arithmetic. Compare
                     // full batches directly to establish the new tile's bits.
-                    const auto* wide_option=std::getenv("MFQ_NVQ_PREFILL_M256");
-                    const auto* k_option=std::getenv("MFQ_NVQ_PREFILL_NARROW_G2");
-                    const auto* cohorts_option=std::getenv("MFQ_NVQ_PREFILL_COHORTS");
+                    const auto* wide_option=mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_M256");
+                    const auto* k_option=mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_NARROW_G2");
+                    const auto* cohorts_option=mfq::cuda::env_lookup("MFQ_NVQ_PREFILL_COHORTS");
                     const bool wide=wide_option && std::atoi(wide_option)!=0;
                     const bool k_tile=k_option && std::atoi(k_option)!=0;
                     const char* tile_key=wide?"MFQ_NVQ_PREFILL_M256":k_tile?"MFQ_NVQ_PREFILL_NARROW_G2":"MFQ_NVQ_PREFILL_COHORTS";
@@ -248,7 +245,7 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
                     throw std::runtime_error("prefill did not copy registered RAM directly");
                 if(grouped && (!std::regex_search(stats,match,std::regex("pipeline_prefill_groups=(\\d+)")) || std::stoll(match[1])<3))
                     throw std::runtime_error("prefill did not reuse its streamed expert ring");
-                const auto* phased=std::getenv("MFQ_MOE_PREFILL_LAYER_PHASED");
+                const auto* phased=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_PHASED");
                 if(layer_prefill && !layout_only && (!phased || std::atoi(phased)!=0) &&
                     (!std::regex_search(stats,match,std::regex("pipeline_phased_transfer_serves=(\\d+)")) || std::stoll(match[1])<=0))
                     throw std::runtime_error("whole-layer prefill did not partition Gate/Up and Down");

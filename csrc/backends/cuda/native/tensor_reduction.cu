@@ -1,3 +1,4 @@
+#include "env.h"
 #include "tensor_ops_common.cuh"
 
 #include <limits>
@@ -227,7 +228,7 @@ Tensor reduce_cuda(
     bool row_mean_enabled = true;
     if (source.scalar_type() == kFloat32) {
         const char* value =
-            std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+            mfq::cuda::env_lookup("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
         row_mean_enabled = value == nullptr || value[0] != '1';
     }
     if (operation == 1 &&

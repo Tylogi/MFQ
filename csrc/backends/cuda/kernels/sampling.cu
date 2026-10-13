@@ -2,6 +2,7 @@
 // Greedy uses a parallel block reduction. Stochastic full-softmax keeps logits on GPU;
 // random uniforms are passed as a small GPU tensor.
 
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -637,7 +638,7 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
                 "sample_top_k_top_p: top_k must be in [1, min(V,1024)]");
     auto out = mfq_tensor_backend::empty({B}, logits.options().dtype(mfq_tensor_backend::kInt64));
 
-    const char* radix_env = std::getenv("MFQ_SAMPLE_RADIX_TOPK");
+    const char* radix_env = mfq::cuda::env_lookup("MFQ_SAMPLE_RADIX_TOPK");
     const bool use_radix = B == 1 && top_k <= SAMPLE_RADIX_MAX_TOP_K &&
         (radix_env == nullptr || radix_env[0] != '0');
     if (use_radix) {

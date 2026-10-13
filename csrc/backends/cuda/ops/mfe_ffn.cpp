@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "execution_options.h"
 #include "mfe_ffn_runtime.h"
 #include "kernels/mfe_e8_narrow_bounds.h"
@@ -244,7 +245,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         // Small speculative batches favor two accumulators and more CTAs;
         // larger decode batches amortize decoding across up to eight rows.
         batch_.token_group_capacity=batch_.tokens<=8?2:8;
-        if(const auto* capacity=std::getenv("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
+        if(const auto* capacity=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
             if(std::strcmp(capacity,"2")==0)batch_.token_group_capacity=2;
             else if(std::strcmp(capacity,"4")==0)batch_.token_group_capacity=4;
             else if(std::strcmp(capacity,"8")==0)batch_.token_group_capacity=8;
@@ -255,7 +256,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         token_group_slots_=tb::empty({batch_.token_groups,8},input.options().dtype(tb::kInt32));
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
         batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
-        const auto* aligned_gu=std::getenv("MFQ_MFE_TOKEN_ALIGNED_GU");
+        const auto* aligned_gu=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_ALIGNED_GU");
         // The aligned CTA saves work at four rows. Other short shapes retain
         // the more parallel Gate/Up split; an explicit setting can compare it.
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
@@ -266,7 +267,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         for(int i=0;i<batch_.projection_counts[2];++i)
             batch_.token_group_aligned_gu &= aligned_down(views[batch_.projection_offsets[2]+i]);
         if(shared[0])batch_.token_group_aligned_gu &= aligned_down(views.back());
-        const auto* compact_plan=std::getenv("MFQ_MFE_TOKEN_COMPACT_PLAN");
+        const auto* compact_plan=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_COMPACT_PLAN");
         if(!compact_plan || compact_plan[0]!='0') {
             token_group_buckets_=tb::empty({4,batch_.token_groups+1},input.options().dtype(tb::kInt32));
             batch_.token_group_buckets=token_group_buckets_.data_ptr<int32_t>();
@@ -405,7 +406,7 @@ void MfeFfnRuntime::trace_dispatch() {
 void MfeFfnRuntime::prepare(){
     trace_dispatch();
     auto prepared=batch_;
-    if(const auto* setting=std::getenv("MFQ_MFE_TOKEN_GROUPS"))
+    if(const auto* setting=mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUPS"))
         if(setting[0]=='0')prepared.token_group_counts=nullptr;
     mfq::cuda::mfe_ffn_prepare(prepared,reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr()),
         quantization_count_,quantization_groups_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();

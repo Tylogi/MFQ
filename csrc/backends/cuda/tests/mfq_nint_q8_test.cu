@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "kernels/mfq_cuda_quant_ops.h"
 
 #include <cuda_runtime_api.h>
@@ -12,33 +13,17 @@
 namespace {
 using namespace mfq::cuda;
 void single_path(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0");
-#else
-    setenv("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0",1);
-#endif
+    mfq::cuda::env_set("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0");
 }
 
 void group_path(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0");
-#else
-    setenv("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0", 1);
-#endif
+    mfq::cuda::env_set("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0");
 }
 void whole_path(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0");
-#else
-    setenv("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0", 1);
-#endif
+    mfq::cuda::env_set("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0");
 }
 void exact_batch_path(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0");
-#else
-    setenv("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0",1);
-#endif
+    mfq::cuda::env_set("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0");
 }
 
 double grouped_max_nrmse = 0.0;

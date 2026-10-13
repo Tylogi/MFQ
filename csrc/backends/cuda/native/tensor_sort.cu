@@ -1,3 +1,4 @@
+#include "env.h"
 #include "tensor_ops_common.cuh"
 
 #include <cub/cub.cuh>
@@ -307,7 +308,7 @@ Tensor softmax(const Tensor& input, std::int64_t dimension) {
     bool exact_bf16_disabled = false;
     if (input.scalar_type() == kBFloat16) {
         const char* value =
-            std::getenv("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX");
+            mfq::cuda::env_lookup("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX");
         exact_bf16_disabled = value != nullptr && value[0] == '1';
     }
     const bool row_softmax = input.is_cuda() && input.is_contiguous() &&

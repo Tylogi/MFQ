@@ -1,4 +1,5 @@
 // Shared dense and index-selected attention mechanics.
+#include "native/env.h"
 #include "selected_attention.h"
 #include "mfq_sparse_attn_mma_f16.cuh"
 
@@ -358,7 +359,7 @@ Tensor sparse_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     // Keep the shared selected-attention arithmetic for all other widths.
     if (q.size(3) != 256 || !half_or_float(gate) || !q.numel() || !k.size(2))
         return gated(sparse(q, k, v, indices, scale, false), gate, half_output);
-    const char* fused_query = std::getenv("MFQ_QSA_SPARSE_QUERY_FUSED");
+    const char* fused_query = mfq::cuda::env_lookup("MFQ_QSA_SPARSE_QUERY_FUSED");
     return sparse_impl(q, k, v, indices, scale, false, gate, half_output,
         !fused_query || fused_query[0] != '0');
 }
@@ -566,7 +567,7 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     MFQ_RUNTIME_CHECK(shared+sizeof(float)<=48*1024,"MMA gate reduction shared memory exceeded");
     MfqCudaGuard guard(partial.device());
     auto output=tb::empty(partial.sizes(),partial.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
-    const char* parallel=std::getenv("MFQ_QSA_PARALLEL_REDUCE");
+    const char* parallel=mfq::cuda::env_lookup("MFQ_QSA_PARALLEL_REDUCE");
     const bool parallel_reduce=!parallel || parallel[0]!='0';
     const auto kernel=parallel_reduce?mma_reduce_gate_kernel:mma_reduce_gate_serial_kernel;
     if(output.numel())kernel<<<unsigned(output.numel()/width),256,parallel_reduce?0:shared,mfq_current_cuda_stream()>>>(

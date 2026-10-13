@@ -1,4 +1,5 @@
 #pragma once
+#include "native/env.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cstdint>
@@ -36,7 +37,7 @@ class DmaCopyBatch {
         if(result!=cudaSuccess)throw std::runtime_error(std::string("CUDA DMA batch: ")+cudaGetErrorString(result));
     }
     static void trace(const char* stage,std::size_t count) {
-        const auto* enabled=std::getenv("MFQ_TRACE_MOE_DMA_GRAPH");
+        const auto* enabled=mfq::cuda::env_lookup("MFQ_TRACE_MOE_DMA_GRAPH");
         if(enabled && enabled[0]=='1')std::fprintf(stderr,"dma_graph_stage=%s copies=%zu\n",stage,count);
     }
 public:

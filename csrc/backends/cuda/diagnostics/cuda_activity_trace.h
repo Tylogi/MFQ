@@ -1,4 +1,5 @@
 #pragma once
+#include "native/env.h"
 #include <cstdio>
 #include <cstdlib>
 #ifdef _WIN32
@@ -10,7 +11,7 @@
 
 namespace mfq::cuda::internal {
 inline void finish_cuda_activity_trace() noexcept {
-    if(!std::getenv("MFQ_CUDA_ACTIVITY_PREFIX"))return;
+    if(!mfq::cuda::env_lookup("MFQ_CUDA_ACTIVITY_PREFIX"))return;
 #ifdef _WIN32
     const auto module=GetModuleHandleW(L"cuda_activity_collector.dll");
     const auto finish=module?reinterpret_cast<int(*)()>(GetProcAddress(module,"MFQCompleteCudaActivityTrace")):nullptr;

@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "execution_options.h"
 #include "cuda_execution.h"
 
@@ -35,7 +36,7 @@
 namespace {
 
 std::optional<std::string> environment(const char* name) {
-    const char* value = std::getenv(name);
+    const char* value = mfq::cuda::env_lookup(name);
     if (value == nullptr || value[0] == '\0') return std::nullopt;
     return value;
 }
@@ -88,16 +89,16 @@ bool enabled_unless_disabled(const char* name) {
 namespace mfq::cuda::runtime_options {
 namespace {
 bool exact_one(const char* name, bool fallback = false) {
-    const auto* value = std::getenv(name);
+    const auto* value = mfq::cuda::env_lookup(name);
     return value ? std::string_view(value) == "1" : fallback;
 }
 bool first_nonzero(const char* name, bool fallback) {
-    const auto* value = std::getenv(name);
+    const auto* value = mfq::cuda::env_lookup(name);
     return value ? value[0] != '0' : fallback;
 }
 }
 bool resident_plan_overlap() {
-    const auto* value = std::getenv("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+    const auto* value = mfq::cuda::env_lookup("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
     if(value)return std::atoi(value)==1;
     // The GPU-only RAM/VRAM path has exact ordinary-generation coverage. Its
     // small early-window gain is retained; steady-tail gain is not established.
@@ -105,12 +106,12 @@ bool resident_plan_overlap() {
     return exact_one("MFQ_MOE_RAM_PCIE_FRACTION");
 }
 std::optional<bool> rotary_fusion() {
-    const auto* value = std::getenv("MFQ_ROTARY_FUSED");
+    const auto* value = mfq::cuda::env_lookup("MFQ_ROTARY_FUSED");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 bool mhc_timings() { return exact_one("MFQ_TRACE_MHC_TIMINGS"); }
 bool layer_timings() {
-    const auto* value = std::getenv("MFQ_TRACE_LAYER_TIMINGS");
+    const auto* value = mfq::cuda::env_lookup("MFQ_TRACE_LAYER_TIMINGS");
     return value && std::string_view(value) != "0";
 }
 int route_poll_interval_us() {
@@ -125,7 +126,7 @@ bool decode_host_pin() { return exact_one("MFQ_MOE_DECODE_HOST_PIN"); }
 bool dma_graph_batch() { return exact_one("MFQ_MOE_DMA_GRAPH_BATCH"); }
 bool warp_multi_sum() { return exact_one("MFQ_CUDA_WARP_MULTI_SUM"); }
 float residency_heat_retention() {
-    const auto* setting=std::getenv("MFQ_MOE_RESIDENCY_HEAT_RETENTION");
+    const auto* setting=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_HEAT_RETENTION");
     if(!setting)return 0.7f;
     char* end=nullptr;const float value=std::strtof(setting,&end);
     if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
@@ -138,7 +139,7 @@ int residency_interval() {
 bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
 std::size_t workspace_reserve_bytes() {
     std::size_t reserve = std::size_t(4) * 1024 * 1024 * 1024;
-    if (const auto* value = std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
         char* end = nullptr;
         const double gib = std::strtod(value, &end);
         const long double bytes = static_cast<long double>(gib) * 1024 * 1024 * 1024;
@@ -165,169 +166,169 @@ MoeDiagnostics moe_diagnostics() {
     result.dma = exact_one("MFQ_TRACE_MOE_DMA");
     result.dma_fail_alloc = exact_one("MFQ_TRACE_MOE_DMA_FAIL_ALLOC");
     result.shared_cpu_cost = exact_one("MFQ_MOE_SHARED_CPU_COST");
-    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_RECORD")) result.dispatch_record = path;
-    if (const auto* path = std::getenv("MFQ_MOE_MISS_RECORD")) result.miss_record = path;
-    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
+    if (const auto* path = mfq::cuda::env_lookup("MFQ_MOE_DISPATCH_RECORD")) result.dispatch_record = path;
+    if (const auto* path = mfq::cuda::env_lookup("MFQ_MOE_MISS_RECORD")) result.miss_record = path;
+    if (const auto* path = mfq::cuda::env_lookup("MFQ_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
     return result;
 }
 std::optional<int> embedding_mapped() {
-    const auto* value=std::getenv("MFQ_EMBEDDING_MAPPED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_EMBEDDING_MAPPED");
     return value ? std::optional<int>(value[0] - '0') : std::nullopt;
 }
 std::optional<bool> gdn_inplace_state() {
-    const auto* value=std::getenv("MFQ_GDN_INPLACE_STATE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_GDN_INPLACE_STATE");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> gdn_prefill_fused() {
-    const auto* value=std::getenv("MFQ_GDN_PREFILL_FUSED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_FUSED");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> gr_dense_vector() {
-    const auto* value=std::getenv("MFQ_GR_DENSE_VECTOR");
+    const auto* value=mfq::cuda::env_lookup("MFQ_GR_DENSE_VECTOR");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> mfe_group_dot() {
-    const auto* value=std::getenv("MFQ_MFE_GROUP_DOT");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MFE_GROUP_DOT");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> mfe_nint_late_scale() {
-    const auto* value=std::getenv("MFQ_MFE_NINT_LATE_SCALE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MFE_NINT_LATE_SCALE");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 std::optional<bool> mfe_nvq_word_signs() {
-    const auto* value=std::getenv("MFQ_MFE_NVQ_WORD_SIGNS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MFE_NVQ_WORD_SIGNS");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> mfe_shared_dense_math() {
-    const auto* value=std::getenv("MFQ_MFE_SHARED_DENSE_MATH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MFE_SHARED_DENSE_MATH");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 std::optional<bool> moe_assert_resident() {
-    const auto* value=std::getenv("MFQ_MOE_ASSERT_RESIDENT");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_ASSERT_RESIDENT");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 std::optional<bool> moe_nvq_dense() {
-    const auto* value=std::getenv("MFQ_MOE_NVQ_DENSE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_NVQ_DENSE");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 std::optional<bool> moe_plan_reuse() {
-    const auto* value=std::getenv("MFQ_MOE_PLAN_REUSE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PLAN_REUSE");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_plan_reuse_check() {
-    const auto* value=std::getenv("MFQ_MOE_PLAN_REUSE_CHECK");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PLAN_REUSE_CHECK");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_compact_mma() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_COMPACT_MMA");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_COMPACT_MMA");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_direct_ram() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_DIRECT_RAM");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_DIRECT_RAM");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_expert_batch() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_EXPERT_BATCH");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<std::int64_t> moe_prefill_expert_batch_tokens() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH_TOKENS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_EXPERT_BATCH_TOKENS");
     return value ? std::optional<std::int64_t>(std::atoll(value)) : std::nullopt;
 }
 std::optional<bool> moe_prefill_graph() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_GRAPH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GRAPH");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_groups() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_GROUPS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GROUPS");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_async() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_ASYNC");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_ASYNC");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_flush() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_FLUSH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_FLUSH");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_major() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_MAJOR");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_MAJOR");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_overlap() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_OVERLAP");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_OVERLAP");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_phased() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_PHASED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_PHASED");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_layer_reuse_async() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_LAYER_REUSE_ASYNC");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_LAYER_REUSE_ASYNC");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_prefill_pool_retain() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_POOL_RETAIN");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_POOL_RETAIN");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> moe_preload_all() {
-    const auto* value=std::getenv("MFQ_MOE_PRELOAD_ALL");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PRELOAD_ALL");
     return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
 }
 bool nint_dense_reference() {
-    const auto* value=std::getenv("MFQ_NINT_DENSE_REFERENCE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_DENSE_REFERENCE");
     return value != nullptr;
 }
 std::optional<bool> nint_direct_pool() {
-    const auto* value=std::getenv("MFQ_NINT_DIRECT_POOL");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_DIRECT_POOL");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> nint_group_dot() {
-    const auto* value=std::getenv("MFQ_NINT_GROUP_DOT");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_GROUP_DOT");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> nint_route_hint() {
-    const auto* value=std::getenv("MFQ_NINT_ROUTE_HINT");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_HINT");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> nint_route_row_workspace() {
-    const auto* value=std::getenv("MFQ_NINT_ROUTE_ROW_WORKSPACE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_ROW_WORKSPACE");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<int> nint_route_warps() {
-    const auto* value=std::getenv("MFQ_NINT_ROUTE_WARPS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_ROUTE_WARPS");
     return value ? std::optional<int>(std::atoi(value)) : std::nullopt;
 }
 std::optional<bool> nvq1_group_records() {
-    const auto* value=std::getenv("MFQ_NVQ1_GROUP_RECORDS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NVQ1_GROUP_RECORDS");
     return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
 }
 std::optional<bool> nvq1_integer_delta() {
-    const auto* value=std::getenv("MFQ_NVQ1_INTEGER_DELTA");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NVQ1_INTEGER_DELTA");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 bool nvq_dense_reference() {
-    const auto* value=std::getenv("MFQ_NVQ_DENSE_REFERENCE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_NVQ_DENSE_REFERENCE");
     return value != nullptr;
 }
 std::optional<bool> ple_file_map() {
-    const auto* value=std::getenv("MFQ_PLE_FILE_MAP");
+    const auto* value=mfq::cuda::env_lookup("MFQ_PLE_FILE_MAP");
     return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
 }
 std::optional<bool> prefill_expert_batch_audit() {
-    const auto* value=std::getenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT");
+    const auto* value=mfq::cuda::env_lookup("MFQ_PREFILL_EXPERT_BATCH_AUDIT");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> prefill_layer_major_trace() {
-    const auto* value=std::getenv("MFQ_PREFILL_LAYER_MAJOR_TRACE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_MAJOR_TRACE");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> qsa_prefill_fused() {
-    const auto* value=std::getenv("MFQ_QSA_PREFILL_FUSED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_QSA_PREFILL_FUSED");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 
@@ -337,35 +338,35 @@ QsaKvOffloadOptions qsa_kv_offload() {
         environment("MFQ_RUNTIME_PREFIX_CACHE_DIR").value_or("")};
 }
 std::optional<bool> qsa_select_fused() {
-    const auto* value=std::getenv("MFQ_QSA_SELECT_FUSED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_QSA_SELECT_FUSED");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> qsa_sparse_gate_fused() {
-    const auto* value=std::getenv("MFQ_QSA_SPARSE_GATE_FUSED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_QSA_SPARSE_GATE_FUSED");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> shared_gate_fused() {
-    const auto* value=std::getenv("MFQ_SHARED_GATE_FUSED");
+    const auto* value=mfq::cuda::env_lookup("MFQ_SHARED_GATE_FUSED");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> trace_mfe_dispatch() {
-    const auto* value=std::getenv("MFQ_TRACE_MFE_DISPATCH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_MFE_DISPATCH");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
 std::optional<bool> trace_mfe_dispatch_requested() {
-    const auto* value=std::getenv("MFQ_TRACE_MFE_DISPATCH");
+    const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_MFE_DISPATCH");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;
 }
 std::optional<bool> trace_moe_serve() {
-    const auto* value=std::getenv("MFQ_TRACE_MOE_SERVE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_MOE_SERVE");
     return value ? std::optional<bool>(value[0] != '\0' && value[0] != '0') : std::nullopt;
 }
 std::optional<bool> trace_ple_timings() {
-    const auto* value=std::getenv("MFQ_TRACE_PLE_TIMINGS");
+    const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_PLE_TIMINGS");
     return value ? std::optional<bool>(value[0] == '1') : std::nullopt;
 }
 int moe_prefill_group_size() {
-    const auto* value=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE");
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_GROUP_SIZE");
     return value ? std::atoi(value) : 16;
 }
 } // namespace mfq::cuda::runtime_options
@@ -415,13 +416,9 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
     result.tensor_parallel_shard_native_float = environment_flag(
         "MFQ_TP_SHARD_NATIVE_FLOAT", false);
-    result.nvq_fusion = environment("MFQ_DISABLE_NVQ_FUSION")
-        ? enabled_unless_disabled("MFQ_DISABLE_NVQ_FUSION")
-        : enabled_unless_disabled("MFQ_DISABLE_NIQ_FUSION");
+    result.nvq_fusion = enabled_unless_disabled("MFQ_DISABLE_NVQ_FUSION");
     result.nvq2_exec = environment_flag("MFQ_NVQ2_EXEC", false) &&
-        (environment("MFQ_DISABLE_NVQ2_EXEC")
-            ? enabled_unless_disabled("MFQ_DISABLE_NVQ2_EXEC")
-            : enabled_unless_disabled("MFQ_DISABLE_NIQ2_EXEC"));
+        enabled_unless_disabled("MFQ_DISABLE_NVQ2_EXEC");
     result.nvq_extended_group_exec = environment_flag(
         "MFQ_NVQ_EXTENDED_GROUP_EXEC", false);
     result.moe_nvq_heterogeneous = enabled_unless_disabled(
@@ -620,7 +617,7 @@ void CudaProfiler::reset() {
 void CudaProfiler::report(const std::string& title) {
     if (!enabled) return;
     if (!pending.empty()) cudaEventSynchronize(pending.back().stop);
-    const auto* timeline_setting=std::getenv("MFQ_PREFILL_LAYER_TIMELINE");
+    const auto* timeline_setting=mfq::cuda::env_lookup("MFQ_PREFILL_LAYER_TIMELINE");
     if(!pending.empty() && timeline_setting && std::atoi(timeline_setting)!=0) {
         std::ostringstream trace;
         trace<<"profile_timeline_begin "<<title<<'\n';
@@ -1058,6 +1055,9 @@ void report_cuda_memory(
     std::cout<<"native_memory_stage="<<stage<<" owned_mib="<<native.allocated/mib
              <<" peak_mib="<<native.peak/mib<<" limit_mib="<<native.limit/mib
              <<" local_usage_mib="<<context->local_memory_usage()/mib
+             // The limit comes from the hand-tuned geometry factors; the fraction
+             // says how far the real run drifted from that plan.
+             <<(native.limit?" plan_peak_fraction="+std::to_string(double(native.peak)/double(native.limit)):"")
              <<" pool_used_mib="<<pool_used/mib<<" pool_reserved_mib="<<pool_reserved/mib<<"\n";
 #ifdef _WIN32
     Microsoft::WRL::ComPtr<IDXGIFactory1> factory;

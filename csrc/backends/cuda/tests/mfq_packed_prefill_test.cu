@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "native/tensor_backend.h"
 #include "csrc/backends/cuda/kernels/fp8_sq.h"
 #include "csrc/backends/cuda/kernels/mxfp4_sq.h"
@@ -12,11 +13,7 @@ using namespace mfq::cuda;
 const Device gpu{DeviceType::cuda, 0};
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 void environment(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
+    mfq::cuda::env_set(name, value);
 }
 void close(const Tensor& actual, const Tensor& reference, float atol, float rtol) {
     require(actual.sizes() == reference.sizes(), "shape mismatch");

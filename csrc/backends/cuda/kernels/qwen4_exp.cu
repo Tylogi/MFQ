@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "qwen4_exp.h"
 #include "mfq_cuda_norm_ops.h"
 
@@ -305,7 +306,7 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
     mfq_selected_attention::values({&query, &pooled});
     MfqCudaGuard guard(query.device());
-    const auto* option=std::getenv("MFQ_QSA_PREFILL_SCORE_GEMM");
+    const auto* option=mfq::cuda::env_lookup("MFQ_QSA_PREFILL_SCORE_GEMM");
     if(query.size(1)>=32 && option && option[0]=='1') {
         // Each index head owns a token matrix. This replaces thousands of
         // four-row GEMMs with a few large GEMMs and retains head reduction.

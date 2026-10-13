@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "storage/moe_ffn_pipeline.h"
 #include "runtime/decode_window.h"
 #include "ops/execution_options.h"
@@ -44,13 +45,9 @@ void verify_nvq_dense_default(const std::filesystem::path& root) {
     struct Environment {
         const char* names[3]={"MFQ_MOE_NVQ_DENSE","MFQ_MOE_PRELOAD_ALL","MFQ_MOE_ASSERT_RESIDENT"};
         std::string previous[3];
-        Environment(){for(int i=0;i<3;++i)if(const auto* value=std::getenv(names[i]))previous[i]=value;}
+        Environment(){for(int i=0;i<3;++i)if(const auto* value=mfq::cuda::env_lookup(names[i]))previous[i]=value;}
         void set(int i,const char* value)const {
-#ifdef _WIN32
-            _putenv_s(names[i],value);
-#else
-            if(*value)setenv(names[i],value,1);else unsetenv(names[i]);
-#endif
+            if(*value)mfq::cuda::env_set(names[i],value);else mfq::cuda::env_clear(names[i]);
         }
         ~Environment(){for(int i=0;i<3;++i)set(i,previous[i].c_str());}
     } env;
@@ -512,7 +509,7 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
         CudaExecutionContext execution;execution.config.moe_residency_warm=true;
         const bool limited=mode==1,shared=mode==2;
         if(shared && !shared_cases)continue;
-        if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))
+        if(mfq::cuda::env_lookup("MFQ_TEST_RESIDENCY_TRACE"))
             std::cerr<<"fence_fixture format="<<format<<" mode="<<mode<<std::endl;
         if(shared && !execution.config.moe_direct_ram)continue;
         execution.config.moe_host_physical_bytes=limited?1024:0;
@@ -535,13 +532,13 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
         }
         finalize_moe_expert_cache(cache);
         if(shared) {
-            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared before_forward"<<std::endl;
+            if(mfq::cuda::env_lookup("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared before_forward"<<std::endl;
             std::vector<float> values(2560);for(int j=0;j<2560;++j)values[j]=std::sin(float(j)*.013f);
             auto x=tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA);
             auto ids=tb::zeros({1,1},x.options().dtype(tb::kInt32));
             auto route_weights=tb::ones({1,1},x.options());
             auto reference=forwards[0](execution,x,ids,route_weights).cpu().contiguous();
-            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared after_forward"<<std::endl;
+            if(mfq::cuda::env_lookup("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared after_forward"<<std::endl;
             MoeResidencyManager failed(cache.get(),[](const char* phase,std::size_t) {
                 if(std::string(phase)=="publish")throw std::runtime_error("shared backup publication failure");
             });
@@ -589,7 +586,7 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
         std::atomic_bool prepared=false,copies_complete=false;
         const auto observation_start=std::chrono::steady_clock::now();
         MoeResidencyManager manager(cache.get(),[&](const char* phase,std::size_t index) {
-            if(std::getenv("MFQ_TEST_RESIDENCY_TRACE") && (index==0 || std::string(phase)=="copies_complete"))
+            if(mfq::cuda::env_lookup("MFQ_TEST_RESIDENCY_TRACE") && (index==0 || std::string(phase)=="copies_complete"))
                 std::cerr<<"fence_probe phase="<<phase<<" ms="<<std::chrono::duration<double,std::milli>(
                     std::chrono::steady_clock::now()-observation_start).count()<<std::endl;
             if(std::string(phase)=="copies_complete")copies_complete.store(true,std::memory_order_release);
@@ -597,7 +594,7 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
                 prepared.store(true,std::memory_order_release);
         },std::move(memory));
         const bool in_window=manager.prepare_during_window() && !limited;
-        const char* fence_option=std::getenv("MFQ_MOE_RESIDENCY_EXPERT_FENCE");
+        const char* fence_option=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_EXPERT_FENCE");
         std::unique_ptr<TailGate> tail;
         if(in_window && fence_option && fence_option[0]=='1') {
             tail=std::make_unique<TailGate>(manager,count-1);tail->start();
@@ -780,11 +777,11 @@ int verify_projection_heat(const std::filesystem::path& root,bool transfer_cache
         }
         const auto stats=manager.stats();const bool changed=phase=="none";
         if(transfer_cached && changed) {
-            const auto* mode=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+            const auto* mode=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
             const bool reuse=mode && mode[0]=='2';
             if((stats.cached_copy_bytes>0)!=reuse || (reuse && stats.direct_upload_bytes))
                 throw std::runtime_error("cached promotion did not use the requested RAM/GPU copy source");
-            const auto* refill=std::getenv("MFQ_MOE_RESIDENCY_CACHED_REFILL");
+            const auto* refill=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_CACHED_REFILL");
             if(reuse && refill && refill[0]=='1' && !stats.cached_copy_batches)
                 throw std::runtime_error("cached promotion did not exercise the batched GPU refill");
         }
@@ -1031,14 +1028,10 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         bool enabled;
         std::string previous;
         void set(const char* value)const {
-#ifdef _WIN32
-            _putenv_s(option,value);
-#else
-            if(*value)setenv(option,value,1);else unsetenv(option);
-#endif
+            if(*value)mfq::cuda::env_set(option,value);else mfq::cuda::env_clear(option);
         }
         explicit MathEnvironment(bool active,const char* name):option(name),enabled(active) {
-            if(active)if(const auto* value=std::getenv(option))previous=value;
+            if(active)if(const auto* value=mfq::cuda::env_lookup(option))previous=value;
         }
         void select(bool candidate)const {if(enabled)set(candidate?"1":"0");}
         ~MathEnvironment(){if(enabled)set(previous.c_str());}
@@ -1048,14 +1041,10 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         std::string previous;
         bool present=false;
         static void set(const char* value) {
-#ifdef _WIN32
-            _putenv_s("MFQ_MOE_TRANSFER_CACHE",value);
-#else
-            if(*value)setenv("MFQ_MOE_TRANSFER_CACHE",value,1);else unsetenv("MFQ_MOE_TRANSFER_CACHE");
-#endif
+            if(*value)mfq::cuda::env_set("MFQ_MOE_TRANSFER_CACHE",value);else mfq::cuda::env_clear("MFQ_MOE_TRANSFER_CACHE");
         }
         explicit RestoreEnvironment(bool enabled) {
-            if(const auto* value=std::getenv("MFQ_MOE_TRANSFER_CACHE")){previous=value;present=true;}
+            if(const auto* value=mfq::cuda::env_lookup("MFQ_MOE_TRANSFER_CACHE")){previous=value;present=true;}
             set(enabled?"1":"0");
         }
         ~RestoreEnvironment(){set(present?previous.c_str():"");}
@@ -1274,8 +1263,8 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             !counter(caches[1],"pipeline_transfer_cache_misses") || !counter(caches[1],"pipeline_transfer_cache_saved_bytes")))
             throw std::runtime_error("retained transfer fields were not reused by changing shared FFN graphs");
         if(transfer_cache) {
-            const auto* phases=std::getenv("MFQ_MOE_FFN_TRANSFER_PHASES");
-            const auto* mapped=std::getenv("MFQ_MOE_MAPPED_COPY");
+            const auto* phases=mfq::cuda::env_lookup("MFQ_MOE_FFN_TRANSFER_PHASES");
+            const auto* mapped=mfq::cuda::env_lookup("MFQ_MOE_MAPPED_COPY");
             const bool enabled_phase=(!phases || std::string(phases)=="1") && !(mapped && std::string(mapped)=="1");
             const auto actual_phases=counter(caches[1],"pipeline_phased_transfer_serves");
             if(actual_phases!=(comparison?4:enabled_phase?4:0) ||
@@ -1284,13 +1273,13 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             if((enabled_phase || comparison) && (!counter(caches[1],"pipeline_gate_up_dma_bytes") || !counter(caches[1],"pipeline_down_dma_bytes")))
                 throw std::runtime_error("phased-transfer test omitted an original projection payload");
             phased_serves+=actual_phases;
-            const auto* enabled=std::getenv("MFQ_MOE_MAPPED_COPY");
+            const auto* enabled=mfq::cuda::env_lookup("MFQ_MOE_MAPPED_COPY");
             if(enabled && std::string(enabled)=="1") {
                 const auto serves=counter(caches[1],"pipeline_mapped_copy_serves");
                 const auto bytes=counter(caches[1],"pipeline_mapped_copy_bytes");
                 if(serves!=4 || !bytes || counter(caches[0],"pipeline_mapped_copy_serves")!=(compare_math?4:0))
                     throw std::runtime_error("shared graph did not compare DMA with mapped RAM transfer");
-                const auto* overlap=std::getenv("MFQ_MOE_MAPPED_COPY_OVERLAP");
+                const auto* overlap=mfq::cuda::env_lookup("MFQ_MOE_MAPPED_COPY_OVERLAP");
                 const auto overlap_serves=counter(caches[1],"pipeline_mapped_overlap_serves");
                 if(overlap_serves!=(overlap && std::string(overlap)=="1"?4:0))
                     throw std::runtime_error("mapped-copy overlap arm was not exercised");
@@ -1321,12 +1310,12 @@ int verify_transfer_hit_reservation(const std::filesystem::path& root) {
     };
     struct Environment {
         std::string old;
-        Environment(){const auto* p=std::getenv("MFQ_MOE_TRANSFER_CACHE");if(p)old=p;}
+        Environment(){const auto* p=mfq::cuda::env_lookup("MFQ_MOE_TRANSFER_CACHE");if(p)old=p;}
         static void set(const char* p) {
 #if defined(_WIN32)
-            _putenv_s("MFQ_MOE_TRANSFER_CACHE",p);
+            mfq::cuda::env_set("MFQ_MOE_TRANSFER_CACHE",p);
 #else
-            if(*p)setenv("MFQ_MOE_TRANSFER_CACHE",p,1);else unsetenv("MFQ_MOE_TRANSFER_CACHE");
+            if(*p)mfq::cuda::env_set("MFQ_MOE_TRANSFER_CACHE",p);else mfq::cuda::env_clear("MFQ_MOE_TRANSFER_CACHE");
 #endif
         }
         ~Environment(){set(old.c_str());}
@@ -1410,14 +1399,10 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
         const char* name;
         std::string old;
         bool existed=false;
-        explicit Environment(const char* key):name(key){if(const auto* value=std::getenv(name)){old=value;existed=true;}}
+        explicit Environment(const char* key):name(key){if(const auto* value=mfq::cuda::env_lookup(name)){old=value;existed=true;}}
         void set(const char* value) {
-#ifdef _WIN32
-            _putenv_s(name,value);
-#else
-            if(*value)setenv(name,value,1);
-            else unsetenv(name);
-#endif
+            if(*value)mfq::cuda::env_set(name,value);
+            else mfq::cuda::env_clear(name);
         }
         ~Environment(){set(existed?old.c_str():"");}
     } environment(input_views?"MFQ_MFE_WINDOW_INPUT_VIEWS":"MFQ_MOE_EARLY_NO_CPU_READY");
@@ -1552,13 +1537,9 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
 void verify_router_prefetch(const std::filesystem::path& root) {
     struct Environment {
         std::string old;
-        Environment() {if(auto* p=std::getenv("MFQ_MOE_TRANSFER_CACHE"))old=p;set("1");}
+        Environment() {if(auto* p=mfq::cuda::env_lookup("MFQ_MOE_TRANSFER_CACHE"))old=p;set("1");}
         static void set(const char* p) {
-#ifdef _WIN32
-            _putenv_s("MFQ_MOE_TRANSFER_CACHE",p);
-#else
-            if(*p)setenv("MFQ_MOE_TRANSFER_CACHE",p,1);else unsetenv("MFQ_MOE_TRANSFER_CACHE");
-#endif
+            if(*p)mfq::cuda::env_set("MFQ_MOE_TRANSFER_CACHE",p);else mfq::cuda::env_clear("MFQ_MOE_TRANSFER_CACHE");
         }
         ~Environment(){set(old.c_str());}
     } environment;
@@ -1758,7 +1739,7 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--mapped-refill-check") {verify_mapped_refill_descriptors();return 0;}
         if(std::string(argv[2])=="--direct-exchange-check") {verify_direct_exchange(root);return 0;}
         if(std::string(argv[2])=="--transfer-promotion-check") {
-            const auto* mode=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
+            const auto* mode=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
             if(!mode || (mode[0]!='1' && mode[0]!='2'))throw std::runtime_error("promotion check requires explicit candidate mode");
             verify_projection_heat(root,true);return 0;
         }
@@ -2050,7 +2031,7 @@ int main(int argc,char** argv)try {
         {
             auto adaptive_stream=mfq_get_stream_from_pool();MfqCudaStreamGuard adaptive_guard(adaptive_stream);
             CudaExecutionContext adaptive;adaptive.config.moe_ram_pcie_fraction.reset();
-            const auto* shared_cost=std::getenv("MFQ_MOE_SHARED_CPU_COST");
+            const auto* shared_cost=mfq::cuda::env_lookup("MFQ_MOE_SHARED_CPU_COST");
             const bool shared_cost_enabled=shared_cost && std::strcmp(shared_cost,"1")==0;
             // Keep whole RAM experts eligible while obtaining repeated cost
             // observations; projection-wise exchanges are covered separately.
@@ -2121,13 +2102,13 @@ int main(int argc,char** argv)try {
                 if(position==std::string::npos)throw std::runtime_error("missing shared CPU cost evidence");
                 return std::stoll(text.substr(position+field.size()));
             };
-            const auto* enabled=std::getenv("MFQ_MOE_SHARED_CPU_COST");
+            const auto* enabled=mfq::cuda::env_lookup("MFQ_MOE_SHARED_CPU_COST");
             if(enabled && std::strcmp(enabled,"1")==0) {
                 if(cost_counter("pipeline_shared_cpu_cost_enabled")!=1 ||
                    cost_counter("pipeline_cpu_cost_queries")<=0 || cost_counter("pipeline_cpu_cost_samples")<=0)
                     throw std::runtime_error("shared CPU cost mode did not observe real adaptive work");
-                const auto* background=std::getenv("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
-                const auto* budget=std::getenv("MFQ_MOE_CPU_TRANSFER_BUDGET");
+                const auto* background=mfq::cuda::env_lookup("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
+                const auto* budget=mfq::cuda::env_lookup("MFQ_MOE_CPU_TRANSFER_BUDGET");
                 const bool expected_background=(!background || std::strcmp(background,"1")==0) &&
                     (!budget || budget[0]!='0');
                 const auto jobs=cost_counter("pipeline_cpu_calibration_jobs");
@@ -2186,9 +2167,9 @@ int main(int argc,char** argv)try {
                 throw std::runtime_error("missing RAM transfer counter "+name);
             return std::stoll(match[1]);
         };
-        if(const auto* value=std::getenv("MFQ_TRACE_CPU_ROWS");value && std::strcmp(value,"1")==0) {
+        if(const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_CPU_ROWS");value && std::strcmp(value,"1")==0) {
             const auto text=statistics.str();
-            const auto* fail=std::getenv("MFQ_TRACE_CPU_ROWS_FAIL_ALLOC");
+            const auto* fail=mfq::cuda::env_lookup("MFQ_TRACE_CPU_ROWS_FAIL_ALLOC");
             if(fail && std::strcmp(fail,"1")==0) {
                 if(text.find("moe_cpu_profile enabled=0 dropped=1 samples=0")==std::string::npos)
                     throw std::runtime_error("optional CPU trace allocation failure did not disable tracing");
@@ -2212,8 +2193,8 @@ int main(int argc,char** argv)try {
             }
             ++cpu_profile_cases;
         }
-        if(const auto* value=std::getenv("MFQ_TRACE_MOE_DMA");value && std::strcmp(value,"1")==0) {
-            const auto text=statistics.str();const auto* fail=std::getenv("MFQ_TRACE_MOE_DMA_FAIL_ALLOC");
+        if(const auto* value=mfq::cuda::env_lookup("MFQ_TRACE_MOE_DMA");value && std::strcmp(value,"1")==0) {
+            const auto text=statistics.str();const auto* fail=mfq::cuda::env_lookup("MFQ_TRACE_MOE_DMA_FAIL_ALLOC");
             if(fail && std::strcmp(fail,"1")==0) {
                 if(text.find("moe_dma_profile enabled=0 dropped=1 samples=0")==std::string::npos)
                     throw std::runtime_error("optional DMA trace allocation failure did not disable tracing");

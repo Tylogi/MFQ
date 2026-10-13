@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include <cuda_fp16.h>
 #include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_runtime.h>
@@ -812,7 +813,7 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     const int tile_waves = (ntiles_dst + resident_blocks - 1) / resident_blocks;
     const int tile_efficiency = 100 * ntiles_dst / (resident_blocks * tile_waves);
     bool stream_k = cc >= 890 || tile_efficiency < 75;
-    const char * stream_k_env = std::getenv("MFQ_MMA_ATTENTION_DECODE_STREAMK");
+    const char * stream_k_env = mfq::cuda::env_lookup("MFQ_MMA_ATTENTION_DECODE_STREAMK");
     if (stream_k_env != nullptr) stream_k = stream_k_env[0] != '0';
     int raw_blocks = stream_k
         ? std::min(resident_blocks, ntiles_dst * ntiles_kv)

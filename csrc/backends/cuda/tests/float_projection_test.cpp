@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "kernels/float_projection.h"
 #include "ops/gated_residual.h"
 #include "kernels/gated_residual_fused.h"
@@ -309,15 +310,11 @@ class PrefillProjectionScope {
     std::string old_;
     bool present_;
     static void set(const char* value) {
-#ifdef _WIN32
-        _putenv_s("MFQ_GR_PREFILL_MATMUL",value);
-#else
-        if(*value)setenv("MFQ_GR_PREFILL_MATMUL",value,1);else unsetenv("MFQ_GR_PREFILL_MATMUL");
-#endif
+        if(*value)mfq::cuda::env_set("MFQ_GR_PREFILL_MATMUL",value);else mfq::cuda::env_clear("MFQ_GR_PREFILL_MATMUL");
     }
 public:
-    explicit PrefillProjectionScope(int mode):present_(std::getenv("MFQ_GR_PREFILL_MATMUL")!=nullptr) {
-        if(present_)old_=std::getenv("MFQ_GR_PREFILL_MATMUL");set(mode<0?"":std::to_string(mode).c_str());
+    explicit PrefillProjectionScope(int mode):present_(mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL")!=nullptr) {
+        if(present_)old_=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL");set(mode<0?"":std::to_string(mode).c_str());
     }
     ~PrefillProjectionScope(){set(present_?old_.c_str():"");}
 };
@@ -325,28 +322,24 @@ class PrefillMixScope {
     std::string old_;
     bool present_;
     static void set(const char* value) {
-#ifdef _WIN32
-        _putenv_s("MFQ_GR_PREFILL_FUSED_MIX",value);
-#else
-        if(*value)setenv("MFQ_GR_PREFILL_FUSED_MIX",value,1);else unsetenv("MFQ_GR_PREFILL_FUSED_MIX");
-#endif
+        if(*value)mfq::cuda::env_set("MFQ_GR_PREFILL_FUSED_MIX",value);else mfq::cuda::env_clear("MFQ_GR_PREFILL_FUSED_MIX");
     }
 public:
-    explicit PrefillMixScope(int mode):present_(std::getenv("MFQ_GR_PREFILL_FUSED_MIX")!=nullptr) {
-        if(present_)old_=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");set(std::to_string(mode).c_str());
+    explicit PrefillMixScope(int mode):present_(mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX")!=nullptr) {
+        if(present_)old_=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");set(std::to_string(mode).c_str());
     }
     ~PrefillMixScope(){set(present_?old_.c_str():"");}
 };
 void prefill_vector_decode_check() {
-    const auto* projection_option=std::getenv("MFQ_GR_PREFILL_TRIAL_MODE");
-    const auto* mix_option=std::getenv("MFQ_GR_PREFILL_TRIAL_MIX");
+    const auto* projection_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_TRIAL_MODE");
+    const auto* mix_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_TRIAL_MIX");
     const int projection_mode=projection_option?std::atoi(projection_option):21;
     const int mix_mode=mix_option?std::atoi(mix_option):6;
-    const auto* baseline_projection_option=std::getenv("MFQ_GR_PREFILL_BASELINE_MODE");
-    const auto* baseline_mix_option=std::getenv("MFQ_GR_PREFILL_BASELINE_MIX");
+    const auto* baseline_projection_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_BASELINE_MODE");
+    const auto* baseline_mix_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_BASELINE_MIX");
     const int baseline_projection=baseline_projection_option?std::atoi(baseline_projection_option):17;
     const int baseline_mix=baseline_mix_option?std::atoi(baseline_mix_option):3;
-    const auto* rows_option=std::getenv("MFQ_GR_PREFILL_TRIAL_ROWS");
+    const auto* rows_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_TRIAL_ROWS");
     const int benchmark_rows=rows_option?std::atoi(rows_option):1024;
     MFQ_RUNTIME_CHECK(benchmark_rows>0,"GR prefill benchmark rows must be positive");
     int cases=0;

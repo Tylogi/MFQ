@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "kernels/mfq_cuda_moe_ops.h"
 #include "ops/execution_options.h"
 #include "kernels/mfq_cuda_shared_gate.h"
@@ -38,7 +39,7 @@ struct Gr {
     double eps;
     int64_t prefill_work_chunk(const Tensor& input)const {
         if(input.dim()!=3 || input.size(0)!=1)return 0;
-        const auto* option=std::getenv("MFQ_GR_PREFILL_WORK_CHUNK");
+        const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_WORK_CHUNK");
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const int64_t chunk=option?std::atoll(option):8192;
         // Chat framing just beyond 8k needs no large temporary-memory cut.
@@ -86,7 +87,7 @@ struct Gr {
             injection.weight->dense.scalar_type()==tb::kBFloat16))return false;
         const auto& w=up.weight->nint;
         const auto rows=x.numel()/(hidden*streams);
-        const auto* batch=std::getenv("MFQ_GR_BATCH_TWO_STAGE");
+        const auto* batch=mfq::cuda::env_lookup("MFQ_GR_BATCH_TWO_STAGE");
         if(rows>1 && batch && batch[0]=='0')return false;
         return w.ng==1 || ((w.out+3)/4)*rows>=nint_float_projection_resident_blocks(x.get_device());
     }
@@ -169,7 +170,7 @@ static Linear qwen_gdn_preserve_projection_rows(Linear project) {
         if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows)
             return project(execution,source);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const auto* parallel_option=std::getenv("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
+        const auto* parallel_option=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
         const int streams=parallel_option?std::atoi(parallel_option):2;
         const auto tail=source.size(1)%rows;
         if(streams>0 && (tail==0 || tail>8)) {
@@ -197,7 +198,7 @@ static LinearGroup qwen_gdn_preserve_projection_rows(LinearGroup project) {
         if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows)
             return project(execution,source);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const auto* parallel_option=std::getenv("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
+        const auto* parallel_option=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
         const int streams=parallel_option?std::atoi(parallel_option):2;
         const auto tail=source.size(1)%rows;
         if(streams>0 && (tail==0 || tail>8)) {
@@ -240,9 +241,9 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     auto shared=[shared_raw,shared_projections,shared_gate,shared_row_parallel](CudaExecutionContext& execution,const Tensor& source) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const auto rows=qwen_prefill_reference_rows;
-        const auto* parallel_option=std::getenv("MFQ_MOE_PREFILL_SHARED_STREAMS");
+        const auto* parallel_option=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_SHARED_STREAMS");
         const int streams=parallel_option?std::atoi(parallel_option):0;
-        const auto* chain_option=std::getenv("MFQ_MOE_PREFILL_SHARED_CHAIN_STREAMS");
+        const auto* chain_option=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_SHARED_CHAIN_STREAMS");
         const int chain_streams=chain_option?std::atoi(chain_option):4;
         const auto tail=rows>0?source.size(0)%rows:0;
         if(chain_streams>0 && shared_row_parallel && rows>8 && source.size(0)>=8192 &&
@@ -787,7 +788,7 @@ Tensor Qwen4ExpMtp::forward(const MtpTarget &target, Tensor hidden, Tensor ids) 
 }
 
 MtpStep Qwen4ExpMtp::step(const MtpTarget &target, Tensor hidden, Tensor ids) {
-    const auto* graph=std::getenv("MFQ_MTP_PREDICTOR_GRAPH");
+    const auto* graph=mfq::cuda::env_lookup("MFQ_MTP_PREDICTOR_GRAPH");
     if((!graph || graph[0]!='0') && execution->config.moe_pipeline && execution->config.moe_two_stage_ffn &&
         execution->kl_mmq.mode==KlMmqMode::Default && execution->moe_expert_cache &&
         !execution->qsa_kv_store && batch==1 && ids.dim()==2 && ids.size(0)==1 && ids.size(1)>0 && ids.size(1)<=8 &&
@@ -1234,11 +1235,11 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const bool trace=trace_option && *trace_option!=0;
     const auto batch_option=mfq::cuda::runtime_options::moe_prefill_expert_batch();
     const bool batch_experts=!batch_option || *batch_option!=0;
-    const auto* bulk_gr_option=std::getenv("MFQ_GR_PREFILL_LAYER_BATCH");
+    const auto* bulk_gr_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_LAYER_BATCH");
     // Long prompts retain the established memory footprint unless explicitly
     // requested; the combined residual tensors have been verified to 16k.
     const bool bulk_gr=batch_experts && (bulk_gr_option?bulk_gr_option[0]!='0':tokens<=16384);
-    const auto* bulk_gdn_option=std::getenv("MFQ_GDN_PREFILL_LAYER_BATCH");
+    const auto* bulk_gdn_option=mfq::cuda::env_lookup("MFQ_GDN_PREFILL_LAYER_BATCH");
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     // Allow 8k chat framing while keeping the extra whole-sequence QKV and
     // gate tensors out of the 16k service path, which also retains MTP weights.
@@ -1249,7 +1250,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const qwen4_exp::QwenPrefillReferenceRowsScope reference_rows(batch_experts?std::min<int64_t>(1024,compute_chunk):0);
     const auto batch_tokens_option=mfq::cuda::runtime_options::moe_prefill_expert_batch_tokens();
     const int64_t batch_tokens=batch_tokens_option?*batch_tokens_option:8192;
-    const auto* append_tail_option=std::getenv("MFQ_MOE_PREFILL_APPEND_TAIL");
+    const auto* append_tail_option=mfq::cuda::env_lookup("MFQ_MOE_PREFILL_APPEND_TAIL");
     const bool append_tail=append_tail_option && append_tail_option[0]=='1';
     const auto expert_batch_count=[&](int64_t remaining) {
         // Chat framing can leave a few tokens beyond the batch boundary.
@@ -1263,7 +1264,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto started=std::chrono::steady_clock::now();
     int layer=0;
     for(auto& block:model.blocks) {
-        const auto* decode_reuse_option=std::getenv("MFQ_NINT_PREFILL_DECODE_REUSE");
+        const auto* decode_reuse_option=mfq::cuda::env_lookup("MFQ_NINT_PREFILL_DECODE_REUSE");
         NintPrefillDecodeCacheScope decode_reuse(!decode_reuse_option || decode_reuse_option[0]=='1');
         Tensor next_hidden=hidden;
         Tensor ffn_inputs,ffn_injection;

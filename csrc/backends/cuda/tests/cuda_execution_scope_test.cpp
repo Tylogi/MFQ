@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "ops/cuda_execution.h"
 #include "ops/execution_options.h"
 #include "include/cuda_engine.h"
@@ -192,11 +193,7 @@ static void check_engines(const char* model, const char* tokenizer) {
 
 namespace {
 void set_option(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
+    if (value) mfq::cuda::env_set(name, value); else mfq::cuda::env_clear(name);
 }
 }
 
@@ -242,17 +239,9 @@ int main(int argc, char** argv) try {
     if (load_cuda_execution_config().moe_residency_adapt) return 1;
     set_option("MFQ_MOE_RESIDENCY_ADAPT", nullptr);
     if (!load_cuda_execution_config().moe_residency_adapt) return 1;
-#ifdef _WIN32
-    _putenv_s("MFQ_DISABLE_NVQ_FUSION", "1");
-#else
-    setenv("MFQ_DISABLE_NVQ_FUSION", "1", 1);
-#endif
+    mfq::cuda::env_set("MFQ_DISABLE_NVQ_FUSION", "1");
     const auto disabled_config = load_cuda_execution_config();
-#ifdef _WIN32
-    _putenv_s("MFQ_DISABLE_NVQ_FUSION", "");
-#else
-    unsetenv("MFQ_DISABLE_NVQ_FUSION");
-#endif
+    mfq::cuda::env_clear("MFQ_DISABLE_NVQ_FUSION");
     const auto enabled_config = load_cuda_execution_config();
     if (disabled_config.nvq_fusion || !enabled_config.nvq_fusion) return 1;
 
