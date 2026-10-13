@@ -2,7 +2,7 @@
 
 #include <mma.h>
 #include "native/env.h"
-#include "async_copy.cuh"
+#include "kernels/cache/async_copy.cuh"
 #include "native/nint_weight.h"
 #include "qwen4_exp.h"
 

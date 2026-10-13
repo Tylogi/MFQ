@@ -4,7 +4,7 @@
 #include "kernels/float_projection.h"
 #include "kernels/gated_residual_fused.h"
 #include "kernels/quant_ops.h"
-#include "kernels/selected_attention.h"
+#include "kernels/attention/selected_attention.h"
 #include "mfq/mxfp4_sq_decode.h"
 
 #include <algorithm>

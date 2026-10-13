@@ -8,7 +8,7 @@
 #include "kernels/moe/pipeline.h"
 #include "kernels/moe/ops.h"
 #include "ops/decode_window.h"
-#include "kernels/dma_copy_batch.h"
+#include "kernels/cache/dma_copy_batch.h"
 #include "native/context.h"
 #include "ops/mfe_ffn_runtime.h"
 #include "ops/quant_linear.h"

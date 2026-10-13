@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
-#include "glu.cuh"
-#include "warp_multi_sum.cuh"
+#include "kernels/glu.cuh"
+#include "kernels/warp_multi_sum.cuh"
 
 namespace mfq::cuda::packed_nint {
 __device__ __forceinline__ uint8_t unpack_nint_code(

@@ -26,7 +26,7 @@
 #include <vector>
 #include "native/context.h"
 #include "storage/moe/residency.h"
-#include "kernels/dma_copy_batch.h"
+#include "kernels/cache/dma_copy_batch.h"
 #include "mfq/host_parallel.h"
 #include "mfq/moe_cpu_cost_model.h"
 #include "mfq/moe_cpu_calibration.h"

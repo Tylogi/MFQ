@@ -10,13 +10,13 @@
 #endif
 #include "ffn.h"
 #include <cuda_bf16.h>
-#include "kernels/packed_nint.cuh"
-#include "kernels/packed_nvq.cuh"
+#include "kernels/quant/packed_nint.cuh"
+#include "kernels/quant/packed_nvq.cuh"
 #include "e8_narrow.cuh"
 #include "kernels/nvq/device.cuh"
 #include "ffn_launch.h"
 #include "kernels/warp_multi_sum.cuh"
-#include "kernels/nint_route_group.cuh"
+#include "kernels/quant/nint_route_group.cuh"
 #include "nint_whole.cuh"
 #include <algorithm>
 #include <cstdlib>

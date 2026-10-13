@@ -1,5 +1,5 @@
 #pragma once
-#include "kernels/linear_attention_ops.h"
+#include "kernels/attention/linear_ops.h"
 #include "kernels/norm_ops.h"
 #include "common/transformer_layer.h"
 

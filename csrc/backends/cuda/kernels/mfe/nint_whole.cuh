@@ -1,7 +1,7 @@
 #pragma once
 #include "ffn.h"
 #include "kernels/warp_multi_sum.cuh"
-#include "kernels/nint_route_group.cuh"
+#include "kernels/quant/nint_route_group.cuh"
 #include <climits>
 #include <type_traits>
 

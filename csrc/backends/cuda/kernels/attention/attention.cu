@@ -18,7 +18,7 @@
 #include <cstdlib>
 #include <utility>
 
-#include "reduce.cuh"
+#include "kernels/reduce.cuh"
 
 namespace wmma = nvcuda::wmma;
 

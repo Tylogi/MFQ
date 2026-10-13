@@ -1,6 +1,6 @@
 #include "glm5_next.h"
 
-#include "selected_attention.h"
+#include "kernels/attention/selected_attention.h"
 
 #include <cmath>
 

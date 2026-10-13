@@ -2,7 +2,7 @@
 #include "ops/execution_options.h"
 #pragma once
 #include "ops/cuda_execution.h"
-#include "kernels/linear_attention_ops.h"
+#include "kernels/attention/linear_ops.h"
 #include "kernels/norm_ops.h"
 #include "qwen4_exp/causal_lm.h"
 #include "qwen4_exp/ngram.h"

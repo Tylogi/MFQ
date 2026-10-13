@@ -6,7 +6,7 @@
 #include <cuda_fp16.h>
 #include <vector>
 
-#include "reduce.cuh"
+#include "kernels/reduce.cuh"
 
 constexpr int SSM_CONV_BD = 256;
 

@@ -24,10 +24,10 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
-#include "async_copy.cuh"
-#include "glu.cuh"
+#include "kernels/cache/async_copy.cuh"
+#include "kernels/glu.cuh"
 #include "csrc/backends/cuda/native/tensor_backend.h"
-#include "kernels/nint_route_hint.h"
+#include "kernels/quant/nint_route_hint.h"
 #include "packed_backward.cuh"
 #include "packed_nint.cuh"
 #include "nint_route_group.cuh"

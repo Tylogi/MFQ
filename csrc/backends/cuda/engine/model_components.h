@@ -7,7 +7,7 @@
 #include <array>
 #include "grid_vision.h"
 #include "mfq/runtime.h"
-#include "kernels/attention_ops.h"
+#include "kernels/attention/ops.h"
 #include "mfq_paged_prefix_cache.h"
 #include <algorithm>
 #include <cmath>

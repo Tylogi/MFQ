@@ -5,7 +5,7 @@
 #include "ops/quant_linear.h"
 #include "ops/cuda_execution.h"
 #include "kernels/activation_ops.h"
-#include "kernels/linear_attention_ops.h"
+#include "kernels/attention/linear_ops.h"
 #include "kernels/quant_ops.h"
 
 #include <cuda_runtime_api.h>

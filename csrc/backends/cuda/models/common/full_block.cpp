@@ -8,9 +8,9 @@
 #include <array>
 
 #include "kernels/activation_ops.h"
-#include "kernels/attention_ops.h"
+#include "kernels/attention/ops.h"
 #include "kernels/norm_ops.h"
-#include "kernels/paged_kv.h"
+#include "kernels/cache/paged_kv.h"
 
 #include <algorithm>
 #include <cmath>

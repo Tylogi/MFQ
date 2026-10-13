@@ -5,7 +5,7 @@
 #include "ops/cuda_execution.h"
 #include "storage/weight_loader.h"
 #include "storage/mapped_embedding.h"
-#include "kernels/selected_attention.h"
+#include "kernels/attention/selected_attention.h"
 #include "kernels/qwen4_exp.h"
 #include "ops/decode_window.h"
 

@@ -17,7 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "reduce.cuh"
+#include "kernels/reduce.cuh"
 
 template <int D>
 __global__ void gdn_kernel(

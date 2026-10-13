@@ -66,30 +66,30 @@ set_target_properties(mfq-cuda-native PROPERTIES
 set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/acc.cu
     ${MFQ_CUDA_KERNEL_ROOT}/activation.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/attention.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/attention_mma.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/attention_mma.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/selected_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/gated_delta_net.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/cache/kv_cache.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/cache/paged_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe/routing.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.cpp
-    ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/mx_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/fp8_sq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/mxfp4_sq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/nepq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/nepq_residual.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
@@ -98,7 +98,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/ssm_conv.cu
 )
 
 add_library(mfq-cuda-native-kernels STATIC
@@ -114,19 +114,19 @@ add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
 # Keep the shared packed math in incremental builds even when nvcc's depfile
 # omits headers from a heavily inlined translation unit on Windows.
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nint_whole.cuh")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nint_whole.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
-    PROPERTIES OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
+    PROPERTIES OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq/backward.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_backward.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh")
 set_source_files_properties(${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu PROPERTIES
     COMPILE_OPTIONS "--maxrregcount=80")
 target_compile_definitions(mfq-cuda-native-kernels PRIVATE
@@ -873,7 +873,7 @@ if(NOT WIN32 AND TARGET mfq-runtime)
 endif()
 
 set_source_files_properties(
-    ${MFQ_CUDA_KERNEL_ROOT}/attention_mma.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/attention/attention_mma.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math;--extended-lambda"
 )

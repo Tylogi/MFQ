@@ -2,7 +2,7 @@
 #include "qwen4_exp.h"
 #include "kernels/norm_ops.h"
 
-#include "selected_attention.h"
+#include "kernels/attention/selected_attention.h"
 
 #include <cmath>
 #include <cstdlib>

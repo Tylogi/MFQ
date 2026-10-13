@@ -1,6 +1,6 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
-#include "kernels/attention_ops.h"
+#include "kernels/attention/ops.h"
 #include "csrc/backends/cuda/kernels/glm5_next.h"
 #include "csrc/backends/cuda/kernels/qwen4_exp.h"
 #include "models/glm5_next/model.h"
