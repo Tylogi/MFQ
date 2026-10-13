@@ -183,7 +183,6 @@ static MfeCpu unpack_mfe_delta(
         const std::vector<uint8_t> & blob) {
     return unpack_mfe_impl(blob, true);
 }
-static std::atomic<uint64_t> g_moe_route_generation{1};
 
 
 static void initialize_mfe_nint_runtime(MfeWeight & result) {
