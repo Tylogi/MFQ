@@ -4,7 +4,7 @@
 #include "models/common/block.h"
 #include "glm5_next/causal_lm.h"
 #include "glm5_next/config.h"
-#include "../../ops/quant_linear.h"
+#include "ops/quant_linear.h"
 
 #include <memory>
 

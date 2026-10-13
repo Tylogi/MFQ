@@ -1,5 +1,5 @@
 #include "decode_window.h"
-#include "execution_options.h"
+#include "ops/execution_options.h"
 #include "native/context.h"
 #include "mfq/cpu_expert_pool.h"
 #include <algorithm>
@@ -96,6 +96,8 @@ struct DecodeWindow::LayerPoint {
     ~LayerPoint(){if(event)cudaEventDestroy(event);}
 };
 DecodeWindow* DecodeWindow::recording() noexcept { return active; }
+
+bool decode_window_recording() noexcept { return DecodeWindow::recording() != nullptr; }
 DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile):stream_(stream),graphs_(stream),layer_profile_(layer_profile) {}
 void DecodeWindow::mark(int layer,const char* phase) {
     if(!layer_profile_)return;

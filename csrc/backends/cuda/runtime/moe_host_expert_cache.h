@@ -1,6 +1,6 @@
 #pragma once
 
-#include "moe.h"
+#include "ops/moe.h"
 #include "moe_cache_policy.h"
 
 #include <functional>

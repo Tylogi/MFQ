@@ -1,6 +1,7 @@
+#include "../cuda_graph_query.h"
 #include "weights.h"
 #include "nint_row_metadata.h"
-#include "mfq_cuda_moe_ops.h"
+#include "kernels/mfq_cuda_moe_ops.h"
 #include <set>
 
 constexpr int routes=10;
@@ -117,7 +118,7 @@ struct Replay {
         fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));output.clear();
         graph.capture_begin();for(size_t i=0;i<calls;++i)output.push_back(run(i));
         cudaStreamCaptureStatus status;
-        fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&status,nullptr,&captured,nullptr,nullptr));
+        fb::check(bench_stream_captured_graph(mfq_current_cuda_stream(),&status,nullptr,&captured));
         graph.capture_end();
         graph.replay();fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));
     }

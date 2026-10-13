@@ -1,5 +1,5 @@
 #include "runtime/dma_copy_batch.h"
-#include "runtime/moe_pipeline.h"
+#include "kernels/moe_pipeline.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>

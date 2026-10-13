@@ -1,5 +1,5 @@
 #include "gated_residual.h"
-#include "qwen4_exp.h"
+#include "kernels/qwen4_exp.h"
 #include "cuda_execution.h"
 
 namespace {

@@ -8,6 +8,8 @@ endif()
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
 )
+target_include_directories(mfq-cuda-tensor-view-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda)
 target_compile_features(mfq-cuda-tensor-view-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
 
@@ -16,6 +18,8 @@ add_executable(mfq-native-tensor-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_cpu_test_stubs.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_test.cpp
 )
+target_include_directories(mfq-native-tensor-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda)
 target_compile_features(mfq-native-tensor-test PRIVATE cxx_std_20)
 add_test(NAME mfq-native-tensor-test COMMAND mfq-native-tensor-test)
 
@@ -87,6 +91,8 @@ add_executable(mfq-cuda-model-plan-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/cuda_model_plan_test.cpp
 )
 target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
+target_include_directories(mfq-cuda-model-plan-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 

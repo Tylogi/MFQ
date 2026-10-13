@@ -1,4 +1,5 @@
 #pragma once
+#include "storage/weight_loader.h"
 
 void verify_compact_prefill_mma(const std::filesystem::path& root) {
     CudaExecutionContext execution;
@@ -36,7 +37,7 @@ void verify_compact_prefill_mma(const std::filesystem::path& root) {
                 .reshape({tokens*routes,output}).cpu().to(tb::kFloat32);
             // Decode the canonical packed weights independently, then use
             // cuBLAS FP16 GEMM. No compact-reader code participates here.
-            auto expected=mfe_dense_reference(*model,"linear.weight",x,ids,tokens,routes,routed)
+            auto expected=mfe_dense_reference(load_mfe_cpu(*model, "linear.weight"),x,ids,tokens,routes,routed)
                 .cpu().to(tb::kFloat32);
             double squared=0,reference_squared=0;float max_difference=0,max_reference=0;
             for(int64_t i=0;i<actual.numel();++i) {

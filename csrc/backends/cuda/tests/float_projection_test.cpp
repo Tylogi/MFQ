@@ -1,11 +1,11 @@
-#include "float_projection.h"
-#include "gated_residual.h"
-#include "gated_residual_fused.h"
-#include "cuda_execution.h"
+#include "kernels/float_projection.h"
+#include "ops/gated_residual.h"
+#include "kernels/gated_residual_fused.h"
+#include "ops/cuda_execution.h"
 #include "storage/weight_loader.h"
 #include "storage/mapped_embedding.h"
-#include "selected_attention.h"
-#include "qwen4_exp.h"
+#include "kernels/selected_attention.h"
+#include "kernels/qwen4_exp.h"
 #include "runtime/decode_window.h"
 
 #include <cmath>

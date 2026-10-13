@@ -1,5 +1,5 @@
 #include "tensor_ops_common.cuh"
-#include "../kernels/mfq_native_matmul_rows.h"
+#include "mfq_native_matmul_rows.h"
 
 #include <cmath>
 #include <cstdlib>

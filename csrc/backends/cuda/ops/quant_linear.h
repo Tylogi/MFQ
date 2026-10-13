@@ -8,7 +8,7 @@
 #include "vq.h"
 
 #include "cuda_execution.h"
-#include "../native/tensor_backend.h"
+#include "native/tensor_backend.h"
 
 #include <cuda_runtime_api.h>
 

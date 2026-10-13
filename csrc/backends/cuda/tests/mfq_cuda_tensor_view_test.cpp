@@ -1,4 +1,4 @@
-#include "../native/tensor_view.h"
+#include "native/tensor_view.h"
 
 #include <array>
 #include <cassert>

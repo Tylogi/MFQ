@@ -1,6 +1,6 @@
 #include "moe_residency.h"
 #include "runtime/decode_window.h"
-#include "runtime/moe_pipeline.h"
+#include "kernels/moe_pipeline.h"
 #include "storage/moe_cached_source_internal.h"
 #include "mfq/cpu_expert_pool.h"
 #include "host_memory_copy.h"

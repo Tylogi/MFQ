@@ -1,5 +1,5 @@
 #pragma once
-#include "mfe_ffn_runtime.h"
+#include "ops/mfe_ffn_runtime.h"
 #include <cstring>
 
 void verify_mfe_token_groups(const std::filesystem::path& root) {

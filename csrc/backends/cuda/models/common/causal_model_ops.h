@@ -2,12 +2,12 @@
 
 #include "step_sequence.h"
 
-#include "../cuda_model_plan.h"
+#include "models/cuda_model_plan.h"
 #include "models/common/block.h"
 #include "resource_plan.h"
 #include "mfq/model_source.h"
 #include "common/causal_model.h"
-#include "../../ops/quant_linear.h"
+#include "ops/quant_linear.h"
 
 #include <cstddef>
 #include <cstdint>

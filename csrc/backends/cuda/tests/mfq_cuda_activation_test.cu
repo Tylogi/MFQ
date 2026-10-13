@@ -1,6 +1,6 @@
-#include "../native/context.h"
-#include "../kernels/mfq_cuda_kernels.h"
-#include "../native/tensor.h"
+#include "native/context.h"
+#include "kernels/mfq_cuda_kernels.h"
+#include "native/tensor.h"
 
 #include <cuda_fp16.h>
 #include <algorithm>

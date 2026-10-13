@@ -4,7 +4,7 @@
 #include "models/common/block.h"
 #include "qwen4_exp/causal_lm.h"
 #include "qwen4_exp/config.h"
-#include "../../ops/quant_linear.h"
+#include "ops/quant_linear.h"
 
 #include <memory>
 #include <functional>

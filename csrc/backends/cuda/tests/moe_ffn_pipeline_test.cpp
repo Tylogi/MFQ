@@ -1,15 +1,15 @@
 #include "storage/moe_ffn_pipeline.h"
 #include "runtime/decode_window.h"
-#include "runtime/execution_options.h"
-#include "runtime/moe_pipeline.h"
+#include "ops/execution_options.h"
+#include "kernels/moe_pipeline.h"
 #include "runtime/router_lookahead_audit.h"
-#include "mfq_cuda_moe_ops.h"
-#include "moe_cache_transfer.h"
+#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_cache_transfer.h"
 #include "runtime/moe_residency.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
-#include "moe.h"
+#include "ops/moe.h"
 #include "mfq/moe_dispatch_plan.h"
 #include <filesystem>
 #include <fstream>
@@ -1309,7 +1309,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     if(compare_dense)std::cout<<"nvq_dense_pipeline_conversions="<<dense_conversions<<" PASS\n";
     return cases;
 }
-#include "../../../../bench/moe_residency_copy_bench.h"
+#include "../../../bench/moe_residency_copy_bench.h"
 int verify_transfer_hit_reservation(const std::filesystem::path& root) {
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     const auto counter=[](const std::shared_ptr<MoeExpertCache>& cache,const char* name) {

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../ops/quant_linear.h"
-#include "../ops/moe.h"
+#include "ops/quant_linear.h"
+#include "ops/moe.h"
 #include "model_source.h"
-#include "gated_residual.h"
+#include "ops/gated_residual.h"
 
 namespace mfq::cuda {
 class MfeMxfp4ExpertStore;

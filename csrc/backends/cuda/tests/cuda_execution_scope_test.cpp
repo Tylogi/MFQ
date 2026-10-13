@@ -1,6 +1,6 @@
-#include "../ops/cuda_execution.h"
-#include "../runtime/execution_options.h"
-#include "cuda_engine.h"
+#include "ops/cuda_execution.h"
+#include "ops/execution_options.h"
+#include "include/cuda_engine.h"
 
 #include <atomic>
 #include <barrier>

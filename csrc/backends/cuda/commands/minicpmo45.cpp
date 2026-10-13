@@ -1,9 +1,9 @@
-#include "../kernels/mfq_cuda_sampling_ops.h"
+#include "kernels/mfq_cuda_sampling_ops.h"
 #include "minicpmo45.h"
 
 #include "models/minicpmo45/runtime.h"
 #include "cli.h"
-#include "cuda_engine.h"
+#include "include/cuda_engine.h"
 
 #include <nlohmann/json.hpp>
 #include <chrono>

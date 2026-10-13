@@ -1,6 +1,6 @@
 #pragma once
-#include "../../kernels/mfq_cuda_linear_attention_ops.h"
-#include "../../kernels/mfq_cuda_norm_ops.h"
+#include "kernels/mfq_cuda_linear_attention_ops.h"
+#include "kernels/mfq_cuda_norm_ops.h"
 #include "common/transformer_layer.h"
 
 #include "models/common/block.h"

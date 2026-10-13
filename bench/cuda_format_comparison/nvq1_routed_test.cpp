@@ -1,6 +1,6 @@
-#include "mfq_cuda_nvq1_decode.h"
-#include "mfq_cuda_quant_ops.h"
-#include "vq.h"
+#include "kernels/mfq_cuda_nvq1_decode.h"
+#include "kernels/mfq_cuda_quant_ops.h"
+#include "ops/vq.h"
 #include "timing.h"
 #include <array>
 #include <cstdlib>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "causal_model_ops.h"
-#include "runtime/execution_options.h"
+#include "ops/execution_options.h"
 #include "storage/mapped_embedding.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"

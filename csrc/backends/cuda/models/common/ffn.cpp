@@ -2,9 +2,9 @@
 #include "common/gated_mlp.h"
 #include "common/moe.h"
 
-#include "../../kernels/mfq_cuda_activation_ops.h"
-#include "../../kernels/mfq_cuda_moe_ops.h"
-#include "../../kernels/mfq_cuda_norm_ops.h"
+#include "kernels/mfq_cuda_activation_ops.h"
+#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/mfq_cuda_norm_ops.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>

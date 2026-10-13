@@ -1,4 +1,5 @@
 #pragma once
+#include "storage/weight_loader.h"
 
 void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false,bool partial_pin=false) {
     struct Setting {
@@ -182,10 +183,10 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
             }
             if(oracle && tokens>8) {
                 MfqCudaStreamGuard guard(streams[1]);
-                auto gate=mfe_dense_reference(*canonical[0],"linear.weight",x,ids,tokens,3,false).reshape({tokens,3,640});
-                auto up=mfe_dense_reference(*canonical[1],"linear.weight",x,ids,tokens,3,false).reshape({tokens,3,640});
+                auto gate=mfe_dense_reference(load_mfe_cpu(*canonical[0], "linear.weight"),x,ids,tokens,3,false).reshape({tokens,3,640});
+                auto up=mfe_dense_reference(load_mfe_cpu(*canonical[1], "linear.weight"),x,ids,tokens,3,false).reshape({tokens,3,640});
                 auto hidden=moe_swiglu_rounded_cuda(gate,up,moe_swiglu_sigmoid_table_cuda());
-                dense_reference=mfe_dense_reference(*canonical[2],"linear.weight",hidden,ids,tokens,3,true)
+                dense_reference=mfe_dense_reference(load_mfe_cpu(*canonical[2], "linear.weight"),hidden,ids,tokens,3,true)
                     .reshape({tokens,3,2560}).cpu().to(tb::kFloat32);
             }
             for(int layer=0;layer<2;++layer) {

@@ -17,7 +17,7 @@ add_library(mfq-cuda-storage STATIC
 )
 add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
 target_include_directories(mfq-cuda-storage PUBLIC
-    ${MFQ_CUDA_ROOT}/storage
+    ${MFQ_CUDA_ROOT}
 )
 target_link_libraries(mfq-cuda-storage PUBLIC Threads::Threads)
 target_compile_features(mfq-cuda-storage PUBLIC cxx_std_20)
@@ -42,7 +42,7 @@ add_library(mfq-cuda-native STATIC
 )
 add_library(mfq::cuda-native ALIAS mfq-cuda-native)
 target_include_directories(mfq-cuda-native PUBLIC
-    ${MFQ_CUDA_ROOT}/native
+    ${MFQ_CUDA_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native PUBLIC
@@ -105,7 +105,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
-    ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/moe_pipeline.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
@@ -134,8 +134,6 @@ target_compile_definitions(mfq-cuda-native-kernels PRIVATE
 target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${MFQ_REPOSITORY_ROOT}
     ${MFQ_CUDA_ROOT}
-    ${MFQ_CUDA_ROOT}/ops
-    ${MFQ_CUDA_KERNEL_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
@@ -258,7 +256,6 @@ if(BUILD_TESTING)
     target_include_directories(mfq-flash-next-test PRIVATE
         ${MFQ_CUDA_ROOT}
         ${MFQ_REPOSITORY_ROOT}
-        ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/../../core)
 endif()
 
@@ -285,9 +282,6 @@ function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}
-        ${MFQ_CUDA_ROOT}/ops
-        ${MFQ_CUDA_ROOT}/storage
-        ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
     target_link_libraries(${target} PRIVATE
@@ -315,9 +309,6 @@ function(mfq_configure_cuda_runtime_target target)
         ${PROJECT_SOURCE_DIR}/engine/internal
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
-        ${MFQ_CUDA_ROOT}/storage
-        ${MFQ_CUDA_ROOT}/models
-        ${MFQ_CUDA_ROOT}/engine
     )
     target_link_libraries(${target} PRIVATE mfq-models mfq-engine mfq-tokenizer)
 endfunction()
@@ -327,8 +318,6 @@ function(mfq_configure_cuda_model_target target)
     target_include_directories(${target} PRIVATE
         ${PROJECT_SOURCE_DIR}/engine/internal
         ${MFQ_CUDA_ROOT}
-        ${MFQ_CUDA_ROOT}/storage
-        ${MFQ_CUDA_ROOT}/models
     )
     target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
 endfunction()
@@ -392,7 +381,7 @@ set(MFQ_CUDA_LOADING_SOURCES
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
-target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_CUDA_ROOT}/storage)
+target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT})
 target_link_libraries(mfq-cuda-loading PRIVATE mfq-models)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -595,7 +584,7 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-cuda-dma-batch-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-cuda-dma-batch-test COMMAND mfq-cuda-dma-batch-test)
     add_executable(mfq-cuda-warp-multi-sum-test ${MFQ_CUDA_ROOT}/tests/warp_multi_sum_test.cu)
-    target_include_directories(mfq-cuda-warp-multi-sum-test PRIVATE ${MFQ_CUDA_KERNEL_ROOT})
+    target_include_directories(mfq-cuda-warp-multi-sum-test PRIVATE ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-cuda-warp-multi-sum-test PRIVATE CUDA::cudart)
     set_target_properties(mfq-cuda-warp-multi-sum-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
@@ -683,7 +672,7 @@ endif()
 
 add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)
 mfq_configure_cuda_runtime_target(mfq-cuda-eval)
-target_include_directories(mfq-cuda-eval PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_include_directories(mfq-cuda-eval PRIVATE ${MFQ_CUDA_ROOT})
 target_compile_definitions(mfq-cuda-eval PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 target_link_libraries(mfq-cuda-eval PUBLIC mfq-cuda-runtime)
 
@@ -696,7 +685,7 @@ add_library(mfq-cuda-diagnostics STATIC
     ${MFQ_CUDA_ROOT}/diagnostics/session_checks.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-cuda-diagnostics)
-target_include_directories(mfq-cuda-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_include_directories(mfq-cuda-diagnostics PRIVATE ${MFQ_CUDA_ROOT})
 target_compile_definitions(mfq-cuda-diagnostics PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 target_link_libraries(mfq-cuda-diagnostics PUBLIC mfq-cuda-runtime)
 if(MSVC)
@@ -731,7 +720,7 @@ add_executable(mfq-diagnostics
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-diagnostics)
-target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT})
 target_compile_definitions(mfq-diagnostics PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics)
 target_compile_features(mfq-diagnostics PRIVATE cxx_std_20)
@@ -748,7 +737,7 @@ add_executable(mfq-eval
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-eval)
-target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT})
 target_compile_definitions(mfq-eval PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 target_link_libraries(mfq-eval PRIVATE
     mfq-cuda-eval mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)

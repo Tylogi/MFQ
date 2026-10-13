@@ -76,6 +76,16 @@ for old paths or expose implementation directories through a PUBLIC include.
 serving executable; it does not disable backend, tokenizer, cache, diagnostics
 or evaluation targets. Only serving applications link backend and transport.
 
+Inside `backends/cuda`, a cross-directory include is written as
+`"<dir>/<name>"` (`#include "ops/moe.h"`, never `"moe.h"` or `"../ops/moe.h"`);
+the build no longer adds the layer directories to the include path, so the bare
+form cannot compile. The directories form a DAG from lowest to highest:
+`native`, `kernels`, `ops`, `storage`/`runtime`, `models`, `engine`. A file may
+include its own directory or a lower one; `storage` and `runtime` count as one
+layer and may include each other. `apps/`, `commands/`, `diagnostics/`, `eval/`
+and `tests/` are top-level consumers. `tests/test_cuda_include_graph.py`
+enforces the include form and the DAG.
+
 ## Canonical internal representation
 
 Raw Hugging Face, GGUF, or historical MFQ tensor names may appear only at the

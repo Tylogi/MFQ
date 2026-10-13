@@ -2,7 +2,7 @@
 #include "cli.h"
 #include "engine/model_registry.h"
 #include "eval/kl.h"
-#include "../ops/cuda_execution.h"
+#include "ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>

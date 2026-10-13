@@ -1,11 +1,11 @@
-#include "../runtime/execution_options.h"
+#include "execution_options.h"
 #include "mfe_ffn_runtime.h"
-#include "mfe_e8_narrow_bounds.h"
-#include "mfe_ffn_launch.h"
-#include "mfe_ffn_compact.h"
-#include "mfe_nvq_dense_bounds.h"
-#include "mfq_cuda_nint_route_hint.h"
-#include "runtime/decode_window.h"
+#include "kernels/mfe_e8_narrow_bounds.h"
+#include "kernels/mfe_ffn_launch.h"
+#include "kernels/mfe_ffn_compact.h"
+#include "kernels/mfe_nvq_dense_bounds.h"
+#include "kernels/mfq_cuda_nint_route_hint.h"
+#include "cuda_execution.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -283,7 +283,7 @@ void MfeFfnRuntime::cpu_results(const tb::Tensor& kinds,const tb::Tensor& pairs,
     kinds_=kinds;cpu_=pairs;batch_.kinds=kinds.data_ptr<int32_t>();batch_.cpu_pairs=reinterpret_cast<const __half*>(pairs.data_ptr());batch_.cpu_ready=ready;
 }
 void MfeFfnRuntime::bind_window_inputs(const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights) {
-    if(!mfq::cuda::DecodeWindow::recording() ||
+    if(!mfq::cuda::decode_window_recording() ||
         input.sizes()!=input_.sizes() || ids.sizes()!=ids_.sizes() || weights.sizes()!=weights_.sizes() ||
         !input.is_cuda() || !ids.is_cuda() || !weights.is_cuda() ||
         input.device()!=input_.device() || ids.device()!=ids_.device() || weights.device()!=weights_.device() ||
@@ -389,7 +389,7 @@ void MfeFfnRuntime::trace_dispatch() {
     // counts; graph replay does not call this method again.
     std::fprintf(stderr,"mfe_e8_dispatch runtime=%p scope=first_prepare tokens=%d routes=%d async=%d capture=%d mask=%u bounds=%d default_math=%d grouped=%d gu_requested=%d down_requested=%d gu_selected=%d down_selected=%d\n",
         static_cast<void*>(this),batch_.tokens,batch_.routes,int(batch_.plan_ready!=nullptr),
-        int(mfq::cuda::DecodeWindow::recording()!=nullptr),batch_.nvq_format_mask,int(batch_.e8_narrow),
+        int(mfq::cuda::decode_window_recording()),batch_.nvq_format_mask,int(batch_.e8_narrow),
         int(batch_.default_math),int(group_dot),int(gu_requested),int(down_requested),
         int(eligible && gu_requested),int(eligible && down_requested));
     for(int format:{5,13,14}) {

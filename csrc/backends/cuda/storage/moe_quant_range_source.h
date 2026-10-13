@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq/mfe_quant_expert_store.h"
-#include "moe.h"
+#include "ops/moe.h"
 #include "runtime/moe_host_expert_cache.h"
 #include <atomic>
 #include <unordered_map>

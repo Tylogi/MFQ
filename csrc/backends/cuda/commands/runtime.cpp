@@ -1,6 +1,6 @@
 #include "engine/load_options.h"
 #include "cli.h"
-#include "cuda_engine.h"
+#include "include/cuda_engine.h"
 #include "minicpmo45.h"
 #include "storage/model_source.h"
 #include "mfq/model_source.h"

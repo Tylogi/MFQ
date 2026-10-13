@@ -1,8 +1,8 @@
 #include "backend_checks.h"
 
-#include "../kernels/mfq_cuda_activation_ops.h"
-#include "../kernels/mfq_cuda_sampling_ops.h"
-#include "../native/tensor_backend.h"
+#include "kernels/mfq_cuda_activation_ops.h"
+#include "kernels/mfq_cuda_sampling_ops.h"
+#include "native/tensor_backend.h"
 
 #include <cuda_runtime_api.h>
 

@@ -1,9 +1,9 @@
 #include "e8_dense_group_probe.h"
-#include "mfq/kernels/cuda/nvq_e8_dense_group.cuh"
-#include "mfq/kernels/cuda/nvq_jsc_bank_map.cuh"
-#include "mfq/kernels/cuda/mfe_e8_narrow.cuh"
-#include "mfq/kernels/cuda/nvq_byte_signs.cuh"
-#include "mfq/kernels/cuda/nvq_dense_window32.cuh"
+#include "csrc/backends/cuda/kernels/nvq_e8_dense_group.cuh"
+#include "csrc/backends/cuda/kernels/nvq_jsc_bank_map.cuh"
+#include "csrc/backends/cuda/kernels/mfe_e8_narrow.cuh"
+#include "csrc/backends/cuda/kernels/nvq_byte_signs.cuh"
+#include "csrc/backends/cuda/kernels/nvq_dense_window32.cuh"
 #include "e8_cache_policy.cuh"
 #include <stdexcept>
 

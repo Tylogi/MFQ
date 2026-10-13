@@ -1,4 +1,4 @@
-#include "../native/tensor.h"
+#include "native/tensor.h"
 
 #include <stdexcept>
 

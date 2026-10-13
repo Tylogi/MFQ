@@ -1,10 +1,10 @@
-#include "../runtime/execution_options.h"
+#include "ops/execution_options.h"
 #include "weight_loader.h"
-#include "../ops/format.h"
-#include "../ops/float_projection.h"
-#include "../ops/gated_residual_fused.h"
-#include "../kernels/mfq_cuda_quant_ops.h"
-#include "../kernels/selected_attention.h"
+#include "ops/format.h"
+#include "kernels/float_projection.h"
+#include "kernels/gated_residual_fused.h"
+#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/selected_attention.h"
 #include "mfq/mxfp4_sq_decode.h"
 
 #include <algorithm>
@@ -694,7 +694,29 @@ QuantLinearGroup load_paired_gate_up(
 
 MfeCpu load_mfe_cpu(
         const mfq::ModelSource & mfq, const std::string & name) {
-    if (require_tensor(mfq, name).dtype != "MFE") {
+    const auto& dtype = require_tensor(mfq, name).dtype;
+    if (dtype == "NINT") {
+        MfeCpuPool pool;
+        pool.dtype = "NINT";
+        pool.payload = read_tensor(mfq, name);
+        pool.weight = unpack_nint(pool.payload);
+        const auto& shape = pool.weight.shape;
+        MFQ_RUNTIME_CHECK(pool.weight.axis == 0 && shape.size() == 3 &&
+            shape[0] > 0 && shape[0] <= std::numeric_limits<int>::max() &&
+            shape[1] > 0 && shape[1] <= std::numeric_limits<int>::max() &&
+            shape[2] == pool.weight.neuron_len && shape[0] * shape[1] == pool.weight.out,
+            "routed NINT tensor must use [experts,out,in]: ", name);
+        MfeCpu result;
+        result.n_experts = static_cast<int>(shape[0]);
+        result.out_per_expert = static_cast<int>(shape[1]);
+        result.neuron_len = pool.weight.neuron_len;
+        pool.expert_ids.resize(result.n_experts);
+        std::iota(pool.expert_ids.begin(), pool.expert_ids.end(), 0);
+        pool.weight.shape = {pool.weight.out, pool.weight.neuron_len};
+        result.pools.push_back(std::move(pool));
+        return result;
+    }
+    if (dtype != "MFE") {
         throw std::runtime_error("expert tensor must use MFE: " + name);
     }
     return unpack_mfe(read_tensor(mfq, name));

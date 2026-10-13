@@ -67,8 +67,7 @@ int main() {
     for (const char* extension : {".MFQ", ".mFq"}) {
         auto uppercase = model;
         uppercase.replace_extension(extension);
-        const auto profile = resolve_mfq_runtime_profile(
-            uppercase.string(), "minicpmo-hf-mfq", "minicpmo", "test");
+        const auto profile = resolve_mfq_runtime_profile(uppercase.string());
         require(std::abs(profile.chat.top_p.value_or(-1.0) - 0.6) < 1e-12,
                 "case-insensitive shard family sidecar was lost");
     }

@@ -1,6 +1,6 @@
 #pragma once
 #include "moe.h"
-#include "mfe_ffn.h"
+#include "kernels/mfe_ffn.h"
 #include <array>
 
 class MfeFfnRuntime {

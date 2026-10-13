@@ -1,9 +1,9 @@
 #include "load_options.h"
 #include "cuda_runtime_config.h"
-#include "../ops/cuda_execution.h"
+#include "ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"
-#include "../native/tensor_backend.h"
+#include "native/tensor_backend.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>

@@ -2,13 +2,13 @@
 #include "cuda_activity_trace.h"
 
 #include "generation_result.h"
-#include "../include/cuda_engine.h"
-#include "../kernels/mfq_cuda_sampling_ops.h"
-#include "../ops/cuda_execution.h"
-#include "../engine/decode_graph.h"
-#include "../models/common/full_block.h"
-#include "../storage/moe_expert_cache.h"
-#include "../native/tensor_backend.h"
+#include "include/cuda_engine.h"
+#include "kernels/mfq_cuda_sampling_ops.h"
+#include "ops/cuda_execution.h"
+#include "engine/decode_graph.h"
+#include "models/common/full_block.h"
+#include "storage/moe_expert_cache.h"
+#include "native/tensor_backend.h"
 #include "mfq/model_source.h"
 
 #include <cuda_profiler_api.h>

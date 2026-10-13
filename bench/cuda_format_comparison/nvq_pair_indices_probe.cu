@@ -1,5 +1,5 @@
 #include "timing.h"
-#include "mfq/kernels/cuda/packed_nvq_pair_indices.cuh"
+#include "csrc/backends/cuda/kernels/packed_nvq_pair_indices.cuh"
 #include <array>
 #include <random>
 

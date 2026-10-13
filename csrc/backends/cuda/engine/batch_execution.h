@@ -4,7 +4,7 @@
 #include "continuous_batch.h"
 #include "decode_graph.h"
 #include "generation_step.h"
-#include "../ops/cuda_sampling.h"
+#include "ops/cuda_sampling.h"
 #include <map>
 #include <span>
 

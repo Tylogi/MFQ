@@ -1,8 +1,8 @@
-#include "../runtime/execution_options.h"
+#include "execution_options.h"
 #include "rope.h"
 
 #include "cuda_execution.h"
-#include "../kernels/mfq_cuda_attention_ops.h"
+#include "kernels/mfq_cuda_attention_ops.h"
 
 #include <algorithm>
 #include <array>

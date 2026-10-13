@@ -2,11 +2,11 @@
 
 #include "storage/weight_loader.h"
 
-#include "mfe_expert_store.h"
+#include "storage/mfe_expert_store.h"
 #include "deepseek_v41/config.h"
 #include "csrc/models/deepseek_v41/engram.h"
 #include "deepseek_v41/causal_lm.h"
-#include "../../ops/quant_linear.h"
+#include "ops/quant_linear.h"
 
 #include <algorithm>
 #include <array>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../kernels/mfq_cuda_moe_ops.h"
+#include "kernels/mfq_cuda_moe_ops.h"
 #include "moe_expert_cache_internal.h"
 #include "mfq/moe_dispatch_plan.h"
 

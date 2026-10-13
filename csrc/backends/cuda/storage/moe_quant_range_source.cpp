@@ -1,8 +1,8 @@
-#include "../runtime/execution_options.h"
+#include "ops/execution_options.h"
 #include "moe_quant_range_source.h"
-#include "cpu_projection_rows.h"
+#include "ops/cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
-#include "quant_linear.h"
+#include "ops/quant_linear.h"
 
 #include <algorithm>
 #include <cstring>

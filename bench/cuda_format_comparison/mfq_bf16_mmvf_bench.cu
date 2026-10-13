@@ -1,8 +1,8 @@
 #include "timing.h"
-#include "cuda_execution.h"
+#include "ops/cuda_execution.h"
 #include "storage/weight_loader.h"
 #include "mfq/model_source.h"
-#include "cpp_runtime/backends/cuda/kernels/bf16_mmvf.cuh"
+#include "kernels/bf16_mmvf.cuh"
 #include <array>
 #include <cstring>
 #include <random>

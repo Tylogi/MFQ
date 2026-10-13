@@ -1,6 +1,6 @@
-#include "../ops/float_projection.h"
+#include "float_projection.h"
 #include "qwen4_exp.h"
-#include "../ops/gated_residual_fused.h"
+#include "gated_residual_fused.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>

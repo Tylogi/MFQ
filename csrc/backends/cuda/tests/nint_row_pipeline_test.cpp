@@ -1,9 +1,9 @@
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/decode_window.h"
-#include "nint.h"
-#include "runtime/moe_pipeline.h"
+#include "ops/nint.h"
+#include "kernels/moe_pipeline.h"
 #include "mfq/nint_row_cache.h"
-#include "../../../tests/nint_row_fixture.h"
+#include "../../tests/nint_row_fixture.h"
 #include <atomic>
 #include <cstring>
 #include <iostream>

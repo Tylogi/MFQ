@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../native/tensor_backend.h"
-#include "../../storage/batch_paged_kv.h"
+#include "native/tensor_backend.h"
+#include "storage/batch_paged_kv.h"
 #include "common/causal_metadata.h"
 
 #include <exception>

@@ -1,5 +1,5 @@
 #pragma once
-#include "mfe_weight.h"
+#include "ops/mfe_weight.h"
 #include "mfq/moe_dispatch_plan.h"
 #include "runtime/decode_window.h"
 #include <array>

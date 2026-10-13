@@ -1,7 +1,12 @@
 #pragma once
-namespace mfq::cuda { class KvOffloadStore; }
+namespace mfq::cuda {
+class KvOffloadStore;
+// Defined in runtime/decode_window.cpp.  Declared here so operator code can ask
+// whether a decode graph is being captured without including the runtime layer.
+bool decode_window_recording() noexcept;
+}
 
-#include "../native/tensor_backend.h"
+#include "native/tensor_backend.h"
 #include "tensor_parallel.h"
 
 #include <cuda_runtime_api.h>

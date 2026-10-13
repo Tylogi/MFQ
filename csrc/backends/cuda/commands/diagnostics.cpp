@@ -10,9 +10,9 @@
 #include "diagnostics/runtime_checks.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "minicpmo45.h"
-#include "../ops/cuda_execution.h"
+#include "ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
-#include "runtime/execution_options.h"
+#include "ops/execution_options.h"
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"
 
 #include <algorithm>
@@ -591,7 +591,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         return with_loaded_cuda_model(execution, *this,
             check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
             [&](auto& model, auto& runtime_components,
-                    auto, auto) -> int {
+                    std::chrono::steady_clock::time_point t0,
+                    std::chrono::steady_clock::time_point t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
             if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
