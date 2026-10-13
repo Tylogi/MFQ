@@ -79,15 +79,14 @@ int main() {
         DepthController controller(2);
         while (controller.warming_up()) controller.observe(controller.depth(), 0, 30.0);
         ParkState park;
-        {
-            mfq::engine::PrefillActivity activity;
-            require(mfq::engine::PrefillActivity::recent());
-            park.park(controller);
-            require(park.baseline_ms == 0.0);
-            park.tokens_remaining = 0;
-            require(!park.probe_ready());
-        }
-        require(mfq::engine::PrefillActivity::recent() && !park.probe_ready());
+        park.park(controller, true);
+        require(park.baseline_ms == 0.0);
+        park.tokens_remaining = 0;
+        require(!park.probe_ready(true));
+        park.park(controller, false);
+        require(park.baseline_ms == controller.measured_cycle_ms(0).value_or(0.0));
+        park.tokens_remaining = 0;
+        require(park.probe_ready(false));
     }
     {
         auto controller = DepthController::cycle_timed(3);

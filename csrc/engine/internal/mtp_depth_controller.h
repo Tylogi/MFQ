@@ -1,7 +1,5 @@
 #pragma once
 
-#include "prefill_activity.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -298,8 +296,10 @@ public:
         return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin);
     }
     void remember(const DepthController& controller) { seed_ = controller; }
-    void record_loop_tax(double baseline_ms, const std::vector<double>& samples) {
-        if (baseline_ms <= 0.0 || samples.size() < 8 || PrefillActivity::recent()) return;
+    // busy: prefill is in flight somewhere in the process, so wall-clock cycle
+            // times say nothing about the loop tax and must not be sampled.
+    void record_loop_tax(double baseline_ms, const std::vector<double>& samples, bool busy) {
+        if (baseline_ms <= 0.0 || samples.size() < 8 || busy) return;
         auto sorted = samples;
         std::sort(sorted.begin(), sorted.end());
         const double normal_ms = sorted[sorted.size()/2];
@@ -325,25 +325,25 @@ struct ParkState {
     double baseline_ms = 0.0;
     std::vector<double> tax_samples;
 
-    void park(const DepthController& controller) {
+    void park(const DepthController& controller, bool busy) {
         if (reentry) cooldown_tokens = std::min(4096, cooldown_tokens*2);
         tokens_remaining = cooldown_tokens;
         parked = true;
         reentry = false;
         tax_skip = 2;
-        baseline_ms = PrefillActivity::recent() ? 0.0 : controller.measured_cycle_ms(0).value_or(0.0);
+        baseline_ms = busy ? 0.0 : controller.measured_cycle_ms(0).value_or(0.0);
         tax_samples.clear();
     }
-    void observe_plain(double elapsed_ms, PolicyState& policy, bool time_sample = true) {
+    void observe_plain(double elapsed_ms, PolicyState& policy, bool time_sample, bool busy) {
         tokens_remaining = std::max(0, tokens_remaining-1);
         if (!time_sample) { baseline_ms = 0.0; return; }
         if (tax_skip > 0) { --tax_skip; return; }
         if (tax_samples.size() >= 8) return;
         tax_samples.push_back(elapsed_ms);
-        if (tax_samples.size() == 8) policy.record_loop_tax(baseline_ms, tax_samples);
+        if (tax_samples.size() == 8) policy.record_loop_tax(baseline_ms, tax_samples, busy);
     }
-    bool probe_ready() const noexcept {
-        return parked && tokens_remaining <= 0 && !PrefillActivity::recent();
+    bool probe_ready(bool busy) const noexcept {
+        return parked && tokens_remaining <= 0 && !busy;
     }
     void begin_probe() noexcept { parked = false; reentry = true; }
     void probe_succeeded() noexcept { reentry = false; cooldown_tokens = 128; }
@@ -366,7 +366,7 @@ public:
     std::optional<double> measured_cycle_ms(int depth) const {
         return controller_.measured_cycle_ms(depth);
     }
-    void observe(int used, int accepted, double elapsed_ms, bool time_sample = true) {
+    void observe(int used, int accepted, double elapsed_ms, bool time_sample = true, bool busy = false) {
         const bool was_warmup = controller_.warming_up();
         controller_.observe(used, accepted, elapsed_ms, time_sample);
         if (cycle_timed_) return;
@@ -374,14 +374,14 @@ public:
             !controller_.speculation_losing()) park_.probe_succeeded();
         if (controller_.should_exit()) {
             state_.remember(controller_);
-            park_.park(controller_);
+            park_.park(controller_, busy);
             ++parks_;
         }
     }
-    void observe_plain(double elapsed_ms, bool time_sample = true) {
+    void observe_plain(double elapsed_ms, bool time_sample = true, bool busy = false) {
         if (cycle_timed_) return;
-        park_.observe_plain(elapsed_ms, state_, time_sample);
-        if (park_.probe_ready()) {
+        park_.observe_plain(elapsed_ms, state_, time_sample, busy);
+        if (park_.probe_ready(busy)) {
             park_.begin_probe();
             controller_ = state_.begin(controller_.maximum_depth());
             ++reentries_;
