@@ -3,7 +3,7 @@
 #include "models/common/causal_model_ops.h"
 #include "ops/execution/execution_options.h"
 #include "storage/mapped_embedding.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "storage/moe/expert_cache.h"
 #include <algorithm>
 #include <iostream>
@@ -137,7 +137,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
 }
 } // namespace mfq::cuda
 #include "models/common/mtp.h"
-#include "storage/text_session_cache_impl.h"
+#include "storage/session/text_cache_impl.h"
 
 #define MFQ_BIND_CUDA_MODEL(TYPE) \
     template TYPE mfq::cuda::load_causal_lm<TYPE>(CudaExecutionContext&, const std::string&, const std::string&, int64_t, bool, bool, std::shared_ptr<const mfq::ModelSource>); \

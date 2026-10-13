@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 
 #include "models/common/mtp.h"
 #include "models/common/full_block.h"

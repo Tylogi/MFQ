@@ -1,6 +1,6 @@
 #include "kernels/moe/ops.h"
 #include "kernels/norm_ops.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 #include "common/transformer_layer.h"

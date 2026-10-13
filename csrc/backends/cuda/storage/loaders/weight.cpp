@@ -1,5 +1,5 @@
 #include "ops/execution/execution_options.h"
-#include "weight_loader.h"
+#include "weight.h"
 #include "ops/format.h"
 #include "kernels/float_projection.h"
 #include "kernels/gated_residual_fused.h"
@@ -14,14 +14,14 @@
 #include <limits>
 #include <numeric>
 
-#include "moe/expert_cache.h"
-#include "mfe_expert_store.h"
-#include "moe/quant_range_source.h"
+#include "storage/moe/expert_cache.h"
+#include "storage/mfe_expert_store.h"
+#include "storage/moe/quant_range_source.h"
 #include "mfq/quant/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
 #include "storage/moe/weight_loader.h"
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 const mfq::TensorMetadata& require_tensor(
         const mfq::ModelSource& source,

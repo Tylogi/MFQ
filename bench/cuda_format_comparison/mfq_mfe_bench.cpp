@@ -2,7 +2,7 @@
 #include "ops/moe/mfe_ffn_runtime.h"
 #include "kernels/moe/ops.h"
 #include "ops/quant/quant_linear.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "e8_dense_group_pack.h"
 #include <array>
 #include <functional>

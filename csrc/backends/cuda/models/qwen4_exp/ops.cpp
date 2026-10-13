@@ -6,7 +6,7 @@
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "storage/moe/ffn_pipeline.h"
 #include "storage/moe/expert_cache.h"
 #include "storage/nint_row_pipeline.h"

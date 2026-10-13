@@ -3,7 +3,7 @@
 #include "ops/gated_residual.h"
 #include "kernels/gated_residual_fused.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "storage/mapped_embedding.h"
 #include "kernels/attention/selected_attention.h"
 #include "kernels/qwen4_exp.h"

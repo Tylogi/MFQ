@@ -333,7 +333,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
-    ${MFQ_CUDA_ROOT}/storage/kv_offload.cpp
+    ${MFQ_CUDA_ROOT}/storage/kv/offload.cpp
     ${MFQ_CUDA_ROOT}/models/glm5_next/ops.cpp
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
@@ -372,17 +372,17 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/moe/expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/ffn_pipeline.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/mx_weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/sq_weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/nint_weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/vq_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/loaders/mx.cpp
+    ${MFQ_CUDA_ROOT}/storage/loaders/sq.cpp
+    ${MFQ_CUDA_ROOT}/storage/loaders/nint.cpp
+    ${MFQ_CUDA_ROOT}/storage/loaders/vq.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/quant_range_source.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/execution/graph_registry.cpp
     ${MFQ_CUDA_ROOT}/ops/decode_window.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/residency.cpp
     ${MFQ_CUDA_ROOT}/storage/nint_row_pipeline.cpp
-    ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/loaders/weight.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
@@ -403,8 +403,8 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/model_components.cpp
     ${MFQ_CUDA_ROOT}/engine/minicpmo_components.cpp
     ${MFQ_CUDA_ROOT}/engine/batch_execution.cpp
-    ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp
-    ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/kv/cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/session/text_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
 )
 add_library(mfq-cuda-runtime STATIC

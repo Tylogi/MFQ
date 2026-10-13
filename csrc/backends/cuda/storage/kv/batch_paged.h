@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kv_cache.h"
+#include "cache.h"
 #include "paged_kv_allocator.h"
 
 #include <algorithm>

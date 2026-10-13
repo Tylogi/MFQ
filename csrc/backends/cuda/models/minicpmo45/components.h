@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 
 #include "minicpmo45/causal_lm.h"
 #include "common/transformer_layer.h"

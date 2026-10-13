@@ -8,7 +8,7 @@
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/moe/expert_cache.h"

@@ -1,4 +1,4 @@
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "dspark.h"
 
 #include "models/common/causal_model_ops.h"

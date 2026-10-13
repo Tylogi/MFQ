@@ -1,5 +1,5 @@
 #include "batch_execution.h"
-#include "storage/text_session_cache.h"
+#include "storage/session/text_cache.h"
 #include <algorithm>
 
 namespace mfq::cuda {

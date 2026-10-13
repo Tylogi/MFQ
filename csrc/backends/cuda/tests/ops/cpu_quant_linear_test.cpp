@@ -1,4 +1,4 @@
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
 #include "mfq/quant/nint_rows.h"
@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 namespace {
 std::vector<float> read(const std::filesystem::path& path, std::size_t count) {

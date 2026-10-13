@@ -1,7 +1,7 @@
 #pragma once
 
-#include "text_session_cache.h"
-#include "session_state.h"
+#include "text_cache.h"
+#include "state.h"
 #include "session_cache.h"
 
 namespace mfq::cuda::internal {

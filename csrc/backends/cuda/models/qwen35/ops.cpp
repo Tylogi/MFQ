@@ -1,4 +1,4 @@
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 #include "mtp.h"

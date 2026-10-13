@@ -1,4 +1,4 @@
-#include "text_session_cache_impl.h"
+#include "text_cache_impl.h"
 #include "runtime_config.h"
 #include "mfq/model_source/model_source.h"
 #include "mfq_paged_prefix_cache.h"

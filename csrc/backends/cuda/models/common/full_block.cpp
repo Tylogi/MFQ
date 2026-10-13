@@ -1,7 +1,7 @@
 #include "full_block.h"
 #include "resource_plan.h"
 #include "common/causal_metadata.h"
-#include "storage/session_state.h"
+#include "storage/session/state.h"
 #include "common/attention.h"
 #include "common/gated_mlp.h"
 #include "common/transformer_layer.h"

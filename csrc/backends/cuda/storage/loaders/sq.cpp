@@ -1,4 +1,4 @@
-#include "quant_weight_loader.h"
+#include "quant.h"
 
 #include "ops/format.h"
 

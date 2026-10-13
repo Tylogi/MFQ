@@ -1,5 +1,5 @@
 #include "models/common/transformer_loader.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 

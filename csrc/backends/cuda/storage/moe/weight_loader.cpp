@@ -11,7 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;

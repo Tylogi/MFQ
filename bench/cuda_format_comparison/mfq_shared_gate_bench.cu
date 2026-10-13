@@ -1,6 +1,6 @@
 #include "timing.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "mfq/model_source/model_source.h"
 #include "kernels/shared_gate.h"
 #include "kernels/shared_gate_fused.cuh"

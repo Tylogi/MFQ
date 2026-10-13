@@ -3,7 +3,7 @@
 #include "ops/moe/mfe_ffn_runtime.h"
 #include <cstring>
 #include "storage/moe/weight_loader.h"
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 void verify_mfe_token_groups(const std::filesystem::path& root) {
     struct Environment {

@@ -3,7 +3,7 @@
 #include "ops/moe/mfe_ffn_runtime.h"
 #include "storage/moe/quant_range_source.h"
 #include "storage/moe/cached_source_internal.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "mfq/model_source/model_source.h"
 #include <array>
 #include <cstring>

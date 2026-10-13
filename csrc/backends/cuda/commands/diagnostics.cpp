@@ -33,7 +33,7 @@ inline void finish_cuda_activity_trace() noexcept {
 #include "engine/load_options.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "cli.h"
 namespace mfq::cuda::diagnostics {
 

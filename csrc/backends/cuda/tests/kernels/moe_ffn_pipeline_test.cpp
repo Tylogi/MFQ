@@ -9,7 +9,7 @@
 #include "storage/moe/residency.h"
 #include "storage/moe/quant_range_source.h"
 #include "storage/moe/expert_cache.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "ops/moe/moe.h"
 #include "mfq/moe/dispatch_plan.h"
 #include <filesystem>
@@ -22,7 +22,7 @@
 #include <thread>
 #include <atomic>
 #include "storage/moe/weight_loader.h"
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 namespace tb=mfq_tensor_backend;
 namespace {
 std::size_t bytes(const MixedMoePool& p) {

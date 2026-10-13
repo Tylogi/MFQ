@@ -3,7 +3,7 @@
 #include "step_sequence.h"
 
 #include "models/common/causal_model_ops.h"
-#include "storage/session_state.h"
+#include "storage/session/state.h"
 #include "batch_state.h"
 #include "qwen35/causal_lm.h"
 #include "qwen35/config.h"

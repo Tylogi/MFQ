@@ -10,7 +10,7 @@
 #include "ops/rope.h"
 #include "csrc/backends/cuda/kernels/qwen4_exp.h"
 #include "storage/nint_row_pipeline.h"
-#include "storage/kv_offload.h"
+#include "storage/kv/offload.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>

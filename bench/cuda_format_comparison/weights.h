@@ -8,7 +8,7 @@
 #include <map>
 #include <memory>
 #include <type_traits>
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 namespace tb=mfq_tensor_backend;
 namespace fb=format_bench;

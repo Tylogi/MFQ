@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 #include "model_checks.h"
 
 #include "ops/quant/quant_linear.h"

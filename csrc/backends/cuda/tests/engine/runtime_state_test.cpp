@@ -4,7 +4,7 @@
 #include "engine/batch_execution.h"
 #include "ops/execution/cuda_sampling.h"
 #include "diagnostics/generation_result.h"
-#include "storage/text_session_cache.h"
+#include "storage/session/text_cache.h"
 #include "mfq_paged_prefix_cache.h"
 #include "gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
@@ -13,11 +13,11 @@
 #include "models/qwen35/ops.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen35/mtp.h"
-#include "storage/session_state.h"
+#include "storage/session/state.h"
 #include "ops/moe/moe.h"
 #include "storage/mfe_expert_store.h"
 #include "storage/moe/expert_cache.h"
-#include "storage/weight_loader.h"
+#include "storage/loaders/weight.h"
 
 #include <chrono>
 #include <cstring>
@@ -25,7 +25,7 @@
 #include <iostream>
 #include <stdexcept>
 #include "storage/moe/weight_loader.h"
-#include "storage/quant_weight_loader.h"
+#include "storage/loaders/quant.h"
 
 using namespace mfq::cuda;
 using namespace mfq::cuda::internal;

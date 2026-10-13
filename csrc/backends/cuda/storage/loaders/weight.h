@@ -2,7 +2,7 @@
 
 #include "ops/quant/quant_linear.h"
 #include "ops/moe/moe.h"
-#include "model_source.h"
+#include "storage/model_source.h"
 #include "ops/gated_residual.h"
 #include "storage/moe/weight_loader.h"
 

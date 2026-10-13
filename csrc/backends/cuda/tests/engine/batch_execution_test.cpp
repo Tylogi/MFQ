@@ -1,7 +1,7 @@
 #include "engine/batch_execution.h"
 #include "request_executor.h"
 #include "common/causal_metadata.h"
-#include "storage/batch_paged_kv.h"
+#include "storage/kv/batch_paged.h"
 
 #include <array>
 #include <iostream>
