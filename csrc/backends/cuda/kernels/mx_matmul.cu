@@ -8,7 +8,7 @@
 #include <limits>
 #include <type_traits>
 
-#include "kernels/packed_nint.cuh"
+#include "packed_backward.cuh"
 
 namespace {
 

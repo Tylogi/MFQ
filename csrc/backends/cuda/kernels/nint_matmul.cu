@@ -27,10 +27,10 @@
 #include "async_copy.cuh"
 #include "glu.cuh"
 #include "csrc/backends/cuda/native/tensor_backend.h"
-#include "kernels/quant/nint_route_hint.h"
-#include "kernels/quant/packed_nint.cuh"
+#include "kernels/nint_route_hint.h"
+#include "packed_backward.cuh"
 #include "packed_nint.cuh"
-#include "kernels/quant/nint_route_group.cuh"
+#include "nint_route_group.cuh"
 
 
 #define MFQ_CUBLAS_CHECK(expression) \

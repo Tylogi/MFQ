@@ -1,5 +1,5 @@
 #pragma once
-#include "kernels/quant/packed_nvq.cuh"
+#include "kernels/packed_nvq.cuh"
 
 namespace mfq::cuda::packed_nvq {
 // The validated JSC table has sixteen states and at most four banks. A

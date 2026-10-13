@@ -7,8 +7,8 @@
 #include <torch/extension.h>
 #include <vector>
 #include <optional>
-#include "kernels/quant/fp8_sq.h"
-#include "kernels/quant/mxfp4_sq.h"
+#include "fp8_sq.h"
+#include "mxfp4_sq.h"
 #include "glm5_next.h"
 #include "qwen4_exp.h"
 

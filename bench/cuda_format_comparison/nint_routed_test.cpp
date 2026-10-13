@@ -1,5 +1,5 @@
 #include "kernels/quant_ops.h"
-#include "kernels/quant/nint_route_hint.h"
+#include "kernels/nint_route_hint.h"
 #include "kernels/moe/ops.h"
 #include "nint_row_metadata.h"
 #include <algorithm>

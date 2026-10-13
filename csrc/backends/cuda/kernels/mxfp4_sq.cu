@@ -5,7 +5,7 @@
 #include <limits>
 #include <cstdlib>
 
-#include "kernels/packed_nint.cuh"
+#include "packed_backward.cuh"
 #include <mma.h>
 
 namespace {

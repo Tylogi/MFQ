@@ -84,12 +84,12 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.cpp
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/mx_matmul.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/fp8_sq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/mxfp4_sq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/nepq.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/nepq_residual.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
@@ -119,7 +119,7 @@ set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu PROPERTIE
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.h")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nint_whole.cuh")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul.cu PROPERTIES
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu

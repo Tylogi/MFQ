@@ -1,5 +1,5 @@
 #pragma once
-#include "kernels/packed_nint.cuh"
+#include "packed_nint.cuh"
 
 namespace mfq::cuda::packed_nint {
 
