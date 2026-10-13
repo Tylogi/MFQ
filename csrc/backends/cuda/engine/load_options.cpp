@@ -2,7 +2,7 @@
 #include "cuda_runtime_config.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/moe/expert_cache.h"
-#include "moe_cache_profile.h"
+#include "moe/moe_cache_profile.h"
 #include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>

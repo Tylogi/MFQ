@@ -1,6 +1,6 @@
 #pragma once
 
-#include "moe_cache_profile.h"
+#include "moe/moe_cache_profile.h"
 
 #include <cstdint>
 #include <memory>
