@@ -85,40 +85,6 @@ struct CpuQuantizedActivation {
     std::vector<int32_t> sums;
 };
 
-void require_tp_row_major_weight(
-    const std::vector<int64_t>& shape,
-    int axis,
-    int out,
-    int neuron_len,
-    const char* format);
-NintCpu unpack_nint(const std::vector<uint8_t>& blob);
-Nint8ZeroCpu unpack_nint8_zero(const std::vector<uint8_t>& blob);
-NintCpu slice_nint_cpu_output(
-    const NintCpu& source, int64_t begin, int64_t end);
-NintCpu slice_nint_cpu_input_groups(
-    const NintCpu& source, int64_t begin, int64_t end);
-NintCpu select_nint_cpu_rows(
-    const NintCpu& source, const std::vector<int64_t>& rows);
-Nint8ZeroCpu slice_nint8_zero_cpu_output(
-    const Nint8ZeroCpu& source, int64_t begin, int64_t end);
-Nint8ZeroCpu slice_nint8_zero_cpu_input_groups(
-    const Nint8ZeroCpu& source, int64_t begin, int64_t end);
-Nint8ZeroCpu select_nint8_zero_cpu_rows(
-    const Nint8ZeroCpu& source, const std::vector<int64_t>& rows);
-NintWeight to_device_nint(const NintCpu& source, bool cuda);
-NintWeight to_gpu_nint(const NintCpu& source);
-NintWeight to_cuda_device_nint(const NintCpu& source, int device);
-NintWeight to_cpu_nint(const NintCpu& source);
-NintWeight to_device_mfe_nint(
-    const NintCpu& source, int local_experts, int out_per_expert, bool cuda);
-NintWeight to_device_nint8_zero(const Nint8ZeroCpu& source, bool cuda);
-NintWeight to_gpu_nint8_zero(const Nint8ZeroCpu& source);
-NintWeight to_cuda_device_nint8_zero(
-    const Nint8ZeroCpu& source, int device);
-NintWeight to_cpu_nint8_zero(const Nint8ZeroCpu& source);
-mfq_tensor_backend::Tensor dequant_nint8_zero_cpu(
-    const Nint8ZeroCpu& source);
-
 mfq_tensor_backend::Tensor pad_last(
     mfq_tensor_backend::Tensor input, int64_t target);
 uint32_t cpu_load_packed_bits(

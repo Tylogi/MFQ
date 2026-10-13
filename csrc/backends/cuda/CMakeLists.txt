@@ -374,6 +374,8 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/moe_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/mx_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/sq_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/nint_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/vq_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_quant_range_source.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/graph_registry.cpp

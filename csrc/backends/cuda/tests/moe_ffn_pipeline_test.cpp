@@ -21,6 +21,8 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include "storage/moe_weight_loader.h"
+#include "storage/quant_weight_loader.h"
 namespace tb=mfq_tensor_backend;
 namespace {
 std::size_t bytes(const MixedMoePool& p) {
@@ -1706,7 +1708,6 @@ void verify_router_lookahead_inputs() {
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
 #include "mfe_token_group_test.h"
-#include "storage/moe_weight_loader.h"
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");

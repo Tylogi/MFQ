@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "storage/quant_weight_loader.h"
 
 namespace {
 std::vector<float> read(const std::filesystem::path& path, std::size_t count) {

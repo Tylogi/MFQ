@@ -158,35 +158,8 @@ struct NepqWeight {
     mfq_tensor_backend::Tensor residual_second;
 };
 
-NvqCpu unpack_nvq(const std::vector<uint8_t>& blob, const std::string& dtype);
-NvqCpu slice_nvq_cpu(
-    const NvqCpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
-NvqCpu select_nvq_cpu_rows(
-    const NvqCpu& source, const std::vector<int64_t>& rows);
-NvqWeight to_device_nvq(
-    const NvqCpu& source,
-    bool cuda,
-    const CudaExecutionConfig& config = {});
-NvqWeight to_gpu_nvq(
-    const NvqCpu& source,
-    const CudaExecutionConfig& config = {});
-NvqWeight to_cuda_device_nvq(
-    const NvqCpu& source,
-    int device,
-    const CudaExecutionConfig& config = {});
-NvqWeight to_cpu_nvq(const NvqCpu& source);
-NepqCpu unpack_nepq(
-    const std::vector<uint8_t>& blob,
-    const std::string& dtype,
-    const std::vector<uint8_t>& runtime_payload);
-NepqCpu select_nepq_cpu_rows(
-    const NepqCpu& source,
-    const std::vector<int64_t>& rows,
-    int output_per_expert,
-    int selected_experts = -1);
-NepqWeight to_device_nepq(const NepqCpu& source, bool cuda);
-NepqWeight to_gpu_nepq(const NepqCpu& source);
-NepqWeight to_cpu_nepq(const NepqCpu& source);
+constexpr int64_t kNvq2JscXlGroupExecKernelFormat = 16;
+constexpr int64_t kNvq3JscLGroupExecKernelFormat = 17;
 
 bool nvq_pair_compatible(const NvqWeight& first, const NvqWeight& second);
 mfq_tensor_backend::Tensor nvq_dequant(const NvqWeight& weight);

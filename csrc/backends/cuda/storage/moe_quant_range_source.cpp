@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include "storage/quant_weight_loader.h"
 
 namespace tb=mfq_tensor_backend;
 

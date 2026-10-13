@@ -18,13 +18,14 @@
 #include "storage/mfe_expert_store.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
-#include "storage/moe_weight_loader.h"
 
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include "storage/moe_weight_loader.h"
+#include "storage/quant_weight_loader.h"
 
 using namespace mfq::cuda;
 using namespace mfq::cuda::internal;

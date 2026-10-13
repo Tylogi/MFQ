@@ -6,12 +6,12 @@
 #include "kernels/quant_ops.h"
 #include "mfq_format_compat.h"
 #include "ops/quant_linear.h"
-#include "storage/quant_weight_loader.h"
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include "storage/quant_weight_loader.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;

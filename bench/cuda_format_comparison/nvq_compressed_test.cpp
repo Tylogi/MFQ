@@ -2,6 +2,7 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include "storage/quant_weight_loader.h"
 
 namespace tb=mfq_tensor_backend;
 static void clear_flag(const char* name) {

@@ -10,7 +10,6 @@
 #include "ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "kernels/moe_ops.h"
-#include "storage/moe_weight_loader.h"
 
 #include <cuda_runtime_api.h>
 
@@ -27,6 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "storage/moe_weight_loader.h"
 
 static double mfe_weight_bytes(const MfeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);
