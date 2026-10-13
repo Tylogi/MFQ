@@ -1,24 +1,7 @@
 #include "mxfp4_sq.h"
+#include "format.h"
 
-namespace {
-mfq_tensor_backend::Tensor cpu_u8_tensor(
-        const std::vector<uint8_t>& values,
-        std::initializer_list<int64_t> shape) {
-    return mfq_tensor_backend::from_blob(
-        const_cast<uint8_t*>(values.data()), shape,
-        mfq_tensor_backend::TensorOptions().dtype(
-            mfq_tensor_backend::kUInt8)).clone();
-}
-
-mfq_tensor_backend::Tensor cpu_i32_tensor(
-        const std::vector<int32_t>& values,
-        std::initializer_list<int64_t> shape) {
-    return mfq_tensor_backend::from_blob(
-        const_cast<int32_t*>(values.data()), shape,
-        mfq_tensor_backend::TensorOptions().dtype(
-            mfq_tensor_backend::kInt32)).clone();
-}
-} // namespace
+using namespace mfq::cuda::quant_format;
 
 Mxfp4SqWeight to_device_mxfp4_sq(
         const std::vector<uint8_t> & payload,
