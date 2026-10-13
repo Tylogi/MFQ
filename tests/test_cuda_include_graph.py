@@ -39,14 +39,36 @@ def dir_of(path):
     return None if rel.startswith("..") else rel.split(os.sep)[0]
 
 
-REPO_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", ".."))
+REPO_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", "..", ".."))
+CSRC_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", ".."))
+
+# Every directory the CUDA targets put on the include path.  Kept here so a
+# first-party include that no longer resolves is reported instead of skipped.
+INCLUDE_ROOTS = [
+    REPO_ROOT,
+    CSRC_ROOT,
+    BACKEND_ROOT,
+    os.path.join(CSRC_ROOT, "core"),
+    os.path.join(CSRC_ROOT, "core", "include"),
+    os.path.join(CSRC_ROOT, "models"),
+    os.path.join(CSRC_ROOT, "engine", "internal"),
+]
+
+# Basenames of every header under the backend root.  An include of one of these
+# that does not resolve is a broken path, not a system header.
+FIRST_PARTY = {
+    name
+    for layer in DIRS
+    for dirpath, _, files in os.walk(os.path.join(BACKEND_ROOT, layer))
+    for name in files
+    if name.endswith(SOURCE_EXT)
+}
 
 
 def resolve(raw, including_file):
     """Resolve a quoted include the way the compiler does for this backend."""
     candidates = [os.path.normpath(os.path.join(os.path.dirname(including_file), raw))]
-    candidates.append(os.path.normpath(os.path.join(REPO_ROOT, raw)))
-    candidates.append(os.path.normpath(os.path.join(BACKEND_ROOT, raw)))
+    candidates.extend(os.path.normpath(os.path.join(root, raw)) for root in INCLUDE_ROOTS)
     for d in DIRS:
         candidates.append(os.path.normpath(os.path.join(BACKEND_ROOT, d, raw)))
     for c in candidates:
@@ -81,6 +103,9 @@ def collect():
                                 (src, lineno, raw, "relative include; write \"<dir>/<name>\""))
                         target = resolve(raw, src)
                         if target is None:
+                            if os.path.basename(raw) in FIRST_PARTY:
+                                violations.append(
+                                    (src, lineno, raw, "include does not resolve"))
                             continue  # system / third-party / generated header
                         dst_dir = dir_of(target)
                         if dst_dir is not None and dst_dir != dir_of(src) \
