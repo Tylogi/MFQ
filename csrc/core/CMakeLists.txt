@@ -67,7 +67,7 @@ set_target_properties(mfq-model-source PROPERTIES
 )
 
 add_library(mfq-cache-policy STATIC moe_cache_policy.cpp)
-target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-cache-policy PUBLIC cxx_std_17)
 set_target_properties(mfq-cache-policy PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

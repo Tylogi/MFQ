@@ -3,8 +3,8 @@
 
 #include "moe_cache_types_internal.h"
 #include "native/context.h"
-#include "runtime/moe_residency.h"
-#include "runtime/dma_copy_batch.h"
+#include "storage/moe_residency.h"
+#include "kernels/dma_copy_batch.h"
 #include "mfq/host_parallel.h"
 #include "mfq/moe_cpu_cost_model.h"
 #include "mfq/moe_cpu_calibration.h"

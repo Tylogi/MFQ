@@ -1,6 +1,6 @@
 #include "native/env.h"
-#include "runtime/nint_row_pipeline.h"
-#include "runtime/decode_window.h"
+#include "storage/nint_row_pipeline.h"
+#include "ops/decode_window.h"
 #include "ops/nint.h"
 #include "kernels/moe_pipeline.h"
 #include "mfq/nint_row_cache.h"

@@ -45,7 +45,7 @@ int main() {
     }
     {
         PolicyState state;
-        GenerationPolicy<DsparkDepthController> policy(3, false, &state);
+        GenerationPolicy<CycleDepthController> policy(3, false, &state);
         for (int cycle = 0; cycle < 64 && !policy.parked(); ++cycle) {
             const int depth = policy.depth();
             policy.observe(depth, 0, depth ? 100.0 : 20.0);
@@ -69,7 +69,7 @@ int main() {
             else policy.observe(policy.depth(), policy.depth(), policy.depth() ? 21.0 : 20.0);
         }
         require(!policy.parked() && policy.depth() > 0);
-        GenerationPolicy<DsparkDepthController> legacy(3, true, &state);
+        GenerationPolicy<CycleDepthController> legacy(3, true, &state);
         for (int cycle = 0; cycle < 100; ++cycle)
             legacy.observe(legacy.depth(), 0, legacy.depth() ? 100.0 : 20.0);
         require(!legacy.parked() && legacy.parks() == 0 && legacy.reentries() == 0);
@@ -90,7 +90,7 @@ int main() {
         require(mfq::engine::PrefillActivity::recent() && !park.probe_ready());
     }
     {
-        DsparkDepthController controller(3);
+        CycleDepthController controller(3);
         require(controller.depth() == 3);
         controller.observe(3, 3, 30.0);
         controller.observe(3, 3, 29.0);
@@ -102,7 +102,7 @@ int main() {
         require(controller.conditional_acceptance(0) > 0.6);
     }
     {
-        DsparkDepthController controller(1);
+        CycleDepthController controller(1);
         controller.observe(1, 0, 80.0);
         controller.observe(1, 0, 75.0);
         controller.observe(0, 0, 40.0);
@@ -112,7 +112,7 @@ int main() {
         require(controller.measured_cycle_ms(0).has_value());
     }
     {
-        DsparkDepthController controller(3);
+        CycleDepthController controller(3);
         controller.observe(3, 0, 70.0);
         controller.observe(3, 0, 65.0);
         controller.observe(0, 0, 30.0);

@@ -1,4 +1,4 @@
-#include "runtime/dma_copy_batch.h"
+#include "kernels/dma_copy_batch.h"
 #include "kernels/moe_pipeline.h"
 #include <atomic>
 #include <chrono>

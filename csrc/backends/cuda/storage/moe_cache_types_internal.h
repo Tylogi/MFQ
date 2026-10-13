@@ -6,7 +6,7 @@
 #include "ops/moe.h"
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
-#include "moe_cache_policy.h"
+#include "mfq/moe_cache_policy.h"
 #include "kernels/moe_cache_transfer.h"
 
 #include <algorithm>

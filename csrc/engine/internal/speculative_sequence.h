@@ -90,7 +90,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
     };
     const bool compact_stochastic = !greedy && sampling.top_k > 0 && sampling.top_k <= 64;
     auto draft_sampling = sampling;
-    if (compact_stochastic && mtp.dspark_policy()) {
+    if (compact_stochastic && mtp.cycle_timed_policy()) {
         draft_sampling.temperature = 0.6;
         draft_sampling.top_p = 0.95;
     }
@@ -98,8 +98,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         (!greedy && !compact_stochastic)
             ? 1
             : std::clamp<int>(sampling.mtp_max_draft_tokens, 1, policy::kMaximumDraftDepth));
-    policy::GenerationPolicy<policy::DsparkDepthController> depth_controller(
-        maximum_depth, mtp.dspark_policy(), &mtp.policy_state);
+    policy::GenerationPolicy<policy::CycleDepthController> depth_controller(
+        maximum_depth, mtp.cycle_timed_policy(), &mtp.policy_state);
 
     {
         Tensor raw, hidden;
@@ -304,7 +304,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 }
                 return result;
             }
-            if (!depth_controller.dspark() && requested_depth == 0) {
+            if (!depth_controller.cycle_timed() && requested_depth == 0) {
                 pending_hidden.push_back(hidden_rows);
                 pending_ids.insert(pending_ids.end(), next_ids.begin(), next_ids.end());
                 if (pending_ids.size() >= 512) { maintenance = true; flush_history(); }
@@ -375,7 +375,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 continue;
             }
             const int draft_count = static_cast<int>(draft.tokens.size());
-            if (depth_controller.dspark()) cycle_started = Clock::now();
+            if (depth_controller.cycle_timed()) cycle_started = Clock::now();
             Tensor verified_raw;
             std::vector<int64_t> verify_ids{pending};
             verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());

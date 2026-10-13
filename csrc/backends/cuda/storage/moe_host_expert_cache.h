@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/moe.h"
-#include "moe_cache_policy.h"
+#include "mfq/moe_cache_policy.h"
 
 #include <functional>
 #include <memory>

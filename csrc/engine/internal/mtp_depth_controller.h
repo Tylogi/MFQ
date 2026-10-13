@@ -296,28 +296,28 @@ struct ParkState {
     void probe_succeeded() noexcept { reentry = false; cooldown_tokens = 128; }
 };
 
-template<class DsparkController>
+template<class CycleController>
 class GenerationPolicy {
 public:
-    GenerationPolicy(int maximum_depth, bool dspark, PolicyState* state = nullptr)
+    GenerationPolicy(int maximum_depth, bool cycle_timed, PolicyState* state = nullptr)
         : state_(state ? *state : local_state_) {
-        if (dspark) dspark_.emplace(maximum_depth);
+        if (cycle_timed) cycle_.emplace(maximum_depth);
         else controller_.emplace(state_.begin(maximum_depth));
     }
     ~GenerationPolicy() { if (controller_) state_.remember(*controller_); }
     int depth() const noexcept {
-        return dspark_ ? dspark_->depth() : park_.parked ? 0 : controller_->depth();
+        return cycle_ ? cycle_->depth() : park_.parked ? 0 : controller_->depth();
     }
     int maximum_depth() const noexcept {
-        return dspark_ ? dspark_->maximum_depth() : controller_->maximum_depth();
+        return cycle_ ? cycle_->maximum_depth() : controller_->maximum_depth();
     }
-    bool parked() const noexcept { return !dspark_ && park_.parked; }
-    bool dspark() const noexcept { return dspark_.has_value(); }
+    bool parked() const noexcept { return !cycle_ && park_.parked; }
+    bool cycle_timed() const noexcept { return cycle_.has_value(); }
     std::optional<double> measured_cycle_ms(int depth) const {
-        return dspark_ ? dspark_->measured_cycle_ms(depth) : controller_->measured_cycle_ms(depth);
+        return cycle_ ? cycle_->measured_cycle_ms(depth) : controller_->measured_cycle_ms(depth);
     }
     void observe(int used, int accepted, double elapsed_ms, bool time_sample = true) {
-        if (dspark_) { dspark_->observe(used, accepted, elapsed_ms, time_sample); return; }
+        if (cycle_) { cycle_->observe(used, accepted, elapsed_ms, time_sample); return; }
         const bool was_warmup = controller_->warming_up();
         controller_->observe(used, accepted, elapsed_ms, time_sample);
         if (park_.reentry && !was_warmup && !controller_->warming_up() &&
@@ -342,7 +342,7 @@ private:
     PolicyState local_state_;
     PolicyState& state_;
     std::optional<DepthController> controller_;
-    std::optional<DsparkController> dspark_;
+    std::optional<CycleController> cycle_;
     ParkState park_;
     std::uint64_t parks_ = 0;
     std::uint64_t reentries_ = 0;

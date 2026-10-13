@@ -80,11 +80,15 @@ Inside `backends/cuda`, a cross-directory include is written as
 `"<dir>/<name>"` (`#include "ops/moe.h"`, never `"moe.h"` or `"../ops/moe.h"`);
 the build no longer adds the layer directories to the include path, so the bare
 form cannot compile. The directories form a DAG from lowest to highest:
-`native`, `kernels`, `ops`, `storage`/`runtime`, `models`, `engine`. A file may
-include its own directory or a lower one; `storage` and `runtime` count as one
-layer and may include each other. `apps/`, `commands/`, `diagnostics/`, `eval/`
+`native`, `kernels`, `ops`, `storage`, `models`, `engine`. A file may include
+its own directory or a lower one. `apps/`, `commands/`, `diagnostics/`, `eval/`
 and `tests/` are top-level consumers. `tests/test_cuda_include_graph.py`
-enforces the include form and the DAG.
+enforces the include form and the DAG, and `tests/test_layer_independence.py`
+keeps the shared layers free of backend and model-family names.
+
+There is no `runtime/` layer and no `Runtime` type. Composition and lifetime
+live in the application executable (`apps/`, `commands/`); a word that names no
+responsibility is not a module.
 
 ## Canonical internal representation
 

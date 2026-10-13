@@ -7,7 +7,7 @@
 #include "storage/mapped_embedding.h"
 #include "kernels/selected_attention.h"
 #include "kernels/qwen4_exp.h"
-#include "runtime/decode_window.h"
+#include "ops/decode_window.h"
 
 #include <cmath>
 #include <cstring>

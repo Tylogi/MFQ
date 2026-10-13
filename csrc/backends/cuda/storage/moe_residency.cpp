@@ -1,10 +1,10 @@
 #include "native/env.h"
-#include "moe_residency.h"
-#include "runtime/decode_window.h"
+#include "storage/moe_residency.h"
+#include "ops/decode_window.h"
 #include "kernels/moe_pipeline.h"
 #include "storage/moe_cached_source_internal.h"
 #include "mfq/cpu_expert_pool.h"
-#include "host_memory_copy.h"
+#include "mfq/host_memory_copy.h"
 #include "mfq/moe_residency_ranker.h"
 #include <algorithm>
 #include <array>

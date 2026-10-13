@@ -1,4 +1,4 @@
-#include "graph_registry.h"
+#include "ops/graph_registry.h"
 #include "native/context.h"
 #include <chrono>
 #include <thread>

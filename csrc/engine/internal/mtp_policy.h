@@ -42,9 +42,9 @@ inline ChainVerification verify_greedy(
     };
 }
 
-class DsparkDepthController {
+class CycleDepthController {
 public:
-    explicit DsparkDepthController(int maximum_depth = 3)
+    explicit CycleDepthController(int maximum_depth = 3)
         : maximum_depth_(std::clamp(maximum_depth, 1, kMaximumDraftDepth)),
           current_depth_(maximum_depth_),
           acceptance_(static_cast<std::size_t>(maximum_depth_), 0.6),

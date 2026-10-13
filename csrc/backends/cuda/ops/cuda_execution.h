@@ -1,8 +1,8 @@
 #pragma once
 namespace mfq::cuda {
 class KvOffloadStore;
-// Defined in runtime/decode_window.cpp.  Declared here so operator code can ask
-// whether a decode graph is being captured without including the runtime layer.
+// Defined in ops/decode_window.cpp.  Declared here so operator code can ask
+// whether a decode graph is being captured without pulling in DecodeWindow.
 bool decode_window_recording() noexcept;
 }
 

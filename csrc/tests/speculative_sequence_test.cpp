@@ -27,7 +27,7 @@ struct Predictor {
     int64_t position = 0;
     bool legacy = false;
     int maximum_draft_depth() const { return 3; }
-    bool dspark_policy() const { return legacy; }
+    bool cycle_timed_policy() const { return legacy; }
     bool blockwise_drafting() const { return false; }
     bool supports_session_state() const { return true; }
     bool teacher_forced_prompt_prime() const { return true; }
@@ -135,10 +135,10 @@ struct Ops {
     }
 };
 
-void run(bool dspark) {
+void run(bool cycle_timed) {
     Model model;
     Predictor mtp;
-    mtp.legacy = dspark;
+    mtp.legacy = cycle_timed;
     InferenceRequest request;
     request.chat = false;
     request.prompt = {0, 0, 0};
@@ -156,7 +156,7 @@ void run(bool dspark) {
     if (tokens != std::vector<int64_t>(256, 0) || model.cache_pos != 258 || !Ops::defined(last_hidden))
         throw std::runtime_error("shared MTP output/cache boundary mismatch");
     const auto& stats = output.metrics.mtp;
-    if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
+    if (cycle_timed ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
 }

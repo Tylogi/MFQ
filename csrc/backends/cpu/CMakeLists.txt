@@ -7,9 +7,8 @@ add_library(mfq-cpu-ops STATIC
     ops/nvq_group.cpp
     ops/nvq_group.h
     ops/host_memory_copy.cpp
-    ops/host_memory_copy.h
 )
-target_include_directories(mfq-cpu-ops PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ops)
+target_include_directories(mfq-cpu-ops PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ops ${MFQ_CORE_INCLUDE_DIR})
 target_link_libraries(mfq-cpu-ops PUBLIC mfq-host-parallel)
 target_compile_features(mfq-cpu-ops PUBLIC cxx_std_17)
 set_target_properties(mfq-cpu-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)

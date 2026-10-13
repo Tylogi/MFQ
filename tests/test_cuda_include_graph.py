@@ -5,7 +5,7 @@ Every cross-directory include inside csrc/backends/cuda must be written as
 "<dir>/<name>", resolved against the backend root.  The directory graph must
 stay a DAG in the documented order:
 
-    native -> kernels -> ops -> storage -> runtime -> models -> engine
+    native -> kernels -> ops -> storage -> models -> engine
 
 Run: python3 cuda/tests/cuda_include_graph.py [--verbose]
 """
@@ -19,12 +19,8 @@ BACKEND_ROOT = os.path.normpath(
 # Directories that hold the layered library.  Everything else under the
 # backend root (apps/, commands/, diagnostics/, eval/, tests/) is a top-level
 # consumer and may include anything below it.
-DIRS = ["native", "kernels", "ops", "storage", "runtime", "models", "engine"]
-# storage/ and runtime/ are one layer: the expert caches and the pipelines that
-# drive them are mutually dependent, and separating them would mean moving a
-# dozen files for no gain.  Everything else must point strictly downward.
-GROUP = {"storage": "storage_runtime", "runtime": "storage_runtime"}
-LAYERS = ["native", "kernels", "ops", "storage_runtime", "models", "engine"]
+DIRS = ["native", "kernels", "ops", "storage", "models", "engine"]
+LAYERS = DIRS
 RANK = {d: i for i, d in enumerate(LAYERS)}
 SOURCE_EXT = (".cpp", ".cu", ".cuh", ".c", ".h", ".tpp")
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
@@ -35,7 +31,7 @@ def layer_of(path):
     if rel.startswith(".."):
         return None
     head = rel.split(os.sep)[0]
-    return GROUP.get(head, head) if head in GROUP or head in LAYERS else None
+    return head if head in LAYERS else None
 
 
 def dir_of(path):
