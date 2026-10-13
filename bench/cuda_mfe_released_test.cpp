@@ -2,7 +2,7 @@
 #include "kernels/moe_ops.h"
 #include "ops/mfe_ffn_runtime.h"
 #include "storage/moe_quant_range_source.h"
-#include "storage/moe_cache_types_internal.h"
+#include "storage/moe_cached_source_internal.h"
 #include "storage/weight_loader.h"
 #include "mfq/model_source.h"
 #include <array>

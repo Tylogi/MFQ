@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tts.h"
+#include "components.h"
 
 inline auto minicpmo45_parse_bounds(mfq_tensor_backend::Tensor bounds, const char *label) {
     if (!bounds.defined() || bounds.numel() == 0)

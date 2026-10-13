@@ -8,7 +8,7 @@
 #include "mfq_paged_prefix_cache.h"
 #include "gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
-#include "models/minicpmo45/tts.h"
+#include "models/minicpmo45/components.h"
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen35/batch_state.h"
