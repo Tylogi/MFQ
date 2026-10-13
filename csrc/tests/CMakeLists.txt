@@ -12,7 +12,7 @@ if(MFQ_PYTHON_EXECUTABLE)
 endif()
 
 add_executable(mfq-cuda-tensor-view-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/tensor_view_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native/tensor_view_test.cpp
 )
 target_include_directories(mfq-cuda-tensor-view-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda)
@@ -21,8 +21,8 @@ add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
 
 add_executable(mfq-native-tensor-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/native/tensor.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native_tensor_cpu_test_stubs.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native_tensor_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native/native_tensor_cpu_test_stubs.cpp
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native/native_tensor_test.cpp
 )
 target_include_directories(mfq-native-tensor-test PRIVATE
     ${PROJECT_SOURCE_DIR}/backends/cuda)
@@ -94,7 +94,7 @@ add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
 
 add_executable(mfq-cuda-model-plan-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/model_plan_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/engine/model_plan_test.cpp
 )
 target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_include_directories(mfq-cuda-model-plan-test PRIVATE
