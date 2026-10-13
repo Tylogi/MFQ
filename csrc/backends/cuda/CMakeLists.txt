@@ -354,7 +354,6 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
-    ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/moe.cpp
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
@@ -373,6 +372,8 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_ffn_pipeline.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/mx_weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/sq_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_quant_range_source.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/graph_registry.cpp

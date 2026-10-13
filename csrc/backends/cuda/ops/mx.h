@@ -81,20 +81,4 @@ struct Mxfp4Cpu {
     std::vector<uint8_t> scales;
 };
 
-size_t checked_mxfp8_size(
-    uint64_t left, uint64_t right, const char* label);
-Mxfp8Cpu unpack_mxfp8(const std::vector<uint8_t>& blob);
-Mxfp4Cpu unpack_mxfp4(const std::vector<uint8_t>& blob);
-mfq_tensor_backend::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu& source);
-Mxfp4Cpu select_mxfp4_cpu_rows(
-    const Mxfp4Cpu& source, const std::vector<int64_t>& rows);
-Mxfp4Cpu slice_mxfp4_cpu(
-    const Mxfp4Cpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
-Mxfp8Cpu slice_mxfp8_cpu(
-    const Mxfp8Cpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
-Mxfp8Weight to_device_mxfp8(
-    const Mxfp8Cpu& source, bool cuda, int device = -1);
-Mxfp8Weight to_cuda_device_mxfp8(const Mxfp8Cpu& source, int device);
-Mxfp4Weight to_device_mxfp4(
-    const Mxfp4Cpu& source, bool cuda, int device = -1);
 mfq_tensor_backend::Tensor mxfp8_cpu_reference(const Mxfp8Weight& weight);

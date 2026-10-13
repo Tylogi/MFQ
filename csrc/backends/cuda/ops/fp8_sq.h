@@ -75,10 +75,5 @@ struct Fp8SqLinear {
     }
 };
 
-Fp8SqWeight to_device_fp8_sq(
-    std::string_view dtype,
-    const std::vector<uint8_t>& payload,
-    bool cuda,
-    int device = -1);
 mfq_tensor_backend::Tensor dequant_fp8_sq(
     const Fp8SqWeight& weight, bool fp32);

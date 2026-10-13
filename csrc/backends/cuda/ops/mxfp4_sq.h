@@ -60,8 +60,3 @@ struct Mxfp4SqLinear {
         return output.reshape(shape);
     }
 };
-
-Mxfp4SqWeight to_device_mxfp4_sq(
-    const std::vector<uint8_t>& payload,
-    bool cuda,
-    int device = -1);
