@@ -4,7 +4,7 @@
 #include "storage/weight_loader.h"
 #include "storage/mfe_expert_store.h"
 #include "csrc/models/deepseek_v41/engram.h"
-#include "ops/quant_linear.h"
+#include "ops/quant/quant_linear.h"
 #include <cstddef>
 #include <cstring>
 #include <filesystem>

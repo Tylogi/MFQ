@@ -1,6 +1,6 @@
 #include "kernels/nvq1_decode.h"
 #include "kernels/quant_ops.h"
-#include "ops/vq.h"
+#include "ops/quant/vq.h"
 #include "timing.h"
 #include <array>
 #include <cstdlib>

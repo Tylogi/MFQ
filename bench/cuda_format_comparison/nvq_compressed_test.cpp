@@ -1,4 +1,4 @@
-#include "ops/vq.h"
+#include "ops/quant/vq.h"
 #include <array>
 #include <cstring>
 #include <iostream>

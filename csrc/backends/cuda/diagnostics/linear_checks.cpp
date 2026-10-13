@@ -2,8 +2,8 @@
 #include "storage/weight_loader.h"
 #include "model_checks.h"
 
-#include "ops/quant_linear.h"
-#include "ops/cuda_execution.h"
+#include "ops/quant/quant_linear.h"
+#include "ops/execution/cuda_execution.h"
 #include "kernels/activation_ops.h"
 #include "kernels/attention/linear_ops.h"
 #include "kernels/quant_ops.h"

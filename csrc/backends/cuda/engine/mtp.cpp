@@ -1,8 +1,8 @@
 #include "generation.h"
 #include "speculative_sequence.h"
 
-#include "ops/cuda_execution.h"
-#include "ops/cuda_sampling.h"
+#include "ops/execution/cuda_execution.h"
+#include "ops/execution/cuda_sampling.h"
 #include "generation_policy.h"
 #include "inference.h"
 #include "kernels/sampling_ops.h"

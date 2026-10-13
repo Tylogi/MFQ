@@ -1,6 +1,6 @@
 #pragma once
 #include "native/env.h"
-#include "ops/mfe_ffn_runtime.h"
+#include "ops/moe/mfe_ffn_runtime.h"
 #include <cstring>
 #include "storage/moe/weight_loader.h"
 #include "storage/quant_weight_loader.h"

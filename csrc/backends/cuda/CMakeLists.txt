@@ -349,17 +349,17 @@ target_compile_definitions(mfq-cuda-models PRIVATE
 set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
-    ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/ops/execution/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
-    ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
-    ${MFQ_CUDA_ROOT}/ops/mx.cpp
-    ${MFQ_CUDA_ROOT}/ops/moe.cpp
-    ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
-    ${MFQ_CUDA_ROOT}/ops/nint.cpp
-    ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant/fp8_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant/mx.cpp
+    ${MFQ_CUDA_ROOT}/ops/moe/moe.cpp
+    ${MFQ_CUDA_ROOT}/ops/moe/mfe_ffn.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant/nint.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant/quant_linear.cpp
     ${MFQ_CUDA_ROOT}/ops/rope.cpp
-    ${MFQ_CUDA_ROOT}/ops/vq.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant/vq.cpp
 )
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
@@ -378,7 +378,7 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/vq_weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/quant_range_source.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/host_expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/ops/graph_registry.cpp
+    ${MFQ_CUDA_ROOT}/ops/execution/graph_registry.cpp
     ${MFQ_CUDA_ROOT}/ops/decode_window.cpp
     ${MFQ_CUDA_ROOT}/storage/moe/residency.cpp
     ${MFQ_CUDA_ROOT}/storage/nint_row_pipeline.cpp

@@ -1,5 +1,5 @@
 #include "fp8_sq.h"
-#include "format.h"
+#include "ops/format.h"
 
 using namespace mfq::cuda::quant_format;
 

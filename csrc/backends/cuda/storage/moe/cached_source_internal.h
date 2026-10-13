@@ -2,10 +2,10 @@
 
 #include "kernels/moe/ops.h"
 
-#include "ops/execution_options.h"
+#include "ops/execution/execution_options.h"
 #include "storage/moe/expert_cache.h"
-#include "ops/cuda_execution.h"
-#include "ops/moe.h"
+#include "ops/execution/cuda_execution.h"
+#include "ops/moe/moe.h"
 #include "storage/mfe_expert_store.h"
 #include "quant_range_source.h"
 #include "mfq/moe_cache_policy.h"

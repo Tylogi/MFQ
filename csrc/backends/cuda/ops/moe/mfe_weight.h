@@ -2,12 +2,12 @@
 
 #include "kernels/moe/ops.h"
 
-#include "cuda_execution.h"
-#include "fp8_sq.h"
-#include "mx.h"
-#include "mxfp4_sq.h"
-#include "nint.h"
-#include "vq.h"
+#include "ops/execution/cuda_execution.h"
+#include "ops/quant/fp8_sq.h"
+#include "ops/quant/mx.h"
+#include "ops/quant/mxfp4_sq.h"
+#include "ops/quant/nint.h"
+#include "ops/quant/vq.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>

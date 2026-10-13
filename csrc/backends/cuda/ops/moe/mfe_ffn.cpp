@@ -1,12 +1,12 @@
 #include "native/env.h"
-#include "execution_options.h"
+#include "ops/execution/execution_options.h"
 #include "mfe_ffn_runtime.h"
 #include "kernels/mfe/e8_narrow_bounds.h"
 #include "kernels/mfe/ffn_launch.h"
 #include "kernels/mfe/ffn_compact.h"
 #include "kernels/mfe/nvq_dense_bounds.h"
 #include "kernels/quant/nint_route_hint.h"
-#include "cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>

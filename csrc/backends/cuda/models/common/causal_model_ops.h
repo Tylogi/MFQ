@@ -7,7 +7,7 @@
 #include "resource_plan.h"
 #include "mfq/model_source.h"
 #include "common/causal_model.h"
-#include "ops/quant_linear.h"
+#include "ops/quant/quant_linear.h"
 
 #include <cstddef>
 #include <cstdint>

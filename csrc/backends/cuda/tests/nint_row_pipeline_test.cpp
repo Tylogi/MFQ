@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "storage/nint_row_pipeline.h"
 #include "ops/decode_window.h"
-#include "ops/nint.h"
+#include "ops/quant/nint.h"
 #include "kernels/moe/pipeline.h"
 #include "mfq/nint_row_cache.h"
 #include "../../tests/nint_row_fixture.h"

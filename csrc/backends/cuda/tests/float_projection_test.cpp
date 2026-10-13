@@ -2,7 +2,7 @@
 #include "kernels/float_projection.h"
 #include "ops/gated_residual.h"
 #include "kernels/gated_residual_fused.h"
-#include "ops/cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include "storage/weight_loader.h"
 #include "storage/mapped_embedding.h"
 #include "kernels/attention/selected_attention.h"

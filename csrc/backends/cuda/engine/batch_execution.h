@@ -3,13 +3,13 @@
 #include "cuda_runtime_config.h"
 
 #include "kernels/sampling_ops.h"
-#include "ops/cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include "models/common/full_block.h"
 #include "storage/batch_paged_kv.h"
 #include "continuous_batch.h"
 #include "decode_graph.h"
 #include "generation_step.h"
-#include "ops/cuda_sampling.h"
+#include "ops/execution/cuda_sampling.h"
 #include <map>
 #include <span>
 

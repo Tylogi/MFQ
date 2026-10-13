@@ -1,6 +1,6 @@
 #include "native/env.h"
 #include "kernels/moe/ops.h"
-#include "ops/execution_options.h"
+#include "ops/execution/execution_options.h"
 #include "kernels/shared_gate.h"
 #include "kernels/sampling_ops.h"
 #include "ops.h"
@@ -12,7 +12,7 @@
 #include "storage/nint_row_pipeline.h"
 #include "ops/decode_window.h"
 #include "kernels/moe/pipeline.h"
-#include "ops/router_lookahead_audit.h"
+#include "ops/moe/router_lookahead_audit.h"
 #include "common/gated_mlp.h"
 #include "common/moe.h"
 #include "common/transformer_layer.h"
@@ -20,7 +20,7 @@
 #include "ops/gated_residual.h"
 #include "kernels/gated_residual_fused.h"
 #include "kernels/float_projection.h"
-#include "ops/nint_prefill_cache.h"
+#include "ops/quant/nint_prefill_cache.h"
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 #include "native/matmul_rows.h"
 #endif

@@ -1,12 +1,12 @@
-#include "execution_options.h"
+#include "ops/execution/execution_options.h"
 #include "kernels/moe/ops.h"
 #include "kernels/quant_ops.h"
 #include "kernels/quant/nint_route_hint.h"
 #include "kernels/nvq1_decode.h"
 #include "moe.h"
 
-#include "quant_linear.h"
-#include "format.h"
+#include "ops/quant/quant_linear.h"
+#include "ops/format.h"
 #include "mfq_format_compat.h"
 #include "kernels/moe/pipeline.h"
 

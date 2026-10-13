@@ -1,7 +1,7 @@
 #include "native/env.h"
-#include "ops/execution_options.h"
+#include "ops/execution/execution_options.h"
 #pragma once
-#include "ops/cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include "kernels/attention/linear_ops.h"
 #include "kernels/norm_ops.h"
 #include "qwen4_exp/causal_lm.h"

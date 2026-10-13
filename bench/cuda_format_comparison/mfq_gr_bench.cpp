@@ -1,6 +1,6 @@
 #include "../cuda_graph_query.h"
 #include "timing.h"
-#include "ops/cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include "kernels/gated_residual_fused.h"
 #include "storage/weight_loader.h"
 #include "mfq/model_source.h"

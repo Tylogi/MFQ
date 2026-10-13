@@ -9,7 +9,7 @@
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "models/common/full_block.h"
-#include "ops/cuda_sampling.h"
+#include "ops/execution/cuda_sampling.h"
 #include "storage/text_session_cache.h"
 #include "kernels/sampling_ops.h"
 

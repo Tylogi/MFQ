@@ -1,6 +1,6 @@
 #pragma once
-#include "ops/quant_linear.h"
-#include "ops/cuda_execution.h"
+#include "ops/quant/quant_linear.h"
+#include "ops/execution/cuda_execution.h"
 #include "native/context.h"
 #include <cstring>
 #include <memory>

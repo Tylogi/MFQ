@@ -1,10 +1,10 @@
 #pragma once
 
-#include "ops/fp8_sq.h"
-#include "ops/mx.h"
-#include "ops/mxfp4_sq.h"
-#include "ops/nint.h"
-#include "ops/vq.h"
+#include "ops/quant/fp8_sq.h"
+#include "ops/quant/mx.h"
+#include "ops/quant/mxfp4_sq.h"
+#include "ops/quant/nint.h"
+#include "ops/quant/vq.h"
 
 #include <cstdint>
 #include <vector>

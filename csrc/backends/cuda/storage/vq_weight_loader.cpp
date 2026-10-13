@@ -1,7 +1,7 @@
 #include "quant_weight_loader.h"
 
-#include "ops/cpu_projection_rows.h"
-#include "ops/execution_options.h"
+#include "ops/quant/cpu_projection_rows.h"
+#include "ops/execution/execution_options.h"
 #include "nvq_codebooks.generated.h"
 #include "nvq_dense_pack.h"
 #include "nvq_group.h"

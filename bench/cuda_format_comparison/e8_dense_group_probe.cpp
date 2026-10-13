@@ -1,6 +1,6 @@
 #include "weights.h"
 #include "e8_dense_group_probe.h"
-#include "ops/cpu_projection_rows.h"
+#include "ops/quant/cpu_projection_rows.h"
 #include <chrono>
 #include <set>
 #include <cstdlib>

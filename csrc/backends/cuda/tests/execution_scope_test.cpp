@@ -1,6 +1,6 @@
 #include "native/env.h"
-#include "ops/cuda_execution.h"
-#include "ops/execution_options.h"
+#include "ops/execution/cuda_execution.h"
+#include "ops/execution/execution_options.h"
 #include "include/cuda_engine.h"
 
 #include <atomic>

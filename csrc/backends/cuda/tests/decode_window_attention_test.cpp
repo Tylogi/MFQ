@@ -2,7 +2,7 @@
 #include "models/qwen4_exp/model.h"
 #include "ops/decode_window.h"
 #include "native/context.h"
-#include "ops/cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>

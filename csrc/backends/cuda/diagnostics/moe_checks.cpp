@@ -6,8 +6,8 @@
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"
 #include "models/glm_dsa/ops.h"
-#include "ops/quant_linear.h"
-#include "ops/cuda_execution.h"
+#include "ops/quant/quant_linear.h"
+#include "ops/execution/cuda_execution.h"
 #include "storage/moe/expert_cache.h"
 #include "kernels/moe/ops.h"
 

@@ -1,6 +1,6 @@
 #include "kernels/quant_ops.h"
 #include "mx.h"
-#include "format.h"
+#include "ops/format.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;

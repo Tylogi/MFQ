@@ -1,7 +1,7 @@
 #include "storage/weight_loader.h"
 #include "packed_bench_utils.h"
 #include "kernels/moe/ops.h"
-#include "ops/mfe_ffn_runtime.h"
+#include "ops/moe/mfe_ffn_runtime.h"
 #include "mfq/model_source.h"
 #include <array>
 #include <atomic>

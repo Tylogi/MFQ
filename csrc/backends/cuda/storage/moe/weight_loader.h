@@ -1,14 +1,14 @@
 #pragma once
 
-#include "ops/mfe_weight.h"
-#include "ops/moe.h"
+#include "ops/moe/mfe_weight.h"
+#include "ops/moe/moe.h"
 
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 // MFE/MoE weight loading: payload bytes -> CPU weight description -> device
-// weights. MixedMoeRuntime itself (ops/moe.h) is the compute side.
+// weights. MixedMoeRuntime itself (ops/moe/moe.h) is the compute side.
 struct MfeCpuPool {
     std::vector<int32_t> expert_ids;
     std::string dtype;

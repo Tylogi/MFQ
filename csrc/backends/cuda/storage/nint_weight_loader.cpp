@@ -1,10 +1,10 @@
 #include "quant_weight_loader.h"
 
-#include "ops/cpu_projection_rows.h"
+#include "ops/quant/cpu_projection_rows.h"
 #include "kernels/activation_ops.h"
 #include "kernels/quant_ops.h"
 #include "ops/format.h"
-#include "ops/nint_prefill_cache.h"
+#include "ops/quant/nint_prefill_cache.h"
 #include "packed_nint.h"
 
 #include <array>

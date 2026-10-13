@@ -77,7 +77,7 @@ serving executable; it does not disable backend, tokenizer, cache, diagnostics
 or evaluation targets. Only serving applications link backend and transport.
 
 Inside `backends/cuda`, a cross-directory include is written as
-`"<dir>/<name>"` (`#include "ops/moe.h"`, never `"moe.h"` or `"../ops/moe.h"`);
+`"<dir>/<name>"` (`#include "ops/moe/moe.h"`, never `"moe.h"` or `"../ops/moe/moe.h"`);
 the build no longer adds the layer directories to the include path, so the bare
 form cannot compile. The directories form a DAG from lowest to highest:
 `native`, `kernels`, `ops`, `storage`, `models`, `engine`. A file may include

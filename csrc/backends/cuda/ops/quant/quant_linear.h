@@ -1,13 +1,13 @@
 #pragma once
 
-#include "format.h"
+#include "ops/format.h"
 #include "fp8_sq.h"
 #include "mx.h"
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
 
-#include "cuda_execution.h"
+#include "ops/execution/cuda_execution.h"
 #include "native/tensor_backend.h"
 
 #include <cuda_runtime_api.h>
