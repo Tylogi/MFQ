@@ -22,7 +22,7 @@ RUNTIME = "\n".join(
     )
 )
 SAMPLING = (
-    ROOT / "csrc" / "backends" / "cuda" / "ops" / "cuda_sampling.h"
+    ROOT / "csrc" / "backends" / "cuda" / "ops" / "execution" / "cuda_sampling.h"
 ).read_text(encoding="utf-8")
 
 
@@ -41,7 +41,7 @@ def test_prefill_speed_uses_cuda_events_per_bounded_model_chunk() -> None:
     flow = (ROOT / "csrc/engine/internal/generation_step.h").read_text()
     assert "next_prefill_chunk(end, offset, chunk_size)" in flow
     assert "elapsed += ops.prefill(chunk)" in flow
-    assert "co_yield PrefillProgress" in flow
+    assert "co_yield prefill_progress(" in flow
     assert "inline SamplingOps::Tensor sample_logits(" in SAMPLING
     assert "sample_apply_penalties_cuda(" in SAMPLING
     assert "1000.0 * metrics.prefill_tokens / metrics.prefill_ms" in SERVER

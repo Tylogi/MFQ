@@ -86,6 +86,11 @@ and `tests/` are top-level consumers. `tests/test_cuda_include_graph.py`
 enforces the include form and the DAG, and `tests/test_layer_independence.py`
 keeps the shared layers free of backend and model-family names.
 
+A layer is grouped by concept, not by file count: when several files in one
+directory share a name prefix, the prefix becomes a subdirectory
+(`kernels/nvq/device.cuh`, not `kernels/nvq_device.cuh`).  The include rule is
+unchanged, the path is still rooted at the layer directory.
+
 `engine/internal` is PRIVATE in `engine/CMakeLists.txt`, and the backends and
 tests add that directory to their include path and include its headers bare.
 That is the only way a backend drives the shared generation loop, so it is
