@@ -3,7 +3,7 @@
 find_package(Threads REQUIRED)
 
 add_library(mfq-runtime-communication STATIC
-    include/transport.h
+    transport.h
     src/common.cpp
     src/common.h
     src/protocol.cpp
@@ -11,8 +11,7 @@ add_library(mfq-runtime-communication STATIC
     src/stdio.cpp
 )
 add_library(mfq::runtime-communication ALIAS mfq-runtime-communication)
-target_include_directories(mfq-runtime-communication PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+target_include_directories(mfq-runtime-communication PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(mfq-runtime-communication
     PUBLIC

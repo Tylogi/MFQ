@@ -6,7 +6,7 @@ add_library(mfq-engine STATIC
 )
 add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/internal
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)

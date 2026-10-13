@@ -1,9 +1,9 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
 find_package(Threads REQUIRED)
-add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h
-    cpu_expert_pool.cpp include/mfq/cpu_expert_pool.h)
-target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(mfq-host-parallel STATIC host_parallel.cpp mfq/host_parallel.h
+    cpu_expert_pool.cpp mfq/cpu_expert_pool.h)
+target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
 target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
 set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -34,27 +34,27 @@ set_target_properties(mfq-model-graph PROPERTIES
 add_library(mfq-model-source STATIC
     file_range_reader.cpp
     async_range_reader.cpp
-    include/mfq/file_range_reader.h
+    mfq/file_range_reader.h
     mfe_quant_expert_store.cpp
-    include/mfq/mfe_quant_expert_store.h
+    mfq/mfe_quant_expert_store.h
     nint_rows.cpp
-    include/mfq/nint_rows.h
+    mfq/nint_rows.h
     nvq_rows.cpp
-    include/mfq/nvq_rows.h
-    include/mfq/packed_row_range.h
+    mfq/nvq_rows.h
+    mfq/packed_row_range.h
     hf_model_source.cpp
     hf_safetensors_source.cpp
-    include/mfq/hf_model_source.h
-    include/mfq/hf_safetensors_source.h
-    include/mfq/model_graph.h
-    include/mfq/model_source.h
-    include/mfq/mfq_model_source.h
+    mfq/hf_model_source.h
+    mfq/hf_safetensors_source.h
+    mfq/model_graph.h
+    mfq/model_source.h
+    mfq/mfq_model_source.h
     mfq_model_source.cpp
     model_source.cpp
 )
 add_library(mfq::model-source ALIAS mfq-model-source)
 target_include_directories(mfq-model-source PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
@@ -67,13 +67,13 @@ set_target_properties(mfq-model-source PROPERTIES
 )
 
 add_library(mfq-cache-policy STATIC moe_cache_policy.cpp)
-target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(mfq-cache-policy PUBLIC cxx_std_17)
 set_target_properties(mfq-cache-policy PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-core INTERFACE)
-add_library(mfq-qsa-kv-store STATIC qsa_kv_store.cpp include/mfq/qsa_kv_store.h)
-target_include_directories(mfq-qsa-kv-store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(mfq-qsa-kv-store STATIC qsa_kv_store.cpp mfq/qsa_kv_store.h)
+target_include_directories(mfq-qsa-kv-store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads)
 target_compile_features(mfq-qsa-kv-store PUBLIC cxx_std_17)
 set_target_properties(mfq-qsa-kv-store PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -82,7 +82,7 @@ if(MSVC)
 endif()
 add_library(mfq::core ALIAS mfq-core)
 target_include_directories(mfq-core INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
