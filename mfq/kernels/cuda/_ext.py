@@ -49,6 +49,7 @@ _SOURCES = [
     os.path.join(_KERNEL_DIR, "nvq", "moe.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "backward.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "routed_reuse.cu"),
+    os.path.join(_BACKEND_DIR, "native", "env.cpp"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None
