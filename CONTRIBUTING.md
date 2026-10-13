@@ -86,6 +86,15 @@ and `tests/` are top-level consumers. `tests/test_cuda_include_graph.py`
 enforces the include form and the DAG, and `tests/test_layer_independence.py`
 keeps the shared layers free of backend and model-family names.
 
+`engine/internal` is PRIVATE in `engine/CMakeLists.txt`, and the backends and
+tests add that directory to their include path and include its headers bare.
+That is the only way a backend drives the shared generation loop, so it is
+allowed for `backends/` and `tests/` and for nobody else: `core/`,
+`transport/`, `scheduler/`, `models/` and `components/` must not include an
+engine internal header. `engine/` never includes a backend header. The
+engine-internal header graph is a DAG and no internal header is orphaned.
+`tests/test_engine_include_graph.py` enforces all four.
+
 There is no `runtime/` layer and no `Runtime` type. Composition and lifetime
 live in the application executable (`apps/`, `commands/`); a word that names no
 responsibility is not a module.
