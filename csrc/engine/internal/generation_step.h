@@ -21,6 +21,13 @@ inline void require_execution(bool condition, const char *message) {
         throw std::runtime_error(message);
 }
 
+// Prompt progress published while prefill runs: llm_ms is the language-model
+// part, multimodal_ms the encoder work that preceded it, model_ms both.
+inline PrefillProgress prefill_progress(
+    std::size_t prompt_tokens, double llm_ms, double multimodal_ms = 0.0) {
+    return PrefillProgress{{prompt_tokens, llm_ms, multimodal_ms, llm_ms + multimodal_ms}};
+}
+
 // Resource owners release exactly once, including coroutine destruction. The
 // executor observes teardown failures before publishing a terminal event.
 template <class Release> struct ExecutionCleanup {
@@ -61,8 +68,7 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
             elapsed += ops.prefill(chunk);
         }
         offset += chunk.count;
-        co_yield PrefillProgress{
-            {static_cast<std::size_t>(offset - reused_tokens), elapsed, 0.0, elapsed}};
+        co_yield prefill_progress(static_cast<std::size_t>(offset - reused_tokens), elapsed);
     }
     if (output.stopped())
         co_return;

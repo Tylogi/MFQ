@@ -118,8 +118,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             raw_chunks.push_back(std::move(step.raw));
             offset += chunk.count;
             prefill_ms += step.elapsed;
-            co_yield PrefillProgress{
-                {static_cast<std::size_t>(offset) - reused_tokens, prefill_ms, 0.0, prefill_ms}};
+            co_yield prefill_progress(static_cast<std::size_t>(offset) - reused_tokens, prefill_ms);
         }
         if (output.result.cancelled)
             co_return;
@@ -180,8 +179,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 if (output.result.cancelled)
                     co_return;
                 offset += chunk.count;
-                co_yield PrefillProgress{
-                    {prompt.size() - reused_tokens, prefill_ms, 0.0, prefill_ms}};
+                co_yield prefill_progress(prompt.size() - reused_tokens, prefill_ms);
             }
         }
 

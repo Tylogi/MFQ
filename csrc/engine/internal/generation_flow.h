@@ -25,7 +25,7 @@ Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput 
         }
         if (output.stopped()) co_return;
         const auto elapsed = output.metrics.multimodal_ms;
-        co_yield PrefillProgress{{0, 0.0, elapsed, elapsed}};
+        co_yield prefill_progress(0, 0.0, elapsed);
     }
     if (output.stopped()) co_return;
     auto sequence = ops.generate_text(input, output, std::move(prepared), id, batched);
