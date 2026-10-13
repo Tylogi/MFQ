@@ -8,12 +8,18 @@
 
 #include <exception>
 #include <functional>
+#include <stdexcept>
 #include <utility>
 
 namespace mfq::engine {
 
 using mfq::StepState;
 using Generation = mfq::StepSequence<EventData>;
+
+inline void require_execution(bool condition, const char *message) {
+    if (!condition)
+        throw std::runtime_error(message);
+}
 
 // Resource owners release exactly once, including coroutine destruction. The
 // executor observes teardown failures before publishing a terminal event.
