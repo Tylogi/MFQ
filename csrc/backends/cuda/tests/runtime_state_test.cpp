@@ -1,4 +1,4 @@
-#include "kernels/mfq_cuda_norm_ops.h"
+#include "kernels/norm_ops.h"
 #include "ops/cuda_execution.h"
 #include "engine/cuda_runtime_config.h"
 #include "engine/batch_execution.h"

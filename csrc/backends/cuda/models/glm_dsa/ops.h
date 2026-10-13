@@ -2,9 +2,9 @@
 
 #include "step_sequence.h"
 #include "storage/session_state.h"
-#include "kernels/mfq_cuda_attention_ops.h"
-#include "kernels/mfq_cuda_cache_ops.h"
-#include "kernels/mfq_cuda_norm_ops.h"
+#include "kernels/attention_ops.h"
+#include "kernels/cache_ops.h"
+#include "kernels/norm_ops.h"
 #include "common/transformer_layer.h"
 #include "glm_dsa/causal_lm.h"
 

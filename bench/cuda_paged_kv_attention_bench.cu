@@ -1,4 +1,4 @@
-#include "csrc/backends/cuda/kernels/mfq_cuda_paged_kv.h"
+#include "csrc/backends/cuda/kernels/paged_kv.h"
 #include "csrc/backends/cuda/native/tensor.h"
 
 #include <cuda_runtime_api.h>

@@ -2,7 +2,7 @@
 #include "rope.h"
 
 #include "cuda_execution.h"
-#include "kernels/mfq_cuda_attention_ops.h"
+#include "kernels/attention_ops.h"
 
 #include <algorithm>
 #include <array>

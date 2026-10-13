@@ -1,5 +1,5 @@
 #pragma once
-#include "csrc/backends/cuda/native/tensor_backend.h"
+#include "native/tensor_backend.h"
 #include <optional>
 
 // One BF16 scalar weight row, Half input, 1..8 tokens. Unsupported views

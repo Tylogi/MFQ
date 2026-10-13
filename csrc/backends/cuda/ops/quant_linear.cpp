@@ -1,5 +1,5 @@
-#include "kernels/mfq_cuda_activation_ops.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/activation_ops.h"
+#include "kernels/quant_ops.h"
 #include "quant_linear.h"
 
 #include "fp8_sq.h"

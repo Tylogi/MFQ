@@ -1,5 +1,5 @@
-#include "kernels/mfq_cuda_cache_ops.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/cache_ops.h"
+#include "kernels/quant_ops.h"
 
 #include <array>
 #include <cstring>

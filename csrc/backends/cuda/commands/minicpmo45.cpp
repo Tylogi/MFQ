@@ -1,4 +1,4 @@
-#include "kernels/mfq_cuda_sampling_ops.h"
+#include "kernels/sampling_ops.h"
 #include "minicpmo45.h"
 
 #include "models/minicpmo45/runtime.h"

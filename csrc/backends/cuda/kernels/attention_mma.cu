@@ -6,7 +6,7 @@
 #include <climits>
 
 #define MFQ_FATTN_KERNEL_ONLY
-#include "mfq_fattn_mma_f16.cuh"
+#include "fattn_mma_f16.cuh"
 
 __global__ void minicpm_flash128_q_cast_kernel(
     const __nv_bfloat16* source,

@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "storage/nint_row_pipeline.h"
 #include "mfq/nint_row_cache.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/quant_ops.h"
 #include "mfq/host_parallel.h"
 #include "native/context.h"
 #include <atomic>

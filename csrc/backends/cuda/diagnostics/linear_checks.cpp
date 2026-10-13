@@ -4,9 +4,9 @@
 
 #include "ops/quant_linear.h"
 #include "ops/cuda_execution.h"
-#include "kernels/mfq_cuda_activation_ops.h"
-#include "kernels/mfq_cuda_linear_attention_ops.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/activation_ops.h"
+#include "kernels/linear_attention_ops.h"
+#include "kernels/quant_ops.h"
 
 #include <cuda_runtime_api.h>
 

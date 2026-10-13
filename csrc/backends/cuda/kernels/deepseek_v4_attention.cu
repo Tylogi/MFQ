@@ -16,7 +16,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "mfq_sparse_attn_mma_f16.cuh"
+#include "sparse_attn_mma_f16.cuh"
 
 namespace {
 

@@ -1,5 +1,5 @@
 #pragma once
-#include "kernels/mfq_cuda_norm_ops.h"
+#include "kernels/norm_ops.h"
 #include "common/transformer_layer.h"
 #include "deepseek_v41/causal_lm.h"
 

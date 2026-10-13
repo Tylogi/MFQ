@@ -3,7 +3,7 @@
 #include "ops/format.h"
 #include "kernels/float_projection.h"
 #include "kernels/gated_residual_fused.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/quant_ops.h"
 #include "kernels/selected_attention.h"
 #include "mfq/mxfp4_sq_decode.h"
 

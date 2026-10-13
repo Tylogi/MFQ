@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "glu.cuh"
-#include "csrc/backends/cuda/kernels/mfq_cuda_kernels.h"
+#include "kernels/kernels.h"
 
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.

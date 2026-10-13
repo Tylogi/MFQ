@@ -1,4 +1,4 @@
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/quant_ops.h"
 #include "../../tests/nint_row_fixture.h"
 #include <cstring>
 #include <iostream>

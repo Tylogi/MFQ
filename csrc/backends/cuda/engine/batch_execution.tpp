@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/mfq_cuda_sampling_ops.h"
+#include "kernels/sampling_ops.h"
 #include "ops/cuda_execution.h"
 #include "models/common/full_block.h"
 #include "storage/batch_paged_kv.h"

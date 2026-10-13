@@ -1,4 +1,4 @@
-#include "mfq_cuda_shared_gate.h"
+#include "kernels/shared_gate.h"
 #include "csrc/backends/cuda/native/context.h"
 #include "shared_gate_fused.cuh"
 

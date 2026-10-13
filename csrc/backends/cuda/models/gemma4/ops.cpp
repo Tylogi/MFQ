@@ -1,5 +1,5 @@
-#include "kernels/mfq_cuda_moe_ops.h"
-#include "kernels/mfq_cuda_norm_ops.h"
+#include "kernels/moe_ops.h"
+#include "kernels/norm_ops.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
 #include "models/common/session_codec.h"

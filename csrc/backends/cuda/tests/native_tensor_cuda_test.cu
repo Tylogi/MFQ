@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "native/context.h"
 #include "native/tensor.h"
-#include "native/mfq_native_matmul_rows.h"
+#include "native/matmul_rows.h"
 #include <cstring>
 
 #include <cuda_runtime_api.h>

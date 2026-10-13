@@ -1,6 +1,6 @@
 #pragma once
 #include "timing.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/quant_ops.h"
 #include "storage/moe_quant_range_source.h"
 #include "mfq/model_source.h"
 #include <cstring>

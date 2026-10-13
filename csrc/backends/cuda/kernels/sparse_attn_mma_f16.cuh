@@ -4,7 +4,7 @@
 #define MFQ_FATTN_KERNEL_ONLY
 #define MFQ_SPARSE_ATTN_UNDEF_KERNEL_ONLY
 #endif
-#include "mfq_fattn_mma_f16.cuh"
+#include "fattn_mma_f16.cuh"
 #ifdef MFQ_SPARSE_ATTN_UNDEF_KERNEL_ONLY
 #undef MFQ_SPARSE_ATTN_UNDEF_KERNEL_ONLY
 #undef MFQ_FATTN_KERNEL_ONLY

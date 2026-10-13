@@ -1,6 +1,6 @@
 #include "cuda_graph_query.h"
 #include "packed_bench_utils.h"
-#include "../csrc/backends/cuda/kernels/mfq_cuda_quant_ops.h"
+#include "../csrc/backends/cuda/kernels/quant_ops.h"
 
 #include <cuda_runtime_api.h>
 #include <array>

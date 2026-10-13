@@ -1,8 +1,8 @@
 #include "native/env.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_ops.h"
 #include "ops/execution_options.h"
-#include "kernels/mfq_cuda_shared_gate.h"
-#include "kernels/mfq_cuda_sampling_ops.h"
+#include "kernels/shared_gate.h"
+#include "kernels/sampling_ops.h"
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
@@ -22,7 +22,7 @@
 #include "kernels/float_projection.h"
 #include "ops/nint_prefill_cache.h"
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-#include "native/mfq_native_matmul_rows.h"
+#include "native/matmul_rows.h"
 #endif
 #include <cstdlib>
 #include <chrono>

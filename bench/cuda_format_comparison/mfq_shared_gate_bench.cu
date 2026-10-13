@@ -2,7 +2,7 @@
 #include "ops/cuda_execution.h"
 #include "storage/weight_loader.h"
 #include "mfq/model_source.h"
-#include "kernels/mfq_cuda_shared_gate.h"
+#include "kernels/shared_gate.h"
 #include "kernels/shared_gate_fused.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

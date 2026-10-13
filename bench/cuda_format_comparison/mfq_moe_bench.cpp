@@ -1,7 +1,7 @@
 #include "../cuda_graph_query.h"
 #include "weights.h"
 #include "nint_row_metadata.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_ops.h"
 #include <set>
 
 constexpr int routes=10;

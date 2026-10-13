@@ -6,7 +6,7 @@
 #include "mfq/cpu_expert_pool.h"
 #include "ops/graph_registry.h"
 #include "kernels/moe_pipeline.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_ops.h"
 #include "ops/decode_window.h"
 #include "kernels/dma_copy_batch.h"
 #include "native/context.h"

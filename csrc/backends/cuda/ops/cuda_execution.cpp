@@ -2,7 +2,7 @@
 #include "execution_options.h"
 #include "cuda_execution.h"
 
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/quant_ops.h"
 
 #include <algorithm>
 #include <charconv>

@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "mfq_sparse_attn_mma_f16.cuh"
+#include "sparse_attn_mma_f16.cuh"
 
 namespace {
 

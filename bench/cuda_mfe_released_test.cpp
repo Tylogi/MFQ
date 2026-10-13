@@ -1,5 +1,5 @@
 #include "packed_bench_utils.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_ops.h"
 #include "ops/mfe_ffn_runtime.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_cache_types_internal.h"

@@ -1,6 +1,6 @@
-#include "kernels/mfq_cuda_quant_ops.h"
-#include "kernels/mfq_cuda_nint_route_hint.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/quant_ops.h"
+#include "kernels/nint_route_hint.h"
+#include "kernels/moe_ops.h"
 #include "nint_row_metadata.h"
 #include <algorithm>
 #include <array>

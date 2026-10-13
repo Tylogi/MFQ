@@ -4,7 +4,7 @@
 
 #include "generation_result.h"
 #include "include/cuda_engine.h"
-#include "kernels/mfq_cuda_sampling_ops.h"
+#include "kernels/sampling_ops.h"
 #include "ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/full_block.h"

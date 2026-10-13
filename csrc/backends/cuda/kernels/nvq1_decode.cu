@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "mfq_cuda_nvq1_decode.h"
+#include "kernels/nvq1_decode.h"
 #include "packed_nvq.cuh"
 #include <cstdlib>
 #include <type_traits>

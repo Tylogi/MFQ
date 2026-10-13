@@ -1,5 +1,5 @@
-#include "kernels/mfq_cuda_activation_ops.h"
-#include "kernels/mfq_cuda_quant_ops.h"
+#include "kernels/activation_ops.h"
+#include "kernels/quant_ops.h"
 #include "nint.h"
 #include "nint_prefill_cache.h"
 #include "cuda_execution.h"

@@ -4,7 +4,7 @@
 #include "ops/execution_options.h"
 #include "kernels/moe_pipeline.h"
 #include "ops/router_lookahead_audit.h"
-#include "kernels/mfq_cuda_moe_ops.h"
+#include "kernels/moe_ops.h"
 #include "kernels/moe_cache_transfer.h"
 #include "storage/moe_residency.h"
 #include "storage/moe_quant_range_source.h"

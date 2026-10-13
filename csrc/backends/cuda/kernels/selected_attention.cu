@@ -1,7 +1,7 @@
 // Shared dense and index-selected attention mechanics.
 #include "native/env.h"
 #include "selected_attention.h"
-#include "mfq_sparse_attn_mma_f16.cuh"
+#include "sparse_attn_mma_f16.cuh"
 
 #include <cmath>
 #include <cstdlib>

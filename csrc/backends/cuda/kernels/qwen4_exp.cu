@@ -1,6 +1,6 @@
 #include "native/env.h"
 #include "qwen4_exp.h"
-#include "mfq_cuda_norm_ops.h"
+#include "kernels/norm_ops.h"
 
 #include "selected_attention.h"
 
