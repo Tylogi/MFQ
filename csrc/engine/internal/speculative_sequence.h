@@ -97,7 +97,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         (!greedy && !compact_stochastic)
             ? 1
             : std::clamp<int>(sampling.mtp_max_draft_tokens, 1, policy::kMaximumDraftDepth));
-    policy::GenerationPolicy<policy::CycleDepthController> depth_controller(
+    policy::GenerationPolicy depth_controller(
         maximum_depth, mtp.cycle_timed_policy(), &mtp.policy_state);
 
     {

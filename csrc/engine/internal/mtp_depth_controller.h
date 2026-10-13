@@ -13,6 +13,11 @@
 
 namespace mfq::engine::mtp {
 
+// One adaptive-depth model: acceptance estimates per draft position, cycle-time
+// estimates per depth, and a probe/explore schedule that tests rival depths.
+// Two tunings share it. Park mode (default) seeds from the previous request and
+// gives up on speculation once it stops paying. Cycle mode measures the loop tax
+// instead and never parks.
 class DepthController {
 public:
     explicit DepthController(int maximum_depth = 3,
@@ -30,18 +35,32 @@ public:
             warmup_.push_back(depth);
         if (maximum_depth_ > 1)
             warmup_.insert(warmup_.end(), {0, 0, 0});
-        if (seed && !seed->measurement_order_.empty()) {
+        if (seed && !seed->measured_.empty()) {
             for (int position = 0; position < std::min(maximum_depth_, seed->maximum_depth_); ++position)
                 acceptance_[static_cast<std::size_t>(position)] = seed->acceptance_[static_cast<std::size_t>(position)];
             for (int depth = 0; depth <= std::min(maximum_depth_, seed->maximum_depth_); ++depth) {
                 const auto index = static_cast<std::size_t>(depth);
                 cycle_ms_[index] = seed->cycle_ms_[index];
-                if (cycle_ms_[index])
+                if (cycle_ms_[index]) {
                     cycle_age_ms_[index] = std::numeric_limits<double>::infinity();
+                    measured_.push_back(depth);
+                }
             }
-            for (int depth : seed->measurement_order_)
-                if (depth <= maximum_depth_) measurement_order_.push_back(depth);
         }
+    }
+
+    // Cycle-timed tuning: every position starts optimistic, warmup counts hits
+    // exactly before falling back to the exponential average, and the depth is
+    // never parked.
+    static DepthController cycle_timed(int maximum_depth) {
+        DepthController controller(std::clamp(maximum_depth, 1, 5));
+        controller.cycle_timed_ = true;
+        controller.exit_margin_ = 1.0;
+        controller.acceptance_.assign(static_cast<std::size_t>(controller.maximum_depth_), 0.6);
+        controller.warmup_accepts_.assign(static_cast<std::size_t>(controller.maximum_depth_), 0);
+        controller.warmup_trials_.assign(static_cast<std::size_t>(controller.maximum_depth_), 0);
+        controller.warmup_ = {controller.maximum_depth_, controller.maximum_depth_, 0, 0, 0};
+        return controller;
     }
 
     int depth() const noexcept { return current_depth_; }
@@ -64,9 +83,18 @@ public:
         accepted_drafts = std::clamp(accepted_drafts, 0, used_depth);
         for (int position = 0; position < used_depth; ++position) {
             const auto index = static_cast<std::size_t>(position);
-            if (!acceptance_[index]) acceptance_[index] = conditional_acceptance(position);
             const double hit = position < accepted_drafts ? 1.0 : 0.0;
-            acceptance_[index] = 0.92 * *acceptance_[index] + 0.08 * hit;
+            if (!cycle_timed_ && !acceptance_[index])
+                acceptance_[index] = conditional_acceptance(position);
+            if (cycle_timed_ && !warmup_.empty()) {
+                warmup_accepts_[index] += hit > 0.0 ? 1 : 0;
+                ++warmup_trials_[index];
+                acceptance_[index] = static_cast<double>(warmup_accepts_[index]) /
+                    static_cast<double>(warmup_trials_[index]);
+            } else {
+                acceptance_[index] = (1.0 - kAcceptanceAlpha) * acceptance_[index] +
+                    kAcceptanceAlpha * hit;
+            }
             if (position >= accepted_drafts) break;
         }
         cycle_ms = std::max(0.0, cycle_ms);
@@ -75,9 +103,9 @@ public:
         if (time_sample) cycle_age_ms_[static_cast<std::size_t>(used_depth)] = 0.0;
         milliseconds_since_probe_ += cycle_ms;
         milliseconds_since_explore_ += cycle_ms;
-        exit_streak_ = speculation_losing() ? exit_streak_ + 1 : 0;
+        if (!cycle_timed_) exit_streak_ = speculation_losing() ? exit_streak_ + 1 : 0;
         if (!warmup_.empty()) {
-            if (!time_sample) return;
+            if (!cycle_timed_ && !time_sample) return;
             warmup_.erase(warmup_.begin());
             if (!warmup_.empty()) {
                 current_depth_ = warmup_.front();
@@ -97,22 +125,28 @@ public:
         }
         current_depth_ = best_depth();
         if (maximum_depth_ <= 1) return;
-        const double period = std::max(1000.0, 4.0 * cycle_ms / 0.15);
+        const double period = std::max(kProbePeriodMs,
+            static_cast<double>(kProbeLength) * cycle_ms / kProbeDuty);
         if (milliseconds_since_probe_ < period) return;
-        const bool explore_due = milliseconds_since_explore_ >= std::max(5000.0, 2.0 * period);
+        const bool explore_due = milliseconds_since_explore_ >=
+            std::max(kExplorePeriodMs, 2.0 * period);
         const auto target = explore_due ? most_stale() : best_rival();
         if (!target) return;
         current_depth_ = *target;
-        probe_left_ = 4;
+        probe_left_ = kProbeLength;
         milliseconds_since_probe_ = 0.0;
         if (explore_due) milliseconds_since_explore_ = 0.0;
     }
 
+    // Park mode inherits from the deepest position already measured, so a fresh
+    // request starts where the last one left off. Cycle mode keeps its own
+    // optimistic estimate for every position.
     double conditional_acceptance(int position) const {
         if (position < 0 || position >= maximum_depth_)
             throw std::out_of_range("MTP acceptance position is out of range");
-        while (!acceptance_[static_cast<std::size_t>(position)]) --position;
-        return *acceptance_[static_cast<std::size_t>(position)];
+        if (!cycle_timed_)
+            while (!acceptance_[static_cast<std::size_t>(position)]) --position;
+        return acceptance_[static_cast<std::size_t>(position)];
     }
 
     std::optional<double> measured_cycle_ms(int depth) const {
@@ -122,11 +156,23 @@ public:
     }
 
 private:
+    static constexpr double kAcceptanceAlpha = 0.08;
+    static constexpr double kTimeTauMs = 400.0;
+    static constexpr double kProbePeriodMs = 1000.0;
+    static constexpr double kExplorePeriodMs = 5000.0;
+    static constexpr int kProbeLength = 4;
+    static constexpr double kProbeDuty = 0.15;
+    static constexpr double kProbeMargin = 1.15;
+    static constexpr double kSpikeRatio = 2.0;
+    static constexpr double kSpikeDamp = 0.25;
+    static constexpr double kHysteresis = 1.03;
+
     void update_time(int depth, double cycle_ms) {
         const auto index = static_cast<std::size_t>(depth);
         auto& estimate = cycle_ms_[index];
+        // A seeded estimate is stale by construction; replace it outright.
         if (!estimate || cycle_age_ms_[index] == std::numeric_limits<double>::infinity()) {
-            if (!estimate) measurement_order_.push_back(depth);
+            if (!estimate) measured_.push_back(depth);
             estimate = cycle_ms;
             return;
         }
@@ -134,8 +180,8 @@ private:
             *estimate = std::min(*estimate, cycle_ms);
             return;
         }
-        double alpha = 1.0 - std::exp(-cycle_ms / 400.0);
-        if (cycle_ms > 2.0 * *estimate) alpha *= 0.25;
+        double alpha = 1.0 - std::exp(-cycle_ms / kTimeTauMs);
+        if (cycle_ms > kSpikeRatio * *estimate) alpha *= kSpikeDamp;
         *estimate = (1.0 - alpha) * *estimate + alpha * cycle_ms;
     }
 
@@ -157,17 +203,20 @@ private:
     double time_estimate(int depth) const {
         if (cycle_ms_[static_cast<std::size_t>(depth)]) return *cycle_ms_[static_cast<std::size_t>(depth)];
         int reference = -1;
-        double minimum = std::numeric_limits<double>::infinity();
-        for (int candidate : measurement_order_) {
-            const auto& measured = cycle_ms_[static_cast<std::size_t>(candidate)];
-            if (!measured) continue;
-            minimum = std::min(minimum, *measured);
-            if (reference < 0 || std::abs(candidate-depth) < std::abs(reference-depth)) reference = candidate;
+        for (int candidate = 0; candidate <= maximum_depth_; ++candidate) {
+            if (!cycle_ms_[static_cast<std::size_t>(candidate)]) continue;
+            if (reference < 0 || std::abs(candidate - depth) < std::abs(reference - depth))
+                reference = candidate;
         }
         if (reference < 0) return 30.0 + marginal_ms_ * depth;
-        if (depth == 0) return minimum;
+        if (depth == 0) {
+            double minimum = std::numeric_limits<double>::infinity();
+            for (const auto& measured : cycle_ms_)
+                if (measured) minimum = std::min(minimum, *measured);
+            return minimum;
+        }
         return std::max(1.0e-3, *cycle_ms_[static_cast<std::size_t>(reference)] +
-            marginal_estimate() * (depth-reference));
+            marginal_estimate() * (depth - reference));
     }
 
     double score(int depth) const {
@@ -186,7 +235,8 @@ private:
             const double candidate = score(depth);
             if (candidate > best_score) { best = depth; best_score = candidate; }
         }
-        if (best != current_depth_ && best_score < score(current_depth_) * 1.03) return current_depth_;
+        if (best != current_depth_ && best_score < score(current_depth_) * kHysteresis)
+            return current_depth_;
         return best;
     }
 
@@ -202,7 +252,7 @@ private:
         };
         for (int depth = 1; depth <= maximum_depth_; ++depth) consider(depth);
         consider(0);
-        return rival && rival_score >= current_score / 1.15 ? rival : std::nullopt;
+        return rival && rival_score >= current_score / kProbeMargin ? rival : std::nullopt;
     }
 
     std::optional<int> most_stale() const {
@@ -227,11 +277,14 @@ private:
     double exit_margin_;
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
-    std::vector<std::optional<double>> acceptance_;
+    bool cycle_timed_ = false;
+    std::vector<double> acceptance_;
+    std::vector<int> warmup_accepts_;
+    std::vector<int> warmup_trials_;
     std::vector<std::optional<double>> cycle_ms_;
     std::vector<std::optional<double>> cycle_age_ms_;
     std::vector<int> warmup_;
-    std::vector<int> measurement_order_;
+    std::vector<int> measured_;
 };
 
 class PolicyState {
@@ -296,43 +349,41 @@ struct ParkState {
     void probe_succeeded() noexcept { reentry = false; cooldown_tokens = 128; }
 };
 
-template<class CycleController>
 class GenerationPolicy {
 public:
     GenerationPolicy(int maximum_depth, bool cycle_timed, PolicyState* state = nullptr)
-        : state_(state ? *state : local_state_) {
-        if (cycle_timed) cycle_.emplace(maximum_depth);
-        else controller_.emplace(state_.begin(maximum_depth));
-    }
-    ~GenerationPolicy() { if (controller_) state_.remember(*controller_); }
+        : state_(state ? *state : local_state_),
+          cycle_timed_(cycle_timed),
+          controller_(cycle_timed ? DepthController::cycle_timed(maximum_depth)
+                                  : state_.begin(maximum_depth)) {}
+    ~GenerationPolicy() { if (!cycle_timed_) state_.remember(controller_); }
     int depth() const noexcept {
-        return cycle_ ? cycle_->depth() : park_.parked ? 0 : controller_->depth();
+        return cycle_timed_ || !park_.parked ? controller_.depth() : 0;
     }
-    int maximum_depth() const noexcept {
-        return cycle_ ? cycle_->maximum_depth() : controller_->maximum_depth();
-    }
-    bool parked() const noexcept { return !cycle_ && park_.parked; }
-    bool cycle_timed() const noexcept { return cycle_.has_value(); }
+    int maximum_depth() const noexcept { return controller_.maximum_depth(); }
+    bool parked() const noexcept { return !cycle_timed_ && park_.parked; }
+    bool cycle_timed() const noexcept { return cycle_timed_; }
     std::optional<double> measured_cycle_ms(int depth) const {
-        return cycle_ ? cycle_->measured_cycle_ms(depth) : controller_->measured_cycle_ms(depth);
+        return controller_.measured_cycle_ms(depth);
     }
     void observe(int used, int accepted, double elapsed_ms, bool time_sample = true) {
-        if (cycle_) { cycle_->observe(used, accepted, elapsed_ms, time_sample); return; }
-        const bool was_warmup = controller_->warming_up();
-        controller_->observe(used, accepted, elapsed_ms, time_sample);
-        if (park_.reentry && !was_warmup && !controller_->warming_up() &&
-            !controller_->speculation_losing()) park_.probe_succeeded();
-        if (controller_->should_exit()) {
-            state_.remember(*controller_);
-            park_.park(*controller_);
+        const bool was_warmup = controller_.warming_up();
+        controller_.observe(used, accepted, elapsed_ms, time_sample);
+        if (cycle_timed_) return;
+        if (park_.reentry && !was_warmup && !controller_.warming_up() &&
+            !controller_.speculation_losing()) park_.probe_succeeded();
+        if (controller_.should_exit()) {
+            state_.remember(controller_);
+            park_.park(controller_);
             ++parks_;
         }
     }
     void observe_plain(double elapsed_ms, bool time_sample = true) {
+        if (cycle_timed_) return;
         park_.observe_plain(elapsed_ms, state_, time_sample);
         if (park_.probe_ready()) {
             park_.begin_probe();
-            controller_.emplace(state_.begin(controller_->maximum_depth()));
+            controller_ = state_.begin(controller_.maximum_depth());
             ++reentries_;
         }
     }
@@ -341,8 +392,8 @@ public:
 private:
     PolicyState local_state_;
     PolicyState& state_;
-    std::optional<DepthController> controller_;
-    std::optional<CycleController> cycle_;
+    bool cycle_timed_;
+    DepthController controller_;
     ParkState park_;
     std::uint64_t parks_ = 0;
     std::uint64_t reentries_ = 0;
