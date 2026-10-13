@@ -917,7 +917,122 @@ __global__ void __launch_bounds__(128) nint_matmul_dense_kernel(
     }
 }
 
-#include "nint_whole_group.cuh"
+// Each lane owns an original NINT GS24/28 group. Read its packed words once,
+// normalize the bit alignment in registers, then extract each original int4.
+// This is temporary register state, not an expanded weight representation.
+template<int GS,int Bits>
+struct NintWholeGroup {
+    static constexpr int Words=(GS*Bits+31)/32;
+    uint32_t normalized[Words+1];
+    __device__ __forceinline__ NintWholeGroup(const uint8_t* stream,uint64_t bit,uint64_t bytes) {
+        const uint64_t start=(bit>>3)&~uint64_t(3);
+        const int shift=int(bit&31u);
+        uint32_t packed[Words+1];
+#pragma unroll
+        for(int i=0;i<=Words;++i) {
+            const uint64_t at=start+4*i;
+            if(at+4<=bytes)packed[i]=__ldg(reinterpret_cast<const uint32_t*>(stream+at));
+            else {
+                uint32_t word=0;
+#pragma unroll
+                for(int b=0;b<4;++b)if(at+b<bytes)word|=uint32_t(stream[at+b])<<(8*b);
+                packed[i]=word;
+            }
+        }
+#pragma unroll
+        for(int i=0;i<Words;++i)normalized[i]=__funnelshift_r(packed[i],packed[i+1],shift);
+        normalized[Words]=0;
+    }
+    template<int Chunk> __device__ __forceinline__ int codes() const {
+        constexpr int bit=Chunk*4*Bits,index=bit/32,shift=bit%32;
+        const uint32_t packed=__funnelshift_r(normalized[index],normalized[index+1],shift);
+        const uint32_t pairs=__byte_perm(packed,packed>>(2*Bits),0x5410);
+        return int(__byte_perm(pairs,pairs>>Bits,0x6240)&(((1u<<Bits)-1u)*0x01010101u));
+    }
+};
+
+struct NintWholeArgs {
+    const uint8_t *weights,*bits,*scale,*minimum;
+    const int64_t* offsets;
+    const float *outer_scale,*outer_minimum;
+    const int8_t* activation;
+    const float* activation_scale;
+    __half* output;
+    uint64_t bytes;
+    int rows,groups;
+    int activation_rows=1;
+};
+
+// Four warps own the same row as the original dense NINT kernel. Only the
+// integer decoder changes: all accumulation and both XOR trees are retained.
+template<int GS,int Bits,int Rows>
+__device__ __forceinline__ void nint_whole_row(NintWholeArgs a) {
+    const int row=blockIdx.x,lane=threadIdx.x,warp=threadIdx.y;
+    const uint64_t row_bit=uint64_t(a.offsets[row]);
+    const float outer_scale=a.outer_scale[row],outer_minimum=a.outer_minimum[row];
+    float acc[Rows]={};
+    for(int group=warp*32+lane;group<a.groups;group+=128) {
+        const NintWholeGroup<GS,Bits> packed(a.weights,row_bit+uint64_t(group*GS)*Bits,a.bytes);
+        int dots[Rows]={},sums[Rows]={};
+        const auto consume=[&](auto chunk_constant) {
+            constexpr int chunk=decltype(chunk_constant)::value;
+            const int column=group*GS+chunk*4;
+            const int qw=packed.template codes<chunk>();
+            #pragma unroll
+            for(int m=0;m<Rows;++m)if(m<a.activation_rows) {
+                const int qx=*reinterpret_cast<const int*>(a.activation+size_t(m)*a.groups*GS+column);
+                sums[m]=__dp4a(0x01010101,qx,sums[m]);
+                dots[m]=__dp4a(Bits==8?qw^int(0x80808080u):qw,qx,dots[m]);
+            }
+        };
+        consume(std::integral_constant<int,0>{});consume(std::integral_constant<int,1>{});
+        consume(std::integral_constant<int,2>{});consume(std::integral_constant<int,3>{});
+        consume(std::integral_constant<int,4>{});consume(std::integral_constant<int,5>{});
+        if constexpr(GS==28)consume(std::integral_constant<int,6>{});
+        const float scale=outer_scale*float(a.scale[size_t(row)*a.groups+group]);
+        const float minimum=outer_minimum*float(a.minimum[size_t(row)*a.groups+group]);
+        #pragma unroll
+        for(int m=0;m<Rows;++m)if(m<a.activation_rows) {
+            const int dot=dots[m]+(Bits==8?128*sums[m]:0);
+            acc[m]+=a.activation_scale[size_t(m)*a.groups+group]*(scale*float(dot)-minimum*float(sums[m]));
+        }
+    }
+#pragma unroll
+    for(int m=0;m<Rows;++m) {
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1)acc[m]+=__shfl_xor_sync(0xffffffffu,acc[m],offset);
+    }
+    __shared__ float partial[Rows][4];
+    #pragma unroll
+    for(int m=0;m<Rows;++m)if(lane==0)partial[m][warp]=acc[m];
+    __syncthreads();
+    if(warp==0) {
+        #pragma unroll
+        for(int m=0;m<Rows;++m) {
+            float value=lane<4?partial[m][lane]:0.f;
+            #pragma unroll
+            for(int offset=16;offset>0;offset>>=1)value+=__shfl_xor_sync(0xffffffffu,value,offset);
+            if(lane==0 && m<a.activation_rows)a.output[size_t(m)*a.rows+row]=__float2half_rn(value);
+        }
+    }
+}
+
+template<int GS,int Rows=1>
+__global__ void __launch_bounds__(128) nint_whole_group_kernel(NintWholeArgs a) {
+    if(int(blockIdx.x)>=a.rows)return;
+    // Read current device metadata, including for graph replay. All four
+    // warps see the same row bit width and enter the same specialization.
+    switch(a.bits[blockIdx.x]) {
+    case 1:nint_whole_row<GS,1,Rows>(a);break;
+    case 2:nint_whole_row<GS,2,Rows>(a);break;
+    case 3:nint_whole_row<GS,3,Rows>(a);break;
+    case 4:nint_whole_row<GS,4,Rows>(a);break;
+    case 5:nint_whole_row<GS,5,Rows>(a);break;
+    case 6:nint_whole_row<GS,6,Rows>(a);break;
+    case 7:nint_whole_row<GS,7,Rows>(a);break;
+    case 8:nint_whole_row<GS,8,Rows>(a);break;
+    }
+}
 
 // Decode four adjacent values once and store one aligned eight-byte vector.
 template<int GroupSize>
@@ -1485,7 +1600,43 @@ __global__ void __launch_bounds__(1024) nint_matmul_activation_cache_kernel(
 
 // The caller has proven q8
 // row widths, aligned offsets, four-element groups and aligned storage.
-#include "nint_q8_ordered.cuh"
+// GS48, one activation row. Four producer warps decode different groups,
+// then warp 0 preserves the original chunk-lane accumulation and XOR order.
+__global__ void __launch_bounds__(128) nint_q8_ordered_kernel(
+        const uint8_t* __restrict__ bitstream,const int64_t* __restrict__ offsets,
+        const uint8_t* __restrict__ subgroup_scale,const uint8_t* __restrict__ subgroup_minimum,
+        const float* __restrict__ neuron_scale,const float* __restrict__ neuron_minimum,
+        const int8_t* __restrict__ activation,const float* __restrict__ activation_scale,
+        __half* __restrict__ output,int rows,int groups) {
+    const int row=blockIdx.x,lane=threadIdx.x,warp=threadIdx.y;
+    if(row>=rows)return;
+    const int relative_group=lane/12,chunk=lane%12;
+    const auto* weights=bitstream+(uint64_t(offsets[row])>>3);
+    const auto* scales=subgroup_scale+size_t(row)*groups;
+    const auto* minima=subgroup_minimum+size_t(row)*groups;
+    const float outer_scale=neuron_scale[row],outer_minimum=neuron_minimum[row];
+    __shared__ float terms[64][12];
+    if(relative_group<2)for(int group=warp*2+relative_group;group<groups;group+=8) {
+        const int column=group*48+chunk*4;
+        const int w=*reinterpret_cast<const int*>(weights+column);
+        const int x=*reinterpret_cast<const int*>(activation+column);
+        const int sum=__dp4a(0x01010101,x,0);
+        const int dot=__dp4a(w^int(0x80808080u),x,0)+128*sum;
+        // Store before multiplying by activation_scale. The production loop
+        // contracts that multiplication with the accumulator addition.
+        terms[group][chunk]=outer_scale*float(scales[group])*float(dot)
+            -outer_minimum*float(minima[group])*float(sum);
+    }
+    __syncthreads();
+    if(warp!=0)return;
+    float accumulator=0.0f;
+    if(relative_group<2)for(int group=relative_group;group<groups;group+=2)
+        accumulator+=activation_scale[group]*terms[group][chunk];
+#pragma unroll
+    for(int offset=16;offset>0;offset>>=1)
+        accumulator+=__shfl_xor_sync(0xffffffffu,accumulator,offset);
+    if(lane==0)output[row]=__float2half_rn(accumulator);
+}
 
 template<int maximum_activation_rows>
 __global__ void __launch_bounds__(128) nint_matmul_aligned_q8_kernel(

@@ -1,4 +1,8 @@
 #include "float_projection.h"
+
+#include <mma.h>
+#include "native/env.h"
+#include "async_copy.cuh"
 #include "native/nint_weight.h"
 #include "qwen4_exp.h"
 
@@ -10,12 +14,865 @@
 #include <cstdlib>
 #include <array>
 #include <cstdio>
-#include "gr_prefill_tf32.cuh"
-#include "gr_prefill_half2.cuh"
-#include "gr_prefill_decode.cuh"
-#include "gr_prefill_pipeline.cuh"
-#include "gr_prefill_matmul.cuh"
-#include "gr_prefill_mix.cuh"
+// Compressed GR tiles with three TF32 products: Ah*Bh + Al*Bh + Ah*Bl.
+// The residual products retain near-FP32 precision without dense weights.
+namespace {
+template<class Input,bool AlignedQ8,bool Zero>
+__global__ void gr_prefill_tf32_kernel(const Input* input,
+        const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
+        const uint8_t* scales,const uint8_t* minima,const float* row_scales,
+        const float* row_minima,const __half* zero_scales,float* output,
+        int rows,int width,int outputs,int groups,int gs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__>=800
+    using namespace nvcuda;
+    constexpr int BM=32,BN=32,BK=32,Pad=40;
+    __shared__ __align__(32) float ah[BM][Pad],al[BM][Pad],bh[BN][Pad],bl[BN][Pad],result[BM][BN];
+    const int tid=threadIdx.x,warp=tid/32,wm=(warp/2)*16,wn=(warp%2)*16;
+    const int row0=int(blockIdx.y)*BM,out0=int(blockIdx.x)*BN;
+    wmma::fragment<wmma::accumulator,16,16,8,float> total;
+    wmma::fill_fragment(total,0.0f);
+    for(int k0=0;k0<width;k0+=BK) {
+        wmma::fragment<wmma::accumulator,16,16,8,float> high,low;
+        wmma::fill_fragment(high,0.0f);wmma::fill_fragment(low,0.0f);
+        for(int i=tid;i<BM*BK;i+=128) {
+            const int r=i/BK,c=i%BK;
+            const float value=row0+r<rows && k0+c<width ? float(input[int64_t(row0+r)*width+k0+c]) : 0;
+            const float top=wmma::__float_to_tf32(value);
+            ah[r][c]=top;al[r][c]=wmma::__float_to_tf32(__fsub_rn(value,top));
+        }
+        for(int i=tid;i<BN*BK;i+=128) {
+            const int r=i/BK,c=i%BK,neuron=out0+r,column=k0+c;
+            float value=0;
+            if(neuron<outputs && column<width) {
+                const int64_t meta=int64_t(neuron)*groups+column/gs;
+                float q,scale,minimum;
+                if constexpr(Zero) {
+                    q=float(static_cast<int8_t>(packed[meta*gs+column%gs]));
+                    scale=__half2float(zero_scales[meta]);minimum=0;
+                } else {
+                    const int bits=AlignedQ8?8:row_bits[neuron];
+                    const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+                    unsigned word=packed[bit>>3];const int shift=int(bit&7);
+                    if(shift+bits>8)word|=unsigned(packed[(bit>>3)+1])<<8;
+                    q=float((word>>shift)&((1u<<bits)-1));
+                    scale=row_scales[neuron]*float(scales[meta]);
+                    minimum=row_minima[neuron]*float(minima[meta]);
+                }
+                value=__fsub_rn(__fmul_rn(scale,q),minimum);
+            }
+            const float top=wmma::__float_to_tf32(value);
+            bh[r][c]=top;bl[r][c]=wmma::__float_to_tf32(__fsub_rn(value,top));
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int k=0;k<BK;k+=8) {
+            wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> a_hi,a_lo;
+            wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> b_hi,b_lo;
+            wmma::load_matrix_sync(a_hi,&ah[wm][k],Pad);
+            wmma::load_matrix_sync(b_hi,&bh[wn][k],Pad);
+            wmma::load_matrix_sync(b_lo,&bl[wn][k],Pad);
+            wmma::mma_sync(low,a_hi,b_lo,low);
+            if constexpr(!std::is_same_v<Input,__half>) {
+                wmma::load_matrix_sync(a_lo,&al[wm][k],Pad);
+                wmma::mma_sync(low,a_lo,b_hi,low);
+            }
+            wmma::mma_sync(high,a_hi,b_hi,high);
+        }
+        #pragma unroll
+        for(int i=0;i<total.num_elements;++i)total.x[i]+=high.x[i]+low.x[i];
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&result[wm][wn],total,BN,wmma::mem_row_major);
+    __syncthreads();
+    for(int i=tid;i<BM*BN;i+=128) {
+        const int m=i/BN,n=i%BN;
+        if(row0+m<rows && out0+n<outputs)output[int64_t(row0+m)*outputs+out0+n]=result[m][n];
+    }
+#endif
+}
+} // namespace
+// Transient half high/residual tiles. Residuals are scaled by 4096 before
+// half conversion; two/three Tensor Core products retain FP32 accuracy.
+namespace {
+template<class Input,bool AlignedQ8,bool Zero>
+__global__ void gr_prefill_half2_kernel(const Input* input,
+        const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
+        const uint8_t* scales,const uint8_t* minima,const float* row_scales,
+        const float* row_minima,const __half* zero_scales,float* output,
+        int rows,int width,int outputs,int groups,int gs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__>=700
+    using namespace nvcuda;
+    constexpr int BM=64,BN=32,BK=32,Pad=40;
+    __shared__ __align__(32) __half ah[BM][Pad],al[BM][Pad],bh[BN][Pad],bl[BN][Pad];
+    __shared__ __align__(32) float result[BM][BN];
+    const int tid=threadIdx.x,warp=tid/32,wm=(warp/2)*16,wn=(warp%2)*16;
+    const int row0=int(blockIdx.y)*BM,out0=int(blockIdx.x)*BN;
+    wmma::fragment<wmma::accumulator,16,16,16,float> total;
+    wmma::fill_fragment(total,0.0f);
+    for(int k0=0;k0<width;k0+=BK) {
+        for(int i=tid;i<BM*BK;i+=256) {
+            const int r=i/BK,c=i%BK;
+            const float value=row0+r<rows && k0+c<width?
+                float(input[int64_t(row0+r)*width+k0+c]):0;
+            const auto top=__float2half_rn(value);
+            ah[r][c]=top;
+            if constexpr(!std::is_same_v<Input,__half>)
+                al[r][c]=__float2half_rn(__fsub_rn(value,__half2float(top))*4096.0f);
+        }
+        for(int i=tid;i<BN*BK;i+=256) {
+            const int r=i/BK,c=i%BK,neuron=out0+r,column=k0+c;
+            float value=0;
+            if(neuron<outputs && column<width) {
+                const int64_t meta=int64_t(neuron)*groups+column/gs;
+                float q,scale,minimum;
+                if constexpr(Zero) {
+                    q=float(static_cast<int8_t>(packed[meta*gs+column%gs]));
+                    scale=__half2float(zero_scales[meta]);minimum=0;
+                } else {
+                    const int bits=AlignedQ8?8:row_bits[neuron];
+                    const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+                    unsigned word=packed[bit>>3];const int shift=int(bit&7);
+                    if(shift+bits>8)word|=unsigned(packed[(bit>>3)+1])<<8;
+                    q=float((word>>shift)&((1u<<bits)-1));
+                    scale=row_scales[neuron]*float(scales[meta]);
+                    minimum=row_minima[neuron]*float(minima[meta]);
+                }
+                value=__fsub_rn(__fmul_rn(scale,q),minimum);
+            }
+            const auto top=__float2half_rn(value);
+            bh[r][c]=top;bl[r][c]=__float2half_rn(__fsub_rn(value,__half2float(top))*4096.0f);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::accumulator,16,16,16,float> high,low;
+        wmma::fill_fragment(high,0.0f);wmma::fill_fragment(low,0.0f);
+        #pragma unroll
+        for(int k=0;k<BK;k+=16) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> a_hi,a_lo;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> b_hi,b_lo;
+            wmma::load_matrix_sync(a_hi,&ah[wm][k],Pad);
+            wmma::load_matrix_sync(b_hi,&bh[wn][k],Pad);
+            wmma::load_matrix_sync(b_lo,&bl[wn][k],Pad);
+            wmma::mma_sync(high,a_hi,b_hi,high);
+            wmma::mma_sync(low,a_hi,b_lo,low);
+            if constexpr(!std::is_same_v<Input,__half>) {
+                wmma::load_matrix_sync(a_lo,&al[wm][k],Pad);
+                wmma::mma_sync(low,a_lo,b_hi,low);
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<total.num_elements;++i)
+            total.x[i]+=high.x[i]+low.x[i]*(1.0f/4096.0f);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&result[wm][wn],total,BN,wmma::mem_row_major);
+    __syncthreads();
+    for(int i=tid;i<BM*BN;i+=256) {
+        const int m=i/BN,n=i%BN;
+        if(row0+m<rows && out0+n<outputs)
+            output[int64_t(row0+m)*outputs+out0+n]=result[m][n];
+    }
+#endif
+}
+} // namespace
+namespace {
+// Four adjacent columns share subgroup and neuron metadata. Decode directly
+// into a transient shared tile while retaining the original affine rounding.
+template<bool AlignedQ8,bool Zero>
+__device__ __forceinline__ void gr_prefill_decode_four(
+        float (&values)[4],const uint8_t* packed,const uint8_t* row_bits,
+        const int64_t* row_offsets,const uint8_t* scales,const uint8_t* minima,
+        const float* row_scales,const float* row_minima,const __half* zero_scales,
+        int neuron,int column,int width,int groups,int gs) {
+    const int bits=AlignedQ8 || Zero?8:row_bits[neuron];
+    const int64_t first_meta=int64_t(neuron)*groups+column/gs;
+    const float outer_scale=Zero?0.f:row_scales[neuron];
+    const float outer_minimum=Zero?0.f:row_minima[neuron];
+    if((gs&3)==0 && column+4<=width) {
+        const float scale=Zero?__half2float(zero_scales[first_meta]):
+            __fmul_rn(outer_scale,float(scales[first_meta]));
+        const float minimum=Zero?0.f:__fmul_rn(outer_minimum,float(minima[first_meta]));
+        uint64_t codes=0;
+        if constexpr(Zero) {
+            codes=*reinterpret_cast<const uint32_t*>(packed+first_meta*gs+column%gs);
+        } else if constexpr(AlignedQ8) {
+            codes=*reinterpret_cast<const uint32_t*>(packed+(row_offsets[neuron]>>3)+column);
+        } else {
+            const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+            const int shift=int(bit&7),bytes=(shift+bits*4+7)/8;
+            #pragma unroll
+            for(int b=0;b<5;++b)if(b<bytes)codes|=uint64_t(packed[(bit>>3)+b])<<(8*b);
+            codes>>=shift;
+        }
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const unsigned code=unsigned(codes>>(bits*j))&((1u<<bits)-1);
+            const float q=Zero?float(static_cast<int8_t>(code)):float(code);
+            values[j]=__fsub_rn(__fmul_rn(scale,q),minimum);
+        }
+        return;
+    }
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        float value=0;
+        const int c=column+j;
+        if(c<width) {
+            const int64_t meta=int64_t(neuron)*groups+c/gs;
+            float q,scale,minimum;
+            if constexpr(Zero) {
+                q=float(static_cast<int8_t>(packed[meta*gs+c%gs]));
+                scale=__half2float(zero_scales[meta]);minimum=0;
+            } else {
+                const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(c)*bits;
+                const int shift=int(bit&7);
+                unsigned code=packed[bit>>3];
+                if(shift+bits>8)code|=unsigned(packed[(bit>>3)+1])<<8;
+                q=float((code>>shift)&((1u<<bits)-1));
+                scale=__fmul_rn(outer_scale,float(scales[meta]));
+                minimum=__fmul_rn(outer_minimum,float(minima[meta]));
+            }
+            value=__fsub_rn(__fmul_rn(scale,q),minimum);
+        }
+        values[j]=value;
+    }
+}
+}
+namespace {
+bool gr_prefill_pipeline_supported(const mfq_tensor_backend::Tensor& input) {
+    thread_local std::map<int,std::pair<int,int>> capabilities;
+    auto found=capabilities.find(input.get_device());
+    if(found==capabilities.end()) {
+        int major=0,shared=0;
+        MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,input.get_device()));
+        MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&shared,cudaDevAttrMaxSharedMemoryPerBlockOptin,input.get_device()));
+        found=capabilities.emplace(input.get_device(),std::pair<int,int>{major,shared}).first;
+    }
+    const int bytes=input.scalar_type()==mfq_tensor_backend::kFloat16?50176:82944;
+    return found->second.first>=8 && found->second.second>=bytes;
+}
+template<class Input,int BM,int BN,int BK,bool Packed=false> union GrPrefillPipelineShared {
+    struct {Input a[2][BM][BK+(std::is_same_v<Input,float>?4:8)];float w[2][BN][BK+(Packed?4:1)];} tile;
+    float products[BM][BN];
+};
+template<class Input,class Value,bool AlignedQ8,bool Zero,bool Mix,int RN,int RM,int BK=32,int BM=256,int TileN=32,bool Packed=false>
+__global__ __launch_bounds__(BM*TileN/(RN*RM),1) void gr_prefill_pipeline_kernel(
+        const Input* input,const uint8_t* packed,const uint8_t* row_bits,
+        const int64_t* row_offsets,const uint8_t* scales,const uint8_t* minima,
+        const float* row_scales,const float* row_minima,const __half* zero_scales,
+        const Value* normalized,std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,int rows,int width,int outputs,int groups,int gs) {
+    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    constexpr int BN=TileN,Threads=BM*BN/(RN*RM),Columns=BN/RN,HiddenN=BN/4;
+    extern __shared__ __align__(16) unsigned char bytes[];
+    auto& shared=*reinterpret_cast<GrPrefillPipelineShared<Input,BM,BN,BK,Packed>*>(bytes);
+    const auto weight_row=[](int r) {return Packed?r^(r>>3):r;};
+    const int tid=threadIdx.x,m=tid/Columns,n=(tid%Columns)*RN;
+    const int row0=blockIdx.y*BM,col0=blockIdx.x*(Mix?HiddenN:BN),hidden=outputs/4;
+    float acc[RM][RN][4]{};
+    const auto load=[&](int buffer,int k0) {
+        constexpr int Vector=16/sizeof(Input);
+        for(int i=tid;i<BM*(BK/Vector);i+=Threads) {
+            const int r=i/(BK/Vector),c=(i%(BK/Vector))*Vector;
+            auto* destination=&shared.tile.a[buffer][r][c];
+            if(row0+r<rows && k0+c+Vector-1<width && width%Vector==0) {
+                mfq::cuda_detail::copy_16_async(reinterpret_cast<__half*>(destination),
+                    reinterpret_cast<const __half*>(input+int64_t(row0+r)*width+k0+c));
+            } else {
+                #pragma unroll
+                for(int j=0;j<Vector;++j)destination[j]=row0+r<rows && k0+c+j<width?
+                    input[int64_t(row0+r)*width+k0+c+j]:Input(0.f);
+            }
+        }
+        mfq::cuda_detail::copy_async_commit();
+        for(int i=tid;i<BN*(BK/4);i+=Threads) {
+            const int r=i/(BK/4),c=(i%(BK/4))*4;
+            const int hcol=col0+r%HiddenN;
+            const int neuron=Mix?(r/HiddenN)*hidden+hcol:col0+r;
+            float values[4]{};
+            if((Mix?hcol<hidden:neuron<outputs) && k0+c<width)
+                gr_prefill_decode_four<AlignedQ8,Zero>(values,packed,row_bits,row_offsets,
+                    scales,minima,row_scales,row_minima,zero_scales,neuron,k0+c,width,groups,gs);
+            #pragma unroll
+            for(int j=0;j<4;++j)shared.tile.w[buffer][weight_row(r)][c+j]=values[j];
+        }
+    };
+    load(0,0);mfq::cuda_detail::copy_async_wait();__syncthreads();
+    for(int k0=0;k0<width;k0+=BK) {
+        const int buffer=(k0/BK)&1;
+        if(k0+BK<width)load(buffer^1,k0+BK);
+        const auto accumulate=[&](int k,auto slot) {
+            #pragma unroll
+            for(int r=0;r<RM;++r) {
+                const float x=float(shared.tile.a[buffer][m+r*(BM/RM)][k]);
+                #pragma unroll
+                for(int j=0;j<RN;++j)
+                    acc[r][j][decltype(slot)::value]=fmaf(x,shared.tile.w[buffer][n+j][k],acc[r][j][decltype(slot)::value]);
+            }
+        };
+        #pragma unroll
+        for(int k=0;k<BK;k+=4) {
+            if constexpr(Packed) {
+                // One aligned shared load supplies all four canonical chains.
+                // Permute weight rows so the vector loads use separate banks.
+                #pragma unroll
+                for(int j=0;j<RN;++j) {
+                    const float4 w=*reinterpret_cast<const float4*>(
+                        &shared.tile.w[buffer][weight_row(n+j)][k]);
+                    #pragma unroll
+                    for(int r=0;r<RM;++r) {
+                        const float x0=float(shared.tile.a[buffer][m+r*(BM/RM)][k]);
+                        const float x1=float(shared.tile.a[buffer][m+r*(BM/RM)][k+1]);
+                        const float x2=float(shared.tile.a[buffer][m+r*(BM/RM)][k+2]);
+                        const float x3=float(shared.tile.a[buffer][m+r*(BM/RM)][k+3]);
+                        acc[r][j][0]=fmaf(x0,w.x,acc[r][j][0]);
+                        acc[r][j][1]=fmaf(x1,w.y,acc[r][j][1]);
+                        acc[r][j][2]=fmaf(x2,w.z,acc[r][j][2]);
+                        acc[r][j][3]=fmaf(x3,w.w,acc[r][j][3]);
+                    }
+                }
+            } else {
+                accumulate(k,std::integral_constant<int,0>{});
+                accumulate(k+1,std::integral_constant<int,1>{});
+                accumulate(k+2,std::integral_constant<int,2>{});
+                accumulate(k+3,std::integral_constant<int,3>{});
+            }
+        }
+        mfq::cuda_detail::copy_async_wait();__syncthreads();
+    }
+    #pragma unroll
+    for(int r=0;r<RM;++r) {
+        const int row=row0+m+r*(BM/RM);
+        #pragma unroll
+        for(int j=0;j<RN;++j) {
+            const float projection=(acc[r][j][0]+acc[r][j][1])+(acc[r][j][2]+acc[r][j][3]);
+            if constexpr(Mix) {
+                const int hcol=col0+(n+j)%HiddenN,neuron=((n+j)/HiddenN)*hidden+hcol;
+                float product=0;
+                if(row<rows && hcol<hidden) {
+                    const Input projected=static_cast<Input>(projection);
+                    const Input gate=static_cast<Input>(1.0f/(1.0f+expf(-float(projected))));
+                    product=float(static_cast<Output>(__fmul_rn(float(gate),float(normalized[int64_t(row)*hidden*4+neuron]))));
+                }
+                shared.products[m+r*(BM/RM)][n+j]=product;
+            } else if(row<rows && col0+n+j<outputs)
+                output[int64_t(row)*outputs+col0+n+j]=projection;
+        }
+    }
+    if constexpr(Mix) {
+        __syncthreads();
+        for(int i=tid;i<BM*HiddenN;i+=Threads) {
+            const int r=i/HiddenN,c=i%HiddenN;
+            if(row0+r<rows && col0+c<hidden) {
+                float sum=0;
+                #pragma unroll
+                for(int stream=0;stream<4;++stream)sum=__fadd_rn(sum,shared.products[r][stream*HiddenN+c]);
+                output[int64_t(row0+r)*hidden+col0+c]=static_cast<Output>(__fdiv_rn(sum,4.0f));
+            }
+        }
+    }
+}
+template<bool Mix,class Input,class Value,bool Aligned,bool Zero>
+void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& normalized,mfq_tensor_backend::Tensor& output) {
+    namespace tb=mfq_tensor_backend;
+    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    const auto rows=input.numel()/weight.neuron_len;
+    const auto launch=[&](auto rn_tag,auto rm_tag,auto bm_tag,auto bn_tag,auto bk_tag,auto packed_tag) {
+        constexpr int rn=decltype(rn_tag)::value,rm=decltype(rm_tag)::value;
+        constexpr int bm=decltype(bm_tag)::value,bn=decltype(bn_tag)::value,bk=decltype(bk_tag)::value;
+        constexpr bool packed=decltype(packed_tag)::value;
+        constexpr int shared_bytes=sizeof(GrPrefillPipelineShared<Input,bm,bn,bk,packed>);
+        const auto kernel=gr_prefill_pipeline_kernel<Input,Value,Aligned,Zero,Mix,rn,rm,bk,bm,bn,packed>;
+        thread_local int configured_device=-1;
+        if(configured_device!=input.get_device()) {
+            MFQ_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,shared_bytes));
+            configured_device=input.get_device();
+        }
+        const int64_t outputs=Mix?weight.out/4:weight.out;
+        constexpr int columns=Mix?bn/4:bn;
+        kernel<<<dim3(unsigned((outputs+columns-1)/columns),unsigned((rows+bm-1)/bm)),bm*bn/(rn*rm),shared_bytes,mfq_current_cuda_stream()>>>(
+            input.data_ptr<Input>(),weight.q_packed.data_ptr<uint8_t>(),
+            Zero?nullptr:weight.row_q_bits.data_ptr<uint8_t>(),Zero?nullptr:weight.row_q_bit_offsets.data_ptr<int64_t>(),
+            Zero?nullptr:weight.sub_scale.data_ptr<uint8_t>(),Zero?nullptr:weight.sub_min.data_ptr<uint8_t>(),
+            Zero?nullptr:weight.neuron_scale.data_ptr<float>(),Zero?nullptr:weight.neuron_min.data_ptr<float>(),
+            Zero?weight.q8_zero_scale.data_ptr<__half>():nullptr,Mix?normalized.data_ptr<Value>():nullptr,
+            output.data_ptr<Output>(),int(rows),int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
+    };
+    const auto* option=mfq::cuda::env_lookup(Mix?"MFQ_GR_PREFILL_FUSED_MIX":"MFQ_GR_PREFILL_MATMUL");
+    const int mode=option?std::atoi(option):(Mix?(std::is_same_v<Input,__half>?12:10):31);
+    if constexpr(!Mix) {
+        if((mode==29 || mode==31) && weight.out<=4) {
+            launch(std::integral_constant<int,1>{},std::integral_constant<int,2>{},
+                std::integral_constant<int,64>{},std::integral_constant<int,4>{},
+                std::integral_constant<int,32>{},std::false_type{});return;
+        }
+    }
+        const auto wide=[&](auto rn,auto rm) {
+            const auto invoke=[&](auto packed) {launch(rn,rm,
+            std::integral_constant<int,256>{},std::integral_constant<int,32>{},
+            std::integral_constant<int,32>{},packed);};
+            if(mode==(Mix?12:31))invoke(std::true_type{});else invoke(std::false_type{});
+        };
+        if constexpr(Mix)wide(std::integral_constant<int,4>{},std::integral_constant<int,4>{});
+        else if(weight.out>=weight.neuron_len)wide(std::integral_constant<int,4>{},std::integral_constant<int,4>{});
+        else wide(std::integral_constant<int,8>{},std::integral_constant<int,2>{});
+}
+}
+// FP32 batched GR projection from compressed NINT weights. The only decoded
+// weights are a small shared-memory tile reused by sixty-four token rows.
+namespace {
+bool gr_prefill_selected(const mfq_tensor_backend::Tensor& input) {
+    const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL");
+    return (!option || std::atoi(option)!=0) && input.dim()>0 && input.size(-1)>0 &&
+        input.numel()/input.size(-1)>=32;
+}
+
+template<class Input,bool AlignedQ8,bool Zero,int BM=64,int RegisterN=4,int BK=32,int RegisterM=2,bool CompactK=false,bool VectorDecode=false,bool TransposeWeight=false,int TileN=32>
+__global__ __launch_bounds__(BM*TileN/(RegisterN*RegisterM),1) void gr_prefill_matmul_kernel(const Input* input,
+        const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
+        const uint8_t* scales,const uint8_t* minima,const float* row_scales,
+        const float* row_minima,const __half* zero_scales,float* output,
+        int rows,int width,int outputs,int groups,int gs) {
+    constexpr int BN=TileN,Pad=BK+1,Threads=BM*BN/(RegisterN*RegisterM),Columns=BN/RegisterN;
+    static_assert(BK%4==0,"GR K tile must preserve the four FP32 accumulator streams");
+    __shared__ float a[BM][Pad];
+    union WeightTile {float row[BN][Pad];float col[BK][BN];};
+    __shared__ __align__(16) WeightTile w;
+    const int tid=threadIdx.x,m=tid/Columns,n=(tid%Columns)*RegisterN;
+    const int row0=int(blockIdx.y)*BM,out0=int(blockIdx.x)*BN;
+    float acc[RegisterM][RegisterN][4]{};
+    for(int k0=0;k0<width;k0+=BK) {
+        for(int i=tid;i<BM*BK;i+=Threads) {
+            const int r=i/BK,c=i%BK;
+            a[r][c]=row0+r<rows && k0+c<width ? float(input[(int64_t(row0+r)*width)+k0+c]) : 0;
+        }
+        if constexpr(VectorDecode) {
+            for(int i=tid;i<BN*(BK/4);i+=Threads) {
+                const int r=i/(BK/4),c=(i%(BK/4))*4,neuron=out0+r;
+                float values[4]{};
+                if(neuron<outputs && k0+c<width)gr_prefill_decode_four<AlignedQ8,Zero>(
+                    values,packed,row_bits,row_offsets,scales,minima,row_scales,row_minima,zero_scales,
+                    neuron,k0+c,width,groups,gs);
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    if constexpr(TransposeWeight)w.col[c+j][r]=values[j];
+                    else w.row[TileN>32?r^(r>>5):r][c+j]=values[j];
+                }
+            }
+        } else for(int i=tid;i<BN*BK;i+=Threads) {
+            const int r=i/BK,c=i%BK,neuron=out0+r,column=k0+c;
+            float value=0;
+            if(neuron<outputs && column<width) {
+                const int64_t meta=int64_t(neuron)*groups+column/gs;
+                float q,scale,minimum;
+                if constexpr(Zero) {
+                    q=float(static_cast<int8_t>(packed[meta*gs+column%gs]));
+                    scale=__half2float(zero_scales[meta]);minimum=0;
+                } else {
+                    const int bits=AlignedQ8?8:row_bits[neuron];
+                    const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+                    unsigned word=packed[bit>>3];const int shift=int(bit&7);
+                    if(shift+bits>8)word|=unsigned(packed[(bit>>3)+1])<<8;
+                    q=float((word>>shift)&((1u<<bits)-1));
+                    scale=row_scales[neuron]*float(scales[meta]);
+                    minimum=row_minima[neuron]*float(minima[meta]);
+                }
+                value=__fsub_rn(__fmul_rn(scale,q),minimum);
+            }
+            w.row[TileN>32?r^(r>>5):r][c]=value;
+        }
+        __syncthreads();
+        if constexpr(TransposeWeight) {
+            #pragma unroll
+            for(int k=0;k<BK;++k) {
+                float weight[RegisterN];
+                #pragma unroll
+                for(int j=0;j<RegisterN;j+=4) {
+                    const float4 value=*reinterpret_cast<const float4*>(&w.col[k][n+j]);
+                    weight[j]=value.x;weight[j+1]=value.y;weight[j+2]=value.z;weight[j+3]=value.w;
+                }
+                #pragma unroll
+                for(int r=0;r<RegisterM;++r) {
+                    const float x=a[m+r*(BM/RegisterM)][k];
+                    #pragma unroll
+                    for(int j=0;j<RegisterN;++j)acc[r][j][k&3]=fmaf(x,weight[j],acc[r][j][k&3]);
+                }
+            }
+        } else if constexpr(CompactK) {
+        // Explicit constant accumulator slots keep the arrays in registers;
+        // only four K positions are live rather than the entire shared tile.
+        #pragma unroll 1
+        for(int kb=0;kb<BK;kb+=4) {
+            #pragma unroll
+            for(int slot=0;slot<4;++slot) {
+                #pragma unroll
+                for(int r=0;r<RegisterM;++r) {
+                    const float x=a[m+r*(BM/RegisterM)][kb+slot];
+                    #pragma unroll
+                    for(int j=0;j<RegisterN;++j)
+                        acc[r][j][slot]=fmaf(x,w.row[TileN>32?(n+j)^((n+j)>>5):n+j][kb+slot],acc[r][j][slot]);
+                }
+            }
+        }
+        } else {
+        #pragma unroll
+        for(int k=0;k<BK;++k) {
+            #pragma unroll
+            for(int r=0;r<RegisterM;++r) {
+                const float x=a[m+r*(BM/RegisterM)][k];
+                #pragma unroll
+                for(int j=0;j<RegisterN;++j)acc[r][j][k&3]=fmaf(x,w.row[TileN>32?(n+j)^((n+j)>>5):n+j][k],acc[r][j][k&3]);
+            }
+        }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int r=0;r<RegisterM;++r)if(row0+m+r*(BM/RegisterM)<rows) {
+        #pragma unroll
+        for(int j=0;j<RegisterN;++j)if(out0+n+j<outputs)
+            output[int64_t(row0+m+r*(BM/RegisterM))*outputs+out0+n+j]=
+                (acc[r][j][0]+acc[r][j][1])+(acc[r][j][2]+acc[r][j][3]);
+    }
+}
+
+mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
+        const mfq_tensor_backend::Tensor& input) {
+    namespace tb=mfq_tensor_backend;
+    auto x=input.scalar_type()==tb::kFloat16 ? input.contiguous() : input.to(tb::kFloat32).contiguous();
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.size(-1)==weight.neuron_len && weight.q_packed.is_cuda() &&
+        input.device()==weight.q_packed.device() && weight.gs>0 && weight.neuron_len>0 &&
+        weight.neuron_len<=std::numeric_limits<int>::max() && weight.out>0 && weight.out<=std::numeric_limits<int>::max() &&
+        weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,
+        "GR prefill projection geometry mismatch");
+    const auto rows=x.numel()/weight.neuron_len;
+    const auto* trace_geometry=mfq::cuda::env_lookup("MFQ_GR_PREFILL_GEOMETRY_TRACE");
+    if(trace_geometry && trace_geometry[0]=='1') {
+        thread_local std::map<std::array<int64_t,5>,bool> seen;
+        const std::array<int64_t,5> shape={weight.out,weight.neuron_len,weight.gs,int64_t(x.scalar_type()==tb::kFloat16),int64_t(weight.q8_zero)};
+        if(seen.emplace(shape,true).second)std::fprintf(stderr,
+            "gr_prefill_geometry rows=%lld outputs=%lld width=%lld gs=%lld half=%d zero=%d\n",
+            (long long)rows,(long long)weight.out,(long long)weight.neuron_len,(long long)weight.gs,
+            int(x.scalar_type()==tb::kFloat16),int(weight.q8_zero));
+    }
+    MFQ_RUNTIME_CHECK(rows<=65535*16,"GR prefill projection exceeds CUDA grid geometry");
+    MfqCudaGuard guard(input.device());
+    const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL");
+    int major=0;
+    const bool requested_tf32=option && std::atoi(option)==2;
+    const bool requested_half2=option && std::atoi(option)==3;
+    int mode=option?std::atoi(option):31;
+    const bool wide_contraction=mode==24 && weight.out<weight.neuron_len && rows>=128;
+    const bool transpose_weight=mode==22 || mode==23;
+    const bool fewer_registers=mode==23;
+    const bool pipeline_mode=mode==27 || mode==29 || mode==31;
+    const bool vector_decode=mode==21 || mode==24 || pipeline_mode || transpose_weight;
+    if(vector_decode)mode=17;
+    const bool compact_k=mode==19 || mode==20;
+    if(compact_k)mode=mode==19?6:17;
+    if(mode==16 || mode==17 || mode==18) {
+        const bool expansion=weight.out>=weight.neuron_len;
+        mode=expansion?(mode>=17?(x.scalar_type()==tb::kFloat32?14:(mode==18?15:9)):(x.scalar_type()==tb::kFloat32?5:9))
+            :(rows>=2048?9:rows>=128?(mode==17?11:13):1);
+    }
+    if(mode==12)mode=weight.out>=weight.neuron_len?(x.scalar_type()==tb::kFloat32?5:9):(rows>=2048?9:rows>=128?11:1);
+    if(mode==6)mode=weight.out>=weight.neuron_len?(x.scalar_type()==tb::kFloat32?5:9):(rows>=2048?9:1);
+    const int exact_tile=mode==4?128:mode==5?256:64;
+    if(requested_tf32 || requested_half2)MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,input.get_device()));
+    const bool tf32=requested_tf32 && major>=8;
+    const bool half2=requested_half2 && major>=7;
+    auto shape=input.sizes().vec();shape.back()=weight.out;
+    auto output=tb::empty(shape,input.options().dtype(tb::kFloat32));
+    const auto typed=[&](auto tag,auto aligned_tag,auto zero_tag) {
+        using Input=decltype(tag);constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value;
+        if(pipeline_mode && rows>=128 && gr_prefill_pipeline_supported(x)) {
+            launch_gr_prefill_pipeline<false,Input,float,aligned,zero>(weight,x,{},output);return;
+        }
+        const auto launch_kernel=[&](auto kernel,int tile_m,int threads,int tile_n=32) {
+        kernel<<<dim3(unsigned((weight.out+tile_n-1)/tile_n),unsigned((rows+tile_m-1)/tile_m)),threads,0,mfq_current_cuda_stream()>>>(
+            x.data_ptr<Input>(),weight.q_packed.data_ptr<uint8_t>(),
+            zero?nullptr:weight.row_q_bits.data_ptr<uint8_t>(),zero?nullptr:weight.row_q_bit_offsets.data_ptr<int64_t>(),
+            zero?nullptr:weight.sub_scale.data_ptr<uint8_t>(),zero?nullptr:weight.sub_min.data_ptr<uint8_t>(),
+            zero?nullptr:weight.neuron_scale.data_ptr<float>(),zero?nullptr:weight.neuron_min.data_ptr<float>(),
+            zero?weight.q8_zero_scale.data_ptr<__half>():nullptr,output.data_ptr<float>(),int(rows),
+            int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
+        };
+        if(transpose_weight) {
+            if(fewer_registers)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,32,2,false,true,true>,128,512);
+            else if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,false,true,true>,256,512);
+            else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,false,true,true>,128,512);
+            else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,2,false,true,true>,256,512);
+            else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,32,2,false,true,true>,64,256);
+            return;
+        }
+        if(vector_decode) {
+            if(wide_contraction)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,8,32,2,false,true,false,64>,128,512,64);
+            else if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,false,true>,256,512);
+            else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,false,true>,128,512);
+            else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,2,false,true>,256,512);
+            else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,32,2,false,true>,64,256);
+            return;
+        }
+        if(compact_k) {
+            if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,true>,256,512);
+            else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,true>,128,512);
+            else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,2,true>,256,512);
+            else if(mode==5)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,2,true>,256,1024);
+            else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,32,2,true>,64,256);
+            return;
+        }
+        if(half2)launch_kernel(gr_prefill_half2_kernel<Input,aligned,zero>,64,256);
+        else if(tf32)launch_kernel(gr_prefill_tf32_kernel<Input,aligned,zero>,32,128);
+        else if(mode==10)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,64>,64,256);
+        else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64>,128,512);
+        else if(mode==13)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,4>,128,256);
+        else if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4>,256,512);
+        else if(mode==15)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,4>,256,256);
+        else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8>,256,512);
+        else if(mode==8)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,8>,128,256);
+        else if(mode==7)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,8>,64,128);
+        else if(exact_tile==256)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256>,256,1024);
+        else if(exact_tile==128)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128>,128,512);
+        else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero>,64,256);
+    };
+    const auto launch=[&](auto tag) {
+        if(weight.q8_zero)typed(tag,std::false_type{},std::true_type{});
+        else if(weight.aligned_q8)typed(tag,std::true_type{},std::false_type{});
+        else typed(tag,std::false_type{},std::false_type{});
+    };
+    if(x.scalar_type()==tb::kFloat16)launch(__half{});else launch(float{});
+    MFQ_CUDA_CHECK(cudaGetLastError());return output;
+}
+} // namespace
+// Four stream projections share the activation tile. Products overwrite the
+// decoded tile after the last FMA, then reduce in canonical stream order.
+namespace {
+template<int BM,int BN,int BK> union GrPrefillMixShared {
+    struct {float a[BM][BK+1];union {float w[BN][BK+1];float wt[BK][BN];};} tile;
+    float products[BM][BN];
+};
+template<class Input,class Value,bool AlignedQ8,bool Zero,bool Swizzle=false,int BM=128,int HiddenN=16,int BK=32,bool CompactK=false,bool VectorDecode=false,bool TransposeWeight=false,int RegisterM=4>
+__global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* input,
+        const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
+        const uint8_t* scales,const uint8_t* minima,const float* row_scales,
+        const float* row_minima,const __half* zero_scales,const Value* normalized,
+        std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,
+        int rows,int width,int hidden,int groups,int gs) {
+    using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    constexpr int BN=HiddenN*4,RN=4,RM=RegisterM,Threads=512,Columns=BN/RN;
+    static_assert(BM*BN/(RN*RM)==Threads,"GR fused tile and register geometry mismatch");
+    using Shared=GrPrefillMixShared<BM,BN,BK>;
+    extern __shared__ __align__(16) unsigned char gr_mix_dynamic[];
+    Shared* storage;
+    if constexpr(BK>32)storage=reinterpret_cast<Shared*>(gr_mix_dynamic);
+    else {__shared__ __align__(16) Shared fixed;storage=&fixed;}
+    auto& shared=*storage;
+    const int tid=threadIdx.x,m=tid/Columns,n=(tid%Columns)*RN;
+    const int row0=int(blockIdx.y)*BM,col0=int(blockIdx.x)*HiddenN;
+    float acc[RM][RN][4]{};
+    for(int k0=0;k0<width;k0+=BK) {
+        for(int i=tid;i<BM*BK;i+=Threads) {
+            const int r=i/BK,c=i%BK;
+            shared.tile.a[r][c]=row0+r<rows && k0+c<width?float(input[int64_t(row0+r)*width+k0+c]):0;
+        }
+        if constexpr(VectorDecode) {
+            for(int i=tid;i<BN*(BK/4);i+=Threads) {
+                const int r=i/(BK/4),c=(i%(BK/4))*4,hcol=col0+r%HiddenN;
+                const int neuron=(r/HiddenN)*hidden+hcol;
+                float values[4]{};
+                if(hcol<hidden && k0+c<width)gr_prefill_decode_four<AlignedQ8,Zero>(
+                    values,packed,row_bits,row_offsets,scales,minima,row_scales,row_minima,zero_scales,
+                    neuron,k0+c,width,groups,gs);
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    if constexpr(TransposeWeight)shared.tile.wt[c+j][r]=values[j];
+                    else shared.tile.w[r][c+j]=values[j];
+                }
+            }
+        } else for(int i=tid;i<BN*BK;i+=Threads) {
+            const int r=i/BK,c=i%BK,column=k0+c,hcol=col0+r%HiddenN;
+            const int neuron=(r/HiddenN)*hidden+hcol;
+            float value=0;
+            if(hcol<hidden && column<width) {
+                const int64_t meta=int64_t(neuron)*groups+column/gs;
+                float q,scale,minimum;
+                if constexpr(Zero) {
+                    q=float(static_cast<int8_t>(packed[meta*gs+column%gs]));
+                    scale=__half2float(zero_scales[meta]);minimum=0;
+                } else {
+                    const int bits=AlignedQ8?8:row_bits[neuron];
+                    const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
+                    unsigned word=packed[bit>>3];const int shift=int(bit&7);
+                    if(shift+bits>8)word|=unsigned(packed[(bit>>3)+1])<<8;
+                    q=float((word>>shift)&((1u<<bits)-1));
+                    scale=row_scales[neuron]*float(scales[meta]);
+                    minimum=row_minima[neuron]*float(minima[meta]);
+                }
+                value=__fsub_rn(__fmul_rn(scale,q),minimum);
+            }
+            const int stored_row=Swizzle?r^(r>>5):r;
+            shared.tile.w[stored_row][c]=value;
+        }
+        __syncthreads();
+        const auto accumulate=[&](int k,auto slot) {
+            #pragma unroll
+            for(int r=0;r<RM;++r) {
+                const float x=shared.tile.a[m+r*(BM/RM)][k];
+                #pragma unroll
+                for(int j=0;j<RN;++j) {
+                    const int stored_row=Swizzle?(n+j)^((n+j)>>5):n+j;
+                    acc[r][j][decltype(slot)::value]=fmaf(x,shared.tile.w[stored_row][k],acc[r][j][decltype(slot)::value]);
+                }
+            }
+        };
+        if constexpr(TransposeWeight) {
+            #pragma unroll
+            for(int k=0;k<BK;++k) {
+                const float4 vector=*reinterpret_cast<const float4*>(&shared.tile.wt[k][n]);
+                const float weight[4]={vector.x,vector.y,vector.z,vector.w};
+                #pragma unroll
+                for(int r=0;r<RM;++r) {
+                    const float x=shared.tile.a[m+r*(BM/RM)][k];
+                    #pragma unroll
+                    for(int j=0;j<RN;++j)acc[r][j][k&3]=fmaf(x,weight[j],acc[r][j][k&3]);
+                }
+            }
+        } else if constexpr(CompactK) {
+            #pragma unroll 1
+            for(int k=0;k<BK;k+=4) {
+                accumulate(k,std::integral_constant<int,0>{});
+                accumulate(k+1,std::integral_constant<int,1>{});
+                accumulate(k+2,std::integral_constant<int,2>{});
+                accumulate(k+3,std::integral_constant<int,3>{});
+            }
+        } else {
+            #pragma unroll
+            for(int k=0;k<BK;++k) {
+                #pragma unroll
+                for(int r=0;r<RM;++r) {
+                    const float x=shared.tile.a[m+r*(BM/RM)][k];
+                    #pragma unroll
+                    for(int j=0;j<RN;++j) {
+                        const int stored_row=Swizzle?(n+j)^((n+j)>>5):n+j;
+                        acc[r][j][k&3]=fmaf(x,shared.tile.w[stored_row][k],acc[r][j][k&3]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int r=0;r<RM;++r) {
+        const int row=row0+m+r*(BM/RM);
+        #pragma unroll
+        for(int j=0;j<RN;++j) {
+            const int hcol=col0+(n+j)%HiddenN,neuron=((n+j)/HiddenN)*hidden+hcol;
+            float product=0;
+            if(row<rows && hcol<hidden) {
+                const Input projected=static_cast<Input>((acc[r][j][0]+acc[r][j][1])+(acc[r][j][2]+acc[r][j][3]));
+                const Input gate=static_cast<Input>(1.0f/(1.0f+expf(-static_cast<float>(projected))));
+                product=float(static_cast<Output>(__fmul_rn(float(gate),float(normalized[int64_t(row)*hidden*4+neuron]))));
+            }
+            shared.products[m+r*(BM/RM)][n+j]=product;
+        }
+    }
+    __syncthreads();
+    for(int i=tid;i<BM*HiddenN;i+=Threads) {
+        const int r=i/HiddenN,c=i%HiddenN;
+        if(row0+r<rows && col0+c<hidden) {
+            float sum=0;
+            #pragma unroll
+            for(int s=0;s<4;++s)sum=__fadd_rn(sum,shared.products[r][s*HiddenN+c]);
+            output[int64_t(row0+r)*hidden+col0+c]=static_cast<Output>(__fdiv_rn(sum,4.0f));
+        }
+    }
+}
+
+bool gr_prefill_mix_selected(const NintWeight& weight,const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& normalized,int64_t streams) {
+    namespace tb=mfq_tensor_backend;
+    const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
+    const auto* projection=mfq::cuda::env_lookup("MFQ_GR_PREFILL_MATMUL");
+    if(projection && (std::atoi(projection)==2 || std::atoi(projection)==3))return false;
+    if(!option && (weight.out<weight.neuron_len || input.numel()/input.size(-1)<128))return false;
+    const auto supported=[](const tb::Tensor& t){return t.scalar_type()==tb::kFloat16 || t.scalar_type()==tb::kFloat32;};
+    return (!option || std::atoi(option)!=0) && streams==4 && input.is_contiguous() && normalized.is_contiguous()
+        && supported(input) && supported(normalized);
+}
+
+mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
+        const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& normalized) {
+    namespace tb=mfq_tensor_backend;
+    MfqCudaGuard guard(input.device());
+    const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/4;
+    MFQ_RUNTIME_CHECK(rows<=65535*int64_t(128) && hidden<=std::numeric_limits<int>::max() &&
+        weight.neuron_len<=std::numeric_limits<int>::max() && weight.ng<=std::numeric_limits<int>::max(),
+        "fused GR prefill exceeds CUDA launch geometry");
+    auto shape=input.sizes().vec();shape.back()=hidden;
+    const auto dtype=input.scalar_type()==tb::kFloat32 || normalized.scalar_type()==tb::kFloat32?tb::kFloat32:tb::kFloat16;
+    auto output=tb::empty(shape,input.options().dtype(dtype));
+    const auto typed=[&](auto input_tag,auto value_tag,auto aligned_tag,auto zero_tag,auto swizzle_tag) {
+        using Input=decltype(input_tag);using Value=decltype(value_tag);
+        using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+        constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
+        {
+            const auto* pipeline_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
+            if((!pipeline_option || std::atoi(pipeline_option)==10 || std::atoi(pipeline_option)==12) && gr_prefill_pipeline_supported(input)) {
+                launch_gr_prefill_pipeline<true,Input,Value,aligned,zero>(weight,input,normalized,output);return;
+            }
+        }
+        const auto invoke=[&](auto tile_tag,auto k_tag,auto compact_tag,auto vector_tag,auto transpose_tag,auto register_tag) {
+        constexpr int tile=decltype(tile_tag)::value,register_m=decltype(register_tag)::value;
+        constexpr int columns=register_m==2 || tile==256?8:16,k=decltype(k_tag)::value;
+        constexpr bool compact=decltype(compact_tag)::value;
+        constexpr bool vector_decode=decltype(vector_tag)::value;
+        constexpr bool transpose_weight=decltype(transpose_tag)::value;
+        constexpr size_t shared_bytes=k>32?sizeof(GrPrefillMixShared<tile,columns*4,k>):0;
+        if constexpr(shared_bytes>48*1024) {
+            thread_local int configured_device=-1;
+            if(configured_device!=input.device().index) {
+                MFQ_CUDA_CHECK(cudaFuncSetAttribute(gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact,vector_decode,transpose_weight,register_m>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,int(shared_bytes)));
+                configured_device=input.device().index;
+            }
+        }
+        gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact,vector_decode,transpose_weight,register_m><<<dim3(unsigned((hidden+columns-1)/columns),unsigned((rows+tile-1)/tile)),512,shared_bytes,mfq_current_cuda_stream()>>>(
+            input.data_ptr<Input>(),weight.q_packed.data_ptr<uint8_t>(),
+            zero?nullptr:weight.row_q_bits.data_ptr<uint8_t>(),zero?nullptr:weight.row_q_bit_offsets.data_ptr<int64_t>(),
+            zero?nullptr:weight.sub_scale.data_ptr<uint8_t>(),zero?nullptr:weight.sub_min.data_ptr<uint8_t>(),
+            zero?nullptr:weight.neuron_scale.data_ptr<float>(),zero?nullptr:weight.neuron_min.data_ptr<float>(),
+            zero?weight.q8_zero_scale.data_ptr<__half>():nullptr,normalized.data_ptr<Value>(),output.data_ptr<Output>(),
+            int(rows),int(weight.neuron_len),int(hidden),int(weight.ng),int(weight.gs));
+        };
+        if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+        else {
+            const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
+            const int requested_mode=option?std::atoi(option):(std::is_same_v<Input,__half>?12:10);
+            const int mode=requested_mode==10 || requested_mode==12?6:requested_mode;
+            if(mode==8)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,2>{});
+            else if(mode==7)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,4>{});
+            else if(mode==6)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==4)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==5)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::true_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==3)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+        }
+    };
+    const auto launch=[&](auto input_tag,auto value_tag) {
+        const auto dispatch=[&](auto swizzle_tag) {
+            if(weight.q8_zero)typed(input_tag,value_tag,std::false_type{},std::true_type{},swizzle_tag);
+            else if(weight.aligned_q8)typed(input_tag,value_tag,std::true_type{},std::false_type{},swizzle_tag);
+            else typed(input_tag,value_tag,std::false_type{},std::false_type{},swizzle_tag);
+        };
+        const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
+        if(option && std::atoi(option)==2)dispatch(std::true_type{});else dispatch(std::false_type{});
+    };
+    if(input.scalar_type()==tb::kFloat16) {
+        if(normalized.scalar_type()==tb::kFloat16)launch(__half{},__half{});else launch(__half{},float{});
+    } else {
+        if(normalized.scalar_type()==tb::kFloat16)launch(float{},__half{});else launch(float{},float{});
+    }
+    MFQ_CUDA_CHECK(cudaGetLastError());return output;
+}
+}
 
 namespace {
 template<bool AlignedQ8=false,int FixedGroup=0,class Input>

@@ -496,12 +496,6 @@ if(BUILD_TESTING)
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_definitions(mfq-cuda-bf16-mmvf-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-bf16-mmvf-bench PRIVATE mfq-cuda-runtime)
-    add_executable(mfq-cuda-nvq-pair-indices-probe
-        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_pair_indices_probe.cu)
-    target_include_directories(mfq-cuda-nvq-pair-indices-probe PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
-    set_target_properties(mfq-cuda-nvq-pair-indices-probe PROPERTIES
-        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
-        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     add_executable(mfq-cuda-nvq-compressed-test
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nvq_compressed_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-nvq-compressed-test)
