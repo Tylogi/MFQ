@@ -1,5 +1,5 @@
 #pragma once
-#include "kernels/packed_nvq.cuh"
+#include "kernels/quant/packed_nvq.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>

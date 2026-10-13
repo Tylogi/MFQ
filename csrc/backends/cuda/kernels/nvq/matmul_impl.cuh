@@ -26,9 +26,9 @@
 #include <type_traits>
 
 #if defined(MFQ_NVQ_BACKWARD)
-#include "kernels/packed_backward.cuh"
+#include "kernels/quant/packed_nint.cuh"
 #endif
-#include "kernels/packed_nvq.cuh"
+#include "kernels/quant/packed_nvq.cuh"
 namespace mfq::cuda::packed_nvq {
 __host__ __device__ constexpr bool dense_nvq_format(int format) {
     return format==5 || format==10 || format==11 || format==12 ||

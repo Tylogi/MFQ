@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "packed_backward.cuh"
+#include "kernels/packed_nint.cuh"
 
 namespace {
 

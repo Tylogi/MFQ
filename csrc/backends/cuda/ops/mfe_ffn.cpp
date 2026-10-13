@@ -5,7 +5,7 @@
 #include "kernels/mfe/ffn_launch.h"
 #include "kernels/mfe/ffn_compact.h"
 #include "kernels/mfe/nvq_dense_bounds.h"
-#include "kernels/nint_route_hint.h"
+#include "kernels/quant/nint_route_hint.h"
 #include "cuda_execution.h"
 #include <algorithm>
 #include <cstring>
