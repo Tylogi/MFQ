@@ -1,6 +1,6 @@
 import torch
 
-from bench.dsv4f_mxfp4_pq import (
+from bench.dsv4f_mxfp4.pq import (
     mxfp4_pq_rate,
     project_mxfp4_codebook,
     quantize_mxfp4_pq,

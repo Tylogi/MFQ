@@ -3,14 +3,14 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_hybrid_sq import (
+from bench.dsv4f_mxfp4.hybrid_sq import (
     _pack_block_selectors,
     _unpack_block_selectors,
     decode_hybrid_mxfp4_sq,
     hybrid_mxfp4_sq_rate,
     quantize_hybrid_mxfp4_sq,
 )
-from bench.dsv4f_mxfp4_xor_sq import _unpack_two_bit_symbols
+from bench.dsv4f_mxfp4.xor_sq import _unpack_two_bit_symbols
 from mfq.quantize.mxfp import decode_mxfp4
 
 

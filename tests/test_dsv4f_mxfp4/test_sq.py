@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_sq import (
+from bench.dsv4f_mxfp4.sq import (
     ALPHABETS,
     quantize_row_scale_strict_mxfp4_sq,
     quantize_strict_mxfp4_sq,

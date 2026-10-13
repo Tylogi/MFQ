@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from bench.dsv4f_mxfp4_sq1 import quantize_mxfp4_sq1
+from bench.dsv4f_mxfp4.sq1 import quantize_mxfp4_sq1
 from mfq.formats.mxfp4_sq import build_mxfp4_sq, pack_mxfp4_sq
 
 

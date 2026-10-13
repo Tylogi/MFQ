@@ -20,19 +20,19 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_adaptive_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import (
     E2M1_NIBBLES,
     E2M1_VALUES,
     NIBBLE_VALUES,
     _raw_gate_up_native,
     _unpack_source,
 )
-from bench.dsv4f_mxfp4_sq2 import (
+from bench.dsv4f_mxfp4.sq2 import (
     SQ2_TAG_ORDERS,
     _greedy_assignments,
     _refine_from_assignments,
 )
-from bench.dsv4f_mxfp4_sq3 import _pack_block_selectors, _pack_fixed_width
+from bench.dsv4f_mxfp4.sq3 import _pack_block_selectors, _pack_fixed_width
 from mfq.quantize.mxfp import decode_mxfp4
 from mfq.quantize.v4f_source import V4FCheckpoint
 

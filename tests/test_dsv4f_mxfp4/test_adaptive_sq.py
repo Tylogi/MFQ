@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_adaptive_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import (
     FIXED4_PALETTE_IDS,
     FIXED16_PALETTE_IDS,
     PALETTE_NIBBLES,

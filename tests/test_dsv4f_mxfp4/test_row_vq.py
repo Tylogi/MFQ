@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_row_vq import (
+from bench.dsv4f_mxfp4.row_vq import (
     match_row_vq_rate,
     mxfp4_matrix_nbytes,
     project_mxfp4,

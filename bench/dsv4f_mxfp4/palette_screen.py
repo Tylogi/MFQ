@@ -11,19 +11,19 @@ from pathlib import Path
 
 import numpy as np
 
-from bench.dsv4f_mxfp4_adaptive_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import (
     FIXED16_PALETTE_IDS,
     PALETTE_VALUES,
     _raw_gate_up_native,
     _row_candidate_exponents,
     _unpack_source,
 )
-from bench.dsv4f_mxfp4_hybrid_sq import (
+from bench.dsv4f_mxfp4.hybrid_sq import (
     _hybrid_labeled_errors,
     _solve_hybrid_row,
 )
-from bench.dsv4f_mxfp4_row_vq import _git_identity, _sha256
-from bench.dsv4f_mxfp4_xor_sq import _candidate_xor_errors
+from bench.dsv4f_mxfp4.row_vq import _git_identity, _sha256
+from bench.dsv4f_mxfp4.xor_sq import _candidate_xor_errors
 from mfq.quantize.v4f_source import V4FCheckpoint
 
 
@@ -62,7 +62,7 @@ def _greedy_catalog(partition_errors: np.ndarray, size: int) -> list[int]:
 def main() -> None:
     args = _parse_args()
     started = time.time()
-    script_root = Path(__file__).resolve().parents[1]
+    script_root = Path(__file__).resolve().parents[2]
     model = args.model.resolve()
     checkpoint = V4FCheckpoint(model)
     packed, source_scales = _raw_gate_up_native(checkpoint, args.layer, args.expert)

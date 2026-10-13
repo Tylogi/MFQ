@@ -670,7 +670,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     started = time.time()
-    script_root = Path(__file__).resolve().parents[1]
+    script_root = Path(__file__).resolve().parents[2]
     model = args.model.resolve()
     checkpoint = V4FCheckpoint(model)
     source_reader = checkpoint.expert_source(args.layer, "gate_up")

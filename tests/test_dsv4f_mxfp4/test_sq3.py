@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_sq3 import (
+from bench.dsv4f_mxfp4.sq3 import (
     _pack_fixed_width,
     _pack_three_bit_symbols,
     _unpack_fixed_width,
@@ -12,12 +12,12 @@ from bench.dsv4f_mxfp4_sq3 import (
     mxfp4_sq3_rate,
     quantize_mxfp4_sq3,
 )
-from bench.dsv4f_mxfp4_sq3_eight import (
+from bench.dsv4f_mxfp4.sq3_eight import (
     decode_eight_mxfp4_sq3,
     eight_mxfp4_sq3_rate,
     quantize_eight_mxfp4_sq3,
 )
-from bench.dsv4f_mxfp4_sq3_hybrid import hybrid_mxfp4_sq3_rate
+from bench.dsv4f_mxfp4.sq3_hybrid import hybrid_mxfp4_sq3_rate
 from mfq.formats.nvq import NVQ3_D4
 from mfq.quantize.mxfp import decode_mxfp4
 

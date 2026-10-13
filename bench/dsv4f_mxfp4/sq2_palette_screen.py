@@ -11,18 +11,18 @@ from pathlib import Path
 
 import numpy as np
 
-from bench.dsv4f_mxfp4_adaptive_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import (
     FIXED16_PALETTE_IDS,
     PALETTE_VALUES,
     _raw_gate_up_native,
     _unpack_source,
 )
-from bench.dsv4f_mxfp4_row_vq import _git_identity, _sha256
-from bench.dsv4f_mxfp4_sq2 import (
+from bench.dsv4f_mxfp4.row_vq import _git_identity, _sha256
+from bench.dsv4f_mxfp4.sq2 import (
     SCREENED32_PALETTE_IDS,
     _solve_sq2_row,
 )
-from bench.dsv4f_mxfp4_xor_sq import _candidate_xor_errors
+from bench.dsv4f_mxfp4.xor_sq import _candidate_xor_errors
 from mfq.quantize.v4f_source import V4FCheckpoint
 
 
@@ -65,7 +65,7 @@ def main() -> None:
     if args.sample_rows <= 0 or args.palette_chunk <= 0 or args.maximum_refinement_steps <= 0:
         raise ValueError("screen controls must be positive")
     started = time.time()
-    script_root = Path(__file__).resolve().parents[1]
+    script_root = Path(__file__).resolve().parents[2]
     model = args.model.resolve()
     checkpoint = V4FCheckpoint(model)
     packed, source_scales = _raw_gate_up_native(checkpoint, args.layer, args.expert)

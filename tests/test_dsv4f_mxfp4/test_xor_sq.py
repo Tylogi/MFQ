@@ -3,8 +3,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_adaptive_sq import FIXED16_PALETTE_IDS
-from bench.dsv4f_mxfp4_xor_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import FIXED16_PALETTE_IDS
+from bench.dsv4f_mxfp4.xor_sq import (
     _candidate_xor_errors,
     _pack_two_bit_symbols,
     _quantize_blocks_for_tag,

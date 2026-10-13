@@ -4,14 +4,14 @@ import numpy as np
 import pytest
 import torch
 
-from bench.dsv4f_mxfp4_sq2 import (
+from bench.dsv4f_mxfp4.sq2 import (
     FIXED32_PALETTE_IDS,
     SCREENED32_PALETTE_IDS,
     decode_mxfp4_sq2,
     mxfp4_sq2_rate,
     quantize_mxfp4_sq2,
 )
-from bench.dsv4f_mxfp4_xor_sq import _unpack_two_bit_symbols
+from bench.dsv4f_mxfp4.xor_sq import _unpack_two_bit_symbols
 from mfq.formats.nvq import NVQ2_E8
 from mfq.quantize.mxfp import decode_mxfp4
 

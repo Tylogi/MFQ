@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_row_vq import (
+from bench.dsv4f_mxfp4.row_vq import (
     _git_identity,
     _metrics,
     _quantize_baseline,
@@ -514,7 +514,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     started = time.time()
-    script_root = Path(__file__).resolve().parents[1]
+    script_root = Path(__file__).resolve().parents[2]
     model = args.model.resolve()
     checkpoint = V4FCheckpoint(model)
     print(

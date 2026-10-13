@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from bench.dsv4f_mxfp4_adaptive_sq import (
+from bench.dsv4f_mxfp4.adaptive_sq import (
     FIXED16_PALETTE_IDS,
     NIBBLE_VALUES,
     PALETTE_NIBBLES,
@@ -33,13 +33,13 @@ from bench.dsv4f_mxfp4_adaptive_sq import (
     _row_candidate_exponents,
     _unpack_source,
 )
-from bench.dsv4f_mxfp4_row_vq import (
+from bench.dsv4f_mxfp4.row_vq import (
     _git_identity,
     _metrics,
     _quantize_baseline,
     _sha256,
 )
-from bench.dsv4f_mxfp4_xor_sq import (
+from bench.dsv4f_mxfp4.xor_sq import (
     XorRowSolution,
     _candidate_xor_errors,
     _pack_palette_codes,
@@ -468,7 +468,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     started = time.time()
-    script_root = Path(__file__).resolve().parents[1]
+    script_root = Path(__file__).resolve().parents[2]
     model = args.model.resolve()
     checkpoint = V4FCheckpoint(model)
     print(
