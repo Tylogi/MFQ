@@ -139,10 +139,72 @@ remaining SIMD shims (`__vsubss4`, `__vcmpne4`, `__trap`) and the
 - Short prompts (~12 tokens): **391 tok/s prefill** (was 13 with the
   stub), 83 tok/s decode, 525ms TTFT.
 - Longer prompts (~35+ tokens): `mfq_attention_mma256 launch failed:
-  unspecified launch failure` — the CDNA MFMA tile config for
-  multi-tile attention exceeds a launch limit. This is the next debug
-  target; the short-prompt path proves the kernel logic and the AMD
-  MFMA availability detection are correct.
+  unspecified launch failure`. The initial explanation was a multi-tile
+  launch limit; the isolated checks below correct that explanation.
+
+### Attention launch correction (2026-10-13)
+
+Direct calls to `mfq_attention_mma256_cuda` failed at both 32 and 33
+query tokens on gfx942. Short model prompts used another attention path,
+so their success did not validate the MMA kernel. With `AMD_LOG_LEVEL=3`,
+the 33-token call failed at launch with a block of `(32, 4, 1)` and
+33,792 bytes of dynamic shared memory.
+
+The native build did not define `GGML_USE_HIP` or the CDNA architecture
+macros. The device kernel therefore used the default 32-thread launch
+bound and omitted the MFMA body. Meanwhile, the host treated HIP's
+`major=9, minor=4` as NVIDIA compute capability 940 and selected a
+128-thread NVIDIA configuration. The host and device configurations
+did not match.
+
+The attention compatibility header now enables ggml's HIP architecture
+selection. The shared HIP shuffle shim preserves explicit widths. Host
+configuration uses the AMD architecture parsed from `gcnArchName`, and
+launches use
+`properties.warpSize` (64 on MI300X). The 256-dimensional prefill path
+uses at least 16 columns, as required by the CDNA kernel. The ggml HIP
+vendor shim maps the CUDA TF32 math-mode name to `HIPBLAS_DEFAULT_MATH`
+so the header also compiles in a clean native build.
+
+The `mfq-hip-attention-mma-test` compares GPU output with a CPU causal
+softmax reference using rounded FP16 keys and values. All 32 numerical
+cases passed on MI300X: GQA ratios 4 and 8, two KV heads, batches 1 and 2,
+and token counts from 1 to 257 including the 32/33, 63/64/65, 127/128/129, and
+256/257 boundaries. Maximum relative error was 0.000316 and maximum
+absolute error was 0.000527. An additional test checks that unsupported
+512-dimensional CDNA tiles fail before launch rather than returning an
+uncomputed output.
+
+An isolated diagnostic executable linked with the corrected attention
+object also completed Qwen3.5-4B BF16 prefill at 33, 129, 512, and 2048
+tokens with `MFQ_DISABLE_MMA_ATTENTION` unset. The running server and its
+build artifacts were not replaced. These checks cover the 256-dimensional
+prefill path; other attention families and GPU architectures need
+separate validation. The FMA override remains available.
+
+
+### Clean-build verification (2026-10-14)
+
+The feature branch was updated to upstream master `0cda1e0f`. A clean
+native HIP build exposed two additional port gaps: the missing TF32
+math-mode mapping described above and missing `gdn_weights`/`qsa_weights`
+accessors in the HIP Qwen4 block loader. The accessors load the existing
+combined-QKV GDN and QSA weight structures required by the shared loader.
+
+After these fixes, the full native HIP build and all 41 registered CTest
+cases passed on MI300X. The attention test includes 32 numerical cases
+and the unsupported-tile rejection check. The newly built diagnostics
+executable completed BF16 and S4-M Qwen3.5-4B prefill at 33, 129, 256,
+512, and 2048 tokens with `MFQ_DISABLE_MMA_ATTENTION` unset. Both models
+also generated 16 tokens from a 129-token input. At that input length,
+MMA and FMA logits selected the same top token, with absolute KL
+divergence below 0.0000022. These are functional checks, not a language
+quality or performance benchmark.
+
+On macOS, all 32 backend-neutral CTest cases and 134 focused Python
+cases passed. The full Python suite reported 2599 passed, 608 skipped,
+and 42 failed. Each of the 42 failures was reproduced against unchanged
+upstream `0cda1e0f`; no new failing cases were observed.
 
 ## Compile-time fix
 

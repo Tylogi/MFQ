@@ -367,6 +367,11 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-hip-activation-test PRIVATE
         mfq-hip-core mfq-hip-native-kernels)
 
+    mfq_add_hip_test(mfq-hip-attention-mma-test
+        ${MFQ_HIP_ROOT}/tests/attention_mma_test.cu)
+    target_link_libraries(mfq-hip-attention-mma-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels mfq-core mfq-ggml)
+
     mfq_add_hip_test(mfq-hip-native-tensor-test
         ${MFQ_HIP_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
     target_link_libraries(mfq-hip-native-tensor-test PRIVATE mfq-hip-core)

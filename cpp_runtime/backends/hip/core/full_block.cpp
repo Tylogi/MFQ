@@ -503,9 +503,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         attn_scale, false);
                                 }
                             } else {
-                                // The CDNA MFMA attention kernel crashes on
-                                // multi-tile launches (T > 32); allow routing to
-                                // the flash256 FMA fallback via env var.
+                                // Use FMA attention when the override is set.
                                 static const bool disable_mma_attention = [] {
                                     const char* v = std::getenv("MFQ_DISABLE_MMA_ATTENTION");
                                     return v != nullptr && std::atoi(v) != 0;

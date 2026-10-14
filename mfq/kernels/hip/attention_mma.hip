@@ -4,10 +4,35 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 #define MFQ_FATTN_KERNEL_ONLY
 #include "mfq_fattn_mma_f16.cuh"
 #include "mfq_hip_compat.h"
+
+static int mfq_attention_mma_arch(const hipDeviceProp_t& properties)
+{
+    const char* arch = properties.gcnArchName;
+    MFQ_RUNTIME_CHECK(std::strncmp(arch, "gfx", 3) == 0,
+                      "attention MMA: invalid HIP architecture");
+    char* end = nullptr;
+    const long version = std::strtol(arch + 3, &end, 16);
+    MFQ_RUNTIME_CHECK(end != arch + 3 && (*end == '\0' || *end == ':') &&
+                      version > 0 && version < 0x10000,
+                      "attention MMA: invalid HIP architecture");
+    return GGML_CUDA_CC_OFFSET_AMD + static_cast<int>(version);
+}
+
+static void mfq_attention_mma_check_config(
+    int head_dim, int query_cols, int head_cols, int cc)
+{
+    const bool supported = amd_mfma_available(cc)
+        ? head_dim <= 256 && query_cols * head_cols >= 16
+        : amd_wmma_available(cc) && head_dim <= 128 &&
+          query_cols * head_cols >= 16 && head_cols > 1;
+    MFQ_RUNTIME_CHECK(supported, "attention MMA: unsupported HIP tile configuration");
+}
 
 __global__ void minicpm_flash128_q_cast_kernel(
     const __hip_bfloat16* source,
@@ -273,9 +298,10 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     MFQ_RUNTIME_CHECK(hipGetDevice(&device) == hipSuccess, "mfq_attention_mma256: hipGetDevice failed");
     MFQ_RUNTIME_CHECK(hipGetDeviceProperties(&properties, device) == hipSuccess,
                 "mfq_attention_mma256: hipGetDeviceProperties failed");
-    const int cc = properties.major * 100 + properties.minor * 10;
+    const int cc = mfq_attention_mma_arch(properties);
+    mfq_attention_mma_check_config(DKQ, ncols1, ncols2, cc);
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
-    const int nwarps = nthreads / 32;
+    const int nwarps = nthreads / properties.warpSize;
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
     const int nbatch_K2 = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc);
     const int nbatch_V2 = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc);
@@ -323,7 +349,7 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     const int ntiles_dst = iter_j * iter_z_gqa * Hk * B;
     const uint3 ne01 = init_fastdiv_values(T);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
-    const dim3 block(32, nwarps, 1);
+    const dim3 block(properties.warpSize, nwarps, 1);
     const char * mask_pointer = nullptr;
     kernel<<<ntiles_dst, block, shared_total, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
@@ -375,7 +401,6 @@ mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(
             : mfq_attention_mma_launch<256, 256, 16, 4>(
                   q, k, v, scale, false, 0);
     }
-    if (T <= 8) return mfq_attention_mma_launch<256, 256, 8, 1>(q, k, v, scale, false, 0);
     if (T <= 16) return mfq_attention_mma_launch<256, 256, 16, 1>(q, k, v, scale, false, 0);
     if (T <= 32) return mfq_attention_mma_launch<256, 256, 32, 1>(q, k, v, scale, false, 0);
     return mfq_attention_mma_launch<256, 256, 64, 1>(q, k, v, scale, false, 0);
@@ -511,9 +536,10 @@ static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
                 "glm_mla576_cached: hipGetDevice failed");
     MFQ_RUNTIME_CHECK(hipGetDeviceProperties(&properties, device) == hipSuccess,
                 "glm_mla576_cached: hipGetDeviceProperties failed");
-    const int cc = properties.major * 100 + properties.minor * 10;
+    const int cc = mfq_attention_mma_arch(properties);
+    mfq_attention_mma_check_config(DKQ, ncols1, ncols2, cc);
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
-    const int nwarps = nthreads / 32;
+    const int nwarps = nthreads / properties.warpSize;
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
     const int nbatch_K2 = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc);
     const int nbatch_V2 = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc);
@@ -588,7 +614,7 @@ static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
 
     auto out = mfq_tensor_backend::empty({B, M, 64, DV}, q.options());
     const uint3 ne01 = init_fastdiv_values(M);
-    kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
+    kernel<<<rounded_blocks, dim3(properties.warpSize, nwarps, 1), shmem, stream>>>(
         reinterpret_cast<const char *>(q.data_ptr<float>()),
         reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
@@ -756,9 +782,10 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     status = hipGetDeviceProperties(&properties, device);
     MFQ_RUNTIME_CHECK(status == hipSuccess, "mfq_attention_mma_decode: hipGetDeviceProperties failed: ",
                 hipGetErrorString(status));
-    const int cc = properties.major * 100 + properties.minor * 10;
+    const int cc = mfq_attention_mma_arch(properties);
+    mfq_attention_mma_check_config(DKQ_EXPECTED, ncols1, ncols2, cc);
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
-    const int nwarps = nthreads / 32;
+    const int nwarps = nthreads / properties.warpSize;
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
     const int nbatch_K2 = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
     const int nbatch_V2 = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
@@ -855,7 +882,7 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     auto out = mfq_tensor_backend::empty({B, 1, Hq, DV_EXPECTED}, q.options());
     const uint3 ne01 = init_fastdiv_values(1);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
-    kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
+    kernel<<<rounded_blocks, dim3(properties.warpSize, nwarps, 1), shmem, stream>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
         reinterpret_cast<const char*>(k_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v_cache.data_ptr<mfq_half>()),
