@@ -1,13 +1,6 @@
 #include "generation.h"
 #include "generation_flow.h"
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
+#include "cuda_model_list.h"
 #include "models/common/full_block.h"
 #include "ops/execution/cuda_sampling.h"
 #include "storage/session/text_cache.h"
@@ -74,7 +67,7 @@ template <typename Model> struct CudaGenerationOps {
         PrefillCudaTimer timer;
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        if constexpr (Model::policy.layer_major_prefill) {
             if((!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,chunk.count))
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
@@ -284,7 +277,7 @@ template <class Model> struct CudaGenerationContext {
                      size_t reused, size_t stable) {
         if (execution) return std::move(*execution);
         auto logical_chunk = config.generation.prefill_chunk_size;
-        if constexpr (std::is_same_v<Model, Qwen4CausalLm>) {
+        if constexpr (Model::policy.layer_major_prefill) {
             if (reused == 0 && (stable == 0 || stable == input.prompt.size()) &&
                     (!prepared || !prepared->transformed()) &&
                     qwen4_layer_major_prefill_eligible(model, input.prompt.size()))
@@ -322,25 +315,17 @@ Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cac
         output);
 }
 
-#define MFQ_INSTANTIATE_FLOW(MODEL)                                                                \
-    template Generation generate(MODEL &,                                                          \
-        DecodeGraphCache &,                                                                        \
-        TextSessionCache &,                                                                        \
-        const CudaRuntimeConfig &,                                                                 \
-        mfq::engine::InferenceRequest &,                                                           \
-        mfq::engine::InferenceOutput &,                                                            \
-        MtpModule *,                                                                               \
-        std::optional<CudaPreparedPrompt>,                                                         \
+#define MFQ_INSTANTIATE_FLOW(MODEL)                                                    \
+    template Generation generate(MODEL &,                                                        \
+        DecodeGraphCache &,                                                                      \
+        TextSessionCache &,                                                                      \
+        const CudaRuntimeConfig &,                                                               \
+        mfq::engine::InferenceRequest &,                                                         \
+        mfq::engine::InferenceOutput &,                                                          \
+        MtpModule *,                                                                             \
+        std::optional<CudaPreparedPrompt>,                                                       \
         std::optional<Generation>);
-MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen35CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMO45CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMOTtsCausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::Gemma4CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::GlmDsaCausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::Glm5CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen4CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV4CausalLm)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV41CausalLm)
+MFQ_CUDA_EACH_MODEL(MFQ_INSTANTIATE_FLOW)
 
 #undef MFQ_INSTANTIATE_FLOW
 } // namespace mfq::cuda::internal

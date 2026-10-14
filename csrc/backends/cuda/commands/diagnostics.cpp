@@ -900,14 +900,14 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     std::chrono::steady_clock::time_point t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
+            if constexpr (Model::policy.continuous_batching) {
                 return run_cuda_continuous_batching_check(model);
             }
             throw std::runtime_error(
                 "continuous batching requires Qwen35CausalLm");
         }
         if (check_qwen4_decode_hidden) {
-            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+            if constexpr(Model::policy.decode_graph) {
                 const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_GENERATION_VARIANTS");
                 if(profile && variants && variants[0]=='1') {
                     MFQ_RUNTIME_CHECK(runtime_components.mtp,"MTP variants require a loaded predictor");
@@ -915,24 +915,20 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                         ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file));
                 }
             }
-            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+            if constexpr(Model::policy.decode_graph)
                 return profile?run_qwen4_mtp_profile(model,ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file))
                     :run_qwen4_decode_hidden_check(model);
             throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
         }
         if (check_flash_next) {
-            if constexpr (
-                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
                 return run_flash_next_check(model);
             }
             throw std::runtime_error(
                 "Flash-Next diagnostic requires a Flash-Next causal LM");
         }
         if (check_flash_next_mtp) {
-            if constexpr (
-                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
                 using Predictor=std::conditional_t<
                     std::is_same_v<Model, mfq::cuda::Qwen4CausalLm>,
                     mfq::cuda::qwen4_exp::Qwen4ExpMtp,
@@ -946,7 +942,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
         }
         if (check_qwen35_mtp) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,
@@ -957,7 +953,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "--check-qwen35-mtp requires Qwen35CausalLm");
         }
         if (!bench_qwen35_mtp.empty()) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,

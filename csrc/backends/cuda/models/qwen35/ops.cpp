@@ -332,7 +332,7 @@ std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
 
 void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&
-        cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
+        plan_components(graph).vision != CudaVisionAdapter::grid_vit) {
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
     }
 }
@@ -413,6 +413,16 @@ bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return tru
 namespace mfq::cuda {
 
 template struct FullAttentionSessionCodec<Qwen35Model>;
+
+CudaModelPlan Qwen35Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    // Only the qwen3_5 spelling has CUDA component adapters; the generic_qwen
+    // alias loads the same text model but stays text-only.
+    if (graph.backbone != "qwen3_5") return result;
+    if (declares_grid_vision(graph)) result.vision = CudaVisionAdapter::grid_vit;
+    if (declares_next_token_predictor(graph)) result.predictor = policy.predictor;
+    return result;
+}
 
 } // namespace mfq::cuda
 

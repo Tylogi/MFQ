@@ -239,7 +239,7 @@ struct CudaEngineState {
             auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
             metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
-                {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
+                {"qsa_kv_offload_supported", Model::policy.qsa_kv_offload ? 1.0 : 0.0}});
             if (execution->qsa_kv_store) {
                 auto kv = execution->qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());
@@ -295,7 +295,7 @@ namespace {
 // Concrete execution types are selected only here, at composition. Neither
 // the generation interface nor the shared batch policy knows a model family.
 template <class Model> using BoundState = std::conditional_t<
-    std::is_same_v<Model, Qwen35CausalLm>,
+    Model::policy.continuous_batching,
     CudaEngineState<Model, ContinuousBatch<CudaBatchExecution<Model>>,
                     qwen35::Qwen35GenerationState>,
     CudaEngineState<Model>>;
@@ -338,7 +338,7 @@ struct CudaBackend {
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
-                if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
+                if constexpr (!Model::policy.qsa_kv_offload)
                     if (execution->qsa_kv_store)
                         throw std::invalid_argument("CUDA streamed KV requires a QSA model");
                 return std::make_unique<BoundState<Model>>(execution, std::move(model),

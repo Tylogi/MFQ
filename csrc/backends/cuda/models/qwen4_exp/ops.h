@@ -32,6 +32,11 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     mfq_tensor_backend::Tensor* raw_hidden = nullptr);
 
 struct Qwen4Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.qsa_kv_offload = true,
+        .layer_major_prefill = true, .decode_graph = true,
+        .predictor = CudaPredictorAdapter::flash_next};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
+
     Qwen4Model();
     ~Qwen4Model();
     Qwen4Model(Qwen4Model&&) noexcept;

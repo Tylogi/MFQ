@@ -244,6 +244,12 @@ namespace mfq::cuda {
 
 template struct CudaSessionCodec<DeepseekV41Model>;
 
+CudaModelPlan DeepseekV41Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    if (declares_deepseek_v41_dspark(graph)) result.predictor = policy.predictor;
+    return result;
+}
+
 } // namespace mfq::cuda
 
 namespace mfq::models {

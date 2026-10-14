@@ -15,6 +15,7 @@
 namespace mfq::cuda {
 
 struct MiniCPMO45Model : CausalResources {
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
     template <class Backend> using CausalModel = mfq::models::minicpmo45::CausalLm<Backend>;
     mfq::models::minicpmo45::Config config;
 

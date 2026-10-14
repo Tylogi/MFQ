@@ -6,14 +6,7 @@
 #include "generation_policy.h"
 #include "inference.h"
 #include "kernels/sampling_ops.h"
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
+#include "cuda_model_list.h"
 
 #include <cuda_runtime_api.h>
 
@@ -105,7 +98,7 @@ template <class Model> struct CudaMtpOps {
                         int64_t confirmed = 0) {
     projected_target_hidden = {}; projected_target_logits = {};
     projected_target_greedy.clear();
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if constexpr(Model::policy.decode_graph) {
       if(!transformed_prompt) {
         bool initialized=false;
         const auto host_ids = known_ids_device.defined() &&
@@ -135,7 +128,7 @@ template <class Model> struct CudaMtpOps {
     PrefillCudaTimer timer;
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if constexpr(Model::policy.layer_major_prefill) {
       if(!transformed_prompt && mfq::cuda::qwen4_layer_major_prefill_eligible(model,chunk.count)) {
         auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,false,
             [&] { return output && output->stopped(); }, &raw);
@@ -321,7 +314,7 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    mfq_tensor_backend::Tensor restored_last_hidden,
                    mfq_tensor_backend::Tensor *session_last_hidden) {
   auto logical_chunk=prefill_chunk_size;
-  if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+  if constexpr(Model::policy.layer_major_prefill) {
     if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();
@@ -331,20 +324,12 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
       logical_chunk, reused_tokens, std::move(restored_last_hidden),
       session_last_hidden);
 }
-#define MFQ_INSTANTIATE_MTP(MODEL)                                             \
-  template Generation run_mtp_generation<MODEL>(                               \
-      MODEL &, MtpModule &, InferenceRequest &, InferenceOutput &, int64_t,    \
-      const CudaPreparedPrompt *, std::size_t, mfq_tensor_backend::Tensor,     \
-      mfq_tensor_backend::Tensor *)
+#define MFQ_INSTANTIATE_MTP(MODEL)                                 \
+  template Generation run_mtp_generation<MODEL>(                             \
+      MODEL &, MtpModule &, InferenceRequest &, InferenceOutput &, int64_t,  \
+      const CudaPreparedPrompt *, std::size_t, mfq_tensor_backend::Tensor,   \
+      mfq_tensor_backend::Tensor *);
 
-MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMOTtsCausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::Gemma4CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::GlmDsaCausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::Glm5CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen4CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::DeepseekV4CausalLm);
-MFQ_INSTANTIATE_MTP(mfq::cuda::DeepseekV41CausalLm);
+MFQ_CUDA_EACH_MODEL(MFQ_INSTANTIATE_MTP)
 
 #undef MFQ_INSTANTIATE_MTP

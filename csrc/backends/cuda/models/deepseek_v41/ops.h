@@ -1376,6 +1376,8 @@ inline int run_self_check() {
 namespace mfq::cuda {
 
 struct DeepseekV41Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.predictor = CudaPredictorAdapter::deepseek_v41_dspark};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
     template <class Backend> using CausalModel = mfq::models::deepseek_v41::CausalLm<Backend>;
     mfq::models::deepseek_v41::Config config;
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;

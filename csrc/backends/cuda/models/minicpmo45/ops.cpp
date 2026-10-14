@@ -94,6 +94,13 @@ namespace mfq::cuda {
 template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
 
+CudaModelPlan MiniCPMO45Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    if (declares_minicpmo45_components(graph))
+        result.vision = CudaVisionAdapter::minicpmo45;
+    return result;
+}
+
 } // namespace mfq::cuda
 
 namespace mfq::models {

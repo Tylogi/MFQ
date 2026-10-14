@@ -11,6 +11,8 @@
 namespace mfq::cuda {
 
 struct Glm5Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.predictor = CudaPredictorAdapter::flash_next};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
     template <class Backend> using CausalModel = mfq::models::glm5_next::CausalLm<Backend>;
     mfq::models::glm5_next::Config config;
 

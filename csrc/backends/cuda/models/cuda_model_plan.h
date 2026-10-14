@@ -10,19 +10,10 @@ namespace mfq::cuda {
 
 // CUDA resolves semantic implementation IDs from model_graph.json.  These are
 // execution implementations, not checkpoint/model aliases.
-enum class CudaBackbone {
-    generic_qwen,
-    minicpmo45,
-    minicpmo_tts,
-    gemma4,
-    glm_dsa,
-    glm5_next,
-    qwen4_exp,
-    deepseek_v4,
-    deepseek_v41,
-    unsupported,
-};
-
+//
+// There is no backbone enum here on purpose: a graph's family is the CausalLm
+// type whose accepts_backbone() takes graph.backbone. These enums name only the
+// component adapters a family has CUDA code for.
 enum class CudaVisionAdapter {
     none,
     grid_vit,
@@ -37,8 +28,23 @@ enum class CudaPredictorAdapter {
 };
 
 struct CudaModelPlan {
-    CudaBackbone backbone = CudaBackbone::unsupported;
     CudaVisionAdapter vision = CudaVisionAdapter::none;
+    CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
+};
+
+// How the engine runs one CUDA model family. Every family states exactly one of
+// these, as `policy`, in its own models/*/ops.h. The engine reads these instead
+// of comparing model types, so adding a family never edits the engine.
+struct CudaFamilyPolicy {
+    // Bind the engine state to the continuous-batching executor.
+    bool continuous_batching = false;
+    // May use the streamed QSA KV store.
+    bool qsa_kv_offload = false;
+    // Prefill runs layer-major over the whole prompt instead of in chunks.
+    bool layer_major_prefill = false;
+    // Decode replays this family's captured decode graph.
+    bool decode_graph = false;
+    // The MTP predictor adapter this family implements, if it has one.
     CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
 };
 
@@ -52,6 +58,43 @@ struct CudaCapabilityMatrix {
     bool mtp = false;
 };
 
+// Graph component contracts that have a CUDA adapter. A family's
+// plan_components() calls these; an adapter is never inferred from the model
+// name alone.
+inline bool declares_grid_vision(const ModelGraph& graph) noexcept {
+    const auto* vision = graph.component("vision");
+    return vision != nullptr && vision->tensor_root == "vision" &&
+        vision->implementation == "grid_vit" &&
+        vision->input_contract == mfq::kMfqGridVisionInputContract &&
+        vision->position_policy == mfq::kMfqGridMropePositionPolicy;
+}
+
+// MiniCPM-o's CUDA adapter is one composite implementation, so a graph that
+// declares only some of its weighted components is not supported.
+inline bool declares_minicpmo45_components(const ModelGraph& graph) noexcept {
+    const auto* vision = graph.component("vision");
+    const auto* audio = graph.component("audio_input");
+    const auto* tts = graph.component("audio_output");
+    return vision != nullptr && audio != nullptr && tts != nullptr &&
+        vision->implementation == "minicpmo45_vision" &&
+        audio->implementation == "minicpmo45_audio" &&
+        tts->implementation == "minicpmo45_tts";
+}
+
+inline bool declares_next_token_predictor(const ModelGraph& graph) noexcept {
+    const auto* predictor = graph.component("predictor");
+    return predictor != nullptr &&
+        predictor->implementation == "next_token_prediction" &&
+        predictor->tensor_root == "predictor";
+}
+
+inline bool declares_deepseek_v41_dspark(const ModelGraph& graph) noexcept {
+    const auto* predictor = graph.component("predictor");
+    return predictor != nullptr &&
+        predictor->implementation == "deepseek_v41_dspark" &&
+        predictor->tensor_root == "predictor";
+}
+
 struct CudaComponentState {
     bool vision_declared = false;
     bool vision_supported = false;
@@ -63,78 +106,12 @@ struct CudaComponentState {
     bool mtp_enabled = false;
 };
 
-inline constexpr CudaBackbone cuda_backbone(
-        std::string_view implementation) noexcept {
-    if (implementation == "qwen3_5" ||
-        implementation == "generic_qwen") {
-        return CudaBackbone::generic_qwen;
-    }
-    if (implementation == "minicpmo45") {
-        return CudaBackbone::minicpmo45;
-    }
-    if (implementation == "minicpmo_tts") {
-        return CudaBackbone::minicpmo_tts;
-    }
-    if (implementation == "gemma4") return CudaBackbone::gemma4;
-    if (implementation == "glm_dsa") return CudaBackbone::glm_dsa;
-    if (implementation == "glm5_next") return CudaBackbone::glm5_next;
-    if (implementation == "qwen4_exp") return CudaBackbone::qwen4_exp;
-    if (implementation == "deepseek_v4") {
-        return CudaBackbone::deepseek_v4;
-    }
-    if (implementation == "deepseek_v41") {
-        return CudaBackbone::deepseek_v41;
-    }
-    return CudaBackbone::unsupported;
-}
-
-inline CudaModelPlan cuda_model_plan(
-        const ModelGraph& graph) noexcept {
-    CudaModelPlan result;
-    result.backbone = cuda_backbone(graph.backbone);
-    const auto* vision = graph.component("vision");
-    if (graph.backbone == "qwen3_5" && vision != nullptr &&
-        vision->tensor_root == "vision" &&
-        vision->implementation == "grid_vit" &&
-        vision->input_contract == kMfqGridVisionInputContract &&
-        vision->position_policy == kMfqGridMropePositionPolicy) {
-        result.vision = CudaVisionAdapter::grid_vit;
-    }
-    const auto* audio = graph.component("audio_input");
-    const auto* tts = graph.component("audio_output");
-    // The current CUDA MiniCPM adapter is one composite implementation.  Do
-    // not advertise a partially declared graph as supported until those
-    // weighted components have independent adapters.
-    if (result.backbone == CudaBackbone::minicpmo45 &&
-        vision != nullptr && audio != nullptr && tts != nullptr &&
-        vision->implementation == "minicpmo45_vision" &&
-        audio->implementation == "minicpmo45_audio" &&
-        tts->implementation == "minicpmo45_tts") {
-        result.vision = CudaVisionAdapter::minicpmo45;
-    }
-    const auto* predictor = graph.component("predictor");
-    if (graph.backbone == "qwen3_5" && predictor != nullptr &&
-        predictor->implementation == "next_token_prediction" &&
-        predictor->tensor_root == "predictor") {
-        result.predictor = CudaPredictorAdapter::qwen35;
-    }
-    if ((graph.backbone=="qwen4_exp" || graph.backbone=="glm5_next") && predictor!=nullptr &&
-        predictor->implementation=="next_token_prediction" && predictor->tensor_root=="predictor") {
-        result.predictor=CudaPredictorAdapter::flash_next;
-    }
-    if (graph.backbone == "deepseek_v41" && predictor != nullptr &&
-        predictor->implementation == "deepseek_v41_dspark" &&
-        predictor->tensor_root == "predictor") {
-        result.predictor = CudaPredictorAdapter::deepseek_v41_dspark;
-    }
-    return result;
-}
-
 inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
         const CudaModelPlan& plan) noexcept {
     CudaCapabilityMatrix result;
-    result.text = plan.backbone != CudaBackbone::unsupported;
-    if (!result.text) return result;
+    // A plan only exists once a family has been selected, so text is supported;
+    // cuda_runtime_capabilities() gates it on the graph declaring text.
+    result.text = true;
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
         plan.vision == CudaVisionAdapter::minicpmo45;

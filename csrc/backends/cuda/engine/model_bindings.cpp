@@ -1,4 +1,4 @@
-#include "models/deepseek_v4/ops.h"
+#include "cuda_model_list.h"
 
 #include "models/common/causal_model_ops.h"
 #include "ops/execution/execution_options.h"
@@ -7,13 +7,6 @@
 #include "storage/moe/expert_cache.h"
 #include <algorithm>
 #include <iostream>
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
 
 namespace mfq::cuda {
 namespace {
@@ -85,7 +78,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     const auto& source = *model.source;
     validate_model_source(source);
     model.graph = source.resolved_model_graph();
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = Model::plan_components(model.graph);
     model.load_definition(load_model_config_json(source, config_path), model.graph, source, context_size_override);
     model.adapter_validate_load_options();
     if (execution.expert_parallel.enabled() && model.num_experts() <= 0)
@@ -144,12 +137,5 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     template mfq::StepSequence<mfq::cuda::internal::TextSessionRestore> mfq::cuda::internal::TextSessionCache::restore_steps(TYPE&, MtpModule*, const std::string&, const std::vector<int64_t>&, size_t, const std::string&); \
     template mfq::cuda::internal::TextSessionRestore mfq::cuda::internal::TextSessionCache::restore_best(TYPE&, MtpModule*, const std::string&, const std::vector<int64_t>&, size_t, const std::string&);
 
-MFQ_BIND_CUDA_MODEL(mfq::cuda::Qwen35CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::MiniCPMO45CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::MiniCPMOTtsCausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::Gemma4CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::GlmDsaCausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::Glm5CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::Qwen4CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::DeepseekV4CausalLm)
-MFQ_BIND_CUDA_MODEL(mfq::cuda::DeepseekV41CausalLm)
+MFQ_CUDA_EACH_MODEL(MFQ_BIND_CUDA_MODEL)
+#undef MFQ_BIND_CUDA_MODEL

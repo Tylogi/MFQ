@@ -1,13 +1,6 @@
 #pragma once
 
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
+#include "cuda_model_list.h"
 #include "model_components.h"
 #include "load_options.h"
 #include "storage/moe/expert_cache.h"
@@ -18,6 +11,9 @@
 
 namespace mfq::cuda::internal {
 
+// Written out rather than expanded from MFQ_CUDA_EACH_MODEL: C++ rejects a
+// trailing comma in a template argument list. A family added to that list but
+// not here fails to compile at the variant conversion in cuda_engine.cpp.
 template <template<class> class State>
 using CudaModelStates = std::variant<
     std::unique_ptr<State<Qwen35CausalLm>>, std::unique_ptr<State<MiniCPMO45CausalLm>>,
@@ -43,18 +39,10 @@ auto with_loaded_cuda_model(CudaExecutionContext& execution, const CudaLoadOptio
         report_cuda_memory(execution.config, "loaded");
         return run(model, components, started, loaded);
     };
-    switch (cuda_backbone(source->resolved_model_graph().backbone)) {
-        case CudaBackbone::generic_qwen: return load.template operator()<Qwen35CausalLm>();
-        case CudaBackbone::minicpmo45: return load.template operator()<MiniCPMO45CausalLm>();
-        case CudaBackbone::minicpmo_tts: return load.template operator()<MiniCPMOTtsCausalLm>();
-        case CudaBackbone::gemma4: return load.template operator()<Gemma4CausalLm>();
-        case CudaBackbone::glm_dsa: return load.template operator()<GlmDsaCausalLm>();
-        case CudaBackbone::glm5_next: return load.template operator()<Glm5CausalLm>();
-        case CudaBackbone::qwen4_exp: return load.template operator()<Qwen4CausalLm>();
-        case CudaBackbone::deepseek_v4: return load.template operator()<DeepseekV4CausalLm>();
-        case CudaBackbone::deepseek_v41: return load.template operator()<DeepseekV41CausalLm>();
-        case CudaBackbone::unsupported: throw std::runtime_error("unsupported CUDA model backbone");
-    }
-    throw std::runtime_error("invalid CUDA model backbone");
+    const auto& backbone = source->resolved_model_graph().backbone;
+#define MFQ_CASE(TYPE) if (TYPE::accepts_backbone(backbone)) return load.template operator()<TYPE>();
+    MFQ_CUDA_EACH_MODEL(MFQ_CASE)
+#undef MFQ_CASE
+    throw std::runtime_error("unsupported CUDA model backbone: " + backbone);
 }
 } // namespace mfq::cuda::internal

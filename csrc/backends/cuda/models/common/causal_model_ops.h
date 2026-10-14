@@ -59,6 +59,13 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     std::shared_ptr<const mfq::ModelSource> source = {});
 
 struct CausalResources {
+    // The default family strategy: text only, plain execution paths. A family
+    // that differs states its own `policy` and `plan_components` in its own
+    // models/*/ops.{h,cpp}; nothing else in the backend states what a family is.
+    static constexpr CudaFamilyPolicy policy{};
+    // Which declared graph components this family has CUDA adapters for.
+    static CudaModelPlan plan_components(const mfq::ModelGraph&) { return {}; }
+
     CudaResourcePlan adapter_resource_plan(const std::vector<std::unique_ptr<Block>>&,
         bool batch, std::size_t devices, const MtpModule*) const;
     mfq::models::CausalLmMetadata metadata;

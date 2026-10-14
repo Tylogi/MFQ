@@ -342,6 +342,13 @@ namespace mfq::cuda {
 
 template struct CudaSessionCodec<Glm5Model>;
 
+CudaModelPlan Glm5Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    if (declares_next_token_predictor(graph))
+        result.predictor = policy.predictor;
+    return result;
+}
+
 } // namespace mfq::cuda
 
 namespace mfq::models {

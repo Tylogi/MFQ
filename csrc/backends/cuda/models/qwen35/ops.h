@@ -41,6 +41,10 @@ mfq::StepSequence<std::monostate> restore_text_session_state(std::vector<std::un
 namespace mfq::cuda {
 
 struct Qwen35Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.continuous_batching = true,
+        .predictor = CudaPredictorAdapter::qwen35};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
+
     using BatchRequestState = qwen35::QwenBatchRequestState;
     using BatchStorage = qwen35::Qwen35BatchStorage;
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
