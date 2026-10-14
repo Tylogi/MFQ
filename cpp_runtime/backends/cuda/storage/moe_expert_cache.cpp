@@ -3,6 +3,14 @@
 #include "mfq_cuda_resident_allocations.h"
 #include <map>
 #include <cmath>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
         const std::string & name,
@@ -61,7 +69,48 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
     // those weights, retaining room for prefill, graph warmup and growing KV.
     size_t device_free=0,device_total=0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&device_free,&device_total));
-    const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()+kv_growth_reserve;
+    std::size_t transfer_reserve=0,legacy_transfer_reserve=0;
+    if(config_.moe_pipeline && config_.moe_preload_all) {
+        // One decode transfer arena per projection and compressed layout,
+        // shared across layers and M=1..8. Price the pipeline's bounded arenas
+        // instead of withholding the prefill peak throughout decoding.
+        std::map<std::string,std::size_t> transfers;
+        for(const auto& source:sources_)for(const auto& cohort:source->cohorts_) {
+            const auto key=source->projection_role_+":"+cohort.arena->signature;
+            const auto slots=std::min<int64_t>(cohort.cpu->local_experts,moe_decode_transfer_slots(8,10));
+            transfers[key]=std::max(transfers[key],std::size_t(slots)*cohort.arena->slot_bytes);
+        }
+        for(const auto& [key,bytes]:transfers)legacy_transfer_reserve+=bytes;
+        transfer_reserve=legacy_transfer_reserve;
+        if(config_.moe_two_stage_ffn && moe_packed_transfer_stages_enabled() &&
+                std::all_of(sources_.begin(),sources_.end(),[](const auto& s){return s->two_stage_compatible();})) {
+            std::map<int,std::pair<int64_t,int64_t>> packed;
+            for(const auto& bundle:pipeline_bundles_)for(int p=0;p<3;++p) {
+                if(p==1 && bundle[0]==bundle[1])continue;
+                const auto& source=sources_[bundle[p]];
+                auto& [slots,stride]=packed[p];
+                slots=std::max(slots,std::min<int64_t>(source->n_experts(),moe_decode_transfer_slots(8,10)));
+                for(const auto& cohort:source->cohorts_)
+                    stride=std::max(stride,moe_packed_slot_bytes(cohort.bytes_per_expert));
+            }
+            transfer_reserve=0;
+            for(const auto& [p,geometry]:packed)transfer_reserve+=std::size_t(geometry.first*geometry.second);
+        }
+    }
+    // Graph metadata, recurrent snapshots and lazy dense layouts remain live.
+    // Prompt-only workspace is lent by the expert cache.
+    // Loading copies directly into final expert slots and releases its staging
+    // buffers. Only graph/driver overhead and runtime wire buffers survive.
+    const auto other_decode_reserve=std::size_t(1024)<<20;
+    // A packed arena is allocated before its first format is routed. Allow
+    // graph construction's temporary overlap and allocator page rounding.
+    const auto decode_reserve=other_decode_reserve+transfer_reserve+
+        (std::size_t(256)<<20);
+    const auto* borrow_option=std::getenv("MFQ_PREFILL_BORROW");
+    const bool borrowed_prefill=config_.moe_pipeline && config_.moe_preload_all &&
+        mfq::cuda::runtime_options::moe_prefill_layer().value_or(0)!=0 && (!borrow_option || borrow_option[0]!='0');
+    const auto reserve=(borrowed_prefill && !std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")
+        ?decode_reserve:mfq::cuda::runtime_options::workspace_reserve_bytes())+kv_growth_reserve;
     if(device_free<=reserve)
         throw std::runtime_error("CUDA VRAM leaves no workspace for expert streaming");
     const auto requested_physical=budget_bytes_;
@@ -74,7 +123,8 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
         static_cast<std::size_t>(budget_bytes_),device_free-reserve));
     std::cerr<<"moe_cache_physical_budget free_bytes="<<device_free
         <<" workspace_reserve_bytes="<<reserve<<" requested_expert_bytes="<<requested_physical
-        <<" expert_budget_bytes="<<budget_bytes_<<std::endl;
+        <<" expert_budget_bytes="<<budget_bytes_<<" decode_transfer_reserve_bytes="<<transfer_reserve
+        <<" prefill_borrows_experts="<<borrowed_prefill<<std::endl;
     const auto memory=cuda_context->memory_stats();
     if(memory.limit) {
         const auto model_bytes=std::max(memory.allocated,cuda_context->local_memory_usage());
@@ -397,7 +447,10 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
         loan->bytes+=slots*arena->slot_bytes;
         loan->arenas.push_back(std::move(saved));
     }
-    if(loan->bytes<needed)return 0;
+    // The prefill caller adjusts its tile against the actual loan capacity.
+    // Keep a partial loan when the requested peak exceeds all lendable experts;
+    // discarding it would leave only the much smaller unallocated VRAM budget.
+    if(!loan->bytes)return 0;
     // Append temporary cold pools to each immutable layer image. Original
     // books, GPU pointers and the fixed RAM layer layout stay unchanged.
     std::map<int,std::size_t> sizes;
@@ -759,6 +812,18 @@ void MoeExpertCache::preload_complete_residency() {
             << " elapsed_s=" << seconds << " experts_s=" << completed/seconds << std::endl;
     }
     if (transfer_ready_recorded_) MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
+    // Loading batches can contain hundreds of experts. Their staging capacity
+    // must not survive into decoding or consume the host-registration budget.
+    std::size_t released_device=0,released_host=0;
+    for(auto& stage:stages_) {
+        if(stage.pending)MFQ_CUDA_CHECK(cudaEventSynchronize(stage.done));
+        released_device+=tensor_nbytes(stage.device);released_host+=tensor_nbytes(stage.host);
+        stage.device={};stage.host={};stage.pending=false;
+    }
+    next_stage_=0;
+    mfq::cuda::default_context()->reclaim_idle_memory();
+    std::cerr<<"moe_preload_staging_release device_bytes="<<released_device
+        <<" host_bytes="<<released_host<<'\n';
     std::uint64_t gpu_experts=0,ram_experts=0;
     for (const auto& source:sources_) {
         auto& quant=*source->quant_source_;
@@ -790,14 +855,31 @@ void MoeExpertCache::preload_complete_residency() {
         for(const auto& [layer,span]:pipeline_prefill_layers_)
             if(layer<0 && span.first>0)registered=std::min(registered,span.first);
         if(const auto available=mfq::cuda::shared_memory_available(mfq_current_cuda_device())) {
-            constexpr std::size_t scratch=3ULL<<30;
+            // Decode stages are bounded; prefill backup registration separately
+            // checks current headroom and leaves excess backups pageable.
+            const auto scratch=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(1LL<<30));
             registered=std::min<int64_t>(registered,*available>scratch?*available-scratch:0);
         }
 #endif
         if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes()) {
             if(*limit>0)registered=std::min(registered,*limit);
         }
+#ifdef _WIN32
+        SYSTEM_INFO host_info{};GetSystemInfo(&host_info);
+        const auto host_page=std::uintptr_t(host_info.dwPageSize);
+#else
+        const auto host_page=std::uintptr_t(sysconf(_SC_PAGESIZE));
+#endif
         while(registered>0) {
+            // Registration rounds to host pages. Keep a partial arena's end
+            // page-aligned so transfer code can split pinned/pageable fields
+            // at the actual registration boundary.
+            if(registered<ram_allocated) {
+                const auto begin=reinterpret_cast<std::uintptr_t>(address);
+                const auto end=(begin+std::uintptr_t(registered))/host_page*host_page;
+                registered=end>begin?int64_t(end-begin):0;
+                if(!registered)break;
+            }
             const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);
             if(result==cudaSuccess)break;
 #ifdef _WIN32
@@ -1653,6 +1735,7 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     cache->pipeline_prefill_activations_.reset();
     cache->pipeline_prefill_ring_={};
     cache->pipeline_prefill_layer_buffer_={};
+    cache->pipeline_prefill_layer_second_buffer_={};
     cache->pipeline_prefill_layer_down_buffer_={};cache->pipeline_prefill_layer_split_=0;
     cache->pipeline_prefill_layer_stride_=0;
     cache->pipeline_prefill_layer_loaded_={};
@@ -1671,6 +1754,9 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
 
 std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache?cache->streamed_bytes():0;
+}
+void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan) {
+    if(cache)cache->kv_expert_loan_=std::move(loan);
 }
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) {
     if(!cache)return;

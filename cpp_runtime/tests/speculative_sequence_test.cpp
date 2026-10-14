@@ -10,6 +10,7 @@ using namespace mfq::engine;
 struct Tensor {
     std::vector<int64_t> shape;
     bool proposal = false;
+    int64_t start = 0;
 };
 
 struct Model {
@@ -161,6 +162,39 @@ void run(bool dspark) {
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
+}
+
+void run_chunked_prompt_history(bool streaming, int reused) {
+    struct StreamOps : Ops {
+        bool streaming;
+        std::vector<int64_t>* boundaries;
+        bool stream_prompt_history(int64_t) const { return streaming; }
+        static Tensor slice(Tensor value, int axis, int64_t begin, int64_t length) {
+            value=Ops::slice(value,axis,begin,length);value.start+=begin;return value;
+        }
+        Prefill prefill(PrefillChunk chunk) {
+            auto result=Ops::prefill(chunk);result.raw.start=chunk.offset;return result;
+        }
+        double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
+            if(hidden.start+1!=ids.start || size(hidden,1)!=size(ids,1))
+                throw std::runtime_error("streamed prompt lost a hidden/input pair at a chunk or reused boundary");
+            boundaries->push_back(model.cache_pos);
+            (void)predictor_step(hidden,ids,positions);return 0;
+        }
+    };
+    Model model;model.cache_pos=reused;
+    Predictor mtp;mtp.position=reused?reused-1:0;
+    InferenceRequest request;request.chat=false;request.prompt=std::vector<int64_t>(13,0);
+    request.sampling.max_tokens=1;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"mtp-chunked-prompt-history");
+    Tensor last_hidden,restored{{1,1,1},false,reused-1};
+    std::vector<int64_t> boundaries;
+    auto generation=speculative_sequence(StreamOps{Ops{model,mtp},streaming,&boundaries},
+        request,output,4,reused,restored,&last_hidden);
+    while(auto step=generation.next()) {}
+    if(boundaries.empty() || (streaming?boundaries.front()>=13:boundaries.front()!=13) ||
+        mtp.position!=12 || last_hidden.start!=12 || output.result.completion_tokens!=1)
+        throw std::runtime_error("streamed prompt history changed the final cache boundary");
 }
 
 void run_prompt_snapshot_boundary() {
@@ -407,6 +441,7 @@ void batch_policy() {
 int main() {
     run(false);
     run(true);
+    for(bool streaming:{false,true})for(int reused:{0,4})run_chunked_prompt_history(streaming,reused);
     run_prompt_snapshot_boundary();
     run_bootstrap_publication();
     run_target_initialization();

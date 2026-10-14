@@ -1087,8 +1087,11 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-bench")gdn_prefill_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-columns-bench")gdn_short_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-stream-graph-check")qsa_streamed_graph_case();
     else if(argc==2 && std::string(argv[1])=="--turboquant-kv-check")kv_quantization_case();
     else if(argc==2 && std::string(argv[1])=="--turboquant-qsa-check") {qsa_case(8,4,40);qsa_case(256,24,64);qsa_case(128,6,64,64);qsa_kv_offload_case();}
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-check")qsa_sparse_gate_case();

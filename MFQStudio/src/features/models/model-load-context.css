@@ -1,0 +1,15 @@
+.model-load-context { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line-strong); }
+.model-load-context h3 { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+.model-load-context input[type="number"] { width: 130px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-control); color: var(--ink); font: inherit; }
+.model-load-context input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; }
+.model-load-context p { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 12px 0; }
+.model-load-context p[role="alert"] { color: var(--danger); }
+.model-load-advanced-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 12px; }
+.model-load-advanced-heading label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.model-load-context .model-load-advanced-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 6px 0; background: none; border: 0; box-shadow: none; color: var(--ink); }
+.model-load-advanced-toggle svg { transition: transform .15s ease; }
+.model-load-advanced-toggle[aria-expanded="true"] svg { transform: rotate(90deg); }
+.model-load-context-kinds { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px; }
+.model-load-context-kinds button { min-height: 32px; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.model-load-context-kinds button[aria-pressed="true"] { color: var(--ink); border-color: var(--ink-soft); background: var(--surface-subtle); }
+.model-load-context-kinds button:hover { color: var(--ink); background: var(--surface-hover); }

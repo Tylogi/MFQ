@@ -5,6 +5,7 @@
 #include "mfq_cuda_context.h"
 #include "runtime/moe_residency.h"
 #include "runtime/dma_copy_batch.h"
+#include "runtime/kv_expert_loan.h"
 #include "mfq/host_parallel.h"
 #include "mfq/moe_cpu_cost_model.h"
 #include "mfq/moe_cpu_calibration.h"
@@ -15,6 +16,7 @@
 struct MoeFfnPrefillHostWorkspace;
 class MoeExpertCache {
 public:
+    std::shared_ptr<mfq::cuda::KvExpertLoan> kv_expert_loan_;
     std::size_t begin_prefill_loan(std::size_t workspace_bytes);
     void suspend_prefill_loan();
     void end_prefill_loan();
@@ -674,8 +676,14 @@ public:
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
             for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
+        std::size_t transfer_bytes=0;
+        for(const auto& [signature,arena]:pipeline_stages_)if(!signature.starts_with("prefill16:")) {
+            if(arena->packed.defined())transfer_bytes+=std::size_t(tensor_nbytes(arena->packed));
+            for(const auto& field:arena->fields)transfer_bytes+=std::size_t(tensor_nbytes(field));
+        }
         return {{"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
-            {"resident_expert_cache_bytes",double(gpu_weights)},
+            {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
+            {"expert_decode_transfer_bytes",double(transfer_bytes)},
             {"ram_expert_payload_bytes", double(resident)},
             {"ram_expert_pcie_read_bytes", double(stats_.ram_pcie_bytes)}};
     }
@@ -819,6 +827,7 @@ private:
     std::map<int,std::pair<int64_t,int64_t>> pipeline_prefill_layers_;
     std::map<int,int64_t> pipeline_prefill_layer_gate_up_bytes_;
     mfq_tensor_backend::Tensor pipeline_prefill_layer_buffer_;
+    mfq_tensor_backend::Tensor pipeline_prefill_layer_second_buffer_;
     mfq_tensor_backend::Tensor pipeline_prefill_layer_down_buffer_;
     int64_t pipeline_prefill_layer_split_=0;
     int64_t pipeline_prefill_layer_stride_=0;
@@ -1009,7 +1018,7 @@ private:
             }
             if (transfer.nbytes == 0) continue;
             const bool direct_mapped =
-                !prewarming_ && transfer.mapped_source != nullptr;
+                !prewarming_ && !measuring_preload_h2d_ && transfer.mapped_source != nullptr;
             if (direct_mapped) {
                 ++mapped_count;
             } else {
@@ -1037,7 +1046,7 @@ private:
         }
         ++stats_.h2d_submissions;
         stats_.h2d_descriptors += transfer_count;
-        if (prewarming_) {
+        if (prewarming_ || measuring_preload_h2d_) {
             auto & stage = acquire_stage(staged_payload_bytes, false);
             auto * staging = stage.host.data_ptr<uint8_t>();
             int64_t offset = 0;
@@ -1048,6 +1057,12 @@ private:
                 offset += transfer.nbytes;
             }
             finish_range_reads();
+            MoePreloadH2DTiming* timing=nullptr;
+            if(measuring_preload_h2d_) {
+                preload_h2d_timings_.push_back(std::make_unique<MoePreloadH2DTiming>(staged_payload_bytes));
+                timing=preload_h2d_timings_.back().get();
+                MFQ_CUDA_CHECK(cudaEventRecord(timing->begin,weight_stream_));
+            }
             offset = 0;
             for (const auto & transfer : transfers) {
                 if (transfer.nbytes == 0) continue;
@@ -1063,6 +1078,7 @@ private:
                 }
                 offset += transfer.nbytes;
             }
+            if(timing)MFQ_CUDA_CHECK(cudaEventRecord(timing->end,weight_stream_));
             MFQ_CUDA_CHECK(cudaEventRecord(
                 stage.done, weight_stream_));
             MFQ_CUDA_CHECK(cudaEventRecord(

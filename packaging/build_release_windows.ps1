@@ -322,7 +322,7 @@ function Initialize-PythonEnvironment {
 
     $syncArguments = @(
         "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
-        "--group", "release"
+        "--group", "release", "--extra", "benchmark"
     )
     Invoke-Checked $Context.Tools.Uv $syncArguments
 
@@ -415,11 +415,12 @@ function Build-PythonCli {
     )
     foreach ($package in @(
             "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
-            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets", "pyarrow")) {
+            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets", "pyarrow",
+            "pandas", "sympy", "regex", "loguru", "antlr4", "yaml", "tokenizers")) {
         $arguments += @("--collect-all", $package)
     }
     foreach ($module in @(
-            "torch", "transformers", "tokenizers", "safetensors",
+            "torch", "transformers", "safetensors",
             "scipy", "tiktoken",
             "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",

@@ -1,3 +1,10 @@
+@import '../../shared/styles/numeric-values.css';
+
+.analysis-page, .architecture-dialog {
+  --small-numerals-font: "MFQ Small Numerals", var(--text-font);
+  font-family: var(--small-numerals-font);
+}
+
 .analysis-page { display: grid; min-width: 0; gap: 22px; }
 .analysis-checkpoint-bar { display: flex; min-width: 0; align-items: flex-end; gap: 14px; }
 .analysis-checkpoint-bar > label { display: grid; width: min(360px, 100%); min-width: 0; gap: 9px; }

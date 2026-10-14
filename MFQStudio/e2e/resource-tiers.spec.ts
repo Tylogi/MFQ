@@ -43,8 +43,9 @@ for (const language of ['zh-CN', 'en'] as const) {
       return { family: style.fontFamily, weight: style.fontWeight };
     });
     await page.goto('/model-hub');
-    await expect(page.locator('.variant-memory-pressure > strong')).toHaveCount(3);
-    expect(await page.locator('.variant-memory-pressure > strong').first().evaluate(element => {
+    const percentages = page.locator('.model-variant-list .variant-memory-pressure > strong');
+    await expect(percentages).toHaveCount(3);
+    expect(await percentages.first().evaluate(element => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, weight: style.fontWeight };
     })).toEqual(reference);

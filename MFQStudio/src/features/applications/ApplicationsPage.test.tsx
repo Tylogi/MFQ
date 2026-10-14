@@ -17,10 +17,10 @@ beforeEach(() => {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockResolvedValue(undefined) } });
 });
 
-it('shows five configuration snippets without application management actions', async () => {
+it('shows six configuration snippets without application management actions', async () => {
   render(<ApplicationsPage />);
   await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue('alias'));
-  expect(screen.getAllByRole('button', { name: 'Copy configuration' })).toHaveLength(5);
+  expect(screen.getAllByRole('button', { name: 'Copy configuration' })).toHaveLength(6);
   expect(screen.getByText('http://127.0.0.1:8991/v1/messages')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /install|configure and connect|download|launch/i })).not.toBeInTheDocument();
 });
@@ -29,8 +29,8 @@ it('uses local official application images instead of initials', async () => {
   const { container } = render(<ApplicationsPage />);
   await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue('alias'));
   const marks = Array.from(container.querySelectorAll('.application-mark'));
-  expect(marks).toHaveLength(5);
-  for (const [index, id] of ['dsh', 'opencode', 'claude', 'openclaw', 'hermes'].entries()) {
+  expect(marks).toHaveLength(6);
+  for (const [index, id] of ['dsh', 'opencode', 'claude', 'openclaw', 'hermes', 'pi'].entries()) {
     expect(marks[index].tagName).toBe('IMG');
     expect(marks[index]).toHaveAttribute('src', `/application-icons/${id}.svg`);
     expect(marks[index]).toHaveAttribute('alt', '');
@@ -58,10 +58,26 @@ it('keeps SDK root inside Claude configuration and full request URL in the page'
   expect(screen.getByText('http://127.0.0.1:8991/v1/messages')).toBeInTheDocument();
 });
 
+it('copies Pi models.json with the active alias and Chat Completions endpoint', async () => {
+  render(<ApplicationsPage />);
+  await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue('alias'));
+  expect(screen.getByText('~/.pi/agent/models.json')).toBeInTheDocument();
+  fireEvent.click(screen.getAllByRole('button', { name: 'Copy configuration' })[5]);
+  await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledOnce());
+  expect(JSON.parse(vi.mocked(navigator.clipboard.writeText).mock.calls[0][0])).toEqual({ providers: { mfq: {
+    baseUrl: 'http://127.0.0.1:8090/v1', api: 'openai-completions', apiKey: 'YOUR_MFQ_API_KEY',
+    models: [{ id: 'alias', name: 'alias' }],
+  } } });
+  expect(openStudioExternal).not.toHaveBeenCalled();
+});
+
 it('escapes model IDs as data in JSON and YAML', () => {
   const model = 'name"\nnot: a new property';
   const opencode = JSON.parse(applicationConfiguration('opencode', model, 'http://127.0.0.1:8090/v1', null));
   expect(opencode.model).toBe(`mfq/${model}`);
   expect(applicationConfiguration('hermes', model, 'http://127.0.0.1:8090/v1', null)).toContain(JSON.stringify(model));
   expect(applicationConfiguration('claude', model, '', null)).toBe('');
+  const pi = JSON.parse(applicationConfiguration('pi', model, 'https://mfq.example/v1', null));
+  expect(pi.providers.mfq.models).toEqual([{ id: model, name: model }]);
+  expect(pi.providers.mfq.baseUrl).toBe('https://mfq.example/v1');
 });

@@ -245,13 +245,13 @@ def _calibrate_imatrix(args: argparse.Namespace) -> int:
 
 
 def _wt2_reference(args: argparse.Namespace) -> int:
-    from mfq.calibration.wt2 import generate_reference
+    from mfq.evaluation.reference import generate_reference
     backend = ('metal' if sys.platform == 'darwin' else 'cuda') if args.backend == 'auto' else args.backend
     device = args.device or ('mps' if backend == 'metal' else 'cuda:0')
     if device.split(':', 1)[0] != ('mps' if backend == 'metal' else 'cuda'):
         raise ValueError('WT2 device must match the selected backend')
     generate_reference(args.model, args.dataset, args.output, context_size=args.context_size,
-        chunks=args.chunks, device=device, layerwise=not args.resident)
+        chunks=args.chunks, device=device, layerwise=not args.resident, runtime=args.runtime or None)
     return 0
 
 
@@ -680,6 +680,7 @@ def _build_parser() -> argparse.ArgumentParser:
     reference.add_argument('--backend', choices=('auto', 'metal', 'cuda'), default='auto')
     reference.add_argument('--device', default='')
     reference.add_argument('--resident', action='store_true')
+    reference.add_argument('--runtime', default='', help='native CUDA runtime executable')
     reference.set_defaults(_impl=_wt2_reference)
     sub.add_parser(
         "voice-runtime-check",

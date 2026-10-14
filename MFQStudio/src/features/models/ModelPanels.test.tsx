@@ -5,6 +5,7 @@ import type { useModelCatalog } from './useModelCatalog';
 import { LoadedModels } from './LoadedModels';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
@@ -24,6 +25,8 @@ function catalog() {
     filteredArtifacts: [],
     loadPinned: false,
     loadIdleTtl: null,
+    loadContext: DEFAULT_LOAD_CONTEXT,
+    setLoadContext: vi.fn(),
     chooseModelDirectory: vi.fn(),
     selectModel: vi.fn(),
     unloadInstance: vi.fn(),
@@ -45,7 +48,7 @@ it('固定与空闲卸载仍调用对应策略操作', () => {
   const state = catalog();
   render(<ModelLoadPolicy catalog={state} />);
   fireEvent.click(screen.getByRole('switch', { name: '固定到内存' }));
-  fireEvent.change(screen.getByRole('combobox'), { target: { value: '900' } });
+  fireEvent.change(screen.getByRole('combobox', { name: '空闲卸载' }), { target: { value: '900' } });
   expect(state.setLoadPinned).toHaveBeenCalledWith(true);
   expect(state.setLoadIdleTtl).toHaveBeenCalledWith(900);
 });

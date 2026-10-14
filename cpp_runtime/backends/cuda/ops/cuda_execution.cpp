@@ -87,6 +87,14 @@ bool enabled_unless_disabled(const char* name) {
 } // namespace
 
 namespace mfq::cuda::runtime_options {
+bool kv_vram_preallocated() {
+    const auto* value = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
+    return value && value[0] == '1';
+}
+bool vision_resident() {
+    const auto* value = std::getenv("MFQ_CUDA_VISION_RESIDENT");
+    return value && value[0] == '1';
+}
 namespace {
 bool exact_one(const char* name, bool fallback = false) {
     const auto* value = std::getenv(name);
@@ -1272,6 +1280,16 @@ std::optional<std::int64_t> moe_ram_pin_bytes() {
         if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
             throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
         return gib>0?std::max<std::int64_t>(1,std::int64_t(gib*(1ull<<30))):0;
+    }
+    return std::nullopt;
+}
+std::optional<std::int64_t> moe_ram_pin_reserve_bytes() {
+    if (const auto* value = std::getenv("MFQ_MOE_RAM_PIN_RESERVE_GIB")) {
+        char* end=nullptr;
+        const double gib=std::strtod(value,&end);
+        if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>=double(INT64_MAX)/(1ull<<30))
+            throw std::invalid_argument("MFQ_MOE_RAM_PIN_RESERVE_GIB must be finite and non-negative");
+        return std::int64_t(gib*(1ull<<30));
     }
     return std::nullopt;
 }

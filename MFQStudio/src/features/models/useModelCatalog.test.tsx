@@ -12,6 +12,7 @@ import { useModelCatalog } from './useModelCatalog';
 import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
 import { setApiBaseUrl } from '../../shared/api/client';
 import { isStudio, selectLocalModelDirectory } from '../../studio';
+import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 const state = vi.hoisted(() => ({
   ready: false,
@@ -302,10 +303,11 @@ describe('useModelCatalog', () => {
       result.current.setLoadDeviceIds(['2']);
     });
     await act(async () => result.current.loadArtifact(artifact.name));
-    expect(load).toHaveBeenCalledWith('Local Model', 8192, 2048, {
+    expect(load).toHaveBeenCalledWith('Local Model', 32768, 2048, {
       pin: true,
       idle_ttl_seconds: 300,
       device_ids: ['2'],
+      context_management: DEFAULT_LOAD_CONTEXT,
     });
     expect(state.refreshRuntime).toHaveBeenCalledWith(false);
     expect(state.setSelectedModel).toHaveBeenCalledWith('Local Model');

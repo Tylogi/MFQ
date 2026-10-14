@@ -13,9 +13,9 @@ void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout
 void publish_mapped_flag(uint32_t* flag) noexcept;
 void check_stream_progress(cudaStream_t stream);
 void check_route_submission(cudaStream_t stream);
-// A captured window submits the model once. Each expert operator records its
-// GPU body and supplies the corresponding host task; replay serves those tasks
-// in graph order without launching a graph or synchronizing at every layer.
+// Resident KV uses one model graph. Streamed KV adds boundaries at host I/O;
+// expert operators within each segment keep their GPU body and host tasks in
+// one submission. Disk reads run after a segment completes, without GPU spins.
 class DecodeWindow {
 public:
     struct Task {
@@ -40,6 +40,12 @@ public:
                  const std::function<void()>& restore,
                  const std::function<void()>& release_output = {});
     void enroll(Task task);
+    // Finish the current GPU segment before running host I/O. During graph
+    // preparation only the supplied placeholder buffers are consumed.
+    void host_barrier(std::function<void()> serve);
+    template<class T,class Factory> std::shared_ptr<T> workspace(const void* identity,Factory create) {
+        auto& owner=workspaces_[identity];if(!owner)owner=create();return std::static_pointer_cast<T>(owner);
+    }
     void run();
     void mark(int layer,const char* phase);
     void mark_current(const char* phase) {mark(profile_layer_,phase);}
@@ -47,8 +53,9 @@ public:
     void set_profile_geometry(const char* role,int rows) {profile_role_=role;profile_rows_=rows;}
     void set_profile_layer_kind(int layer,const char* kind) {if(layer_profile_)profile_kinds_[layer]=kind;}
     std::vector<GpuPhase> gpu_phases() const;
-    std::size_t nodes() const { return graphs_.find(0,1)->nodes(); }
-    bool valid() const { return graphs_.find(0,1)!=nullptr; }
+    std::size_t nodes() const;
+    std::size_t segments() const {return barriers_.size()+1;}
+    bool valid() const { const auto* graph=graphs_.find(0,1);return graph && graph->valid() && !recording_segments_; }
     static DecodeWindow* recording() noexcept;
 private:
     cudaStream_t stream_;
@@ -67,6 +74,10 @@ private:
     std::map<int,std::string> profile_kinds_;
     void observe_layers();
     std::vector<Task> tasks_;
+    std::map<const void*,std::shared_ptr<void>> workspaces_;
+    struct Barrier {std::size_t task_end;std::function<void()> serve;};
+    std::vector<Barrier> barriers_;
+    bool recording_segments_=false;
     bool failed_=false;
     int64_t capture_ns_=0,replay_ns_=0,reset_ns_=0,launch_ns_=0,serve_ns_=0,wait_ns_=0,finish_ns_=0,profile_ns_=0;
     uint64_t replays_=0;

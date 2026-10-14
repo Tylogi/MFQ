@@ -176,6 +176,6 @@ template <typename Model>
 Model load_causal_lm(CudaExecutionContext &execution, const std::string &model_path,
                      const std::string &config_path, std::int64_t context_size_override = 0,
                      bool load_blocks = true, bool defer_moe_cache_finalize = false,
-                     std::shared_ptr<const mfq::ModelSource> source = {});
+                     std::shared_ptr<const mfq::ModelSource> source = {}, bool load_input_output = true);
 
 } // namespace mfq::cuda

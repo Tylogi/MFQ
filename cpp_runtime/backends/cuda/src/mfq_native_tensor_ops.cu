@@ -51,6 +51,9 @@ __global__ void unary_kernel(
                 break;
             }
             case 24: result = ::pow(value, first); break;
+            case 27:
+                result=0.5*value*(1.0+::tanh(0.7978845608028654*(value+0.044715*value*value*value)));
+                break;
         }
         destination[tensor_offset(output, linear)] = store_number<Value>(result);
     }
@@ -238,7 +241,7 @@ __global__ void contiguous_scalar_kernel(
 bool contiguous_unary_operation(int operation) {
     return operation == 2 || operation == 3 || operation == 11 ||
         operation == 12 || operation == 13 || operation == 14 ||
-        operation == 18 || operation == 22;
+        operation == 18 || operation == 22 || operation == 27;
 }
 
 __device__ float apply_unary(float value, int operation) {
@@ -251,6 +254,7 @@ __device__ float apply_unary(float value, int operation) {
         case 14: return 1.0f / ::sqrtf(value);
         case 18: return ::logf(value);
         case 22: return value / (1.0f + ::expf(-value));
+        case 27: return 0.5f*value*(1.0f+::tanhf(0.7978845608028654f*(value+0.044715f*value*value*value)));
         default: return value;
     }
 }
@@ -464,7 +468,10 @@ Tensor log1p(const Tensor& input) { return unary_cuda(input, 19); }
 Tensor log2(const Tensor& input) { return unary_cuda(input, 20); }
 Tensor exp2(const Tensor& input) { return unary_cuda(input, 21); }
 Tensor silu(const Tensor& input) { return unary_cuda(input, 22); }
-Tensor gelu(const Tensor& input, const std::string&) { return unary_cuda(input, 23); }
+Tensor gelu(const Tensor& input, const std::string& approximation) {
+    if(approximation!="none" && approximation!="tanh")throw std::invalid_argument("unknown GELU approximation");
+    return unary_cuda(input,approximation=="tanh"?27:23);
+}
 Tensor exp(const Tensor& input) { return input.exp(); }
 Tensor sqrt(const Tensor& input) { return input.sqrt(); }
 Tensor pow(const Tensor& input, double exponent) { return unary_cuda(input, 24, exponent); }

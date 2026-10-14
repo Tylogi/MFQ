@@ -56,7 +56,7 @@ def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None
     assert "mfq_tensor_backend::layer_norm(" in CUDA
     assert "attention_cuda(" in CUDA
     assert "Tensor gelu_tanh(" in CUDA
-    assert "mfq_tensor_backend::tanh(" in CUDA
+    assert 'mfq_tensor_backend::gelu(input,"tanh")' in CUDA
     assert "mfq::models::grid_vision::merge(" in CUDA
     assert "mfq::models::grid_vision::prepare(" in CUDA
     assert "mfq_tensor_backend::gelu(value, \"none\")" in CUDA

@@ -71,6 +71,7 @@ export function ApplicationsPage() {
           </div>
           <details><summary>{tr('配置片段', 'Configuration snippet')}<code>{app.file}</code></summary>
             {app.id === 'dsh' && <p>{tr('桌面版使用 desktop 而非 web 目录；在应用环境或凭据中设置 MFQ_API_KEY。JSON 数组可作为 YAML 配置片段。', 'Use the desktop directory instead of web for the desktop app. Set MFQ_API_KEY in the application environment or credentials. The JSON array is also a valid YAML snippet.')}</p>}
+            {app.id === 'pi' && <p>{tr('保存后在 Pi 中运行 /model，选择 MFQ 下的模型。', 'After saving, run /model in Pi and select the model under MFQ.')}</p>}
             {model && snippet ? <pre>{snippet}</pre> : <p>{tr('请先载入模型，并启用对应 API 端口。', 'Load a model and enable the required API listener first.')}</p>}
           </details>
         </section>;

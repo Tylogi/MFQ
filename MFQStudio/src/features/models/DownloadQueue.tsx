@@ -3,6 +3,7 @@ import type { JobResource } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { Icon } from '../../app/display';
 import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
+import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
@@ -90,7 +91,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
                 {' · '}{formatBytes(job.progress_data.downloaded_bytes)}{job.progress_data.total_bytes ? ` / ${formatBytes(job.progress_data.total_bytes)}` : ''}
                 {' · '}{job.progress_data.files_completed ?? 0} {tr('个文件完成', 'files completed')}
               </small>}
-              {job.error && <p className="download-item-error">{job.error.message}</p>}
+              {job.error && <p className="download-item-error">{errorMessage(new ApiError(400, { error: job.error }), tr)}</p>}
             </div>
             {(isActiveDownload(job) || retry) && <button disabled={busyId !== null || job.status === 'cancelling'} onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();

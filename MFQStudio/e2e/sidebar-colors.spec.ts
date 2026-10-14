@@ -11,8 +11,7 @@ test('sidebar labels and icons use neutral ink in every theme', async ({ page },
   const nav = page.locator('#studio-sidebar .sectioned-nav');
   const active = nav.locator('button[aria-current="page"]');
   const models = nav.getByRole('button', { name: 'Models', exact: true });
-  await expect(nav.getByRole('button', { name: 'Quantization', exact: true }).locator('svg > path'))
-    .toHaveAttribute('d', 'M3 19h4.5v-5H12V9h4.5V4H21');
+  await expect(nav.getByRole('button', { name: 'Quantization', exact: true })).toHaveCount(0);
   await expect(nav.getByRole('button', { name: 'Resources', exact: true }).locator('svg > path'))
     .toHaveAttribute('d', 'M12 3C10 6.3 5 10.7 5 14a7 7 0 0 0 14 0c0-3.3-5-7.7-7-11z');
   for (const label of await nav.locator('button, .sidebar-group-label').all()) {

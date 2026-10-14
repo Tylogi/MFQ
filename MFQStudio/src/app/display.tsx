@@ -31,7 +31,6 @@ export type IconName =
   | "paperclip"
   | "play"
   | "plus"
-  | "quantize"
   | "queue"
   | "refresh"
   | "reuse"
@@ -87,7 +86,6 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "paperclip" && <><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.6 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8" /></>}
       {name === "play" && <path d="m8 5 11 7-11 7z" fill="currentColor" stroke="none" />}
       {name === "plus" && <><path d="M12 5v14M5 12h14" /></>}
-      {name === "quantize" && <path d="M3 19h4.5v-5H12V9h4.5V4H21" />}
       {name === "queue" && <><path d="M8 7h12M8 12h12M8 17h12" /><circle cx="4" cy="7" r="1" fill="currentColor" stroke="none" /><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="4" cy="17" r="1" fill="currentColor" stroke="none" /></>}
       {name === "refresh" && <><path d="M20 6v5h-5" /><path d="M4 18v-5h5" /><path d="M18.5 9A7 7 0 0 0 6.1 6.1L4 8M5.5 15A7 7 0 0 0 17.9 17.9L20 16" /></>}
       {name === "reuse" && <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M18.3 9A7 7 0 0 0 6 6.5L4 9M5.7 15A7 7 0 0 0 18 17.5l2-2.5" /></>}

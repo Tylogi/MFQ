@@ -12,8 +12,24 @@ the default. Metal keeps its existing dynamic allocation and storage controls.
 | --- | --- |
 | `vram` | Preallocated GPU storage; reject a context that cannot fit. |
 | `ram` | Preallocated mapped host memory, accessible to CUDA kernels. |
-| `auto` (default) | GPU storage first, then a preallocated RAM arena; no SSD fallback. |
-| `auto_ssd` | GPU storage, RAM LRU, then SSD. Disk storage is created on first spill. |
+| `auto` (default) | Budgeted VRAM hot KV and preallocated RAM cold KV; reject insufficient combined capacity. SSD KV is disabled. |
+| `auto_ssd` | Budgeted VRAM hot KV, RAM cold KV, then SSD spill. RAM may be preallocated or allocated as KV grows; SSD storage is created on demand. |
+
+The service's automatic VRAM budget includes the entire target indexer cache
+plus a smoothly interpolated fraction of raw KV: 100% at zero context, 60% at
+128K, 30% at 256K and 10% at 1M. An explicit `gpu_budget_bytes` must cover the
+indexer cache. Unused KV capacity can hold extra experts, which are evicted as
+KV grows. VRAM and RAM tiers exchange cold rows without retaining a full
+duplicate in RAM. `ram_preallocated` defaults to true; disabling it requires
+`auto_ssd`. The service checks disk capacity before admitting SSD-backed KV.
+
+Studio's model loading policy includes a collapsible Context management
+component. An empty default context means 32768 tokens, capped by the model's
+supported limit. Automatic settings disable KV quantization and SSD KV and
+enable preallocation. Manual settings distinguish sparse-attention RAM/SSD
+controls from other models' VRAM preallocation. Defaults are saved per server
+in the current browser and resolved against model/backend capabilities when
+loading. Explicit API KV settings take precedence over these defaults.
 
 Indexer rows, pooled index keys, recurrent state and compute scratch remain on
 the GPU. Capacity admission accounts for dense weights, the minimum expert
@@ -27,6 +43,24 @@ configured context, initially maps up to 16K tokens of raw KV, and grows in 8K
 steps rounded to the driver's allocation granularity. Existing KV is not copied
 when pages are added. Indexer storage is currently preallocated.
 
+GPU kernels resolve RAM cache misses while decode/MTP graphs retain stable
+addresses. Selected rows remain resident across attention calls; queries larger
+than the hot window can read cold RAM rows without an unbounded wait. SSD-backed
+attention uses stable GPU staging and performs required host I/O outside graph
+replay. Indexer and recurrent state remain on the GPU. Prefix restore and
+rewritten speculative positions invalidate stale resident rows. KV precision
+is unchanged (FP16 unless explicitly configured).
+
+Native CLI callers that do not supply the service's tier-budget settings retain
+the legacy 64K threshold and 32K hot-window policy, configured through
+`MFQ_KV_AUTO_STREAM_MIN_CONTEXT` and `MFQ_KV_RESIDENT_CELLS`. Unified-memory
+devices do not use that legacy discrete-memory policy.
+
+Long-prompt prefill also budgets sequence-sized residual and FFN injection arrays
+before choosing a compute tile. When borrowing expert storage, the two transfer
+ring slots use separate allocations so their combined size need not fit one
+contiguous region. If the second slot cannot fit, prefill uses one slot.
+
 Dynamic allocation currently requires GPU-resident raw KV (`vram` or `auto`).
 Growth headroom is retained in the expert budget; direct physical-page exchange
 with expert arenas is not implemented. Additional concurrent sessions are
@@ -38,9 +72,13 @@ SSD use `kv_memory_insufficient`; the Studio message offers enabling SSD KV or
 reducing context length. Settings are persisted per model after a successful
 reload, and a failed reload restores the previous settings.
 
-Local Strata reference `fb58e0dbc8399662c0e47c76578c6e878b14f6cf` defaults to a
-4096-token context. Its context default is fixed; its automatic expert-cache
-budget is computed from remaining memory after model, KV and workspace costs.
+Local Strata reference `fb58e0dbc8399662c0e47c76578c6e878b14f6cf` has a
+4096-token native CLI default. The README's recommended interactive setup instead
+selects context from the model and memory budget (typically 128K for Flash-Next
+on a 24 GiB GPU). From 64K, when RAM permits, that setup keeps raw KV in RAM
+with `--kv-resident 32768`; it normally uses INT8 KV above 8K. MFQ adopts the
+long-context placement without changing the user's context or KV precision.
+Strata's expert-cache budget accounts for model, KV and workspace costs.
 
 Native regression coverage includes four placements, RAM/SSD spill ordering,
 generation parity, reset, prefix restore, MTP, continuous batching and stable
@@ -238,3 +276,15 @@ This corrects timing attribution; it does not by itself reduce inference time.
 Parser-held trailing text is flushed before the final prefix snapshot. Cache
 storage and cleanup still finish before the terminal event; they no longer hold
 back the last visible characters of an otherwise completed response.
+
+CUDA expert transfer arenas pack per-projection fields while retaining stable
+graph addresses. Preload copies pinned host weights directly into final expert
+slots and releases temporary staging after transfer completion. Large MTP
+prompt histories can remain in RAM and upload bounded predictor tiles; the
+predictor budgets its compute workspace before borrowing expert capacity.
+
+Grid vision weights remain in RAM by default and move to VRAM for each encoder
+stage. Its workspace estimate includes decoded projection weights and MLP
+activations. Fused tanh GELU avoids retaining a chain of full-sized temporaries.
+Windows image requests support the authenticated binary tensor-file transport
+used by the Python server, with file ownership, shape and token validation.

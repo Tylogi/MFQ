@@ -9,13 +9,13 @@ sidecars.
 
 ## macOS
 
-The macOS release packages the serve-only `mfq` CLI and MFQ Studio into an
+The macOS release packages the `mfq` service/evaluation CLI and MFQ Studio into an
 Apple Silicon DMG. It includes:
 
-- the unified `mfq` CLI with the `serve` dependencies only;
+- the unified `mfq` CLI with service, benchmark scoring, and native WT2 reference generation;
 - the private native `mfq-decode-metal` sidecar;
 - `libmlx`, `libjaccl`, `mlx.metallib`, and the AVFoundation video bridge;
-- MFQ Studio and its production Web UI.
+- MFQ Studio and its production Web UI, without PyTorch.
 
 Build from a clean checkout on Apple Silicon:
 
@@ -31,7 +31,8 @@ code signatures, then copies the DMG to `packaging/dist/`.
 ## Windows
 
 The Windows release packages `mfq serve`, MFQ Studio, and the native CUDA
-`mfq-runtime` sidecar into a single x64 NSIS installer. This serve-only package
+`mfq-runtime` sidecar into a single x64 NSIS installer. Service, benchmark scoring,
+and native WT2 reference generation are included. The package
 excludes PyTorch and the training, calibration, quantization, and MiniCPM-o
 dependency groups. The CUDA, cuBLAS, MSVC, and optional OpenMP runtime DLLs are
 bundled with the sidecar, so end users do not need Python, the CUDA Toolkit, or a

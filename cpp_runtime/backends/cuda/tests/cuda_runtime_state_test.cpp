@@ -17,6 +17,8 @@
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
 #include "runtime/kv_memory.h"
+#include "runtime/kv_expert_loan.h"
+#include "runtime/dma_copy_batch.h"
 
 #include <chrono>
 #include <cstring>
@@ -727,6 +729,175 @@ static void check_kv_memory() {
         failed=std::string(e.what()).find("kv_memory_insufficient:")==0;
     }
     check(failed && !pending->ready,"automatic KV silently exceeded RAM/VRAM capacity");
+
+    // A small resident window deliberately overflows the selected-row union.
+    // Both GPU hits and direct RAM reads must agree with a GPU-only oracle.
+    for(int width:{32,256})for(double bits:{0.,2.5,4.}) {
+        KvMemoryOptions automatic;automatic.auto_stream_threshold=128;automatic.resident_cells=4;
+        automatic.ram_limit_set=true;automatic.ram_limit=1<<20;
+        KvMemoryManager tiered(automatic);
+        const auto floating=options.dtype(tb::kFloat32);
+        const int key_bits=int(std::floor(bits)),value_bits=int(std::ceil(bits));
+        const int key_width=bits?cuda_kv_packed_width(width,key_bits):width;
+        const int value_width=bits?cuda_kv_packed_width(width,value_bits):width;
+        auto memory=tiered.add(128,1,key_width,value_width,8,4,options.dtype(bits?tb::kInt32:tb::kFloat16));
+        tiered.finalize();
+        check(memory->host && memory->hot.defined() && !memory->offload,
+            "automatic RAM KV did not keep a graph-compatible resident window");
+        check(memory->ram_bytes()==memory->raw_bytes() && memory->gpu_bytes()<memory->raw_bytes()+memory->index_bytes()+4096,
+            "automatic RAM KV incorrectly charged the full raw cache to VRAM");
+        auto raw=tb::arange(128*width,floating).remainder(23).reshape({1,1,128,width})/23.;
+        auto encoded_keys=bits?cuda_kv_encode(raw,key_bits,false):raw.to(tb::kFloat16);
+        auto encoded_values=bits?cuda_kv_encode(raw*.5,value_bits,true):(raw*.5).to(tb::kFloat16);
+        memory->keys.copy_(encoded_keys);memory->values.copy_(encoded_values);
+        auto query=tb::full({1,2,2,width},.125,floating);
+        auto selected=tb::tensor(std::vector<int32_t>{1,2,3,4,127,2,1,5,6,126},options.dtype(tb::kInt32)).reshape({1,2,5});
+        const auto check_published=[&](const std::vector<int>& rows) {
+            const auto tags=memory->hot.mapping.cpu().contiguous();
+            const auto slots=memory->hot.slot_ids.cpu().contiguous();
+            for(int row:rows)check(tags.data_ptr<int32_t>()[row]>=0,
+                "published KV row was not resident");
+            for(const auto& pair:{std::pair{memory->keys,memory->hot.keys},
+                                  std::pair{memory->values,memory->hot.values}}) {
+                const auto raw=pair.first.cpu().contiguous(),hot=pair.second.cpu().contiguous();
+                const auto bytes=raw.size(3)*raw.element_size();
+                for(int row=0;row<128;++row) {
+                    const int slot=tags.data_ptr<int32_t>()[row];if(slot<0)continue;
+                    check(slot<4 && slots.data_ptr<int32_t>()[slot]==row,
+                        "published KV has inconsistent row/slot ownership");
+                    check(std::memcmp(static_cast<const char*>(raw.data_ptr())+row*bytes,
+                        static_cast<const char*>(hot.data_ptr())+slot*bytes,bytes)==0,
+                        "published KV retained stale encoded data");
+                }
+            }
+        };
+        memory->hot.publish(memory->keys,memory->values,tb::arange(4,options.dtype(tb::kInt64)));
+        check_published({0,1,2,3});
+        auto prefix=tb::tensor(std::vector<int32_t>{0,1,2,3},options.dtype(tb::kInt32)).reshape({1,1,4});
+        memory->hot.prepare(memory->keys,memory->values,prefix,
+            tb::tensor(std::vector<int64_t>{3},options.dtype(tb::kInt64)),128,true);
+        check(memory->hot.control.cpu().contiguous().data_ptr<int64_t>()[2]==0,
+            "resident short prefix still queued RAM reads");
+        // One append larger than the cache must retain the final window.
+        memory->hot.publish(memory->keys,memory->values,tb::arange(10,options.dtype(tb::kInt64)));
+        check_published({6,7,8,9});
+        const auto wrapped=memory->hot.mapping.cpu().contiguous();
+        for(int row=0;row<6;++row)check(wrapped.data_ptr<int32_t>()[row]<0,
+            "wrapped KV append retained an overwritten row tag");
+        const auto compare=[&] {
+            auto key=memory->keys.clone(),value=memory->values.clone();
+            memory->hot.prepare(memory->keys,memory->values,selected);
+            auto expected=bits?cuda_kv_attention(query,key,value,KvQuantization{double(bits)},selected):
+                mfq_qwen4_exp::sparse_gqa_attention(query,key,value,selected);
+            auto actual=bits?cuda_kv_attention(query,memory->keys,memory->values,KvQuantization{double(bits)},selected,
+                {},0,{},0,{},{},0,memory->hot.view()):
+                mfq_qwen4_exp::sparse_gqa_attention(query,memory->keys,memory->values,selected,memory->hot.view());
+            auto a=actual.cpu().contiguous(),e=expected.cpu().contiguous();
+            for(int64_t i=0;i<a.numel();++i)check(std::abs(a.data_ptr<float>()[i]-e.data_ptr<float>()[i])<1e-5,
+                "resident/RAM selected attention changed the GPU-only result");
+        };
+        compare();compare();
+        memory->hot.prepare(memory->keys,memory->values,
+            tb::tensor(std::vector<int32_t>{1},options.dtype(tb::kInt32)).reshape({1,1,1}));
+        check(memory->hot.mapping.cpu().contiguous().data_ptr<int32_t>()[1]>=0,
+            "KV overwrite test did not begin with a resident old row");
+        auto replacement=tb::full({1,1,1,width},.875,floating);
+        memory->keys.narrow(2,1,1).copy_(bits?cuda_kv_encode(replacement,key_bits,false):replacement.to(tb::kFloat16));
+        memory->values.narrow(2,1,1).copy_(bits?cuda_kv_encode(replacement,value_bits,true):replacement.to(tb::kFloat16));
+        memory->hot.publish(memory->keys,memory->values,
+            tb::tensor(std::vector<int64_t>{1},options.dtype(tb::kInt64)));
+        check_published({1});
+        // Rewind below the hot-window boundary after a long-prefix lookup.
+        memory->hot.publish(memory->keys,memory->values,tb::arange(2,options.dtype(tb::kInt64)));
+        check_published({0,1});
+        compare();memory->hot.reset();compare();
+        auto counters=memory->hot.control.cpu().contiguous();
+        check(counters.data_ptr<int64_t>()[4]>0 && counters.data_ptr<int64_t>()[5]>0,
+            "resident KV test failed to exercise cold fills and bounded overflow");
+    }
+    KvMemoryOptions no_ram;no_ram.auto_stream_threshold=128;no_ram.resident_cells=4;
+    no_ram.ram_limit_set=true;no_ram.ram_limit=0;
+    KvMemoryManager gpu_only(no_ram);
+    auto resident=gpu_only.add(128,1,32,32,8,4,options);gpu_only.finalize();
+    check(!resident->host && !resident->hot.defined(),"automatic KV ignored an unavailable RAM budget");
+}
+
+static void check_exclusive_kv() {
+    namespace tb=mfq_tensor_backend;
+    const auto options=tb::TensorOptions().device(tb::kCUDA);
+    for(int width:{32,256})for(double bits:{0.,2.5,4.}) {
+        const int maximum=128,heads=2,cells=5;
+        const int kw=bits?cuda_kv_packed_width(width,int(std::floor(bits))):width;
+        const int vw=bits?cuda_kv_packed_width(width,int(std::ceil(bits))):width;
+        KvMemoryOptions policy;policy.budget_policy=true;policy.ram_limit_set=true;policy.ram_limit=1<<20;
+        policy.gpu_budget=(maximum+maximum/4)*8*2+cells*heads*(kw+vw)*(bits?4:2);
+        KvMemoryManager manager(policy);
+        auto memory=manager.add(maximum,heads,kw,vw,8,4,options.dtype(bits?tb::kInt32:tb::kFloat16));manager.finalize();
+        check(memory->hot.exclusive(),"budgeted KV did not use exclusive GPU/RAM tiers");
+        check(memory->ram_bytes()==std::size_t(maximum-cells)*heads*(kw+vw)*(bits?4:2),"RAM KV duplicated GPU capacity");
+        auto raw=tb::arange(heads*maximum*width,options.dtype(tb::kFloat32)).remainder(29).reshape({1,heads,maximum,width})/29.;
+        auto k=bits?cuda_kv_encode(raw,int(std::floor(bits)),false):raw.to(tb::kFloat16);
+        auto v=bits?cuda_kv_encode(raw*.5,int(std::ceil(bits)),true):(raw*.5).to(tb::kFloat16);
+        auto positions=tb::arange(maximum,options.dtype(tb::kInt64));
+        memory->hot.append(k.narrow(2,0,31),v.narrow(2,0,31),positions.narrow(0,0,31));
+        memory->hot.append(k.narrow(2,31,97),v.narrow(2,31,97),positions.narrow(0,31,97));
+        auto selected=tb::tensor(std::vector<int32_t>{1,2,3,4,127,2,1,5,6,126},options.dtype(tb::kInt32)).reshape({1,2,5});
+        auto query=tb::full({1,4,2,width},.125,options.dtype(tb::kFloat32));
+        const auto compare=[&] {
+            memory->hot.prepare(memory->keys,memory->values,selected);
+            auto expected=bits?cuda_kv_attention(query,k,v,KvQuantization{bits},selected):mfq_qwen4_exp::sparse_gqa_attention(query,k,v,selected);
+            auto actual=bits?cuda_kv_attention(query,memory->keys,memory->values,KvQuantization{bits},selected,{},0,{},0,{},{},0,memory->hot.view()):
+                mfq_qwen4_exp::sparse_gqa_attention(query,memory->keys,memory->values,selected,memory->hot.view());
+            auto a=actual.cpu().contiguous(),e=expected.cpu().contiguous();
+            for(int64_t i=0;i<a.numel();++i)check(std::abs(a.data_ptr<float>()[i]-e.data_ptr<float>()[i])<1e-5,"exclusive KV attention differs from GPU-only oracle");
+            auto saved=memory->hot.gather(maximum);
+            for(const auto& pair:{std::pair{saved.first,k},std::pair{saved.second,v}}) {
+                auto found=pair.first.cpu().contiguous(),oracle=pair.second.cpu().contiguous();
+                check(std::memcmp(found.data_ptr(),oracle.data_ptr(),found.nbytes())==0,"exclusive KV migration corrupted encoded rows");
+            }
+        };
+        compare();compare();
+        // Rewrites at full capacity must reuse free GPU slots as well as RAM
+        // slots; a fixed ring destination would require an extra cold row.
+        for(int row:{1,127,4,126,2,3}) {
+            auto kr=k.narrow(2,row,1).contiguous(),vr=v.narrow(2,row,1).contiguous();
+            memory->hot.append(kr,vr,positions.narrow(0,row,1));compare();
+        }
+        memory->hot.reset();memory->hot.append(k,v,positions);compare();
+    }
+}
+
+static void check_kv_expert_loan() {
+    namespace tb=mfq_tensor_backend;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
+    auto arena=tb::zeros({512<<10},options),destination=tb::empty({128<<10},options);
+    auto source=tb::full({128<<10},73,options.device(tb::kCPU));
+    Stream copy(0);KvExpertLoan loan;loan.add(arena,128,4096,true);
+    bool hit=false;
+    check(loan.copy({0,1,2},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit)
+        && !hit && loan.bytes()==source.nbytes(),"unused KV storage did not accept an expert field");
+    check(loan.copy({0,1,2},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit) && hit,"extra expert cache missed a resident field");
+    int uploads=0;
+    const auto stage=[&]() -> const void* {++uploads;return source.data_ptr();};
+    const auto* cached=loan.pin({0,2,2},nullptr,source.nbytes(),copy.get(),hit,nullptr,stage);
+    check(cached && !hit && uploads==1,"pageable expert miss did not request its staged source");
+    check(loan.pin({0,2,2},nullptr,source.nbytes(),copy.get(),hit,nullptr,stage)==cached && hit && uploads==1,
+        "pageable expert hit staged its CPU weights again");
+    loan.ensure(128);arena.zero_();
+    check(!loan.pin({0,3,2},nullptr,source.nbytes(),copy.get(),hit,nullptr,stage) && uploads==1,
+        "unavailable expert cache unnecessarily staged CPU weights");
+    check(loan.bytes()==0 && !loan.copy({0,1,2},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),"KV growth did not reclaim expert pages");
+    auto result=destination.cpu().contiguous();
+    for(int64_t i=0;i<result.numel();++i)check(result.data_ptr<uint8_t>()[i]==73,"KV reclamation raced an expert transfer");
+    KvOffloadConfig config;config.preallocate=true;config.ssd_enabled=false;
+    config.buffer_bytes=256<<10;config.gpu_budget_bytes=(512<<10)+config.buffer_bytes;
+    KvOffloadStore store(config);auto shared=std::make_shared<KvExpertLoan>();store.set_expert_loan(shared);
+    check(shared->copy({1,1,2},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),"streamed KV arena did not lend unused storage");
+    check(store.expert_loan_bytes()==source.nbytes(),"streamed KV loan accounting is incorrect");
+    auto rows=tb::full({128,512},7,options.dtype(tb::kFloat16));auto block=store.write(rows);
+    check(store.expert_loan_bytes()==0,"streamed KV growth did not reclaim its expert pages");
+    auto recovered=store.read(block).to(tb::kCPU,tb::kFloat32).contiguous();
+    for(int64_t i=0;i<recovered.numel();++i)check(recovered.data_ptr<float>()[i]==7,"streamed KV overwrote a live expert transfer");
 }
 
 static void check_workspace_loan() {
@@ -762,11 +933,148 @@ static void check_workspace_loan() {
           "restoring expert bytes changed its address or contents");
 }
 
+static void check_graph_workspace_reuse() {
+    namespace tb=mfq_tensor_backend;
+    auto context=default_context();const auto stream=mfq_current_cuda_stream();
+    const auto before=context->memory_stats().allocated;
+    context->begin_graph_pool(stream);
+    tb::Tensor retained;
+    {
+        GraphWarmupScope warmup(context,stream);
+        auto large=tb::empty({65536},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        const auto* address=large.data_ptr();large={};
+        retained=tb::empty({49152},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        check(retained.data_ptr()==address,"smaller graph shape did not reuse available scratch");
+        retained.fill_(7);
+    }
+    context->end_graph_pool(stream);
+    check(context->memory_stats().allocated==before+65536,"retained graph block lost its allocation capacity");
+    check(retained.cpu().data_ptr<uint8_t>()[49151]==7,"retired graph pool invalidated a live tensor");
+    retained={};context->reclaim_idle_memory();
+    check(context->memory_stats().allocated==before,"oversized graph block was not fully released");
+}
+
+static void check_streamed_graph_segments() {
+    namespace tb=mfq_tensor_backend;
+    auto context=default_context();const auto stream=mfq_current_cuda_stream();
+    context->begin_graph_pool(stream);
+    {
+        auto input=tb::ones({16},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32));
+        auto first=tb::empty_like(input),second=tb::empty_like(input),output=tb::empty_like(input);
+        int calls=0;bool fail=false;
+        DecodeWindow window(stream);
+        window.capture([&] {
+            first.copy_(input*2);
+            window.host_barrier([&] {
+                ++calls;
+                check(first.cpu().data_ptr<float>()[0]==input.cpu().data_ptr<float>()[0]*2,"host I/O ran before its GPU producer");
+                if(fail)throw std::runtime_error("injected KV read failure");
+                first.copy_(first+3);
+            });
+            second.copy_(first*4);
+            window.host_barrier([&] {++calls;second.copy_(second+5);});
+            output.copy_(second*6);
+        },[]{});
+        check(calls==0 && window.segments()==3,"capture executed host I/O or lost a boundary");
+        for(int i=1;i<=3;++i) {
+            input.fill_(i);window.run();
+            auto host=output.cpu();
+            for(int j=0;j<16;++j)check(host.data_ptr<float>()[j]==((i*2+3)*4+5)*6,"segmented graph replay changed its data dependency");
+        }
+        check(calls==6,"host I/O was duplicated during replay");
+        fail=true;bool caught=false;
+        try {window.run();} catch(const std::runtime_error& error) {caught=std::string(error.what())=="injected KV read failure";}
+        check(caught && calls==7,"failed I/O ran a dependent segment");
+    }
+    context->end_graph_pool(stream);
+    for(const auto dtype:{tb::kFloat16,tb::kInt32})for(bool preallocate_ram:{false,true}) {
+        KvOffloadConfig config;config.preallocate=true;config.ram_preallocated=preallocate_ram;
+        config.buffer_bytes=4096;config.gpu_budget_bytes=6144;config.ram_budget_bytes=1024;
+        config.directory=(std::filesystem::current_path()/"streamed-kv-test").string();
+        auto store=std::make_shared<KvOffloadStore>(config);KvOffloadSequence sequence(store,128,2,dtype);
+        auto source=tb::arange(64*128,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64)).remainder(997).to(dtype).reshape({64,128});
+        sequence.append(source);
+        for(int planar:{0,32}) {
+            auto workspace=sequence.gather_workspace(16,2,planar);
+            for(int pass=0;pass<2;++pass) {
+                std::vector<int64_t> selected{63,0,7,62,12,0,61};
+                if(pass)std::reverse(selected.begin(),selected.end());
+                sequence.gather_into(selected,*workspace);
+                tb::Tensor actual;
+                if(planar) {
+                    auto flat=workspace->rows.reshape({-1});
+                    auto keys=flat.narrow(0,0,16*64).reshape({2,16,32}).permute({1,0,2}).reshape({16,64});
+                    auto values=flat.narrow(0,16*64,16*64).reshape({2,16,32}).permute({1,0,2}).reshape({16,64});
+                    actual=tb::cat({keys,values},1).narrow(0,0,selected.size());
+                } else actual=workspace->rows.narrow(0,0,selected.size());
+                auto expected=source.index_select(0,tb::tensor(selected).to(tb::kCUDA)).cpu().contiguous();
+                auto host=actual.cpu().contiguous();
+                check(host.nbytes()==expected.nbytes() && !std::memcmp(host.data_ptr(),expected.data_ptr(),host.nbytes()),"fixed KV gather changed RAM/SSD/GPU rows");
+            }
+        }
+        double reads=0,hits=0;for(const auto& [name,value]:store->metrics()) {
+            if(name=="qsa_kv_ssd_reads")reads=value;if(name=="qsa_kv_gpu_hits")hits=value;
+        }
+        check(reads>0 && hits>0,"streamed gather test missed cold or hot rows");
+    }
+}
+
+void check_gelu_approximations() {
+    namespace tb=mfq_tensor_backend;
+    std::vector<float> values(289);
+    for(std::size_t i=0;i<values.size();++i)values[i]=float(i-144.0)/32;
+    for(auto dtype:{tb::kFloat32,tb::kFloat16})for(bool strided:{false,true}) {
+        auto input=tb::tensor(values,tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32))
+            .reshape({17,17}).to(tb::kCUDA).to(dtype);
+        if(strided)input=input.transpose(0,1);
+        auto source=input.contiguous().to(tb::kFloat32).to(tb::kCPU);
+        for(const std::string mode:{"none","tanh"}) {
+            auto output=tb::gelu(input,mode).to(tb::kFloat32).to(tb::kCPU);
+            for(int i=0;i<289;++i) {
+                const double x=source.data_ptr<float>()[i];
+                const auto reference=mode=="tanh"?
+                    .5*x*(1+std::tanh(.7978845608028654*(x+.044715*x*x*x))):
+                    .5*x*(1+std::erf(x/std::sqrt(2.0)));
+                const auto tolerance=dtype==tb::kFloat32?2e-6:5e-4;
+                check(std::abs(output.data_ptr<float>()[i]-reference)<=tolerance*std::max(1.0,std::abs(x)),
+                    "GELU approximation differs from its scalar reference");
+            }
+        }
+    }
+}
+
+void check_dma_copy_buckets() {
+    using namespace mfq::cuda;
+    namespace tb=mfq_tensor_backend;
+    constexpr int rows=129,width=32;
+    auto host=tb::empty({rows,width},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+    auto device=tb::empty({rows,width},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+    auto* source=host.data_ptr<uint8_t>();
+    for(int i=0;i<rows*width;++i)source[i]=uint8_t(i%251);
+    DmaCopyBatch batch(mfq_current_cuda_stream());
+    batch.prepare(128,device.data_ptr(),source);
+    for(int count:{1,17,65,128,3,73,2,0,129}) {
+        device.fill_(255);
+        std::vector<DmaCopy> copies;
+        for(int i=0;i<count;++i)copies.push_back({device.data_ptr<uint8_t>()+i*width,source+i*width,width});
+        check(batch.submit(copies)==(count>0 && count<=128),"DMA capacity dispatch mismatch");
+        auto actual=device.cpu().contiguous();
+        for(int i=0;i<rows*width;++i)check(actual.data_ptr<uint8_t>()[i]==(i<count*width?source[i]:255),
+            "DMA capacity reused an inactive copy or lost an active copy");
+    }
+}
+
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    check_dma_copy_buckets();
     check_workspace_loan();
     check_kv_memory();
+    check_exclusive_kv();
+    check_kv_expert_loan();
+    check_graph_workspace_reuse();
+    check_gelu_approximations();
+    check_streamed_graph_segments();
     check_retained_recurrent_storage();
     check_sampling_storage();
     check_linear_execution();

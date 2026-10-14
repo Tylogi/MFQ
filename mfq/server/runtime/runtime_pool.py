@@ -68,6 +68,7 @@ from mfq.server.runtime.client import HttpRuntimeClient, StdioRuntimeClient
 from mfq.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget, inspect_prefix_cache, purge_prefix_cache, read_prefix_cache_tokens, prefix_cache_identity
 from mfq.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
 from mfq.server.runtime.qsa_kv_policy import QSA_KV_BUFFER_BYTES, qsa_index_requirement
+from mfq.server.runtime.kv_budget import checkpoint_kv_budget, check_ssd_capacity
 from mfq.server.runtime.native import (
     append_native_prefill_chunk_override,
     find_native_runtime_resource,
@@ -557,6 +558,11 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        from mfq.server.runtime.load_context import apply_load_context
+        try:
+            request = apply_load_context(request, artifact.resource.architecture, self.backend)
+        except ValueError as error:
+            raise _job_error("kv_ssd_required", "Disabling RAM preallocation requires SSD KV") from error
         if 'qsa_kv_offload' not in request.model_fields_set:
             saved_storage = self.context_policy.model_qsa_kv_offload.get(artifact.resource.name)
             if saved_storage is not None:
@@ -582,6 +588,8 @@ class RuntimePool:
         resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
         request = request.model_copy(update={"context_size": resolved,
             "qsa_kv_offload": request.qsa_kv_offload.model_copy(update={"target_context": resolved})})
+        if self.backend == "cuda" and artifact.resource.architecture.casefold().startswith("qwen4_exp"):
+            await asyncio.to_thread(self._validate_kv_memory_budget, artifact, request)
         if request.qsa_kv_offload.enabled:
             await self._validate_qsa_kv_policy(artifact, request.qsa_kv_offload, yarn_enabled=request.yarn_enabled)
         if self.memory_policy.total_limit_bytes is not None or self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
@@ -1424,6 +1432,67 @@ class RuntimePool:
             self._prefix_disk_status = {key: value for key, value in result.items() if key.startswith("prefix_cache_")}
             self._prefix_disk_checked_at = time.monotonic()
 
+    async def reclaim_prefix_disk_for_download(self, destination: Path) -> None:
+        from mfq.server.runtime.disk_budget import DiskBudget, volume
+        from mfq.server.runtime.prefix_disk_budget import _scan_blocks, _remove_block
+        import shutil
+        directory = self._prefix_cache_directory()
+        if volume(directory) != volume(destination):
+            return
+        async with self._prefix_budget_lock:
+            blocks = await asyncio.to_thread(_scan_blocks, directory)
+            used = sum(block.size for block in blocks)
+            deficit = await asyncio.to_thread(lambda: DiskBudget().reserved(destination) - shutil.disk_usage(destination).free)
+            target = max(0, used - deficit)
+            if target >= used:
+                self._prefix_disk_checked_at = 0.0
+                return
+            identities = {name: await asyncio.to_thread(prefix_cache_identity, directory, name)
+                for name in {block.namespace for block in blocks}}
+            async with self._lock:
+                if self._loading_model_names or self._memory_configuration_job is not None:
+                    raise _job_error("cache_reclaim_busy", "Wait for model loading or cache configuration before reclaiming SSD prefix space")
+                current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
+                if any(not getattr(item, "prefix_concurrent_maintenance", False) and
+                    (item.active_requests or item.queued_requests or item.control_leases) for item in current):
+                    raise _job_error("cache_reclaim_busy", "This runtime must finish its current request before reclaiming SSD prefix space")
+                for item in current:
+                    item.control_leases += 1
+                    item.read_control_leases += 1
+            try:
+                loaded_paths = {str(item.artifact.path) for item in current}
+                active = {name for name, identity in identities.items()
+                    if identity.get('model_path') in loaded_paths or current and not identity.get('model_path')}
+                active_used = sum(block.size for block in blocks if block.namespace in active)
+                active_target = target * active_used // max(1, used)
+                for item in current:
+                    share = active_target // len(current)
+                    hot = item.memory.prefix_cache_limit_bytes if item.memory and item.memory.prefix_cache_limit_bytes is not None else 0
+                    result = await item.backend.set_prefix_cache_budget(hot, disk_target_bytes=share)
+                    if result.get('status') != 'ok':
+                        raise _job_error("cache_reclaim_failed", "Could not reduce the SSD prefix cache budget")
+                    item.prefix_disk_capacity = share
+                offline_target = target - active_target
+                def evict_offline():
+                    offline = [block for block in blocks if block.namespace not in active]
+                    remaining = sum(block.size for block in offline)
+                    for block in sorted(offline, key=lambda block: block.stat.st_mtime_ns):
+                        if remaining <= offline_target:
+                            break
+                        removed = _remove_block(block)
+                        if removed:
+                            remaining -= removed[0]
+                await asyncio.to_thread(evict_offline)
+                deadline = time.monotonic() + 30
+                while await asyncio.to_thread(lambda: shutil.disk_usage(destination).free < DiskBudget().reserved(destination)):
+                    if time.monotonic() >= deadline:
+                        raise _job_error("cache_reclaim_busy", "Some SSD prefix blocks are still in use; retry the download after the current request")
+                    await asyncio.sleep(.05)
+                self._prefix_disk_checked_at = 0.0
+            finally:
+                for item in current:
+                    await self._release_control_lease(item, read_only=True)
+
     async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None, *, wait: bool = True,
                                           reclaim_ram: bool = False) -> None:
         if not wait and self._prefix_budget_lock.locked():
@@ -1449,6 +1518,8 @@ class RuntimePool:
                 disk_limit = self.memory_policy.prefix_disk_limit_bytes
                 if disk_limit is None:
                     disk_limit = self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", 100 << 30)
+                else:
+                    disk_limit = min(disk_limit, self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", disk_limit))
                 disk_targets = {}
                 ram_candidates = [item for item in candidates if item.memory.prefix_cache_ram_limit_bytes is not None]
                 ram_reserved = sum(item.memory.prefix_cache_ram_limit_bytes or 0 for item in current
@@ -2437,6 +2508,8 @@ class RuntimePool:
         updated = previous.model_copy(update={"context_size": target, "yarn_enabled": enabled,
             "qsa_kv_offload": policy, "kv_quantization": quantization, "kv_memory": kv_memory,
             "pin": instance.pinned, "idle_ttl_seconds": instance.idle_ttl_seconds})
+        if self.backend == "cuda" and getattr(instance, "kv_memory_supported", False):
+            await asyncio.to_thread(self._validate_kv_memory_budget, instance.artifact, updated)
         async with self._lock:
             if self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY or \
                 instance.active_requests or instance.queued_requests or instance.control_leases:
@@ -3537,9 +3610,10 @@ class RuntimePool:
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
             capacity = self._cuda_discrete_device_capacity(request)
             if capacity:
-                # Compressed dense projections also materialize CUDA layouts
-                # lazily; prefill scratch, graph KV growth and MTP need space.
-                device_ceiling = max(1, capacity - max(2 << 30, capacity // 3))
+                # The native worker prices concrete dense/KV allocations and
+                # decode scratch after load; prefill borrows expert storage.
+                # Do not reserve another third before that calculation.
+                device_ceiling = max(1, capacity - max(1 << 30, capacity // 16))
                 ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
@@ -3564,10 +3638,8 @@ class RuntimePool:
             0,
             resident_total_bytes - artifact.routed_expert_bytes,
         )
-        runtime_headroom = min(
-            4 << 30,
-            max(1 << 30, ceiling // 20),
-        )
+        runtime_headroom = 0 if self.backend == "cuda" else min(
+            4 << 30, max(1 << 30, ceiling // 20))
         resident_expert_bytes = min(
             artifact.routed_expert_bytes,
             max(0, ceiling - runtime_headroom - dense_bytes),
@@ -3877,13 +3949,13 @@ class RuntimePool:
             job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
             normalized = message.casefold()
-            for code in ("kv_memory_insufficient", "kv_vram_insufficient", "kv_dynamic_unavailable"):
+            for code in ("kv_memory_insufficient", "kv_vram_insufficient", "kv_dynamic_unavailable", "kv_budget_below_indexer", "kv_ssd_required", "kv_ssd_insufficient"):
                 if code + ":" in message:
                     instance.error = ErrorDetail(code=code, message=message, retryable=False)
                     break
             if message.startswith("mfq-decode-metal:"):
                 level = RuntimeLogLevel.ERROR
-            elif re.search(r"(?:^|:\s+)warning:", normalized):
+            elif message.startswith("runtime_kv_warning ") or re.search(r"(?:^|:\s+)warning:", normalized):
                 level = RuntimeLogLevel.WARNING
             elif "error" in normalized:
                 level = RuntimeLogLevel.ERROR
@@ -4302,6 +4374,33 @@ class RuntimePool:
                 return port
         raise RuntimeManagementError("unable to reserve a unique runtime port")
 
+    def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
+        _, available = host_memory_capacity()
+        limit = request.kv_memory.ram_budget_bytes
+        if available is not None:
+            cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
+            available = max(0, available - cold_experts - (2 << 30))
+            limit = available if limit is None else min(limit, available)
+        return limit
+
+    def _validate_kv_memory_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest):
+        try:
+            plan = checkpoint_kv_budget(artifact,
+                self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
+                request.kv_memory, request.kv_quantization)
+            if request.kv_memory.placement == "auto_ssd":
+                # Dynamic RAM may need to release every cold block. Verify that
+                # SSD can hold the complete L1 overflow before loading weights.
+                ram = self._kv_ram_limit(artifact, request)
+                required = plan.ram_required_bytes if not request.kv_memory.ram_preallocated or ram is None else max(0, plan.ram_required_bytes - ram)
+                check_ssd_capacity(self._prefix_cache_directory(), required + min(64 << 20, plan.raw_bytes))
+            elif request.kv_memory.ram_budget_bytes is not None and request.kv_memory.ram_budget_bytes < plan.ram_required_bytes:
+                raise ValueError("kv_memory_insufficient: RAM KV budget cannot hold the target cold KV; enable SSD KV or reduce context length")
+            return plan
+        except ValueError as error:
+            code = str(error).split(":", 1)[0]
+            raise _job_error(code if code.startswith("kv_") else "kv_memory_unsupported", str(error)) from error
+
     def _launch_configuration(
         self,
         artifact: DiscoveredModel,
@@ -4349,6 +4448,10 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        from mfq.server.runtime.disk_budget import DiskBudget
+        process_environment['MFQ_DISK_BUDGET_DIR'] = str(DiskBudget().root)
+        if self.backend == "cuda":
+            process_environment.setdefault("MFQ_MEMORY_ARCHITECTURE", memory_topology()["memory_architecture"])
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
                 and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0
                 and memory_topology()["memory_architecture"] == "discrete"):
@@ -4388,14 +4491,19 @@ class RuntimePool:
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")
         process_environment["MFQ_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
+        if self.backend == "cuda" and request.context_management is not None:
+            defaults = request.context_management
+            process_environment["MFQ_KV_VRAM_PREALLOCATED"] = "1" if defaults.automatic or defaults.vram_preallocated else "0"
         if self.backend == "cuda":
             process_environment["MFQ_KV_PLACEMENT"] = request.kv_memory.placement
             process_environment["MFQ_KV_ALLOCATION"] = request.kv_memory.allocation
-            _, host_available = host_memory_capacity()
-            if host_available is not None:
-                # Reserve RAM for experts before allocating KV arenas.
-                cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
-                process_environment["MFQ_KV_RAM_LIMIT_BYTES"] = str(max(0, host_available - cold_experts - (2 << 30)))
+            process_environment["MFQ_KV_RAM_PREALLOCATED"] = "1" if request.kv_memory.ram_preallocated else "0"
+            process_environment.pop("MFQ_KV_GPU_BUDGET_BYTES", None)
+            if request.kv_memory.gpu_budget_bytes is not None:
+                process_environment["MFQ_KV_GPU_BUDGET_BYTES"] = str(request.kv_memory.gpu_budget_bytes)
+            ram_limit = self._kv_ram_limit(artifact, request)
+            if ram_limit is not None:
+                process_environment["MFQ_KV_RAM_LIMIT_BYTES"] = str(ram_limit)
         process_environment.pop("MFQ_QSA_KV_BUDGET_BYTES", None)
         process_environment.pop("MFQ_QSA_KV_TARGET_CONTEXT", None)
         process_environment.pop("MFQ_QSA_KV_RAM_BUDGET_BYTES", None)

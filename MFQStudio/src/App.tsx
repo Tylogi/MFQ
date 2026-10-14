@@ -42,11 +42,6 @@ const EvaluationsPage = lazy(() =>
     default: module.EvaluationsPage,
   })),
 );
-const QuantizationPage = lazy(() =>
-  import('./features/jobs/QuantizationPage').then((module) => ({
-    default: module.QuantizationPage,
-  })),
-);
 const AnalysisPage = lazy(() =>
   import('./features/analysis/AnalysisPage').then((module) => ({ default: module.AnalysisPage })),
 );
@@ -80,7 +75,6 @@ export default function App() {
                     <Route path="analysis" element={<AnalysisPage />} />
                     <Route path="model-hub" element={<ModelHubPage />} />
                     <Route path="evaluations" element={<EvaluationsPage />} />
-                    <Route path="quantization" element={<QuantizationPage />} />
                   </Route>
                   <Route path="*" element={<NotFoundPage />} />
                 </Route>

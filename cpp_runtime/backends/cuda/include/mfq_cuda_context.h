@@ -226,7 +226,7 @@ private:
         cudaMemPool_t memory = nullptr;
         bool capturing = false;
         bool warming = false;
-        std::unordered_map<std::size_t, std::vector<void*>> available;
+        std::map<std::size_t, std::vector<void*>> available;
         std::unordered_set<void*> owned;
     };
 
@@ -238,6 +238,9 @@ private:
     std::shared_ptr<AllocationBudget> allocation_budget_;
     void trim_pool_pages() const;
     mutable std::mutex graph_pool_mutex_;
+    // A tensor may use a larger cached graph block and outlive its pool.
+    // Account/free the allocation's capacity, not that tensor's logical bytes.
+    std::unordered_map<void*,std::size_t> graph_allocation_sizes_;
     struct WorkspaceLoan {
         cudaStream_t stream=nullptr;
         std::thread::id thread;

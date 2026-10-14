@@ -29,7 +29,7 @@ export function Wt2ReferenceGenerator({ dataset, contextSize, chunks, available,
   async function inspect() {
     const current = ++version.current;
     setChecking(true); setError('');
-    try { const next = await quantizationApi.source(path); if (current === version.current) setSource(next); }
+    try { const next = await quantizationApi.source(path, true); if (current === version.current) setSource(next); }
     catch (cause) { if (current === version.current) setError(errorMessage(cause, tr)); }
     finally { if (current === version.current) setChecking(false); }
   }

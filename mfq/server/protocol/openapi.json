@@ -1388,6 +1388,17 @@
               }
             ],
             "title": "Directory Id"
+          },
+          "evict_prefix_cache": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evict Prefix Cache"
           }
         },
         "title": "ConfigureDownloadDirectoryRequest",
@@ -1849,7 +1860,7 @@
         "additionalProperties": false,
         "properties": {
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest"
+            "$ref": "#/components/schemas/ModelLoadRequest-Input"
           },
           "name": {
             "maxLength": 64,
@@ -2710,6 +2721,16 @@
             "title": "Architectures",
             "type": "array"
           },
+          "attention_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelAttentionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "author": {
             "anyOf": [
               {
@@ -2731,6 +2752,11 @@
                 "type": "null"
               }
             ]
+          },
+          "config_inspected": {
+            "default": false,
+            "title": "Config Inspected",
+            "type": "boolean"
           },
           "description": {
             "anyOf": [
@@ -3774,6 +3800,64 @@
         "title": "JsonSchemaResponseFormat",
         "type": "object"
       },
+      "KvMemorySettings": {
+        "additionalProperties": false,
+        "properties": {
+          "allocation": {
+            "default": "preallocated",
+            "enum": [
+              "preallocated",
+              "dynamic"
+            ],
+            "title": "Allocation",
+            "type": "string"
+          },
+          "gpu_budget_bytes": {
+            "anyOf": [
+              {
+                "maximum": 1125899906842624.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpu Budget Bytes"
+          },
+          "placement": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "auto_ssd",
+              "vram",
+              "ram"
+            ],
+            "title": "Placement",
+            "type": "string"
+          },
+          "ram_budget_bytes": {
+            "anyOf": [
+              {
+                "maximum": 1125899906842624.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Budget Bytes"
+          },
+          "ram_preallocated": {
+            "default": true,
+            "title": "Ram Preallocated",
+            "type": "boolean"
+          }
+        },
+        "title": "KvMemorySettings",
+        "type": "object"
+      },
       "KvQuantizationSettings": {
         "additionalProperties": false,
         "properties": {
@@ -4169,6 +4253,30 @@
           "modified_at"
         ],
         "title": "ModelArtifactResource",
+        "type": "object"
+      },
+      "ModelAttentionProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "compressed": {
+            "title": "Compressed",
+            "type": "boolean"
+          },
+          "hybrid": {
+            "title": "Hybrid",
+            "type": "boolean"
+          },
+          "sparse": {
+            "title": "Sparse",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sparse",
+          "compressed",
+          "hybrid"
+        ],
+        "title": "ModelAttentionProfile",
         "type": "object"
       },
       "ModelCacheComponent": {
@@ -4640,7 +4748,37 @@
         "title": "ModelFeatureSet",
         "type": "object"
       },
-      "ModelLoadRequest": {
+      "ModelLoadContextSettings": {
+        "additionalProperties": false,
+        "properties": {
+          "automatic": {
+            "default": true,
+            "title": "Automatic",
+            "type": "boolean"
+          },
+          "kv_quantization": {
+            "$ref": "#/components/schemas/KvQuantizationSettings"
+          },
+          "ram_preallocated": {
+            "default": true,
+            "title": "Ram Preallocated",
+            "type": "boolean"
+          },
+          "ssd_kv": {
+            "default": false,
+            "title": "Ssd Kv",
+            "type": "boolean"
+          },
+          "vram_preallocated": {
+            "default": true,
+            "title": "Vram Preallocated",
+            "type": "boolean"
+          }
+        },
+        "title": "ModelLoadContextSettings",
+        "type": "object"
+      },
+      "ModelLoadRequest-Input": {
         "additionalProperties": false,
         "properties": {
           "artifact_uri": {
@@ -4654,6 +4792,16 @@
               }
             ],
             "title": "Artifact Uri"
+          },
+          "context_management": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelLoadContextSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "context_size": {
             "anyOf": [
@@ -4686,6 +4834,234 @@
               }
             ],
             "title": "Idle Ttl Seconds"
+          },
+          "kv_memory": {
+            "$ref": "#/components/schemas/KvMemorySettings"
+          },
+          "kv_quantization": {
+            "$ref": "#/components/schemas/KvQuantizationSettings"
+          },
+          "model": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "moe_gpu_cache_gb": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moe Gpu Cache Gb"
+          },
+          "pin": {
+            "default": false,
+            "title": "Pin",
+            "type": "boolean"
+          },
+          "prefill_chunk_size": {
+            "default": 2048,
+            "minimum": 1.0,
+            "title": "Prefill Chunk Size",
+            "type": "integer"
+          },
+          "prefix_cache_block_tokens": {
+            "anyOf": [
+              {
+                "maximum": 65536.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Block Tokens"
+          },
+          "prefix_cache_disk_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Disk Bytes"
+          },
+          "prefix_cache_enabled": {
+            "default": true,
+            "title": "Prefix Cache Enabled",
+            "type": "boolean"
+          },
+          "prefix_cache_hot_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Hot Bytes"
+          },
+          "prefix_cache_max_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Max Bytes"
+          },
+          "prefix_cache_max_sessions": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Max Sessions"
+          },
+          "prefix_cache_max_snapshots_per_session": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Max Snapshots Per Session"
+          },
+          "prefix_cache_pending_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Pending Bytes"
+          },
+          "prefix_cache_ram_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Ram Bytes"
+          },
+          "qsa_kv_offload": {
+            "$ref": "#/components/schemas/QsaKvOffloadPolicy"
+          },
+          "sampling_defaults": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SamplingParams"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "yarn_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yarn Enabled"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "title": "ModelLoadRequest",
+        "type": "object"
+      },
+      "ModelLoadRequest-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_uri": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Uri"
+          },
+          "context_management": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelLoadContextSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context_size": {
+            "anyOf": [
+              {
+                "maximum": 2147483647.0,
+                "minimum": 512.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Size"
+          },
+          "device_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Device Ids",
+            "type": "array"
+          },
+          "idle_ttl_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Ttl Seconds"
+          },
+          "kv_memory": {
+            "$ref": "#/components/schemas/KvMemorySettings"
           },
           "kv_quantization": {
             "$ref": "#/components/schemas/KvQuantizationSettings"
@@ -5082,6 +5458,16 @@
             "minLength": 1,
             "title": "Architecture",
             "type": "string"
+          },
+          "attention_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelAttentionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "cache_profile": {
             "anyOf": [
@@ -5924,6 +6310,11 @@
             "minLength": 1,
             "title": "Path",
             "type": "string"
+          },
+          "reference": {
+            "default": false,
+            "title": "Reference",
+            "type": "boolean"
           }
         },
         "required": [
@@ -7245,6 +7636,13 @@
             ],
             "title": "Max Context Size"
           },
+          "model_kv_memory": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/KvMemorySettings"
+            },
+            "title": "Model Kv Memory",
+            "type": "object"
+          },
           "model_kv_quantization": {
             "additionalProperties": {
               "$ref": "#/components/schemas/KvQuantizationSettings"
@@ -7704,6 +8102,14 @@
               }
             ],
             "title": "Kv Bytes"
+          },
+          "kv_memory": {
+            "$ref": "#/components/schemas/KvMemorySettings"
+          },
+          "kv_memory_supported": {
+            "default": false,
+            "title": "Kv Memory Supported",
+            "type": "boolean"
           },
           "kv_quantization": {
             "$ref": "#/components/schemas/KvQuantizationSettings"
@@ -8611,7 +9017,7 @@
             "type": "string"
           },
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest"
+            "$ref": "#/components/schemas/ModelLoadRequest-Output"
           },
           "name": {
             "title": "Name",
@@ -8667,6 +9073,16 @@
               }
             ],
             "title": "Instance Id"
+          },
+          "kv_memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KvMemorySettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "kv_quantization": {
             "anyOf": [
@@ -9354,6 +9770,11 @@
             ],
             "title": "Purpose",
             "type": "string"
+          },
+          "reference": {
+            "default": false,
+            "title": "Reference",
+            "type": "boolean"
           }
         },
         "required": [
@@ -9736,7 +10157,7 @@
         "additionalProperties": false,
         "properties": {
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest"
+            "$ref": "#/components/schemas/ModelLoadRequest-Input"
           },
           "name": {
             "maxLength": 64,
@@ -13390,6 +13811,12 @@
                         "type": "string"
                       },
                       {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
                         "type": "null"
                       }
                     ]
@@ -13538,6 +13965,12 @@
                     "anyOf": [
                       {
                         "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "boolean"
                       },
                       {
                         "type": "null"
@@ -16691,7 +17124,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ModelLoadRequest"
+                "$ref": "#/components/schemas/ModelLoadRequest-Input"
               }
             }
           },

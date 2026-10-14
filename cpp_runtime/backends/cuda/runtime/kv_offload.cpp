@@ -1,4 +1,6 @@
 #include "kv_offload.h"
+#include "kv_expert_loan.h"
+#include "moe_pipeline.h"
 
 #include <algorithm>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <limits>
+#include <tuple>
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
 
@@ -61,11 +64,12 @@ struct KvOffloadStore::Impl {
             ResidentAllocationScope resident;
             gpu_arena=tb::empty({int64_t(hot_limit())},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
             gpu_slots=Slots(hot_limit());
-            if(config.ram_budget_bytes) {
+            if(config.ram_preallocated && config.ram_budget_bytes) {
                 ram_arena.resize(config.ram_budget_bytes);
                 charge_tensor_host_bytes(config.ram_budget_bytes);
             }
-            ram_slots=Slots(config.ram_budget_bytes);
+            ram_slots=Slots(config.ram_preallocated?config.ram_budget_bytes:0);
+            if(!config.ram_preallocated)initialize_disk();
         } else initialize_disk();
     }
     ~Impl() {if(config.preallocate)tensor_host_bytes.fetch_sub(ram_arena.size());}
@@ -74,7 +78,7 @@ struct KvOffloadStore::Impl {
         if(!config.ssd_enabled)throw std::runtime_error("kv_memory_insufficient: available VRAM and RAM cannot hold the configured KV cache; choose automatic with SSD KV or reduce context length");
         cache::QsaKvStoreConfig cold;
         cold.buffer_bytes = config.buffer_bytes;
-        cold.budget_bytes = (config.preallocate?0:config.ram_budget_bytes) + config.buffer_bytes;
+        cold.budget_bytes = (config.preallocate && config.ram_preallocated?0:config.ram_budget_bytes) + config.buffer_bytes;
         cold.directory = config.directory;
         ram = std::make_shared<cache::QsaKvStore>(std::move(cold));
     }
@@ -96,7 +100,7 @@ struct KvOffloadStore::Impl {
     }
     void store_cold(const BlockPtr& block) {
         if(block->ram_offset!=no_offset || block->cold)return;
-        if(config.preallocate && block->bytes<=config.ram_budget_bytes) {
+        if(config.preallocate && config.ram_preallocated && block->bytes<=config.ram_budget_bytes) {
             auto offset=ram_slots.take(block->bytes);
             while(offset==no_offset){spill_ram();offset=ram_slots.take(block->bytes);}
             MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(ram_arena.data()+offset,block->gpu.data_ptr(),block->bytes,cudaMemcpyDeviceToHost,current_stream().stream()));
@@ -128,6 +132,7 @@ struct KvOffloadStore::Impl {
         auto offset=gpu_slots.take(block->bytes);
         while(offset==no_offset && evict_one())offset=gpu_slots.take(block->bytes);
         if(offset==no_offset)throw std::runtime_error("CUDA KV arena cannot hold one block");
+        if(expert_loan)expert_loan->protect(loan_region,int64_t(offset+block->bytes));
         block->gpu_offset=offset;
         auto* data=static_cast<std::uint8_t*>(gpu_arena.data_ptr())+offset;
         auto storage=std::make_shared<TensorStorage>();
@@ -183,6 +188,8 @@ struct KvOffloadStore::Impl {
     KvOffloadConfig config;
     std::shared_ptr<cache::QsaKvStore> ram;
     tb::Tensor gpu_arena;
+    std::shared_ptr<KvExpertLoan> expert_loan;
+    std::size_t loan_region=0;
     std::vector<std::uint8_t> ram_arena;
     Slots gpu_slots,ram_slots;
     std::list<std::weak_ptr<Block>> ram_lru;
@@ -191,12 +198,39 @@ struct KvOffloadStore::Impl {
     mutable std::recursive_mutex mutex;
     std::list<std::uint64_t> lru;
     std::unordered_map<std::uint64_t, Hot> hot;
+    std::map<std::tuple<int64_t,int64_t,int,int64_t,int64_t>,std::shared_ptr<GatherWorkspace>> gather_workspaces;
     std::size_t gpu_bytes = 0;
     std::uint64_t next_id = 0, hits = 0, h2d_bytes = 0, d2h_bytes = 0, evictions = 0;
 };
 
 KvOffloadStore::KvOffloadStore(KvOffloadConfig config) : impl_(std::make_shared<Impl>(std::move(config))) {}
 KvOffloadStore::~KvOffloadStore() = default;
+std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspace(int64_t rows,int64_t width,tb::ScalarType dtype,int64_t heads,int64_t key_width) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    if(rows<=0 || width<=0 || heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
+        throw std::invalid_argument("invalid CUDA KV gather geometry");
+    auto& workspace=impl_->gather_workspaces[{rows,width,int(dtype),heads,key_width}];
+    if(!workspace) {
+        ResidentAllocationScope resident;
+        auto fresh=std::make_shared<GatherWorkspace>();
+        fresh->heads=heads;fresh->key_width=key_width;
+        const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(dtype);
+        fresh->rows=tb::zeros({rows,width},options);
+        fresh->upload=tb::empty({rows,width},options);
+        fresh->host=tb::empty({rows,width},options.device(tb::kCPU).pinned_memory(true));
+        const auto fields=key_width?2*heads:1;
+        fresh->descriptors=tb::zeros({4+rows*fields*4},options.device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true));
+        fresh->device_descriptors=tb::zeros({4+rows*fields*4},options.dtype(tb::kInt64));
+        workspace=std::move(fresh);
+    }
+    return workspace;
+}
+std::size_t KvOffloadStore::graph_workspace_bytes() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    std::size_t bytes=0;
+    for(const auto& [key,work]:impl_->gather_workspaces)bytes+=work->rows.nbytes()+work->upload.nbytes()+work->device_descriptors.nbytes();
+    return bytes;
+}
 const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
 
 KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
@@ -214,6 +248,10 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
     block->id = ++impl_->next_id;
     block->bytes = bytes; block->rows = rows.size(0); block->width = rows.size(1);
     block->options = rows.options();
+    if(impl_->config.preallocate && bytes>impl_->hot_limit()) {
+        block->gpu=rows.contiguous();impl_->store_cold(block);block->gpu={};++impl_->evictions;
+        return block;
+    }
     if(impl_->config.preallocate) {
         block->gpu=impl_->allocate_gpu(block);block->gpu.copy_(rows);
         // A slot can be reused by another write on this same stream.
@@ -260,14 +298,24 @@ void KvOffloadStore::flush() { if(impl_->ram)impl_->ram->flush(); }
 void KvOffloadStore::set_ram_reservation(std::function<void(std::size_t)> reserve) {
     impl_->reserve_ram = std::move(reserve);
 }
+void KvOffloadStore::set_expert_loan(std::shared_ptr<KvExpertLoan> loan) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    if(!loan || !impl_->gpu_arena.defined() || !impl_->gpu_arena.nbytes())return;
+    impl_->loan_region=loan->add(impl_->gpu_arena,int64_t(impl_->gpu_arena.nbytes()),1,false,1,true);
+    impl_->expert_loan=std::move(loan);
+}
+std::size_t KvOffloadStore::expert_loan_bytes() const {
+    return impl_->expert_loan?impl_->expert_loan->region_bytes(impl_->loan_region):0;
+}
 std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     const auto cold = impl_->ram ? impl_->ram->stats() : cache::QsaKvStoreStats{};
     return {{"qsa_kv_offload_enabled", 1.0}, {"qsa_kv_ssd_enabled",impl_->config.ssd_enabled?1.0:0.0},
-        {"qsa_kv_resident_bytes", double(impl_->config.preallocate?impl_->hot_limit():impl_->gpu_bytes)},
+        {"qsa_kv_graph_workspace_bytes",double(graph_workspace_bytes())},
+        {"qsa_kv_resident_bytes", double((impl_->config.preallocate?impl_->hot_limit():impl_->gpu_bytes)-expert_loan_bytes())},
         {"qsa_kv_budget_bytes", double(impl_->config.gpu_budget_bytes)},
         {"qsa_kv_ram_enabled", impl_->config.ram_budget_bytes ? 1.0 : 0.0},
-        {"qsa_kv_ram_bytes", double(impl_->config.preallocate?impl_->ram_arena.size():cold.hot_bytes)}, {"qsa_kv_ram_limit_bytes", double(impl_->config.ram_budget_bytes)},
+        {"qsa_kv_ram_bytes", double(impl_->config.preallocate && impl_->config.ram_preallocated?impl_->ram_arena.size():cold.hot_bytes)}, {"qsa_kv_ram_limit_bytes", double(impl_->config.ram_budget_bytes)},
         {"qsa_kv_ssd_bytes", double(cold.disk_bytes)}, {"qsa_kv_pending_bytes", double(cold.pending_bytes)},
         {"qsa_kv_ssd_reads", double(cold.reads)}, {"qsa_kv_ram_hits", double(cold.hits+impl_->ram_hits)},
         {"qsa_kv_gpu_hits", double(impl_->hits)}, {"qsa_kv_ssd_read_bytes", double(cold.read_bytes)},
@@ -330,6 +378,65 @@ tb::Tensor KvOffloadSequence::gather(const std::vector<int64_t>& rows) const {
         result.index_copy_(0, indices(group.second, options), selected);
     }
     return result;
+}
+void KvOffloadSequence::gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& work) const {
+    if(rows.empty() || int64_t(rows.size())>work.rows.size(0) || work.rows.size(1)!=width_ || work.rows.scalar_type()!=dtype_)
+        throw std::invalid_argument("invalid fixed CUDA KV gather workspace");
+    auto& impl=*store_->impl_;
+    std::lock_guard<std::recursive_mutex> lock(impl.mutex);
+    const auto row_bytes=std::size_t(width_)*work.rows.element_size();
+    auto* host=static_cast<uint8_t*>(work.host.data_ptr());
+    auto* upload=static_cast<uint8_t*>(work.upload.data_ptr());
+    auto* destination=static_cast<uint8_t*>(work.rows.data_ptr());
+    auto* header=work.descriptors.data_ptr<int64_t>();
+    auto* copies=reinterpret_cast<MoeMappedCopyDescriptor*>(header+4);
+    std::map<int64_t,std::vector<std::pair<int64_t,std::size_t>>> groups;
+    for(std::size_t i=0;i<rows.size();++i) {
+        if(rows[i]<0 || rows[i]>=position_)throw std::out_of_range("CUDA KV selected row exceeds its sequence");
+        groups[rows[i]/block_rows_].emplace_back(rows[i]%block_rows_,i);
+    }
+    std::size_t cold_bytes=0,count=0,total=0;
+    for(const auto& [index,selected]:groups) {
+        const auto& block=blocks_.at(index);
+        const uint8_t* source=nullptr;
+        std::shared_ptr<const std::vector<uint8_t>> payload;
+        const bool hot=block->gpu.defined();
+        if(hot) {source=static_cast<const uint8_t*>(block->gpu.data_ptr());impl.touch(block);++impl.hits;}
+        else if(block->ram_offset!=no_offset) {
+            source=impl.ram_arena.data()+block->ram_offset;++impl.ram_hits;
+            impl.ram_lru.remove_if([&](const auto& weak){auto value=weak.lock();return !value || value==block;});
+            impl.ram_lru.push_front(block);
+        } else {
+            if(!impl.ram || !block->cold)throw std::runtime_error("missing spilled KV block");
+            payload=impl.ram->read(block->cold);source=payload->data();
+        }
+        for(const auto& [row,output]:selected) {
+            const auto* input=source+std::size_t(row)*row_bytes;
+            if(!hot) {std::memcpy(host+cold_bytes,input,row_bytes);input=upload+cold_bytes;cold_bytes+=row_bytes;}
+            const auto add=[&](uint8_t* target,const uint8_t* source,std::size_t bytes) {
+                copies[count++]={reinterpret_cast<uint64_t>(target),reinterpret_cast<uint64_t>(source),total,bytes};
+                total+=(bytes+15)&~std::size_t(15);
+            };
+            if(!work.key_width)add(destination+output*row_bytes,input,row_bytes);
+            else {
+                const auto keys=std::size_t(work.key_width)*work.rows.element_size();
+                const auto values=row_bytes/work.heads-keys,capacity=std::size_t(work.rows.size(0));
+                for(int64_t head=0;head<work.heads;++head) {
+                    add(destination+(head*capacity+output)*keys,input+head*keys,keys);
+                    add(destination+capacity*work.heads*keys+(head*capacity+output)*values,
+                        input+work.heads*keys+head*values,values);
+                }
+            }
+        }
+    }
+    header[0]=int64_t(count);header[1]=int64_t(total);header[2]=header[3]=0;
+    const auto stream=current_stream().stream();
+    if(cold_bytes)MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(upload,host,cold_bytes,cudaMemcpyHostToDevice,stream));
+    impl.h2d_bytes+=cold_bytes;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(work.device_descriptors.data_ptr(),header,(4+count*4)*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
+    moe_copy_mapped(work.device_descriptors.data_ptr(),reinterpret_cast<const uint32_t*>(work.device_descriptors.data_ptr<int64_t>()+2),
+        int(std::min<std::size_t>(256,(total+4095)/4096)),256,stream);
+    MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
 }
 tb::Tensor KvOffloadSequence::range(int64_t start, int64_t count) const {
     if (start < 0 || count <= 0 || start > position_ || count > position_ - start)

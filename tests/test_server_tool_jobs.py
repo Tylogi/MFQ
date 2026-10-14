@@ -428,6 +428,7 @@ def test_download_argv_does_not_execute_shell_metacharacters(tmp_path: Path) -> 
                 payload={
                     "repo_id": "owner/model",
                     "destination": "downloads/value;touch-owned",
+                    "expected_bytes": 4,
                 },
             )
         )
@@ -481,7 +482,7 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
         submitted = await manager.submit(
             CreateJobRequest(
                 kind="download.modelscope",
-                payload={"repo_id": "owner/model", "destination": "models/owner/model"},
+                payload={"repo_id": "owner/model", "destination": "models/owner/model", "expected_bytes": 2},
             )
         )
         result = await _wait(store, submitted.id)
@@ -532,7 +533,7 @@ def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkey
         store = SessionStore(tmp_path / "jobs.sqlite3")
         manager = JobManager(store, handlers.handlers())
         submitted = await manager.submit(CreateJobRequest(kind=f"download.{provider}",
-            payload={"repo_id": "owner/model", "destination": "downloads/model"}))
+            payload={"repo_id": "owner/model", "destination": "downloads/model", "expected_bytes": 2}))
         result = await _wait(store, submitted.id)
         assert result.status == JobStatus.SUCCEEDED and result.result["files"] == 1
         await manager.close()

@@ -76,8 +76,6 @@ export function StudioSidebar() {
         active: view === 'lab' && labPage === 'models' },
       { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化', 'Quantization'], icon: 'quantize', path: lab('quantization'),
-        active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: ['系统', 'System'], items: [
       { label: ['日志', 'Logs'], icon: 'scroll', path: dashboard('logs'),

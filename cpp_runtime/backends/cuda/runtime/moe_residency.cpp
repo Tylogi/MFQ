@@ -4,6 +4,7 @@
 #include "storage/moe_cached_source_internal.h"
 #include "mfq/cpu_expert_pool.h"
 #include "host_memory_copy.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "mfq/moe_residency_ranker.h"
 #include <algorithm>
 #include <array>
@@ -112,7 +113,7 @@ struct MoeResidencyManager::Impl {
     }();
     std::vector<std::vector<float>> observations;
     std::unique_ptr<mfq::MoeResidencyRanker> ranking;
-    struct TransferStage {std::string key;MoeGpuArena* arena=nullptr;};
+    struct TransferStage {std::string key;MoeGpuArena* arena=nullptr;int projection=0;};
     std::vector<std::vector<TransferStage>> transfer_stages;
     bool direct=false;
     bool batched=[this] {
@@ -306,10 +307,11 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
             throw std::invalid_argument("adaptive expert bundle geometry differs");
         s.first=std::min(s.first,source->layer_id_);s.last=std::max(s.last,source->layer_id_);
         for(int p=0;p<3;++p) {
+            if(p==1 && bundle[0]==bundle[1])continue;
             const auto& projection=*cache->sources_[bundle[p]];
             auto& stages=s.transfer_stages[bundle[p]];
             for(const auto& cohort:projection.cohorts_)
-                stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr});
+                stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr,p});
         }
     }
     using Expert=mfq::MoeResidencyRanker::Expert;
@@ -400,6 +402,9 @@ void MoeResidencyManager::record_prefill_routes(int layer,const int32_t* ids,int
     if(routes>s.prefill_route_stride) {
         if(s.prefill_pending)MFQ_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
         const int64_t elements=int64_t(s.prefill_routes.size())*32*routes;
+        // The samples are consumed after prefill returns the borrowed expert
+        // storage. They must not be allocated from that temporary workspace.
+        mfq::cuda::ResidentAllocationScope resident;
         auto next=tb::empty({elements},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
         // Preserve samples if a model uses different routing widths by layer.
         if(s.prefill_route_device.defined())for(std::size_t b=0;b<s.prefill_routes.size();++b) {
@@ -576,7 +581,8 @@ void MoeResidencyManager::prepare() {
             // Decode arenas include their route capacity in the cache key.
             // Prefer the smallest compatible arena if multiple widths exist.
             for(const auto& item:cache.pipeline_stages_)
-                if(item.first.starts_with(stage.key+":") &&
+                if((item.first.starts_with(stage.key+":") ||
+                    item.first.starts_with("decodepacked:"+std::to_string(stage.projection)+":")) &&
                     (!stage.arena || item.second->slots<stage.arena->slots))
                     stage.arena=item.second.get();
         }
@@ -774,7 +780,7 @@ void MoeResidencyManager::prepare() {
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
             move.touched_fields=f+1;
             if(move.cached_arena) {
-                const auto* cached=static_cast<const uint8_t*>(move.cached_arena->fields[f].data_ptr())+int64_t(move.cached_slot)*count;
+                const auto* cached=move.cached_arena->field_pointer(move.cached_slot,f,cohort.bytes_per_expert);
                 // The window event fences the final transfer scatter. The
                 // next window joins this transaction before reusing its slots.
                 refill.copy(gpu,cached,std::uint64_t(count));
@@ -904,7 +910,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
                 for(std::size_t f=0;f<item.backed_fields;++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
                     if(item.cached_arena) {
-                        const auto* cached=static_cast<const uint8_t*>(item.cached_arena->fields[f].data_ptr())+int64_t(item.cached_slot)*count;
+                        const auto* cached=item.cached_arena->field_pointer(item.cached_slot,f,cohort.bytes_per_expert);
                         MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),cached,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
                     } else if(gpu_preserve) {
                         MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),incoming_copy(item,f),
@@ -1023,7 +1029,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
                     // Mark queued fields before launch so either submission or
                     // publication failures restore the complete transaction.
                     if(move.cached_arena) {
-                        const auto* cached=static_cast<const uint8_t*>(move.cached_arena->fields[f].data_ptr())+int64_t(move.cached_slot)*count;
+                        const auto* cached=move.cached_arena->field_pointer(move.cached_slot,f,cohort.bytes_per_expert);
                         refill.copy(gpu,cached,std::uint64_t(count));
                     } else if(gpu_preserve) {
                         refill.copy(gpu,incoming_copy(move,f),std::uint64_t(count));
@@ -1073,8 +1079,7 @@ void MoeResidencyManager::prepare_batched(std::int64_t bytes) {
         for(std::size_t f=0;f<move.offsets.size();++f) {
             const auto count=cohort.bytes_per_expert[f];if(!count)continue;
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
-            const auto* cached=move.cached_arena ? static_cast<const uint8_t*>(move.cached_arena->fields[f].data_ptr())+
-                int64_t(move.cached_slot)*count : nullptr;
+            const auto* cached=move.cached_arena ? move.cached_arena->field_pointer(move.cached_slot,f,cohort.bytes_per_expert) : nullptr;
             fields.push_back({s.direct?static_cast<const uint8_t*>(incoming[f].data_ptr()):nullptr,
                 gpu,count,move.offsets[f],move.offsets[f],cached});
             largest=std::max(largest,count);

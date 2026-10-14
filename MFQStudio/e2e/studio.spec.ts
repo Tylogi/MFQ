@@ -14,7 +14,7 @@ for (const language of ['zh', 'en'] as const) {
     await expect(sidebar).toBeVisible();
     const tools = sidebar.locator('nav > section').filter({ has: page.getByText(language === 'zh' ? '工具' : 'Tools', { exact: true }) });
     await expect(tools.locator('button')).toHaveText(language === 'zh'
-      ? ['分析', '下载', '测评', '量化'] : ['Analysis', 'Downloads', 'Evaluations', 'Quantization']);
+      ? ['分析', '下载', '测评'] : ['Analysis', 'Downloads', 'Evaluations']);
     expect((await sidebar.boundingBox())!.width).toBeCloseTo(200, 3);
     for (const button of await tools.locator('button').all()) {
       expect(await button.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
@@ -530,7 +530,6 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   const routes = [
     ['/evaluations', '/api/v1/evaluations'],
     ['/model-hub', null],
-    ['/quantization', null],
     ['/settings', null],
     ['/runtime', '/api/v1/cluster/nodes'],
     ['/resources', '/api/v1/runtime/resources'],
@@ -546,7 +545,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   expect(state.unexpected).toEqual([]);
 });
 
-test('模型下载留在本页，飞入圆圈后打开第三个队列标签，与量化任务保持独立', async ({ page }, testInfo) => {
+test('模型下载留在本页，飞入圆圈后打开第三个队列标签', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
     payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
@@ -581,18 +580,8 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签，�
   await expect(page.getByText('Not a download')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('download-queue.png'), animations: 'disabled' });
-  await navigateClient(page, '/quantization');
-  const workspace = page.getByRole('region', { name: 'Quantization workspace' });
-  await expect(workspace).toBeVisible();
-  await expect(workspace.getByText('3 / 3', { exact: true })).toBeVisible();
-  await expect(workspace.getByRole('textbox', { name: 'Source model directory or MFQ file' })).toBeVisible();
-  await expect(workspace.getByRole('button', { name: 'Register quantization task' })).toBeDisabled();
-  await expect(workspace.getByText('No quantization tasks yet', { exact: true })).toBeVisible();
-  await expect(workspace.locator('.qw-task')).toHaveCount(0);
-  await expect(workspace.getByText('example/studio-layout-test')).toHaveCount(0);
   expect(state.requests).not.toContain('GET /api/v1/artifacts/lineage');
   expect(state.unexpected).toEqual([]);
-  await page.screenshot({ path: testInfo.outputPath('quantization-separate-from-downloads.png'), animations: 'disabled' });
 });
 
 test('生成期间离开聊天页后返回仍完成同一次请求，草稿按会话保留', async ({ page }) => {

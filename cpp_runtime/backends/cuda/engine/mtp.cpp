@@ -69,6 +69,24 @@ template <class Model> struct CudaMtpOps {
   std::uint64_t target_transfer_bytes=0;
   bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
+  bool stream_prompt_history(int64_t tokens) const {
+    const auto* option=std::getenv("MFQ_MTP_STREAM_PROMPT_HISTORY");
+    return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && tokens>16384 && (!option || option[0]!='0');
+  }
+  bool host_prompt_history(int64_t tokens) const {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      const auto* option=std::getenv("MFQ_MTP_HOST_PROMPT_HISTORY");
+      if(option)return option[0]!='0';
+      const auto bytes=std::size_t(tokens)*model.hidden_size()*model.hc_mult()*sizeof(uint16_t);
+      return bytes+(std::size_t(32)<<20)>
+          mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
+    }
+    return false;
+  }
+  void trace_prompt_prefill(double target_ms,double predictor_ms,double workspace_ms) const {
+    std::cerr<<"runtime_mtp_prefill target_ms="<<target_ms<<" predictor_ms="<<predictor_ms
+        <<" predictor_workspace_ms="<<workspace_ms<<" streamed="<<stream_prompt_history(input_ids.size(1))<<std::endl;
+  }
   bool bootstrap_before_publication() const {
     const auto* option=std::getenv("MFQ_MTP_EARLY_BOOTSTRAP");
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0');
@@ -128,7 +146,9 @@ template <class Model> struct CudaMtpOps {
     return value.size(axis);
   }
   static int rank(const Tensor &value) { return value.dim(); }
-  static Tensor clone(const Tensor &value) { return value.clone(); }
+  static Tensor clone(const Tensor &value) {
+    return value.is_cuda()?value.clone():value.to(mfq_tensor_backend::kCUDA);
+  }
   static Tensor slice(const Tensor &value, int axis, int64_t offset,
                       int64_t length) {
     return value.narrow(axis, offset, length).contiguous();
@@ -137,6 +157,11 @@ template <class Model> struct CudaMtpOps {
     return value.reshape(shape);
   }
   static Tensor concatenate(const std::vector<Tensor> &values, int axis) {
+    if(std::any_of(values.begin(),values.end(),[](const auto& value){return !value.is_cuda();})) {
+      auto host=values;
+      for(auto& value:host)value=value.to(mfq_tensor_backend::kCPU);
+      return mfq_tensor_backend::cat(host,axis).contiguous();
+    }
     return mfq_tensor_backend::cat(values, axis).contiguous();
   }
   Tensor target_forward(Tensor ids, Tensor *raw = nullptr,
@@ -177,13 +202,14 @@ template <class Model> struct CudaMtpOps {
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      if(!transformed_prompt && model.reuse_decode_graphs && model.graph_registry &&
-          model.cache_pos>0 && chunk.count<=128) {
-        // A short continuation should not transfer every expert in each layer.
-        // Existing MTP windows already batch these rows and reuse routed weights.
+      if(!transformed_prompt && model.reuse_decode_graphs && model.graph_registry && chunk.count<=128) {
+        // Reuse bounded routed windows for short prompts as well as continuations.
+        // A whole-layer prefill can exceed the remaining workspace after MTP
+        // graphs have been retained by an earlier request. Initialize a fresh
+        // causal state with one eager row before using those captured windows.
         std::vector<Tensor> hidden_rows,raw_rows;
         for(int64_t offset=0;offset<chunk.count;) {
-          const auto rows=std::min<int64_t>(4,chunk.count-offset);
+          const auto rows=model.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
           Tensor part;
           hidden_rows.push_back(target_forward(ids.narrow(1,offset,rows),&part,rows>1?1:0).clone());
           raw_rows.push_back(std::move(part));
@@ -196,12 +222,24 @@ template <class Model> struct CudaMtpOps {
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
       if(!transformed_prompt && mfq::cuda::qwen4_layer_major_prefill_eligible(model,chunk.count)) {
-        auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,false,
-            [&] { return output && output->stopped(); }, &raw);
+        // Sampling consumes only the final normalized row. Teacher-forced
+        // predictor priming uses the separate, full raw hidden sequence.
+        // Decide where the cross-phase history will live before target prefill.
+        // It outlives the borrowed expert workspace; predictor priming consumes
+        // bounded tiles, so a host copy avoids a sequence-sized VRAM reservation.
+        const bool host_history=host_prompt_history(chunk.count);
+        auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
+            [&] { return output && output->stopped(); }, &raw,host_history);
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
     }
+    MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+    const bool host_history=host_prompt_history(chunk.count);
+    bool borrowed=false;
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+      if(transformed_prompt)borrowed=workspace.begin((std::size_t(4)<<30)+
+          std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
     auto hidden =
         transformed_prompt
             ? model.hidden_forward_inputs(
@@ -212,6 +250,13 @@ template <class Model> struct CudaMtpOps {
                       .contiguous(),
                   mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt, &raw)
             : target_forward(ids, &raw);
+    if(host_history)raw=raw.to(mfq_tensor_backend::kCPU);
+    if(borrowed) {
+      workspace.suspend();
+      hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
+      if(!host_history)raw=raw.clone();
+      workspace.finish();
+    }
     MFQ_CUDA_CHECK(
         cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
     return {std::move(hidden), std::move(raw), timer.elapsed_ms()};
@@ -283,9 +328,18 @@ template <class Model> struct CudaMtpOps {
       return std::min<int64_t>(1024,requested);
     return std::min<int64_t>(512,requested);
   }
+  bool cache_only_prompt_history() const {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      const auto* option=std::getenv("MFQ_MTP_CACHE_ONLY_PRIME");
+      const auto* predictor=dynamic_cast<const mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
+      return (!option || option[0]!='0') && predictor && predictor->layers.size()==1;
+    }
+    return false;
+  }
   double begin_predictor_prefill(int64_t pairs) {
     const auto started=std::chrono::steady_clock::now();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(cache_only_prompt_history())return 0;
       if(pairs<=128 || !model.reuse_decode_graphs || !model.graph_registry)return 0;
       prepare_moe_decode_residency(model.execution->moe_expert_cache);
       const auto rows=std::min<int64_t>(1024,pairs);
@@ -303,8 +357,19 @@ template <class Model> struct CudaMtpOps {
   }
   double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
     PrefillCudaTimer timer;
+    if(!cache_only_prompt_history())hidden=hidden.to(mfq_tensor_backend::kCUDA);
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      if(model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
+      if(cache_only_prompt_history()) {
+        auto& predictor=static_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp&>(mtp);
+        MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+        if(ids.size(1)>128)workspace.begin((std::size_t(64)<<20)+
+            std::size_t(ids.size(1))*model.hidden_size()*model.hc_mult()*sizeof(float)*12);
+        {
+          auto resident_hidden=hidden.to(mfq_tensor_backend::kCUDA);
+          (void)predictor.evaluate(target,resident_hidden,ids,0,true,positions,{},true);
+        }
+        workspace.finish();
+      } else if(model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
         // The short tail uses decode graphs, whose expert addresses must again
         // contain weights. The final long compute tile has already retired.
         end_predictor_prefill();
@@ -450,6 +515,7 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    mfq_tensor_backend::Tensor *session_last_hidden) {
   auto logical_chunk=prefill_chunk_size;
   if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    logical_chunk=std::min<int64_t>(logical_chunk,8192);
     if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();

@@ -12,7 +12,7 @@ const configuration = {
   status: 'unknown' as const, recommendation: 'unknown' as const, reasons: [],
 };
 
-it('uses separate MoE pressure bars and applies the KV calculator only to VRAM', async () => {
+it('uses one combined MoE pressure bar and includes applied KV in its total', async () => {
   const data = catalog(false, true);
   const GiB = 2 ** 30;
   data.system = { ...data.system, backend: 'cuda', physical_memory_bytes: 64 * GiB,
@@ -25,14 +25,15 @@ it('uses separate MoE pressure bars and applies the KV calculator only to VRAM',
     estimated_weight_bytes_by_role: { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB } };
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
-  expect(await screen.findByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
-  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  expect(await screen.findByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+  expect(screen.getByText('83.0 GiB / 88.0 GiB')).toBeInTheDocument();
   fireEvent.click(screen.getByText('KV Cache curve & calculator'));
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 25.0%' })).toBeInTheDocument();
-  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 98.9%' })).toBeInTheDocument();
+  expect(screen.getByText('87.0 GiB / 88.0 GiB')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
 });
 
 function catalog(refreshing: boolean, available: boolean): OfficialModelList {
@@ -62,11 +63,11 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-it('keeps file and PLE sizes without repeating a resident weight estimate', async () => {
+it.each(['zh', 'en'])('shows file minus PLE as resident weights rather than runtime estimates: %s', async (language) => {
   const data = catalog(false, true);
   const variant = data.data[0].variants[0];
   variant.byte_size = 110 * 2 ** 30;
-  variant.resident_weight_bytes = 80 * 2 ** 30;
+  variant.resident_weight_bytes = 84 * 2 ** 30;
   variant.estimated_resident_weight_bytes = 88 * 2 ** 30;
   variant.ssd_ple_bytes = 30 * 2 ** 30;
   variant.configuration = {
@@ -75,22 +76,36 @@ it('keeps file and PLE sizes without repeating a resident weight estimate', asyn
   };
   data.data[0].configuration = variant.configuration;
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
-  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
-  expect(await screen.findByText(/file 110.0 GiB · SSD PLE 30.0 GiB/)).toBeInTheDocument();
-  expect(screen.getByText('Smallest tier weights')).toBeInTheDocument();
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(zh, en) => language === 'zh' ? zh : en} />);
+  expect(await screen.findByText(language === 'zh'
+    ? 'MFQ · 文件 110.0 GiB · 常驻 80.0 GiB · SSD PLE 30.0 GiB'
+    : 'MFQ · file 110.0 GiB · resident 80.0 GiB · SSD PLE 30.0 GiB')).toBeInTheDocument();
+  if (language === 'en') expect(screen.getByText('Smallest tier weights')).toBeInTheDocument();
   expect(screen.queryByText(/est\. resident weights/)).not.toBeInTheDocument();
   expect(screen.queryByText(/resident weight baseline 80.0 GiB/)).not.toBeInTheDocument();
 });
 
-it('keeps older servers without a resident estimate readable', async () => {
+it.each([undefined, null, 0])('does not repeat resident size when no PLE is streamed: %s', async (ple) => {
   const data = catalog(false, true);
   data.data[0].variants[0].resident_weight_bytes = 80 * 2 ** 30;
+  data.data[0].variants[0].ssd_ple_bytes = ple;
   data.data[0].variants[0].configuration.required_memory_bytes = 80 * 2 ** 30;
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   expect(await screen.findByText('first-S4')).toBeInTheDocument();
   expect(document.querySelector('.model-variant small')).toHaveTextContent('MFQ · file');
   expect(screen.queryByText(/resident weight baseline/)).not.toBeInTheDocument();
+  expect(document.querySelector('.model-variant small')).not.toHaveTextContent(' · resident ');
+  expect(document.querySelector('.model-variant small')).not.toHaveTextContent(' · SSD PLE ');
+});
+
+it('does not show negative resident weights for inconsistent PLE metadata', async () => {
+  const data = catalog(false, true);
+  data.data[0].variants[0].byte_size = 10 * 2 ** 30;
+  data.data[0].variants[0].ssd_ple_bytes = 12 * 2 ** 30;
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  expect(await screen.findByText('MFQ · file 10.0 GiB · resident — · SSD PLE 12.0 GiB')).toBeInTheDocument();
 });
 
 it.each([true, false])('shows logical parameter components and the requested nine metadata cells: PLE=%s', async (ple) => {
@@ -102,11 +117,13 @@ it.each([true, false])('shows logical parameter components and the requested nin
   data.data[0].mtp_supported = true;
   data.data[0].capabilities = ['MTP', 'MoE', 'SSD streaming'];
   data.data[0].supports_ssd_streaming = true;
+  data.data[0].attention_profile = { sparse: true, compressed: !ple, hybrid: ple };
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(zh) => zh} />);
   expect(await screen.findByText(ple ? '176.2B（4.2B 稠密 + 120.8B 路由专家 + 51.2B PLE）' : '125B（4.2B 稠密 + 120.8B 路由专家）')).toBeInTheDocument();
   expect(document.querySelector('.model-mtp-support dd')).toHaveTextContent('是');
-  expect([...document.querySelectorAll('.model-metadata-grid > div > dt')].map((item) => item.textContent)).toEqual(['架构', '参数', '激活参数', '模态', 'MTP支持', '许可', '下载', '收藏', '发布时间']);
+  expect([...document.querySelectorAll('.model-metadata-grid > div > dt')].map((item) => item.textContent)).toEqual(['架构', '参数', '激活参数', '模态', 'MTP支持', '注意力类型', '下载', '收藏', '发布时间']);
+  expect(screen.getByText(ple ? '稀疏·混合' : '稀疏·压缩·非混合')).toBeInTheDocument();
   expect(document.querySelector('.model-metadata-grid')!.children).toHaveLength(9);
   expect(screen.queryByText('内存压力')).not.toBeInTheDocument();
   expect(document.querySelector('.configuration-badge')).toBeNull();
@@ -176,7 +193,7 @@ it('uses the same nine-cell layout for third-party models', async () => {
   const view = render(<ModelBrowser tab="community" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(zh) => zh} />);
   fireEvent.change(screen.getByPlaceholderText('模型名称、owner/repo 或仓库链接'), { target: { value: 'owner/model' } });
   await act(async () => fireEvent.click(screen.getByRole('button', { name: '查找' })));
-  expect([...view.container.querySelectorAll('.model-metadata-grid > div > dt')].map((item) => item.textContent)).toEqual(['架构', '参数', '激活参数', '模态', 'MTP支持', '许可', '下载', '收藏', '发布时间']);
+  expect([...view.container.querySelectorAll('.model-metadata-grid > div > dt')].map((item) => item.textContent)).toEqual(['架构', '参数', '激活参数', '模态', 'MTP支持', '注意力类型', '下载', '收藏', '发布时间']);
   expect(view.container.querySelector('.model-mtp-support dd')).toHaveTextContent('否');
 });
 
@@ -230,6 +247,31 @@ it('renders immediately and preserves the chosen card while metadata arrives', a
   await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
   expect(modelsApi.officialHubModels).toHaveBeenCalledTimes(2);
   view.unmount();
+});
+
+it('refreshes a renamed repository into one card with both current sources', async () => {
+  const data = catalog(false, true);
+  const currentRepo = 'Tylogi/Qwen3.8-Flash-Next-EW-MFQ';
+  const oldRepo = 'Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ';
+  const hf = { provider: 'huggingface' as const, repo_id: currentRepo, revision: 'master',
+    url: `https://huggingface.co/${currentRepo}`, available: true };
+  const oldMs = { provider: 'modelscope' as const, repo_id: oldRepo, revision: 'master',
+    url: `https://modelscope.cn/models/${oldRepo}`, available: true };
+  data.data[0] = { ...data.data[0], sources: [hf], selected_source: hf };
+  data.data[1] = { ...data.data[1], sources: [oldMs], selected_source: oldMs };
+  const ms = { ...oldMs, repo_id: currentRepo, url: `https://modelscope.cn/models/${currentRepo}` };
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValueOnce(data).mockResolvedValueOnce({
+    ...data, data: [{ ...data.data[0], sources: [hf, ms] }],
+  });
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  await screen.findByText('first-S4');
+  fireEvent.click(screen.getByRole('button', { name: /secondTest/ }));
+  expect(screen.getByRole('button', { name: oldRepo })).toBeInTheDocument();
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Refresh' })));
+  expect(screen.queryByRole('button', { name: oldRepo })).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: currentRepo })).toBeInTheDocument();
+  expect(screen.getByRole('combobox', { name: 'Download source' }).querySelectorAll('option')).toHaveLength(2);
+  expect(document.querySelectorAll('.official-model-card')).toHaveLength(1);
 });
 
 it('cancels catalog requests and polling on unmount', async () => {

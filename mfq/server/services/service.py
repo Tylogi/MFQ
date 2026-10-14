@@ -1008,7 +1008,8 @@ class ServerService:
         except ModelArtifactNotFoundError as error:
             raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
         try:
-            return await asyncio.to_thread(checkpoint_cache_profile, artifact)
+            return await asyncio.to_thread(checkpoint_cache_profile, artifact,
+                cuda=getattr(self.runtime_manager, "backend", None) == "cuda")
         except (ValueError, OSError) as error:
             raise ServiceError(422, "model_cache_profile_unavailable", "checkpoint cache metadata cannot be read") from error
 
@@ -1500,7 +1501,7 @@ class ServerService:
                 501, "model_management_unavailable", "model loading is not available"
             )
         job = await self.create_job(
-            CreateJobRequest(kind="model.load", payload=request.model_dump(mode="json"))
+            CreateJobRequest(kind="model.load", payload=request.model_dump(mode="json", exclude_unset=True))
         )
         return OperationAccepted(operation_id=job.id)
 

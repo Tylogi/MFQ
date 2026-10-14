@@ -27,6 +27,7 @@ from mfq.server.protocol.models import ErrorDetail
 from mfq.server.protocol.quantization import Wt2ReferencePayload
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.services.download_directory import DownloadDirectorySettings
+from mfq.server.runtime.disk_budget import DiskBudget, volume
 from mfq.server.services.inference_benchmark import InferenceBenchmarkPayload, WikitextQualityPayload, run_inference_benchmark
 from mfq.server.services.accuracy_benchmark import AccuracyBenchmarkPayload, run_accuracy_benchmark
 from mfq.server.services.evaluation_datasets import OfficialDatasetDownloadPayload, download_official_dataset, materialize_wt2, WT2_TEXT_SHA256
@@ -254,6 +255,25 @@ class ToolJobHandlers:
         self.runtime_manager = runtime_manager
         from mfq.server.services.quantization import QuantizationWorkbench
         self.quantization_workbench = QuantizationWorkbench(self)
+
+    def _download_prefix_bytes(self, directory: Path) -> int:
+        if self.runtime_manager is None:
+            return 0
+        cache = self.runtime_manager._prefix_cache_directory()
+        if volume(cache) != volume(directory):
+            return 0
+        from mfq.server.runtime.prefix_disk_budget import _scan_blocks
+        return sum(block.size for block in _scan_blocks(cache))
+
+    def download_directory_status(self) -> dict[str, str | int | bool | None]:
+        status = self.download_directories.status()
+        directory = Path(status['actual_directory'])
+        if status['disk_free_bytes'] is not None:
+            reserved = DiskBudget().reserved(directory)
+            prefix = self._download_prefix_bytes(directory) if self.download_directories.evict_prefix_cache else 0
+            status.update(download_reserved_bytes=reserved, reclaimable_prefix_bytes=prefix,
+                disk_available_bytes=max(0, status['disk_free_bytes'] + prefix - reserved))
+        return status
 
     def _mfq_command(self, *arguments: str) -> list[str]:
         command = [str(self.paths.python)]
@@ -516,7 +536,6 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = ModelScopeDownloadPayload.model_validate(payload)
         destination = self._download_output(request.destination, request.download_directory)
-        self._preflight_download(destination, request.expected_bytes)
         if self.paths.internal_modelscope:
             argv = self._mfq_command(
                 "_hub-download",
@@ -568,7 +587,6 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = HuggingFaceDownloadPayload.model_validate(payload)
         destination = self._download_output(request.destination, request.download_directory)
-        self._preflight_download(destination, request.expected_bytes)
         if self.paths.internal_huggingface:
             argv = self._mfq_command(
                 "_hub-download",
@@ -608,41 +626,100 @@ class ToolJobHandlers:
         )
 
     async def _run_download(self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path, expected_bytes: int | None) -> None:
-        def observed() -> tuple[int, int]:
-            size = files = 0
+        def observed() -> tuple[int, int, int]:
+            size = files = allocated = 0
+            seen = set()
             for path in destination.rglob("*"):
                 try:
-                    if not path.is_file() or path.suffix in {".lock", ".metadata"}:
+                    if path.is_symlink() or not path.is_file() or path.suffix in {".lock", ".metadata"}:
                         continue
-                    size += path.stat().st_size
+                    status = path.stat()
+                    identity = (status.st_dev, status.st_ino)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    size += status.st_size
+                    if hasattr(status, 'st_blocks'):
+                        allocated += min(status.st_size, status.st_blocks * 512)
+                    elif os.name == 'nt':
+                        import ctypes
+                        high = ctypes.c_ulong()
+                        measure = ctypes.windll.kernel32.GetCompressedFileSizeW
+                        measure.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+                        measure.restype = ctypes.c_ulong
+                        low = measure(str(path), ctypes.byref(high))
+                        if low != 0xffffffff or ctypes.windll.kernel32.GetLastError() == 0:
+                            allocated += min(status.st_size, (high.value << 32) | low)
                     if path.suffix not in {".incomplete", ".partial"} and not any(part.startswith(".") for part in path.relative_to(destination).parts):
                         files += 1
                 except FileNotFoundError:
                     continue
-            return size, files
+            return size, files, allocated
+
+        _, _, initial = await asyncio.to_thread(observed)
+        if expected_bytes is None or expected_bytes <= 0:
+            raise self._failure("download_size_unknown", "Resolve the model files before downloading so disk space can be reserved")
+        margin = max(512 << 20, expected_bytes // 100)
+        required = max(0, expected_bytes - initial)
+        reclaimable = await asyncio.to_thread(self._download_prefix_bytes, destination) if self.download_directories.evict_prefix_cache else 0
+        budget = DiskBudget()
+        pending_reservation = asyncio.create_task(asyncio.to_thread(budget.reserve, destination,
+            required + margin, reclaimable=reclaimable, exclusive=True))
+        try:
+            reservation = await asyncio.shield(pending_reservation)
+        except asyncio.CancelledError:
+            with suppress(OSError, ValueError):
+                abandoned = await pending_reservation
+                await asyncio.to_thread(abandoned.close)
+            raise
+        except OSError as error:
+            raise self._failure("insufficient_disk_space", "Not enough unreserved disk space for this download") from error
+        except ValueError as error:
+            raise self._failure("download_destination_busy", "This destination already has an active download") from error
 
         async def monitor() -> None:
-            previous, _ = await asyncio.to_thread(observed)
+            previous, _, _ = await asyncio.to_thread(observed)
             previous_time = time.monotonic()
             speed = 0.0
             while True:
                 await asyncio.sleep(1.0)
-                size, files = await asyncio.to_thread(observed)
+                size, files, allocated = await asyncio.to_thread(observed)
                 now = time.monotonic()
                 current_speed = max(0, size - previous) / max(0.001, now - previous_time)
                 speed = current_speed if speed == 0 else speed * 0.5 + current_speed * 0.5
                 previous, previous_time = size, now
+                try:
+                    await asyncio.to_thread(reservation.update, max(0, expected_bytes - allocated) + margin)
+                except OSError as error:
+                    raise self._failure('insufficient_disk_space', 'Not enough disk space to continue this download') from error
                 await context.progress(min(0.98, size / expected_bytes) if expected_bytes else 0.01,
                     data={"downloaded_bytes": size, "total_bytes": expected_bytes,
                           "bytes_per_second": speed, "files_completed": files})
 
-        task = asyncio.create_task(monitor())
+        task = transfer = None
         try:
-            await self._run(context, argv, env=env)
+            if reclaimable and self.runtime_manager is not None:
+                await self.runtime_manager.reclaim_prefix_disk_for_download(destination)
+            if await asyncio.to_thread(lambda: shutil.disk_usage(destination).free < budget.reserved(destination)):
+                raise self._failure("insufficient_disk_space", "Prefix cache could not release enough disk space for this download")
+            task = asyncio.create_task(monitor())
+            child_env = {**env, "MFQ_DISK_BUDGET_DIR": str(budget.root)}
+            if os.name != 'nt':
+                child_env['MFQ_DOWNLOAD_RESERVATION_FD'] = str(reservation.stream.fileno())
+            transfer = asyncio.create_task(self._run(context, argv, env=child_env))
+            finished, _ = await asyncio.wait((task, transfer), return_when=asyncio.FIRST_COMPLETED)
+            for completed in finished:
+                await completed
         finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            try:
+                for pending in (task, transfer):
+                    if pending is not None:
+                        pending.cancel()
+                await asyncio.gather(*(pending for pending in (task, transfer) if pending is not None), return_exceptions=True)
+            finally:
+                await asyncio.to_thread(reservation.close)
+                if self.runtime_manager is not None:
+                    self.runtime_manager._prefix_disk_checked_at = 0.0
 
     async def quantize(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = QuantizePayload.model_validate(payload)
@@ -842,7 +919,7 @@ class ToolJobHandlers:
 
     async def wikitext_reference(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = Wt2ReferencePayload.model_validate(payload)
-        source = await asyncio.to_thread(self.quantization_workbench.source, request.model)
+        source = await asyncio.to_thread(self.quantization_workbench.source, request.model, reference=True)
         if source.format != 'hf' or not source.imatrix_supported:
             raise self._failure('reference_architecture_unsupported', 'WT2 source generation currently supports original Qwen3.5 and Gemma4 HF architectures, including supported native QAT weights')
         dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
@@ -859,6 +936,8 @@ class ToolJobHandlers:
             '--backend', backend, '--device', 'mps' if backend == 'metal' else 'cuda:0')
         if not request.layerwise:
             argv.append('--resident')
+        if backend == 'cuda':
+            argv.extend(['--runtime', str(self._required_executable(self.paths.runtime, 'MFQ native CUDA runtime'))])
 
         loading_data = {}
         def progress(line):
@@ -1077,6 +1156,7 @@ class ToolJobHandlers:
         final_progress: float = 0.99,
         final_message: str = "Finalizing output",
     ) -> list[str]:
+        inherited = (int(env['MFQ_DOWNLOAD_RESERVATION_FD']),) if env and os.name != 'nt' and 'MFQ_DOWNLOAD_RESERVATION_FD' in env else ()
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=self.root,
@@ -1085,6 +1165,7 @@ class ToolJobHandlers:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            **({'pass_fds': inherited} if inherited else {}),
         )
 
         async def stop() -> None:
@@ -1205,20 +1286,6 @@ class ToolJobHandlers:
             },
         )
         return {"repo_id": repo_id, "files": len(files), "total_bytes": total, "artifact": uri}
-
-    def _preflight_download(self, destination: Path, expected_bytes: int | None) -> None:
-        if expected_bytes is None or expected_bytes <= 0:
-            return
-        existing = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file())
-        required = max(0, expected_bytes - existing)
-        free = shutil.disk_usage(destination).free
-        reserve = max(512 * 1024 * 1024, expected_bytes // 100)
-        if free < required + reserve:
-            raise self._failure(
-                "insufficient_disk_space",
-                f"download requires {required} bytes plus {reserve} bytes reserve, "
-                f"but only {free} bytes are free",
-            )
 
     async def _model(self, identifier: str):
         try:

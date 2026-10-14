@@ -113,13 +113,13 @@ __device__ void store_attention(float value, float* output, int64_t offset,
     else static_cast<float*>(epilogue.output)[offset] = value;
 }
 
-template<int Slices>
+template<int Slices, bool use_hot = false>
 __global__ void sparse_attention_kernel(
     const void* query, const half* key, const half* value, const int32_t* indices,
     float* output, int64_t heads, int64_t kv_heads, int64_t tokens,
     int64_t width, int64_t cache_length, int64_t topk, float scale,
     bool half_query, const void* causal_positions, bool wide_positions,
-    AttentionEpilogue epilogue) {
+    AttentionEpilogue epilogue, mfq::cuda::HotKvView hot) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -151,12 +151,24 @@ __global__ void sparse_attention_kernel(
         const bool valid = index >= 0 && index < cache_length;
         const int64_t cb = ((batch * kv_heads + kv_head) * cache_length +
             (valid ? index : 0)) * width;
+        const half* source_key=key+cb;
+        const half* source_value=value+cb;
+        if constexpr(use_hot) {
+            if(valid) {const int slot=hot.mapping[index];if(slot>=0) {
+                const auto at=((batch*kv_heads+kv_head)*hot.cells+slot)*width;
+                source_key=static_cast<const half*>(hot.keys)+at;
+                source_value=static_cast<const half*>(hot.values)+at;
+            }else if(hot.cold_mapping) {
+                const auto at=((batch*kv_heads+kv_head)*hot.cold_cells+hot.cold_mapping[index])*width;
+                source_key=key+at;source_value=value+at;
+            }}
+        }
         float dot = 0.f;
         if (valid) {
             for (int64_t d = tid; d < width; d += 256) {
                 const float q = half_query ? __half2float(static_cast<const half*>(query)[qb + d])
                     : static_cast<const float*>(query)[qb + d];
-                dot += q * __half2float(key[cb + d]);
+                dot += q * __half2float(source_key[d]);
             }
         }
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -181,12 +193,12 @@ __global__ void sparse_attention_kernel(
             #pragma unroll
             for (int slice = 0; slice < Slices; ++slice) {
                 const int64_t d = tid + slice * 256;
-                const float v = valid && d < width ? __half2float(value[cb + d]) : 0.f;
+                const float v = valid && d < width ? __half2float(source_value[d]) : 0.f;
                 accum[slice] = accum[slice] * online[2] + v * online[3];
             }
         } else {
             for (int64_t d = tid; d < width; d += 256) {
-                const float v = valid ? __half2float(value[cb + d]) : 0.f;
+                const float v = valid ? __half2float(source_value[d]) : 0.f;
                 output[ob + d] = output[ob + d] * online[2] + v * online[3];
             }
         }
@@ -209,7 +221,7 @@ __global__ void sparse_attention_kernel(
 
 static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& selected, double scale, bool v_is_k_view,
-    const Tensor& gate, bool half_output, bool fused_query = false) {
+    const Tensor& gate, bool half_output, bool fused_query = false, mfq::cuda::HotKvView hot = {}) {
     attention_shapes(q, k, v);
     MFQ_RUNTIME_CHECK(selected.defined() && selected.is_cuda() &&
         selected.device() == q.device() && selected.dim() == 3 &&
@@ -268,6 +280,9 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<int>(key.size(2)));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
+            if(hot.mapping)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(
+                query,key,value,safe_indices,mask,Tensor{},Tensor{},scale,
+                "qwen4_sparse_gqa_attention_hot",gate,half_output,Tensor{},0,hot);
             return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
                 scale, "qwen4_sparse_gqa_attention", gate, half_output);
@@ -284,23 +299,23 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     MFQ_RUNTIME_CHECK(blocks <= std::numeric_limits<int>::max(),
         "sparse attention exceeds CUDA grid size");
     const auto stream = mfq_current_cuda_stream();
-    #define MFQ_LAUNCH_SPARSE(S) sparse_attention_kernel<S><<<unsigned(blocks), 256, 0, stream>>>( \
+    #define MFQ_LAUNCH_SPARSE(S,H) sparse_attention_kernel<S,H><<<unsigned(blocks), 256, 0, stream>>>( \
         query.data_ptr<float>(), reinterpret_cast<const half*>(key.data_ptr()), \
         reinterpret_cast<const half*>(value.data_ptr()), indices.data_ptr<int32_t>(), \
         output.data_ptr<float>(), q.size(1), k.size(1), q.size(2), q.size(3), \
-        k.size(2), selected.size(2), static_cast<float>(scale), false, nullptr, false, AttentionEpilogue{})
-    if (q.size(3) <= 256) { MFQ_LAUNCH_SPARSE(1); }
-    else if (q.size(3) <= 512) { MFQ_LAUNCH_SPARSE(2); }
-    else if (q.size(3) <= 1024) { MFQ_LAUNCH_SPARSE(4); }
-    else { MFQ_LAUNCH_SPARSE(0); }
+        k.size(2), selected.size(2), static_cast<float>(scale), false, nullptr, false, AttentionEpilogue{},hot)
+    if (q.size(3) <= 256) { if(hot.mapping){MFQ_LAUNCH_SPARSE(1,true);}else{MFQ_LAUNCH_SPARSE(1,false);} }
+    else if (q.size(3) <= 512) { if(hot.mapping){MFQ_LAUNCH_SPARSE(2,true);}else{MFQ_LAUNCH_SPARSE(2,false);} }
+    else if (q.size(3) <= 1024) { if(hot.mapping){MFQ_LAUNCH_SPARSE(4,true);}else{MFQ_LAUNCH_SPARSE(4,false);} }
+    else { if(hot.mapping){MFQ_LAUNCH_SPARSE(0,true);}else{MFQ_LAUNCH_SPARSE(0,false);} }
     #undef MFQ_LAUNCH_SPARSE
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
 Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& selected, double scale, bool v_is_k_view) {
-    return sparse_impl(q, k, v, selected, scale, v_is_k_view, Tensor{}, false);
+    const Tensor& selected, double scale, bool v_is_k_view, mfq::cuda::HotKvView hot) {
+    return sparse_impl(q, k, v, selected, scale, v_is_k_view, Tensor{}, false, false, hot);
 }
 
 __global__ void attention_gated_kernel(const void* attended, bool half_input,
@@ -348,7 +363,7 @@ Tensor gated(const Tensor& attended, const Tensor& gate, bool half_output) {
 }
 
 Tensor sparse_gated(const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& indices, const Tensor& gate, double scale, bool half_output) {
+    const Tensor& indices, const Tensor& gate, double scale, bool half_output, mfq::cuda::HotKvView hot) {
     attention_shapes(q, k, v);
     values({&q, &gate});
     MFQ_RUNTIME_CHECK(gate.dim() == 4 && gate.size(0) == q.size(0) &&
@@ -357,10 +372,10 @@ Tensor sparse_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     // The QSA MMA epilogue combines stream-K normalization, gate and cast.
     // Keep the shared selected-attention arithmetic for all other widths.
     if (q.size(3) != 256 || !half_or_float(gate) || !q.numel() || !k.size(2))
-        return gated(sparse(q, k, v, indices, scale, false), gate, half_output);
+        return gated(sparse(q, k, v, indices, scale, false,hot), gate, half_output);
     const char* fused_query = std::getenv("MFQ_QSA_SPARSE_QUERY_FUSED");
     return sparse_impl(q, k, v, indices, scale, false, gate, half_output,
-        !fused_query || fused_query[0] != '0');
+        !fused_query || fused_query[0] != '0',hot);
 }
 
 template<class BlockIndex, class Position>
@@ -580,7 +595,7 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
 
 Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
-    bool half_output, bool fused_mma_gate, bool fused_mma_prepare) {
+    bool half_output, bool fused_mma_gate, bool fused_mma_prepare, mfq::cuda::HotKvView hot) {
     attention_shapes(q, k, v);
     values({&q, &gate});
     MFQ_RUNTIME_CHECK(gate.dim() == 4 && gate.size(0) == q.size(0) && gate.size(1) == q.size(2) &&
@@ -595,10 +610,16 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
             .expand({q.size(0), q.size(2), columns});
         selected = tb::where(selected <= cache_positions.reshape({1, q.size(2), 1}),
             selected, tb::full_like(selected, -1));
-        return gated(sparse(q, k, v, selected, scale, false), gate, half_output);
+        return gated(sparse(q, k, v, selected, scale, false,hot), gate, half_output);
     }
     if (q.size(3) == 256) {
         auto key = k.to(tb::kFloat16).contiguous(), value = v.to(tb::kFloat16).contiguous();
+        if(hot.mapping && q.numel()) {
+            auto attended=mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(q,key,value,
+                Tensor{},Tensor{},Tensor{},Tensor{},scale,"causal_gqa_attention_hot",
+                fused_mma_gate?gate:Tensor{},half_output,cache_positions,columns,hot);
+            return fused_mma_gate?attended:gated(attended,gate,half_output);
+        }
         if (fused_mma_prepare && q.numel()) {
             auto attended = mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 q, key, value, Tensor{}, Tensor{}, Tensor{}, Tensor{}, scale,
@@ -639,28 +660,37 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     const AttentionEpilogue epilogue{gate.data_ptr(), output.data_ptr(),
         gate.scalar_type() == tb::kFloat32, half_output,
         gate.scalar_type() == tb::kFloat32 && !gate.is_contiguous(), attention_layout(gate)};
-    #define MFQ_LAUNCH_CAUSAL(S) sparse_attention_kernel<S><<<unsigned(blocks), 256, 0, mfq_current_cuda_stream()>>>( \
+    #define MFQ_LAUNCH_CAUSAL(S,H) sparse_attention_kernel<S,H><<<unsigned(blocks), 256, 0, mfq_current_cuda_stream()>>>( \
         query.data_ptr(), reinterpret_cast<const half*>(key.data_ptr()), reinterpret_cast<const half*>(value.data_ptr()), \
         nullptr, scratch.defined() ? scratch.data_ptr<float>() : nullptr, q.size(1), k.size(1), q.size(2), q.size(3), \
         k.size(2), columns, float(scale), q.scalar_type() == tb::kFloat16, cache_positions.data_ptr(), \
-        cache_positions.scalar_type() == tb::kInt64, epilogue)
-    if (q.size(3) <= 256) { MFQ_LAUNCH_CAUSAL(1); }
-    else if (q.size(3) <= 512) { MFQ_LAUNCH_CAUSAL(2); }
-    else if (q.size(3) <= 1024) { MFQ_LAUNCH_CAUSAL(4); }
-    else { MFQ_LAUNCH_CAUSAL(0); }
+        cache_positions.scalar_type() == tb::kInt64, epilogue,hot)
+    if (q.size(3) <= 256) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(1,true);}else{MFQ_LAUNCH_CAUSAL(1,false);} }
+    else if (q.size(3) <= 512) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(2,true);}else{MFQ_LAUNCH_CAUSAL(2,false);} }
+    else if (q.size(3) <= 1024) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(4,true);}else{MFQ_LAUNCH_CAUSAL(4,false);} }
+    else { if(hot.mapping){MFQ_LAUNCH_CAUSAL(0,true);}else{MFQ_LAUNCH_CAUSAL(0,false);} }
     #undef MFQ_LAUNCH_CAUSAL
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
 Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
-                       int64_t offset, double scale) {
+                       int64_t offset, double scale, mfq::cuda::HotKvView hot) {
     attention_shapes(query, key, value);
     const auto count = key.size(2);
     MFQ_RUNTIME_CHECK(count > 0 && offset >= 0 && offset <= count &&
         query.size(2) <= count - offset, "attention query range is outside the cache");
     MFQ_RUNTIME_CHECK(std::isfinite(scale), "attention scale must be finite");
     MfqCudaGuard guard(query.device());
+    if(hot.mapping) {
+        auto positions=tb::arange(offset,offset+query.size(2),query.options().dtype(tb::kInt64));
+        if(query.size(3)==256)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(
+            query,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,"dense_gqa_attention_hot",
+            Tensor{},false,positions,offset+query.size(2),hot);
+        auto selected=tb::arange(offset+query.size(2),positions.options()).reshape({1,1,-1}).expand({1,query.size(2),offset+query.size(2)});
+        selected=tb::where(selected<=positions.reshape({1,-1,1}),selected,tb::full_like(selected,-1));
+        return sparse(query,key,value,selected,scale,false,hot);
+    }
     const auto options = query.options().dtype(tb::kInt64);
     const auto kp = tb::arange(count, options).unsqueeze(0);
     const auto qp = tb::arange(query.size(2), options).unsqueeze(1) + offset;

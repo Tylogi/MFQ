@@ -116,7 +116,13 @@ struct CacheView {
     const int64_t* chunks=nullptr;
     const int32_t* table=nullptr;
     int table_width=0,page_size=0,chunk_pages=0,heads=0,packed=0;
-    __device__ const uint32_t* row(int batch,int head,int token) const {
+    const uint32_t* hot_data=nullptr;
+    const int32_t* hot_mapping=nullptr;
+    int64_t hot_cells=0,cold_cells=0;
+    const int32_t* cold_mapping=nullptr;
+    template<bool use_hot=false> __device__ const uint32_t* row(int batch,int head,int token) const {
+        if constexpr(use_hot) {const int slot=hot_mapping[token];if(slot>=0)return hot_data+(int64_t(head)*hot_cells+slot)*token_stride;
+            if(cold_mapping)return data+(int64_t(head)*cold_cells+cold_mapping[token])*token_stride;}
         if(!page_size)return data+int64_t(batch)*batch_stride+int64_t(head)*head_stride+int64_t(token)*token_stride;
         const int physical=table[int64_t(batch)*table_width+token/page_size];
         if(physical<0)return nullptr;
@@ -134,7 +140,7 @@ __global__ void paged_write_kernel(CacheView view,const uint32_t* source,const i
 }
 __device__ float warp_sum(float x){for(int i=16;i;i/=2)x+=__shfl_xor_sync(0xffffffff,x,i);return x;}
 __device__ float warp_max(float x){for(int i=16;i;i/=2)x=fmaxf(x,__shfl_xor_sync(0xffffffff,x,i));return x;}
-template<int W> __global__ void attention_kernel(const float* query,CacheView keys,CacheView values,
+template<int W,bool use_hot=false> __global__ void attention_kernel(const float* query,CacheView keys,CacheView values,
         const float* kc,const float* vc,const float* signs,const int32_t* selected,const int64_t* positions,
         const int64_t* lengths,const float* mask,int mask_width,float* partial,float* stats,
         int heads,int kv_heads,int tokens,int d,int capacity,int slots,int parts,int span,
@@ -164,8 +170,8 @@ template<int W> __global__ void attention_kernel(const float* query,CacheView ke
             int id=slot<slots&&slot<(part+1)*span?(selected?selected[int64_t(bt)*slots+slot]:slot):-1;
             bool valid=id>=0&&id<visible;
             if(valid&&mask)valid=mask[int64_t(batch)*mask_width+id]!=0;
-            const auto* kr=valid?keys.row(batch,kh,id):nullptr;
-            const auto* vr=valid?values.row(batch,kh,id):nullptr;
+            const auto* kr=valid?keys.row<use_hot>(batch,kh,id):nullptr;
+            const auto* vr=valid?values.row<use_hot>(batch,kh,id):nullptr;
             valid=valid&&kr&&vr;
             if(dim==0)ids[at/W]=valid?id:-1;
             kt[at]=valid?__uint_as_float(kr[0])*code(kr,dim,bk,kc):0.f;
@@ -262,7 +268,7 @@ void cuda_kv_write_paged(const QuantizedKvPages& pages,const tb::Tensor& keys,co
 }
 tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,const tb::Tensor& values,
         KvQuantization quant,const tb::Tensor& selected,const tb::Tensor& positions,int64_t offset,
-        const QuantizedKvPages& pages,int64_t capacity,const tb::Tensor& lengths,const tb::Tensor& mask,double scale) {
+        const QuantizedKvPages& pages,int64_t capacity,const tb::Tensor& lengths,const tb::Tensor& mask,double scale,HotKvView hot) {
     MFQ_RUNTIME_CHECK(quant.enabled()&&valid_bits(quant.bits)&&query.is_cuda()&&query.dim()==4,"invalid TurboQuant attention");
     MfqCudaGuard guard(query.get_device());
     const int b=int(query.size(0)),h=int(query.size(1)),t=int(query.size(2)),d=int(query.size(3)),w=rotation_width(d);
@@ -288,8 +294,9 @@ tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,cons
     auto len=lengths.defined()?lengths.to(tb::kInt64).contiguous():tb::Tensor{};
     auto valid=mask.defined()?mask.to(tb::kFloat32).contiguous():tb::Tensor{};
     const auto kt=tables(w,quant.key_bits(),false,query.device()),vt=tables(w,quant.value_bits(),true,query.device());
-    const auto kv=view(keys,pages.keys,pages,cuda_kv_packed_width(d,quant.key_bits()));
-    const auto vv=view(values,pages.values,pages,cuda_kv_packed_width(d,quant.value_bits()));
+    auto kv=view(keys,pages.keys,pages,cuda_kv_packed_width(d,quant.key_bits()));
+    auto vv=view(values,pages.values,pages,cuda_kv_packed_width(d,quant.value_bits()));
+    if(hot.mapping){kv.hot_data=static_cast<const uint32_t*>(hot.keys);vv.hot_data=static_cast<const uint32_t*>(hot.values);kv.hot_mapping=vv.hot_mapping=hot.mapping;kv.hot_cells=vv.hot_cells=hot.cells;kv.cold_mapping=vv.cold_mapping=hot.cold_mapping;kv.cold_cells=vv.cold_cells=hot.cold_cells;}
     // Prefill already has enough query rows to fill the GPU. Splitting those rows
     // multiplies scratch storage without adding useful parallelism (GiB at 8K).
     const int parts=b*h*t>=1024?1:std::min(16,(slots+255)/256);
@@ -297,9 +304,11 @@ tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,cons
     auto partial=tb::empty({b,h,t,parts,w},q.options()),stats=tb::empty({b,h,t,parts,2},q.options());
     auto output=tb::empty({b,t,h,d},q.options());
     const dim3 grid(parts,kh*((h/kh+3)/4),b*t);
-    #define TQ_LAUNCH(W) attention_kernel<W><<<grid,128,0,mfq_get_current_cuda_stream()>>>(q.data_ptr<float>(),kv,vv,kt.centers.data_ptr<float>(),vt.centers.data_ptr<float>(),kt.signs.data_ptr<float>(),ids.defined()?ids.data_ptr<int32_t>():nullptr,pos.defined()?pos.data_ptr<int64_t>():nullptr,len.defined()?len.data_ptr<int64_t>():nullptr,valid.defined()?valid.data_ptr<float>():nullptr,valid.defined()?int(valid.size(1)):0,partial.data_ptr<float>(),stats.data_ptr<float>(),h,kh,t,d,int(capacity),slots,parts,span,int(offset),pos.defined()&&pos.dim()==2,quant.key_bits(),quant.value_bits(),float(scale>0?scale:1/std::sqrt(double(d))))
+    #define TQ_LAUNCH_H(W,H) attention_kernel<W,H><<<grid,128,0,mfq_get_current_cuda_stream()>>>(q.data_ptr<float>(),kv,vv,kt.centers.data_ptr<float>(),vt.centers.data_ptr<float>(),kt.signs.data_ptr<float>(),ids.defined()?ids.data_ptr<int32_t>():nullptr,pos.defined()?pos.data_ptr<int64_t>():nullptr,len.defined()?len.data_ptr<int64_t>():nullptr,valid.defined()?valid.data_ptr<float>():nullptr,valid.defined()?int(valid.size(1)):0,partial.data_ptr<float>(),stats.data_ptr<float>(),h,kh,t,d,int(capacity),slots,parts,span,int(offset),pos.defined()&&pos.dim()==2,quant.key_bits(),quant.value_bits(),float(scale>0?scale:1/std::sqrt(double(d))))
+    #define TQ_LAUNCH(W) if(hot.mapping){TQ_LAUNCH_H(W,true);}else{TQ_LAUNCH_H(W,false);}
     switch(w){case 1:TQ_LAUNCH(1);break;case 2:TQ_LAUNCH(2);break;case 4:TQ_LAUNCH(4);break;case 8:TQ_LAUNCH(8);break;case 16:TQ_LAUNCH(16);break;case 32:TQ_LAUNCH(32);break;case 64:TQ_LAUNCH(64);break;case 128:TQ_LAUNCH(128);break;case 256:TQ_LAUNCH(256);break;case 512:TQ_LAUNCH(512);break;case 1024:TQ_LAUNCH(1024);break;}
     #undef TQ_LAUNCH
+    #undef TQ_LAUNCH_H
     attention_output<<<b*h*t,std::max(32,w),0,mfq_get_current_cuda_stream()>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),vt.signs.data_ptr<float>(),output.data_ptr<float>(),w,d,parts,h,t);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }

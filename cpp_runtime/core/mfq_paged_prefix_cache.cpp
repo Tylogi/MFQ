@@ -1,4 +1,5 @@
 #include "mfq_paged_prefix_cache.h"
+#include "include/mfq/disk_budget.h"
 
 #include <algorithm>
 #include <atomic>
@@ -996,6 +997,8 @@ private:
     }
 
     void write_text(const WriteRequest& request) {
+        DiskWriteGuard space_guard(namespace_dir_, 108 + request.tokens.size() * 8, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return;
         const auto target = path_for(request.hash).string() + ".tokens";
         const auto temporary = target + ".tmp." + std::to_string(monotonic_tick());
         std::vector<std::uint8_t> bytes;
@@ -1112,6 +1115,8 @@ private:
         const auto temporary = final_path.parent_path() /
             (".mfqkv.tmp." + std::to_string(monotonic_tick()) + "." +
              std::to_string(temp_counter_.fetch_add(1)));
+        DiskWriteGuard space_guard(final_path.parent_path(), bytes + overhead, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return false;
         std::ofstream output(
             temporary,
             std::ios::binary | std::ios::trunc);
@@ -1193,6 +1198,8 @@ private:
     }
 
     void write_identity() {
+        DiskWriteGuard space_guard(namespace_dir_, 32768, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return;
         const auto target = namespace_dir_ / "identity.txt";
         const auto temporary = namespace_dir_ / (".identity.tmp." + std::to_string(monotonic_tick()));
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -1520,11 +1527,8 @@ private:
         std::error_code error;
         const auto space = std::filesystem::space(namespace_dir_, error);
         if (error) return config_.max_disk_bytes;
-        const auto available = static_cast<std::uint64_t>(space.available);
-        const auto managed_and_available = disk_bytes_ >
-                std::numeric_limits<std::uint64_t>::max() - available
-            ? std::numeric_limits<std::uint64_t>::max()
-            : disk_bytes_ + available;
+        std::uint64_t managed_and_available = 0;
+        try { managed_and_available = unreserved_disk_space(namespace_dir_, disk_bytes_); } catch (...) { return 0; }
         const auto safe_available = managed_and_available -
             managed_and_available / kDiskSafeDenominator;
         return std::min(config_.max_disk_bytes, safe_available);

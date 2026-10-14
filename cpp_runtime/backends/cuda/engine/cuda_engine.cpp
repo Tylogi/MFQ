@@ -142,6 +142,8 @@ struct CudaEngineState {
                 std::cerr<<"runtime_qwen4_mtp_warmup tokens="<<output.result.completion_tokens
                     <<" ms="<<std::chrono::duration<double,std::milli>(
                         std::chrono::steady_clock::now()-start).count()<<'\n';
+                release_moe_prefill_buffers(execution->moe_expert_cache);
+                mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
             }
         }
     }

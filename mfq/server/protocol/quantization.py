@@ -34,6 +34,7 @@ class QuantizationFiles(ProtocolModel):
 
 class QuantizationSourceRequest(ProtocolModel):
     path: str = Field(min_length=1, max_length=4096)
+    reference: bool = False
 
 
 class SourceLoadingRequest(QuantizationSourceRequest):

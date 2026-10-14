@@ -21,7 +21,6 @@ matches what you want to do.
 ## Models and runtimes
 
 - [Runtime support matrix](runtime-support.md)
-- [DeepSeek V4.1 raw-HF validation](deepseek-v41-raw-hf.md)
 - [MiniCPM-o 4.5 multimodal runtime](minicpmo45.md)
 - [CUDA runtime validation](cuda-native-runtime-validation.md)
 - [HIP runtime validation](hip-native-runtime-validation.md)
@@ -37,7 +36,3 @@ matches what you want to do.
 
 - [Architecture and contribution rules](../CONTRIBUTING.md)
 - [Repository README](../README.md)
-
-Runtime support is checkpoint- and backend-dependent. Use the support matrix
-as the starting point, then validate the exact model artifact on its target
-machine before deployment.

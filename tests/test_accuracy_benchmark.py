@@ -137,7 +137,7 @@ def test_tools_report_native_availability_and_remove_external_connector(tmp_path
         service = ServerService(SessionStore(tmp_path / "db.sqlite3"), FakeBackend())
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
             result = await client.get("/api/v1/evaluations/tools")
-            assert result.json() == {"workspace_root": None, "api_base": "http://test/v1", "quality_available": False, "benchmark_available": False, "accuracy_available": False, "task_benchmarks": {}}
+            assert result.json() == {"workspace_root": None, "api_base": "http://test/v1", "quality_available": False, "reference_available": False, "benchmark_available": False, "accuracy_available": False, "task_benchmarks": {}}
             assert (await client.get("/api/v1/evaluations/benchi")).status_code == 404
     asyncio.run(run())
 

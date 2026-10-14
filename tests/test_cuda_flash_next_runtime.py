@@ -865,7 +865,8 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent)
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
 @pytest.mark.parametrize("quantized_gr,hidden",[(False,16),(True,16),("shared-q8",16),
     ("shared-nint",16),("shared-up",16),(False,160)])
-def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr,hidden):
+@pytest.mark.parametrize("ram_hot",[False,True])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr,hidden,ram_hot):
     from mfq.formats.nint import NintSpec
     from mfq.formats.mfe import MfePool,MfeTensor
     from mfq.quantize.nint_quant import quantize
@@ -917,6 +918,9 @@ def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interva
         "MFQ_MOE_PREFILL_GRAPH":"0",
         "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
         "MFQ_MOE_HOST_CACHE_BYTES":"1048576"}
+    if ram_hot:
+        env.update(MFQ_KV_PLACEMENT="auto",MFQ_KV_ALLOCATION="preallocated",
+            MFQ_MEMORY_ARCHITECTURE="discrete",MFQ_KV_AUTO_STREAM_MIN_CONTEXT="32",MFQ_KV_RESIDENT_CELLS="8")
     process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
         "--ctx-size","32","--moe-gpu-cache-gb","0.01","--check-qwen4-decode-hidden"],
         text=True,capture_output=True,timeout=90,env=env)

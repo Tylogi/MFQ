@@ -88,13 +88,19 @@ def test_invalid_candidate_does_not_unload_or_save_any_setting(tmp_path, budget,
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('placement', ['auto', 'auto_ssd', 'vram', 'ram'])
-def test_kv_memory_policy_is_persisted_with_quantization_off(tmp_path, placement):
+@pytest.mark.parametrize('placement,allocation,preallocated', [('auto', 'preallocated', True),
+    ('auto_ssd', 'preallocated', True), ('auto_ssd', 'preallocated', False), ('vram', 'preallocated', True),
+    ('ram', 'preallocated', True), ('auto', 'dynamic', True), ('vram', 'dynamic', True)])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_kv_memory_policy_is_persisted_with_quantization_off(tmp_path, placement, allocation, preallocated, explicit):
     model, pool, service, instance, _, _ = fixture(tmp_path)
     pool.backend = 'cuda'
     instance.kv_memory_supported = True
     async def run():
-        memory = {'placement': placement, 'allocation': 'preallocated'}
+        memory = {'placement': placement, 'allocation': allocation, 'ram_preallocated': preallocated,
+            'gpu_budget_bytes': (1 << 30) if explicit else None, 'ram_budget_bytes': (1 << 30) if explicit else None}
+        from mfq.server.protocol.models import KvMemorySettings
+        memory = KvMemorySettings.model_validate(memory).model_dump()
         pool.load = AsyncMock(return_value={'instance_id': str(uuid4()), 'model': model.resource.name, 'context_size': 32768})
         await pool.configure_context(_TestJobContext(), {'instance_id': str(instance.id), 'context_size': 32768,
             'kv_memory': memory})

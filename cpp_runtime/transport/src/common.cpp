@@ -31,7 +31,10 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1537,10 +1540,10 @@ public:
                 parameter + " has an invalid size", parameter);
         }
         size_ = static_cast<size_t>(declared_size);
-        const std::filesystem::path path(spec["path"].get<std::string>());
-        const std::string filename = path.filename().string();
+        const auto path=std::filesystem::u8path(spec["path"].get<std::string>());
+        const auto filename = path.filename().native();
         if (!path.is_absolute() ||
-            filename.rfind("mfq-multimodal-", 0) != 0 ||
+            filename.rfind(std::filesystem::path("mfq-multimodal-").native(), 0) != 0 ||
             path.extension() != ".bin") {
             throw ApiError(
                 400, "invalid_request_error",
@@ -1549,10 +1552,33 @@ public:
         const auto token = decode_file_token(
             spec["token"].get<std::string>(), parameter + ".token");
 #ifdef _WIN32
-        (void) token;
-        throw ApiError(
-            400, "invalid_request_error",
-            parameter + " is unavailable on this platform", parameter);
+        descriptor_=CreateFileW(path.c_str(),GENERIC_READ|READ_CONTROL,FILE_SHARE_READ,
+            nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        BY_HANDLE_FILE_INFORMATION metadata{};
+        bool valid=descriptor_!=INVALID_HANDLE_VALUE && GetFileType(descriptor_)==FILE_TYPE_DISK &&
+            GetFileInformationByHandle(descriptor_,&metadata) && metadata.nNumberOfLinks==1 &&
+            !(metadata.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            ((uint64_t(metadata.nFileSizeHigh)<<32)|metadata.nFileSizeLow)==size_;
+        if(valid) {
+            PSID owner=nullptr;PSECURITY_DESCRIPTOR security=nullptr;HANDLE process_token=nullptr;
+            valid=GetSecurityInfo(descriptor_,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION,
+                &owner,nullptr,nullptr,nullptr,&security)==ERROR_SUCCESS;
+            if(valid)valid=OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&process_token)!=0;
+            if(valid) {
+                DWORD bytes=0;
+                GetTokenInformation(process_token,TokenOwner,nullptr,0,&bytes);
+                std::vector<uint8_t> info(bytes);
+                valid=bytes && GetTokenInformation(process_token,TokenOwner,info.data(),bytes,&bytes) &&
+                    EqualSid(owner,reinterpret_cast<TOKEN_OWNER*>(info.data())->Owner);
+            }
+            if(process_token)CloseHandle(process_token);
+            if(security)LocalFree(security);
+        }
+        if(!valid) {
+            close_descriptor();
+            throw ApiError(400,"invalid_request_error",
+                parameter+" failed ownership, type, or size validation",parameter);
+        }
 #else
         int flags = O_RDONLY;
 #ifdef O_CLOEXEC
@@ -1579,8 +1605,10 @@ public:
                 400, "invalid_request_error",
                 parameter + " failed ownership, mode, or size validation", parameter);
         }
+#endif
         std::array<uint8_t, 64> header{};
-        read_exact(0, header.data(), header.size(), parameter);
+        try {read_exact(0, header.data(), header.size(), parameter);}
+        catch(...) {close_descriptor();throw;}
         constexpr std::array<uint8_t, 8> magic{
             'M', 'F', 'Q', 'M', 'M', '0', '1', 0};
         if (!std::equal(magic.begin(), magic.end(), header.begin()) ||
@@ -1590,7 +1618,6 @@ public:
                 400, "invalid_request_error",
                 parameter + " header or token does not match", parameter);
         }
-#endif
     }
 
     ~TensorFileReader() {
@@ -1616,7 +1643,11 @@ public:
 
 private:
     void close_descriptor() noexcept {
-#ifndef _WIN32
+#ifdef _WIN32
+        if(descriptor_!=INVALID_HANDLE_VALUE) {
+            CloseHandle(descriptor_);descriptor_=INVALID_HANDLE_VALUE;
+        }
+#else
         if (descriptor_ >= 0) {
             ::close(descriptor_);
             descriptor_ = -1;
@@ -1630,12 +1661,17 @@ private:
             size_t length,
             const std::string & parameter) const {
 #ifdef _WIN32
-        (void) offset;
-        (void) destination;
-        (void) length;
-        throw ApiError(
-            400, "invalid_request_error",
-            parameter + " is unavailable on this platform", parameter);
+        LARGE_INTEGER position{};position.QuadPart=static_cast<LONGLONG>(offset);
+        if(!SetFilePointerEx(descriptor_,position,nullptr,FILE_BEGIN))
+            throw ApiError(400,"invalid_request_error",parameter+" could not be positioned",parameter);
+        size_t completed=0;
+        while(completed<length) {
+            DWORD count=0;
+            if(!ReadFile(descriptor_,static_cast<uint8_t*>(destination)+completed,
+                    static_cast<DWORD>(length-completed),&count,nullptr) || !count)
+                throw ApiError(400,"invalid_request_error",parameter+" could not be read completely",parameter);
+            completed+=count;
+        }
 #else
         auto * output = static_cast<uint8_t *>(destination);
         size_t completed = 0;
@@ -1656,7 +1692,9 @@ private:
     }
 
     size_t size_ = 0;
-#ifndef _WIN32
+#ifdef _WIN32
+    HANDLE descriptor_=INVALID_HANDLE_VALUE;
+#else
     mutable int descriptor_ = -1;
 #endif
 };

@@ -25,6 +25,8 @@ bool skip_gpu_only_cpu_wait();
 bool skip_fixed_gpu_timing();
 bool window_input_views();
 bool decode_host_pin();
+bool kv_vram_preallocated();
+bool vision_resident();
 bool dma_graph_batch();
 bool ram_field_packing();
 bool warp_multi_sum();
@@ -144,4 +146,5 @@ std::optional<char> gr_up_group_coefficients();
 std::optional<bool> gr_dense_bf16_direct();
 std::optional<int> mfe_token_group_capacity();
 std::optional<std::int64_t> moe_ram_pin_bytes();
+std::optional<std::int64_t> moe_ram_pin_reserve_bytes();
 } // namespace mfq::cuda::runtime_options

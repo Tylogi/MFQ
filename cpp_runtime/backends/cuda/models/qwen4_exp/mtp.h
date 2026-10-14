@@ -44,7 +44,8 @@ struct Qwen4ExpMtp final : MtpModule {
     std::pair<Tensor, Tensor> evaluate(const MtpTarget &target, const Tensor &hidden,
                                        const Tensor &ids, int64_t depth = 0, bool cache = true,
                                        const Tensor &supplied_positions = {},
-                                       const Tensor &supplied_embeddings = {});
+                                       const Tensor &supplied_embeddings = {},
+                                       bool history_only = false);
 
     Tensor forward(const MtpTarget &target, Tensor hidden, Tensor ids) override;
 

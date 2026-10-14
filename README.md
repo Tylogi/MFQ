@@ -53,23 +53,9 @@ memory, storage, and latency limits.
 | --- | --- | ---: | ---: | ---: | ---: |
 | DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **390.2 / 458.6 / 471.1 tok/s** | **18.29 tok/s** | **33.46 tok/s** (**+83.0%**) |
 
-*Measured locally at batch size 1 with a 32,768-token context, temperature 0,
-and warmed execution. Prefill uses representative 509-, 2,009-, and
-15,969-token prompts. The process used approximately 287 GiB RSS after load;
-the 440 GiB wired budget is a ceiling rather than steady-state usage. The
-high-acceptance MTP result accepted 132/132 drafted tokens and matched the
-non-MTP output exactly; gains remain workload-dependent.*
-
-See the [full protocol, lower-acceptance fallback result, and current
-limitations](./docs/deepseek-v41-raw-hf.md).
-
-MFQ handles the full path from a source checkpoint to a deployable packed
-model. It measures activation and loss sensitivity, assigns precision at
-tensor, expert, and projection granularity under an exact serialized-size
-budget, stores the result in a self-contained `.mfq` container, and executes
-the packed weights with optimized C++ kernels. The formats and runtime are
-co-designed so fidelity-per-bit gains carry through to fast CUDA/Metal
-execution and one-command serving.
+MFQ covers calibration, precision allocation, quantization, and inference.
+Create self-contained `.mfq` models with tensor-, expert-, and projection-level
+mixed precision, then deploy them with MFQ Studio or the inference API.
 
 <p align="center">
   <img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="MFQ Studio running a local model" width="900">
@@ -163,36 +149,23 @@ sharded output. See
 
 ### Quantization
 
-- **Fine-Grained Quantization & Precision Virtualization.** MFQ virtualizes
-  Expert-Wise and Sub-Tensor precision choices inside a single logical tensor
-  container, producing clean, unified quantization formats instead of exposing
-  every internal configuration as another dtype. A descriptor-driven JIT
-  lowers these metadata-described tensors into compact execution plans and
-  production kernels, keeping the runtime robust, simple, and efficient.
-  Calibration and quantization can therefore search a much larger space—down
-  to each expert, projection, chunk, or neuron—without multiplying execution
-  paths.
+- **Fine-Grained Quantization & Precision Virtualization.** Assign precision
+  to individual experts, projections, chunks, or neurons within unified MFQ
+  formats, retaining higher precision where the model needs it most.
 
-- **High-Quality Calibrated Models & Rapid Architecture Support.** MFQ
-  publishes fine-grained mixed-precision models, evaluates them against their
-  source models under consistent model-level protocols, and rapidly extends
-  both quantization and runtime support to important new architectures.
+- **High-Quality Calibrated Models & Rapid Architecture Support.** Download
+  ready-to-run mixed-precision models, with quantization and inference support
+  for new architectures added regularly.
 
 ### Inference
 
-- **Production Inference & Serving.** One native serving stack provides
-  Continuous Batching, tiered RAM/SSD Prefix and KV-cache management,
-  multi-model loading and lifecycle management with LRU, and SSD-streamed
-  expert execution for models beyond memory capacity. Scheduling, prefetch,
-  and cache policies remain shared runtime capabilities rather than separate
-  model-specific serving paths.
+- **Production Inference & Serving.** Continuous Batching, multi-model loading
+  with LRU management, tiered RAM/SSD Prefix and KV caches, and SSD-streamed
+  experts let you serve multiple models and run MoE models beyond memory capacity.
 
-- **High-Performance CUDA, ROCm & Metal Backends.** Backend-specific packed-weight,
-  attention, cache, and I/O kernels sit behind a shared C++ model graph and
-  runtime contract. CUDA and Metal are supported today; an early HIP backend
-  covers dense Qwen3.5+ models on MI300X (see
-  [HIP validation](./docs/hip-native-runtime-validation.md)). Optimized CPU
-  backends are planned.
+- **High-Performance CUDA, ROCm & Metal Backends.** Optimized packed-weight,
+  attention, cache, and I/O kernels for CUDA and Metal, with early ROCm/HIP
+  support for dense Qwen3.5–3.8 models on MI300X. Optimized CPU backends are planned.
 
 | Model | Model size | Expert budget | Precision | Hardware | Prefill | Decode |
 | --- | ---: | ---: | --- | --- | ---: | ---: |
@@ -221,8 +194,7 @@ Published `.mfq` models are available from
 | Qwen3.6-27B | `V2`–`V3`, `S2`–`S6` tiers | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) |
 | MiniCPM-o 4.5 | `S4`–`S8` multimodal tiers | [ModelScope](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
 
-The C++ runtime currently covers the following architecture groups. Exact
-coverage depends on checkpoint revision, embedded components, and backend.
+Supported architecture groups:
 
 | Architecture group | Backends |
 | --- | --- |
@@ -233,10 +205,7 @@ coverage depends on checkpoint revision, embedded components, and backend.
 | GLM5–5.3 | CUDA C++; Metal reference runtime |
 | Gemma 4 | CUDA C++; Metal reference runtime |
 
-See the [runtime support matrix](./docs/runtime-support.md) before deploying a
-specific artifact. HIP/ROCm support is early; see
-[HIP validation](./docs/hip-native-runtime-validation.md) for validated models
-and known gaps.
+See the [runtime support matrix](./docs/runtime-support.md) for details.
 
 ## Tools and APIs
 

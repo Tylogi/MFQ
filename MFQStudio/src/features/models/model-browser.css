@@ -131,6 +131,7 @@
 .repository-line { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
 .repository-line button { overflow: hidden; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .repository-line span { flex: none; color: var(--muted); font-size: 11px; }
+.model-detail-panel > .model-weight-pressure-note { margin: -8px 0 0; color: var(--muted-light); font-size: 10.5px; line-height: 1.6; }
 .model-variant-list { display: grid; gap: 0; overflow: hidden; border: 1px solid var(--panel-line); border-radius: 10px; }
 .model-variant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, 0.35fr) auto; align-items: center; gap: 10px; overflow: hidden; background: var(--panel-control); }
 .model-variant + .model-variant { border-top: 1px solid var(--panel-line); }
@@ -227,7 +228,13 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .download-item-heading > .model-identity-trailing { align-self: stretch; justify-content: space-between; margin-left: 0; }
   .download-queue-item > button { margin-left: 42px; }
 }
-.download-directory-control { display: flex; min-width: 0; align-items: center; gap: 10px; color: var(--muted); font-size: 11px; }
+.download-directory-row { display: flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: 12px 24px; }
+.download-directory-control { display: flex; flex: 1 1 250px; min-width: 0; align-items: center; gap: 10px; color: var(--muted); font-size: 11px; }
+.download-storage { display: grid; flex: 0 1 230px; min-width: 0; gap: 5px; }
+.download-storage-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10.5px; }
+.download-storage-summary > span:last-child { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.download-prefix-reclaim { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; cursor: pointer; }
+.download-prefix-reclaim input { width: 13px; height: 13px; margin: 0; accent-color: var(--accent); }
 .download-directory-control > span { flex-shrink: 0; }
 .download-directory-control > code { min-width: 0; max-width: 520px; overflow: hidden; color: var(--ink-soft); font-family: inherit; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .download-directory-control > button { display: inline-flex; flex-shrink: 0; align-items: center; gap: 5px; min-height: 28px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-control); color: var(--ink-soft); font-size: 11px; }

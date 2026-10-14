@@ -31,6 +31,7 @@ struct RuntimeInput {
     bool half_query = false;
     bool wide_positions = false;
     bool direct_query = false;
+    mfq::cuda::HotKvView hot{};
 };
 
 inline uint3 sparse_fastdiv_values(uint32_t divisor) {
@@ -48,7 +49,7 @@ inline uint3 sparse_fastdiv_values(uint32_t divisor) {
 // selection order and optional validity mask; this kernel owns KV gathering,
 // MMA, online softmax and stream-K reduction.
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,
-         bool needs_fixup, bool is_fixup>
+         bool needs_fixup, bool is_fixup, bool use_hot>
 static __device__ __forceinline__ void process_sparse_attention_tile(
     const void * __restrict__ q,
     const half * __restrict__ k,
@@ -98,14 +99,15 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     const float2 * q_f2 = input.direct_query ? nullptr : reinterpret_cast<const float2 *>(q) +
         (static_cast<int64_t>(sequence) * heads * M +
          static_cast<int64_t>(zt_q) * M) * (DKQ / 2);
+    const int64_t physical_seq=use_hot && input.hot.cold_mapping?input.hot.cold_cells:max_seq;
     const half2 * k_h2 = reinterpret_cast<const half2 *>(k) +
-        (static_cast<int64_t>(sequence) * kv_heads * max_seq +
-         static_cast<int64_t>(z_kv) * max_seq) * (DKQ / 2);
+        (static_cast<int64_t>(sequence) * kv_heads * physical_seq +
+         static_cast<int64_t>(z_kv) * physical_seq) * (DKQ / 2);
     const half2 * v_h2 = V_is_K_view
         ? k_h2
         : reinterpret_cast<const half2 *>(v) +
-            (static_cast<int64_t>(sequence) * kv_heads * max_seq +
-             static_cast<int64_t>(z_kv) * max_seq) * (DV / 2);
+            (static_cast<int64_t>(sequence) * kv_heads * physical_seq +
+             static_cast<int64_t>(z_kv) * physical_seq) * (DV / 2);
     float2 * dst = reinterpret_cast<float2 *>(out) +
         (static_cast<int64_t>(sequence) * M * heads + zt_q) * (DV / 2);
     const int * row_indices = indices ? indices +
@@ -133,10 +135,16 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         tile_input.causal_row_count = static_cast<int>(end + 1);
     }
 
+    if constexpr(use_hot) {
+        tile_input.hot_keys=reinterpret_cast<const half2*>(input.hot.keys)+(int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DKQ/2);
+        tile_input.hot_values=reinterpret_cast<const half2*>(input.hot.values)+(int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DV/2);
+        tile_input.hot_mapping=input.hot.mapping;
+        tile_input.cold_mapping=input.hot.cold_mapping;
+    }
     flash_attn_ext_f16_process_tile<
         DKQ, DV, ncols1, ncols2, nwarps,
         use_logit_softcap, V_is_K_view, needs_fixup, is_fixup,
-        use_indirect>(
+        use_indirect, use_hot>(
         q_f2, k_h2, v_h2, sequence_mask, tile_sinks, dst, meta,
         scale, 1.0f, 0.0f, ne01, heads, gqa_ratio, selected,
         DKQ / 2, M * (DKQ / 2), DKQ / 2,
@@ -146,7 +154,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         input.positions != nullptr, 0, tile_input);
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, bool use_hot = false>
 __launch_bounds__(
     ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1 * ncols2),
     ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1 * ncols2))
@@ -194,14 +202,14 @@ __global__ void sparse_attention_kernel(
     while (kbc < kbc_stop && kb0_stop == iter_k) {
         if (kb0_start == 0) {
             process_sparse_attention_tile<
-                DKQ, DV, ncols1, ncols2, V_is_K_view, false, false>(
+                DKQ, DV, ncols1, ncols2, V_is_K_view, false, false, use_hot>(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
                 kb0_start, kb0_stop, input);
         } else {
             process_sparse_attention_tile<
-                DKQ, DV, ncols1, ncols2, V_is_K_view, true, false>(
+                DKQ, DV, ncols1, ncols2, V_is_K_view, true, false, use_hot>(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
@@ -215,7 +223,7 @@ __global__ void sparse_attention_kernel(
 
     if (kbc < kbc_stop) {
         process_sparse_attention_tile<
-            DKQ, DV, ncols1, ncols2, V_is_K_view, false, true>(
+            DKQ, DV, ncols1, ncols2, V_is_K_view, false, true, use_hot>(
             q, k, v, indices, mask, sinks, out, meta, scale,
             M, heads, kv_heads, max_seq, selected, ne01, kbc,
             work_per_sequence, iter_k, iter_j, iter_z_gqa,
@@ -228,7 +236,7 @@ __global__ void sparse_attention_kernel(
 #endif
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, bool use_hot = false>
 Tensor launch(
     const Tensor& q,
     const Tensor& k,
@@ -242,7 +250,7 @@ Tensor launch(
     const Tensor& gate = Tensor{},
     bool half_output = false,
     const Tensor& positions = Tensor{},
-    int64_t causal_columns = 0) {
+    int64_t causal_columns = 0, mfq::cuda::HotKvView hot = {}) {
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
     constexpr int ncols = ncols1 * ncols2;
@@ -341,9 +349,9 @@ Tensor launch(
                  : shared_q + shared_kv + shared_mask);
 
     using Kernel = decltype(&sparse_attention_kernel<
-        DKQ, DV, ncols1, ncols2, V_is_K_view>);
+        DKQ, DV, ncols1, ncols2, V_is_K_view, use_hot>);
     Kernel kernel = sparse_attention_kernel<
-        DKQ, DV, ncols1, ncols2, V_is_K_view>;
+        DKQ, DV, ncols1, ncols2, V_is_K_view, use_hot>;
     static bool shmem_set[32] = {};
     MFQ_RUNTIME_CHECK(device >= 0 && device < 32,
         name, ": unsupported CUDA device index");
@@ -404,7 +412,7 @@ Tensor launch(
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
         causal && positions.scalar_type() == mfq_tensor_backend::kInt64,
-        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16};
+        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16, hot};
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),

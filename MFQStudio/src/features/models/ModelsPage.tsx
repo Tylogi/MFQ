@@ -73,13 +73,6 @@ export function ModelsPage() {
       <section id="local-checkpoints" ref={checkpoints}>
         <LocalCheckpoints catalog={catalog} />
       </section>
-      <div className="model-workbench-links">
-        <span>{tr('自定义模型精度', 'Custom model precision')}</span>
-        <button onClick={() => openStudioPage('lab', 'quantization')} type="button">
-          {tr('打开量化工作台', 'Open quantization workspace')}
-          <Icon name="text-forward" size={14} />
-        </button>
-      </div>
       <ModelDirectoryDialog catalog={catalog} />
     </section>
   );

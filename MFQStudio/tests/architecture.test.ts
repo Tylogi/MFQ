@@ -14,9 +14,10 @@ describe('业务职责边界', () => {
     const app = source('App.tsx');
     expect(app).not.toMatch(/\buseState\b|\buseEffect\b|\bapi\.|\bfetch\(|<form\b|<input\b/);
     expect(app.split('\n').length).toBeLessThan(100);
-    for (const route of ['chat', 'models', 'runtime', 'resources', 'logs', 'settings', 'model-hub', 'evaluations', 'quantization']) {
+    for (const route of ['chat', 'models', 'runtime', 'resources', 'logs', 'settings', 'model-hub', 'evaluations']) {
       expect(app).toContain(`path="${route}"`);
     }
+    expect(app).not.toContain('QuantizationPage');
   });
   it('共享传输层不反向引用React、页面或业务状态', () => {
     for (const file of files(join(root, 'shared/api'))) {

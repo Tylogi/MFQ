@@ -109,6 +109,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_KERNEL_SOURCES}
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/kernels/kv_quantization.cu
+    ${MFQ_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
     ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
@@ -397,6 +398,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
+    ${MFQ_CUDA_ROOT}/commands/reference.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
     ${MFQ_CUDA_TRANSFORMER_SOURCES}
@@ -607,7 +609,14 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
+    add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
+    foreach(bits 0 2.5 4)
+        add_test(NAME mfq-cuda-qsa-stream-graph-${bits}-test COMMAND mfq-window-attention-test --qsa-stream-graph-check)
+        set_tests_properties(mfq-cuda-qsa-stream-graph-${bits}-test PROPERTIES
+            ENVIRONMENT "MFQ_KV_TURBOQUANT_BITS=${bits};MFQ_KV_STREAM_GRAPHS=1;MFQ_MEMORY_ARCHITECTURE=discrete")
+    endforeach()
     add_test(NAME mfq-cuda-turboquant-kv-test COMMAND mfq-window-attention-test --turboquant-kv-check)
     add_test(NAME mfq-cuda-turboquant-qsa-test COMMAND mfq-window-attention-test --turboquant-qsa-check)
     set_tests_properties(mfq-cuda-turboquant-qsa-test PROPERTIES ENVIRONMENT "MFQ_KV_TURBOQUANT_BITS=3.5")

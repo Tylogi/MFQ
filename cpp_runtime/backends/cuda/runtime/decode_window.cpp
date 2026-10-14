@@ -222,6 +222,17 @@ void DecodeWindow::enroll(Task task) {
         throw std::logic_error("one MFQ operator cell was recorded twice in a window");
     tasks_.push_back(std::move(task));
 }
+std::size_t DecodeWindow::nodes() const {
+    std::size_t result=0;
+    for(std::size_t i=0;i<segments();++i)if(const auto* graph=graphs_.find(i,1))result+=graph->nodes();
+    return result;
+}
+void DecodeWindow::host_barrier(std::function<void()> serve) {
+    if(active!=this)throw std::logic_error("host I/O barrier outside window capture");
+    if(recording_segments_)graphs_.end(barriers_.size(),1);
+    barriers_.push_back({tasks_.size(),std::move(serve)});
+    if(recording_segments_)graphs_.begin(barriers_.size(),1);
+}
 void DecodeWindow::capture(const std::function<void()>& body,const std::function<void()>& restore,
         const std::function<void()>& release_output) {
     if(valid())return;
@@ -251,16 +262,20 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         checkpoint("prepare");
         body();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
         release_warm_outputs();
-        tasks_.clear();
+        tasks_.clear();barriers_.clear();
         checkpoint("warmup");
         {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
             GraphWarmupScope warmup(default_context(device),stream_);body();}
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
         release_warm_outputs();
-        const auto warm_tasks=tasks_.size();tasks_.clear();
+        const auto warm_tasks=tasks_.size(),warm_barriers=barriers_.size();tasks_.clear();barriers_.clear();
         checkpoint("record");
-        std::string error;
-        if(!graphs_.record(0,1,body,error)) {
+        try {
+            recording_segments_=true;graphs_.begin(0,1);body();graphs_.end(barriers_.size(),1);
+            recording_segments_=false;
+        } catch(const std::exception& failure) {
+            recording_segments_=false;graphs_.clear();
+            const std::string error=failure.what();
             // Preserve quota errors so admission can discard this request
             // without marking the entire backend unhealthy.
             if(error.starts_with("CUDA process VRAM limit exceeded:") ||
@@ -269,13 +284,14 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
                     error.starts_with("CUDA pinned allocation failed:"))throw MfqResourceExhausted(error);
             throw std::runtime_error(error);
         }
-        if(tasks_.size()!=warm_tasks)throw std::logic_error("MFQ window task order changed during capture");
+        if(tasks_.size()!=warm_tasks || barriers_.size()!=warm_barriers)throw std::logic_error("MFQ window task order changed during capture");
         checkpoint("restore");
         restore();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
         capture_ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()-capture_started).count();
         checkpoint("complete");
     } catch(...) {
+        recording_segments_=false;graphs_.clear();
         report_window_error("capture",phase);
         bool allocation_rejected=false;
         try {std::rethrow_exception(std::current_exception());}
@@ -320,22 +336,28 @@ void DecodeWindow::run() {
         for(auto& task:tasks_)task.reset();
         sample(reset_ns_);
         std::string error;
-        const auto* graph=graphs_.find(0,1);
-        checkpoint("launch");
-        if(!graph->launch(stream_,error))throw std::runtime_error(error);
-        checkpoint("submit");
-        if(runtime_options::single_window_flush()) {
-            check_stream_progress(stream_);
-            flushed_window_stream=stream_;
-            has_flushed_window=true;
+        std::size_t task_begin=0;
+        for(std::size_t segment=0;segment<segments();++segment) {
+            const auto* graph=graphs_.find(segment,1);
+            checkpoint("launch");
+            if(!graph->launch(stream_,error))throw std::runtime_error(error);
+            checkpoint("submit");
+            if(runtime_options::single_window_flush()) {
+                check_stream_progress(stream_);
+                flushed_window_stream=stream_;has_flushed_window=true;
+            }
+            sample(launch_ns_);
+            checkpoint("serve");
+            const auto task_end=segment<barriers_.size()?barriers_[segment].task_end:tasks_.size();
+            for(;task_begin<task_end;++task_begin)tasks_[task_begin].serve();
+            sample(serve_ns_);
+            checkpoint("wait");
+            if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");
+            sample(wait_ns_);
+            if(segment<barriers_.size()) {
+                checkpoint("host_io");barriers_[segment].serve();sample(serve_ns_);
+            }
         }
-        sample(launch_ns_);
-        checkpoint("serve");
-        for(auto& task:tasks_)task.serve();
-        sample(serve_ns_);
-        checkpoint("wait");
-        if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");
-        sample(wait_ns_);
         // Only after all GPU consumers finish may adaptation overwrite L1.
         checkpoint("finish");
         for(auto& task:tasks_)if(task.finish)task.finish();

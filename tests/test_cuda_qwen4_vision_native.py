@@ -1,5 +1,6 @@
 """Exercise the native Qwen4 image adapter with NINT vision weights and MTP."""
 import asyncio
+import base64
 import json
 import os
 from contextlib import suppress
@@ -14,7 +15,7 @@ from mfq.formats.io import save
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize
 from mfq.server.runtime.client import BackendError, StdioRuntimeClient
-from mfq.server.vision.decode import _tensor
+from mfq.server.vision.decode import _tensor, _binary_tensors
 from tests.test_cuda_flash_next_runtime import mtp_fixture
 from tests.test_native_nint_ple import _worker_tokenizer
 
@@ -62,12 +63,14 @@ def test_cuda_qwen4_image_and_mtp(tmp_path, bits):
         image_grid_thw=_tensor(np.array([[1, 4, 4]], np.int32), "int32"),
         vision_types=_tensor(np.array([1], np.int32), "int32"))
 
-    async def run():
-        with (tmp_path / "worker.log").open("wb") as log:
+    async def run(resident):
+        with (tmp_path / f"worker-{resident}.log").open("wb") as log:
             process = await asyncio.create_subprocess_exec(str(Path(executable).resolve()),
                 "--model", str(model), "--tokenizer", str(tokenizer), "--transport", "stdio", "--ctx-size", "128",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
-                env=dict(os.environ, MFQ_KV_TURBOQUANT_BITS=str(bits), MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1"))
+                env=dict(os.environ, MFQ_KV_TURBOQUANT_BITS=str(bits), MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
+                    MFQ_CUDA_VISION_RESIDENT=str(int(resident)),
+                    MFQ_MTP_HOST_PROMPT_HISTORY=str(int(not resident))))
             client = StdioRuntimeClient(process, control_timeout_seconds=20)
             try:
                 status = await client.status()
@@ -82,15 +85,36 @@ def test_cuda_qwen4_image_and_mtp(tmp_path, bits):
                     metrics = next(event["mfq_metrics"] for event in output if "mfq_metrics" in event)
                     assert metrics["mtp_used"] == mtp
                     return "".join(c.get("delta", {}).get("content", "") for event in output for c in event.get("choices", []))
-                await generate(False)
-                await generate(True)
+                outputs = [await generate(False), await generate(True)]
                 with pytest.raises(BackendError):
                     await generate(False, {**media, "vision_types": _tensor(np.array([2], np.int32), "int32")})
-                await generate(False)
+                outputs.append(await generate(False))
+                binary, path = _binary_tensors([
+                    (name, np.frombuffer(base64.b64decode(value['data_base64']),
+                        dtype=value['dtype']).reshape(value['shape']), value['dtype'])
+                    for name, value in media.items() if isinstance(value, dict)])
+                unicode_path = path.with_name('mfq-multimodal-视觉-' + path.name.removeprefix('mfq-multimodal-'))
+                path.rename(unicode_path)
+                binary['binary_file']['path'] = str(unicode_path)
+                binary.update(version=media['version'], processor=media['processor'])
+                try:
+                    assert await generate(False, binary) == outputs[0]
+                    assert await generate(True, binary) == outputs[1]
+                    for invalid in ({'token': '00'*32}, {'size': binary['binary_file']['size']+64}):
+                        with pytest.raises(BackendError):
+                            await generate(False, {**binary, 'binary_file': {**binary['binary_file'], **invalid}})
+                finally:
+                    unicode_path.unlink()
+                after = await client.status()
+                assert after['resident_weight_bytes'] == status['resident_weight_bytes']
+                return outputs, status['resident_weight_bytes']
             finally:
                 with suppress(Exception):
                     await client.aclose()
                 if process.returncode is None:
                     process.terminate()
                 await asyncio.wait_for(process.wait(), 5)
-    asyncio.run(run())
+    expected, resident_bytes = asyncio.run(run(True))
+    actual, streamed_bytes = asyncio.run(run(False))
+    assert actual == expected
+    assert streamed_bytes < resident_bytes

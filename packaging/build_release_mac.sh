@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the self-contained Apple Silicon MFQ Studio DMG with a serve-only CLI.
+# Build the self-contained Apple Silicon MFQ Studio DMG.
 
 set -euo pipefail
 
@@ -68,7 +68,8 @@ if [[ "${MFQ_RELEASE_REUSE_VENV:-0}" != "1" ]]; then
     --no-editable \
     --group release \
     --extra metal \
-    --extra benchmark
+    --extra benchmark \
+    --extra reference
 fi
 
 command -v ninja >/dev/null 2>&1 || fail "ninja is required"
@@ -152,12 +153,14 @@ mfq_pyinstaller_args=(
   --collect-all pypdf
   --collect-all pyarrow
   --collect-all pandas
-  --collect-all torch
   --collect-all sympy
   --collect-all regex
   --collect-all loguru
   --collect-all antlr4
   --collect-all yaml
+  --collect-all mlx
+  --collect-all mlx_lm
+  --collect-all transformers
   --collect-all huggingface_hub
   --collect-all modelscope_hub
   --collect-all uvicorn
@@ -165,9 +168,7 @@ mfq_pyinstaller_args=(
   --copy-metadata requests
   --copy-metadata huggingface-hub
   --copy-metadata modelscope-hub
-  --exclude-module transformers
-  --exclude-module mlx
-  --exclude-module safetensors
+  --exclude-module torch
   --exclude-module scipy
   --exclude-module tiktoken
   --exclude-module mfq.calibration
@@ -185,11 +186,6 @@ mfq_pyinstaller_args=(
   --workpath "${mfq_pyinstaller_build_dir}"
   --specpath "${mfq_spec_dir}"
 )
-if "${mfq_venv_dir}/bin/python" -c \
-  'import importlib.metadata; importlib.metadata.distribution("torchcodec")' \
-  >/dev/null 2>&1; then
-  mfq_pyinstaller_args+=(--copy-metadata torchcodec)
-fi
 if [[ "${mfq_signing_identity}" != "-" ]]; then
   mfq_pyinstaller_args+=(--codesign-identity "${mfq_signing_identity}")
 fi

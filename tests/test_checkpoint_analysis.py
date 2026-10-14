@@ -78,9 +78,16 @@ def test_checkpoint_metadata_preserves_expert_ids_and_encoded_budget(tmp_path: P
     assert result.attention_heads == 2
     assert result.kv_heads == 1
     assert result.cache_profile.max_context == 32768
-    assert result.cache_profile.fixed_bytes == 0
+    # Metal's rolling indexer tail has fixed storage; only pooled index rows
+    # grow with context. The CUDA full indexer is priced separately.
+    assert result.cache_profile.fixed_bytes == (4 + 5) * 4 * 2 + 2
+    assert [(item.name, item.bytes) for item in result.cache_profile.fixed_components] == [
+        ("indexer_tail", 74),
+    ]
     assert {item.group for item in result.cache_profile.components} == {"QSA"}
-    assert [item.bytes_per_row for item in result.cache_profile.components] == [32, 8, 16]
+    assert [(item.name, item.bytes_per_row) for item in result.cache_profile.components] == [
+        ("raw_kv", 32), ("indexer_pooled", 16),
+    ]
     assert not result.warnings
     assert len(result.experts) == (4 if fused else 2)
     first = next(item for item in result.experts if item.expert == 0 and item.projection == "gate")

@@ -10,13 +10,37 @@ import type {
   ArtifactLineage,
 } from '../types';
 import { request } from '../client';
+import type { KvQuantizationSettings } from './runtime';
+
+export interface ModelLoadContextSettings {
+  automatic: boolean;
+  ssd_kv: boolean;
+  ram_preallocated: boolean;
+  vram_preallocated: boolean;
+  kv_quantization: KvQuantizationSettings;
+}
+
+export interface DownloadDirectoryStatus {
+  directory: string | null;
+  actual_directory: string;
+  default_directory: string;
+  disk_total_bytes?: number | null;
+  disk_free_bytes?: number | null;
+  disk_available_bytes?: number | null;
+  download_reserved_bytes?: number;
+  reclaimable_prefix_bytes?: number;
+  evict_prefix_cache?: boolean;
+}
 
 export const modelsApi = {
-  downloadDirectory(): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+  downloadDirectory(): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory');
   },
-  configureDownloadDirectory(directoryId: string | null): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+  configureDownloadDirectory(directoryId: string | null): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ directory_id: directoryId }) });
+  },
+  configureDownloadReclaim(evictPrefixCache: boolean): Promise<DownloadDirectoryStatus> {
+    return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ evict_prefix_cache: evictPrefixCache }) });
   },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
@@ -67,7 +91,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize = 2048,
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[] } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -76,6 +100,11 @@ export const modelsApi = {
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
+        ...(policy.context_management ? { context_management: {
+          automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,
+          ram_preallocated: policy.context_management.ram_preallocated, vram_preallocated: policy.context_management.vram_preallocated,
+          kv_quantization: policy.context_management.kv_quantization,
+        } } : {}),
         ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),

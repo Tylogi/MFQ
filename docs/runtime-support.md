@@ -1,8 +1,6 @@
 # Runtime support
 
-MFQ uses one canonical model graph and shared runtime contracts across its
-CUDA, Metal, and HIP backends. Support is checkpoint- and component-dependent:
-validate the exact artifact on its deployment backend before release.
+Model and feature support for CUDA, Metal, and ROCm (HIP).
 
 ## Status terms
 
@@ -66,8 +64,7 @@ the backbone from loading.
   Continuous Batching is active on supported native paths and is being expanded
   across the remaining model graphs.
 - Metal supports bounded resident expert caches and SSD-streamed expert access
-  for supported large-MoE runtimes. Route-aware prefetch and cache policy are
-  runtime services rather than model-specific serving protocols.
+  for supported large-MoE runtimes.
 - One backend-wide MTP engine owns sampling, verification, cache snapshots,
   adaptive depth, and accounting. Model modules provide only predictor math
   and model-specific state adapters.
@@ -92,9 +89,7 @@ GEMV and small-M paths consume MFQ storage directly; large-M paths can
 temporarily dequantize for matrix multiplication without keeping a persistent
 FP16 weight copy. DeepSeek V4/V4.1 and Qwen Flash-Next runtimes also support
 bounded expert residency, while DeepSeek V4.1 can stream Engram storage from
-the internal SSD. See the
-[DeepSeek V4.1 raw-HF report](deepseek-v41-raw-hf.md) for a validated large-model
-configuration.
+the internal SSD.
 
 ### AMD GPUs and ROCm (HIP)
 

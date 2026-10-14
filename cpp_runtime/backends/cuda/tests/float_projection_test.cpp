@@ -145,6 +145,44 @@ Fixture make_weight(int out, int width, int group_size, bool zero = false,bool a
     return fixture;
 }
 
+void mapped_nint_embedding() {
+    const auto before=mfq::cuda::tensor_host_bytes.load();
+    int cases=0;
+    for(bool control:{false,true})for(bool zero:{false,true})for(int width:{57,2560}) {
+        auto fixture=make_weight(257,width,32,zero);
+        if(zero)fixture.weight.q_packed=fixture.weight.q_packed.narrow(0,0,257*fixture.weight.ng*32)
+            .reshape({257,fixture.weight.ng,32});
+        QuantLinear reference;reference.kind=QuantLinearKind::Nint;reference.nint=fixture.weight;
+        auto cpu=reference;
+        for(auto* field:{&cpu.nint.q_packed,&cpu.nint.row_q_bits,&cpu.nint.row_q_bit_offsets,
+                &cpu.nint.q8_zero_scale,&cpu.nint.sub_scale,&cpu.nint.sub_min,
+                &cpu.nint.neuron_scale,&cpu.nint.neuron_min})
+            if(field->defined())*field=field->cpu();
+        auto original=map_nint_embedding(std::move(cpu),mfq_current_cuda_device(),control);
+        auto mapped=original;original={};
+        for(int count:{1,8,257}) {
+            const auto type=tb::kInt64;
+            auto ids=tb::zeros({1,count},tb::TensorOptions().device(tb::kCUDA).dtype(type));
+            tb::Tensor actual;
+            mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+            window.capture([&]{actual=quant_embedding_lookup(mapped,ids);},[]{},[&]{actual={};});
+            for(int step=0;step<3;++step) {
+                std::vector<int64_t> next(count);
+                for(int i=0;i<count;++i)next[i]=i%3==0?256:i%3==1?0:(i*19+step*53)%257;
+                ids.copy_(tb::tensor(next).reshape({1,count}).to(type).to(tb::kCUDA));
+                window.run();
+                auto a=actual.cpu().contiguous(),b=quant_embedding_lookup(reference,ids).cpu().contiguous();
+                if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+                        std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size()))
+                    throw std::runtime_error("mapped NINT embedding changed output bytes");
+                ++cases;
+            }
+        }
+    }
+    if(mfq::cuda::tensor_host_bytes.load()!=before)throw std::runtime_error("mapped NINT embedding ownership leaked");
+    std::cout<<"mapped_nint_embedding_cases="<<cases<<" changing graph, mixed bits, NINT8-0 and ownership exact PASS"<<std::endl;
+}
+
 void exact(const tb::Tensor& actual,const tb::Tensor& expected,const std::string& name) {
     if(actual.sizes()!=expected.sizes() || actual.scalar_type()!=expected.scalar_type())
         throw std::runtime_error(name+" dtype/shape differs");
@@ -1000,7 +1038,7 @@ int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--mapped-embedding") {
         auto context=mfq::cuda::default_context(mfq_current_cuda_device());
         const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
-        mapped_embedding();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
+        mapped_embedding();mapped_nint_embedding();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
     }
     const bool vector_only=argc>=2 && std::string(argv[1])=="--dense-vector";
     if (argc>(vector_only?3:2)) throw std::runtime_error("expected fixture directory, or --dense-vector [completion report]");

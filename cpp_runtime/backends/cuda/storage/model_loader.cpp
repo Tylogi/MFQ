@@ -2,6 +2,7 @@
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
 #include "storage/mapped_embedding.h"
+#include "mfq_weight_memory.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
 #include "models/qwen35/mtp.h"
@@ -28,11 +29,28 @@ template <class Model> struct CudaWeightLoader {
             model.execution->config.moe_pipeline && model.execution->config.moe_preload_all &&
             model.execution->config.moe_ram_pcie;
         const auto& dtype=require_tensor(source,name).dtype;
+        const bool nint=dtype=="NINT";
         if(use_mapped && model.has_independent_output_weights(*this) &&
                 !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
-                (dtype=="BF16" || dtype=="F16" || dtype=="F32")) {
-            auto cpu=load_dense_cpu(*model.execution,source,name);
+                (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint)) {
             try {
+                const mfq::cuda::WeightAllocationScope weight_memory;
+                if(nint) {
+                    QuantLinear cpu;
+                    {
+                        struct CpuLoadScope {
+                            bool& flag;
+                            explicit CpuLoadScope(bool& value):flag(value){flag=true;}
+                            ~CpuLoadScope(){flag=false;}
+                        } scope(model.execution->loading_cpu_layer);
+                        cpu=load_quant_linear(*model.execution,source,name);
+                    }
+                    auto result=map_nint_embedding(std::move(cpu),active_weight_load_device(*model.execution),mapped_control);
+                    std::cerr<<"mapped_token_embedding rows="<<result.out()<<" width="<<result.neuron_len()
+                             <<" dtype="<<dtype<<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
+                    return result;
+                }
+                auto cpu=load_dense_cpu(*model.execution,source,name);
                 auto result=map_dense_embedding(cpu,active_weight_load_device(*model.execution),mapped_control);
                 std::cerr<<"mapped_token_embedding bytes="<<cpu.numel()*cpu.element_size()
                          <<" rows="<<cpu.size(0)<<" width="<<cpu.size(1)<<" dtype="<<dtype
@@ -71,6 +89,7 @@ template <class Model> struct CudaWeightLoader {
         auto block = model.adapter_load_block(source, layer, device, type);
         block->cuda_device = device;
         block->cpu_offloaded = cpu_offloaded;
+        if (auto* full = dynamic_cast<FullBlock*>(block.get())) full->preallocate_kv();
         return block;
     }
 };
@@ -81,7 +100,7 @@ template <typename Model>
 Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::string &model_path,
                                 const std::string &config_path, int64_t context_size_override,
                                 bool load_blocks, bool defer_moe_cache_finalize,
-                                std::shared_ptr<const mfq::ModelSource> model_source) {
+                                std::shared_ptr<const mfq::ModelSource> model_source, bool load_input_output) {
     Model model;
     model.execution = &execution;
     model.source = model_source ? std::move(model_source) : mfq::open_model_source(model_path);
@@ -173,7 +192,13 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
     }
 
     CudaWeightLoader<Model> weights{model, source};
-    model.load_weights(weights, load_blocks);
+    if (load_input_output) {
+        model.load_weights(weights, load_blocks);
+    } else {
+        if (load_blocks) throw std::invalid_argument("streamed model setup requires deferred blocks");
+        model.adapter_load_final_state(source, model.output_norm);
+        model.adapter_prepare_blocks(source);
+    }
 
     execution.loading_cpu_layer = false;
     execution.layer_placement.load_device = execution.layer_placement.primary_device();
@@ -187,7 +212,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
 #define MFQ_INSTANTIATE_CAUSAL_LM(TYPE)                                                            \
     template TYPE mfq::cuda::load_causal_lm<TYPE>(CudaExecutionContext &, const std::string &,     \
                                                   const std::string &, int64_t, bool, bool,        \
-                                                  std::shared_ptr<const mfq::ModelSource>)
+                                                  std::shared_ptr<const mfq::ModelSource>, bool)
 
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::MiniCPMO45CausalLm);

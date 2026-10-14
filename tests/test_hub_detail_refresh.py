@@ -22,6 +22,7 @@ def no_network(monkeypatch):
 
 def model(files):
     return HubModelInfo(provider='huggingface', repo_id=REPO, revision='a' * 40, files=files,
+                        architectures=['qwen4_exp'], config_inspected=True,
                         parameter_breakdown=ModelParameterBreakdown(total=100, dense=40, routed_experts=50, ple=10, active=45),
                         cache_profile=ModelCacheProfile(max_context=32768), mtp_supported=True)
 
@@ -228,3 +229,45 @@ def test_verified_cross_provider_reuse_recomputes_variants_without_network(monke
         assert result.cache_profile == info.cache_profile
         await catalog.aclose()
     asyncio.run(run())
+
+
+def test_complete_file_bytes_with_missing_model_metadata_repair_and_persist(tmp_path, monkeypatch):
+    from tests.test_flash_next_architecture import _qwen_config
+    async def run():
+        path = tmp_path / 'hub.json'
+        catalog = hub.HubCatalog(cache_path=path)
+        key = ('huggingface', REPO)
+        files = [HubModelFile(name=f'model-{i:05d}-of-00043.mfq', byte_size=100,
+            weight_bytes=60, ssd_ple_bytes=40, sha256=f'{i:064x}') for i in range(1, 44)]
+        catalog._official_cache[key] = HubModelInfo(provider='huggingface', repo_id=REPO, revision='a' * 40, files=files)
+        catalog._official_cache_time = time.monotonic()
+        calls = []
+        async def read(client, url, params, size):
+            calls.append(url)
+            return MfqMetadata('qwen4_exp', {**_qwen_config(), 'language_model_only': True}, 60, 40, has_mtp_weights='-00043-of-' in url)
+        monkeypatch.setattr(hub, 'read_mfq_metadata', read)
+        assert (await catalog.official()).refreshing
+        await catalog._refresh_task
+        repaired = catalog._official_cache[key]
+        assert len(calls) == 2
+        assert repaired.parameter_breakdown is not None and repaired.cache_profile is not None
+        assert repaired.attention_profile.model_dump() == dict(sparse=True, compressed=False, hybrid=True)
+        assert repaired.mtp_supported and repaired.config_inspected
+        assert all(f.weight_bytes == 60 and f.ssd_ple_bytes == 40 for f in repaired.files)
+        restored = hub.HubCatalog(cache_path=path)
+        assert not (await restored.official()).refreshing
+        assert restored._official_cache[key].parameter_breakdown == repaired.parameter_breakdown
+        await catalog.aclose()
+        await restored.aclose()
+    asyncio.run(run())
+
+
+def test_empty_model_metadata_donor_does_not_hide_complete_donor():
+    catalog = hub.HubCatalog()
+    file = HubModelFile(name='model.mfq', byte_size=100, sha256='a' * 64, weight_bytes=60, ssd_ple_bytes=40)
+    empty = HubModelInfo(provider='huggingface', repo_id=REPO, revision='a' * 40, files=[file])
+    complete = model([file]).model_copy(update={'provider': 'modelscope'})
+    catalog._official_cache = {('huggingface', REPO): empty, ('modelscope', REPO): complete}
+    result = catalog._reuse_mfq_files(empty)
+    assert result.parameter_breakdown == complete.parameter_breakdown
+    assert result.config_inspected and result.architectures == complete.architectures

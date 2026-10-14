@@ -110,6 +110,7 @@ auto with_loaded_cuda_model(
             load_runtime_components(model, load_optional_components);
         if(execution.kv_memory) {
             execution.kv_memory->finalize(moe_expert_cache_minimum_bytes(execution.moe_expert_cache));
+            set_moe_kv_expert_loan(execution.moe_expert_cache,execution.kv_memory->expert_loan());
             if(auto offload=execution.kv_memory->offload())execution.qsa_kv_store=std::move(offload);
         }
         if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&

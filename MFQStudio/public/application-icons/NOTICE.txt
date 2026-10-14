@@ -7,17 +7,19 @@ OpenCode: https://github.com/anomalyco/opencode/blob/dev/packages/ui/src/assets/
 Claude Code: https://claude.com/product/claude-code
 OpenClaw: https://github.com/openclaw/openclaw/blob/main/ui/public/favicon.svg
 Hermes Agent: https://github.com/NousResearch/hermes-agent/blob/main/website/static/img/favicon.svg
+Pi: https://pi.dev/favicon.svg (official press kit: https://pi.dev/press-kit)
 
 Names and marks remain the property of their respective owners.
 Their appearance does not imply affiliation or endorsement.
 
-OpenCode, OpenClaw and Hermes Agent repository assets:
+OpenCode, OpenClaw, Hermes Agent and Pi assets:
 
 MIT License
 
 Copyright (c) 2025 opencode
 Copyright (c) 2026 OpenClaw Foundation
 Copyright (c) 2025 Nous Research
+Copyright (c) Earendil Inc. & Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

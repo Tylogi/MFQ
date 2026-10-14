@@ -744,6 +744,14 @@ void Context::reclaim_idle_memory() {
     // Trimming unused pages leaves live graph-pool allocations untouched.
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
     trim_pool_pages();
+    if(const auto* trace=std::getenv("MFQ_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1') {
+        std::lock_guard lock(graph_pool_mutex_);
+        std::size_t cached=0,blocks=0;
+        for(const auto& [stream,pool]:graph_pools_)for(const auto& [bytes,pointers]:pool.available) {
+            cached+=bytes*pointers.size();blocks+=pointers.size();
+        }
+        std::fprintf(stderr,"graph_workspace_memory cached_bytes=%zu cached_blocks=%zu\n",cached,blocks);
+    }
 }
 
 void Context::set_memory_limit(std::size_t bytes) {
@@ -839,6 +847,17 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             pool != graph_pools_.end() && (pool->second.warming || pool->second.capturing)) {
             if(pool->second.memory)allocation_pool=pool->second.memory;
             pooled_allocation=true;
+            // Stable size classes let serial graph shapes share scratch. The
+            // same request must use the same class in warmup and capture; a
+            // free-form best-fit choice can consume a later operation's slot.
+            if(bytes>=4096) {
+                std::size_t capacity=4096;
+                while(capacity<bytes) {
+                    if(capacity>SIZE_MAX/2)throw Error("CUDA graph workspace size overflows");
+                    capacity*=2;
+                }
+                bytes=capacity;
+            }
             auto available = pool->second.available.find(bytes);
             if (available != pool->second.available.end() &&
                     !available->second.empty()) {
@@ -929,12 +948,22 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
         MFQ_NATIVE_CUDA_CHECK(result);
         if(verify_pool_reuse)check_memory_limit();
         if(pooled_allocation) {
-            std::lock_guard lock(graph_pool_mutex_);graph_pools_.at(allocation_stream).owned.insert(pointer);
+            std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.emplace(pointer,bytes);
+            graph_pools_.at(allocation_stream).owned.insert(pointer);
         }
     } catch(...) {
+        if(pooled_allocation && pointer) {
+            std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.erase(pointer);
+            graph_pools_.at(allocation_stream).owned.erase(pointer);
+        }
         if(pointer) {if(async_allocations_)(void)cudaFreeAsync(pointer,allocation_stream);else (void)cudaFree(pointer);}
         allocation_budget_->release(bytes);throw;
     }
+    if(const auto* trace=std::getenv("MFQ_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_allocate pointer="<<pointer<<" bytes="<<bytes
+            <<" graph="<<pooled_allocation<<" resident="<<resident_allocations<<'\n';
     return pointer;
 }
 
@@ -968,11 +997,14 @@ void Context::release(
                 return;
             }
         }
+        if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
+            bytes=capacity->second;
         if (auto pool = graph_pools_.find(allocation_stream);
             pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
             pool->second.available[bytes].push_back(pointer);
             return;
         }
+        graph_allocation_sizes_.erase(pointer);
     } catch (...) {
         // Tensor destruction is noexcept. A warm-up bookkeeping allocation
         // failure must release the CUDA allocation instead of terminating or
@@ -984,6 +1016,7 @@ void Context::release(
         if(workspace_loan_ && workspace_loan_->live.count(pointer))return;
         if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
             pool->second.owned.erase(pointer);
+        graph_allocation_sizes_.erase(pointer);
     }
     on_device_noexcept(device_, [&] {
         if (async_allocations_) {
@@ -992,6 +1025,8 @@ void Context::release(
             (void)cudaFree(pointer);
         }
     });
+    if(const auto* trace=std::getenv("MFQ_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_release pointer="<<pointer<<" bytes="<<bytes<<'\n';
     allocation_budget_->release(bytes);
 }
 
@@ -1081,6 +1116,8 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         if (found == graph_pools_.end()) {
             return;
         }
+        for(const auto& [bytes,pointers]:found->second.available)
+            for(void* pointer:pointers)graph_allocation_sizes_.erase(pointer);
         pool = std::move(found->second);
         graph_pools_.erase(found);
     }

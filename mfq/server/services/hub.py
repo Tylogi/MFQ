@@ -45,6 +45,7 @@ from mfq.server.services.hardware import hardware_identity, memory_topology
 from mfq.server.services.hub_metadata import estimated_resident_weight_bytes, read_mfq_metadata
 from mfq.server.services.model_parameters import parameter_breakdown
 from mfq.server.services.model_memory import cache_profile
+from mfq.server.services.model_attention import attention_profile
 
 HubProvider = Literal["huggingface", "modelscope"]
 
@@ -63,6 +64,10 @@ _MFQ_DETAIL_RETRY_TTL = 30
 
 
 class HubError(RuntimeError):
+    pass
+
+
+class _RepositoryNotFound(HubError):
     pass
 
 
@@ -762,8 +767,13 @@ class HubCatalog:
             cached_identities = {self._mfq_file_identity(cached, item) for item in cached.files if item.name.lower().endswith('.mfq')}
             if identities and None not in identities and identities == cached_identities:
                 for field in ('architectures', 'modalities', 'parameter_count', 'parameter_breakdown',
-                              'mtp_supported', 'cache_profile', 'ple_parameter_count', 'runtime_compatible'):
-                    if field not in update and (getattr(info, field) is None or getattr(info, field) == []):
+                              'mtp_supported', 'cache_profile', 'ple_parameter_count', 'runtime_compatible',
+                              'attention_profile', 'config_inspected'):
+                    value = getattr(cached, field)
+                    missing = getattr(info, field) is None or getattr(info, field) == [] or field == 'config_inspected' and not info.config_inspected
+                    if field not in update and missing and value is not None and value != []:
+                        if field == 'config_inspected' and not value:
+                            continue
                         update[field] = getattr(cached, field)
             for item in cached.files:
                 identity = self._mfq_file_identity(cached, item)
@@ -784,11 +794,16 @@ class HubCatalog:
                 if item.name.lower().endswith('.mfq') and item.byte_size >= 64
                 and (item.weight_bytes is None or item.ssd_ple_bytes is None)]
 
+    @staticmethod
+    def _missing_model_metadata(info: HubModelInfo) -> bool:
+        return any(item.name.lower().endswith('.mfq') and item.byte_size >= 64 for item in info.files) and (
+            not info.config_inspected or not info.architectures or info.mtp_supported is None)
+
     def _start_detail_refresh(self, profile: HubSystemProfile) -> bool:
         if self._closed or self._refresh_task is not None and not self._refresh_task.done():
             return False
         now = time.monotonic()
-        keys = [key for key, info in self._official_cache.items() if info is not None and self._missing_mfq_files(info)
+        keys = [key for key, info in self._official_cache.items() if info is not None and (self._missing_mfq_files(info) or self._missing_model_metadata(info))
                 and now - self._detail_attempt_times.get(key, float('-inf')) >= _MFQ_DETAIL_RETRY_TTL]
         if not keys:
             return False
@@ -813,7 +828,7 @@ class HubCatalog:
 
     async def _inspect_mfq_files(self, info: HubModelInfo, profile: HubSystemProfile, *, publish: bool = False) -> HubModelInfo:
         candidates = self._missing_mfq_files(info)
-        if not candidates:
+        if not candidates and not self._missing_model_metadata(info):
             info = info.model_copy(update={'variants': _model_variants(info.files, profile, runtime_compatible=info.runtime_compatible)})
             if publish:
                 self._official_cache[(info.provider, info.repo_id)] = info
@@ -851,6 +866,8 @@ class HubCatalog:
                 'ple_parameter_count': ple_parameters,
                 'parameter_breakdown': parameters,
                 'cache_profile': cache_profile(config) if config else info.cache_profile,
+                'attention_profile': attention_profile(config) if config else info.attention_profile,
+                'config_inspected': bool(config) or info.config_inspected,
                 'parameter_count': parameters.total if parameters else info.parameter_count,
                 'modalities': modalities,
                 'mtp_supported': mtp_supported,
@@ -879,6 +896,14 @@ class HubCatalog:
                 except (httpx.HTTPError, ValueError, UnicodeError, asyncio.TimeoutError):
                     pass
             await asyncio.gather(*(inspect(index, item) for index, item in candidates))
+            if self._missing_model_metadata(result()):
+                remaining = [(index, item) for index, item in enumerate(files)
+                    if item.name.lower().endswith('.mfq') and item.byte_size >= 64 and index not in {i for i, _ in candidates}]
+                remaining = remaining[:1] + remaining[:0:-1]
+                for index, item in remaining:
+                    if not self._missing_model_metadata(result()):
+                        break
+                    await inspect(index, item)
         return result()
 
     async def resolve(
@@ -917,6 +942,13 @@ class HubCatalog:
             for model in self._official_specs()
             for source in model.sources
         }
+        static_sources = {
+            (source.provider, source.repo_id)
+            for model in _OFFICIAL_MODELS
+            for source in model.sources
+        }
+        discovered: dict[HubProvider, set[tuple[HubProvider, str]]] = {}
+        missing: set[tuple[HubProvider, str]] = set()
 
         semaphore = asyncio.Semaphore(4)
 
@@ -926,6 +958,8 @@ class HubCatalog:
                 async with semaphore:
                     self._official_cache[key] = await self._fetch_info(provider, repo_id, None, profile)
                 self._source_cache_times[key] = time.monotonic()
+            except _RepositoryNotFound:
+                missing.add(key)
             except HubError:
                 # Keep the last usable snapshot when a hub is temporarily offline.
                 self._official_cache.setdefault(key, None)
@@ -935,12 +969,20 @@ class HubCatalog:
                 repos = await asyncio.wait_for(self._discover_official(provider), timeout=_METADATA_DEADLINE)
             except (HubError, asyncio.TimeoutError):
                 return
-            additions = {(provider, repo) for repo in repos if self._is_official_repo(repo)} - sources
+            discovered[provider] = {(provider, repo) for repo in repos if self._is_official_repo(repo)}
+            additions = discovered[provider] - sources
             self._discovered_sources.update(additions)
             await asyncio.gather(*(inspect(*key) for key in sorted(additions)))
 
         try:
             await asyncio.gather(*(inspect(*key) for key in sorted(sources)), discover("huggingface"), discover("modelscope"))
+            removed = missing | {key for key in self._discovered_sources
+                if key[0] in discovered and key not in discovered[key[0]] and key not in static_sources}
+            self._discovered_sources.difference_update(removed)
+            for key in removed:
+                self._official_cache.pop(key, None)
+                self._source_cache_times.pop(key, None)
+                self._detail_attempt_times.pop(key, None)
             self._official_cache_time = time.monotonic()
         finally:
             self._save_cache()
@@ -964,10 +1006,16 @@ class HubCatalog:
                     if provider == 'huggingface':
                         values = payload
                     else:
+                        if not isinstance(payload, dict):
+                            raise HubError('Invalid ModelScope author discovery response')
                         if payload.get('success') is False:
                             raise HubError('ModelScope author discovery failed')
                         data = payload.get('data', {})
-                        values = data.get('models', [])
+                        if not isinstance(data, dict) or not isinstance(data.get('models'), list):
+                            raise HubError('Invalid ModelScope author discovery response')
+                        values = data['models']
+                    if not isinstance(values, list) or any(not isinstance(item, dict) or not isinstance(item.get('id'), str) for item in values):
+                        raise HubError('Invalid official model discovery response')
                     repos.extend(item['id'] for item in values if isinstance(item.get('id'), str) and not item.get('private', False) and HubCatalog._is_official_repo(item['id']))
                     if provider == 'modelscope':
                         if len(values) < 20 or page * 20 >= int(data.get('total_count', page * 20 + 1)):
@@ -981,6 +1029,8 @@ class HubCatalog:
                             raise HubError('Invalid Hugging Face discovery pagination URL')
                         url = next_url
                     page += 1
+                else:
+                    raise HubError('Official model discovery pagination did not complete')
             return repos
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
             raise HubError('Official model discovery failed') from error
@@ -1052,14 +1102,15 @@ class HubCatalog:
             id=spec.id,
             name=spec.name,
             family=spec.family,
-            architecture=spec.architecture,
+            architecture=source_info.architectures[0] if source_info and source_info.architectures else spec.architecture,
+            attention_profile=source_info.attention_profile if source_info else None,
             description=spec.description,
             description_zh=spec.description_zh,
             parameter_label=spec.parameter_label,
             active_parameter_label=spec.active_parameter_label,
             parameter_breakdown=source_info.parameter_breakdown if source_info else None,
             cache_profile=source_info.cache_profile if source_info else None,
-            mtp_supported=source_info.mtp_supported if source_info and source_info.mtp_supported is not None else 'MTP' in spec.capabilities if spec.capabilities else None,
+            mtp_supported=source_info.mtp_supported if source_info and source_info.mtp_supported is not None else True if 'MTP' in spec.capabilities else None,
             modalities=list(spec.modalities),
             capabilities=list(spec.capabilities),
             precision_options=list(spec.precision_options),
@@ -1174,6 +1225,7 @@ class HubCatalog:
                     getattr(info, "pipeline_tag", None), limit=255
                 ),
                 architectures=[str(value) for value in architectures],
+                attention_profile=attention_profile(config),
                 modalities=modalities,
                 parameter_count=parameter_count,
                 gated=bool(getattr(info, "gated", False)),
@@ -1183,6 +1235,8 @@ class HubCatalog:
                 ),
             )
         except Exception as error:
+            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {404, 410}:
+                raise _RepositoryNotFound("Model repository no longer exists.") from error
             raise HubError(str(error)) from error
 
     @staticmethod
@@ -1265,7 +1319,11 @@ class HubCatalog:
 
                 tasks = [asyncio.create_task(metadata()), asyncio.create_task(listing())]
                 try:
-                    model, entries = await asyncio.gather(*tasks)
+                    model, entries = await asyncio.gather(*tasks, return_exceptions=True)
+                    if isinstance(model, Exception):
+                        raise model
+                    if isinstance(entries, Exception):
+                        raise entries
                 finally:
                     for task in tasks:
                         if not task.done():
@@ -1319,6 +1377,9 @@ class HubCatalog:
                 ),
             )
         except Exception as error:
+            if (isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {404, 410}
+                    and error.request.url.path.rstrip('/').endswith('/models/' + repo_id)):
+                raise _RepositoryNotFound("Model repository no longer exists.") from error
             raise HubError(str(error)) from error
 
 

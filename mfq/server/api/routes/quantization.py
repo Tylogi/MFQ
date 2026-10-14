@@ -25,9 +25,9 @@ def workbench(service):
     return service.tool_handlers.quantization_workbench
 
 
-async def invoke(function, *args):
+async def invoke(function, *args, **kwargs):
     try:
-        return await asyncio.to_thread(function, *args)
+        return await asyncio.to_thread(function, *args, **kwargs)
     except JobExecutionError as error:
         raise ServiceError(422, error.detail.code, error.detail.message, details=error.detail.details) from error
     except (ValueError, OSError, KeyError) as error:
@@ -51,7 +51,7 @@ async def files(service: ServiceDependency, path: str | None = Query(default=Non
 
 @router.post('/api/v1/quantization/source', response_model=QuantizationSource)
 async def source(service: ServiceDependency, body: QuantizationSourceRequest):
-    return await invoke(workbench(service).source, body.path)
+    return await invoke(workbench(service).source, body.path, reference=body.reference)
 
 
 @router.get('/api/v1/quantization/jobs/{job_id}/recipe')

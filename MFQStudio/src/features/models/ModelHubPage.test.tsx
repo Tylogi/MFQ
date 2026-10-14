@@ -7,7 +7,7 @@ import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelHubPage } from './ModelHubPage';
 
-vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn() } }));
+vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn(), configureDownloadReclaim: vi.fn() } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: (job: JobResource) => useJobStore.getState().addJob(job) }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
@@ -29,11 +29,11 @@ function download(id = 'download-1'): JobResource {
 beforeEach(() => {
   useJobStore.getState().setJobs([]);
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(catalog);
-  vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
+  vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30 });
   vi.mocked(jobsApi.jobKinds).mockResolvedValue([{ kind: 'download.modelscope', payload_schema: {} }]);
   Element.prototype.scrollIntoView = vi.fn();
 });
-afterEach(() => { vi.clearAllMocks(); useJobStore.getState().setJobs([]); });
+afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); useJobStore.getState().setJobs([]); });
 
 it('keeps a submitted download on this page, animates into the circle and opens the third tab', async () => {
   vi.mocked(jobsApi.createJob).mockResolvedValue(download());
@@ -58,6 +58,22 @@ it('keeps a submitted download on this page, animates into the circle and opens 
   expect(screen.getByText('Queued')).toBeInTheDocument();
 });
 
+it('reclaims prefix space only after the setting is saved and restores it on failure', async () => {
+  vi.mocked(modelsApi.configureDownloadReclaim).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30, disk_available_bytes: 260 * 2 ** 30, evict_prefix_cache: true });
+  render(<ModelHubPage />);
+  const checkbox = await screen.findByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
+  await waitFor(() => expect(checkbox).toBeEnabled());
+  expect(checkbox).not.toBeChecked();
+  fireEvent.click(checkbox);
+  await waitFor(() => expect(checkbox).toBeChecked());
+  expect(modelsApi.configureDownloadReclaim).toHaveBeenCalledWith(true);
+  expect(screen.getByText('260.0 / 2048.0 GiB')).toBeInTheDocument();
+  vi.mocked(modelsApi.configureDownloadReclaim).mockRejectedValue(new Error('save failed'));
+  fireEvent.click(checkbox);
+  await waitFor(() => expect(checkbox).toBeEnabled());
+  expect(checkbox).toBeChecked();
+});
+
 it('distinguishes two precisions of one repository by their file paths and lists all shards', () => {
   const first = 'S2-L/model-00001-of-00002.mfq';
   const second = 'S2-L/model-00002-of-00002.mfq';
@@ -77,7 +93,7 @@ it('distinguishes two precisions of one repository by their file paths and lists
 
 it('displays and changes the real server download folder before submitting another download', async () => {
   vi.mocked(modelsApi.modelDirectories).mockResolvedValue({ current_id: 'chosen-folder', current_path: '/chosen/downloads', current_name: 'downloads', parent_id: null, data: [], files: [], model_file_count: 0 });
-  vi.mocked(modelsApi.configureDownloadDirectory).mockResolvedValue({ directory: '/chosen/downloads', actual_directory: '/chosen/downloads', default_directory: '/workspace/models' });
+  vi.mocked(modelsApi.configureDownloadDirectory).mockResolvedValue({ directory: '/chosen/downloads', actual_directory: '/chosen/downloads', default_directory: '/workspace/models', disk_total_bytes: 512 * 2 ** 30, disk_free_bytes: 100 * 2 ** 30 });
   vi.mocked(jobsApi.createJob).mockResolvedValue(download());
   render(<ModelHubPage />);
   await screen.findByText('/workspace/models');
@@ -87,9 +103,35 @@ it('displays and changes the real server download folder before submitting anoth
   await waitFor(() => expect(use).toBeEnabled());
   fireEvent.click(use);
   await screen.findByText('/chosen/downloads');
+  expect(screen.getByText('100.0 / 512.0 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'SSD free space: 19.5%' })).toBeInTheDocument();
   expect(modelsApi.configureDownloadDirectory).toHaveBeenCalledWith('chosen-folder');
   fireEvent.click(screen.getByRole('button', { name: 'Download' }));
   await waitFor(() => expect(jobsApi.createJob).toHaveBeenCalledWith('download.modelscope', expect.objectContaining({ download_directory: '/chosen/downloads' })));
+});
+
+it('shows remaining download disk capacity and refreshes it while mounted', async () => {
+  vi.useFakeTimers();
+  const first = { directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30 };
+  vi.mocked(modelsApi.downloadDirectory).mockResolvedValueOnce(first).mockResolvedValue({ ...first, disk_free_bytes: 150 * 2 ** 30 });
+  let view: ReturnType<typeof render>;
+  await act(async () => { view = render(<ModelHubPage />); });
+  expect(screen.getByText('200.0 / 2048.0 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'SSD free space: 9.8%' })).toHaveAttribute('aria-valuenow', '9.765625');
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(screen.getByText('150.0 / 2048.0 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'SSD free space: 7.3%' })).toBeInTheDocument();
+  view!.unmount();
+  await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+  expect(modelsApi.downloadDirectory).toHaveBeenCalledTimes(2);
+});
+
+it('keeps download controls usable when disk capacity is not reported', async () => {
+  vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
+  render(<ModelHubPage />);
+  await screen.findByText('/workspace/models');
+  expect(screen.getByRole('progressbar', { name: 'SSD free space: —' })).not.toHaveAttribute('aria-valuenow');
+  expect(screen.getByRole('button', { name: 'Change' })).toBeEnabled();
 });
 
 it('filters model-load and quantization jobs, retains downloads across remount and updates live progress', async () => {

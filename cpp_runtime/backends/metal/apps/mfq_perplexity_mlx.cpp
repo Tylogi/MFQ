@@ -791,7 +791,7 @@ ReferenceContract load_reference_contract(
         contract.score_count < 1 ||
         !((contract.attention == "native_model_default" &&
            contract.kv_cache_dtype == "native_model_default") ||
-          (contract.attention == "hf_sdpa" &&
+          ((contract.attention == "hf_sdpa" || contract.attention == "native_sdpa") &&
            contract.kv_cache_dtype == "none")) ||
         contract.scored_tokens !=
             static_cast<std::uint64_t>(contract.chunks) *

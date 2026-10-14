@@ -108,6 +108,42 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         Tensor raw, hidden;
         std::vector<Tensor> raw_chunks;
         double prefill_ms = 0.0;
+        double target_prefill_ms=0.0, predictor_prefill_ms=0.0, predictor_workspace_ms=0.0;
+        const bool stream_prompt_history = mtp.teacher_forced_prompt_prime() && !mtp.blockwise_drafting() && [&] {
+            if constexpr (requires { ops.stream_prompt_history(ops.size(input_ids, 1)); })
+                return ops.stream_prompt_history(ops.size(input_ids, 1));
+            return false;
+        }();
+        const int64_t predictor_chunk = [&] {
+            if constexpr (requires { ops.predictor_prefill_chunk_size(prefill_chunk_size); })
+                return ops.predictor_prefill_chunk_size(prefill_chunk_size);
+            return std::min<int64_t>(512, prefill_chunk_size);
+        }();
+        auto prime_rows = [&](Tensor prime_hidden, int64_t ids_offset, int64_t pairs) {
+            if (pairs <= 0) return;
+            if constexpr (requires { ops.begin_predictor_prefill(pairs); }) {
+                const auto elapsed=ops.begin_predictor_prefill(pairs);
+                prefill_ms+=elapsed;predictor_workspace_ms+=elapsed;
+            }
+            for (int64_t offset = 0; offset < pairs;) {
+                if (output.result.cancelled) return;
+                const auto chunk = next_prefill_chunk(pairs, offset, predictor_chunk);
+                auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
+                auto ids = ops.slice(input_ids, 1, ids_offset + chunk.offset, chunk.count);
+                auto positions = transformed_prompt
+                    ? ops.slice(prepared->positions, -1, ids_offset + chunk.offset, chunk.count) : Tensor{};
+                if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
+                    const auto elapsed=ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
+                    prefill_ms+=elapsed;predictor_prefill_ms+=elapsed;
+                }
+                else (void)ops.predictor_step(std::move(prime), std::move(ids), std::move(positions));
+                offset += chunk.count;
+            }
+            if constexpr (requires { ops.end_predictor_prefill(); }) {
+                const auto elapsed=ops.end_predictor_prefill();
+                prefill_ms+=elapsed;predictor_workspace_ms+=elapsed;
+            }
+        };
         for (int64_t offset = static_cast<int64_t>(reused_tokens);
             offset < ops.size(input_ids, 1);) {
             if (output.result.cancelled)
@@ -119,9 +155,19 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 return ops.prefill(chunk);
             }();
             hidden = std::move(step.hidden);
-            raw_chunks.push_back(std::move(step.raw));
+            if (stream_prompt_history) {
+                if (offset == static_cast<int64_t>(reused_tokens) && reused_tokens > 0)
+                    prime_rows(restored_last_hidden, offset, 1);
+                // Each target row pairs with the next input ID, including
+                // the boundary between target chunks. Retain just the final
+                // row; a long prompt's multi-stream states can occupy GiBs.
+                const auto pairs = std::min<int64_t>(chunk.count, ops.size(input_ids, 1) - offset - 1);
+                prime_rows(ops.slice(step.raw, 1, 0, pairs), offset + 1, pairs);
+                raw = ops.clone(ops.slice(step.raw, 1, ops.size(step.raw, 1) - 1, 1));
+            } else raw_chunks.push_back(std::move(step.raw));
             offset += chunk.count;
             prefill_ms += step.elapsed;
+            target_prefill_ms += step.elapsed;
             co_yield PrefillProgress{
                 {static_cast<std::size_t>(offset) - reused_tokens, prefill_ms, 0.0, prefill_ms}};
         }
@@ -129,8 +175,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             co_return;
         if (transformed_prompt)
             model.decode_position_delta = prepared->decode_position_delta;
-        raw =
-            raw_chunks.size() == 1 ? std::move(raw_chunks.front()) : ops.concatenate(raw_chunks, 1);
+        if (!stream_prompt_history)
+            raw = raw_chunks.size() == 1 ? std::move(raw_chunks.front()) : ops.concatenate(raw_chunks, 1);
         raw_chunks.clear();
         auto committed_last_hidden = ops.slice(raw, 1, ops.size(raw, 1) - 1, 1);
         std::function<void()> flush_history;
@@ -154,7 +200,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             mtp.append_target_context(raw, 0);
         }
 
-        if (mtp.teacher_forced_prompt_prime()) {
+        if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {
             const int64_t chunk_size = [&] {
                 if constexpr (requires { ops.predictor_prefill_chunk_size(prefill_chunk_size); })
                     return ops.predictor_prefill_chunk_size(prefill_chunk_size);
@@ -175,8 +221,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             } else if (pairs > 0) {
                 prime_hidden = ops.slice(raw, 1, 0, pairs);
             }
-            if constexpr (requires { ops.begin_predictor_prefill(pairs); })
-                prefill_ms += ops.begin_predictor_prefill(pairs);
+            if constexpr (requires { ops.begin_predictor_prefill(pairs); }) {
+                const auto elapsed=ops.begin_predictor_prefill(pairs);
+                prefill_ms+=elapsed;predictor_workspace_ms+=elapsed;
+            }
             for (int64_t offset = 0; offset < pairs;) {
                 if (output.result.cancelled)
                     co_return;
@@ -186,20 +234,27 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 auto positions = transformed_prompt
                     ? ops.slice(prepared->positions, -1, prime_ids_offset + chunk.offset, chunk.count)
                     : Tensor{};
-                if constexpr (requires { ops.predictor_prefill(prime, ids, positions); })
-                    prefill_ms += ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
+                if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
+                    const auto elapsed=ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
+                    prefill_ms+=elapsed;predictor_prefill_ms+=elapsed;
+                }
                 else
                     (void)ops.predictor_step(std::move(prime), std::move(ids), std::move(positions));
                 if (output.result.cancelled)
                     co_return;
                 offset += chunk.count;
                 if constexpr (requires { ops.end_predictor_prefill(); })
-                    if(offset == pairs)prefill_ms += ops.end_predictor_prefill();
+                    if(offset == pairs) {
+                        const auto elapsed=ops.end_predictor_prefill();
+                        prefill_ms+=elapsed;predictor_workspace_ms+=elapsed;
+                    }
                 co_yield PrefillProgress{
                     {prompt.size() - reused_tokens, prefill_ms, 0.0, prefill_ms}};
             }
         }
 
+        if constexpr (requires { ops.trace_prompt_prefill(target_prefill_ms,predictor_prefill_ms,predictor_workspace_ms); })
+            ops.trace_prompt_prefill(target_prefill_ms,predictor_prefill_ms,predictor_workspace_ms);
         if (output.result.cancelled)
             co_return;
         // Only one boundary row is needed after prompt priming. A contiguous

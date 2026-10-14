@@ -3,6 +3,7 @@
 #include "moe_cache_profile.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <ostream>
@@ -11,6 +12,12 @@
 #include <utility>
 
 class MoeExpertCache;
+// Share one bounded transfer arena across single-token decode and MTP.
+inline int moe_decode_transfer_slots(int rows, int routes) {
+    return std::max(80, rows * routes);
+}
+namespace mfq::cuda {class KvExpertLoan;}
+void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan);
 
 // The owner outlives every temporary tensor allocated from the borrowed tails.
 // Destruction restores experts on cancellation/exception as well as success.

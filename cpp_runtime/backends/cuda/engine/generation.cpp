@@ -92,6 +92,11 @@ template <typename Model> struct CudaGenerationOps {
         if (hidden.defined()) {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
+            MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+            bool borrowed=false;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                borrowed=workspace.begin((std::size_t(4)<<30)+
+                    std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
                 prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
@@ -99,6 +104,11 @@ template <typename Model> struct CudaGenerationOps {
                 nullptr,
                 mfq_nullopt,
                 true);
+            if(borrowed) {
+                workspace.suspend();
+                hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
+                workspace.finish();
+            }
             model.decode_position_delta = prepared->decode_position_delta;
         } else {
             MfqOptional<Tensor> length = mfq_nullopt;
@@ -360,6 +370,9 @@ template <class Model> struct CudaGenerationContext {
             reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
         auto logical_chunk=config.generation.prefill_chunk_size;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            // Bound residual/FFN storage as well as projection tiles. Long
+            // prompts advance each bounded chunk through all layers.
+            logical_chunk=std::min<int64_t>(logical_chunk,8192);
             if(reused==0 && (stable==0 || stable==input.prompt.size()) &&
                 (!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,input.prompt.size()))

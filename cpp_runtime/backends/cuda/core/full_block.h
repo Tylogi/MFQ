@@ -48,6 +48,7 @@ struct FullBlock : Block {
 
     bool supports_speculation() const noexcept override { return !sliding; }
     void reset(int64_t batch) override;
+    void preallocate_kv();
     mfq_tensor_backend::Tensor forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,

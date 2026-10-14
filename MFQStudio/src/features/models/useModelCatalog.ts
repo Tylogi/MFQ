@@ -12,6 +12,7 @@ import { STUDIO_PATHS, labPath } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
+import { readLoadContext, saveLoadContext, type LoadContextDefaults } from './loadContextDefaults';
 
 export function useModelCatalog() {
   const {
@@ -26,7 +27,7 @@ export function useModelCatalog() {
   } = useRuntime();
   const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
-  const { tr, contextSize } = useSettings();
+  const { tr } = useSettings();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [busy, setBusy] = useState(false);
@@ -39,6 +40,11 @@ export function useModelCatalog() {
   const [loadPinned, setLoadPinned] = useState(false);
   const [loadDeviceIds, setLoadDeviceIds] = useState<string[]>([]);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
+  const [loadContext, updateLoadContext] = useState(readLoadContext);
+  function setLoadContext(value: LoadContextDefaults) {
+    updateLoadContext(value);
+    saveLoadContext(value);
+  }
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
   const [modelBrowserOpen, updateModelBrowserOpen] = useState(false);
   const [modelFolderPath, setModelFolderPath] = useState(readModelDirectory);
@@ -50,7 +56,7 @@ export function useModelCatalog() {
   const modelBrowserTriggerRef = useRef<HTMLElement | null>(null);
   const canUseNativeModelPicker = isStudio() && studio?.config.mode !== 'remote';
   const availableModelNames = runtimeModelNames(models, instances);
-  const openStudioPage = (_view: string, page: 'models' | 'quantization') =>
+  const openStudioPage = (_view: string, page: 'models') =>
     navigate(labPath(page));
   const artifactRevision = jobs.map((job) => job.id + ':' + job.status).join(',');
   function setModelBrowserOpen(open: boolean) {
@@ -76,6 +82,7 @@ export function useModelCatalog() {
     updateModelBrowserOpen(false);
     setBusy(false);
     setLoadDeviceIds([]);
+    updateLoadContext(readLoadContext());
   }, [connectionRevision]);
   useEffect(() => {
     if (!ready) return;
@@ -140,10 +147,11 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      await modelsApi.loadModel(name, contextSize, 2048, {
+      await modelsApi.loadModel(name, loadContext.context_size ?? 32768, 2048, {
         pin: loadPinned,
         device_ids: loadDeviceIds,
         idle_ttl_seconds: loadIdleTtl,
+        context_management: loadContext,
       });
       if (!current()) return;
       navigate(STUDIO_PATHS.models);
@@ -186,10 +194,11 @@ export function useModelCatalog() {
         instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
         runtime?.model === artifact.name;
       if (!loaded) {
-        await modelsApi.loadModel(artifact.name, contextSize, 2048, {
+        await modelsApi.loadModel(artifact.name, loadContext.context_size ?? 32768, 2048, {
           pin: loadPinned,
           device_ids: loadDeviceIds,
           idle_ttl_seconds: loadIdleTtl,
+          context_management: loadContext,
         });
         if (!current()) return;
       }
@@ -327,6 +336,7 @@ export function useModelCatalog() {
   }
 
   return {
+    connectionRevision,
     runtime,
     artifacts,
     busy,
@@ -338,6 +348,8 @@ export function useModelCatalog() {
     filteredInstances,
     filteredArtifacts,
     loadPinned,
+    loadContext,
+    setLoadContext,
     loadDeviceIds,
     setLoadDeviceIds,
     setLoadPinned,

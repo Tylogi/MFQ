@@ -38,6 +38,7 @@ _DTYPE_LAYOUTS = {
     "F64": np.dtype("<f8"),
     "F8_E4M3": np.dtype("u1"),
     "F8_E4M3FN": np.dtype("u1"),
+    "F8_E5M2": np.dtype("u1"),
     "F8_E8M0": np.dtype("u1"),
 }
 

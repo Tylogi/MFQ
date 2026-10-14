@@ -23,6 +23,9 @@ target_link_libraries(mfq-runtime-communication
         Threads::Threads
 )
 target_compile_definitions(mfq-runtime-communication PRIVATE NOMINMAX)
+if(WIN32)
+    target_link_libraries(mfq-runtime-communication PRIVATE advapi32)
+endif()
 target_compile_features(mfq-runtime-communication PUBLIC cxx_std_17)
 set_target_properties(mfq-runtime-communication PROPERTIES
     POSITION_INDEPENDENT_CODE ON

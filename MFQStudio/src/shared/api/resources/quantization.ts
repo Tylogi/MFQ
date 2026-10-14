@@ -41,7 +41,7 @@ export const quantizationApi = {
     method: 'PUT', body: JSON.stringify({ import_directory, export_directory }),
   }),
   files: (path: string, signal?: AbortSignal) => request<QuantizationFiles>(`/api/v1/quantization/files?path=${encodeURIComponent(path)}`, { signal }),
-  source: (path: string) => request<QuantizationSource>('/api/v1/quantization/source', { method: 'POST', body: JSON.stringify({ path }) }),
+  source: (path: string, reference = false) => request<QuantizationSource>('/api/v1/quantization/source', { method: 'POST', body: JSON.stringify({ path, reference }) }),
   loadingPlan: (path: string, purpose: 'imatrix' | 'wt2', context_size: number) => request<SourceLoadingPlan>('/api/v1/quantization/loading-plan', {
     method: 'POST', body: JSON.stringify({ path, purpose, context_size }),
   }),

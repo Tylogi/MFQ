@@ -274,8 +274,29 @@ struct MoeGpuArena {
     int slots = 0;
     std::vector<MoeCacheFieldLayout> layouts;
     std::vector<mfq_tensor_backend::Tensor> fields;
+    // Decode descriptors can address heterogeneous experts in one byte arena.
+    // The slot book belongs to the arena, so formats compete for the same slots.
+    mfq_tensor_backend::Tensor packed;
     std::unique_ptr<mfq::MoeCacheSlotBook> book;
+    uint8_t* field_pointer(int slot, std::size_t field,
+                          const std::vector<int64_t>& bytes) const {
+        if(!packed.defined())return static_cast<uint8_t*>(fields[field].data_ptr())+int64_t(slot)*bytes[field];
+        int64_t offset=0;
+        for(std::size_t f=0;f<field;++f)offset+=(bytes[f]+255)&~int64_t(255);
+        return packed.data_ptr<uint8_t>()+int64_t(slot)*slot_bytes+offset;
+    }
 };
+
+inline int64_t moe_packed_slot_bytes(const std::vector<int64_t>& fields) {
+    int64_t result=0;
+    for(auto bytes:fields)result+=(bytes+255)&~int64_t(255);
+    return result;
+}
+
+inline bool moe_packed_transfer_stages_enabled() {
+    const auto* value=std::getenv("MFQ_MOE_PACKED_TRANSFER_STAGE");
+    return !value || value[0]!='0';
+}
 
 struct MoePinnedStage {
     mfq_tensor_backend::Tensor host;

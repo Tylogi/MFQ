@@ -222,7 +222,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(APP).toContain('localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated))');
     expect(shell).toContain('<Outlet />');
     expect(APP_ENTRY).toContain('path="settings"');
-    expect(APP_ENTRY).toContain('path="quantization"');
+    expect(APP_ENTRY).not.toContain('path="quantization"');
     const jobs = readSources('features/jobs/useJobRecordActions.ts');
     expect(jobs).toContain('jobsApi.clearCompletedJobs()');
     expect(jobs).toContain('jobsApi.deleteJob(id)');

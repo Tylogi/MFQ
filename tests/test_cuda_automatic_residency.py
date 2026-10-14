@@ -47,7 +47,8 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
     else:
         capacity = hardware.gpu_memory[int(device)].capacity_bytes
         assert selected.moe_gpu_cache_gb is not None and selected.moe_gpu_cache_gb > 0
-        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 3
+        # Native admission prices actual allocations; no extra third for PP.
+        assert pool._estimated_load_bytes(model, selected) == capacity - max(GIB, capacity // 16)
     explicit = request.model_copy(update={"moe_gpu_cache_gb": 7})
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
 
@@ -62,7 +63,9 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
     pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
     model = artifact(tmp_path)
     assert supports_cuda_ram_expert_pipeline(model.path)
-    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    # Select the mocked GPU explicitly, independent of the test runner's
+    # CUDA_VISIBLE_DEVICES setting.
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
     if not enabled:
         with pytest.raises(JobExecutionError) as raised:
             pool._launch_configuration(model, request, port=1234)
