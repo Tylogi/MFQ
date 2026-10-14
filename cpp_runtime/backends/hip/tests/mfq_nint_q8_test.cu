@@ -27,6 +27,16 @@ void group_path(bool enabled) {
 #endif
 }
 
+void default_path() {
+#ifdef _WIN32
+    _putenv_s("MFQ_NINT_SINGLE_ROW", "");
+    _putenv_s("MFQ_NINT_GROUP_DOT", "");
+#else
+    unsetenv("MFQ_NINT_SINGLE_ROW");
+    unsetenv("MFQ_NINT_GROUP_DOT");
+#endif
+}
+
 double grouped_max_nrmse = 0.0;
 double grouped_max_absolute = 0.0;
 
@@ -208,6 +218,7 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
     auto qx=empty({1,k},options.dtype(kInt8)),xs=empty({1,ng},options.dtype(kFloat32));
     const auto run=[&]{return nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
     single_path(false);group_path(false);auto expected=run();
+    default_path();exact_half(run(),expected);++cases;
     single_path(true);group_path(grouped);auto actual=run();
     const auto compare=grouped ? grouped_half : exact_half;compare(actual,expected);++cases;
     const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);

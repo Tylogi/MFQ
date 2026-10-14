@@ -85,6 +85,10 @@ inline unsigned long long __ballot(bool) { return votes; }
 #define __HIP_PLATFORM_AMD__ 1
 #include "mfq_hip_compat.h"
 int main() {
+    assert(__dp4a(int(0x80808080u), int(0x80808080u), 0) == 65536);
+    assert(__dp4a(int(0xfffe0180u), int(0x027f80ffu), 50) == -206);
+    assert(__dp4a(0x7f7f7f7f, 0x7f7f7f7f, 2147483647) == -2147419133);
+    assert(__dp4a(int(0x80808080u), 0x7f7f7f7f, -2147483647 - 1) == 2147418624);
     for (unsigned wave : {32u, 64u}) {
         warpSize = wave;
         for (unsigned thread = 0; thread < 256; ++thread) {

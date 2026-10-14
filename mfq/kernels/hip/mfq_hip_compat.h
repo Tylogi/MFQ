@@ -70,18 +70,20 @@ __device__ __forceinline__ unsigned ballot(unsigned mask, unsigned long long vot
 #define CUBLAS_OP_T HIPBLAS_OP_T
 #endif
 
-// ROCm does not provide CUDA's __dp4a intrinsic; emulate it in device code.
+// Preserve CUDA's signed-byte dot product and wrapping accumulator.
 #if !defined(MFQ_HIP_COMPAT_DP4A)
 #define MFQ_HIP_COMPAT_DP4A
 __device__ __forceinline__ int __dp4a(int a, int b, int c) {
-    // Scalar byte dot product; correct but compute-limited. The hardware
-    // v_dot4_i32_i8 exists on gfx942 but its inline-asm encoding differs
-    // from the documented form (produced wrong results). The OCKL
-    // __ockl_sdot4 intrinsic requires a header chain not on our path.
-    // Closing the ~15% decode gap to BF16 needs the hardware instruction.
+#if defined(__HIP_DEVICE_COMPILE__) && \
+    (defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__)) && \
+    __has_builtin(__builtin_amdgcn_sdot4)
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#else
     const signed char* av = reinterpret_cast<const signed char*>(&a);
     const signed char* bv = reinterpret_cast<const signed char*>(&b);
-    return c + av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2] + av[3] * bv[3];
+    const int dot = av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2] + av[3] * bv[3];
+    return static_cast<int>(static_cast<unsigned>(c) + static_cast<unsigned>(dot));
+#endif
 }
 #endif
 

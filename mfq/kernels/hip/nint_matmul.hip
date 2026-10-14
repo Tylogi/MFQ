@@ -2186,7 +2186,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             false,static_cast<uint64_t>(bitstream.numel()));
     };
     const auto* single=std::getenv("MFQ_NINT_SINGLE_ROW");
-    if (activation_rows == 1 && single && std::strcmp(single, "1") == 0 &&
+    if (activation_rows == 1 && (!single || std::strcmp(single, "0") != 0) &&
             (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0) {
         const size_t activation_bytes =
             (static_cast<size_t>(padded_width) + 3u) & ~size_t(3u);
@@ -2217,7 +2217,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         }
         // At least one warp of groups avoids underfilled lanes.
         const auto* group_flag=std::getenv("MFQ_NINT_GROUP_DOT");
-        const bool use_group=(!group_flag || std::strcmp(group_flag,"1")==0) &&
+        const bool use_group=group_flag && std::strcmp(group_flag,"1")==0 &&
             groups>=32 && group_size>=1 && group_size<=64;
         if (use_cache) {
             const auto launch_cache=[&](auto grouped) {

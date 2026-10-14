@@ -176,7 +176,7 @@ absolute error was 0.000527. An additional test checks that unsupported
 uncomputed output.
 
 An isolated diagnostic executable linked with the corrected attention
-object also completed Qwen3.5-4B BF16 prefill at 33, 129, 512, and 2048
+object also completed Qwen3.5-4B uniform NINT4 prefill at 33, 129, 512, and 2048
 tokens with `MFQ_DISABLE_MMA_ATTENTION` unset. The running server and its
 build artifacts were not replaced. These checks cover the 256-dimensional
 prefill path; other attention families and GPU architectures need
@@ -194,17 +194,77 @@ combined-QKV GDN and QSA weight structures required by the shared loader.
 After these fixes, the full native HIP build and all 41 registered CTest
 cases passed on MI300X. The attention test includes 32 numerical cases
 and the unsupported-tile rejection check. The newly built diagnostics
-executable completed BF16 and S4-M Qwen3.5-4B prefill at 33, 129, 256,
+executable completed uniform NINT4 and S4-M Qwen3.5-4B prefill at 33, 129, 256,
 512, and 2048 tokens with `MFQ_DISABLE_MMA_ATTENTION` unset. Both models
 also generated 16 tokens from a 129-token input. At that input length,
 MMA and FMA logits selected the same top token, with absolute KL
 divergence below 0.0000022. These are functional checks, not a language
 quality or performance benchmark.
 
+The artifact named `qwen35-4b-bf16.mfq` was later found to contain 249
+NINT tensors. The two checks above used uniform NINT4 weights, despite
+that filename. A separate conversion of the original HF checkpoint
+contains 690 BF16 tensors and 48 F32 tensors, with no NINT tensors. Use
+the verified conversion for unquantized comparisons.
+
 On macOS, all 32 backend-neutral CTest cases and 134 focused Python
 cases passed. The full Python suite reported 2599 passed, 608 skipped,
 and 42 failed. Each of the 42 failures was reproduced against unchanged
 upstream `0cda1e0f`; no new failing cases were observed.
+
+### Packed NINT decode optimization
+
+The HIP decode kernel quantizes activations to signed bytes, reads four
+packed weight codes, computes integer dots and activation sums, then
+applies each group's scale and minimum before the FP32 reduction. NINT8
+weights use the same signed dot after a byte bias, with the matching
+activation-sum correction. This is the CUDA packed-integer algorithm.
+
+The old scalar `__dp4a` expression was already lowered to
+`v_dot4c_i32_i8_e32` by Clang 23 on gfx942, but a standalone assembly
+probe showed ten extra vector instructions to repack its operands. The
+explicit `__builtin_amdgcn_sdot4` uses the original packed registers.
+Saturation is disabled to retain CUDA's wrapping accumulator. The
+native branch is limited to gfx908, gfx90a and gfx942; other targets and
+host translation units retain the scalar fallback. The first two targets
+were compile-checked; GPU execution was checked on gfx942.
+
+Single-token projections now select the existing single-row kernel by
+default. This removes the generic kernel's eight-row and routed branches,
+uses checked packed-word reads, and caches activations in shared memory
+for narrow-output contractions. It preserves the original FP32 reduction
+order. `MFQ_NINT_SINGLE_ROW=0` selects the generic path.
+`MFQ_NINT_GROUP_DOT=1` opts into integer accumulation across a complete
+group, which changes the FP32 reduction order and remains separate.
+
+The full native build and all 41 CTest cases passed after this change.
+The wave test now checks 524,288 signed dot-product and accumulator-wrap
+cases. The NINT tests passed 1,176 single-row comparisons, 2,592 q8 cases,
+54 q8 capture/replay cases, and 111 ordinary plus 333 changing-graph
+activation checks. Default single-row output is compared byte for byte
+with the generic path, including mixed bit widths, odd group sizes,
+unpadded tails, offset storage and shared-activation cases.
+
+On macOS, 32 focused portability and source-contract checks passed. One
+additional CUDA source-contract assertion fails on unchanged `37f3de1f`
+as well; the isolated baseline reproduction fails at the same assertion.
+
+Alternating before/after runs against `37f3de1f`, on the same MI300X,
+used batch 1, a 129-token input, 256 timed decode tokens and HIP graphs.
+Median S4-M throughput increased from 182.46 to 219.92 tok/s for 0.8B,
+65.77 to 123.35 tok/s for 4B, and 51.17 to 88.84 tok/s for 9B. The 4B
+comparison used five runs per version; the other models used three.
+Shared-host timing varied: the 4B ranges were 61.57-70.51 and
+102.60-123.94 tok/s. Generated token sequences matched across versions
+for all three models and for three additional varied 4B prompts.
+
+Individual 4B projection checks used 200 repetitions, including activation
+quantization. The GDN QKV projection improved 4.24x, the FFN down
+projection 2.35x, and the vocabulary projection 2.80x. The relative,
+mean-absolute and maximum-absolute output errors matched the baseline.
+Prefill was unchanged in repeat medians: 10,631.4 to 10,628.2 tok/s at
+2K, and 10,051.9 to 10,055.7 tok/s at 8K. Each repeat median summarizes
+three trials of seven measurements; timing outliers were retained.
 
 ## Compile-time fix
 
