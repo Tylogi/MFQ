@@ -12,11 +12,10 @@
 
 struct RopeCache;
 
+// A predictor runs against any loaded CUDA model, so it holds the model through
+// the family-independent interface rather than a list of concrete types.
 struct MtpTarget {
-    std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
-        mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
-        mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
-        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
+    mfq::cuda::CudaCausalModel* model = nullptr;
     const RopeCache* rope = nullptr;
     template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
     mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;
