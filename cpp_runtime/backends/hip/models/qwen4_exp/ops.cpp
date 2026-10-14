@@ -147,6 +147,21 @@ struct BlockLoader : weight_loader::Loader {
                 c.hidden, c.streams, c.eps};
     }
     static auto final_mixer(Gr weights) { return std::make_unique<Gr>(std::move(weights)); }
+    auto gdn_weights(const std::string &p) const {
+        return GdnWeights{
+            linear(p + ".qkv.weight"), linear(p + ".gate.weight"),
+            linear(p + ".alpha.weight"), linear(p + ".beta.weight"),
+            linear(p + ".output.weight"), dense(p + ".conv.weight"),
+            dense(p + ".dt_bias"), dense(p + ".a"), dense(p + ".norm.weight")};
+    }
+    auto qsa_weights(const std::string &p) const {
+        return QsaWeights{
+            linear(p + ".query.weight"), linear(p + ".key.weight"),
+            linear(p + ".value.weight"), linear(p + ".output.weight"),
+            linear(p + ".indexer.query_key.weight"), dense(p + ".query_norm.weight"),
+            dense(p + ".key_norm.weight"), dense(p + ".indexer.query_norm.weight"),
+            dense(p + ".indexer.key_norm.weight")};
+    }
     auto gdn(GdnWeights weights, const Config &c) const {
         std::vector<Linear> projections{weights.qkv,weights.gate,weights.alpha,weights.beta};
         weights.input_projection=weight_loader::grouped_linear(execution,projections);
