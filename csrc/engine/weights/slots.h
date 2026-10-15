@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace mfq {
+namespace mfq::engine {
 struct MoeCacheKey {
     int source = -1, cohort = -1, expert = -1;
     bool operator==(const MoeCacheKey& other) const noexcept {
@@ -72,4 +72,4 @@ struct MoeArenaDemand {
     int minimum_slots = 0, registered_experts = 0;
 };
 std::unordered_map<std::string, int> plan_moe_arena_slots(int64_t budget_bytes, const std::vector<MoeArenaDemand>& demands);
-} // namespace mfq
+} // namespace mfq::engine

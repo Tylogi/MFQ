@@ -27,7 +27,7 @@ public:
     bool gpu_resident(int expert) const;
     std::size_t expert_field_bytes(int expert) const;
     const std::shared_ptr<MoeHostExpertCache>& host_cache() const { return host_cache_; }
-    mfq::MoeCacheKey host_key(int expert) const;
+    mfq::engine::MoeCacheKey host_key(int expert) const;
     mfq_tensor_backend::Tensor forward_cpu(
         CudaExecutionContext& execution,mfq_tensor_backend::Tensor input,const MoeRoutePlan& route,
         const std::unordered_map<int,MoeHostExpertCache::Lease>* prepared = nullptr) const;

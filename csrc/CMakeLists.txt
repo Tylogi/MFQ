@@ -16,6 +16,7 @@ set(MFQ_ENGINE_PRIVATE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/requests
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/batch
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/state
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/weights
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/executor
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/text
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/src

@@ -964,7 +964,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             // Share one capacity across M=9..32; changing concurrency must not
             // retain a separate weight staging arena for every batch size.
             auto& arena=stage(p,cohort,std::max(128,(cell.tokens>8?32:8)*cell.routes));
-            if(!arena.book)arena.book=std::make_unique<mfq::MoeCacheSlotBook>(arena.slots);
+            if(!arena.book)arena.book=std::make_unique<mfq::engine::MoeCacheSlotBook>(arena.slots);
             cell.binding[p].stages.push_back(&arena);
         }
         if(!cell.two_stage)for(int projection=0;projection<3;++projection) {
@@ -1602,7 +1602,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(const auto& group:cell.plan.groups)if(group.kind==mfq::MoeDispatchKind::GpuTransfer) {
                 const int e=group.expert,c=source.expert_to_cohort_[e];
                 if(source.cohorts_[c].arena->book->slot_for({source.id_,c,e})>=0)continue;
-                auto* book=cell.binding[p].stages[c]->book.get();const mfq::MoeCacheKey key{source.id_,c,e};
+                auto* book=cell.binding[p].stages[c]->book.get();const mfq::engine::MoeCacheKey key{source.id_,c,e};
                 const int slot=book->slot_for(key);
                 if(slot>=0) {
                     cache_->pipeline_transfer_slots_.push_back({book,key,slot,0});
@@ -1620,7 +1620,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 if(stage && slot>=stage->slots)throw std::logic_error("MFQ direct transfer exceeds cohort geometry");
                 if(cohort.arena->book->slot_for({source.id_,c,e})>=0)continue;
                 if(cell.transfer_cache) {
-                    const mfq::MoeCacheKey key{source.id_,c,e};const auto held=stage->book->acquire(key);
+                    const mfq::engine::MoeCacheKey key{source.id_,c,e};const auto held=stage->book->acquire(key);
                     slot=held.slot;
                     const MoeCacheNewLease item{stage->book.get(),key,slot,held.generation};
                     if(!held.hit)rollback.added.push_back(item);
@@ -1881,7 +1881,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     }
     void fetch(Cell& cell) {
         struct ClearPrefetchKeys {
-            std::vector<mfq::MoeCacheKey>& keys;
+            std::vector<mfq::engine::MoeCacheKey>& keys;
             ~ClearPrefetchKeys(){keys.clear();}
         } clear_prefetch_keys{cache_->pipeline_prefetched_keys_};
         // The preceding call can finish CPU work before its weight DMA. Its
@@ -1894,7 +1894,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
         cache_->pipeline_transfer_slots_.clear();
         if(!cell.two_stage)for(auto& item:cache_->pipeline_stages_)
-            if(item.second->book)item.second->book=std::make_unique<mfq::MoeCacheSlotBook>(item.second->slots);
+            if(item.second->book)item.second->book=std::make_unique<mfq::engine::MoeCacheSlotBook>(item.second->slots);
         if(!cell.mapped_copy && cache_->compute_done_recorded_)
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,cache_->compute_done_,0));
         if(cell.wire.defined() && cache_->pipeline_ram_registered_bytes_) {
@@ -2297,7 +2297,7 @@ public:
                 if(combined_gate_up_ && p==1)continue;
                 auto& source=*sources_[p];const int c=source.expert_to_cohort_[e];
                 auto& cohort=source.cohorts_[c];if(source.quant_source_->gpu_resident(e))continue;
-                auto& arena=stage(p,cohort);auto* book=arena.book.get();const mfq::MoeCacheKey key{source.id_,c,e};
+                auto& arena=stage(p,cohort);auto* book=arena.book.get();const mfq::engine::MoeCacheKey key{source.id_,c,e};
                 if(book->slot_for(key)>=0)continue;
                 bool available=false;for(int slot=0;slot<book->capacity();++slot)available|=!book->inflight(slot);
                 if(!available){++cache_->stats_.pipeline_prefetch_busy_skips;continue;}
@@ -2384,7 +2384,7 @@ public:
             cache_->pipeline_prefetch_host_stage_=tb::empty({capacity},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
         }
         for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_) {
-            auto& arena=stage(p,cohort);if(!arena.book)arena.book=std::make_unique<mfq::MoeCacheSlotBook>(arena.slots);
+            auto& arena=stage(p,cohort);if(!arena.book)arena.book=std::make_unique<mfq::engine::MoeCacheSlotBook>(arena.slots);
         }
         const auto* window=mfq::cuda::DecodeWindow::recording();
         auto& entry=prediction_cells_[window];if(!entry)entry=std::make_shared<PredictionCell>();

@@ -1,8 +1,9 @@
 #pragma once
-#include "mfq/moe/residency_ranker.h"
+#include "ranker.h"
 #include <map>
 
 namespace mfq::bench {
+using engine::MoeResidencyRanker;
 using ResidencyExpert=MoeResidencyRanker::Expert;
 struct ResidencyEntry {ResidencyExpert expert;std::size_t group;};
 

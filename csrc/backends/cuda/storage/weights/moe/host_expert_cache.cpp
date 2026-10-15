@@ -35,7 +35,7 @@ struct MoeHostExpertReservation {
 };
 
 struct MoeHostExpertCache::Impl {
-    struct Entry { Lease value; std::list<mfq::MoeCacheKey>::iterator position; };
+    struct Entry { Lease value; std::list<mfq::engine::MoeCacheKey>::iterator position; };
     struct Flight {
         bool ready=false;
         bool retain=true;
@@ -46,9 +46,9 @@ struct MoeHostExpertCache::Impl {
     const std::size_t budget;
     std::shared_ptr<Ledger> ledger=std::make_shared<Ledger>();
     mutable std::mutex mutex;
-    std::list<mfq::MoeCacheKey> lru;
-    std::unordered_map<mfq::MoeCacheKey,Entry,mfq::MoeCacheKeyHash> entries;
-    std::unordered_map<mfq::MoeCacheKey,std::shared_ptr<Flight>,mfq::MoeCacheKeyHash> flights;
+    std::list<mfq::engine::MoeCacheKey> lru;
+    std::unordered_map<mfq::engine::MoeCacheKey,Entry,mfq::engine::MoeCacheKeyHash> entries;
+    std::unordered_map<mfq::engine::MoeCacheKey,std::shared_ptr<Flight>,mfq::engine::MoeCacheKeyHash> flights;
     MoeHostExpertCacheStats counters;
     bool preserve=false;
 
@@ -76,7 +76,7 @@ struct MoeHostExpertCache::Impl {
         }
         return true;
     }
-    void publish(mfq::MoeCacheKey key,Lease value) {
+    void publish(mfq::engine::MoeCacheKey key,Lease value) {
         lru.push_front(key);
         try {
             if (!entries.emplace(key,Entry{value,lru.begin()}).second)
@@ -95,7 +95,7 @@ void MoeHostExpertCache::preserve_resident_experts() {
     impl_->preserve=true;
 }
 
-MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::size_t bytes,
+MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::engine::MoeCacheKey key,std::size_t bytes,
         const Load& load,bool retain) {
     if (!load || !bytes) throw std::invalid_argument("host expert needs a loader and exact byte size");
     auto& state=*impl_;
@@ -155,7 +155,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
     }
 }
 
-bool MoeHostExpertCache::demote(mfq::MoeCacheKey key,std::size_t bytes,const Load& copy) {
+bool MoeHostExpertCache::demote(mfq::engine::MoeCacheKey key,std::size_t bytes,const Load& copy) {
     if (!copy || !bytes) throw std::invalid_argument("GPU expert demotion needs exact fields");
     auto& state=*impl_;
     std::shared_ptr<MoeHostExpertReservation> reservation;
@@ -193,7 +193,7 @@ bool MoeHostExpertCache::demote(mfq::MoeCacheKey key,std::size_t bytes,const Loa
     }
 }
 
-void MoeHostExpertCache::promote(mfq::MoeCacheKey key) {
+void MoeHostExpertCache::promote(mfq::engine::MoeCacheKey key) {
     auto& state=*impl_;
     std::lock_guard lock(state.mutex);
     const auto found=state.entries.find(key);
@@ -202,7 +202,7 @@ void MoeHostExpertCache::promote(mfq::MoeCacheKey key) {
     if (flight!=state.flights.end()) flight->second->retain=false;
 }
 
-void MoeHostExpertCache::erase(mfq::MoeCacheKey key) {
+void MoeHostExpertCache::erase(mfq::engine::MoeCacheKey key) {
     auto& state=*impl_;
     std::lock_guard lock(state.mutex);
     const auto found=state.entries.find(key);
@@ -211,11 +211,11 @@ void MoeHostExpertCache::erase(mfq::MoeCacheKey key) {
     if (flight!=state.flights.end()) flight->second->retain=false;
 }
 
-bool MoeHostExpertCache::contains(mfq::MoeCacheKey key) const {
+bool MoeHostExpertCache::contains(mfq::engine::MoeCacheKey key) const {
     std::lock_guard lock(impl_->mutex);
     return impl_->entries.contains(key);
 }
-bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
+bool MoeHostExpertCache::exchange(mfq::engine::MoeCacheKey incoming,mfq::engine::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy) {
     if(!expected || !copy || incoming==outgoing)return false;
     auto& state=*impl_;std::lock_guard lock(state.mutex);
@@ -239,8 +239,8 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
         const std::function<void()>& publish,const std::function<void()>& prepare) {
     if(changes.empty())return false;
     auto& state=*impl_;std::lock_guard lock(state.mutex);
-    std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> keys;
-    struct Prepared {std::shared_ptr<MoeHostExpert> value;std::list<mfq::MoeCacheKey>::iterator position;};
+    std::unordered_set<mfq::engine::MoeCacheKey,mfq::engine::MoeCacheKeyHash> keys;
+    struct Prepared {std::shared_ptr<MoeHostExpert> value;std::list<mfq::engine::MoeCacheKey>::iterator position;};
     std::vector<Prepared> prepared;prepared.reserve(changes.size());
     for(const auto& change:changes) {
         if(!change.expected || !*change.expected || !change.copy || !change.restore ||

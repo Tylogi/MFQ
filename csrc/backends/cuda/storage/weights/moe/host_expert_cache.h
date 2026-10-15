@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/moe/moe.h"
-#include "mfq/moe/cache_policy.h"
+#include "slots.h"
 
 #include <functional>
 #include <memory>
@@ -37,19 +37,19 @@ public:
     ~MoeHostExpertCache();
     MoeHostExpertCache(const MoeHostExpertCache&)=delete;
     MoeHostExpertCache& operator=(const MoeHostExpertCache&)=delete;
-    Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true);
+    Lease acquire(mfq::engine::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true);
     // Returns false without invoking copy when the managed budget cannot fit.
-    bool demote(mfq::MoeCacheKey key,std::size_t bytes,const Load& copy);
-    void promote(mfq::MoeCacheKey key);
-    void erase(mfq::MoeCacheKey key);
-    bool contains(mfq::MoeCacheKey key) const;
+    bool demote(mfq::engine::MoeCacheKey key,std::size_t bytes,const Load& copy);
+    void promote(mfq::engine::MoeCacheKey key);
+    void erase(mfq::engine::MoeCacheKey key);
+    bool contains(mfq::engine::MoeCacheKey key) const;
     MoeHostExpertCacheStats stats() const;
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
-    bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
+    bool exchange(mfq::engine::MoeCacheKey incoming,mfq::engine::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy);
     struct Exchange {
-        mfq::MoeCacheKey incoming, outgoing;
+        mfq::engine::MoeCacheKey incoming, outgoing;
         const Lease* expected = nullptr;
         std::function<MixedMoePool(const MixedMoePool&)> copy;
         std::function<void(const MixedMoePool&)> restore;

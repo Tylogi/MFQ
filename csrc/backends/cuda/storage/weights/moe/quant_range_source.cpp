@@ -104,7 +104,7 @@ void MoeQuantRangeSource::bind_host_cache(std::shared_ptr<MoeHostExpertCache> ca
     source_id_=source_id;
 }
 
-mfq::MoeCacheKey MoeQuantRangeSource::host_key(int expert) const {
+mfq::engine::MoeCacheKey MoeQuantRangeSource::host_key(int expert) const {
     return {source_id_,store_->expert_pool(expert),expert};
 }
 

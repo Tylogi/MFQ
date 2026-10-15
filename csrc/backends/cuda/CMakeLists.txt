@@ -386,7 +386,7 @@ set(MFQ_CUDA_LOADING_SOURCES
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
-target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT})
+target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_ENGINE_PRIVATE_DIRS})
 target_link_libraries(mfq-cuda-loading PRIVATE mfq-models)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

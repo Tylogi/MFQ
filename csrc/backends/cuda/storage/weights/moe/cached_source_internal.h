@@ -8,7 +8,7 @@
 #include "ops/moe/moe.h"
 #include "storage/weights/mfe_expert_store.h"
 #include "quant_range_source.h"
-#include "mfq/moe/cache_policy.h"
+#include "slots.h"
 #include "kernels/moe/cache_transfer.h"
 #include <algorithm>
 #include <condition_variable>
@@ -48,8 +48,8 @@ struct MoeCacheTransfer {
 };
 
 struct MoeCacheNewLease {
-    mfq::MoeCacheSlotBook * book = nullptr;
-    mfq::MoeCacheKey key;
+    mfq::engine::MoeCacheSlotBook * book = nullptr;
+    mfq::engine::MoeCacheKey key;
     int slot = -1;
     uint64_t generation = 0;
 };
@@ -284,7 +284,7 @@ struct MoeGpuArena {
     int slots = 0;
     std::vector<MoeCacheFieldLayout> layouts;
     std::vector<mfq_tensor_backend::Tensor> fields;
-    std::unique_ptr<mfq::MoeCacheSlotBook> book;
+    std::unique_ptr<mfq::engine::MoeCacheSlotBook> book;
 };
 
 struct MoePinnedStage {
@@ -297,7 +297,7 @@ struct MoePinnedStage {
 struct MoePendingRangeRead {
     mfq_tensor_backend::Tensor host;
     std::vector<MoeCacheTransfer> transfers;
-    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    std::vector<std::pair<mfq::engine::MoeCacheSlotBook *, int>> held_slots;
     std::vector<MoeCacheNewLease> new_leases;
     mfq::cuda::MfeMxfp4ReadTicket ticket;
     bool replaced_occupied = false;
@@ -1144,7 +1144,7 @@ private:
     mfq_tensor_backend::Tensor pipeline_wire_gpu_;
     std::array<std::unique_ptr<mfq::cuda::DmaCopyBatch>,2> pipeline_dma_batches_;
     mfq_tensor_backend::Tensor pipeline_prefetch_wire_gpu_,pipeline_prefetch_host_stage_;
-    std::vector<mfq::MoeCacheKey> pipeline_prefetched_keys_;
+    std::vector<mfq::engine::MoeCacheKey> pipeline_prefetched_keys_;
     mfq_tensor_backend::Tensor pipeline_sigmoid_table_;
     int64_t pipeline_wire_route_bytes_=0,pipeline_wire_route_fields_=0;
     std::shared_ptr<mfq_tensor_backend::Tensor> pipeline_ram_complement_;
@@ -1168,13 +1168,13 @@ private:
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<std::pair<mfq::engine::MoeCacheSlotBook *, int>> * held_slots,
         std::vector<MoeCacheNewLease> * new_leases);
 
     void rollback_preparation(
         const std::vector<MoeCacheNewLease> & new_leases,
         const std::vector<
-            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept;
+            std::pair<mfq::engine::MoeCacheSlotBook *, int>> & held_slots) noexcept;
 
     bool begin_deferred_range_read(
         MoeCachedSource & source,
@@ -1499,7 +1499,7 @@ private:
         }
     }
 
-    void invalidate(const mfq::MoeCacheKey & key, int slot,bool retain_cold=true);
+    void invalidate(const mfq::engine::MoeCacheKey & key, int slot,bool retain_cold=true);
     void publish_quant_promotions(const std::vector<MoeCacheNewLease>& leases);
 
     int64_t budget_bytes_ = 0;

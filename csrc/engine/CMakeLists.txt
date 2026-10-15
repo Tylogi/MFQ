@@ -1,4 +1,5 @@
 add_library(mfq-engine STATIC
+    weights/slots.cpp
     src/settings.cpp
     src/policy.cpp
     src/mtp_metrics.cpp

@@ -83,7 +83,7 @@ void MoeExpertCache::finalize() {
             <<" workspace_reserve_bytes="<<reserve<<" requested_expert_bytes="<<requested
             <<" expert_budget_bytes="<<budget_bytes_<<std::endl;
     }
-    std::vector<mfq::MoeArenaDemand> demands;
+    std::vector<mfq::engine::MoeArenaDemand> demands;
     demands.reserve(arenas_.size());
     for (const auto & item : arenas_) {
         const auto & arena = *item.second;
@@ -282,7 +282,7 @@ void MoeExpertCache::finalize() {
         }
     }
     const auto plan =
-        mfq::plan_moe_arena_slots(budget_bytes_, demands);
+        mfq::engine::plan_moe_arena_slots(budget_bytes_, demands);
     for (auto & item : arenas_) {
         auto & arena = *item.second;
         arena.slots = plan.at(arena.signature);
@@ -304,7 +304,7 @@ void MoeExpertCache::finalize() {
                     .dtype(layout.scalar_type)));
         }
         arena.book =
-            std::make_unique<mfq::MoeCacheSlotBook>(
+            std::make_unique<mfq::engine::MoeCacheSlotBook>(
                 arena.slots);
         allocated_bytes_ +=
             static_cast<int64_t>(arena.slots) *
@@ -681,7 +681,7 @@ void MoeExpertCache::prewarm() {
 }
 
 void MoeExpertCache::invalidate(
-        const mfq::MoeCacheKey & key,
+        const mfq::engine::MoeCacheKey & key,
         int slot,bool retain_cold) {
     if (key.source < 0 ||
         key.source >= static_cast<int>(sources_.size())) {
@@ -738,7 +738,7 @@ void MoeExpertCache::append_source_transfers(
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<std::pair<mfq::engine::MoeCacheSlotBook *, int>> * held_slots,
         std::vector<MoeCacheNewLease> * new_leases) {
     for (int expert : experts) {
         const int cohort_index =
@@ -751,7 +751,7 @@ void MoeExpertCache::append_source_transfers(
             source.cohorts_.at(
                 static_cast<size_t>(cohort_index));
         auto & arena = *cohort.arena;
-        const mfq::MoeCacheKey key{
+        const mfq::engine::MoeCacheKey key{
             source.id_, cohort_index, expert};
         auto lease = arena.book->acquire(key);
         if (held_slots != nullptr &&
@@ -873,7 +873,7 @@ void MoeExpertCache::append_source_transfers(
 void MoeExpertCache::rollback_preparation(
         const std::vector<MoeCacheNewLease> & new_leases,
         const std::vector<
-            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept {
+            std::pair<mfq::engine::MoeCacheSlotBook *, int>> & held_slots) noexcept {
     (void)cudaStreamSynchronize(weight_stream_);
     for (auto lease = new_leases.rbegin();
          lease != new_leases.rend();
@@ -904,7 +904,7 @@ bool MoeExpertCache::begin_deferred_range_read(
 
     std::unordered_map<
         MoeGpuArena *,
-        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        std::unordered_set<mfq::engine::MoeCacheKey, mfq::engine::MoeCacheKeyHash>>
         arena_demands;
     for (int expert : experts) {
         if (expert < 0 || expert >= source.n_experts()) return false;
@@ -1051,7 +1051,7 @@ bool MoeExpertCache::prepare(
 
     std::unordered_map<
         MoeGpuArena *,
-        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        std::unordered_set<mfq::engine::MoeCacheKey, mfq::engine::MoeCacheKeyHash>>
         arena_demands;
     for (int expert : experts) {
         if (expert < 0 || expert >= source.n_experts()) return false;
@@ -1069,7 +1069,7 @@ bool MoeExpertCache::prepare(
         }
     }
 
-    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    std::vector<std::pair<mfq::engine::MoeCacheSlotBook *, int>> held_slots;
     for (const auto & item : arena_demands) {
         auto * book = item.first->book.get();
         for (const auto & key : item.second) {
@@ -1118,7 +1118,7 @@ bool MoeExpertCache::prepare_bundle(
 
     std::unordered_map<
         MoeGpuArena *,
-        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        std::unordered_set<mfq::engine::MoeCacheKey, mfq::engine::MoeCacheKeyHash>>
         arena_demands;
     for (auto * source : sources) {
         if (source == nullptr || source->cache_ != this) return false;
@@ -1139,7 +1139,7 @@ bool MoeExpertCache::prepare_bundle(
         }
     }
 
-    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    std::vector<std::pair<mfq::engine::MoeCacheSlotBook *, int>> held_slots;
     for (const auto & item : arena_demands) {
         auto * book = item.first->book.get();
         for (const auto & key : item.second) {
@@ -1392,7 +1392,7 @@ void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cach
     cache->pipeline_transfer_slots_.clear();
     cache->pipeline_prefetched_keys_.clear();
     for(auto& [key,arena]:cache->pipeline_stages_)
-        if(arena->book)arena->book=std::make_unique<mfq::MoeCacheSlotBook>(arena->slots);
+        if(arena->book)arena->book=std::make_unique<mfq::engine::MoeCacheSlotBook>(arena->slots);
     if(cache->pipeline_wire_gpu_.defined()) {
         MFQ_CUDA_CHECK(cudaMemsetAsync(cache->pipeline_wire_gpu_.data_ptr(),0,32,cache->weight_stream_));
         MFQ_CUDA_CHECK(cudaStreamSynchronize(cache->weight_stream_));

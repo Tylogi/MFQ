@@ -18,7 +18,7 @@ MixedMoePool weight(std::size_t bytes,int marker) {
         tb::TensorOptions().dtype(tb::kUInt8));
     return result;
 }
-mfq::MoeCacheKey key(int expert,int source=0) { return {source,0,expert}; }
+mfq::engine::MoeCacheKey key(int expert,int source=0) { return {source,0,expert}; }
 void bytes_equal(MoeHostExpertCache::Lease value,int marker) {
     check(value && value->weights.nint.q_packed.numel()==value->bytes,"host lease shape mismatch");
     const auto* data=value->weights.nint.q_packed.data_ptr<std::uint8_t>();

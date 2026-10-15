@@ -36,7 +36,7 @@ std::vector<Routes> read_routes(const char* path) {
     return routes;
 }
 volatile std::uint64_t result_checksum=0;
-void consume(const std::vector<mfq::MoeResidencyRanker::Pair>& pairs) {
+void consume(const std::vector<mfq::engine::MoeResidencyRanker::Pair>& pairs) {
     std::uint64_t value=pairs.size();
     if(!pairs.empty())value+=pairs.front().incoming.expert+std::uint64_t(pairs.back().outgoing.bundle)*experts;
     result_checksum=result_checksum+value;
@@ -50,7 +50,7 @@ void benchmark(const std::vector<Routes>& routes,bool projections) {
     std::vector<ResidencyEntry> entries;
     for(int b=0;b<layers;++b)for(int e=0;e<experts;++e)for(int p=0;p<(projections?3:1);++p)
         entries.push_back({{b,e,projections?p:-1},std::size_t((p==2?8:0)+(e+b)%8)});
-    mfq::MoeResidencyRanker ranker(residency_layout(entries,16));
+    mfq::engine::MoeResidencyRanker ranker(residency_layout(entries,16));
     Snapshot current;current.heat.resize(layers*experts);current.resident.resize(layers*experts);
     for(int b=0;b<layers;++b)for(int e=0;e<experts;++e)for(int p=0;p<3;++p)
         current.resident[std::size_t(b)*experts+e][p]=((e*7+b*11+(projections?p*13:0))%100)<30;

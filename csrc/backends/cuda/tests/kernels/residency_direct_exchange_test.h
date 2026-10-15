@@ -46,7 +46,7 @@ struct MoeResidencyTestAccess {
         if(!arena) {
             arena=std::make_unique<MoeGpuArena>();arena->signature=key;
             arena->slot_bytes=cohort.arena->slot_bytes;arena->slots=1;arena->layouts=cohort.arena->layouts;
-            arena->book=std::make_unique<mfq::MoeCacheSlotBook>(1);
+            arena->book=std::make_unique<mfq::engine::MoeCacheSlotBook>(1);
         }
         const auto held=source.quant_source_->acquire_expert(expert);
         const auto fields=moe_cache_fields(held->weights);

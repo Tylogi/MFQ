@@ -1,4 +1,4 @@
-#include "mfq/moe/cache_policy.h"
+#include "slots.h"
 
 #include <algorithm>
 #include <iterator>
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace mfq {
+namespace mfq::engine {
 size_t MoeCacheKeyHash::operator()(const MoeCacheKey& key) const noexcept {
     size_t value = static_cast<uint32_t>(key.source);
     value = value * 1315423911u + static_cast<uint32_t>(key.cohort);
@@ -195,4 +195,4 @@ std::unordered_map<std::string, int> plan_moe_arena_slots(int64_t budget, const 
     }
     return result;
 }
-} // namespace mfq
+} // namespace mfq::engine

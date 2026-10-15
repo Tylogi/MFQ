@@ -5,7 +5,7 @@
 #include "storage/weights/moe/cached_source_internal.h"
 #include "mfq/moe/cpu_expert_pool.h"
 #include "mfq/io/host_memory_copy.h"
-#include "mfq/moe/residency_ranker.h"
+#include "ranker.h"
 #include <algorithm>
 #include <array>
 #include <exception>
@@ -66,7 +66,7 @@ struct MoeResidencyManager::Impl {
         int incoming_source=0,outgoing_source=0,cohort=0,incoming=0,outgoing=0,slot=-1;
         int incoming_bundle=0,incoming_projection=0;
         MoeHostExpertCache::Lease lease;
-        mfq::MoeCacheSlotBook::Replacement replacement;
+        mfq::engine::MoeCacheSlotBook::Replacement replacement;
         std::vector<int64_t> offsets;
         std::size_t touched_fields=0;
         std::size_t backed_fields=0;
@@ -111,7 +111,7 @@ struct MoeResidencyManager::Impl {
         return flag?flag[0]=='2':exchange_defaults;
     }();
     std::vector<std::vector<float>> observations;
-    std::unique_ptr<mfq::MoeResidencyRanker> ranking;
+    std::unique_ptr<mfq::engine::MoeResidencyRanker> ranking;
     struct TransferStage {std::string key;MoeGpuArena* arena=nullptr;};
     std::vector<std::vector<TransferStage>> transfer_stages;
     bool direct=false;
@@ -259,7 +259,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
                 stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr});
         }
     }
-    using Expert=mfq::MoeResidencyRanker::Expert;
+    using Expert=mfq::engine::MoeResidencyRanker::Expert;
     std::vector<std::vector<Expert>> layout;
     if(cache->config_.moe_residency_warm && cache->config_.moe_residency_projection_heat) {
         std::map<std::pair<MoeGpuArena*,int>,std::vector<Expert>> groups;
@@ -292,7 +292,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         }
         for(auto& item:groups)layout.push_back(std::move(item.second));
     }
-    s.ranking=std::make_unique<mfq::MoeResidencyRanker>(std::move(layout));
+    s.ranking=std::make_unique<mfq::engine::MoeResidencyRanker>(std::move(layout));
     if(s.cached_refill) {
         // Allocate before any consumer graph runs. Only descriptors are mapped;
         // weights stay in their original GPU fields. This avoids a per-round
@@ -418,7 +418,7 @@ void MoeResidencyManager::prepare() {
     auto& s=*impl_;auto& cache=*s.cache;
     const PhaseClock clock(s.prepare_ns,s.pending_tokens<=8?&s.decode_prepare_ns:nullptr);
     const MfqCudaGuard guard(cache.sources_.front()->cohorts_.front().active.expert_local.device());
-    using Expert=mfq::MoeResidencyRanker::Expert;
+    using Expert=mfq::engine::MoeResidencyRanker::Expert;
     if(cache.pipeline_transfer_cache_)for(auto& stages:s.transfer_stages)for(auto& stage:stages)
         if(!stage.arena) {
             const auto found=cache.pipeline_stages_.find(stage.key);

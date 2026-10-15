@@ -31,7 +31,7 @@ import tempfile
 
 CSRC = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "csrc"))
 ENGINE = os.path.join(CSRC, "engine")
-MODULES = ("requests", "batch", "state", "executor", "text", "src")
+MODULES = ("requests", "batch", "state", "weights", "executor", "text", "src")
 SOURCE_EXT = (".cpp", ".cu", ".c", ".h")
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 ALLOWED_CONSUMERS = ("engine", "backends", "tests")
@@ -45,6 +45,7 @@ FORBIDDEN = {
     "batch": ("executor/driver.h", "executor/flow.h"),
     "text": ("executor/driver.h", "executor/flow.h", "state/"),
     "state": ("executor/", "requests/", "text/", "src/"),
+    "weights": ("executor/", "requests/", "text/", "src/", "state/", "batch/"),
     "executor": ("src/",),
 }
 # Backend device code may use shared value/policy headers (sampling rules,
@@ -231,6 +232,10 @@ def fixtures():
             "engine/state/sessions.h": '#include "driver.h"\n',
             "engine/executor/driver.h": "struct D {};\n",
         }, "engine/state may not include executor/"),
+        ("weight residency rule may not depend on the Executor", {
+            "engine/weights/slots.h": '#include "driver.h"\n',
+            "engine/executor/driver.h": "struct D {};\n",
+        }, "engine/weights may not include executor/"),
         ("Planner may not depend on the Executor driver", {
             "engine/batch/plan.h": '#include "driver.h"\n',
             "engine/executor/driver.h": "struct D {};\n",
