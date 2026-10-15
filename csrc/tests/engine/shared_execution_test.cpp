@@ -142,6 +142,33 @@ void batch_test() {
     batch_execution_test<StoredBatchOps>();
 }
 
+// Batch selection is a pure function of batch state: the eligible set plus the
+// decode/prefill preference decide one physical step, and nothing else does.
+void batch_plan_test() {
+    BatchExecution<BatchOps> ops;
+    RequestExecutor executor(4);
+    executor.admit(batch_request("a", 5, 20), nullptr, batch_info(), ops);
+    executor.admit(batch_request("b"), nullptr, batch_info(), ops);
+    bool saw_decode = false, saw_prefill = false;
+    for (int i = 0; i < 60 && !executor.empty(); ++i) {
+        const auto prefer = ops.batch.plan_batch({"a", "b"}, true);
+        const auto defer = ops.batch.plan_batch({"a", "b"}, false);
+        // A step commits either the decode rows or one prefill chunk, never both.
+        assert(prefer.decode.empty() || !prefer.prefill);
+        assert(defer.decode.empty() || !defer.prefill);
+        // The two preferences only disagree when both kinds of work are pending.
+        assert(prefer.decode.empty() == defer.decode.empty() || (defer.prefill && !prefer.prefill));
+        saw_decode |= !prefer.decode.empty();
+        saw_prefill |= static_cast<bool>(defer.prefill);
+        // A row the scheduler excludes keeps its work but is not selected.
+        for (const auto& row : ops.batch.plan_batch({"b"}, true).decode) assert(row->id == "b");
+        const auto idle = ops.batch.plan_batch({}, true);
+        assert(idle.decode.empty() && !idle.prefill);
+        executor.step({"a", "b"}, ops);
+    }
+    assert(executor.empty() && saw_decode && saw_prefill);
+}
+
 void batch_failure_test() {
     enum Stage { prefill, decode };
     struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
@@ -1726,6 +1753,7 @@ int main() {
     inner_model_flow_test();
     predictor_flow_test();
     batch_test();
+    batch_plan_test();
     batch_failure_test();
     model_test();
 }

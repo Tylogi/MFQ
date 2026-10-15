@@ -124,41 +124,30 @@ template <class Execution> class ContinuousBatch {
     }
 
     void step(const std::vector<std::string>& eligible) {
-        std::vector<std::shared_ptr<Request>> decoding;
-        for (const auto& request : active) {
-            const auto& work = *requests.at(request->id);
-            if (work.decode && std::find(eligible.begin(), eligible.end(), request->id) != eligible.end())
-                decoding.push_back(request);
-        }
-        auto prefill = requests.end();
-        for (const auto& id : eligible) {
-            auto it = requests.find(id);
-            if (it != requests.end() && it->second->prefill) { prefill = it; break; }
-        }
+        const auto plan = plan_batch(eligible, decode_next);
         try {
-            if (!decoding.empty() && (prefill == requests.end() || decode_next)) {
-                auto decoded = execution.execute(DecodeWork<Request>{decoding});
+            if (!plan.decode.empty()) {
+                auto decoded = execution.execute(DecodeWork<Request>{plan.decode});
                 if (!decoded) return; // Preparation committed no row.
-                if (decoded->size() != decoding.size())
+                if (decoded->size() != plan.decode.size())
                     throw std::logic_error("batch decode result count disagrees with selected rows");
-                for (size_t row = 0; row < decoding.size(); ++row) {
-                    auto& request = decoding[row];
+                for (size_t row = 0; row < plan.decode.size(); ++row) {
+                    auto& request = plan.decode[row];
                     auto& work = *requests.at(request->id);
                     work.result = std::move((*decoded)[row]);
                     ++request->cache_length;
                     work.decode = false;
                 }
-            } else if (prefill != requests.end()) {
-                auto& work = *prefill->second;
-                auto& request = work.request;
-                const auto chunk = *work.prefill;
+            } else if (plan.prefill) {
+                auto& work = *requests.at(plan.prefill->id);
+                const auto chunk = plan.prefill_chunk;
                 PrefillActivity prefill_activity;
-                auto sample = execution.execute(PrefillWork<Request>{request, chunk});
-                request->prefill_offset = chunk.offset + chunk.count;
+                auto sample = execution.execute(PrefillWork<Request>{plan.prefill, chunk});
+                plan.prefill->prefill_offset = chunk.offset + chunk.count;
                 ++prefill_chunks;
-                if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
-                    request->cache_length = request->prompt.size();
-                    active.push_back(request);
+                if (plan.prefill->prefill_offset == static_cast<int64_t>(plan.prefill->prompt.size())) {
+                    plan.prefill->cache_length = plan.prefill->prompt.size();
+                    active.push_back(plan.prefill);
                     ++admissions;
                 } else ++prefill_yields;
                 work.result = std::move(sample);
@@ -169,6 +158,35 @@ template <class Execution> class ContinuousBatch {
             recover(std::current_exception());
             throw;
         }
+    }
+
+    // One physical decision per step: the whole decode batch, or one prefill
+    // chunk. Pure over current batch state - it reads activity, pending work
+    // and the scheduler's eligible set, and writes nothing. Budget and state
+    // readiness enter here as inputs, not as a second queue inside the
+    // execution implementation.
+    struct Plan {
+        std::vector<std::shared_ptr<Request>> decode;
+        std::shared_ptr<Request> prefill;
+        PrefillChunk prefill_chunk;
+    };
+    Plan plan_batch(const std::vector<std::string>& eligible, bool prefer_decode) const {
+        Plan plan;
+        for (const auto& request : active) {
+            const auto& work = *requests.at(request->id);
+            if (work.decode && std::find(eligible.begin(), eligible.end(), request->id) != eligible.end())
+                plan.decode.push_back(request);
+        }
+        for (const auto& id : eligible) {
+            const auto it = requests.find(id);
+            if (it == requests.end() || !it->second->prefill) continue;
+            plan.prefill = it->second->request;
+            plan.prefill_chunk = *it->second->prefill;
+            break;
+        }
+        if (plan.decode.empty() || (plan.prefill && !prefer_decode)) plan.decode.clear();
+        else plan.prefill.reset();
+        return plan;
     }
 
     Metrics metrics() const {
