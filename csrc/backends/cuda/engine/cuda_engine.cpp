@@ -8,7 +8,7 @@
 #include "models/qwen35/batch_state.h"
 #include "storage/loaders/weight.h"
 #include "storage/moe/expert_cache.h"
-#include "storage/kv/offload.h"
+#include "storage/state/offload.h"
 #include "ops/execution/execution_options.h"
 #include "storage/session/text_cache.h"
 #include "mtp_metrics.h"

@@ -2,7 +2,7 @@
 
 #include "block.h"
 #include "ffn.h"
-#include "storage/kv/cache.h"
+#include "storage/state/cache.h"
 
 #include <cstdint>
 #include <memory>

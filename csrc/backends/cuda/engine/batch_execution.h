@@ -5,7 +5,7 @@
 #include "kernels/sampling_ops.h"
 #include "ops/execution/cuda_execution.h"
 #include "models/common/full_block.h"
-#include "storage/kv/batch_paged.h"
+#include "storage/state/batch_paged.h"
 #include "continuous_batch.h"
 #include "decode_graph.h"
 #include "generation_step.h"

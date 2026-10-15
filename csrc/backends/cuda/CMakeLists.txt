@@ -333,7 +333,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
-    ${MFQ_CUDA_ROOT}/storage/kv/offload.cpp
+    ${MFQ_CUDA_ROOT}/storage/state/offload.cpp
     ${MFQ_CUDA_ROOT}/models/glm5_next/ops.cpp
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
@@ -403,7 +403,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/model_components.cpp
     ${MFQ_CUDA_ROOT}/engine/minicpmo_components.cpp
     ${MFQ_CUDA_ROOT}/engine/batch_execution.cpp
-    ${MFQ_CUDA_ROOT}/storage/kv/cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/state/cache.cpp
     ${MFQ_CUDA_ROOT}/storage/session/text_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
 )

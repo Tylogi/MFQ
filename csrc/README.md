@@ -95,7 +95,7 @@ with complete prefill/decode quanta and ordered token results. This includes
 sampling state, metadata, Graph planning/storage and execution metrics. Family
 native state stays in `models/<family>/`; scoped Qwen35 bindings own KV/recurrent
 packing and global cache-position restoration, not a shared StateAdapter protocol.
-Paged allocation, chunks and page tables live in `storage/kv/batch_paged.h`,
+Paged allocation, chunks and page tables live in `storage/state/batch_paged.h`,
 which accepts native geometry rather than a model. Model Ops associate native
 request/storage types; only Engine composition enables supported batch execution.
 Production batching is currently bound only to Qwen35. A synthetic dense CUDA
