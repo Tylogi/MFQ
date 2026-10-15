@@ -91,19 +91,20 @@ directory share a name prefix, the prefix becomes a subdirectory
 (`kernels/nvq/device.cuh`, not `kernels/nvq_device.cuh`).  The include rule is
 unchanged, the path is still rooted at the layer directory.
 
-`engine/<module>` (`requests`, `batch`, `state`, `executor`, `text`, `src`) is
-PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add those
-directories to their include path and include their headers bare. That is the
-only way a backend drives the shared generation loop, so it is allowed for
+`engine/<module>` (`requests`, `batch`, `state`, `weights`, `executor`, `text`,
+`src`) is PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add
+those directories to their include path and include their headers bare. That is
+the only way a backend drives the shared generation loop, so it is allowed for
 `backends/` and `tests/` and for nobody else: `core/`, `transport/`,
 `scheduler/`, `models/` and `components/` must not include an engine private
 header. `engine/` never includes a backend header, and inside `engine/` the
 request table, Planner, Store rules and text layer never reach the Executor
 driver. A backend's `ops/`, `kernels/` or `execution/` code never includes the
 shared Executor or Store headers; `storage/` may, because it is the physical
-StateStore. The engine header graph is a DAG and no private header is orphaned.
-`tests/test_engine_include_graph.py` checks all of this, and carries one small
-fixture per rule so a rule that stopped firing fails the test by itself.
+StateStore and WeightStore. The engine header graph is a DAG and no private
+header is orphaned. `tests/test_engine_include_graph.py` checks all of this, and
+carries one small fixture per rule so a rule that stopped firing fails the test
+by itself.
 `tests/test_engine_include_graph.py` enforces all four.
 
 There is no `runtime/` layer and no `Runtime` type. Composition and lifetime

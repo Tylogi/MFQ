@@ -80,6 +80,15 @@ BatchTokens sample_cuda_batch(mfq_tensor_backend::Tensor logits,
     mfq_tensor_backend::Tensor greedy_tokens, std::span<const BatchSamplingRow>,
     bool greedy, int64_t& readbacks);
 
+// The Engine composition root owns the physical batch state, so it needs the
+// storage type of a model that batches; a model that never batches has none.
+template <class Model, class = void> struct NoBatchStorage { using type = std::monostate; };
+template <class Model>
+struct NoBatchStorage<Model, std::void_t<typename Model::BatchStorage>> {
+    using type = typename Model::BatchStorage;
+};
+template <class Model> using batch_storage_t = typename NoBatchStorage<Model>::type;
+
 template <class Model> struct CudaBatchRequest : mfq::engine::BatchRequest {
     using BatchRequest::BatchRequest;
     std::optional<Sampler> sampler;
@@ -88,15 +97,16 @@ template <class Model> struct CudaBatchRequest : mfq::engine::BatchRequest {
     typename Model::BatchRequestState cache;
 };
 
-// Reusable CUDA numerical quanta. The model and its native state are bound at
-// Engine composition; neither the shared batch policy nor this module selects
-// a family. Other native executions can implement the quantum contract directly.
+// Reusable CUDA numerical quanta. The model and the physical batch state are
+// bound here at Engine composition; the Store owns that state and this module
+// borrows it. Neither the shared batch policy nor this module selects a family.
 template <class Model> class CudaBatchExecution {
   public:
     using Tensor = mfq_tensor_backend::Tensor;
     using Request = CudaBatchRequest<Model>;
     using Sample = mfq::engine::BatchSample;
-    CudaBatchExecution(Model&, CudaExecutionContext&, CudaContinuousBatchConfig);
+    CudaBatchExecution(Model&, CudaExecutionContext&, CudaContinuousBatchConfig,
+                       typename Model::BatchStorage&);
     CudaBatchExecution(const CudaBatchExecution&) = delete;
     CudaBatchExecution& operator=(const CudaBatchExecution&) = delete;
     mfq::engine::Metrics metrics() const;
@@ -111,7 +121,7 @@ template <class Model> class CudaBatchExecution {
     void invalidate_decode_graph();
 
     Model& model_;
-    typename Model::BatchStorage native_;
+    typename Model::BatchStorage& native_;
     CudaExecutionContext& execution_;
     const CudaContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
@@ -129,9 +139,9 @@ namespace mfq::cuda {
 
 template <class Model>
 CudaBatchExecution<Model>::CudaBatchExecution(
-        Model& model, CudaExecutionContext& execution, CudaContinuousBatchConfig config)
-    : model_(model), native_(model, config.max_sequences, config.paged_kv),
-      execution_(execution), config_(std::move(config)),
+        Model& model, CudaExecutionContext& execution, CudaContinuousBatchConfig config,
+        typename Model::BatchStorage& storage)
+    : model_(model), native_(storage), execution_(execution), config_(std::move(config)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(model.num_experts() > 0),
       cached_moe_enabled_(moe_enabled_ && bool(execution.stores.moe_expert_cache)),

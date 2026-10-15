@@ -157,12 +157,15 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             DecodeGraphCache& graph;
             TextSessionCache& cache;
             const CudaRuntimeConfig& config;
+            Qwen35CausalLm::BatchStorage storage;
             ContinuousBatch<CudaBatchExecution<Qwen35CausalLm>> batcher;
             Execution(Qwen35CausalLm& model, DecodeGraphCache& graph, TextSessionCache& cache,
                       const CudaRuntimeConfig& config)
                 : model(model), graph(graph), cache(cache), config(config),
+                  storage(model, config.continuous_batch.max_sequences,
+                          config.continuous_batch.paged_kv),
                   batcher(64, config.continuous_batch.prefill_token_budget,
-                          model, *model.execution, config.continuous_batch) {}
+                          model, *model.execution, config.continuous_batch, storage) {}
             bool can_overlap(const EngineRequest&) const { return true; }
             bool exclusive() const { return false; }
             bool mtp_available() const { return false; }

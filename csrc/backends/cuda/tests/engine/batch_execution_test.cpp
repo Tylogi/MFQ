@@ -87,9 +87,11 @@ static void check_dense_execution(bool graph) {
     CudaContinuousBatchConfig config;
     config.max_sequences = 4; config.cuda_graph = graph; config.cuda_graph_minimum_tokens = 2;
     struct Ops {
+        DenseModel::BatchStorage storage;
         ContinuousBatch<CudaBatchExecution<DenseModel>> batch;
         Ops(DenseModel& model, CudaExecutionContext& context, CudaContinuousBatchConfig config)
-            : batch(2, 2, model, context, config) {}
+            : storage(model, config.max_sequences, config.paged_kv),
+              batch(2, 2, model, context, config, storage) {}
         bool can_overlap(const EngineRequest&) const { return true; }
         bool exclusive() const { return false; }
         bool mtp_available() const { return false; }

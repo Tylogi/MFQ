@@ -58,6 +58,7 @@ struct CudaEngineState : CudaEngineOps {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
+    std::optional<batch_storage_t<Model>> storage;
     std::unique_ptr<Batch> batching;
     bool duplex_active = false, duplex_pending = false, duplex_stop = false;
     mfq::StepSequence<ControlCompletion> duplex_sequence;
@@ -161,10 +162,13 @@ struct CudaEngineState : CudaEngineOps {
             throw std::invalid_argument("continuous batching is unavailable for this model");
         prepare_memory(memory_limit);
         if constexpr (supports_batch) {
-            if (config.continuous_batch.max_sequences)
+            if (config.continuous_batch.max_sequences) {
+                storage.emplace(language, config.continuous_batch.max_sequences,
+                                config.continuous_batch.paged_kv);
                 batching = std::make_unique<Batch>(config.generation.prefill_chunk_size,
                     config.continuous_batch.prefill_token_budget, language, *execution,
-                    config.continuous_batch);
+                    config.continuous_batch, *storage);
+            }
         }
     }
     bool can_overlap(const EngineRequest&) const override {
