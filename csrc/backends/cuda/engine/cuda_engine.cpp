@@ -12,7 +12,7 @@
 #include "ops/execution/execution_options.h"
 #include "storage/session/text_cache.h"
 #include "mtp_metrics.h"
-#include "request_executor.h"
+#include "request_table.h"
 #include "generation_flow.h"
 #include "engine_instance.h"
 

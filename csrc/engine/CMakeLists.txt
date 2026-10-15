@@ -8,6 +8,8 @@ add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/internal
+        ${CMAKE_CURRENT_SOURCE_DIR}/request_table
+        ${CMAKE_CURRENT_SOURCE_DIR}/batch_planner
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
 target_link_libraries(mfq-engine PUBLIC mfq-core)
@@ -22,7 +24,7 @@ if(TARGET mfq-tokenizer)
     target_sources(mfq-engine PRIVATE
         src/inference.cpp
         src/media_input.cpp
-        src/request_executor.cpp
+        request_table/request_table.cpp
         src/token_constraint.cpp
         src/tokenizer.cpp
         src/text_processor.cpp

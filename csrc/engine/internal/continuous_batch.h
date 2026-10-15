@@ -1,4 +1,5 @@
 #pragma once
+#include "batch_plan.h"
 #include "generation_step.h"
 #include "prefill_activity.h"
 #include <memory>
@@ -160,33 +161,12 @@ template <class Execution> class ContinuousBatch {
         }
     }
 
-    // One physical decision per step: the whole decode batch, or one prefill
-    // chunk. Pure over current batch state - it reads activity, pending work
-    // and the scheduler's eligible set, and writes nothing. Budget and state
-    // readiness enter here as inputs, not as a second queue inside the
-    // execution implementation.
-    struct Plan {
-        std::vector<std::shared_ptr<Request>> decode;
-        std::shared_ptr<Request> prefill;
-        PrefillChunk prefill_chunk;
-    };
+    // One physical decision per step, made by the shared BatchPlanner over
+    // this batch's own facts; see batch_planner/batch_plan.h. step() above
+    // only executes the result.
+    using Plan = BatchPlan<Request>;
     Plan plan_batch(const std::vector<std::string>& eligible, bool prefer_decode) const {
-        Plan plan;
-        for (const auto& request : active) {
-            const auto& work = *requests.at(request->id);
-            if (work.decode && std::find(eligible.begin(), eligible.end(), request->id) != eligible.end())
-                plan.decode.push_back(request);
-        }
-        for (const auto& id : eligible) {
-            const auto it = requests.find(id);
-            if (it == requests.end() || !it->second->prefill) continue;
-            plan.prefill = it->second->request;
-            plan.prefill_chunk = *it->second->prefill;
-            break;
-        }
-        if (plan.decode.empty() || (plan.prefill && !prefer_decode)) plan.decode.clear();
-        else plan.prefill.reset();
-        return plan;
+        return mfq::engine::plan_batch(active, requests, eligible, prefer_decode);
     }
 
     Metrics metrics() const {

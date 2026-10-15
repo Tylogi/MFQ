@@ -1,5 +1,5 @@
 #include "engine/batch_execution.h"
-#include "request_executor.h"
+#include "request_table.h"
 #include "common/causal_metadata.h"
 #include "storage/state/batch_paged.h"
 

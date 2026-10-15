@@ -1,5 +1,5 @@
 #include "continuous_batch.h"
-#include "request_executor.h"
+#include "request_table.h"
 #include "generation_policy.h"
 #include "common/attention.h"
 #include "common/causal_forward.h"

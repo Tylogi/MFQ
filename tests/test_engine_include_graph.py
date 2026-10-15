@@ -8,7 +8,8 @@ shared generation loop, so the arrangement is allowed -- but only for them.
 
 Rules:
   1. engine/** never includes backends/** (the engine is backend agnostic).
-  2. engine/internal/*.h is included only from engine/, backends/ and tests/.
+  2. engine private module headers (internal/, request_table/, batch_planner/) are
+     included only from engine/, backends/ and tests/.
   3. The engine/internal header graph is a DAG.
   4. Every engine/internal/*.h has at least one includer.
 
@@ -22,6 +23,10 @@ import sys
 CSRC = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "csrc"))
 ENGINE = os.path.join(CSRC, "engine")
 INTERNAL = os.path.join(ENGINE, "internal")
+# Private engine module directories. Backends and tests add all of them to the
+# include path and include their headers bare, so they share one rule set.
+INTERNAL_DIRS = [os.path.join(ENGINE, d)
+                 for d in ("internal", "request_table", "batch_planner")]
 SOURCE_EXT = (".cpp", ".cu", ".c", ".h")
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 ALLOWED_CONSUMERS = ("engine", "backends", "tests")
@@ -49,7 +54,7 @@ def rel(path):
 def resolve(raw, including_file):
     """Resolve a quoted include the way the compiler does for these targets."""
     candidates = [os.path.join(os.path.dirname(including_file), raw)]
-    for base in (CSRC, ENGINE, INTERNAL, os.path.join(ENGINE, "include")):
+    for base in (CSRC, ENGINE, *INTERNAL_DIRS, os.path.join(ENGINE, "include")):
         candidates.append(os.path.join(base, raw))
     for c in candidates:
         c = os.path.normpath(c)
@@ -60,7 +65,7 @@ def resolve(raw, including_file):
 
 def collect():
     internal_headers = sorted(
-        os.path.join(INTERNAL, n) for n in os.listdir(INTERNAL) if n.endswith(".h"))
+        p for d in INTERNAL_DIRS for p in sources(d) if p.endswith(".h"))
     by_name = {os.path.basename(p): p for p in internal_headers}
     edges = collections.defaultdict(set)
     includers = collections.defaultdict(set)
@@ -78,8 +83,8 @@ def collect():
             consumer = rel(src).split(os.sep)[0]
             if consumer not in ALLOWED_CONSUMERS:
                 violations.append(
-                    (src, lineno, raw, f"{consumer}/ may not include engine/internal"))
-            if os.path.dirname(src) == INTERNAL and src != target:
+                    (src, lineno, raw, "engine private headers may not be included here"))
+            if os.path.dirname(src) in INTERNAL_DIRS and src != target:
                 edges[src].add(target)
     for src in sources(os.path.join(ENGINE)):
         for lineno, raw in includes(src):

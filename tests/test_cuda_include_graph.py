@@ -52,6 +52,8 @@ INCLUDE_ROOTS = [
     os.path.join(CSRC_ROOT, "core", "include"),
     os.path.join(CSRC_ROOT, "models"),
     os.path.join(CSRC_ROOT, "engine", "internal"),
+    os.path.join(CSRC_ROOT, "engine", "request_table"),
+    os.path.join(CSRC_ROOT, "engine", "batch_planner"),
 ]
 
 # Basenames of every header under the backend root.  An include of one of these
