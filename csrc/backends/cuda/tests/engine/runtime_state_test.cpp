@@ -548,8 +548,8 @@ static void check_resource_plans() {
     auto offloaded = std::make_unique<FullBlock>();
     offloaded->cpu_offloaded = true;
     model.blocks.push_back(std::move(offloaded));
-    const auto serial = model.adapter_resource_plan(model.blocks, false, 2, nullptr);
-    const auto batch = model.adapter_resource_plan(model.blocks, true, 2, nullptr);
+    const auto serial = model.resource_plan(model.blocks, false, 2, nullptr);
+    const auto batch = model.resource_plan(model.blocks, true, 2, nullptr);
     check(serial.request_bytes == std::vector<std::size_t>{1024, 212680} &&
           serial.snapshot_bytes == 212680 / 3, "serial family resource plan changed");
     check(batch.request_bytes == std::vector<std::size_t>{1024, 305760} &&
@@ -558,7 +558,7 @@ static void check_resource_plans() {
     auto draft = std::make_unique<FullBlock>();
     draft->cuda_device = 1; draft->kv_heads = 2; draft->attention_head_dim = 8;
     predictor.blocks.push_back(std::move(draft));
-    const auto speculative = model.adapter_resource_plan(model.blocks, false, 2, &predictor);
+    const auto speculative = model.resource_plan(model.blocks, false, 2, &predictor);
     check(speculative.request_bytes[1] == serial.request_bytes[1] + 208896 &&
           speculative.snapshot_bytes == serial.snapshot_bytes, "predictor plan lost its state budget");
     CudaResourcePlan overflow(1);

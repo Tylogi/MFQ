@@ -820,10 +820,10 @@ struct DeepseekV4Model : CausalResources {
     deepseek_v4::OutputHeadWeights output_head;
     std::unordered_map<int, std::shared_ptr<Dsv4SharedState>> block_states;
 
-    void adapter_validate_load_options() const;
-    void adapter_load_final_state(const mfq::ModelSource &source,
+    void validate_load_options() const;
+    void load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,

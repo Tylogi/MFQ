@@ -32,7 +32,7 @@ auto projected_predictor(State &state, int64_t batch, int64_t tokens, int64_t de
                          Hidden hidden, Fuse fuse, Layer layer, Output output,
                          SavePositions save_positions) {
     const auto cursor =
-        begin_predictor(state, batch, tokens, depth, state.config.maximum, cache, reset);
+        begin_predictor(state, batch, tokens, depth, state.config.max_position_embeddings, cache, reset);
     auto embeds = embed();
     auto pos = positions(cursor);
     auto e = embedding(std::move(embeds), pos);

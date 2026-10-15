@@ -66,51 +66,51 @@ struct CausalResources {
     // Which declared graph components this family has CUDA adapters for.
     static CudaModelPlan plan_components(const mfq::ModelGraph&) { return {}; }
 
-    CudaResourcePlan adapter_resource_plan(const std::vector<std::unique_ptr<Block>>&,
+    CudaResourcePlan resource_plan(const std::vector<std::unique_ptr<Block>>&,
         bool batch, std::size_t devices, const MtpModule*) const;
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
-    adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
+    captured_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
-    void adapter_validate_load_options() const;
-    void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
-    void adapter_load_final_state(const mfq::ModelSource &source,
+    void validate_load_options() const;
+    void configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
+    void load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
-    void adapter_prepare_blocks(const mfq::ModelSource &source);
+    void prepare_blocks(const mfq::ModelSource &source);
 
-    mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
-    void adapter_reset(int64_t batch);
-    bool adapter_requires_batch_reset(int64_t batch) const noexcept;
+    mfq_tensor_backend::Tensor post_embed(mfq_tensor_backend::Tensor output) const;
+    void reset_native(int64_t batch);
+    bool requires_batch_reset(int64_t batch) const noexcept;
 
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
+    mfq_tensor_backend::Tensor prepare_hidden(mfq_tensor_backend::Tensor hidden,
                                                       int64_t batch, int64_t tokens) const;
-    void adapter_begin_forward(bool capture_raw_hidden);
+    void begin_forward(bool capture_raw_hidden);
 
     mfq_tensor_backend::Tensor
-    adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
+    block_positions(const mfq_tensor_backend::Tensor &full_positions,
                             const mfq_tensor_backend::Tensor &local_positions, int device) const;
 
-    void adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
+    void finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
                                 int64_t tokens);
 
     mfq_tensor_backend::Tensor
-    adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+    finalize_hidden(mfq_tensor_backend::Tensor hidden,
                             const mfq_tensor_backend::Tensor &output_norm, int64_t batch,
                             int64_t tokens) const;
     mfq_tensor_backend::Tensor
-    adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+    extract_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
                        const mfq_tensor_backend::Tensor &finalized) const;
-    mfq_tensor_backend::Tensor adapter_logits(const QuantLinear &lm_head,
+    mfq_tensor_backend::Tensor logits_from_head(const QuantLinear &lm_head,
                                               mfq_tensor_backend::Tensor hidden) const;
-    mfq_tensor_backend::Tensor adapter_last_logits(const QuantLinear &lm_head,
+    mfq_tensor_backend::Tensor last_logits_from_head(const QuantLinear &lm_head,
                                                    mfq_tensor_backend::Tensor hidden) const;
-    mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
+    mfq_tensor_backend::Tensor next_token_from_head(const QuantLinear &lm_head,
                                                   mfq_tensor_backend::Tensor hidden) const;
 
-    void adapter_begin_speculative();
-    void adapter_commit_speculative();
-    void adapter_rollback_speculative(int64_t keep);
+    void native_begin_speculation();
+    void native_commit_speculation();
+    void native_rollback_speculation(int64_t keep);
 };
 
 struct Qwen35Model;
@@ -171,7 +171,7 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
     std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
-        return static_cast<Model&>(model).adapter_graph_logits(model,std::move(ids),kind);
+        return static_cast<Model&>(model).captured_logits(model,std::move(ids),kind);
     }
 
     auto execution_scope() const {
@@ -198,7 +198,7 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
     }
     Tensor embed_tokens(Tensor ids) const {
         return this->execution->profiler.measure(
-            "model.embed", [&] { return this->adapter_embed(quant_embedding_lookup(embed, ids)); });
+            "model.embed", [&] { return this->post_embed(quant_embedding_lookup(embed, ids)); });
     }
     Tensor sequence_lengths(int64_t batch, int64_t end) const {
         auto scope = execution_scope();
@@ -276,7 +276,7 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
                         effective_attention_mask.value().to(mfq_tensor_backend::kCPU).contiguous();
                 }
             }
-            return model.adapter_prepare_hidden(
+            return model.prepare_hidden(
                 tensor_to_cuda_device(model.execution->model_parallel_collectives, input_embeddings,
                                       primary)
                     .contiguous(),
@@ -297,7 +297,7 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
             MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
             // Grid-MRoPE semantic coordinates never double as physical KV
             // slots, during either prepared prefill or delta-adjusted decode.
-            if (model.adapter_pass_cache_positions(model.rope.sections.numel() > 0,
+            if (model.passes_cache_positions(model.rope.sections.numel() > 0,
                                                    cache_positions_override.has_value())) {
                 local_cache_positions =
                     b->cpu_offloaded
@@ -336,14 +336,14 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
             context.host_token_ids=cpu_ids;
             context.positions = local_pos;
             context.full_positions =
-                model.adapter_block_positions(full_positions, local_pos, b->cuda_device);
+                model.block_positions(full_positions, local_pos, b->cuda_device);
             context.cache_position = model.cache_pos;
             context.confirmed_prefix = confirmed_prefix;
             context.planned_kv_length = plan.kv_length;
             context.decode_attention_parts = plan.attention_parts;
             context.sequence_lengths = local_seq_len;
             context.cache_positions = local_cache_positions;
-            if (model.adapter_pass_attention_mask()) {
+            if (model.passes_attention_mask()) {
                 context.attention_mask = local_attention_mask;
             }
             x = b->forward_context(*model.execution, std::move(x), context, active_rope);
@@ -358,9 +358,9 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
         }
         Tensor finish(Tensor x, int64_t B, int64_t T) {
             x = tensor_to_cuda_device(model.execution->model_parallel_collectives, x, primary);
-            auto finalized = model.finalize_hidden(x, B, T);
+            auto finalized = model.finalize_hidden(x, model.output_norm, B, T);
             if (raw_hidden)
-                *raw_hidden = model.adapter_raw_hidden(x, finalized);
+                *raw_hidden = model.extract_raw_hidden(x, finalized);
             return finalized;
         }
     };

@@ -20,7 +20,7 @@ void CudaResourcePlan::add(int device, std::initializer_list<std::size_t> factor
     total += bytes;
 }
 
-CudaResourcePlan CausalResources::adapter_resource_plan(
+CudaResourcePlan CausalResources::resource_plan(
         const std::vector<std::unique_ptr<Block>>& blocks, bool batch,
         std::size_t devices, const MtpModule* predictor) const {
     CudaResourcePlan plan(devices);

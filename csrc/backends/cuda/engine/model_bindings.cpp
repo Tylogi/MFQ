@@ -50,8 +50,8 @@ template <class Model> struct CudaWeightLoader {
         return model.execution->tensor_parallel.enabled() ? output(name) : embedding;
     }
     bool has_weight(const std::string& name) { return has_tensor(source, name); }
-    void final_state(mfq_tensor_backend::Tensor& norm) { model.adapter_load_final_state(source, norm); }
-    void prepare_blocks() { model.adapter_prepare_blocks(source); }
+    void final_state(mfq_tensor_backend::Tensor& norm) { model.load_final_state(source, norm); }
+    void prepare_blocks() { model.prepare_blocks(source); }
     auto block(int layer, const std::string& type) {
         auto& execution = *model.execution;
         const int device = execution.layer_placement.device_for_layer(layer);
@@ -60,7 +60,7 @@ template <class Model> struct CudaWeightLoader {
         execution.layer_placement.load_device = device;
         MfqCudaGuard guard(device);
         std::cerr << "loading layer " << layer << ' ' << type << ' ' << (offloaded ? "CPU" : "CUDA") << '\n';
-        auto block = model.adapter_load_block(source, layer, device, type);
+        auto block = model.load_block(source, layer, device, type);
         block->cuda_device = device;
         block->cpu_offloaded = offloaded;
         return block;
@@ -80,7 +80,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     model.graph = source.resolved_model_graph();
     model.plan = Model::plan_components(model.graph);
     model.load_definition(load_model_config_json(source, config_path), model.graph, source, context_size_override);
-    model.adapter_validate_load_options();
+    model.validate_load_options();
     if (execution.expert_parallel.enabled() && model.num_experts() <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
     execution.layer_placement.prepare(model.num_hidden_layers());
@@ -108,7 +108,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     if (Model::policy.common_rope) {
         const auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(model.max_position_embeddings(), model.rotary_dim(), model.rope_base(), 0, -1, device, model.metadata.rope_interleaved);
-            model.adapter_configure_rope(rope, device);
+            model.configure_rope(rope, device);
             return rope;
         };
         model.rope = make_rope(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, execution.layer_placement.primary_device()));

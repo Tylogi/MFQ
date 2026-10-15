@@ -1010,7 +1010,7 @@ int run_kl_eval_streamed(
     for (int begin = 0; begin < chunks; begin += chunk_batch) {
         const int count = std::min(chunk_batch, chunks - begin);
         auto x = hidden_cpu.narrow(0, begin, count).to(mfq_tensor_backend::kCUDA);
-        auto y = model.finalize_hidden(x, count, n_ctx);
+        auto y = model.finalize_hidden(x, model.output_norm, count, n_ctx);
         auto selected =
             y.index({Slice(), Slice(first, first + score_count), Slice()});
         auto logits = model.apply_final_logit_softcap(

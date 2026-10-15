@@ -19,21 +19,21 @@ std::unique_ptr<Block> minicpmo45::load_language_block(CudaExecutionContext& exe
 }
 
 
-std::unique_ptr<Block> MiniCPMO45Model::adapter_load_block(const mfq::ModelSource &source,
+std::unique_ptr<Block> MiniCPMO45Model::load_block(const mfq::ModelSource &source,
                                                            int layer, int,
                                                            const std::string &type) {
     return minicpmo45::load_language_block(*execution, source, config, layer, type,
         mfq::models::minicpmo45::LanguageComponent::text);
 }
 
-std::unique_ptr<Block> MiniCPMOTtsModel::adapter_load_block(const mfq::ModelSource &source,
+std::unique_ptr<Block> MiniCPMOTtsModel::load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {
     return minicpmo45::load_language_block(*execution, source, config, layer, type,
         mfq::models::minicpmo45::LanguageComponent::standalone_tts);
 }
 
-mfq_tensor_backend::Tensor MiniCPMO45Model::adapter_embed(mfq_tensor_backend::Tensor output) const {
+mfq_tensor_backend::Tensor MiniCPMO45Model::post_embed(mfq_tensor_backend::Tensor output) const {
     return output.to(mfq_tensor_backend::kBFloat16).contiguous();
 }
 
@@ -42,12 +42,12 @@ bool MiniCPMO45Model::mask_all_ones(const mfq_tensor_backend::Tensor &mask) cons
 }
 
 mfq_tensor_backend::Tensor
-MiniCPMO45Model::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t, int64_t) const {
+MiniCPMO45Model::prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t, int64_t) const {
     return hidden.to(mfq_tensor_backend::kBFloat16).contiguous();
 }
 
 mfq_tensor_backend::Tensor
-MiniCPMO45Model::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+MiniCPMO45Model::finalize_hidden(mfq_tensor_backend::Tensor hidden,
                                          const mfq_tensor_backend::Tensor &output_norm,
                                          int64_t batch, int64_t tokens) const {
     return execution->profiler.measure("model.output_norm", [&]() {
@@ -59,7 +59,7 @@ MiniCPMO45Model::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
 }
 
 mfq_tensor_backend::Tensor
-MiniCPMO45Model::adapter_logits(const QuantLinear &lm_head,
+MiniCPMO45Model::logits_from_head(const QuantLinear &lm_head,
                                 mfq_tensor_backend::Tensor hidden) const {
     return execution->profiler.measure("model.lm_head", [&]() {
         return lm_head.forward(*execution, hidden).to(mfq_tensor_backend::kBFloat16).contiguous();
@@ -67,15 +67,15 @@ MiniCPMO45Model::adapter_logits(const QuantLinear &lm_head,
 }
 
 mfq_tensor_backend::Tensor
-MiniCPMO45Model::adapter_last_logits(const QuantLinear &lm_head,
+MiniCPMO45Model::last_logits_from_head(const QuantLinear &lm_head,
                                      mfq_tensor_backend::Tensor hidden) const {
-    return adapter_logits(lm_head, hidden.to(mfq_tensor_backend::kBFloat16).contiguous());
+    return logits_from_head(lm_head, hidden.to(mfq_tensor_backend::kBFloat16).contiguous());
 }
 
 mfq_tensor_backend::Tensor
-MiniCPMO45Model::adapter_next_token(const QuantLinear &lm_head,
+MiniCPMO45Model::next_token_from_head(const QuantLinear &lm_head,
                                     mfq_tensor_backend::Tensor hidden) const {
-    return mfq_tensor_backend::argmax(adapter_last_logits(lm_head, std::move(hidden)), -1)
+    return mfq_tensor_backend::argmax(last_logits_from_head(lm_head, std::move(hidden)), -1)
         .to(mfq_tensor_backend::kInt64);
 }
 

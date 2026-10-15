@@ -305,7 +305,7 @@ void Qwen35Mtp::plan_resources(mfq::cuda::CudaResourcePlan& plan,
 
 namespace mfq::cuda {
 
-std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
+std::vector<const void*> Qwen35Model::batch_state_addresses(
         const std::vector<std::unique_ptr<Block>>& blocks) const {
     std::vector<const void*> addresses;
     for (const auto& block : blocks) {
@@ -330,19 +330,19 @@ std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
     return addresses;
 }
 
-void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
+void Qwen35Model::validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&
         plan_components(graph).vision != CudaVisionAdapter::grid_vit) {
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
     }
 }
 
-void Qwen35Model::adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const {
+void Qwen35Model::configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const {
     rope.configure_mrope(config.mrope_sections, config.mrope_interleaved, config.rotary_dim,
                          device);
 }
 
-std::unique_ptr<Block> Qwen35Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> Qwen35Model::load_block(const mfq::ModelSource &source, int layer,
                                                        int, const std::string &type) {
     return qwen35::load_block(*execution, source, config, layer, type);
 }
@@ -398,7 +398,7 @@ CudaSessionCodec<Qwen35Model>::restore_steps(Model &model,
   co_yield std::monostate{};
 }
 
-mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor output) const {
+mfq_tensor_backend::Tensor Qwen35Model::post_embed(mfq_tensor_backend::Tensor output) const {
     return output.to(mfq_tensor_backend::kFloat16).contiguous();
 }
 

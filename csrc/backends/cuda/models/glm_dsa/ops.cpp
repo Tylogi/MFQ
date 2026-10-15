@@ -25,7 +25,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext& execution, const mfq::
 } // namespace mfq::cuda::glm_dsa
 
 namespace mfq::cuda {
-void GlmDsaModel::adapter_validate_model_geometry() const {
+void GlmDsaModel::validate_model_geometry() const {
     if (config.q_lora_rank <= 0 || config.kv_lora_rank <= 0 || config.qk_nope_head_dim <= 0 ||
         config.qk_rope_head_dim <= 0 || config.v_head_dim <= 0 || config.index_head_dim <= 0 ||
         config.index_n_heads <= 0 || config.index_topk <= 0 || config.num_experts <= 0 ||
@@ -43,7 +43,7 @@ void GlmDsaModel::adapter_validate_model_geometry() const {
     }
 }
 
-std::unique_ptr<Block> GlmDsaModel::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> GlmDsaModel::load_block(const mfq::ModelSource &source, int layer,
                                                        int device, const std::string &type) {
     auto &state = block_states[device];
     if (!state)

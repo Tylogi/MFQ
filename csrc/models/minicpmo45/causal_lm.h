@@ -281,7 +281,6 @@ inline void set_standard_metadata(mfq::models::CausalLmMetadata &metadata,
     metadata.num_attention_heads = config.num_attention_heads;
     metadata.num_key_value_heads = config.num_key_value_heads;
     metadata.head_dim = config.head_dim;
-    metadata.max_position_embeddings = config.max_position_embeddings;
     metadata.rotary_dim = config.rotary_dim;
     metadata.rope_base = config.rope_base;
     metadata.rms_norm_eps = config.rms_norm_eps;
@@ -294,7 +293,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "minicpmo45"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
@@ -314,18 +313,15 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.rope_interleaved = true;
         metadata.decode_graph_double_warmup = true;
     }
-    void adapter_set_max_position_embeddings(int64_t value) {
-        this->config.max_position_embeddings = value;
-    }
-    std::optional<Tensor> adapter_attention_mask(std::optional<Tensor> mask, int64_t tokens,
+    std::optional<Tensor> attention_mask(std::optional<Tensor> mask, int64_t tokens,
                                                  int64_t cache_position) const {
         if (mask && (tokens == 1 || cache_position == 0) && this->mask_all_ones(*mask))
             return {};
         return mask;
     }
-    bool adapter_uses_decode_sequence_length() const noexcept { return false; }
-    bool adapter_pass_cache_positions(bool, bool) const noexcept { return true; }
-    bool adapter_pass_attention_mask() const noexcept { return true; }
+    bool uses_decode_sequence_length() const noexcept { return false; }
+    bool passes_cache_positions(bool, bool) const noexcept { return true; }
+    bool passes_attention_mask() const noexcept { return true; }
 };
 
 template <class Backend>
@@ -333,16 +329,13 @@ struct TtsCausalLm : models::CausalModelBase<Backend, TtsCausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "minicpmo_tts"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
         config = mfq::models::ModelConfig::from_json(payload);
         set_standard_metadata(metadata, config);
         metadata.norm_weight_offset = 1.0;
-    }
-    void adapter_set_max_position_embeddings(int64_t value) {
-        this->config.max_position_embeddings = value;
     }
 };
 

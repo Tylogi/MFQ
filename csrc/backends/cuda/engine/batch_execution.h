@@ -200,7 +200,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::PrefillWork<Request> work) {
     }
     auto timer = std::make_unique<internal::PrefillCudaTimer>();
     MfqOptional<Tensor> length = mfq_nullopt;
-    if (model_.adapter_uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
+    if (model_.uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
         length = mfq_tensor_backend::full({1}, chunk.offset + 1, request->prefill_ids.options());
     auto hidden = model_.hidden_forward(
         request->prefill_ids.narrow(1, chunk.offset, chunk.count).contiguous(), mfq_nullopt, length);
@@ -274,7 +274,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::DecodeWork<Request> work) {
     BatchDecodeGraph* decode_graph = nullptr;
     bool graph_cache_hit = false;
     if (batch_greedy && config_.greedy && batch_cuda_graph_enabled(execution_, config_, cached_moe_enabled_)) {
-        const auto addresses = model_.adapter_batch_state_addresses(model_.blocks);
+        const auto addresses = model_.batch_state_addresses(model_.blocks);
         const auto found = std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
             return graph->matches(batch, planned_len, addresses);
         });
@@ -321,7 +321,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::DecodeWork<Request> work) {
                     decode_graph->graph->capture_begin();
                     decode_graph->static_next = invoke();
                     decode_graph->graph->capture_end();
-                    decode_graph->set_key(batch, planned_len, model_.adapter_batch_state_addresses(model_.blocks));
+                    decode_graph->set_key(batch, planned_len, model_.batch_state_addresses(model_.blocks));
                     ++cuda_graph_captures_;
                     ++graph_bucket_counts_[{batch, planned_len}].first;
                 } catch (...) { decode_graph->invalidate(); throw; }

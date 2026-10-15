@@ -63,7 +63,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "deepseek_v4"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
@@ -76,7 +76,6 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.num_attention_heads = config.num_attention_heads;
         metadata.num_key_value_heads = config.num_key_value_heads;
         metadata.head_dim = config.head_dim;
-        metadata.max_position_embeddings = config.max_position_embeddings;
         metadata.rotary_dim = config.rotary_dim;
         metadata.num_experts = config.num_experts;
         metadata.hc_mult = config.hc_mult;
@@ -87,16 +86,13 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.model_type = config.model_type;
         metadata.layer_types = config.layer_types;
     }
-    Tensor adapter_finalize_hidden(Tensor hidden, const Tensor &output_norm, int64_t batch,
+    Tensor finalize_hidden(Tensor hidden, const Tensor &output_norm, int64_t batch,
                                    int64_t tokens) const {
         auto collapsed = this->collapse_hidden(std::move(hidden), batch, tokens);
         return this->normalize_hidden(std::move(collapsed), output_norm, batch, tokens);
     }
-    Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
+    Tensor prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
         return this->expand_hidden(std::move(hidden), batch, tokens, this->metadata.hc_mult);
-    }
-    void adapter_set_max_position_embeddings(int64_t value) {
-        this->config.max_position_embeddings = value;
     }
 };
 

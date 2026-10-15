@@ -157,7 +157,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         return backbone == "qwen3_5" || backbone == "generic_qwen";
     }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
@@ -169,7 +169,6 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.num_attention_heads = config.num_attention_heads;
         metadata.num_key_value_heads = config.num_key_value_heads;
         metadata.head_dim = config.head_dim;
-        metadata.max_position_embeddings = config.max_position_embeddings;
         metadata.rotary_dim = config.rotary_dim;
         metadata.num_experts = config.num_experts;
         metadata.rope_base = config.rope_base;
@@ -178,9 +177,9 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.tie_word_embeddings = config.tie_word_embeddings;
         metadata.model_type = config.model_type;
         metadata.layer_types = config.layer_types;
-        this->adapter_validate_components(graph);
+        this->validate_components(graph);
     }
-    void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
+    void validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
                                     bool has_mrope) const {
         const auto rank = Backend::rank(positions);
         require_model(this->config.valid_positions(rank, rank > 1 ? Backend::size(positions, 0) : 0,
@@ -189,10 +188,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
                       "position_ids must have shape [tokens], [batch,tokens], or configured "
                       "grid-MRoPE [3,tokens]");
     }
-    void adapter_set_max_position_embeddings(int64_t value) {
-        this->config.max_position_embeddings = value;
-    }
-    bool adapter_supports_speculation() const noexcept { return true; }
+    bool family_supports_speculation() const noexcept { return true; }
 };
 
 } // namespace mfq::models::qwen35

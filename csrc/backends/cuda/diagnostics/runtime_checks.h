@@ -223,7 +223,7 @@ static int run_prefill_sweep(
                     if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
                         execution.profiler.enabled=profile;
                         auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,m),chunk,true);
-                        logits=model.apply_final_logit_softcap(model.adapter_last_logits(
+                        logits=model.apply_final_logit_softcap(model.last_logits_from_head(
                             model.lm_head,model.last_hidden(std::move(hidden))));
                         mfq_cuda_synchronize();
                         if(profile) {
@@ -420,7 +420,7 @@ static int run_prefill_sweep(
                 if(tail_profile && std::atoi(tail_profile)!=0) {
                     model.reset(1);execution.profiler.reset();execution.profiler.enabled=true;
                     auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
-                    (void)model.apply_final_logit_softcap(model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))));
+                    (void)model.apply_final_logit_softcap(model.last_logits_from_head(model.lm_head,model.last_hidden(std::move(hidden))));
                     mfq_cuda_synchronize();
                     execution.profiler.report("prefill_optimized_tail_profile_m="+std::to_string(sizes.front()));
                     execution.profiler.enabled=false;
@@ -434,7 +434,7 @@ static int run_prefill_sweep(
                     mfq::cuda::env_set("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1");
                     model.reset(1);
                     auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
-                    auto result=model.apply_final_logit_softcap(model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))))
+                    auto result=model.apply_final_logit_softcap(model.last_logits_from_head(model.lm_head,model.last_hidden(std::move(hidden))))
                         .to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kFloat32).contiguous();
                     double error=0,scale=0;
                     for(int64_t i=0;i<result.numel();++i) {

@@ -276,17 +276,17 @@ mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor hidden,
 
 namespace mfq::cuda {
 
-void DeepseekV4Model::adapter_validate_load_options() const {
+void DeepseekV4Model::validate_load_options() const {
     deepseek_v4::validate_load_options(config, *execution);
 }
 
-void DeepseekV4Model::adapter_load_final_state(const mfq::ModelSource &source,
+void DeepseekV4Model::load_final_state(const mfq::ModelSource &source,
                                                mfq_tensor_backend::Tensor &output_norm) {
-    CausalResources::adapter_load_final_state(source, output_norm);
+    CausalResources::load_final_state(source, output_norm);
     output_head = deepseek_v4::load_output_head(*execution, source);
 }
 
-std::unique_ptr<Block> DeepseekV4Model::adapter_load_block(const mfq::ModelSource &source,
+std::unique_ptr<Block> DeepseekV4Model::load_block(const mfq::ModelSource &source,
                                                            int layer, int device,
                                                            const std::string &type) {
     auto &state = block_states[device];

@@ -90,7 +90,7 @@ template <typename Model> struct CudaGenerationOps {
             model.decode_position_delta = prepared->decode_position_delta;
         } else {
             MfqOptional<Tensor> length = mfq_nullopt;
-            if (model.adapter_uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
+            if (model.uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
                 length = mfq_tensor_backend::full({1}, chunk.offset + 1, full_ids.options());
             hidden = model.hidden_forward(ids, mfq_nullopt, length);
         }

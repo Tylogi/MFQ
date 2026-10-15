@@ -49,41 +49,41 @@ struct Qwen4Model : CausalResources {
     std::optional<bool> router_lookahead;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
-    adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
+    captured_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
         if (ids.dim()==2 && ids.size(0)==1 &&
             qwen4_layer_major_prefill_eligible(model,ids.size(1))) {
             auto hidden=qwen4_layer_major_prefill_hidden(model,std::move(ids),1024,kind!=0);
-            if(kind==2)return model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
+            if(kind==2)return model.next_token_from_head(model.lm_head,model.last_hidden(std::move(hidden)));
             if(kind==1)return model.apply_final_logit_softcap(
-                model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))));
+                model.last_logits_from_head(model.lm_head,model.last_hidden(std::move(hidden))));
             return model.logits_from_hidden(std::move(hidden));
         }
         return qwen4_decode_graph_logits(model,std::move(ids),kind);
     }
 
-    void adapter_validate_load_options() const;
-    void adapter_load_final_state(const mfq::ModelSource &source,
+    void validate_load_options() const;
+    void load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    void adapter_reset(int64_t batch);
-    void adapter_begin_forward(bool capture_raw_hidden);
+    void reset_native(int64_t batch);
+    void begin_forward(bool capture_raw_hidden);
 
     mfq_tensor_backend::Tensor
-    adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
+    block_positions(const mfq_tensor_backend::Tensor &full_positions,
                             const mfq_tensor_backend::Tensor &local_positions, int device) const;
-    void adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
+    void finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
                                 int64_t tokens);
     mfq_tensor_backend::Tensor
-    adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+    finalize_hidden(mfq_tensor_backend::Tensor hidden,
                             const mfq_tensor_backend::Tensor &output_norm, int64_t batch,
                             int64_t tokens) const;
-    mfq_tensor_backend::Tensor adapter_last_logits(const QuantLinear &lm_head,
+    mfq_tensor_backend::Tensor last_logits_from_head(const QuantLinear &lm_head,
                                                    mfq_tensor_backend::Tensor hidden) const;
-    mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
+    mfq_tensor_backend::Tensor next_token_from_head(const QuantLinear &lm_head,
                                                   mfq_tensor_backend::Tensor hidden) const;
-    void adapter_rollback_speculative(int64_t keep);
+    void native_rollback_speculation(int64_t keep);
 };
 
 extern template struct CudaSessionCodec<Qwen4Model>;

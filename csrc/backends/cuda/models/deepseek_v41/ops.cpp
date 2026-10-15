@@ -175,27 +175,27 @@ Tensor finalize_hidden(const std::shared_ptr<SharedState> &state, const Tensor &
 
 namespace mfq::cuda {
 
-void DeepseekV41Model::adapter_validate_load_options() const {
+void DeepseekV41Model::validate_load_options() const {
     deepseek_v41_runtime::validate_load_options(*execution);
 }
 
-void DeepseekV41Model::adapter_load_final_state(const mfq::ModelSource &source,
+void DeepseekV41Model::load_final_state(const mfq::ModelSource &source,
                                                 mfq_tensor_backend::Tensor &output_norm) {
-    CausalResources::adapter_load_final_state(source, output_norm);
+    CausalResources::load_final_state(source, output_norm);
 }
 
-void DeepseekV41Model::adapter_prepare_blocks(const mfq::ModelSource &source) {
+void DeepseekV41Model::prepare_blocks(const mfq::ModelSource &source) {
     shared = deepseek_v41_runtime::load_shared_state(source, config);
 }
 
-std::unique_ptr<Block> DeepseekV41Model::adapter_load_block(const mfq::ModelSource &source,
+std::unique_ptr<Block> DeepseekV41Model::load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {
     MFQ_RUNTIME_CHECK(type == "deepseek_v41" && shared, "invalid DeepSeek-V4.1 block loader state");
     return deepseek_v41_runtime::load_block(*execution, source, layer, shared);
 }
 
-void DeepseekV41Model::adapter_begin_forward(bool capture_raw_hidden) {
+void DeepseekV41Model::begin_forward(bool capture_raw_hidden) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 target capture state is unavailable");
     shared->begin_forward(capture_raw_hidden, shared->config.dspark_target_layer_ids.size());
 }
@@ -218,22 +218,22 @@ DeepseekV41Model::normalize_hidden(mfq_tensor_backend::Tensor hidden,
 }
 
 mfq_tensor_backend::Tensor
-DeepseekV41Model::adapter_raw_hidden(const mfq_tensor_backend::Tensor &,
+DeepseekV41Model::extract_raw_hidden(const mfq_tensor_backend::Tensor &,
                                      const mfq_tensor_backend::Tensor &) const {
     return shared->dspark_target_hidden();
 }
 
-void DeepseekV41Model::adapter_begin_speculative() {
+void DeepseekV41Model::native_begin_speculation() {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->begin_speculative();
 }
 
-void DeepseekV41Model::adapter_commit_speculative() {
+void DeepseekV41Model::native_commit_speculation() {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->commit_speculative();
 }
 
-void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
+void DeepseekV41Model::native_rollback_speculation(int64_t) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->rollback_speculative();
 }

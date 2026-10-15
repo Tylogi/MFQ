@@ -49,15 +49,15 @@ struct Qwen35Model : CausalResources {
     using BatchRequestState = qwen35::QwenBatchRequestState;
     using BatchStorage = qwen35::Qwen35BatchStorage;
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
-    std::vector<const void*> adapter_batch_state_addresses(const std::vector<std::unique_ptr<Block>>&) const;
+    std::vector<const void*> batch_state_addresses(const std::vector<std::unique_ptr<Block>>&) const;
     mfq::models::qwen35::Config config;
 
-    void adapter_validate_components(const mfq::ModelGraph &graph) const;
-    void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    void validate_components(const mfq::ModelGraph &graph) const;
+    void configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
+    mfq_tensor_backend::Tensor post_embed(mfq_tensor_backend::Tensor output) const;
 };
 
 template <> struct CudaSessionCodec<Qwen35Model> {

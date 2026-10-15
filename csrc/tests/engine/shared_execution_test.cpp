@@ -266,10 +266,10 @@ struct Model {
     std::vector<std::unique_ptr<Block>> blocks;
     bool supports_suffix_speculation() const { return true; }
     int max_position_embeddings() const { return 100; }
-    void adapter_begin_speculative() {}
-    void adapter_commit_speculative() {}
-    void adapter_rollback_speculative(int64_t) {}
-    void adapter_reset(int64_t) {}
+    void native_begin_speculation() {}
+    void native_commit_speculation() {}
+    void native_rollback_speculation(int64_t) {}
+    void reset_native(int64_t) {}
 };
 void model_test() {
     using namespace mfq::models;
@@ -608,29 +608,29 @@ struct CausalTestOps {
         t.value = -t.value;
         return t;
     }
-    static Tensor adapter_finalize_hidden(Tensor t, const Tensor &, int64_t, int64_t) {
+    static Tensor finalize_hidden(Tensor t, const Tensor &, int64_t, int64_t) {
         t.value += 3;
         return t;
     }
-    static Tensor adapter_logits(int, Tensor t) {
+    static Tensor logits_from_head(int, Tensor t) {
         t.value *= 5;
         return t;
     }
-    static Tensor adapter_last_logits(int, Tensor t) {
+    static Tensor last_logits_from_head(int, Tensor t) {
         t.value *= 7;
         return t;
     }
-    static Tensor adapter_next_token(int, Tensor t) {
+    static Tensor next_token_from_head(int, Tensor t) {
         t.value %= 11;
         return t;
     }
-    static void adapter_reset(int64_t) {}
-    static bool adapter_requires_batch_reset(int64_t) { return false; }
-    static void adapter_begin_forward(bool) {}
-    static void adapter_finish_forward(const Tensor &, int64_t, int64_t) {}
-    static void adapter_begin_speculative() {}
-    static void adapter_commit_speculative() {}
-    static void adapter_rollback_speculative(int64_t) {}
+    static void reset_native(int64_t) {}
+    static bool requires_batch_reset(int64_t) { return false; }
+    static void begin_forward(bool) {}
+    static void finish_forward(const Tensor &, int64_t, int64_t) {}
+    static void native_begin_speculation() {}
+    static void native_commit_speculation() {}
+    static void native_rollback_speculation(int64_t) {}
     template <class Model> static auto forward_ops(Model &model, typename Model::Inputs input) {
         struct Ops : Model::Inputs {
             Model &model;
@@ -668,7 +668,7 @@ struct CausalTestOps {
             Tensor finish(Tensor t, int64_t b, int64_t n) {
                 if (this->raw_hidden)
                     *this->raw_hidden = t;
-                return model.finalize_hidden(t, b, n);
+                return model.finalize_hidden(t, {}, b, n);
             }
         };
         return Ops(model, std::move(input));
@@ -678,8 +678,8 @@ struct CausalTestOps {
 void causal_lm_test() {
     using Tensor = CausalTestOps::Tensor;
     struct TestModel : mfq::models::CausalModelBase<CausalTestOps, TestModel> {
-        bool adapter_supports_speculation() const { return true; }
-        bool adapter_supports_suffix_speculation() const { return true; }
+        bool family_supports_speculation() const { return true; }
+        bool family_supports_suffix_speculation() const { return true; }
     } model;
     Tensor ids{{1, 2}, 2}, raw;
     std::vector<Tensor> trace;
@@ -762,7 +762,7 @@ void family_model_test() {
         }
         qwen4_exp::Config config{};
         int batch = 1;
-        static bool adapter_supports_speculation() { return false; }
+        static bool family_supports_speculation() { return false; }
     };
     qwen4_exp::CausalLm<QwenOps> qwen;
     // Dispatch must reach the family's rules, including from inherited entry points.
@@ -770,7 +770,7 @@ void family_model_test() {
     qwen.hidden_forward_inputs({{1, 2}, 2}, {{1, 2, 4}, 6}, CausalTestOps::Tensor{{2}, 10});
     assert(qwen.cache_pos == 2); // Qwen4 advances even with explicit semantic positions.
     qwen.positions = {{3, 2}, 0};
-    auto prepared = qwen.adapter_prepare_positions({{4, 1}, 9}, 1, 1);
+    auto prepared = qwen.prepare_positions({{4, 1}, 9}, 1, 1);
     assert(prepared.positions.shape == std::vector<int64_t>({3, 1}));
     assert(prepared.full_positions.shape == std::vector<int64_t>({3, 3}));
     glm5_next::CausalLm<FinalCausalTestOps> glm;
@@ -785,10 +785,10 @@ void family_model_test() {
     mini.next_token({{1}, 2});
     assert(!mini.seen_lengths); // Its BF16 attention uses a different decode contract.
     const CausalTestOps::Tensor ones{{1, 2}, 1}, masked{{1, 2}, 0};
-    assert(!mini.adapter_attention_mask(ones, 2, 0));
-    assert(!mini.adapter_attention_mask(ones, 1, 3));
-    assert(mini.adapter_attention_mask(ones, 2, 3));
-    assert(mini.adapter_attention_mask(masked, 2, 0));
+    assert(!mini.attention_mask(ones, 2, 0));
+    assert(!mini.attention_mask(ones, 1, 3));
+    assert(mini.attention_mask(ones, 2, 3));
+    assert(mini.attention_mask(masked, 2, 0));
 }
 
 void remaining_family_flows_test() {
@@ -988,11 +988,11 @@ void boundary_model_test() {
     assert(previous == 1); // Never commit pre-weights from a failed layer.
 
     glm5_next::CausalLm<FinalCausalTestOps> glm;
-    assert(glm.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+    assert(glm.finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
     deepseek_v4::CausalLm<FinalCausalTestOps> v4;
     deepseek_v41::CausalLm<FinalCausalTestOps> v41;
-    assert(v4.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
-    assert(v41.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+    assert(v4.finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+    assert(v41.finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
 
     for (bool parallel : {false, true}) {
         std::array<int, 2> calls{};
@@ -1109,9 +1109,9 @@ void token_generation_test() {
 
 struct LoadTestModel : mfq::models::CausalModelBase<CausalTestOps, LoadTestModel> {
     static bool accepts_backbone(std::string_view value) { return value == "fixture"; }
-    void adapter_set_max_position_embeddings(int64_t) {}
+    struct { int64_t max_position_embeddings = 32; } config;
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view, const Graph &, const Source &) {
+    void load_config(std::string_view, const Graph &, const Source &) {
         metadata.num_hidden_layers = 2;
         metadata.layer_types = {"first", "second"};
     }

@@ -290,7 +290,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 namespace mfq::cuda {
 
-std::unique_ptr<Block> Gemma4Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> Gemma4Model::load_block(const mfq::ModelSource &source, int layer,
                                                        int, const std::string &type) {
     return gemma4::load_block(*execution, source, config, layer, type);
 }

@@ -427,8 +427,8 @@ struct BlockLoader : weight_loader::Loader {
         weights.query=std::move(projections[0]);weights.key=std::move(projections[1]);
         weights.value=std::move(projections[2]);weights.index_query_key=std::move(projections[3]);
         QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
-                           c.pool, c.budget, c.maximum, c.eps};
-        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base, c.sections, c.interleaved);
+                           c.pool, c.budget, c.max_position_embeddings, c.eps};
+        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.max_position_embeddings, c.rope_base, c.sections, c.interleaved);
         return std::make_unique<Qsa>(std::move(weights), geometry, std::move(rotary), true, true, execution.qsa_kv_store);
     }
     auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
@@ -640,11 +640,11 @@ struct Qwen4MtpGraph {
         MFQ_RUNTIME_CHECK(!failed && stream.stream()==mfq_current_cuda_stream(),"MTP predictor graph is unavailable");
         auto& execution=*predictor.execution;auto& block=*predictor.layers[0];
         const int64_t tokens=ids.size(1),start=predictor.lengths[0],required=start+tokens;
-        MFQ_RUNTIME_CHECK(required<=predictor.config.maximum,"MTP predictor exceeds context capacity");
+        MFQ_RUNTIME_CHECK(required<=predictor.config.max_position_embeddings,"MTP predictor exceeds context capacity");
         if(required>capacity) {
             finish_moe_expert_exchanges(execution.moe_expert_cache);restore_legacy(predictor);
-            capacity=std::min<int64_t>(predictor.config.maximum,std::max<int64_t>(2048,capacity));
-            while(capacity<required)capacity=std::min(predictor.config.maximum,capacity*2);
+            capacity=std::min<int64_t>(predictor.config.max_position_embeddings,std::max<int64_t>(2048,capacity));
+            while(capacity<required)capacity=std::min(predictor.config.max_position_embeddings,capacity*2);
         }
         const auto key=std::make_pair(int(tokens),int(hidden.scalar_type()));
         auto& owner=cells[key];if(!owner)owner=std::make_unique<Cell>(hidden,ids,stream.stream());
@@ -953,7 +953,7 @@ struct Qwen4DecodeGraph {
                 };
                 cell.window.capture([&] {
                     cell.window.mark(-1,"window_begin");
-                    auto hidden=model.adapter_prepare_hidden(model.embed_tokens(cell.ids),1,tokens);
+                    auto hidden=model.prepare_hidden(model.embed_tokens(cell.ids),1,tokens);
                     std::size_t ple_index=0;int layer=0;
                     for(const auto& block:model.blocks) {
                         cell.window.mark(layer,"block_begin");
@@ -994,7 +994,7 @@ struct Qwen4DecodeGraph {
                         cell.window.mark(layer++,"block_end");
                     }
                     if(kind>=3)cell.raw_hidden=hidden.clone();
-                    hidden=model.adapter_finalize_hidden(std::move(hidden),model.output_norm,1,tokens);
+                    hidden=model.finalize_hidden(std::move(hidden),model.output_norm,1,tokens);
                     if(kind>=3) {
                         cell.output=std::move(hidden);
                         if(kind==4) {
@@ -1004,8 +1004,8 @@ struct Qwen4DecodeGraph {
                                 cudaMemcpyDeviceToHost,stream.stream()));
                         }
                     }
-                    else if(kind==2)cell.output=model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
-                    else if(kind==1)cell.output=model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden)));
+                    else if(kind==2)cell.output=model.next_token_from_head(model.lm_head,model.last_hidden(std::move(hidden)));
+                    else if(kind==1)cell.output=model.last_logits_from_head(model.lm_head,model.last_hidden(std::move(hidden)));
                     else cell.output=model.logits_from_hidden(std::move(hidden));
                     cell.window.mark(-1,"window_end");
                     auto audit=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks.front()).router_audit;
@@ -1141,11 +1141,11 @@ Qwen4Model::~Qwen4Model() = default;
 Qwen4Model::Qwen4Model(Qwen4Model&&) noexcept = default;
 Qwen4Model& Qwen4Model::operator=(Qwen4Model&&) noexcept = default;
 
-void Qwen4Model::adapter_validate_load_options() const {
+void Qwen4Model::validate_load_options() const {
     weight_loader::validate_load_options(*execution);
 }
 
-void Qwen4Model::adapter_load_final_state(const mfq::ModelSource &source,
+void Qwen4Model::load_final_state(const mfq::ModelSource &source,
                                           mfq_tensor_backend::Tensor &output_norm) {
     qwen4_exp::BlockLoader loader{{*execution, source, "qwen4_exp"}};
     final_mixer = loader.final_mixer(
@@ -1153,28 +1153,28 @@ void Qwen4Model::adapter_load_final_state(const mfq::ModelSource &source,
     output_norm = mfq_tensor_backend::Tensor();
 }
 
-std::unique_ptr<Block> Qwen4Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> Qwen4Model::load_block(const mfq::ModelSource &source, int layer,
                                                       int, const std::string &) {
     return std::make_unique<qwen4_exp::Qwen4Block>(*execution, source, config, layer);
 }
 
-void Qwen4Model::adapter_reset(int64_t new_batch) {
+void Qwen4Model::reset_native(int64_t new_batch) {
     if(execution && execution->moe_expert_cache)finish_moe_expert_exchanges(execution->moe_expert_cache);
     graph_registry.reset();
     positions = mfq_tensor_backend::Tensor();
     batch = new_batch;
 }
-void Qwen4Model::adapter_begin_forward(bool) {
+void Qwen4Model::begin_forward(bool) {
     if(graph_registry) {graph_registry->restore_legacy();graph_registry.reset();}
 }
 
 mfq_tensor_backend::Tensor
-Qwen4Model::adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
+Qwen4Model::block_positions(const mfq_tensor_backend::Tensor &full_positions,
                                     const mfq_tensor_backend::Tensor &, int device) const {
     return tensor_to_cuda_device(execution->model_parallel_collectives, full_positions, device);
 }
 
-void Qwen4Model::adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions,
+void Qwen4Model::finish_forward(const mfq_tensor_backend::Tensor &full_positions,
                                         int64_t new_batch, int64_t) {
     positions = full_positions;
     batch = new_batch;
@@ -1208,20 +1208,20 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     auto scope=model.execution_scope();
     ids=model.device_ids(std::move(ids));
     const auto tokens=ids.size(1);
-    model.adapter_validate_forward(1,tokens,0,false,false,false);
+    model.validate_forward(1,tokens,0,false,false,false);
     model.reset(1);
-    model.adapter_begin_forward(raw_hidden!=nullptr);
+    model.begin_forward(raw_hidden!=nullptr);
     auto current=tb::arange(tokens,ids.options());
     if(model.decode_position_delta)current=current+model.decode_position_delta;
-    auto prepared=model.adapter_prepare_positions(std::move(current),1,tokens);
-    model.adapter_validate_positions(prepared.positions,1,tokens,false);
+    auto prepared=model.prepare_positions(std::move(current),1,tokens);
+    model.validate_positions(prepared.positions,1,tokens,false);
     auto cpu_ids=ids.to(tb::kCPU,tb::kInt64).contiguous();
     Tensor hidden=tb::empty({1,tokens,model.hidden_size()*model.hc_mult()},
                            ids.options().dtype(tb::kFloat16));
     for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
         if(cancelled && cancelled())return {};
         const auto count=std::min(compute_chunk,tokens-begin);
-        auto input=model.adapter_prepare_hidden(model.embed_tokens(ids.narrow(1,begin,count)),1,count);
+        auto input=model.prepare_hidden(model.embed_tokens(ids.narrow(1,begin,count)),1,count);
         MFQ_RUNTIME_CHECK(input.scalar_type()==hidden.scalar_type() &&
             input.size(-1)==hidden.size(-1),"layer-major embedding geometry changed");
         hidden.narrow(1,begin,count).copy_(input);
@@ -1446,44 +1446,44 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         }
     }
     profiler.enabled=restore.enabled;
-    model.adapter_finish_forward(prepared.full_positions,1,tokens);
+    model.finish_forward(prepared.full_positions,1,tokens);
     model.cache_pos=tokens;
     if(raw_hidden)*raw_hidden=hidden;
     if(last_only) {
         // Use the same final GR dispatch and rounding as chunk-major prefill.
         const auto begin=((tokens-1)/compute_chunk)*compute_chunk;
-        auto finalized=model.finalize_hidden(hidden.narrow(1,begin,tokens-begin),1,tokens-begin);
+        auto finalized=model.finalize_hidden(hidden.narrow(1,begin,tokens-begin),model.output_norm,1,tokens-begin);
         return model.last_hidden(std::move(finalized)).unsqueeze(1);
     }
     Tensor finalized;
     for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
         const auto count=std::min(compute_chunk,tokens-begin);
-        auto part=model.finalize_hidden(hidden.narrow(1,begin,count),1,count);
+        auto part=model.finalize_hidden(hidden.narrow(1,begin,count),model.output_norm,1,count);
         if(!finalized.defined())finalized=tb::empty({1,tokens,part.size(-1)},part.options());
         finalized.narrow(1,begin,count).copy_(part);
     }
     return finalized;
 }
 
-mfq_tensor_backend::Tensor Qwen4Model::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+mfq_tensor_backend::Tensor Qwen4Model::finalize_hidden(mfq_tensor_backend::Tensor hidden,
                                                                const mfq_tensor_backend::Tensor &,
                                                                int64_t, int64_t) const {
     return final_mixer->pre(*execution, hidden)[0];
 }
 
 mfq_tensor_backend::Tensor
-Qwen4Model::adapter_last_logits(const QuantLinear &lm_head,
+Qwen4Model::last_logits_from_head(const QuantLinear &lm_head,
                                 mfq_tensor_backend::Tensor hidden) const {
-    return adapter_logits(lm_head, std::move(hidden));
+    return logits_from_head(lm_head, std::move(hidden));
 }
 
-mfq_tensor_backend::Tensor Qwen4Model::adapter_next_token(const QuantLinear &lm_head,
+mfq_tensor_backend::Tensor Qwen4Model::next_token_from_head(const QuantLinear &lm_head,
                                                           mfq_tensor_backend::Tensor hidden) const {
-    return mfq_tensor_backend::argmax(adapter_logits(lm_head, std::move(hidden)), -1)
+    return mfq_tensor_backend::argmax(logits_from_head(lm_head, std::move(hidden)), -1)
         .to(mfq_tensor_backend::kInt64);
 }
 
-void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
+void Qwen4Model::native_rollback_speculation(int64_t keep) {
     if (positions.defined())
         positions = positions.narrow(-1, 0, keep);
 }

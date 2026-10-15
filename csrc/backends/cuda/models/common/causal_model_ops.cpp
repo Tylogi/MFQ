@@ -21,44 +21,44 @@ mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
 
 } // namespace
 
-void CausalResources::adapter_validate_load_options() const {}
+void CausalResources::validate_load_options() const {}
 
-void CausalResources::adapter_configure_rope(RopeCache &, mfq_tensor_backend::Device) const {}
+void CausalResources::configure_rope(RopeCache &, mfq_tensor_backend::Device) const {}
 
-void CausalResources::adapter_load_final_state(const mfq::ModelSource &source,
+void CausalResources::load_final_state(const mfq::ModelSource &source,
                                                mfq_tensor_backend::Tensor &output_norm) {
     output_norm = load_dense_gpu(*execution, source, "model.output_norm.weight");
 }
 
-void CausalResources::adapter_prepare_blocks(const mfq::ModelSource &) {}
+void CausalResources::prepare_blocks(const mfq::ModelSource &) {}
 
-mfq_tensor_backend::Tensor CausalResources::adapter_embed(mfq_tensor_backend::Tensor output) const {
+mfq_tensor_backend::Tensor CausalResources::post_embed(mfq_tensor_backend::Tensor output) const {
     return output;
 }
 
-void CausalResources::adapter_reset(int64_t) {}
+void CausalResources::reset_native(int64_t) {}
 
-bool CausalResources::adapter_requires_batch_reset(int64_t) const noexcept { return false; }
+bool CausalResources::requires_batch_reset(int64_t) const noexcept { return false; }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t, int64_t) const {
+CausalResources::prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t, int64_t) const {
     return hidden;
 }
 
-void CausalResources::adapter_begin_forward(bool) {}
+void CausalResources::begin_forward(bool) {}
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_block_positions(const mfq_tensor_backend::Tensor &,
+CausalResources::block_positions(const mfq_tensor_backend::Tensor &,
                                          const mfq_tensor_backend::Tensor &local_positions,
                                          int) const {
     return local_positions;
 }
 
-void CausalResources::adapter_finish_forward(const mfq_tensor_backend::Tensor &, int64_t, int64_t) {
+void CausalResources::finish_forward(const mfq_tensor_backend::Tensor &, int64_t, int64_t) {
 }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+CausalResources::finalize_hidden(mfq_tensor_backend::Tensor hidden,
                                          const mfq_tensor_backend::Tensor &output_norm,
                                          int64_t batch, int64_t tokens) const {
     return normalize_hidden(std::move(hidden), output_norm, metadata, batch, tokens,
@@ -66,13 +66,13 @@ CausalResources::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
 }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+CausalResources::extract_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
                                     const mfq_tensor_backend::Tensor &) const {
     return hidden;
 }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_logits(const QuantLinear &lm_head,
+CausalResources::logits_from_head(const QuantLinear &lm_head,
                                 mfq_tensor_backend::Tensor hidden) const {
     auto logits = execution->profiler.measure(
         "model.lm_head", [&]() { return lm_head.forward(*execution, hidden); });
@@ -80,13 +80,13 @@ CausalResources::adapter_logits(const QuantLinear &lm_head,
 }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_last_logits(const QuantLinear &lm_head,
+CausalResources::last_logits_from_head(const QuantLinear &lm_head,
                                      mfq_tensor_backend::Tensor hidden) const {
     return lm_head.forward(*execution, hidden.to(mfq_tensor_backend::kFloat16).contiguous());
 }
 
 mfq_tensor_backend::Tensor
-CausalResources::adapter_next_token(const QuantLinear &lm_head,
+CausalResources::next_token_from_head(const QuantLinear &lm_head,
                                     mfq_tensor_backend::Tensor hidden) const {
     auto input = hidden.to(mfq_tensor_backend::kFloat16).contiguous();
     auto logits = execution->profiler.measure("model.lm_head",
@@ -94,8 +94,8 @@ CausalResources::adapter_next_token(const QuantLinear &lm_head,
     return sample_greedy_cuda(logits.contiguous().view({input.size(0), -1}));
 }
 
-void CausalResources::adapter_begin_speculative() {}
-void CausalResources::adapter_commit_speculative() {}
-void CausalResources::adapter_rollback_speculative(int64_t) {}
+void CausalResources::native_begin_speculation() {}
+void CausalResources::native_commit_speculation() {}
+void CausalResources::native_rollback_speculation(int64_t) {}
 
 } // namespace mfq::cuda

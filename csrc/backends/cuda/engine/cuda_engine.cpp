@@ -68,7 +68,7 @@ struct CudaEngineState : CudaEngineOps {
     void prepare_memory(std::size_t limit) {
         int device_count = 0;
         MFQ_CUDA_CHECK(cudaGetDeviceCount(&device_count));
-        auto plan = language.adapter_resource_plan(language.blocks,
+        auto plan = language.resource_plan(language.blocks,
             config.continuous_batch.max_sequences != 0, device_count, components.mtp.get());
         cache.limit_snapshot_bytes(plan.snapshot_bytes);
         if (components.composite) plan.add(execution->layer_placement.primary_device(),

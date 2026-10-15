@@ -1382,25 +1382,25 @@ struct DeepseekV41Model : CausalResources {
     mfq::models::deepseek_v41::Config config;
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
 
-    void adapter_validate_load_options() const;
-    void adapter_load_final_state(const mfq::ModelSource &source,
+    void validate_load_options() const;
+    void load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
-    void adapter_prepare_blocks(const mfq::ModelSource &source);
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    void prepare_blocks(const mfq::ModelSource &source);
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    void adapter_begin_forward(bool capture_raw_hidden);
+    void begin_forward(bool capture_raw_hidden);
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;
     mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
                                                 const mfq_tensor_backend::Tensor &output_norm,
                                                 int64_t batch, int64_t tokens) const;
     mfq_tensor_backend::Tensor
-    adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+    extract_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
                        const mfq_tensor_backend::Tensor &finalized) const;
-    void adapter_begin_speculative();
-    void adapter_commit_speculative();
-    void adapter_rollback_speculative(int64_t keep);
+    void native_begin_speculation();
+    void native_commit_speculation();
+    void native_rollback_speculation(int64_t keep);
 };
 
 extern template struct CudaSessionCodec<DeepseekV41Model>;

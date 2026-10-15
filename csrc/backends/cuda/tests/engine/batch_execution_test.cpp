@@ -66,8 +66,8 @@ struct DenseModel {
     int64_t vocab_size() const { return 32; }
     int64_t max_position_embeddings() const { return 256; }
     int64_t num_experts() const { return 0; }
-    bool adapter_uses_decode_sequence_length() const { return false; }
-    std::vector<const void*> adapter_batch_state_addresses(const auto&) const { return {}; }
+    bool uses_decode_sequence_length() const { return false; }
+    std::vector<const void*> batch_state_addresses(const auto&) const { return {}; }
     Tensor hidden_forward(Tensor ids, MfqOptional<Tensor> = {}, MfqOptional<Tensor> = {},
                           void* = nullptr, MfqOptional<Tensor> = {}) {
         return ids.to(kFloat32).unsqueeze(-1);
