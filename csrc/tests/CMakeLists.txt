@@ -138,6 +138,7 @@ endforeach()
 
 add_executable(mfq-moe-cache-profile-test moe/moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
+target_include_directories(mfq-moe-cache-profile-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 target_compile_features(mfq-moe-cache-profile-test PRIVATE cxx_std_17)
 if(MSVC)
     target_compile_options(mfq-moe-cache-profile-test PRIVATE /utf-8 /EHsc)

@@ -571,7 +571,7 @@ public:
 
     void finalize();
 
-    void set_profile(mfq::MoeCacheProfile profile) {
+    void set_profile(mfq::engine::MoeCacheProfile profile) {
         if (finalized_ || !sources_.empty()) {
             throw std::runtime_error(
                 "MoE cache profile must be set before source registration");
@@ -1524,8 +1524,8 @@ private:
     size_t next_stage_ = 0;
     std::unordered_map<std::string, std::unique_ptr<MoeGpuArena>> arenas_;
     std::vector<std::shared_ptr<MoeCachedSource>> sources_;
-    std::optional<mfq::MoeCacheProfile> profile_;
-    std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
+    std::optional<mfq::engine::MoeCacheProfile> profile_;
+    std::vector<mfq::engine::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;
     std::shared_ptr<MoeHostExpertCache> host_experts_;
     struct RegisteredHostField {

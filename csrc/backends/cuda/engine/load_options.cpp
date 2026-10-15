@@ -2,7 +2,7 @@
 #include "cuda_runtime_config.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/weights/moe/expert_cache.h"
-#include "moe/moe_cache_profile.h"
+#include "profile.h"
 #include "device/tensor/backend.h"
 
 #include <cuda_runtime_api.h>
@@ -315,7 +315,7 @@ void setup_cuda_load(
         if (!options.moe_cache_profile_path.empty()) {
             set_moe_expert_cache_profile(
                 *execution.stores.moe_expert_cache,
-                mfq::load_moe_cache_profile(
+                mfq::engine::load_moe_cache_profile(
                     options.moe_cache_profile_path));
         }
         execution.drop_file_cache = true;

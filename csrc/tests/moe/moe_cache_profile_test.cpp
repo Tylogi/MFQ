@@ -1,4 +1,4 @@
-#include "moe/moe_cache_profile.h"
+#include "profile.h"
 
 #include <cmath>
 #include <filesystem>
@@ -51,7 +51,7 @@ void test_parses_partial_source_independent_profile() {
             "2": {}
           }
         })JSON");
-    const auto profile = mfq::load_moe_cache_profile(path.string());
+    const auto profile = mfq::engine::load_moe_cache_profile(path.string());
     require(profile.layers.size() == 3, "layer count differs");
     require(
         profile.layers.at(0).ranking ==
@@ -80,9 +80,9 @@ void test_orders_frequency_globally_and_ranking_deterministically() {
             "2": {"ranking": [3, 4]}
           }
         })JSON");
-    const auto profile = mfq::load_moe_cache_profile(path.string());
+    const auto profile = mfq::engine::load_moe_cache_profile(path.string());
     const auto hot =
-        mfq::order_moe_profile_candidates(profile, false);
+        mfq::engine::order_moe_profile_candidates(profile, false);
     require(hot.size() == 5, "candidate count differs");
     require(
         hot[0].layer == 1 && hot[0].expert == 0,
@@ -99,7 +99,7 @@ void test_orders_frequency_globally_and_ranking_deterministically() {
         "ranking-only order differs");
 
     const auto cold =
-        mfq::order_moe_profile_candidates(profile, true);
+        mfq::engine::order_moe_profile_candidates(profile, true);
     require(
         cold.front().layer == 2 && cold.front().expert == 4,
         "cold-to-hot ordering differs");
@@ -117,16 +117,16 @@ void test_validates_model_dimensions() {
             "3": {"ranking": [7]}
           }
         })JSON");
-    const auto profile = mfq::load_moe_cache_profile(path.string());
+    const auto profile = mfq::engine::load_moe_cache_profile(path.string());
     require_rejected(
         [&]() {
-            mfq::validate_moe_cache_profile(
+            mfq::engine::validate_moe_cache_profile(
                 profile, std::unordered_map<int, int>{{0, 4}, {3, 4}});
         },
         "out-of-range expert was accepted");
     require_rejected(
         [&]() {
-            mfq::validate_moe_cache_profile(
+            mfq::engine::validate_moe_cache_profile(
                 profile, std::unordered_map<int, int>{{0, 8}});
         },
         "unknown layer was accepted");
@@ -140,7 +140,7 @@ void test_rejects_malformed_profiles() {
           "layers": {"0": {"ranking": [1, 1]}}
         })JSON");
     require_rejected(
-        [&]() { (void)mfq::load_moe_cache_profile(duplicate.string()); },
+        [&]() { (void)mfq::engine::load_moe_cache_profile(duplicate.string()); },
         "duplicate ranking was accepted");
 
     const auto negative = write_profile(
@@ -150,7 +150,7 @@ void test_rejects_malformed_profiles() {
           "layers": {"0": {"frequencies": {"1": -0.1}}}
         })JSON");
     require_rejected(
-        [&]() { (void)mfq::load_moe_cache_profile(negative.string()); },
+        [&]() { (void)mfq::engine::load_moe_cache_profile(negative.string()); },
         "negative frequency was accepted");
 
     const auto unknown = write_profile(
@@ -160,7 +160,7 @@ void test_rejects_malformed_profiles() {
           "layers": {"0": {"frequncy": {"1": 0.1}}}
         })JSON");
     require_rejected(
-        [&]() { (void)mfq::load_moe_cache_profile(unknown.string()); },
+        [&]() { (void)mfq::engine::load_moe_cache_profile(unknown.string()); },
         "unknown field was accepted");
 }
 

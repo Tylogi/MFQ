@@ -122,7 +122,7 @@ void MoeExpertCache::finalize() {
             }
             layer_sources[source->layer_id()].push_back(source);
         }
-        mfq::validate_moe_cache_profile(
+        mfq::engine::validate_moe_cache_profile(
             *profile_, layer_experts);
 
         std::unordered_map<std::string, int> required_slots;
@@ -156,7 +156,7 @@ void MoeExpertCache::finalize() {
         };
 
         auto select_candidate = [&](
-                const mfq::MoeProfileCandidate & candidate,
+                const mfq::engine::MoeProfileCandidate & candidate,
                 int64_t layer_limit,
                 std::unordered_map<int, int64_t> * layer_used) {
             const auto source_it =
@@ -219,7 +219,7 @@ void MoeExpertCache::finalize() {
         };
 
         const auto candidates =
-            mfq::order_moe_profile_candidates(
+            mfq::engine::order_moe_profile_candidates(
                 *profile_, false);
         int64_t frequency_bytes = 0;
         std::unordered_set<int> ranking_layers;
@@ -1447,6 +1447,6 @@ std::size_t finish_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>
 
 void set_moe_expert_cache_profile(
         MoeExpertCache& cache,
-        mfq::MoeCacheProfile profile) {
+        mfq::engine::MoeCacheProfile profile) {
     cache.set_profile(std::move(profile));
 }

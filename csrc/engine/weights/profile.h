@@ -12,7 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace mfq {
+namespace mfq::engine {
 
 struct MoeCacheLayerProfile {
     std::vector<int> ranking;
@@ -275,4 +275,4 @@ order_moe_profile_candidates(
     return result;
 }
 
-}  // namespace mfq
+}  // namespace mfq::engine

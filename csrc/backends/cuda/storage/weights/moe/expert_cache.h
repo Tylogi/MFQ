@@ -1,6 +1,6 @@
 #pragma once
 
-#include "moe/moe_cache_profile.h"
+#include "profile.h"
 
 #include <cstdint>
 #include <memory>
@@ -50,7 +50,7 @@ void print_moe_expert_cache_stats(
     std::ostream& output);
 void set_moe_expert_cache_profile(
     MoeExpertCache& cache,
-    mfq::MoeCacheProfile profile);
+    mfq::engine::MoeCacheProfile profile);
 
 struct MfeWeight;
 struct MixedMoeRuntime;
