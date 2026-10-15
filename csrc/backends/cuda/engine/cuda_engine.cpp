@@ -300,12 +300,12 @@ struct CudaEngineState : CudaEngineOps {
                 metrics.emplace_back(prefix + "_reserved_bytes", memory.used()[device]);
                 metrics.emplace_back(prefix + "_request_bytes", request_bytes[device]);
             }
-            auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
+            auto experts = moe_expert_memory_metrics(execution->stores.moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
             metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
                 {"qsa_kv_offload_supported", Model::policy.qsa_kv_offload ? 1.0 : 0.0}});
-            if (execution->qsa_kv_store) {
-                auto kv = execution->qsa_kv_store->metrics();
+            if (execution->stores.qsa_kv_store) {
+                auto kv = execution->stores.qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());
                 for (const auto& value : kv)
                     if (value.first == "qsa_kv_resident_bytes")
@@ -395,13 +395,13 @@ struct CudaBackend {
             kv.ram_budget_bytes = cuda_has_separate_memory() ? kv_options.ram_budget_bytes : 0;
             kv.buffer_bytes = std::min<std::size_t>(kv.buffer_bytes, kv.gpu_budget_bytes / 4);
             kv.directory = kv_options.directory;
-            execution->qsa_kv_store = std::make_shared<KvOffloadStore>(std::move(kv));
+            execution->stores.qsa_kv_store = std::make_shared<KvOffloadStore>(std::move(kv));
         }
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
                 if constexpr (!Model::policy.qsa_kv_offload)
-                    if (execution->qsa_kv_store)
+                    if (execution->stores.qsa_kv_store)
                         throw std::invalid_argument("CUDA streamed KV requires a QSA model");
                 return std::make_unique<BoundState<Model>>(execution, std::move(model),
                     std::move(components), config, options.memory_budget_bytes);

@@ -123,9 +123,9 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     model.load_weights(weights, load_blocks);
     execution.loading_cpu_layer = false;
     execution.layer_placement.load_device = execution.layer_placement.primary_device();
-    if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
-            !moe_expert_cache_finalized(execution.moe_expert_cache) && !defer_moe_cache_finalize)
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+    if (moe_expert_cache_has_sources(execution.stores.moe_expert_cache) &&
+            !moe_expert_cache_finalized(execution.stores.moe_expert_cache) && !defer_moe_cache_finalize)
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
     return model;
 }
 } // namespace mfq::cuda

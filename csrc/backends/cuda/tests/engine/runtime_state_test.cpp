@@ -286,8 +286,8 @@ static void check_cached_moe_binding() {
     auto input = (arange(32, options.dtype(kFloat32)) * 0.01 - 0.1)
                      .to(kFloat16).reshape({1, 32});
     for (bool ranges : {false, true}) {
-        execution.moe_expert_cache = make_moe_expert_cache(1 << 20, execution.config);
-        auto& cache = execution.moe_expert_cache;
+        execution.stores.moe_expert_cache = make_moe_expert_cache(1 << 20, execution.config);
+        auto& cache = execution.stores.moe_expert_cache;
         std::weak_ptr<MoeExpertCache> lifetime = cache;
         auto runtime = ranges ? make_mxfp4_range_runtime(*store)
                               : make_mixed_moe_runtime(cpu, false);
@@ -296,10 +296,10 @@ static void check_cached_moe_binding() {
         check(moe_expert_cache_has_sources(cache), "MoE source was not registered");
         finalize_moe_expert_cache(cache);
         CudaExecutionContext other;
-        other.moe_expert_cache = make_moe_expert_cache(1 << 20, other.config);
+        other.stores.moe_expert_cache = make_moe_expert_cache(1 << 20, other.config);
         execution.reset();
         check(!lifetime.expired(), "execution reset destroyed a live model cache");
-        check(!moe_expert_cache_has_sources(other.moe_expert_cache),
+        check(!moe_expert_cache_has_sources(other.stores.moe_expert_cache),
               "Engine instances share registered MoE sources");
         for (int32_t expert : {0, 1, 0}) {
             auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
@@ -327,7 +327,7 @@ static void check_cached_moe_binding() {
               "retained projection cannot use its cache");
         retained_forward = {};
         check(lifetime.expired(), "registered sources form a cache ownership cycle");
-        check(bool(other.moe_expert_cache), "releasing one cache changed another Engine");
+        check(bool(other.stores.moe_expert_cache), "releasing one cache changed another Engine");
     }
 }
 

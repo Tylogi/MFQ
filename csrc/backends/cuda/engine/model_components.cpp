@@ -36,7 +36,7 @@ RuntimeComponents load_runtime_components(
     if (result.plan.predictor == CudaPredictorAdapter::qwen35) {
         const auto& execution = *model.execution;
         if (!execution.layer_placement.enabled() && execution.dense_cpu_layer_count == 0 &&
-                execution.dsv4_cpu_offload_layers.empty() && !execution.moe_expert_cache &&
+                execution.dsv4_cpu_offload_layers.empty() && !execution.stores.moe_expert_cache &&
                 model.num_experts() == 0 && model.supports_speculation()) {
             if (auto predictor = Qwen35Mtp::load_if_present(
                     *model.source, model.config, *model.execution))

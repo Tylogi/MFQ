@@ -134,7 +134,7 @@ CudaBatchExecution<Model>::CudaBatchExecution(
       execution_(execution), config_(std::move(config)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(model.num_experts() > 0),
-      cached_moe_enabled_(moe_enabled_ && bool(execution.moe_expert_cache)),
+      cached_moe_enabled_(moe_enabled_ && bool(execution.stores.moe_expert_cache)),
       metadata_(max_sequences_) {}
 
 template <class Model>

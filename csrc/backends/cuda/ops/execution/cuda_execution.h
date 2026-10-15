@@ -47,6 +47,15 @@ bool decode_window_recording() noexcept;
 
 class MoeExpertCache;
 
+// The native storage instances one Engine load owns.  The execution context
+// holds them, operators and the batch executor borrow them through the
+// context, and nothing else takes ownership.  An execution reset drops the
+// Engine's reference to the expert cache; a live model keeps that cache alive.
+struct CudaStores {
+    std::shared_ptr<MoeExpertCache> moe_expert_cache;
+    std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
+};
+
 namespace mfq::cuda::internal {
 
 class PrefillCudaTimer {
@@ -349,8 +358,7 @@ struct CudaExecutionContext {
     ModelParallelCollectiveRuntime model_parallel_collectives;
     LayerPlacementConfig layer_placement;
     // Engine-owned load resource; cached model/MTP weights share its lifetime.
-    std::shared_ptr<MoeExpertCache> moe_expert_cache;
-    std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
+    CudaStores stores;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
     void reset() noexcept;

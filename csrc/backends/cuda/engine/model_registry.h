@@ -21,8 +21,8 @@ auto with_loaded_cuda_model(CudaExecutionContext& execution, const CudaLoadOptio
         auto model = load_causal_lm<Model>(execution, options.model_path, options.config_path,
             options.context_size, true, optional, source);
         auto components = load_runtime_components(model, optional);
-        if (moe_expert_cache_has_sources(execution.moe_expert_cache) && !moe_expert_cache_finalized(execution.moe_expert_cache))
-            finalize_moe_expert_cache(execution.moe_expert_cache);
+        if (moe_expert_cache_has_sources(execution.stores.moe_expert_cache) && !moe_expert_cache_finalized(execution.stores.moe_expert_cache))
+            finalize_moe_expert_cache(execution.stores.moe_expert_cache);
         mfq_cuda_synchronize();
         const auto loaded = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "loaded");

@@ -113,7 +113,7 @@ template <typename Model> struct CudaGenerationOps {
         return graph_config.enabled && (!prepared || !prepared->transformed()) && !constraint &&
                !model.metadata.flash_next && mfq_cuda_graph_capture_supported() &&
                execution.dsv4_cpu_offload_layers.empty() && execution.dense_cpu_layer_count == 0 &&
-               !execution.moe_expert_cache && model_parallel_cuda_graph_enabled(execution) &&
+               !execution.stores.moe_expert_cache && model_parallel_cuda_graph_enabled(execution) &&
                generation_limit >= graph_config.minimum_generation_tokens &&
                generation_limit <= graph.generated_capacity;
     }

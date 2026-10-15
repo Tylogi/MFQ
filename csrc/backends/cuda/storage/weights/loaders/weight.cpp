@@ -778,7 +778,7 @@ MfeWeight load_mfe_gpu(
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
-    auto& cache = execution.moe_expert_cache;
+    auto& cache = execution.stores.moe_expert_cache;
     if (cache && cacheable &&
             !moe_parallel_config(execution).enabled() &&
             execution.config.moe_ssd_ranges) {

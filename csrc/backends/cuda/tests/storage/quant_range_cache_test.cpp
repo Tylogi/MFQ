@@ -305,21 +305,21 @@ int main(int argc,char** argv) try {
         // Exercise the public loader used by the native attention adapters,
         // including its owning ModelSource range callback after model release.
         auto loaded_model=mfq::open_model_source((root/(name+".mfq")).string());
-        execution.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
+        execution.stores.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
         execution.moe_cache_registration_min_slots=1;
         mfq::cuda::weight_loader::validate_load_options(execution);
         auto loaded=load_mfe_gpu(execution,*loaded_model,"linear.weight",true,0,"gate");
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
         loaded_model.reset();
-        execution.moe_expert_cache.reset(); // MfeWeight retains its cache owner.
+        execution.stores.moe_expert_cache.reset(); // MfeWeight retains its cache owner.
         verify_gpu(loaded.forward(execution,x,selected),baseline.forward(execution,x,selected));
         verify_cpu(loaded.forward(execution,x,cold_route),reference,all,tokens,3,output);
         if (!cases) {
             WithoutOwningReader borrowed(mfq::open_model_source((root/(name+".mfq")).string()));
-            execution.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
+            execution.stores.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
             auto compatible=load_mfe_gpu(execution,borrowed,"linear.weight",true,0,"gate");
-            finalize_moe_expert_cache(execution.moe_expert_cache);
-            execution.moe_expert_cache.reset();
+            finalize_moe_expert_cache(execution.stores.moe_expert_cache);
+            execution.stores.moe_expert_cache.reset();
             verify_gpu(compatible.forward(execution,x,selected),baseline.forward(execution,x,selected));
         }
         MFQ_CUDA_CHECK(cudaDeviceSynchronize());

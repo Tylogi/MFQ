@@ -309,12 +309,12 @@ void setup_cuda_load(
             throw std::runtime_error(
                 "--moe-gpu-cache-gb is outside the supported range");
         }
-        execution.moe_expert_cache =
+        execution.stores.moe_expert_cache =
             make_moe_expert_cache(
                 static_cast<int64_t>(bytes), execution.config);
         if (!options.moe_cache_profile_path.empty()) {
             set_moe_expert_cache_profile(
-                *execution.moe_expert_cache,
+                *execution.stores.moe_expert_cache,
                 mfq::load_moe_cache_profile(
                     options.moe_cache_profile_path));
         }

@@ -209,9 +209,9 @@ int run_mfe_tensor_check(
     const auto& mfq = *model_source;
     auto weight = load_mfe_gpu(execution,
         mfq, tensor_name, true, 0, "diagnostic");
-    if (execution.moe_expert_cache &&
-            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+    if (execution.stores.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.stores.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
     }
     if (routes > weight.n_experts) {
         throw std::runtime_error("MFE tensor check routes exceed expert count");
@@ -528,8 +528,8 @@ int run_mfe_tensor_check(
                   << " max_abs=" << diff.abs().max().item<double>()
                   << "\n";
     }
-    if (execution.moe_expert_cache) {
-        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
+    if (execution.stores.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.stores.moe_expert_cache, std::cout);
     }
     return 0;
 }
@@ -548,9 +548,9 @@ static int run_gemma_moe_check(
     auto down = load_mfe_gpu(execution,
         mfq, prefix + "down.weight",
         true, layer, "down");
-    if (execution.moe_expert_cache &&
-            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+    if (execution.stores.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.stores.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
     }
     const int routes = static_cast<int>(config.num_experts_per_tok);
     const int experts = static_cast<int>(config.num_experts);
@@ -775,8 +775,8 @@ static int run_gemma_moe_check(
             }
         }
     }
-    if (execution.moe_expert_cache) {
-        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
+    if (execution.stores.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.stores.moe_expert_cache, std::cout);
     }
     return 0;
 }
@@ -852,9 +852,9 @@ int run_moe_check(
         throw std::runtime_error(
             "selected layer does not contain MFE MoE weights");
     }
-    if (execution.moe_expert_cache &&
-            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+    if (execution.stores.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.stores.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
     }
     const double routed_weight_bytes =
         mfe_weight_bytes(ffn.moe_gate_up) + mfe_weight_bytes(ffn.moe_down);
@@ -970,8 +970,8 @@ int run_moe_check(
         execution.profiler.enabled = false;
         execution.profiler.reset();
     }
-    if (execution.moe_expert_cache) {
-        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
+    if (execution.stores.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.stores.moe_expert_cache, std::cout);
     }
     return 0;
 }
