@@ -27,13 +27,34 @@ using namespace mfq::engine;
 using namespace mfq::cuda::internal;
 
 namespace internal {
+// The model family is decided once, in CudaBackend::load(). Everything after
+// that talks to this interface, so no engine operation re-identifies which
+// family is loaded. The family-specific work stays inside CudaEngineState,
+// where its compile-time policy branches still resolve per family.
+struct CudaEngineOps {
+    virtual ~CudaEngineOps() = default;
+    virtual CudaExecutionContext& engine_execution() noexcept = 0;
+    virtual TextSessionCache& session_cache() noexcept = 0;
+    virtual RuntimeComponents& loaded_components() noexcept = 0;
+    virtual CudaCausalModel& language_model() noexcept = 0;
+    virtual bool exclusive() const = 0;
+    virtual std::size_t available() const = 0;
+    virtual bool mtp_available() const = 0;
+    virtual bool can_overlap(const EngineRequest&) const = 0;
+    virtual std::optional<AdmissionBudget::Lease> reserve(const EngineRequest&) = 0;
+    virtual void execute(const std::vector<RequestId>&) = 0;
+    virtual Generation generate(const RequestId&, ExecutionRequest&) = 0;
+    virtual ControlResult control(ControlRequest&&) = 0;
+    virtual void advance_control(EngineStepResult&) = 0;
+};
+
 template <typename Model, class Batch = std::monostate, class RequestState = std::monostate>
-struct CudaEngineState {
+struct CudaEngineState : CudaEngineOps {
     static constexpr bool supports_batch = !std::is_same_v<Batch, std::monostate>;
     std::shared_ptr<CudaExecutionContext> execution;
     CudaRuntimeConfig config;
     Model model;
-    RuntimeComponents<Model> components;
+    RuntimeComponents components;
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
@@ -82,15 +103,34 @@ struct CudaEngineState {
         memory = AdmissionBudget(std::move(budgets.request_bytes));
         if (config.continuous_batch.max_sequences) config.continuous_batch.max_sequences = capacity;
     }
-    auto reserve(const EngineRequest&) { return memory.reserve(request_bytes); }
-    std::size_t available() const { return memory.available(request_bytes); }
+    auto reserve(const EngineRequest&) -> std::optional<AdmissionBudget::Lease> override {
+        return memory.reserve(request_bytes);
+    }
+    std::size_t available() const override { return memory.available(request_bytes); }
+
+    CudaExecutionContext& engine_execution() noexcept override { return *execution; }
+    TextSessionCache& session_cache() noexcept override { return cache; }
+    RuntimeComponents& loaded_components() noexcept override { return components; }
+    CudaCausalModel& language_model() noexcept override { return language; }
+    // MiniCPM-o's composite owns the language model it actually runs; every
+    // other family runs the model it loaded. Bound once here so the hot paths
+    // keep a concrete reference; a mismatch is a bug, so it throws.
+    static Model& bind_language(RuntimeComponents& loaded_components, Model& loaded) {
+        if (!loaded_components.composite) return loaded;
+        return dynamic_cast<Model&>(loaded_components.composite->language());
+    }
+    ControlResult control(ControlRequest&& command) override {
+        return std::visit([this](auto&& value) {
+            return control_command(std::forward<decltype(value)>(value));
+        }, std::move(command));
+    }
 
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
-            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config, std::size_t memory_limit)
+            RuntimeComponents optional, CudaRuntimeConfig runtime_config, std::size_t memory_limit)
         : execution(std::move(owner)), config(std::move(runtime_config)),
           model(std::move(loaded)), components(std::move(optional)),
-          language(components.language(model)), graph(language.max_position_embeddings()),
+          language(bind_language(components, model)), graph(language.max_position_embeddings()),
           cache(config.session_cache, config.prefix_cache,
               make_cuda_paged_prefix_cache(*language.source, language.max_position_embeddings(),
                   language.supports_paged_text_session_state(), config.prefix_cache),
@@ -106,12 +146,12 @@ struct CudaEngineState {
                     config.continuous_batch);
         }
     }
-    bool can_overlap(const EngineRequest&) const {
+    bool can_overlap(const EngineRequest&) const override {
         return bool(batching);
     }
-    bool exclusive() const { return duplex_active; }
-    bool mtp_available() const { return bool(components.mtp); }
-    void execute(const std::vector<RequestId>& eligible) {
+    bool exclusive() const override { return duplex_active; }
+    bool mtp_available() const override { return bool(components.mtp); }
+    void execute(const std::vector<RequestId>& eligible) override {
         if constexpr (supports_batch) if (batching) batching->step(eligible);
     }
     using Prepared = CudaPreparedPrompt;
@@ -133,7 +173,7 @@ struct CudaEngineState {
         return internal::generate(language, graph, cache, config, input, output,
                                   components.mtp.get(), std::move(prepared), std::move(physical));
     }
-    Generation generate(const RequestId& id, ExecutionRequest& request) {
+    Generation generate(const RequestId& id, ExecutionRequest& request) override {
         if (request.concurrent && batch_requires_owned_generation(request.input, cache, bool(components.mtp))) {
             if constexpr (!std::is_same_v<RequestState, std::monostate>) return generate_owned(id, request);
             else throw InferenceInputError(InferenceInputErrorCode::Unsupported,
@@ -189,7 +229,7 @@ struct CudaEngineState {
             else co_yield step.state;
         }
     }
-    void advance_control(EngineStepResult& result) {
+    void advance_control(EngineStepResult& result) override {
         if (!duplex_pending && !duplex_stop) return;
         try {
             if (duplex_stop) {
@@ -219,7 +259,7 @@ struct CudaEngineState {
         result.has_control_work = duplex_pending || duplex_stop;
     }
 
-    template <class T> ControlResult control(T value) {
+    template <class T> ControlResult control_command(T value) {
         if constexpr (std::is_same_v<T, RuntimeMetrics>) {
             size_t free = 0, total = 0;
             MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
@@ -299,19 +339,17 @@ template <class Model> using BoundState = std::conditional_t<
     CudaEngineState<Model, ContinuousBatch<CudaBatchExecution<Model>>,
                     qwen35::Qwen35GenerationState>,
     CudaEngineState<Model>>;
-using State = CudaModelStates<BoundState>;
+using State = std::unique_ptr<CudaEngineOps>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
     Options options;
     State state;
     template <class F> decltype(auto) visit(F&& run) {
-        return std::visit([&](auto& state) -> decltype(auto) {
-            if (!state) throw std::runtime_error("CUDA engine is unloaded");
-            CudaExecutionScope guard(*state->execution);
-            mfq_tensor_backend::NoGradGuard no_grad;
-            return run(*state);
-        }, state);
+        if (!state) throw std::runtime_error("CUDA engine is unloaded");
+        CudaExecutionScope guard(state->engine_execution());
+        mfq_tensor_backend::NoGradGuard no_grad;
+        return run(*state);
     }
     std::pair<EngineInfo, std::unique_ptr<TextProcessor>> load() {
         // Knobs are consulted from the launch paths, so pin them for the rest of
@@ -344,36 +382,32 @@ struct CudaBackend {
                 return std::make_unique<BoundState<Model>>(execution, std::move(model),
                     std::move(components), config, options.memory_budget_bytes);
             });
-        return visit([&](auto& state) {
+        return visit([&](CudaEngineOps& state) {
             EngineInfo info;
             info.backend = "cuda";
             info.max_requests = state.available();
-            info.max_context = state.language.max_position_embeddings();
-            info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
-            info.model_type = state.language.model_type();
-            info.multimodal = state.components.grid_vision.has_value() || bool(state.components.composite);
+            info.max_context = state.language_model().max_position_embeddings();
+            info.vocab_size = static_cast<int32_t>(state.language_model().vocab_size());
+            info.model_type = state.language_model().model_type();
+            info.multimodal = state.loaded_components().grid_vision.has_value() || bool(state.loaded_components().composite);
             info.reload = true;
-            const auto caps = cuda_runtime_capabilities(state.components.graph, state.components.plan,
-                state.components.state(), info.multimodal, bool(state.components.composite));
+            const auto caps = cuda_runtime_capabilities(state.loaded_components().graph, state.loaded_components().plan,
+                state.loaded_components().state(), info.multimodal, bool(state.loaded_components().composite));
             info.duplex = caps.full_duplex;
-            info.capabilities = {state.components.graph.architecture, caps.text,
+            info.capabilities = {state.loaded_components().graph.architecture, caps.text,
                 caps.image_input, caps.video_input, caps.audio_input, caps.audio_output,
                 caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
-            auto text = TextProcessor::load(*state.language.source, options.tokenizer_model,
+            auto text = TextProcessor::load(*state.language_model().model_source(), options.tokenizer_model,
                 info.vocab_size, info.model_type);
             return std::pair{std::move(info), std::move(text)};
         });
     }
-    bool exclusive() const {
-        return std::visit([](const auto& state) { return state && state->exclusive(); }, state);
-    }
-    std::size_t available() const {
-        return std::visit([](const auto& state) { return state ? state->available() : 0; }, state);
-    }
+    bool exclusive() const { return state && state->exclusive(); }
+    std::size_t available() const { return state ? state->available() : 0; }
     void unload() {
         if (mfq::cuda::env_frozen() && mfq::cuda::env_flag("MFQ_CUDA_ENV_DUMP", false))
             std::cerr << "cuda knobs in use:\n" << mfq::cuda::env_dump();
-        state = State{};
+        state.reset();
     }
 };
 } // namespace

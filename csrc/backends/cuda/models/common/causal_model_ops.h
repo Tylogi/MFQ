@@ -162,6 +162,10 @@ struct CudaCausalModel {
     virtual const CudaModelPlan& component_plan() const noexcept = 0;
     virtual CudaExecutionContext* model_execution() const noexcept = 0;
     virtual CudaFamilyPolicy family_policy() const noexcept = 0;
+    virtual const std::shared_ptr<const mfq::ModelSource>& model_source() const noexcept = 0;
+    virtual int64_t max_position_embeddings() const noexcept = 0;
+    virtual int64_t vocab_size() const noexcept = 0;
+    virtual std::string_view model_type() const noexcept = 0;
 };
 
 template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
@@ -187,6 +191,7 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
     const CudaModelPlan& component_plan() const noexcept override { return plan; }
     CudaExecutionContext* model_execution() const noexcept override { return this->execution; }
     CudaFamilyPolicy family_policy() const noexcept override { return Model::policy; }
+    const std::shared_ptr<const mfq::ModelSource>& model_source() const noexcept override { return source; }
     std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
         return static_cast<Model&>(model).adapter_graph_logits(model,std::move(ids),kind);
     }

@@ -77,7 +77,7 @@ template <class Backend> class EngineInstance final : public Engine {
         return result;
     }
     SessionResult session(const SessionCommand& command) override {
-        return backend.visit([&](auto& ops) { return control_session(ops.cache, command); });
+        return backend.visit([&](auto& ops) { return control_session(ops.session_cache(), command); });
     }
     ControlResult control(ControlRequest request) override {
         if (!loaded_) throw std::runtime_error("engine is unloaded");
@@ -126,7 +126,7 @@ template <class Backend> class EngineInstance final : public Engine {
                 } catch (...) { text_control_ = {}; text_control_busy_->store(false); throw; }
                 return ControlPending{};
             } else
-                return backend.visit([&](auto& ops) { return ops.control(std::move(value)); });
+                return backend.visit([&](auto& ops) { return ops.control(ControlRequest{std::move(value)}); });
         }, std::move(request));
         if (std::holds_alternative<ControlPending>(result)) control_pending_ = true;
         return result;

@@ -94,10 +94,11 @@ struct TestBackend {
             std::uint64_t trim_hot(std::uint64_t) { return clear(); }
             Metrics metrics() const { return {{"sessions", double(count)}}; }
         } cache;
-        template <class T> ControlResult control(T) {
-            if constexpr (std::is_same_v<T, RuntimeMetrics>)
+        Cache& session_cache() noexcept { return cache; }
+        ControlResult control(ControlRequest&& command) {
+            if (std::holds_alternative<RuntimeMetrics>(command))
                 return Metrics{{"advances", double(advances)}};
-            else throw std::invalid_argument("no duplex in test backend");
+            throw std::invalid_argument("no duplex in test backend");
         }
     } ops;
     ~TestBackend() { assert(ops.live == 0); }

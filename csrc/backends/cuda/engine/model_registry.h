@@ -11,17 +11,6 @@
 
 namespace mfq::cuda::internal {
 
-// Written out rather than expanded from MFQ_CUDA_EACH_MODEL: C++ rejects a
-// trailing comma in a template argument list. A family added to that list but
-// not here fails to compile at the variant conversion in cuda_engine.cpp.
-template <template<class> class State>
-using CudaModelStates = std::variant<
-    std::unique_ptr<State<Qwen35CausalLm>>, std::unique_ptr<State<MiniCPMO45CausalLm>>,
-    std::unique_ptr<State<MiniCPMOTtsCausalLm>>, std::unique_ptr<State<Gemma4CausalLm>>,
-    std::unique_ptr<State<GlmDsaCausalLm>>, std::unique_ptr<State<Glm5CausalLm>>,
-    std::unique_ptr<State<Qwen4CausalLm>>, std::unique_ptr<State<DeepseekV4CausalLm>>,
-    std::unique_ptr<State<DeepseekV41CausalLm>>>;
-
 template <typename F>
 auto with_loaded_cuda_model(CudaExecutionContext& execution, const CudaLoadOptions& options,
         bool optional, F&& run) {

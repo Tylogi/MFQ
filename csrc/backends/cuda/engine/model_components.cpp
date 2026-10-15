@@ -17,9 +17,9 @@
 namespace mfq::cuda {
 
 template<>
-RuntimeComponents<Qwen35CausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         Qwen35CausalLm& model, bool optional) {
-    RuntimeComponents<Qwen35CausalLm> result{model.graph, model.plan};
+    RuntimeComponents result{model.graph, model.plan};
     if (!optional) return result;
     if (result.plan.vision == CudaVisionAdapter::grid_vit) {
         const auto* component = result.graph.component("vision");
@@ -52,9 +52,9 @@ RuntimeComponents<Qwen35CausalLm> load_runtime_components(
 }
 
 template<>
-RuntimeComponents<Qwen4CausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         Qwen4CausalLm& model, bool optional) {
-    RuntimeComponents<Qwen4CausalLm> result{model.graph, model.plan};
+    RuntimeComponents result{model.graph, model.plan};
     if (!optional) return result;
     if (result.plan.vision != CudaVisionAdapter::none ||
             (result.plan.predictor != CudaPredictorAdapter::none &&
@@ -70,9 +70,9 @@ RuntimeComponents<Qwen4CausalLm> load_runtime_components(
 }
 
 template<>
-RuntimeComponents<Glm5CausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         Glm5CausalLm& model, bool optional) {
-    RuntimeComponents<Glm5CausalLm> result{model.graph, model.plan};
+    RuntimeComponents result{model.graph, model.plan};
     if (!optional) return result;
     if (result.plan.vision != CudaVisionAdapter::none ||
             (result.plan.predictor != CudaPredictorAdapter::none &&
@@ -88,9 +88,9 @@ RuntimeComponents<Glm5CausalLm> load_runtime_components(
 }
 
 template<>
-RuntimeComponents<DeepseekV41CausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         DeepseekV41CausalLm& model, bool optional) {
-    RuntimeComponents<DeepseekV41CausalLm> result{model.graph, model.plan};
+    RuntimeComponents result{model.graph, model.plan};
     if (!optional) return result;
     if (result.plan.vision != CudaVisionAdapter::none ||
             (result.plan.predictor != CudaPredictorAdapter::none &&
@@ -106,20 +106,19 @@ RuntimeComponents<DeepseekV41CausalLm> load_runtime_components(
 }
 
 template<>
-RuntimeComponents<MiniCPMO45CausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         MiniCPMO45CausalLm& model, bool optional) {
-    RuntimeComponents<MiniCPMO45CausalLm> result{model.graph, model.plan};
+    RuntimeComponents result{model.graph, model.plan};
     if (!optional || result.plan.vision == CudaVisionAdapter::none) return result;
     if (result.plan.vision != CudaVisionAdapter::minicpmo45)
         throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
     result.composite = std::make_unique<minicpmo45::Components>(std::move(model));
-    result.language_override = &result.composite->language();
     result.vision_available = true;
     return result;
 }
 
 template<>
-RuntimeComponents<MiniCPMOTtsCausalLm> load_runtime_components(
+RuntimeComponents load_runtime_components(
         MiniCPMOTtsCausalLm& model, bool) {
     return {model.graph, model.plan};
 }
