@@ -28,34 +28,34 @@ if(MSVC)
     target_compile_options(mfq-cuda-storage PRIVATE /utf-8 /EHsc)
 endif()
 
-add_library(mfq-cuda-native STATIC
-    ${MFQ_CUDA_ROOT}/native/context.cu
-    ${MFQ_CUDA_ROOT}/native/env.cpp
-    ${MFQ_CUDA_ROOT}/native/tensor/tensor.cpp
-    ${MFQ_CUDA_ROOT}/native/tensor/tensor.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/blas.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/creation.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/indexing.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/ops.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/reduction.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/signal.cu
-    ${MFQ_CUDA_ROOT}/native/tensor/sort.cu
+add_library(mfq-cuda-device STATIC
+    ${MFQ_CUDA_ROOT}/device/context.cu
+    ${MFQ_CUDA_ROOT}/device/env.cpp
+    ${MFQ_CUDA_ROOT}/device/tensor/tensor.cpp
+    ${MFQ_CUDA_ROOT}/device/tensor/tensor.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/blas.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/creation.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/indexing.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/ops.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/reduction.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/signal.cu
+    ${MFQ_CUDA_ROOT}/device/tensor/sort.cu
 )
-add_library(mfq::cuda-native ALIAS mfq-cuda-native)
-target_include_directories(mfq-cuda-native PUBLIC
+add_library(mfq::cuda-device ALIAS mfq-cuda-device)
+target_include_directories(mfq-cuda-device PUBLIC
     ${MFQ_CUDA_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_link_libraries(mfq-cuda-native PUBLIC
+target_link_libraries(mfq-cuda-device PUBLIC
     CUDA::cudart CUDA::cublas mfq-host-parallel)
 if(WIN32)
-    target_link_libraries(mfq-cuda-native PUBLIC dxgi)
+    target_link_libraries(mfq-cuda-device PUBLIC dxgi)
 endif()
-target_compile_features(mfq-cuda-native PUBLIC cxx_std_20)
-target_compile_options(mfq-cuda-native PRIVATE
+target_compile_features(mfq-cuda-device PUBLIC cxx_std_20)
+target_compile_options(mfq-cuda-device PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
 )
-set_target_properties(mfq-cuda-native PROPERTIES
+set_target_properties(mfq-cuda-device PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
     CUDA_STANDARD 20
@@ -138,7 +138,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
-    PUBLIC mfq-cuda-native CUDA::cuda_driver mfq-ggml
+    PUBLIC mfq-cuda-device CUDA::cuda_driver mfq-ggml
     PRIVATE mfq-core mfq-ggml-internal-headers
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
@@ -153,7 +153,7 @@ set_target_properties(mfq-cuda-native-kernels PROPERTIES
 )
 
 if(MSVC)
-    foreach(mfq_cuda_target mfq-cuda-native mfq-cuda-native-kernels)
+    foreach(mfq_cuda_target mfq-cuda-device mfq-cuda-native-kernels)
         target_compile_options(${mfq_cuda_target} PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
@@ -164,7 +164,7 @@ endif()
 if(BUILD_TESTING)
     function(mfq_add_cuda_test target source)
         add_executable(${target} ${source})
-        target_link_libraries(${target} PRIVATE mfq-cuda-native ${ARGN})
+        target_link_libraries(${target} PRIVATE mfq-cuda-device ${ARGN})
         set_target_properties(${target} PROPERTIES
             CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
             CUDA_RUNTIME_LIBRARY Shared
@@ -190,7 +190,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-mxfp4-sq-test PRIVATE
-        mfq-core mfq-cuda-native mfq-cuda-native-kernels)
+        mfq-core mfq-cuda-device mfq-cuda-native-kernels)
     set_target_properties(mfq-mxfp4-sq-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
@@ -201,18 +201,18 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-paged-kv-attention-bench PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-paged-kv-attention-bench PRIVATE
-        mfq-cuda-native mfq-cuda-native-kernels)
+        mfq-cuda-device mfq-cuda-native-kernels)
     set_target_properties(mfq-paged-kv-attention-bench PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
     add_executable(mfq-cuda-nint-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_nint_bench.cpp)
     target_compile_definitions(mfq-cuda-nint-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
-    target_link_libraries(mfq-cuda-nint-bench PRIVATE mfq-cuda-native mfq-cuda-native-kernels)
+    target_link_libraries(mfq-cuda-nint-bench PRIVATE mfq-cuda-device mfq-cuda-native-kernels)
     target_compile_features(mfq-cuda-nint-bench PRIVATE cxx_std_20)
 
     mfq_add_cuda_test(mfq-cuda-context-test
-        ${MFQ_CUDA_ROOT}/tests/native/context_test.cu)
+        ${MFQ_CUDA_ROOT}/tests/device/context_test.cu)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/kernels/activation_test.cu
         mfq-cuda-native-kernels)
@@ -243,7 +243,7 @@ if(BUILD_TESTING)
     target_include_directories(mfq-deepseek-v41-hc-test PRIVATE
         ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
-        ${MFQ_CUDA_ROOT}/tests/native/native_tensor_cuda_test.cu)
+        ${MFQ_CUDA_ROOT}/tests/device/native_tensor_cuda_test.cu)
     mfq_add_cuda_test(mfq-cuda-storage-offset-test
         ${MFQ_CUDA_ROOT}/tests/kernels/storage_offset_test.cu
         mfq-cuda-native-kernels)
@@ -588,9 +588,9 @@ if(BUILD_TESTING)
         add_test(NAME mfq-cuda-include-graph-test
             COMMAND ${MFQ_PYTHON_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../../../tests/test_cuda_include_graph.py)
     endif()
-    add_executable(mfq-cuda-env-test ${MFQ_CUDA_ROOT}/tests/native/env_test.cpp)
+    add_executable(mfq-cuda-env-test ${MFQ_CUDA_ROOT}/tests/device/env_test.cpp)
     target_include_directories(mfq-cuda-env-test PRIVATE ${MFQ_CUDA_ROOT})
-    target_link_libraries(mfq-cuda-env-test PRIVATE mfq-cuda-native)
+    target_link_libraries(mfq-cuda-env-test PRIVATE mfq-cuda-device)
     target_compile_features(mfq-cuda-env-test PRIVATE cxx_std_20)
     add_test(NAME mfq-cuda-env-test COMMAND mfq-cuda-env-test)
     add_executable(mfq-cuda-warp-multi-sum-test ${MFQ_CUDA_ROOT}/tests/kernels/warp_multi_sum_test.cu)
@@ -627,7 +627,7 @@ target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::cublas
-    mfq-cuda-native
+    mfq-cuda-device
     mfq-cuda-native-kernels
     mfq-cuda-storage
 )

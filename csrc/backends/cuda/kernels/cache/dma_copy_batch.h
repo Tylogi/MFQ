@@ -1,5 +1,5 @@
 #pragma once
-#include "native/env.h"
+#include "device/env.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cstdint>

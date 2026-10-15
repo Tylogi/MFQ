@@ -1,4 +1,4 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "ops_common.cuh"
 
 #include <cub/cub.cuh>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 
 mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda(
     mfq_tensor_backend::Tensor input);

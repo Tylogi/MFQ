@@ -1,7 +1,7 @@
 // Share generic decoders across the partition/bundle kernel variants. The
 // compact decode translation unit keeps its fully inlined specializations.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
-#include "native/env.h"
+#include "device/env.h"
 #include "ffn_device.cuh"
 #include "ffn_compact.h"
 #include "ffn_token_groups.h"

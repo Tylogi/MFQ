@@ -1,5 +1,5 @@
 #define MFQ_MFE_COMPACT_NVQ 1
-#include "native/env.h"
+#include "device/env.h"
 #include "ffn_device.cuh"
 #include "ffn_compact.h"
 

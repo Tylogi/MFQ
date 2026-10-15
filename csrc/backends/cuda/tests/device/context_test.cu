@@ -1,4 +1,4 @@
-#include "native/context.h"
+#include "device/context.h"
 
 #include <cuda_runtime_api.h>
 

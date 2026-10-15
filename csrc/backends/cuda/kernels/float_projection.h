@@ -1,5 +1,5 @@
 #pragma once
-#include "native/tensor/backend.h"
+#include "device/tensor/backend.h"
 
 struct NintWeight;
 int nint_float_projection_resident_blocks(int device);

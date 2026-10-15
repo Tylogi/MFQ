@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
-#include "native/context.h"
+#include "device/context.h"
 #include <cstring>
 #include <memory>
 

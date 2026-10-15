@@ -1,4 +1,4 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "kernels/quant_ops.h"
 
 #include <cuda_runtime_api.h>

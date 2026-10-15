@@ -7,7 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 
 
 namespace {

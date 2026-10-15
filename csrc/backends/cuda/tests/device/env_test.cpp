@@ -1,6 +1,6 @@
 // Interface test for the single MFQ_* knob seam: presence, strict parsing, the
 // retired-name alias, frozen memoization and provenance recording.
-#include "native/env.h"
+#include "device/env.h"
 
 #include <iostream>
 #include <stdexcept>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native/env.h"
+#include "device/env.h"
 #include "engine/generation.h"
 #include "generation_result.h"
 #include "models/deepseek_v4/ops.h"

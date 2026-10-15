@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native/tensor/view.h"
+#include "device/tensor/view.h"
 
 #include <cuda_runtime_api.h>
 

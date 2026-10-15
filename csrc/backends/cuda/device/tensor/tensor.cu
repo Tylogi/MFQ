@@ -1,7 +1,7 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "tensor.h"
 
-#include "native/context.h"
+#include "device/context.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

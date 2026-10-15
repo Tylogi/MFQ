@@ -2,7 +2,7 @@
 
 #include "step_sequence.h"
 
-#include "native/tensor/backend.h"
+#include "device/tensor/backend.h"
 
 #include <cstddef>
 #include <cstdint>

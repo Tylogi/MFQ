@@ -24,7 +24,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include "native/context.h"
+#include "device/context.h"
 #include "storage/weights/moe/residency.h"
 #include "kernels/cache/dma_copy_batch.h"
 #include "mfq/host_parallel.h"

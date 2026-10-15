@@ -1,6 +1,6 @@
-#include "native/env.h"
+#include "device/env.h"
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>

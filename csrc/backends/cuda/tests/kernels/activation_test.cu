@@ -1,6 +1,6 @@
-#include "native/context.h"
+#include "device/context.h"
 #include "kernels/kernels.h"
-#include "native/tensor/tensor.h"
+#include "device/tensor/tensor.h"
 
 #include <cuda_fp16.h>
 #include <algorithm>

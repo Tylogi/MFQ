@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native/tensor/backend.h"
+#include "device/tensor/backend.h"
 #include "mfq/qsa_kv_store.h"
 #include <memory>
 #include <string>

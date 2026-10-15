@@ -11,11 +11,11 @@
 // performs signed int8 dot products with __dp4a or integer MMA. The medium-M
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
-#include "native/env.h"
+#include "device/env.h"
 #include "device.cuh"
 
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <algorithm>

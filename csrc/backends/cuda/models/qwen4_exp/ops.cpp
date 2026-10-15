@@ -1,4 +1,4 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "kernels/moe/ops.h"
 #include "ops/execution/execution_options.h"
 #include "kernels/shared_gate.h"
@@ -22,7 +22,7 @@
 #include "kernels/float_projection.h"
 #include "ops/quant/nint_prefill_cache.h"
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-#include "native/matmul_rows.h"
+#include "device/matmul_rows.h"
 #endif
 #include <cstdlib>
 #include <chrono>

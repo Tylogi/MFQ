@@ -6,13 +6,13 @@
 // scale = 1/sqrt(D). Scalar gate and per-dim (KDA) gate; D in {32,64,128} (D=128 needs the
 // 64KB shared-mem opt-in via cudaFuncSetAttribute).
 
-#include "native/env.h"
+#include "device/env.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda/atomic>
 #include <cmath>
 #include <limits>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 #include <vector>
 #include <cstdlib>
 #include <cstring>

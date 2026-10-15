@@ -3,7 +3,7 @@
 
 #include "ops/execution/cuda_execution.h"
 #include "ops/execution/cuda_sampling.h"
-#include "native/tensor/backend.h"
+#include "device/tensor/backend.h"
 #include "tensor_parallel.h"
 
 #include <algorithm>

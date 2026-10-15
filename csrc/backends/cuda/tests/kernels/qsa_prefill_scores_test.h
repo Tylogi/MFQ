@@ -1,5 +1,5 @@
 #pragma once
-#include "native/env.h"
+#include "device/env.h"
 
 void qsa_prefill_scores_case() {
     struct Setting {

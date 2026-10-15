@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 
 #include <cstdint>
 #include <vector>

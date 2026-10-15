@@ -1,7 +1,7 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "ops/decode_window.h"
 #include "ops/execution/execution_options.h"
-#include "native/context.h"
+#include "device/context.h"
 #include "mfq/moe/cpu_expert_pool.h"
 #include <algorithm>
 #include <atomic>

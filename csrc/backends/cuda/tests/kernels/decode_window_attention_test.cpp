@@ -1,7 +1,7 @@
-#include "native/env.h"
+#include "device/env.h"
 #include "models/qwen4_exp/model.h"
 #include "ops/decode_window.h"
-#include "native/context.h"
+#include "device/context.h"
 #include "ops/execution/cuda_execution.h"
 #include <algorithm>
 #include <cmath>

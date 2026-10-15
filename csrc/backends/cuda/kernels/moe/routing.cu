@@ -11,9 +11,9 @@
 // Canonical NINT routed projection reuses nint_matmul_kernel from
 // nint_matmul.cu; q/k metadata does not create an MFE-specific compute kernel.
 
-#include "native/env.h"
+#include "device/env.h"
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "csrc/backends/cuda/device/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
