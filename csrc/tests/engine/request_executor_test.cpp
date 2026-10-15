@@ -1,4 +1,4 @@
-#include "request_table.h"
+#include "requests.h"
 #include "generation_flow.h"
 #include "runtime_config.h"
 #include "gguf.h"

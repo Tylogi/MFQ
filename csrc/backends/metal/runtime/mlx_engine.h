@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_generation_job.h"
-#include "request_table.h"
+#include "requests.h"
 
 namespace mfq::metal {
 

@@ -8,15 +8,16 @@ add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/internal
-        ${CMAKE_CURRENT_SOURCE_DIR}/request_table
-        ${CMAKE_CURRENT_SOURCE_DIR}/batch_planner
+        ${CMAKE_CURRENT_SOURCE_DIR}/requests
+        ${CMAKE_CURRENT_SOURCE_DIR}/plan
+        ${CMAKE_CURRENT_SOURCE_DIR}/state
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
 target_link_libraries(mfq-engine PUBLIC mfq-core)
 set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(TARGET mfq-paged-prefix-cache)
-    target_sources(mfq-engine PRIVATE src/paged_session_bindings.cpp)
+    target_sources(mfq-engine PRIVATE state/paged_session_bindings.cpp)
     target_link_libraries(mfq-engine PUBLIC mfq-paged-prefix-cache)
 endif()
 
@@ -24,7 +25,7 @@ if(TARGET mfq-tokenizer)
     target_sources(mfq-engine PRIVATE
         src/inference.cpp
         src/media_input.cpp
-        request_table/request_table.cpp
+        requests/requests.cpp
         src/token_constraint.cpp
         src/tokenizer.cpp
         src/text_processor.cpp

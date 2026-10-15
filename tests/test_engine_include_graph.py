@@ -8,7 +8,7 @@ shared generation loop, so the arrangement is allowed -- but only for them.
 
 Rules:
   1. engine/** never includes backends/** (the engine is backend agnostic).
-  2. engine private module headers (internal/, request_table/, batch_planner/) are
+  2. engine private module headers (internal/, requests/, plan/, state/) are
      included only from engine/, backends/ and tests/.
   3. The engine/internal header graph is a DAG.
   4. Every engine/internal/*.h has at least one includer.
@@ -26,7 +26,7 @@ INTERNAL = os.path.join(ENGINE, "internal")
 # Private engine module directories. Backends and tests add all of them to the
 # include path and include their headers bare, so they share one rule set.
 INTERNAL_DIRS = [os.path.join(ENGINE, d)
-                 for d in ("internal", "request_table", "batch_planner")]
+                 for d in ("internal", "requests", "plan", "state")]
 SOURCE_EXT = (".cpp", ".cu", ".c", ".h")
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 ALLOWED_CONSUMERS = ("engine", "backends", "tests")

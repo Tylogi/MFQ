@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "request_table.h"
+#include "requests.h"
 #include "runtime_checks.h"
 #include <map>
 

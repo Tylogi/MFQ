@@ -1,6 +1,6 @@
 #pragma once
 
-#include "request_table.h"
+#include "requests.h"
 
 #include <atomic>
 #include <chrono>

@@ -1,5 +1,5 @@
 #pragma once
-#include "batch_plan.h"
+#include "plan.h"
 #include "generation_step.h"
 #include "prefill_activity.h"
 #include <memory>
