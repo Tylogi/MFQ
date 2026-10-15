@@ -16,6 +16,9 @@ namespace mfq::engine {
 // Serial, independent-state and physically batched execution share request
 // state. Concurrent admission does not imply physical batching. Only the
 // executor drains events and finishes the request after device cleanup.
+// This is the RequestTable row: the loop that calls step() is the only writer,
+// and complete() is the only place that ends a request, so a request reaches
+// exactly one terminal event.
 struct ExecutionRequest {
     std::optional<AdmissionBudget::Lease> memory;
     InferenceRequest input;
@@ -182,7 +185,7 @@ class RequestExecutor {
             current.generation = {};
             if (current.output.cleanup_failure) {
                 healthy_ = false;
-                current.failure = current.output.cleanup_failure;
+                current.complete(current.output.cleanup_failure);
             }
             finish(it->first, current, result);
             it = requests_.erase(it);
