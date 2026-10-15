@@ -147,25 +147,14 @@ struct CudaForwardPlan {
 };
 
 // One loaded CUDA causal model, independent of which family instantiated it.
-// Everything the engine, MTP and diagnostics need that is not family-specific
-// is reachable here, so nothing above the loader has to enumerate families.
-// embed_forward() and logits_from_hidden() are implemented once by
-// models::CausalModelBase; the rest are the members CudaCausalOps already holds
-// with family-independent types.
+// Only MTP and the MiniCPM-o composite need to name a model without knowing its
+// family, and both only need to run embed/logits. models::CausalModelBase
+// already implements them, so no family writes code for this.
 struct CudaCausalModel {
     using Tensor = mfq_tensor_backend::Tensor;
     virtual ~CudaCausalModel() = default;
     virtual Tensor embed_forward(Tensor ids) const = 0;
     virtual Tensor logits_from_hidden(Tensor hidden) = 0;
-    virtual RopeCache& rope_cache() noexcept = 0;
-    virtual const mfq::ModelGraph& model_graph() const noexcept = 0;
-    virtual const CudaModelPlan& component_plan() const noexcept = 0;
-    virtual CudaExecutionContext* model_execution() const noexcept = 0;
-    virtual CudaFamilyPolicy family_policy() const noexcept = 0;
-    virtual const std::shared_ptr<const mfq::ModelSource>& model_source() const noexcept = 0;
-    virtual int64_t max_position_embeddings() const noexcept = 0;
-    virtual int64_t vocab_size() const noexcept = 0;
-    virtual std::string_view model_type() const noexcept = 0;
 };
 
 template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
@@ -185,13 +174,6 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
     std::vector<std::unique_ptr<Block>> blocks;
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
-
-    RopeCache& rope_cache() noexcept override { return rope; }
-    const mfq::ModelGraph& model_graph() const noexcept override { return graph; }
-    const CudaModelPlan& component_plan() const noexcept override { return plan; }
-    CudaExecutionContext* model_execution() const noexcept override { return this->execution; }
-    CudaFamilyPolicy family_policy() const noexcept override { return Model::policy; }
-    const std::shared_ptr<const mfq::ModelSource>& model_source() const noexcept override { return source; }
     std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
         return static_cast<Model&>(model).adapter_graph_logits(model,std::move(ids),kind);
     }

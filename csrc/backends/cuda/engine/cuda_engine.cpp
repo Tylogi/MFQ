@@ -35,8 +35,8 @@ struct CudaEngineOps {
     virtual ~CudaEngineOps() = default;
     virtual CudaExecutionContext& engine_execution() noexcept = 0;
     virtual TextSessionCache& session_cache() noexcept = 0;
-    virtual RuntimeComponents& loaded_components() noexcept = 0;
-    virtual CudaCausalModel& language_model() noexcept = 0;
+    virtual std::pair<EngineInfo, std::unique_ptr<TextProcessor>> describe(
+        const std::string& tokenizer_model) = 0;
     virtual bool exclusive() const = 0;
     virtual std::size_t available() const = 0;
     virtual bool mtp_available() const = 0;
@@ -110,8 +110,28 @@ struct CudaEngineState : CudaEngineOps {
 
     CudaExecutionContext& engine_execution() noexcept override { return *execution; }
     TextSessionCache& session_cache() noexcept override { return cache; }
-    RuntimeComponents& loaded_components() noexcept override { return components; }
-    CudaCausalModel& language_model() noexcept override { return language; }
+    // Engine info is built by the state that owns the model and its components,
+    // so the interface never has to expose either.
+    std::pair<EngineInfo, std::unique_ptr<TextProcessor>> describe(
+            const std::string& tokenizer_model) override {
+        EngineInfo info;
+        info.backend = "cuda";
+        info.max_requests = available();
+        info.max_context = language.max_position_embeddings();
+        info.vocab_size = static_cast<int32_t>(language.vocab_size());
+        info.model_type = language.model_type();
+        info.multimodal = components.grid_vision.has_value() || bool(components.composite);
+        info.reload = true;
+        const auto caps = cuda_runtime_capabilities(components.graph, components.plan,
+            components.state(), info.multimodal, bool(components.composite));
+        info.duplex = caps.full_duplex;
+        info.capabilities = {components.graph.architecture, caps.text,
+            caps.image_input, caps.video_input, caps.audio_input, caps.audio_output,
+            caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
+        auto text = TextProcessor::load(*language.source, tokenizer_model,
+            info.vocab_size, info.model_type);
+        return std::pair{std::move(info), std::move(text)};
+    }
     // MiniCPM-o's composite owns the language model it actually runs; every
     // other family runs the model it loaded. Bound once here so the hot paths
     // keep a concrete reference; a mismatch is a bug, so it throws.
@@ -382,25 +402,7 @@ struct CudaBackend {
                 return std::make_unique<BoundState<Model>>(execution, std::move(model),
                     std::move(components), config, options.memory_budget_bytes);
             });
-        return visit([&](CudaEngineOps& state) {
-            EngineInfo info;
-            info.backend = "cuda";
-            info.max_requests = state.available();
-            info.max_context = state.language_model().max_position_embeddings();
-            info.vocab_size = static_cast<int32_t>(state.language_model().vocab_size());
-            info.model_type = state.language_model().model_type();
-            info.multimodal = state.loaded_components().grid_vision.has_value() || bool(state.loaded_components().composite);
-            info.reload = true;
-            const auto caps = cuda_runtime_capabilities(state.loaded_components().graph, state.loaded_components().plan,
-                state.loaded_components().state(), info.multimodal, bool(state.loaded_components().composite));
-            info.duplex = caps.full_duplex;
-            info.capabilities = {state.loaded_components().graph.architecture, caps.text,
-                caps.image_input, caps.video_input, caps.audio_input, caps.audio_output,
-                caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
-            auto text = TextProcessor::load(*state.language_model().model_source(), options.tokenizer_model,
-                info.vocab_size, info.model_type);
-            return std::pair{std::move(info), std::move(text)};
-        });
+        return visit([&](CudaEngineOps& state) { return state.describe(options.tokenizer_model); });
     }
     bool exclusive() const { return state && state->exclusive(); }
     std::size_t available() const { return state ? state->available() : 0; }
