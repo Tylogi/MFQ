@@ -86,3 +86,28 @@ done; wait $PID; echo "gpu_delta_mib=$((PEAK-BEFORE))"
 - 基线可复现：命令与固定输入已写入本文件，CTest 80/82 与两个失败已定位到源码行。
 - 缺口明确：缺权重 family 6 个、缺环境项 3 个（双 Engine、Flash-Next、DeepSeek-V4 真实权重），全部单列。
 - 未删除任何运行路径：本阶段只新增本文件。
+
+## 阶段 1（CUDA）已落地的结构
+
+基线 `4bce8b5c` 之后，CUDA 侧的阶段 1 结构变更（`951e9bcd..d78a3ee6`）：
+
+| 变更 | 结果 |
+| --- | --- |
+| 删除 `engine/internal/` 抽屉 | 按职责分为 `engine/{include,src,requests,batch,state,weights,executor,text}`，头文件名去掉目录前缀（`table.h`、`policy.h`、`driver.h`、`budget.h`…） |
+| 新增 `engine/weights/` | `slots.h/.cpp`（slot 身份、lease、arena 预算）、`ranker.h`（驻留排序）、`profile.h`（驻留输入的 profile 解析）。原 `mfq-cache-policy` 目标删除，由 `mfq-engine` 编译 |
+| Store 所有权 | `CudaExecutionContext` 用 `CudaStores` 持有 `moe_expert_cache`、`qsa_kv_store`；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用，不再自己拥有 KV 池 |
+| `backends/cuda/native/` → `device/` | 含 `tests/native/` → `tests/device/`；编译该目录的库改名 `mfq-cuda-device`。`mfq-cuda-native-kernels` 保留原名（它编译 `kernels/`） |
+
+后端层序不变：`device -> kernels -> ops -> storage -> models -> engine`，跨目录 include 必须带目录前缀。
+
+依赖检查（每条规则都带正/反例 fixture，规则失效会单独失败）：
+
+```bash
+python3 tests/test_engine_include_graph.py   # engine 不含 backend；模块方向受限；DAG；私有头都有消费者
+python3 tests/test_cuda_include_graph.py     # 后端 DAG，跨目录 include 全部限定
+python3 tests/test_layer_independence.py     # 共享层不 include engine 私有头
+```
+
+构建与测试：`cmake --build build -j16` 通过；`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` 的 `build-nocomm` 通过；CTest 仍为 80/82，两个失败与基线相同（`mfq-float-projection-test` 真实缺陷、`mfq-cuda-runtime-state-test` 显存被外部进程占用 44.8GB）。`mfq-engine` 只链接 `mfq-core`（及可选 tokenizer/prefix-cache），不链接设备库。
+
+未做：`EngineImpl<B>` 公共装配骨架。现在没有任何消费者使用它，写出来就是死代码；它应随阶段 2 的 Qwen3.5 混合链路一起落地，由真实调用方约束形状。
