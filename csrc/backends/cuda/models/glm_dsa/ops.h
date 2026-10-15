@@ -496,12 +496,12 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 namespace mfq::cuda {
 
 struct GlmDsaModel : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.common_rope = true};
     void adapter_validate_model_geometry() const;
     template <class Backend> using CausalModel = mfq::models::glm_dsa::CausalLm<Backend>;
     mfq::models::glm_dsa::Config config;
     std::unordered_map<int, std::shared_ptr<GlmDsaSharedState>> block_states;
 
-    bool adapter_uses_common_rope() const noexcept;
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 };

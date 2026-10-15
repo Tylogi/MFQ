@@ -44,6 +44,10 @@ struct CudaFamilyPolicy {
     bool layer_major_prefill = false;
     // Decode replays this family's captured decode graph.
     bool decode_graph = false;
+    // One shared rope cache covers every layer, so it is built once at load.
+    bool common_rope = false;
+    // Dense (non-MoE) blocks may be placed on CPU by --n-gpu-layers.
+    bool dense_cpu_offload = false;
     // The MTP predictor adapter this family implements, if it has one.
     CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
 };
@@ -95,17 +99,9 @@ inline bool declares_deepseek_v41_dspark(const ModelGraph& graph) noexcept {
         predictor->tensor_root == "predictor";
 }
 
-struct CudaComponentState {
-    bool vision_declared = false;
-    bool vision_supported = false;
-    bool vision_available = false;
-    bool vision_enabled = false;
-    bool mtp_declared = false;
-    bool mtp_supported = false;
-    bool mtp_available = false;
-    bool mtp_enabled = false;
-};
-
+// What the loaded model advertises. Derived from the graph plus this family's
+// adapter plan plus which adapter weights actually loaded; RuntimeComponents
+// already holds all three, so there is no separate component-lifecycle struct.
 inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
         const CudaModelPlan& plan) noexcept {
     CudaCapabilityMatrix result;
@@ -123,46 +119,24 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     return result;
 }
 
-inline CudaComponentState cuda_component_state(
-        const ModelGraph& graph,
-        const CudaModelPlan& plan,
-        bool vision_loaded,
-        bool mtp_loaded,
-        bool enable_vision = true,
-        bool enable_mtp = true) noexcept {
-    CudaComponentState result;
-    result.vision_declared = graph.has_component("vision");
-    result.vision_supported = result.vision_declared &&
-        plan.vision != CudaVisionAdapter::none;
-    result.vision_available = result.vision_supported && vision_loaded;
-    result.vision_enabled = result.vision_available && enable_vision;
-    result.mtp_declared = graph.has_component("predictor");
-    result.mtp_supported = result.mtp_declared &&
-        plan.predictor != CudaPredictorAdapter::none;
-    result.mtp_available = result.mtp_supported && mtp_loaded;
-    result.mtp_enabled = result.mtp_available && enable_mtp;
-    return result;
-}
-
 inline CudaCapabilityMatrix cuda_runtime_capabilities(
         const ModelGraph& graph,
         const CudaModelPlan& plan,
-        const CudaComponentState& components,
+        bool vision_available,
+        bool mtp_available,
         bool multimodal_available,
         bool duplex_available) noexcept {
     auto result = cuda_capability_matrix(plan);
     result.text = result.text && graph.has_component("text");
-    result.image_input = result.image_input &&
-        components.vision_available && multimodal_available;
-    result.video_input = result.video_input &&
-        components.vision_available && multimodal_available;
+    result.image_input = result.image_input && vision_available && multimodal_available;
+    result.video_input = result.video_input && vision_available && multimodal_available;
     result.audio_input = result.audio_input && multimodal_available &&
         graph.has_component("audio_input");
     result.audio_output = result.audio_output && duplex_available &&
         graph.has_component("audio_output");
     result.full_duplex = result.full_duplex && duplex_available &&
         graph.has_component("duplex");
-    result.mtp = result.mtp && components.mtp_available;
+    result.mtp = result.mtp && mtp_available;
     return result;
 }
 

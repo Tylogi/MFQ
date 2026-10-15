@@ -42,6 +42,7 @@ namespace mfq::cuda {
 
 struct Qwen35Model : CausalResources {
     static constexpr CudaFamilyPolicy policy{.continuous_batching = true,
+        .common_rope = true, .dense_cpu_offload = true,
         .predictor = CudaPredictorAdapter::qwen35};
     static CudaModelPlan plan_components(const mfq::ModelGraph&);
 
@@ -53,14 +54,10 @@ struct Qwen35Model : CausalResources {
 
     void adapter_validate_components(const mfq::ModelGraph &graph) const;
     void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
-    bool adapter_uses_common_rope() const noexcept;
-    bool adapter_supports_dense_cpu_offload() const noexcept;
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
     mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
-
-    bool adapter_supports_prepared_prompt() const noexcept;
 };
 
 template <> struct CudaSessionCodec<Qwen35Model> {

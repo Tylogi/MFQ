@@ -15,12 +15,11 @@
 namespace mfq::cuda {
 
 struct MiniCPMO45Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.common_rope = true, .dense_cpu_offload = true};
     static CudaModelPlan plan_components(const mfq::ModelGraph&);
     template <class Backend> using CausalModel = mfq::models::minicpmo45::CausalLm<Backend>;
     mfq::models::minicpmo45::Config config;
 
-    bool adapter_uses_common_rope() const noexcept;
-    bool adapter_supports_dense_cpu_offload() const noexcept;
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
@@ -46,11 +45,10 @@ struct CudaSessionCodec<MiniCPMO45Model> : FullAttentionSessionCodec<MiniCPMO45M
 extern template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 
 struct MiniCPMOTtsModel : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.common_rope = true, .dense_cpu_offload = true};
     template <class Backend> using CausalModel = mfq::models::minicpmo45::TtsCausalLm<Backend>;
     mfq::models::ModelConfig config;
 
-    bool adapter_uses_common_rope() const noexcept;
-    bool adapter_supports_dense_cpu_offload() const noexcept;
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 };

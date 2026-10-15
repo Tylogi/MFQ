@@ -19,20 +19,12 @@ std::unique_ptr<Block> minicpmo45::load_language_block(CudaExecutionContext& exe
 }
 
 
-bool MiniCPMO45Model::adapter_uses_common_rope() const noexcept { return true; }
-
-bool MiniCPMO45Model::adapter_supports_dense_cpu_offload() const noexcept { return true; }
-
 std::unique_ptr<Block> MiniCPMO45Model::adapter_load_block(const mfq::ModelSource &source,
                                                            int layer, int,
                                                            const std::string &type) {
     return minicpmo45::load_language_block(*execution, source, config, layer, type,
         mfq::models::minicpmo45::LanguageComponent::text);
 }
-
-bool MiniCPMOTtsModel::adapter_uses_common_rope() const noexcept { return true; }
-
-bool MiniCPMOTtsModel::adapter_supports_dense_cpu_offload() const noexcept { return true; }
 
 std::unique_ptr<Block> MiniCPMOTtsModel::adapter_load_block(const mfq::ModelSource &source,
                                                             int layer, int,

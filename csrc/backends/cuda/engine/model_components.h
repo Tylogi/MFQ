@@ -518,7 +518,6 @@ struct RuntimeComponents {
     std::unique_ptr<MtpModule> mtp;
     std::unique_ptr<minicpmo45::Components> composite;
     bool vision_available = false, mtp_available = false;
-    CudaComponentState state() const noexcept { return cuda_component_state(graph, plan, vision_available, mtp_available); }
 };
 
 // A family with CUDA adapters for its graph components declares an overload of

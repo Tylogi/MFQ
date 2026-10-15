@@ -23,8 +23,6 @@ mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
 
 void CausalResources::adapter_validate_load_options() const {}
 
-bool CausalResources::adapter_uses_common_rope() const noexcept { return false; }
-
 void CausalResources::adapter_configure_rope(RopeCache &, mfq_tensor_backend::Device) const {}
 
 void CausalResources::adapter_load_final_state(const mfq::ModelSource &source,
@@ -33,8 +31,6 @@ void CausalResources::adapter_load_final_state(const mfq::ModelSource &source,
 }
 
 void CausalResources::adapter_prepare_blocks(const mfq::ModelSource &) {}
-
-bool CausalResources::adapter_supports_dense_cpu_offload() const noexcept { return false; }
 
 mfq_tensor_backend::Tensor CausalResources::adapter_embed(mfq_tensor_backend::Tensor output) const {
     return output;
@@ -97,8 +93,6 @@ CausalResources::adapter_next_token(const QuantLinear &lm_head,
                                               [&]() { return lm_head.forward(*execution, input); });
     return sample_greedy_cuda(logits.contiguous().view({input.size(0), -1}));
 }
-
-bool CausalResources::adapter_supports_prepared_prompt() const noexcept { return false; }
 
 void CausalResources::adapter_begin_speculative() {}
 void CausalResources::adapter_commit_speculative() {}

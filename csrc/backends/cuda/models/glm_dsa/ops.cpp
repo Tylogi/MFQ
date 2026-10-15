@@ -43,8 +43,6 @@ void GlmDsaModel::adapter_validate_model_geometry() const {
     }
 }
 
-bool GlmDsaModel::adapter_uses_common_rope() const noexcept { return true; }
-
 std::unique_ptr<Block> GlmDsaModel::adapter_load_block(const mfq::ModelSource &source, int layer,
                                                        int device, const std::string &type) {
     auto &state = block_states[device];

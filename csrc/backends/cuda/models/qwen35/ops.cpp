@@ -342,10 +342,6 @@ void Qwen35Model::adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::De
                          device);
 }
 
-bool Qwen35Model::adapter_uses_common_rope() const noexcept { return true; }
-
-bool Qwen35Model::adapter_supports_dense_cpu_offload() const noexcept { return true; }
-
 std::unique_ptr<Block> Qwen35Model::adapter_load_block(const mfq::ModelSource &source, int layer,
                                                        int, const std::string &type) {
     return qwen35::load_block(*execution, source, config, layer, type);
@@ -405,8 +401,6 @@ CudaSessionCodec<Qwen35Model>::restore_steps(Model &model,
 mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor output) const {
     return output.to(mfq_tensor_backend::kFloat16).contiguous();
 }
-
-bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return true; }
 
 } // namespace mfq::cuda
 

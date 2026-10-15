@@ -123,7 +123,8 @@ struct CudaEngineState : CudaEngineOps {
         info.multimodal = components.grid_vision.has_value() || bool(components.composite);
         info.reload = true;
         const auto caps = cuda_runtime_capabilities(components.graph, components.plan,
-            components.state(), info.multimodal, bool(components.composite));
+            components.vision_available, components.mtp_available, info.multimodal,
+            bool(components.composite));
         info.duplex = caps.full_duplex;
         info.capabilities = {components.graph.architecture, caps.text,
             caps.image_input, caps.video_input, caps.audio_input, caps.audio_output,
@@ -284,12 +285,15 @@ struct CudaEngineState : CudaEngineOps {
             size_t free = 0, total = 0;
             MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
             auto device_memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
-            const auto capabilities = components.state();
+            const bool vision_declared = components.graph.has_component("vision");
+            const bool mtp_declared = components.graph.has_component("predictor");
             Metrics metrics{{"device_free_bytes", double(free)}, {"device_total_bytes", double(total)},
                 {"cuda_allocated_bytes", double(device_memory.allocated_bytes)}, {"cuda_reserved_bytes", double(device_memory.reserved_bytes)},
-                {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
-                {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},
-                {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
+                {"vision_declared", double(vision_declared)},
+                {"vision_supported", double(vision_declared && components.plan.vision != CudaVisionAdapter::none)},
+                {"vision_available", double(components.vision_available)}, {"mtp_declared", double(mtp_declared)},
+                {"mtp_supported", double(mtp_declared && components.plan.predictor != CudaPredictorAdapter::none)},
+                {"mtp_available", double(components.mtp_available)}};
             for (size_t device = 0; device < request_bytes.size(); ++device) if (request_bytes[device]) {
                 const auto prefix = "admission_device_" + std::to_string(device);
                 metrics.emplace_back(prefix + "_capacity_bytes", memory.capacity()[device]);

@@ -74,12 +74,10 @@ struct CausalResources {
     adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
     void adapter_validate_load_options() const;
-    bool adapter_uses_common_rope() const noexcept;
     void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
     void adapter_load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
     void adapter_prepare_blocks(const mfq::ModelSource &source);
-    bool adapter_supports_dense_cpu_offload() const noexcept;
 
     mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
     void adapter_reset(int64_t batch);
@@ -109,8 +107,6 @@ struct CausalResources {
                                                    mfq_tensor_backend::Tensor hidden) const;
     mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
                                                   mfq_tensor_backend::Tensor hidden) const;
-
-    bool adapter_supports_prepared_prompt() const noexcept;
 
     void adapter_begin_speculative();
     void adapter_commit_speculative();

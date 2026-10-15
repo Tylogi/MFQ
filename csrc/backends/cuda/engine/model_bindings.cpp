@@ -90,7 +90,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
         if (execution.dense_cpu_layer_count > 0) {
             if (model_parallel_enabled(execution) || execution.layer_placement.enabled())
                 throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-            bool supported = model.adapter_supports_dense_cpu_offload() && model.num_experts() <= 0;
+            bool supported = Model::policy.dense_cpu_offload && model.num_experts() <= 0;
             for (int layer = 0; supported && layer < model.num_hidden_layers(); ++layer) {
                 const auto type = model.layer_type(layer);
                 supported = type == "full_attention" || type == "linear_attention";
@@ -105,7 +105,7 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     CudaExecutionScope guard(execution);
     if (model.plan.vision == CudaVisionAdapter::grid_vit && execution.dense_cpu_layer_count > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
-    if (model.adapter_uses_common_rope()) {
+    if (Model::policy.common_rope) {
         const auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(model.max_position_embeddings(), model.rotary_dim(), model.rope_base(), 0, -1, device, model.metadata.rope_interleaved);
             model.adapter_configure_rope(rope, device);

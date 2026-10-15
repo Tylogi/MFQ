@@ -129,41 +129,26 @@ int main() {
                 graph_with("minicpmo45", "minicpmo45_vision")),
             "partial MiniCPM graph selected a composite CUDA adapter");
 
-        // Component availability is declaration plus loaded weights.
-        const auto qwen_state = cuda_component_state(qwen, k_grid_plan, true, true);
-        require(
-            qwen_state.vision_declared && qwen_state.mtp_declared,
+        // Component availability is the graph declaration, this family's adapter
+        // plan, and whether the adapter weights actually loaded.
+        require(qwen.has_component("vision") && qwen.has_component("predictor"),
             "graph components were not preserved");
-        require(
-            qwen_state.vision_supported && qwen_state.mtp_supported &&
-                qwen_state.vision_available && qwen_state.mtp_available,
-            "Qwen predictor/vision availability did not match execution adapters");
+        require(k_grid_plan.vision != CudaVisionAdapter::none &&
+                k_grid_plan.predictor != CudaPredictorAdapter::none,
+            "Qwen predictor/vision adapters were not planned");
         require_capabilities(
-            cuda_runtime_capabilities(qwen, k_grid_plan, qwen_state, true, false),
+            cuda_runtime_capabilities(qwen, k_grid_plan, true, true, true, false),
             {true, true, false, false, false, false, true},
             "Qwen3.5 CUDA capability matrix mismatch");
-        const auto qwen_unloaded = cuda_component_state(qwen, k_grid_plan, false, false);
-        require(qwen_unloaded.mtp_supported &&
-            !qwen_unloaded.mtp_available && !qwen_unloaded.mtp_enabled,
-            "unloaded Qwen predictor was reported available");
         require_capabilities(
-            cuda_runtime_capabilities(qwen, k_grid_plan, qwen_unloaded, true, false),
+            cuda_runtime_capabilities(qwen, k_grid_plan, false, false, true, false),
             {true, false, false, false, false, false, false},
             "unloaded Qwen components were advertised by model name");
 
-        const auto minicpm_defaults = cuda_component_state(minicpm, k_minicpm_plan, true, false);
-        require(
-            minicpm_defaults.vision_supported && minicpm_defaults.vision_available &&
-                minicpm_defaults.vision_enabled,
-            "loaded MiniCPM Vision did not default on");
         require_capabilities(
-            cuda_runtime_capabilities(minicpm, k_minicpm_plan, minicpm_defaults, true, true),
+            cuda_runtime_capabilities(minicpm, k_minicpm_plan, true, false, true, true),
             {true, true, true, true, true, true, false},
             "MiniCPM-o CUDA capability matrix mismatch");
-        const auto minicpm_disabled = cuda_component_state(minicpm, k_minicpm_plan, true, false, false, true);
-        require(
-            minicpm_disabled.vision_available && !minicpm_disabled.vision_enabled,
-            "manual switch changed component availability");
 
         // A plan exists only once a family is selected, so text is supported;
         // what an unadapted plan must not infer is media and MTP.
@@ -175,18 +160,24 @@ int main() {
                                   graph_with("deepseek_v4"),
                                   graph_with("deepseek_v4", {}, "next_token_prediction")}) {
             require_capabilities(
-                cuda_runtime_capabilities(graph, k_text_plan,
-                    cuda_component_state(graph, k_text_plan, true, true), true, true),
+                cuda_runtime_capabilities(graph, k_text_plan, true, true, true, true),
                 {true, false, false, false, false, false, false},
                 "text-only CUDA capability matrix mismatch");
         }
 
+        // A declared predictor must not advertise MTP until its weights loaded.
         for (const auto& graph : {graph_with("qwen4_exp", "grid_vit", "next_token_prediction"),
                                   graph_with("glm5_next", "grid_vit", "next_token_prediction")}) {
-            const auto absent = cuda_component_state(graph, k_flash_next_plan, false, false);
-            const auto loaded = cuda_component_state(graph, k_flash_next_plan, false, true);
-            require(absent.mtp_supported && !absent.mtp_available && loaded.mtp_enabled,
-                "Flash-Next predictor declaration was confused with loaded weights");
+            require(k_flash_next_plan.predictor != CudaPredictorAdapter::none,
+                "Flash-Next predictor adapter was not planned");
+            require_capabilities(
+                cuda_runtime_capabilities(graph, k_flash_next_plan, false, false, false, false),
+                {true, false, false, false, false, false, false},
+                "unloaded Flash-Next predictor was advertised");
+            require_capabilities(
+                cuda_runtime_capabilities(graph, k_flash_next_plan, false, true, false, false),
+                {true, false, false, false, false, false, true},
+                "Flash-Next predictor availability mismatch");
             require_capabilities(
                 cuda_capability_matrix(k_flash_next_plan),
                 {true, false, false, false, false, false, true},
@@ -195,16 +186,11 @@ int main() {
 
         const auto deepseek_v41 = graph_with(
             "deepseek_v41", "deepseek_v41_vision", "deepseek_v41_dspark");
-        const auto deepseek_v41_state = cuda_component_state(
-            deepseek_v41, k_dspark_plan, false, true);
-        require(
-            deepseek_v41_state.mtp_supported &&
-                deepseek_v41_state.mtp_enabled &&
-                !deepseek_v41_state.vision_supported,
-            "DeepSeek-V4.1 DSpark availability state mismatch");
+        require(k_dspark_plan.predictor != CudaPredictorAdapter::none &&
+                k_dspark_plan.vision == CudaVisionAdapter::none,
+            "DeepSeek-V4.1 DSpark plan mismatch");
         require_capabilities(
-            cuda_runtime_capabilities(
-                deepseek_v41, k_dspark_plan, deepseek_v41_state, false, false),
+            cuda_runtime_capabilities(deepseek_v41, k_dspark_plan, false, true, false, false),
             {true, false, false, false, false, false, true},
             "DeepSeek-V4.1 inferred an unimplemented Vision adapter");
 
