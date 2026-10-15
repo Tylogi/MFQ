@@ -9,7 +9,7 @@ target_include_directories(mfq-engine
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/internal
         ${CMAKE_CURRENT_SOURCE_DIR}/requests
-        ${CMAKE_CURRENT_SOURCE_DIR}/plan
+        ${CMAKE_CURRENT_SOURCE_DIR}/batch
         ${CMAKE_CURRENT_SOURCE_DIR}/state
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)

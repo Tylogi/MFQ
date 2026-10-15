@@ -307,7 +307,7 @@ endfunction()
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
-        ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/plan ${PROJECT_SOURCE_DIR}/engine/state
+        ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/batch ${PROJECT_SOURCE_DIR}/engine/state
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
     )
@@ -317,7 +317,7 @@ endfunction()
 function(mfq_configure_cuda_model_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
-        ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/plan ${PROJECT_SOURCE_DIR}/engine/state
+        ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/batch ${PROJECT_SOURCE_DIR}/engine/state
         ${MFQ_CUDA_ROOT}
     )
     target_link_libraries(${target} PRIVATE mfq-models mfq-engine)

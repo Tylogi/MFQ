@@ -130,7 +130,7 @@ foreach(target IN ITEMS
         mfq-text-emitter-test mfq-sampling-test
         mfq-inference-test mfq-request-executor-test mfq-shared-execution-test
         mfq-mtp-policy-test mfq-speculative-sequence-test)
-    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/plan ${PROJECT_SOURCE_DIR}/engine/state)
+    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/batch ${PROJECT_SOURCE_DIR}/engine/state)
 endforeach()
 
 add_executable(mfq-moe-cache-profile-test moe/moe_cache_profile_test.cpp)
@@ -145,7 +145,7 @@ if(TARGET mfq-paged-prefix-cache)
     add_executable(mfq-paged-prefix-cache-test
         engine/mfq_paged_prefix_cache_test.cpp
     )
-    target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/plan ${PROJECT_SOURCE_DIR}/engine/state)
+    target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal ${PROJECT_SOURCE_DIR}/engine/requests ${PROJECT_SOURCE_DIR}/engine/batch ${PROJECT_SOURCE_DIR}/engine/state)
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
         mfq-engine
         mfq-paged-prefix-cache
