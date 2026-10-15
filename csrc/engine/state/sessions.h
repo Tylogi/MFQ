@@ -5,8 +5,8 @@
 #include <future>
 #include <thread>
 #include <variant>
-#include "paged_session_bindings.h"
-#include "session_snapshot_cache.h"
+#include "paged.h"
+#include "snapshot.h"
 
 #include <algorithm>
 #include <iostream>

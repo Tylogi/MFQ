@@ -1,6 +1,6 @@
 #include "inference.h"
 
-#include "text_emitter.h"
+#include "emitter.h"
 
 #include <algorithm>
 #include <memory>

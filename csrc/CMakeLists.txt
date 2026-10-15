@@ -9,6 +9,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(MFQ_CORE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core/include")
 
+# Shared engine module headers. They are PRIVATE to mfq-engine; backends, apps
+# and tests add these directories to their include path to drive the shared
+# generation loop, which tests/test_engine_include_graph.py keeps bounded.
+set(MFQ_ENGINE_PRIVATE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/requests
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/state
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/executor
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/text
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/src
+)
+
 option(
     MFQ_BUILD_METAL_RUNTIME
     "Build the native MLX/Metal runtime on Apple Silicon"

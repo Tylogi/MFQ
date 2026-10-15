@@ -1,7 +1,7 @@
 #pragma once
 #include "plan.h"
-#include "generation_step.h"
-#include "prefill_activity.h"
+#include "step.h"
+#include "activity.h"
 #include <memory>
 #include <span>
 #include <unordered_map>

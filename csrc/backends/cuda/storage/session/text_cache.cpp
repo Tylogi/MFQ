@@ -1,5 +1,5 @@
 #include "text_cache_impl.h"
-#include "runtime_config.h"
+#include "settings.h"
 #include "mfq/model_source/model_source.h"
 #include "mfq_paged_prefix_cache.h"
 #include "ops/execution/cuda_execution.h"

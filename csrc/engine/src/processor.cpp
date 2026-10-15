@@ -1,8 +1,8 @@
 #include "text_cancel.h"
-#include "text_processor.h"
+#include "processor.h"
 #include "mfq/model_source/model_source.h"
 
-#include "token_constraint.h"
+#include "constraint.h"
 #include "tokenizer.h"
 
 #include "chat/common.h"

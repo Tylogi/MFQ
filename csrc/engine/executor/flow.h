@@ -1,6 +1,6 @@
 #pragma once
 
-#include "generation_step.h"
+#include "step.h"
 
 #include <algorithm>
 #include <iostream>

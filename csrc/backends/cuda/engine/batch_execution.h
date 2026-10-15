@@ -6,9 +6,9 @@
 #include "ops/execution/cuda_execution.h"
 #include "models/common/full_block.h"
 #include "storage/state/batch_paged.h"
-#include "continuous_batch.h"
+#include "driver.h"
 #include "decode_graph.h"
-#include "generation_step.h"
+#include "step.h"
 #include "ops/execution/cuda_sampling.h"
 #include <map>
 #include <span>

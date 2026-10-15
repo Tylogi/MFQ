@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine.h"
-#include "mtp_depth_controller.h"
+#include "depth.h"
 
 // Host-side MTP depth selection and chain verification shared by engines.
 // Inputs to distribution() have already received the sampler's penalties.

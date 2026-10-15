@@ -13,7 +13,7 @@
 #include "mlx_tensor.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_mtp_lora.h"
-#include "runtime_config.h"
+#include "settings.h"
 #include "mfq_paged_prefix_cache.h"
 #include "mlx_transformer.h"
 

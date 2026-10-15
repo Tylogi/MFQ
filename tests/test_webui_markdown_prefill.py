@@ -38,7 +38,7 @@ def test_prefill_speed_uses_cuda_events_per_bounded_model_chunk() -> None:
     sampling = prefill.index("mfq::cuda::sample_logits(", logits)
     assert logits < finished < sampling
     assert "return timer.elapsed_ms()" in prefill
-    flow = (ROOT / "csrc/engine/internal/generation_step.h").read_text()
+    flow = (ROOT / "csrc/engine/requests/step.h").read_text()
     assert "next_prefill_chunk(end, offset, chunk_size)" in flow
     assert "elapsed += ops.prefill(chunk)" in flow
     assert "co_yield prefill_progress(" in flow

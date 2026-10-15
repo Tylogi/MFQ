@@ -1,6 +1,6 @@
 #pragma once
 
-#include "generation_step.h"
+#include "step.h"
 #include "ops/execution/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/mtp.h"

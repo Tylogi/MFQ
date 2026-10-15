@@ -1,4 +1,4 @@
-#include "speculative_sequence.h"
+#include "speculate.h"
 
 #include <iostream>
 #include <thread>

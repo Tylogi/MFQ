@@ -2,7 +2,7 @@
 
 #include "mfq/token_constraint.h"
 #include "mlx_sampling.h"
-#include "mtp_depth_controller.h"
+#include "depth.h"
 
 #include <array>
 #include <cstddef>

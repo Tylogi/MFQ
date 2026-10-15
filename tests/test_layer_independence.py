@@ -15,6 +15,19 @@ BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/"
 FAMILY_TOKEN = re.compile(
     r"\b(qwen|deepseek|gemma|glm|minicpm|dspark|engram|flash_next)\b", re.IGNORECASE)
 SOURCE_SUFFIXES = {".h", ".hpp", ".cpp", ".cu", ".cuh", ".tpp"}
+# engine/<module> holds mfq-engine's private headers; the shared model layer
+# composes families through the public engine interface instead.
+ENGINE_MODULES = {"requests", "batch", "state", "executor", "text", "src"}
+# Shared files that still name a family, listed one by one.  Delete an entry
+# when its consumer moves behind a capability.
+FAMILY_EXCEPTIONS = {
+    # ReasoningFormat values are wire-visible protocol names, not a model chain.
+    CSRC / "engine/include/engine.h",
+    # Media preprocessing and chat-placeholder geometry still dispatch per
+    # family; that belongs to the family, and moving it is the open item.
+    CSRC / "engine/src/processor.cpp",
+    CSRC / "engine/src/media.cpp",
+}
 
 
 def sources(module):
@@ -23,28 +36,32 @@ def sources(module):
             yield path
 
 
+def code_lines(path):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.lstrip().startswith(("//", "*", "/*")):
+            yield lineno, line
+
+
 def main() -> int:
     failures = []
     for module in SHARED:
         for path in sources(module):
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if line.lstrip().startswith(("//", "*", "/*")):
-                    continue
+            for lineno, line in code_lines(path):
                 hit = BACKEND_TOKEN.search(line)
                 if hit:
                     failures.append(f"{path}:{lineno}: shared layer names a backend: {line.strip()}")
-        # engine/src still validates per-family media and chat-placeholder
-        # geometry; that belongs to the family, and moving it is the open item.
-        if module == "engine":
-            for path in sources(module):
-                if path.parent.name != "internal":
-                    continue
-                for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                    if line.lstrip().startswith(("//", "*", "/*")):
-                        continue
+                if module == "engine" and path not in FAMILY_EXCEPTIONS:
                     hit = FAMILY_TOKEN.search(line)
                     if hit:
                         failures.append(f"{path}:{lineno}: shared engine names a model family: {line.strip()}")
+    model_dir = CSRC / "engine/model"
+    if model_dir.is_dir():
+        include = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+        for path in sources("engine/model"):
+            for lineno, line in code_lines(path):
+                match = include.match(line)
+                if match and match.group(1).split("/")[0] in ENGINE_MODULES:
+                    failures.append(f"{path}:{lineno}: shared model layer reaches an engine private header: {line.strip()}")
     for failure in failures:
         print(failure)
     if failures:

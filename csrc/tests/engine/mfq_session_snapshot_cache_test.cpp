@@ -1,4 +1,4 @@
-#include "session_snapshot_cache.h"
+#include "snapshot.h"
 
 #include <cstdint>
 #include <stdexcept>

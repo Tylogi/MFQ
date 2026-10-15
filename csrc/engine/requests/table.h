@@ -1,8 +1,8 @@
 #pragma once
 
-#include "generation_step.h"
-#include "text_processor.h"
-#include "admission_budget.h"
+#include "step.h"
+#include "processor.h"
+#include "budget.h"
 #include "text_cancel.h"
 
 #include <memory>

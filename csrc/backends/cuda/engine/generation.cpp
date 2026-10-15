@@ -1,5 +1,5 @@
 #include "generation.h"
-#include "generation_flow.h"
+#include "flow.h"
 #include "cuda_model_list.h"
 #include "models/common/full_block.h"
 #include "ops/execution/cuda_sampling.h"

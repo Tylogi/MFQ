@@ -1,5 +1,5 @@
 #include "inference.h"
-#include "generation_policy.h"
+#include "policy.h"
 #include <cassert>
 int main() {
     using namespace mfq::engine;

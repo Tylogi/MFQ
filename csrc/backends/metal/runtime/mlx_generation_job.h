@@ -1,6 +1,6 @@
 #pragma once
 
-#include "generation_step.h"
+#include "step.h"
 
 #include <condition_variable>
 #include <deque>

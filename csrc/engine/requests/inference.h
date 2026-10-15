@@ -3,7 +3,7 @@
 #include "engine.h"
 #include "chat.h"
 #include "tokenizer.h"
-#include "text_emitter.h"
+#include "emitter.h"
 
 #include <cstdint>
 #include <exception>

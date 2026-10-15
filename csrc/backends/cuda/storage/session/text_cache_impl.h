@@ -2,7 +2,7 @@
 
 #include "text_cache.h"
 #include "state.h"
-#include "session_cache.h"
+#include "sessions.h"
 
 namespace mfq::cuda::internal {
 struct CudaSessionOps {

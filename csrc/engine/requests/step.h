@@ -1,10 +1,10 @@
 #pragma once
 
 #include "engine.h"
-#include "generation_policy.h"
+#include "policy.h"
 #include "inference.h"
 #include "step_sequence.h"
-#include "prefill_activity.h"
+#include "activity.h"
 
 #include <exception>
 #include <functional>

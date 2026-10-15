@@ -12,9 +12,9 @@
 #include "ops/execution/execution_options.h"
 #include "storage/session/text_cache.h"
 #include "mtp_metrics.h"
-#include "requests.h"
-#include "generation_flow.h"
-#include "engine_instance.h"
+#include "table.h"
+#include "flow.h"
+#include "instance.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>

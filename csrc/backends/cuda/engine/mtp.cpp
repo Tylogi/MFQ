@@ -1,9 +1,9 @@
 #include "generation.h"
-#include "speculative_sequence.h"
+#include "speculate.h"
 
 #include "ops/execution/cuda_execution.h"
 #include "ops/execution/cuda_sampling.h"
-#include "generation_policy.h"
+#include "policy.h"
 #include "inference.h"
 #include "kernels/sampling_ops.h"
 #include "cuda_model_list.h"

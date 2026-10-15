@@ -1,7 +1,7 @@
 #pragma once
 
-#include "generation_policy.h"
-#include "session_snapshot_cache.h"
+#include "policy.h"
+#include "snapshot.h"
 
 #include <cstdint>
 #include <filesystem>

@@ -1,4 +1,4 @@
-#include "text_emitter.h"
+#include "emitter.h"
 #include <cassert>
 int main() {
     mfq::engine::TextEmitter stop({"STOP", ""});

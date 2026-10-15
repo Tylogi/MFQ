@@ -1,7 +1,7 @@
 #pragma once
 
 #include "storage/session/state.h"
-#include "mtp_policy.h"
+#include "predictor.h"
 #include "native/tensor/backend.h"
 #include "models/common/causal_model_ops.h"
 

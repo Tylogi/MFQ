@@ -1,6 +1,6 @@
 #pragma once
 
-#include "generation_policy.h"
+#include "policy.h"
 
 #include <algorithm>
 #include <memory>

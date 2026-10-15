@@ -1,5 +1,5 @@
 #include "mfq_paged_prefix_cache.h"
-#include "paged_session_bindings.h"
+#include "paged.h"
 
 #include <algorithm>
 #include <array>

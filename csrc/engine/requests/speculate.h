@@ -1,7 +1,7 @@
 #pragma once
 
-#include "generation_step.h"
-#include "mtp_policy.h"
+#include "step.h"
+#include "predictor.h"
 
 #include <algorithm>
 #include <chrono>

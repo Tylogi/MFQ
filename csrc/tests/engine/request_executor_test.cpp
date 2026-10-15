@@ -1,8 +1,8 @@
-#include "requests.h"
-#include "generation_flow.h"
-#include "runtime_config.h"
+#include "table.h"
+#include "flow.h"
+#include "settings.h"
 #include "gguf.h"
-#include "engine_instance.h"
+#include "instance.h"
 #include <cstdio>
 
 #include <cassert>
