@@ -84,3 +84,4 @@ data/wikitext-2-raw/*
 *.sqlite3
 *.pt
 *.pth
+build-*/
