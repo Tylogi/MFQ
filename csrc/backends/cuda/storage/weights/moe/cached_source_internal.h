@@ -3,10 +3,10 @@
 #include "kernels/moe/ops.h"
 
 #include "ops/execution/execution_options.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 #include "ops/execution/cuda_execution.h"
 #include "ops/moe/moe.h"
-#include "storage/mfe_expert_store.h"
+#include "storage/weights/mfe_expert_store.h"
 #include "quant_range_source.h"
 #include "mfq/moe/cache_policy.h"
 #include "kernels/moe/cache_transfer.h"
@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 #include "native/context.h"
-#include "storage/moe/residency.h"
+#include "storage/weights/moe/residency.h"
 #include "kernels/cache/dma_copy_batch.h"
 #include "mfq/host_parallel.h"
 #include "mfq/moe/cpu_cost_model.h"
@@ -33,7 +33,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
-#include "storage/moe/weight_loader.h"
+#include "storage/weights/moe/weight_loader.h"
 using mfq_tensor_backend::indexing::Slice;
 
 struct MoeCacheTransfer {

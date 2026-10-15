@@ -2,9 +2,9 @@
 
 #include "models/common/causal_model_ops.h"
 #include "ops/execution/execution_options.h"
-#include "storage/mapped_embedding.h"
-#include "storage/loaders/weight.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/mapped_embedding.h"
+#include "storage/weights/loaders/weight.h"
+#include "storage/weights/moe/expert_cache.h"
 #include <algorithm>
 #include <iostream>
 

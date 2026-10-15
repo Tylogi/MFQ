@@ -1,15 +1,15 @@
 #include "native/env.h"
-#include "storage/moe/ffn_pipeline.h"
+#include "storage/weights/moe/ffn_pipeline.h"
 #include "ops/decode_window.h"
 #include "ops/execution/execution_options.h"
 #include "kernels/moe/pipeline.h"
 #include "ops/moe/router_lookahead_audit.h"
 #include "kernels/moe/ops.h"
 #include "kernels/moe/cache_transfer.h"
-#include "storage/moe/residency.h"
-#include "storage/moe/quant_range_source.h"
-#include "storage/moe/expert_cache.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/moe/residency.h"
+#include "storage/weights/moe/quant_range_source.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops/moe/moe.h"
 #include "mfq/moe/dispatch_plan.h"
 #include <filesystem>
@@ -21,8 +21,8 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
-#include "storage/moe/weight_loader.h"
-#include "storage/loaders/quant.h"
+#include "storage/weights/moe/weight_loader.h"
+#include "storage/weights/loaders/quant.h"
 namespace tb=mfq_tensor_backend;
 namespace {
 std::size_t bytes(const MixedMoePool& p) {

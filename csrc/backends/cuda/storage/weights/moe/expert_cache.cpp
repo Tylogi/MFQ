@@ -3,7 +3,7 @@
 #include "cached_source_internal.h"
 #include <map>
 #include <cmath>
-#include "storage/moe/weight_loader.h"
+#include "storage/weights/moe/weight_loader.h"
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
         const std::string & name,

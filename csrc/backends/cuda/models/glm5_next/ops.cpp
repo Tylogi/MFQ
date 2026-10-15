@@ -2,7 +2,7 @@
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "common/gated_mlp.h"
 #include "common/moe.h"
 #include "common/transformer_layer.h"

@@ -2,9 +2,9 @@
 
 #include "ops/quant/quant_linear.h"
 #include "ops/moe/moe.h"
-#include "storage/model_source.h"
+#include "storage/weights/model_source.h"
 #include "ops/gated_residual.h"
-#include "storage/moe/weight_loader.h"
+#include "storage/weights/moe/weight_loader.h"
 
 namespace mfq::cuda {
 class MfeMxfp4ExpertStore;

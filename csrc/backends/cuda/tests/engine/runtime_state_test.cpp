@@ -15,17 +15,17 @@
 #include "models/qwen35/mtp.h"
 #include "storage/session/state.h"
 #include "ops/moe/moe.h"
-#include "storage/mfe_expert_store.h"
-#include "storage/moe/expert_cache.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/mfe_expert_store.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "storage/weights/loaders/weight.h"
 
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
-#include "storage/moe/weight_loader.h"
-#include "storage/loaders/quant.h"
+#include "storage/weights/moe/weight_loader.h"
+#include "storage/weights/loaders/quant.h"
 
 using namespace mfq::cuda;
 using namespace mfq::cuda::internal;

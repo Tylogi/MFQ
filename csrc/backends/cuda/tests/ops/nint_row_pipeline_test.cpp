@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "storage/nint_row_pipeline.h"
+#include "storage/weights/nint_row_pipeline.h"
 #include "ops/decode_window.h"
 #include "ops/quant/nint.h"
 #include "kernels/moe/pipeline.h"

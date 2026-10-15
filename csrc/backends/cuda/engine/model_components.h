@@ -2,7 +2,7 @@
 
 #include "models/common/causal_model_ops.h"
 
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "common/grid_vision_model.h"
 #include <array>
 #include "grid_vision.h"

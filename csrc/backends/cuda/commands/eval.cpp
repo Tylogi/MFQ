@@ -4,7 +4,7 @@
 #include "engine/model_registry.h"
 #include "eval/kl.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 
 #include <algorithm>
 #include <cstdlib>

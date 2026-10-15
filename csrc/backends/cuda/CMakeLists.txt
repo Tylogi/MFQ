@@ -13,7 +13,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(mfq-cuda-storage STATIC
-    ${MFQ_CUDA_ROOT}/storage/mfe_expert_store.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/mfe_expert_store.cpp
 )
 add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
 target_include_directories(mfq-cuda-storage PUBLIC
@@ -369,20 +369,20 @@ target_compile_definitions(mfq-cuda-ops PRIVATE
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
-    ${MFQ_CUDA_ROOT}/storage/moe/expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe/ffn_pipeline.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe/weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/loaders/mx.cpp
-    ${MFQ_CUDA_ROOT}/storage/loaders/sq.cpp
-    ${MFQ_CUDA_ROOT}/storage/loaders/nint.cpp
-    ${MFQ_CUDA_ROOT}/storage/loaders/vq.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe/quant_range_source.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe/host_expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/ffn_pipeline.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/loaders/mx.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/loaders/sq.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/loaders/nint.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/loaders/vq.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/quant_range_source.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/ops/execution/graph_registry.cpp
     ${MFQ_CUDA_ROOT}/ops/decode_window.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe/residency.cpp
-    ${MFQ_CUDA_ROOT}/storage/nint_row_pipeline.cpp
-    ${MFQ_CUDA_ROOT}/storage/loaders/weight.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/moe/residency.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/nint_row_pipeline.cpp
+    ${MFQ_CUDA_ROOT}/storage/weights/loaders/weight.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)

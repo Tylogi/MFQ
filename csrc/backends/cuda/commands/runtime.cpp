@@ -2,7 +2,7 @@
 #include "cli.h"
 #include "include/cuda_engine.h"
 #include "minicpmo45.h"
-#include "storage/model_source.h"
+#include "storage/weights/model_source.h"
 #include "mfq/model_source/model_source.h"
 #include "transport.h"
 

@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "model_checks.h"
 
 #include "models/deepseek_v4/ops.h"
@@ -8,7 +8,7 @@
 #include "models/glm_dsa/ops.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 #include "kernels/moe/ops.h"
 
 #include <cuda_runtime_api.h>
@@ -26,7 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "storage/moe/weight_loader.h"
+#include "storage/weights/moe/weight_loader.h"
 
 static double mfe_weight_bytes(const MfeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);

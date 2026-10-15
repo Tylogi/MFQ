@@ -1,10 +1,10 @@
 #include "kl.h"
 
 #include "engine/cuda_model_list.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"

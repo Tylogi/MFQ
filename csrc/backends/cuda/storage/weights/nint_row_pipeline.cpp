@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "storage/nint_row_pipeline.h"
+#include "storage/weights/nint_row_pipeline.h"
 #include "mfq/quant/nint_row_cache.h"
 #include "kernels/quant_ops.h"
 #include "mfq/host_parallel.h"

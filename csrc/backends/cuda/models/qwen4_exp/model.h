@@ -9,7 +9,7 @@
 #include "models/common/attention_ops.h"
 #include "ops/rope.h"
 #include "csrc/backends/cuda/kernels/qwen4_exp.h"
-#include "storage/nint_row_pipeline.h"
+#include "storage/weights/nint_row_pipeline.h"
 #include "storage/state/offload.h"
 #include <array>
 #include <cstdlib>

@@ -3,7 +3,7 @@
 #include "cuda_model_list.h"
 #include "model_components.h"
 #include "load_options.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 
 #include <chrono>
 #include <memory>
