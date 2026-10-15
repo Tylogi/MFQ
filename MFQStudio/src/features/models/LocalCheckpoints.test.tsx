@@ -7,7 +7,7 @@ import { LocalCheckpoints } from './LocalCheckpoints';
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 vi.mock('./ModelLoadProgress', () => ({ ModelLoadProgress: () => null }));
 
-it('uses the same VRAM and RAM estimates as the download page', () => {
+it('uses one combined MoE pressure bar without capacity details, matching the download page', () => {
   const GiB = 2 ** 30;
   const artifact: ModelArtifact = { id: 'a', name: 'MoE', architecture: 'qwen4_exp', format: 'mfq',
     shard_count: 1, total_bytes: 133 * GiB, estimated_resident_weight_bytes: 83 * GiB, ssd_ple_bytes: 50 * GiB,
@@ -19,7 +19,8 @@ it('uses the same VRAM and RAM estimates as the download page', () => {
     modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact: vi.fn(),
     chooseModelDirectory: vi.fn(), openModelFiles: vi.fn() } as unknown as ReturnType<typeof useModelCatalog>;
   render(<LocalCheckpoints catalog={catalog} />);
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
-  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+  expect(document.querySelector('.variant-memory-caption')).toBeNull();
   expect(screen.getByText(/SSD PLE 50/)).toBeInTheDocument();
 });

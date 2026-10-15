@@ -79,7 +79,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div className="local-checkpoint-memory">
                     {!separate && <small>{tr('剩余可用内存', 'Remaining available memory')} {gib(available)}</small>}
                     <ModelPressureBars weights={item.estimated_resident_weight_bytes} roles={item.estimated_weight_bytes_by_role}
-                      system={system} available={available}
+                      system={system} available={available} combineMoe showDetails={false}
                       label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
                       tr={tr} />
                   </div>
