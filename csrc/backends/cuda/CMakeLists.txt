@@ -227,9 +227,13 @@ if(BUILD_TESTING)
 
     mfq_add_cuda_test(mfq-cuda-context-test
         ${MFQ_CUDA_ROOT}/tests/native/context_test.cu)
+    # The allocating activation wrappers live in mfq-cuda-ops, so this test links
+    # the runtime target that carries them.
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/kernels/activation_test.cu
-        mfq-cuda-native-kernels)
+        mfq-cuda-native-kernels mfq-cuda-runtime)
+    target_compile_definitions(mfq-cuda-activation-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     mfq_add_cuda_test(mfq-nint-q8-test
         ${MFQ_CUDA_ROOT}/tests/ops/nint_q8_test.cu
         mfq-cuda-native-kernels)
@@ -367,6 +371,7 @@ target_compile_definitions(mfq-cuda-models PRIVATE
 set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
+    ${MFQ_CUDA_ROOT}/ops/activation.cpp
     ${MFQ_CUDA_ROOT}/ops/execution/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
@@ -624,6 +629,10 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
+    # The small gate/beta preparation case is the native consumer of the
+    # allocating linear_gate_beta wrapper; the default run is the heavy one.
+    add_test(NAME mfq-gdn-preparation-test COMMAND mfq-window-attention-test --gdn-preparation-check)
+    set_tests_properties(mfq-gdn-preparation-test PROPERTIES SKIP_RETURN_CODE 77)
     mfq_configure_cuda_runtime_target(mfq-nint-row-pipeline-test)
     target_link_libraries(mfq-nint-row-pipeline-test PRIVATE mfq-cuda-runtime)
 

@@ -33,6 +33,7 @@ _SOURCES = [
     os.path.join(_KERNEL_DIR, "attention", "ssm_conv.cu"),
     os.path.join(_KERNEL_DIR, "cache", "kv_cache.cu"),
     os.path.join(_KERNEL_DIR, "activation.cu"),
+    os.path.join(_BACKEND_DIR, "ops", "activation.cpp"),
     os.path.join(_KERNEL_DIR, "embedding.cu"),
     os.path.join(_KERNEL_DIR, "attention", "selected_attention.cu"),
     os.path.join(_KERNEL_DIR, "qwen4_exp.cu"),

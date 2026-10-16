@@ -684,6 +684,7 @@ int main(int argc,char** argv)try {
     } else if(argc==2 && std::string(argv[1])=="--gdn-core-bench")gdn_core_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-fixed-bench")gdn_core_benchmark(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-inplace-bench")gdn_core_benchmark(false,true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-preparation-check")gdn_preparation_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-default-check")gdn_prefill_pipeline_case(true);
@@ -705,6 +706,7 @@ int main(int argc,char** argv)try {
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     if(argc==1)std::cout<<"MFQ window QSA/GDN changing-position, rollback and fixed-state checks PASS\n";
     else if(std::string(argv[1])=="--gdn-core-check" || std::string(argv[1])=="--gdn-inplace-check")std::cout<<"MFQ GDN tile 4/2/1 exact checks PASS\n";
+    else if(std::string(argv[1])=="--gdn-preparation-check")std::cout<<"MFQ GDN preparation gate/beta exact checks PASS\n";
     else if(std::string(argv[1])=="--qsa-prefill-check")std::cout<<"MFQ QSA prefill fusion checks PASS\n";
     else if(std::string(argv[1])=="--qsa-sparse-gate-check")std::cout<<"MFQ QSA sparse gate exact checks PASS\n";
     else if(std::string(argv[1])=="--qsa-select-check")std::cout<<"MFQ QSA token selection exact checks PASS\n";
