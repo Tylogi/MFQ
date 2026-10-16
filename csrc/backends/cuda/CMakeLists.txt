@@ -93,7 +93,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nvq/backward.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/dequant.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/routed_reuse.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
@@ -120,13 +120,25 @@ set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_compact.cu PROPERTIE
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe/ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/device.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq/dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe/nint_whole.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
+# The tool-only backward units stay out of MFQ_CUDA_KERNEL_SOURCES: the Python
+# extension manifest and the SQ numeric test compile them.  They share one copy
+# of each format's decode and validation with the inference unit above.
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/mx_matmul_backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/mx_matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/mxfp4_sq_backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/mxfp4_sq_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/fp8_sq_backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/fp8_sq_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/nepq_residual_backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/nepq_residual_impl.cuh")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul_backward.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/quant/nint_matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh")
 set_source_files_properties(
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq/moe.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nvq/dequant.cu
     PROPERTIES OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh")
-set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq/backward.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/nvq/matmul_impl.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_backward.cuh;${MFQ_CUDA_KERNEL_ROOT}/quant/packed_nvq.cuh")
 set_source_files_properties(${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu PROPERTIES
     COMPILE_OPTIONS "--maxrregcount=80")
 target_compile_definitions(mfq-cuda-native-kernels PRIVATE
@@ -186,7 +198,9 @@ if(BUILD_TESTING)
     add_test(NAME mfq-cuda-mfe-expert-store-test
         COMMAND mfq-cuda-mfe-expert-store-test)
 
-    add_executable(mfq-mxfp4-sq-test ${MFQ_CUDA_ROOT}/tests/ops/mxfp4_sq_test.cu)
+    add_executable(mfq-mxfp4-sq-test
+        ${MFQ_CUDA_ROOT}/tests/ops/mxfp4_sq_test.cu
+        ${MFQ_CUDA_KERNEL_ROOT}/quant/mxfp4_sq_backward.cu)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-mxfp4-sq-test PRIVATE
@@ -223,6 +237,10 @@ if(BUILD_TESTING)
         ${MFQ_CUDA_ROOT}/tests/ops/nint_rows_test.cu
         mfq-cuda-native-kernels mfq-core)
     target_compile_definitions(mfq-nint-rows-cuda-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    mfq_add_cuda_test(mfq-nvq-dequant-test
+        ${MFQ_CUDA_ROOT}/tests/ops/nvq_dequant_test.cu
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-nvq-dequant-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_compile_definitions(mfq-nint-q8-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-packed-prefill-test

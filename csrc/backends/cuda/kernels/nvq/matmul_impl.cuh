@@ -76,7 +76,7 @@ namespace {
 
 using namespace mfq::cuda::packed_nvq;
 
-#if defined(MFQ_NVQ_BACKWARD)
+#if defined(MFQ_NVQ_DEQUANT)
 template <int FORMAT>
 __global__ void nvq_dequant_kernel(
     const uint8_t * indices,

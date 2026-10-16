@@ -1,4 +1,4 @@
-"""CUDA kernel tests for GDN and fused NINT GEMM; skipped unless nvcc and MSVC cl are on PATH."""
+"""CUDA kernel tests for GDN and fused NINT GEMM; skipped unless CUDA works, plus MSVC cl on Windows."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA 不可用", allow_module_level=True)
-if shutil.which("cl") is None and shutil.which("cl.exe") is None:
+if os.name == "nt" and shutil.which("cl") is None and shutil.which("cl.exe") is None:
     pytest.skip("MSVC cl 不在 PATH（source vcvars64 或用 Developer Prompt 运行）", allow_module_level=True)
 
 from mfq.kernels.cuda.gated_delta_net import gated_delta_net as gdn_cuda  # noqa: E402

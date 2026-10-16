@@ -10,24 +10,11 @@
 #include <type_traits>
 #include <utility>
 
-#include "packed_backward.cuh"
+#include "fp8_sq_impl.cuh"
 
 namespace {
 
 constexpr int kDirectPackedMaxRows = 48;
-
-struct Layout {
-    int outputs = 0;
-    int width = 0;
-    int block_rows = 0;
-    int block_columns = 0;
-    int scale_rows = 0;
-    int scale_columns = 0;
-    int scale_kind = 0;
-    std::size_t palettes = 0;
-    std::size_t symbols = 0;
-    std::size_t scales = 0;
-};
 
 __device__ __forceinline__ unsigned read_bits(
         const std::uint8_t* data, std::size_t index, int bits) {
@@ -319,98 +306,6 @@ __global__ void fp8_128_sq_mmq_kernel(
         blob, row_q, row_symbol_byte_offsets, input, output, layout, rows,
         expert_ids, expert_local, global_experts, local_experts,
         out_per_expert, routes, shared_input);
-}
-
-void validate_metadata(
-        const mfq_tensor_backend::Tensor& blob,
-        const mfq_tensor_backend::Tensor& row_q,
-        const mfq_tensor_backend::Tensor& row_symbol_byte_offsets,
-        const Layout& layout,
-        bool mxfp8) {
-    MFQ_RUNTIME_CHECK(
-        blob.is_cuda() && blob.scalar_type() == mfq_tensor_backend::kUInt8 &&
-        blob.dim() == 1 && blob.is_contiguous(),
-        "FP8-SQ blob must be contiguous rank-1 CUDA uint8");
-    MFQ_RUNTIME_CHECK(
-        row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
-        row_q.scalar_type() == mfq_tensor_backend::kUInt8 &&
-        row_q.dim() == 1 && row_q.is_contiguous() &&
-        row_q.numel() == layout.outputs &&
-        row_symbol_byte_offsets.is_cuda() &&
-        row_symbol_byte_offsets.get_device() == blob.get_device() &&
-        row_symbol_byte_offsets.scalar_type() == mfq_tensor_backend::kInt32 &&
-        row_symbol_byte_offsets.dim() == 1 &&
-        row_symbol_byte_offsets.is_contiguous() &&
-        row_symbol_byte_offsets.numel() == layout.outputs,
-        "FP8-SQ row metadata must be matching CUDA arrays");
-    MFQ_RUNTIME_CHECK(
-        layout.outputs > 0 && layout.width > 0 &&
-        layout.block_rows > 0 && layout.block_columns > 0 &&
-        layout.scale_rows == (layout.outputs + layout.block_rows - 1) /
-            layout.block_rows &&
-        layout.scale_columns == (layout.width + layout.block_columns - 1) /
-            layout.block_columns &&
-        layout.palettes < layout.symbols && layout.symbols <= layout.scales &&
-        layout.scales < static_cast<std::size_t>(blob.numel()),
-        "FP8-SQ layout metadata is inconsistent");
-    const std::size_t scale_count =
-        static_cast<std::size_t>(layout.scale_rows) * layout.scale_columns;
-    const std::size_t scale_itemsize = mxfp8 || layout.scale_kind == 1
-        ? 1
-        : layout.scale_kind == 4 ? 4 : 2;
-    MFQ_RUNTIME_CHECK(
-        scale_count <=
-            (static_cast<std::size_t>(blob.numel()) - layout.scales) /
-                scale_itemsize,
-        "FP8-SQ scale payload exceeds its blob");
-    if (mxfp8) {
-        MFQ_RUNTIME_CHECK(
-            layout.scale_kind == 1 &&
-            ((layout.block_rows == 1 && layout.block_columns == 32) ||
-             (layout.block_rows == 32 && layout.block_columns == 32) ||
-             (layout.block_rows == 128 && layout.block_columns == 128)),
-            "MXFP8-SQ scale contract is invalid");
-    } else {
-        MFQ_RUNTIME_CHECK(
-            layout.block_rows == 128 && layout.block_columns == 128 &&
-            (layout.scale_kind == 2 || layout.scale_kind == 3 ||
-             layout.scale_kind == 4),
-            "FP8-128SQ scale contract is invalid");
-    }
-}
-
-Layout make_layout(
-        std::int64_t outputs,
-        std::int64_t width,
-        std::int64_t block_rows,
-        std::int64_t block_columns,
-        std::int64_t scale_rows,
-        std::int64_t scale_columns,
-        std::int64_t scale_kind,
-        std::int64_t palettes,
-        std::int64_t symbols,
-        std::int64_t scales) {
-    MFQ_RUNTIME_CHECK(
-        outputs > 0 && outputs <= std::numeric_limits<int>::max() &&
-        width > 0 && width <= std::numeric_limits<int>::max() &&
-        block_rows > 0 && block_rows <= std::numeric_limits<int>::max() &&
-        block_columns > 0 && block_columns <= std::numeric_limits<int>::max() &&
-        scale_rows > 0 && scale_rows <= std::numeric_limits<int>::max() &&
-        scale_columns > 0 && scale_columns <= std::numeric_limits<int>::max() &&
-        palettes >= 0 && symbols >= 0 && scales >= 0,
-        "FP8-SQ host layout exceeds CUDA limits");
-    return {
-        static_cast<int>(outputs),
-        static_cast<int>(width),
-        static_cast<int>(block_rows),
-        static_cast<int>(block_columns),
-        static_cast<int>(scale_rows),
-        static_cast<int>(scale_columns),
-        static_cast<int>(scale_kind),
-        static_cast<std::size_t>(palettes),
-        static_cast<std::size_t>(symbols),
-        static_cast<std::size_t>(scales),
-    };
 }
 
 template <bool MXFP8, typename T>
@@ -715,38 +610,6 @@ void routed_matmul(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <bool MXFP8>
-mfq_tensor_backend::Tensor backward_input(
-        mfq_tensor_backend::Tensor blob,
-        mfq_tensor_backend::Tensor row_q,
-        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
-        mfq_tensor_backend::Tensor output_gradient,
-        Layout layout) {
-    validate_metadata(blob, row_q, row_symbol_byte_offsets, layout, MXFP8);
-    MFQ_RUNTIME_CHECK(
-        output_gradient.is_cuda() &&
-        output_gradient.get_device() == blob.get_device() &&
-        output_gradient.dim() == 2 && output_gradient.is_contiguous() &&
-        output_gradient.size(1) == layout.outputs &&
-        output_gradient.size(0) <= std::numeric_limits<int>::max() &&
-        (output_gradient.scalar_type() == mfq_tensor_backend::kFloat16 ||
-         output_gradient.scalar_type() == mfq_tensor_backend::kBFloat16 ||
-         output_gradient.scalar_type() == mfq_tensor_backend::kFloat32),
-        "FP8-SQ backward requires contiguous CUDA FP16/BF16/FP32 [M,N]");
-    const MfqCudaGuard guard(blob.device());
-    auto result = mfq_tensor_backend::empty(
-        {output_gradient.size(0), layout.width}, output_gradient.options());
-    if (output_gradient.size(0) == 0) return result;
-    auto weight = dequant<MXFP8>(
-        blob, row_q, row_symbol_byte_offsets, layout, false);
-    mfq_packed_backward::launch_dense_half_weight(
-        output_gradient, weight, result,
-        static_cast<int>(output_gradient.size(0)),
-        layout.outputs, layout.width, mfq_current_cuda_stream());
-    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-    return result;
-}
-
 } // namespace
 
 mfq_tensor_backend::Tensor mxfp8_sq_dequant_cuda(
@@ -814,41 +677,6 @@ mfq_tensor_backend::Tensor fp8_128_sq_matmul_cuda(
     return matmul<false>(
         std::move(blob), std::move(row_q),
         std::move(row_symbol_byte_offsets), std::move(input),
-        make_layout(outputs, width, 128, 128,
-                    (outputs + 127) / 128, (width + 127) / 128,
-                    scale_kind, palettes_offset, symbols_offset, scales_offset));
-}
-
-mfq_tensor_backend::Tensor mxfp8_sq_backward_input_cuda(
-        mfq_tensor_backend::Tensor blob,
-        mfq_tensor_backend::Tensor row_q,
-        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
-        mfq_tensor_backend::Tensor output_gradient,
-        std::int64_t outputs, std::int64_t width,
-        std::int64_t block_rows, std::int64_t block_columns,
-        std::int64_t scale_rows, std::int64_t scale_columns,
-        std::int64_t palettes_offset, std::int64_t symbols_offset,
-        std::int64_t scales_offset) {
-    return backward_input<true>(
-        std::move(blob), std::move(row_q),
-        std::move(row_symbol_byte_offsets), std::move(output_gradient),
-        make_layout(outputs, width, block_rows, block_columns,
-                    scale_rows, scale_columns, 1,
-                    palettes_offset, symbols_offset, scales_offset));
-}
-
-mfq_tensor_backend::Tensor fp8_128_sq_backward_input_cuda(
-        mfq_tensor_backend::Tensor blob,
-        mfq_tensor_backend::Tensor row_q,
-        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
-        mfq_tensor_backend::Tensor output_gradient,
-        std::int64_t outputs, std::int64_t width,
-        std::int64_t scale_kind,
-        std::int64_t palettes_offset, std::int64_t symbols_offset,
-        std::int64_t scales_offset) {
-    return backward_input<false>(
-        std::move(blob), std::move(row_q),
-        std::move(row_symbol_byte_offsets), std::move(output_gradient),
         make_layout(outputs, width, 128, 128,
                     (outputs + 127) / 128, (width + 127) / 128,
                     scale_kind, palettes_offset, symbols_offset, scales_offset));
