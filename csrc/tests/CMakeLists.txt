@@ -9,6 +9,10 @@ find_program(MFQ_PYTHON_EXECUTABLE NAMES python3 python)
 if(MFQ_PYTHON_EXECUTABLE)
     add_test(NAME mfq-engine-include-graph-test
         COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_engine_include_graph.py)
+    add_test(NAME mfq-cuda-include-graph-test
+        COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_cuda_include_graph.py)
+    add_test(NAME mfq-layer-independence-test
+        COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_layer_independence.py)
 endif()
 
 add_executable(mfq-cuda-tensor-view-test
