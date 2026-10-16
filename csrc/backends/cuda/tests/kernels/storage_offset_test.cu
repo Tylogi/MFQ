@@ -1,4 +1,5 @@
 #include "kernels/cache/ops.h"
+#include "kernels/kernels.h"
 #include "kernels/quant_ops.h"
 
 #include <array>
@@ -65,6 +66,16 @@ static void embedding_cases() {
                                         expected.data() + t * width);
                     exact(embedding_lookup_cuda(weight.view, indices.view),
                           tensor(expected).reshape({tokens, width}).to(dtype));
+                    // The same fixture through the raw launcher: the wrapper is
+                    // only validation, allocation and the stream.
+                    auto raw = empty({tokens, width},
+                                     TensorOptions().device(kCUDA).dtype(dtype));
+                    mfq::cuda::kernels::dense_embedding_lookup(
+                        weight.view.data_ptr(), dtype,
+                        indices.view.data_ptr<int64_t>(), raw.data_ptr(),
+                        tokens, width, vocabulary, mfq_current_cuda_stream());
+                    MFQ_CUDA_CHECK(cudaGetLastError());
+                    exact(raw, tensor(expected).reshape({tokens, width}).to(dtype));
                     weight.guards();
                     indices.guards();
                 }

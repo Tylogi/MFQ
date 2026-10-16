@@ -237,10 +237,13 @@ if(BUILD_TESTING)
     mfq_add_cuda_test(mfq-nint-q8-test
         ${MFQ_CUDA_ROOT}/tests/ops/nint_q8_test.cu
         mfq-cuda-native-kernels)
+    # The allocating embedding wrappers live in mfq-cuda-ops, so this test links
+    # the runtime target that carries them.
     mfq_add_cuda_test(mfq-nint-rows-cuda-test
         ${MFQ_CUDA_ROOT}/tests/ops/nint_rows_test.cu
-        mfq-cuda-native-kernels mfq-core)
-    target_compile_definitions(mfq-nint-rows-cuda-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+        mfq-cuda-native-kernels mfq-core mfq-cuda-runtime)
+    target_compile_definitions(mfq-nint-rows-cuda-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     mfq_add_cuda_test(mfq-nvq-dequant-test
         ${MFQ_CUDA_ROOT}/tests/ops/nvq_dequant_test.cu
         mfq-cuda-native-kernels)
@@ -268,8 +271,9 @@ if(BUILD_TESTING)
         ${MFQ_CUDA_ROOT}/tests/native/native_tensor_cuda_test.cu)
     mfq_add_cuda_test(mfq-cuda-storage-offset-test
         ${MFQ_CUDA_ROOT}/tests/kernels/storage_offset_test.cu
-        mfq-cuda-native-kernels)
-    target_compile_definitions(mfq-cuda-storage-offset-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+        mfq-cuda-native-kernels mfq-cuda-runtime)
+    target_compile_definitions(mfq-cuda-storage-offset-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     mfq_add_cuda_test(mfq-flash-next-test
         ${MFQ_CUDA_ROOT}/tests/kernels/flash_next_test.cpp
         mfq-cuda-native-kernels mfq-json mfq-models)
@@ -372,6 +376,7 @@ set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/activation.cpp
+    ${MFQ_CUDA_ROOT}/ops/embedding.cpp
     ${MFQ_CUDA_ROOT}/ops/execution/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp

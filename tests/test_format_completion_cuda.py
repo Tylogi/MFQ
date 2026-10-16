@@ -20,6 +20,7 @@ from mfq.kernels.cuda.mx_matmul import (  # noqa: E402
 from mfq.kernels.cuda.nint8_zero_matmul import (  # noqa: E402
     nint8_zero_backward_input,
     nint8_zero_dequantize,
+    nint8_zero_embedding,
     nint8_zero_matmul,
     to_gpu_nint8_zero,
 )
@@ -271,6 +272,28 @@ def test_nint8_zero_native_matmul_matches_packed_reference(
     else:
         expected = source.float() @ dense.float().T
     torch.testing.assert_close(actual, expected.half().float(), rtol=0.004, atol=0.02)
+
+
+def test_nint8_zero_embedding_decodes_only_selected_rows():
+    rng = np.random.default_rng(1616)
+    rows, width = 13, 96
+    tensor = Nint8ZeroTensor(
+        shape=(rows, width),
+        axis=0,
+        scale=rng.uniform(0.001, 0.02, (rows, width // 32)).astype(np.float16),
+        q=rng.integers(-127, 128, (rows, width // 32, 32)).astype(np.int8),
+        neuron_len=width,
+    )
+    weight = to_gpu_nint8_zero(tensor)
+    ids = torch.tensor([0, rows - 1, 3, -1, rows, 3], device="cuda", dtype=torch.int64)
+    dense = nint8_zero_dequantize(weight)
+    valid = (ids >= 0) & (ids < rows)
+    gathered = dense[ids.clamp(min=0, max=rows - 1)]
+    expected = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
+    # The selected-row decode uses the same Half rounding as the full decode, so
+    # the comparison is exact; out-of-range ids give an exact zero row.
+    torch.testing.assert_close(
+        nint8_zero_embedding(weight, ids), expected, atol=0, rtol=0)
 
 
 def test_nint8_zero_packed_backward_and_autograd_match_dequant():

@@ -609,6 +609,52 @@ def test_embedding_lookup_cuda_f32():
     torch.testing.assert_close(embedding(weight, ids), weight[ids], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_embedding_lookup_cuda_vector_path_invalid_ids_stream_and_graph(dtype):
+    # 72 tokens over a 16-wide row is the vector launch (>=64 tokens, row bytes a
+    # multiple of uint4); out-of-range ids must zero-fill instead of wrapping.
+    torch.manual_seed(28)
+    vocabulary, width = 5, 16
+    weight = torch.randn(vocabulary, width, device=DEV, dtype=dtype)
+    ids = torch.arange(-2, 70, device=DEV, dtype=torch.int64)
+    valid = (ids >= 0) & (ids < vocabulary)
+    gathered = weight[ids.clamp(min=0, max=vocabulary - 1)]
+    expected = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
+    torch.testing.assert_close(embedding(weight, ids), expected, atol=0, rtol=0)
+
+    # The wrapper keeps the token-ID shape, so a rank-10 id tensor stays valid.
+    shaped = ids.reshape((1,) * 9 + (ids.numel(),))
+    high_rank = embedding(weight, shaped)
+    assert tuple(high_rank.shape) == (1,) * 9 + (ids.numel(), width)
+    torch.testing.assert_close(
+        high_rank, expected.reshape(high_rank.shape), atol=0, rtol=0)
+
+    module = ext()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    warm = None
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            warm = module.embedding_lookup_cuda(weight, ids)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.testing.assert_close(warm, expected, atol=0, rtol=0)
+    graph_ids = ids.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = module.embedding_lookup_cuda(weight, graph_ids)
+    # Replay must read the live ids, not the values captured during warmup.
+    graph_ids.copy_(torch.arange(graph_ids.numel(), device=DEV, dtype=torch.int64))
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_valid = (graph_ids >= 0) & (graph_ids < vocabulary)
+    replay_gathered = weight[graph_ids.clamp(min=0, max=vocabulary - 1)]
+    torch.testing.assert_close(
+        captured,
+        torch.where(replay_valid[:, None], replay_gathered,
+                    torch.zeros_like(replay_gathered)),
+        atol=0, rtol=0)
+
+
 def test_nint_embedding_lookup_matches_dequant_rows():
     torch.manual_seed(28); np.random.seed(28)
     vocab, D = 32, 70

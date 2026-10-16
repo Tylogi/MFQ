@@ -1,3 +1,4 @@
+#include "kernels/kernels.h"
 #include "kernels/quant_ops.h"
 #include "../../../../tests/quant/nint_row_fixture.h"
 #include <cstring>
@@ -62,6 +63,41 @@ void check(int width, int gs, int k, bool adaptive, int& cases) {
     table.append_rows(ids, sizeof(ids) / sizeof(ids[0]), parallel, 12);
     check_batch(parallel, cases, false);
 }
+void check_inverse(const mfq::NintRowBatch& batch, int& cases) {
+    batch.validate();
+    const Device gpu{kCUDA, 0};
+    auto packed = tensor(batch.packed()).to(gpu);
+    std::vector<std::int32_t> words(batch.descriptors().size());
+    std::memcpy(words.data(), batch.descriptors().data(), words.size() * 4);
+    auto descriptors = tensor(words).reshape({static_cast<int64_t>(batch.rows()), 6}).to(gpu);
+    // The repeated source row keeps this inverse from being a permutation.
+    std::vector<std::int64_t> inverse;
+    for (std::size_t row = 0; row < batch.rows(); ++row)
+        inverse.push_back(static_cast<std::int64_t>(batch.rows() - 1 - row));
+    inverse.push_back(0);
+    std::vector<float> reference;
+    for (const auto source : inverse)
+        for (int col = 0; col < batch.width(); ++col)
+            reference.push_back(mfq::test::row_value(batch, static_cast<std::size_t>(source), col));
+    auto expected = tensor(reference)
+        .reshape({static_cast<int64_t>(inverse.size()), batch.width()}).to(gpu, kFloat16);
+    auto output = tensor(std::vector<float>(inverse.size() * batch.width(), 0.0f))
+        .reshape({static_cast<int64_t>(inverse.size()), batch.width()}).to(gpu, kFloat16);
+    auto inverse_rows = tensor(inverse).to(gpu);
+    mfq::cuda::kernels::nint_selected_rows(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const std::uint32_t*>(descriptors.data_ptr<std::int32_t>()),
+        inverse_rows.data_ptr<std::int64_t>(),
+        reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+        static_cast<std::size_t>(output.numel()), batch.width(),
+        mfq_current_cuda_stream());
+    MFQ_CUDA_CHECK(cudaGetLastError());
+    auto a = output.cpu().contiguous(), b = expected.cpu().contiguous();
+    require(a.sizes() == b.sizes() && a.scalar_type() == kFloat16 &&
+                std::memcmp(a.data_ptr(), b.data_ptr(), a.nbytes()) == 0,
+            "selected row inverse mapping differs");
+    ++cases;
+}
 }
 int main() {
     try {
@@ -81,6 +117,7 @@ int main() {
         mfq::NintRowBatch cross;
         first.append_row(512, cross); second.append_row(257, cross); first.append_row(0, cross);
         check_batch(cross, cases, false);
+        check_inverse(cross, cases);
         const Device gpu{kCUDA, 0};
         auto empty = nint_selected_rows_cuda(tensor(std::vector<std::uint8_t>{}).to(gpu),
             tensor(std::vector<std::int32_t>{}).reshape({0,6}).to(gpu), 160);

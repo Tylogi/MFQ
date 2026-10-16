@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """G3 source isolation: a shared CUDA kernel unit must not reach a Tensor backend.
 
-``kernels/activation.cu`` holds the device bodies and the ``TensorView`` +
-``cudaStream_t`` launchers only.  The allocating, validating wrappers live in
-``ops/activation.cpp``, the one unit of the pair that may include
-``native/tensor/backend.h``.  This check walks the include closure of every
+``kernels/activation.cu`` and ``kernels/embedding.cu`` hold the device bodies and
+the launchers only (``TensorView`` + ``cudaStream_t`` for activation, raw
+pointers + ``cudaStream_t`` for embedding).  The allocating, validating wrappers
+live in ``ops/activation.cpp`` and ``ops/embedding.cpp``, the one unit of each
+pair that may include ``native/tensor/backend.h``.  This check walks the include closure of every
 registered kernel unit and fails when it reaches that dual-mode backend header or
 a Torch/ATen/c10/pybind header, so the kernel unit compiles with either backend
 mode or with neither.
@@ -30,10 +31,10 @@ CSRC = os.path.join(REPO, "csrc")
 BACKEND = os.path.join(CSRC, "backends", "cuda")
 
 # Kernel units that must stay free of any Tensor backend, under kernels/.
-KERNEL_DIR_UNITS = ("activation.cu",)
+KERNEL_DIR_UNITS = ("activation.cu", "embedding.cu")
 # Adapter units that own the validation, allocation, view and stream work, and
 # are compiled by both the native ops target and the Python extension manifest.
-ADAPTER_UNITS = ("ops/activation.cpp",)
+ADAPTER_UNITS = ("ops/activation.cpp", "ops/embedding.cpp")
 KERNEL_UNITS = tuple(f"kernels/{unit}" for unit in KERNEL_DIR_UNITS)
 
 BACKEND_HEADER = "native/tensor/backend.h"
