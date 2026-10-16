@@ -177,6 +177,18 @@ Python 侧不 include 任何 engine 私有头，但 `mfq/kernels/cuda/_ext.py:52
 - 未删除任何运行路径：本阶段只新增脚本与本文件，并撤销一个改名回归。
 - 表填完只代表记录完成：上表里只有 CUDA × qwen35 一列是真跑过的，其余列不得当成已验收。
 
+## R1：native 命名与 Python CUDA 扩展
+
+| 项 | 状态 |
+| --- | --- |
+| `native/`、`tests/native/`、`mfq-cuda-native` 与引用恢复 | 完成（`97a58dc7`），普通与通信关闭构建通过 |
+| 扩展源码清单存在性检查 | 完成：`tests/test_cuda_ext_sources.py` 直接读 `_ext.py` 的 `_SOURCES`，不导入 torch |
+| 统一扩展真实编译 / 加载 / 代表性算子数值 | **未验收**，见下 |
+
+统一扩展把 26 个 `.cu` 交给 torch `cpp_extension`，ninja 默认按 CPU 核数并发，单个 `cicc`/`ptxas` 峰值 1–2GB，24 并发直接打穿 32GB 主机。12:01 尝试时内核 OOM killer 杀掉了正在跑的 `strata` 服务（pid 1623662，GPU 43330 MiB）和编译自身，未产出可用扩展。
+
+重跑前提：那个服务不在跑，或显式限制并发（`MAX_JOBS=2 TORCH_EXTENSIONS_DIR=/tmp/... .venv/bin/python -m pytest tests/test_activation_bridge_cuda.py`）。主机只剩 30GB、且已有服务常驻时不得跑该编译。
+
 ## 阶段 1（CUDA）已落地的结构
 
 基线 `4bce8b5c` 之后，CUDA 侧的阶段 1 结构变更（`951e9bcd..97a58dc7`）：
@@ -188,7 +200,7 @@ Python 侧不 include 任何 engine 私有头，但 `mfq/kernels/cuda/_ext.py:52
 | Store 所有权 | `CudaExecutionContext` 用 `CudaStores` 持有 `moe_expert_cache`、`qsa_kv_store`；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用，不再自己拥有 KV 池 |
 | `backends/cuda/native/` → `device/`（已撤销） | 改名打断 `mfq/kernels/cuda/_ext.py:52` 的 `native/env.cpp`，且计划明确保留 `native/` 命名；`97a58dc7` 撤销目录、库名与引用 |
 
-后端层序不变：`device -> kernels -> ops -> storage -> models -> engine`，跨目录 include 必须带目录前缀。
+后端层序不变：`native -> kernels -> ops -> storage -> models -> engine`，跨目录 include 必须带目录前缀。
 
 依赖检查（每条规则都带正/反例 fixture，规则失效会单独失败）：
 
