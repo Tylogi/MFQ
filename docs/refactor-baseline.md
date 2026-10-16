@@ -68,20 +68,23 @@
 
 ## 重跑方法
 
-采集脚本已入库：`scripts/stage0-matrix.sh <build-dir> <out-dir>`。它串行跑上面全部格子，每格保留完整日志、退出码、GPU 采样（`gpu.before`/`gpu.samples`/`gpu.peak`，峰值按差值算）和 `/usr/bin/time -v` 的主机 RSS。权重与输入用 `MFQ_MODEL`/`MFQ_IDS` 覆盖，默认就是上表的 0.8B 与 12 token trace。
+采集脚本已入库：`scripts/stage0-matrix.sh <build-dir> <out-dir>`。它串行跑上面全部格子，每格写入 `$OUT/results.tsv`：格名、状态（`pass` / `fail` / `missing-env` / `untested`）、退出码、主机 RSS、完整命令和关键输出，同时保留完整日志。GPU 采样（`gpu.before`/`gpu.samples`/`gpu.peak`）是整轮峰值差值，不是逐格；只有 `long_decode_rss` 有主机 RSS，其余格留空。尾延迟、logits 基线、随机采样分布三行以 `untested` 写入，不假装采集过。任一格 `fail` 则脚本退出非 0；`missing-env` 不算失败但会出现在汇总计数里。已用假 `mfq-diagnostics`（固定退出 7）验证：11 格全部记为 `fail`，脚本退出 1。权重与输入用 `MFQ_MODEL`/`MFQ_IDS` 覆盖，默认就是上表的 0.8B 与 12 token trace。
 
 ## 旧构建的串行对照
 
-不保留任何旧构建产物，只保留复现方法：在 `refactor/cuda` 上切回基线 commit 重编，跑同一组命令，再切回来。
+不保留任何旧构建产物，只保留复现方法。脚本在 `refactor/cuda` 上，旧版单独编到 `build-base`，切回分支后用同一份脚本分别指向两个构建目录：
 
 ```bash
 git checkout 4bce8b5c
-cmake -S csrc -B build -DMFQ_CUDA_ARCHITECTURES=86 -DMFQ_BUILD_METAL_RUNTIME=OFF \
+cmake -S csrc -B build-base -DMFQ_CUDA_ARCHITECTURES=86 -DMFQ_BUILD_METAL_RUNTIME=OFF \
       -DMFQ_BUILD_RUNTIME_COMMUNICATION=ON -DBUILD_TESTING=ON
-cmake --build build -j 12      # 退出 0
-sh scripts/stage0-matrix.sh build /tmp/s0-base
-git checkout refactor/cuda
+cmake --build build-base -j 12      # 退出 0
+git checkout refactor/cuda          # 脚本回到工作树，旧构建目录不动
+sh scripts/stage0-matrix.sh build-base /tmp/s0-base   # 旧版结果
+sh scripts/stage0-matrix.sh build    /tmp/s0-head    # 新版结果
 ```
+
+`build-base` 对应 `4bce8b5c`，`build` 对应当前 HEAD；两个结果目录里的 `results.tsv` 就是对照物。旧提交里没有采集脚本，所以不能先 checkout 再跑脚本。
 
 | 项 | 基线 `4bce8b5c` | HEAD `97a58dc7` |
 | --- | --- | --- |
@@ -96,31 +99,66 @@ git checkout refactor/cuda
 | continuous batching 计数器 | `paged=1 captures=6 prewarms=6 replays=59 prefill_cancel=1 slot_reuse=1`，`readbacks=46 batches=46 mixed_seed_replay=1` | 完全相同 | 一致 |
 | MTP 正确性 | `PASS full_chain=1 greedy_tokens=96 stochastic_smoke_tokens=8`，`batched_linear_layers=18 ffn_calls=342` | 相同 | 一致 |
 | attention decode 误差 | `rel=4.27181e-4 max_abs=1.89751e-4` | 相同 | 一致 |
-| prefill 吞吐 m=128/512/1024 | 14037 / 25653 / 28521 tok/s | 14017 / 25644 / 28525 | 一致（<0.2%） |
+| prefill 吞吐 m=128/512/1024 | 14037 / 25653 / 28521 tok/s | 14017 / 25644 / 28525 | **待复测**，见下 |
 | 主机 RSS 峰值 | 1,330,624 KB | 1,330,996 KB | 一致 |
 | GPU 增量峰值（ctx 4096） | 3579 MiB | 3547 MiB | 一致 |
 
-时间类判据不能跨运行比较。同一个基线二进制连跑两次，decode_tps 从 157.8 掉到 103.3，attention `speedup` 从 5.50 变到 9.24，prefill 吞吐却几乎不动——外部占用只影响 decode 的排队。TTFT、吞吐、尾延迟要在 GPU 空闲时重采才进表。
+时间类判据不能跨运行比较。同一个基线二进制连跑两次，decode_tps 从 157.8 掉到 103.3，attention `speedup` 从 5.50 变到 9.24。prefill 也不是稳定的：同一个基线二进制重跑，吞吐呰了一半。
+
+| 输入长度 | 第一次基线 tok/s | 第二次基线 tok/s |
+| --- | ---: | ---: |
+| 128 | 14037.4 | 7907.59 |
+| 512 | 25652.7 | 13047.4 |
+| 1024 | 28520.5 | 14330.8 |
+
+因此“prefill 吞吐几乎不动”和“外部占用只影响 decode 排队”两个断言都撤回，prefill 性能够成待复测；GPU 空闲时重采后才能进表。已保留的只有功能正确性结论（token 序列、计数器、MTP 链路、attention 误差）。
 
 MTP bench 的 `accepted` 自身有抖动：`prompt=3 repeat=0 warmup=0` 样本在基线两次运行里分别是 `accepted=2` 和 `accepted=18`，`cycles` 都是 22。所以 `--bench-qwen35-mtp` 只能证明“跑通且 greedy 对齐”，不能当 MTP 收益证据。
 
 ## 功能矩阵（后端 × family × 功能）
 
-CUDA 列来自上面的基线/HEAD 对照；Metal 列来自源码与 `docs/runtime-support.md`，本机无 macOS/MLX，全部记未测，不得凭目录写成通过。
+状态只用：通过 / 失败 / 缺环境 / 未测，另加 缺权重 和 不支持（该后端没有这个机制）。每格只说该 family 在该后端的证据，不用其他 family 的结果或别的环境限制代替。
 
-| 功能 | CUDA × qwen35（0.8B） | CUDA × 其余 family | Metal |
-| --- | --- | --- | --- |
-| 加载 | 通过，`load_sec=2.26–2.63` | 27B-FP8 未跑；flash-next、dsv4 缺环境；4 个 family 缺权重 | 未测（5 个 family 有实现） |
-| greedy decode | 通过，31/127 token，序列与基线逐 token 相同 | 同上 | 未测（`mfq-metal-sampling-test`、`mfq-metal-qwen35-causal-lm-test` 需 macOS） |
-| 交错 batch | 通过，`PASS requests=2 paused_ticks=4 cancellation=1 session_reuse=1` | 未测 | **不支持**：`mlx_engine.h` 的 `can_batch()` 直接返回 `false`，`execute()` 是空实现 |
-| chunked prefill | 通过，`mfq-cuda-execution-scope-test`（`prefill_chunk_size=8`）；`mfq-cuda-runtime-state-test` 的“一个 chunk 后让出”用例缺环境 | 未测 | 未测 |
-| prefill 吞吐 | 通过，14017 / 25644 / 28525 tok/s（m=128/512/1024） | 未测 | 未测 |
-| session / prefix | 通过但弱：`session_reuse=1` + `mfq-paged-prefix-cache-test`、`mfq-session-snapshot-cache-test`；`--check-text-session-state` 只检查声明，不验证混合状态 save/restore | 缺权重 | 有 `mlx_paged_session_codec` 与 `mfq-metal-paged-session-codec-test`，未测 |
-| MTP | 通过（正确性），`full_chain=1 greedy_tokens=96`；性能格不可比（接受率抖动） | 未测 | 有 `mlx_mtp`、`mfq-metal-mtp-test`、`mfq-metal-mtp-ttt-test`，未测 |
-| CUDA Graph | 通过，`captures=6 prewarms=6 replays=59`；ordinary bench `graph_captures=1 graph_reuses=11` | 未测 | **该机制不存在**：Metal 目录 0 处 `DecodeGraph` 引用 |
-| offload / expert streaming | 缺环境（`mfq-cuda-runtime-state-test` 显存不足）；策略单测通过：`mfq-cpu-expert-pool-test`、`mfq-host-expert-cache-test`、`mfq-cuda-qsa-kv-offload-test` | 27B / 157GB 缺环境 | 有 `mlx_qsa_kv_offload` 与 `mfq-metal-ssd-expert-arena-test`，未测 |
-| 媒体（视觉/音频/TTS/Duplex） | 缺权重（minicpmo45）；`mfq-grid-vision-test` 通过但只是 fixture | 缺权重 | 有 `mlx_grid_vision`、`mlx_axial_patch_vision`、`mlx_multimodal`，未测 |
-| 并行（TP/EP/多卡） | 未测（单卡）：`--check-tp-*`、`--check-ep-moe` 未运行；`mfq-tensor-parallel-test`、`mfq-host-parallel-test` 通过但只是 fixture | 缺环境 | 依赖 `libjaccl`，未测 |
+### CUDA × 本机有权重的 family
+
+| family | 加载 | greedy decode | 交错 batch | chunked prefill | prefill 吞吐 | session/prefix | MTP | CUDA Graph | offload/streaming | 并行 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen35` 0.8B | 通过 `load_sec=2.26–2.63` | 通过，31/127 token 逐 token 同基线 | 通过 `PASS requests=2 paused_ticks=4 cancellation=1 session_reuse=1` | 缺环境，见下节 | 待复测（重复样本差 50%） | 通过但弱：`session_reuse=1` + `mfq-paged-prefix-cache-test`、`mfq-session-snapshot-cache-test`；`--check-text-session-state` 只检查声明 | 通过（正确性 `full_chain=1 greedy_tokens=96`）；性能格不可比 | 通过 `captures=6 prewarms=6 replays=59`，ordinary bench `graph_captures=1 graph_reuses=11` | 缺环境（`mfq-cuda-runtime-state-test` 显存不足）；策略单测通过：`mfq-cpu-expert-pool-test`、`mfq-host-expert-cache-test`、`mfq-cuda-qsa-kv-offload-test` | 未测（单卡）：`--check-tp-*`、`--check-ep-moe` 未运行 |
+| `qwen35` 27B-FP8 | 未测（32GB 主机 + 显存被占） | 未测 | 未测 | 未测 | 未测 | 未测 | 未测 | 未测 | 未测 | 未测 |
+| `qwen4_exp`（Flash-Next FP8，173GB） | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境（`--check-flash-next-mtp` 未运行） | 缺环境 | 缺环境 | 缺环境 |
+| `deepseek_v4`（157GB） | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境 | 缺环境（需 SSD 驻留路径） | 缺环境 |
+
+### CUDA × 缺权重的 family（所有功能格 = 缺权重）
+
+| family | 本机权重 | 已有的 fixture 级证据 |
+| --- | --- | --- |
+| `deepseek_v41` | 无 | `mfq-deepseek-v41-config-test`、`mfq-deepseek-v41-hc-test`、`mfq-deepseek-v41-runtime-check` |
+| `gemma4` | 无 | `--check-gemma4-swa` 未运行 |
+| `glm_dsa` | 无 | `--check-glm-dsa` 未运行 |
+| `glm5_next` | 无 | 无 |
+| `minicpmo45` | 无 | 无端到端证据；`mfq-grid-vision-test` 通过但只是视觉几何 fixture，不是本 family 的媒体能力 |
+
+媒体能力（视觉/音频/TTS/Duplex）只归属 `minicpmo45`，不记在 `qwen35` 名下。
+
+### Metal × family
+
+Metal 共 55 个 CTest 全部要求 macOS/MLX，本机一个都跑不了：除下表标出的机制缺失外，一律未测。机制缺失按源码事实记不支持，不用它推断公共契约失败。
+
+| family | 加载 | greedy decode | 交错 batch | session/prefix | MTP | Graph | offload | 媒体 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen35` | 未测 | 未测（`mfq-metal-qwen35-causal-lm-test`、`mfq-metal-sampling-test`） | **不支持**：`mlx_engine.h` 的 `can_batch()` 返回 `false`，`execute()` 是空实现 | 有 `mlx_paged_session_codec` 与 `mfq-metal-paged-session-codec-test`，未测 | 有 `mlx_mtp`、`mfq-metal-mtp-test`、`mfq-metal-mtp-ttt-test`，未测 | **不支持**：Metal 目录 0 处 `DecodeGraph` 引用 | 有 `mlx_qsa_kv_offload` 与 `mfq-metal-ssd-expert-arena-test`，未测 | 有 `mlx_grid_vision`、`mlx_axial_patch_vision`、`mlx_multimodal`，未测 |
+| `deepseek_v4` | 未测 | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
+| `deepseek_v41` | 未测 | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
+| `flash_next` | 未测（`mlx_qwen4_causal_lm.cpp`） | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
+| `minicpmo45` | 未测 | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
+
+### chunked prefill 为什么记缺环境
+
+`mfq-cuda-execution-scope-test` 的模型分支（`prefill_chunk_size=8`、两个 engine）只在 `argc == 3` 时执行，需要 `<model> <tokenizer-gguf>`。CTest 注册命令不带参数，所以 CTest 通过不能证明该格验证过。本机没有任何带 tokenizer 元数据的 GGUF：手动传 `tokenizer.json` 报 `cannot load tokenizer metadata from GGUF`。测试现在缺参数时会打印 `model_branch=skipped chunked_prefill needs <model> <tokenizer-gguf>`，日志里能直接看出该分支没跑。补齐条件：拿到一个 tokenizer GGUF 后跑
+
+```bash
+build/cuda/mfq-cuda-execution-scope-test ~/models/Qwen/Qwen3.5-0.8B <tokenizer.gguf>
+```
 
 矩阵里故意缺三项，不要当成已采集：
 
@@ -144,17 +182,48 @@ CUDA 列来自上面的基线/HEAD 对照；Metal 列来自源码与 `docs/runti
 
 加载、session 恢复、生成、MTP、KL 评估五件事共用一次宏展开。新链只换类型名而不迁这五处，旧协议会继续留在工厂里。
 
-engine 私有头（`requests/batch/state/weights/executor/text/src`）在 `csrc/engine/` 之外共 38 个消费者：
+engine 私有头（`requests/batch/state/weights/executor/text/src`）在 `csrc/engine/` 之外共 38 个消费者，路径相对 `csrc/`：
 
-| 区域 | 文件数 | 用到的私有头 |
-| --- | --- | --- |
-| `backends/cuda/engine` | 7 | `table.h` `instance.h` `flow.h` `step.h` `settings.h` `inference.h` `policy.h` `speculate.h` `profile.h` |
-| `backends/cuda/storage` | 6 | `settings.h` `sessions.h` `pages.h` `slots.h` `profile.h` `ranker.h` |
-| `backends/cuda/models`、`ops` | 4 | `predictor.h` `policy.h` `sampling.h` |
-| `backends/cuda/diagnostics` | 1 | `table.h`（`runtime_checks.cpp`） |
-| `backends/cuda/tests` | 1 | `table.h`（`batch_execution_test.cpp`） |
-| `backends/metal` | 6 | `table.h` `step.h` `depth.h` `tokenizer.h` `constraint.h` `settings.h` |
-| `tests/engine`、`tests/moe` | 12 | 各私有头 + `slots.h` `profile.h` |
+| 消费者 | 用到的私有头 |
+| --- | --- |
+| `backends/cuda/diagnostics/runtime_checks.cpp` | `table.h` |
+| `backends/cuda/engine/batch_execution.h` | `driver.h` `step.h` |
+| `backends/cuda/engine/cuda_engine.cpp` | `flow.h` `instance.h` `table.h` |
+| `backends/cuda/engine/cuda_runtime_config.h` | `settings.h` |
+| `backends/cuda/engine/generation.cpp` | `flow.h` |
+| `backends/cuda/engine/generation.h` | `step.h` |
+| `backends/cuda/engine/load_options.cpp` | `profile.h` |
+| `backends/cuda/engine/minicpmo_components.h` | `inference.h` |
+| `backends/cuda/engine/mtp.cpp` | `inference.h` `policy.h` `speculate.h` |
+| `backends/cuda/models/common/mtp.h` | `predictor.h` |
+| `backends/cuda/models/minicpmo45/components.h` | `policy.h` `sampling.h` |
+| `backends/cuda/ops/execution/cuda_sampling.h` | `sampling.h` |
+| `backends/cuda/storage/session/text_cache.cpp` | `settings.h` |
+| `backends/cuda/storage/session/text_cache_impl.h` | `sessions.h` |
+| `backends/cuda/storage/state/batch_paged.h` | `pages.h` |
+| `backends/cuda/storage/weights/moe/cached_source_internal.h` | `slots.h` |
+| `backends/cuda/storage/weights/moe/expert_cache.h` | `profile.h` |
+| `backends/cuda/storage/weights/moe/host_expert_cache.h` | `slots.h` |
+| `backends/cuda/storage/weights/moe/residency.cpp` | `ranker.h` |
+| `backends/cuda/tests/engine/batch_execution_test.cpp` | `table.h` |
+| `backends/metal/models/flash_next/mlx_qwen4_causal_lm.cpp` | `settings.h` |
+| `backends/metal/runtime/mlx_engine.cpp` | `tokenizer.h` |
+| `backends/metal/runtime/mlx_engine.h` | `table.h` |
+| `backends/metal/runtime/mlx_generation_job.h` | `step.h` |
+| `backends/metal/runtime/mlx_mtp.h` | `depth.h` |
+| `backends/metal/tests/grammar_fixture.h` | `constraint.h` `tokenizer.h` |
+| `tests/engine/inference_test.cpp` | `inference.h` `policy.h` |
+| `tests/engine/mfq_paged_kv_allocator_test.cpp` | `pages.h` |
+| `tests/engine/mfq_paged_prefix_cache_test.cpp` | `paged.h` |
+| `tests/engine/mfq_sampling_test.cpp` | `sampling.h` |
+| `tests/engine/mfq_session_snapshot_cache_test.cpp` | `snapshot.h` |
+| `tests/engine/mfq_text_emitter_test.cpp` | `emitter.h` |
+| `tests/engine/mtp_policy_test.cpp` | `predictor.h` |
+| `tests/engine/request_executor_test.cpp` | `flow.h` `instance.h` `settings.h` `table.h` |
+| `tests/engine/shared_execution_test.cpp` | `driver.h` `policy.h` `sampling.h` `table.h` |
+| `tests/engine/speculative_sequence_test.cpp` | `speculate.h` |
+| `tests/moe/moe_cache_policy_test.cpp` | `slots.h` |
+| `tests/moe/moe_cache_profile_test.cpp` | `profile.h` |
 
 两个假阳性要记住：`models/glm5_next/causal_lm.h` 和 `models/qwen4_exp/causal_lm.h` include 的是 `models/common/predictor.h`，不是 `engine/requests/predictor.h`。判断依赖要看解析后的目标文件，不能只看 include 文本首段。
 
