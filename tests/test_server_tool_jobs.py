@@ -247,6 +247,169 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
 
 
 
+def _validation_handlers(tmp_path: Path, **paths) -> tuple[ToolJobHandlers, ModelCatalog]:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(exist_ok=True)
+    _model(model_dir / "tiny.mfq")
+    catalog = ModelCatalog([model_dir], cache_seconds=0)
+    handlers = ToolJobHandlers(
+        catalog,
+        ToolJobPaths(
+            work_root=tmp_path,
+            python=tmp_path / "python",
+            modelscope=None,
+            huggingface=None,
+            **paths,
+        ),
+    )
+    return handlers, catalog
+
+
+@pytest.mark.parametrize("form", ("unset", "missing", "directory", "multi-config"))
+def test_container_validation_requires_explicit_diagnostics_and_never_uses_the_runtime(
+    tmp_path: Path,
+    form: str,
+) -> None:
+    async def run() -> None:
+        runtime = _executable(
+            tmp_path / "mfq-runtime",
+            """\
+            #!/usr/bin/env python3
+            import pathlib
+            pathlib.Path('runtime-invoked').write_text('invoked')
+            print('runtime used for validation')
+            """,
+        )
+        diagnostics: Path | None = tmp_path / "mfq-diagnostics"
+        if form == "directory":
+            diagnostics.mkdir()
+        elif form == "multi-config":
+            diagnostics = tmp_path / "build dir" / "Release" / "mfq-diagnostics.exe"
+        elif form == "unset":
+            diagnostics = None
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=diagnostics,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.FAILED
+        assert result.error.code == "tool_unavailable"
+        assert (
+            'cmake --build "<build-dir>" --config <configuration> '
+            "--target mfq-diagnostics"
+        ) in result.error.message
+        if diagnostics is not None:
+            assert str(diagnostics) in result.error.message
+        if form == "multi-config":
+            assert "cmake --build /" not in result.error.message
+        assert not (tmp_path / "runtime-invoked").exists()
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_metal_container_validation_reports_a_missing_runtime_without_a_target_hint(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        runtime = tmp_path / "mfq-decode-metal"
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=runtime,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.FAILED
+        assert result.error.code == "tool_unavailable"
+        assert result.error.message == "MFQ diagnostics executable is unavailable"
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_metal_container_validation_uses_the_runtime_wired_as_diagnostics(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        runtime = _executable(
+            tmp_path / "mfq-decode-metal",
+            """\
+            #!/usr/bin/env python3
+            import sys
+            assert '--check-mfq-container' in sys.argv
+            print('MFQ container OK via metal runtime')
+            """,
+        )
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=runtime,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.SUCCEEDED
+        assert result.result["summary"] == "MFQ container OK via metal runtime"
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_native_tool_jobs_are_advertised_only_for_wired_executables(
+    tmp_path: Path,
+) -> None:
+    metal_runtime = tmp_path / "mfq-decode-metal"
+    cuda_runtime = tmp_path / "mfq-runtime"
+    metal = ToolJobHandlers(
+        ModelCatalog([]),
+        ToolJobPaths(
+            tmp_path,
+            tmp_path / "python",
+            None,
+            None,
+            metal_runtime,
+            tmp_path / "mfq-perplexity",
+            metal_runtime,
+        ),
+    ).handlers()
+    cuda = ToolJobHandlers(
+        ModelCatalog([]),
+        ToolJobPaths(
+            tmp_path,
+            tmp_path / "python",
+            None,
+            None,
+            None,
+            None,
+            cuda_runtime.with_name("mfq-diagnostics"),
+        ),
+    ).handlers()
+
+    # Metal keeps its kernel benchmark and WT2 evaluation jobs; CUDA serving wires neither.
+    assert {"benchmark.kernel", "evaluate.wikitext2"} <= set(metal)
+    assert not {"benchmark.kernel", "evaluate.wikitext2"} & set(cuda)
+
+
 def test_imatrix_calibration_job_publishes_native_artifact(tmp_path: Path) -> None:
     async def run() -> None:
         (tmp_path / "hf-model").mkdir()

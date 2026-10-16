@@ -1,6 +1,6 @@
 # CUDA 重构基线（阶段 0）
 
-日期：2026-10-15。对应 [refactor.md 阶段 0](../../refactor.md#阶段-0固定基线与切换条件) 与 [refactor-plan.md §1](../../refactor-plan.md)。
+日期：2026-10-15。对应 [refactor.md 阶段 0](../../docs/refactor.md#阶段-0固定基线与切换条件) 与 [plan.md §1](../../docs/plan.md)；已知缺陷账本见 [bugs.md](../../docs/bugs.md)。
 本文件只记录"当前实际跑到什么结果"，不记录目标。重构过程中每完成一个阶段，就在对应行追加新链的结果，旧链结果保留到该 family 删除为止。
 
 对照基线 commit：`4bce8b5c cuda: name the family operations for what they do, not for the seam`。
@@ -59,7 +59,7 @@
 | --- | --- | --- |
 | `qwen35` → `Qwen35CausalLm` | `Qwen3.5-0.8B`（1.7GB）、`Qwen3.8-27B-FP8`（29GB） | 0.8B 见上表；27B 未跑，32GB 主机需 `-ngl`/offload 与显存空闲同时满足 |
 | `qwen4_exp` → `Qwen4CausalLm` | `Qwen3.8-Flash-Next-FP8`（173GB） | 缺环境：主机内存与显存不足以常驻；`--check-flash-next`、`--check-flash-next-mtp`、`--check-qwen4-decode-hidden` 未运行 |
-| `deepseek_v4` → `DeepseekV4CausalLm` | `DeepSeek-V4-Flash-Vision-Exp`（157GB，43 层 hidden 4096） | 缺环境：需 SSD 驻留路径与足够主机内存；`--check-dsv4-attention`（`docs/todo.md` 记有已知错误）、`--check-dsv4-hc` 未运行 |
+| `deepseek_v4` → `DeepseekV4CausalLm` | `DeepSeek-V4-Flash-Vision-Exp`（157GB，43 层 hidden 4096） | 缺环境：需 SSD 驻留路径与足够主机内存；`--check-dsv4-attention`（已知错误记在 [bugs.md B17](../../docs/bugs.md)）、`--check-dsv4-hc` 未运行 |
 | `deepseek_v41` → `DeepseekV41CausalLm` | 无 | 缺权重。仅 `mfq-deepseek-v41-config-test`、`mfq-deepseek-v41-hc-test`、`mfq-deepseek-v41-runtime-check` 通过（fixture 级） |
 | `gemma4` → `Gemma4CausalLm` | 无 | 缺权重。`--check-gemma4-swa` 未运行 |
 | `glm_dsa` → `GlmDsaCausalLm` | 无 | 缺权重。`--check-glm-dsa` 未运行 |
@@ -254,7 +254,7 @@ Python 侧不 include 任何 engine 私有头，但 `mfq/kernels/cuda/_ext.py:52
 | 扩展源码清单存在性检查 | 完成：`tests/test_cuda_ext_sources.py` 直接读 `_ext.py` 的 `_SOURCES`，不导入 torch |
 | 统一扩展真实编译 / 加载 / 代表性算子数值 | **未验收**，见下 |
 
-统一扩展把 26 个 `.cu` 交给 torch `cpp_extension`，ninja 默认按 CPU 核数并发，单个 `cicc`/`ptxas` 峰值 1–2GB，24 并发直接打穿 32GB 主机。12:01 尝试时内核 OOM killer 杀掉了正在跑的 `strata` 服务（pid 1623662，GPU 43330 MiB）和编译自身，未产出可用扩展。
+统一扩展把 26 个源文件（24 个 `.cu` + 2 个 `.cpp`）交给 torch `cpp_extension`，ninja 默认按 CPU 核数并发，单个 `cicc`/`ptxas` 峰值 1–2GB，24 并发直接打穿 32GB 主机。12:01 尝试时内核 OOM killer 杀掉了正在跑的 `strata` 服务（pid 1623662，GPU 43330 MiB）和编译自身，未产出可用扩展。`torch.utils.cpp_extension.load()` 没有 `max_jobs` 参数，并发只能用 `MAX_JOBS` 环境变量控制（见 B13）。
 
 重跑前提：那个服务不在跑，或显式限制并发（`MAX_JOBS=2 TORCH_EXTENSIONS_DIR=/tmp/... .venv/bin/python -m pytest tests/test_activation_bridge_cuda.py`）。主机只剩 30GB、且已有服务常驻时不得跑该编译。
 
@@ -281,7 +281,7 @@ python3 tests/test_layer_independence.py     # 共享层不命名后端；family
 
 三个入口跑同一套规则与 fixture：上面的脚本形式、`pytest tests/test_engine_include_graph.py tests/test_cuda_include_graph.py tests/test_layer_independence.py`（24 项，每个 fixture 一个用例）、以及 CTest 里的 `mfq-engine-include-graph-test`、`mfq-cuda-include-graph-test`、`mfq-layer-independence-test`。include 解析与 engine 模块列表共用 `tests/include_graph.py`，模块列表从目录树读取，新增模块不会被漏掉。
 
-构建与测试：`cmake --build build -j16` 通过；`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` 的 `build-nocomm` 通过；CTest 共 84 项（含三项依赖检查），两个失败与基线相同（`mfq-float-projection-test` 真实缺陷、`mfq-cuda-runtime-state-test` 显存被外部进程占用 44.8GB）。`mfq-engine` 只链接 `mfq-core`（及可选 tokenizer/prefix-cache），不链接设备库。
+构建与测试：`cmake --build build -j16` 通过；`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` 的 `build-nocomm` 通过；CTest 枚举 84 项（含三项依赖检查；其中 `mfq-cuda-include-graph-test` 在 `csrc/tests/CMakeLists.txt:12` 与 `csrc/backends/cuda/CMakeLists.txt:588` 重复注册，所以 84 条不等于 84 个唯一检查，见 B15），两个失败与基线相同（`mfq-float-projection-test` 真实缺陷、`mfq-cuda-runtime-state-test` 显存被外部进程占用 44.8GB）。`mfq-engine` 只链接 `mfq-core`（及可选 tokenizer/prefix-cache），不链接设备库。
 
 未做：`EngineImpl<B>` 公共装配骨架。现在没有任何消费者使用它，写出来就是死代码；它应随阶段 2 的 Qwen3.5 混合链路一起落地，由真实调用方约束形状。
 
@@ -298,3 +298,27 @@ python3 tests/test_layer_independence.py     # 共享层不命名后端；family
 | 通用请求、Planner、Store 里出现 family 分支 | fixture 里 `is_qwen35()` 与 `qwen35_slots()` 两个反例；正则改为匹配词干，`Qwen35`、`qwen3_5`、`is_qwen35` 都命中 |
 
 放宽的部分：family 名在 `engine/model/<family>/` 与 `models/` 允许，model 层允许 `state/`、`weights/`。真树上放宽后仍只有原有 3 个例外文件命中（`engine/include/engine.h`、`engine/src/processor.cpp`、`engine/src/media.cpp`），没有新增违规。
+
+## G1 构建入口切片（验证记录，不是数值基线）
+
+本节只记录构建入口这一片段的验收口径，与上面的数值/原生基线分开维护；它不代表 G1 或阶段 1 整体完成，也不改动上面任何历史计数。
+
+- 已接受行为：`mfq build` 与 `mfq serve` 的自动/托管重建只请求 `mfq-runtime`（Metal 仍只 `mfq-decode-metal`）；诊断、评估、bench 用显式 `cmake --build ... --target ...`。CUDA `model.validate` 要求显式 diagnostics 路径，不回退到 runtime；缺失时返回 `tool_unavailable`，消息含预期可执行文件路径与带占位符的 `cmake --build "<build-dir>" --config <configuration> --target mfq-diagnostics`，不从可执行文件位置反推 CMake 构建目录，也不后台补编工具。CUDA 服务不注册 Metal-only 的算子测速与 WT2 质量任务，即使 sibling `mfq-perplexity`/`mfq-eval` 存在；CUDA `mfq-eval kl` 仍是显式原生 CLI，无服务适配。Metal 生产行为与错误文案不变。
+- 实测：`cuda/` 下 `.venv/bin/python -m pytest tests/test_build_cli.py tests/test_serve_cli.py tests/test_server_tool_jobs.py tests/test_wikitext_quality_jobs.py -q` → 97 passed。
+- CLI dry-run 实际输出：`.venv/bin/python -m mfq.cli build --backend cuda --dry-run` 的 Build 行只有 `--target mfq-runtime` 与 `-j 24`，没有 `mfq-diagnostics`/`mfq-eval`。
+- 边界口径：这 4 个套件跑的是真实 Python 控制流（`create_build_plan`、serve 后端选择、job manager/store/文件边界）；只有 CMake 子进程与原生可执行文件是 mock 或脚本替身。未编译原生代码、未跑 GPU、未跑真实模型与 Metal。
+- 未接受：`MFQ_BUILD_CUDA_RUNTIME` 后端开关、G2 编译单元拆分、`EngineImpl<B>` 骨架、CUDA eval 服务适配。
+
+## 更早的 CUDA 结构整理（历史索引）
+
+这些整理在重构开始前已完成并验证，保留结论与证据口径，不再作为待办维护。路径按当时目录，部分已在阶段 1 改名。
+
+- 打破 `csrc/backends/cuda` 的目录级 include 循环（native↔kernels、kernels↔ops、ops↔runtime、ops↔storage）。层级固定为 native → kernels → ops → storage/runtime → models → engine，只允许向下 include；`storage` 与 `runtime` 视为同一层。
+- 消除歧义 include。跨目录一律写 `"<dir>/<name>"`，CMake 不再把 `ops/`、`storage/`、`kernels/`、`models/`、`engine/` 加入 include path，裸写法无法编译。`"moe.h"` 这类同时命中 `ops/` 和 `models/common/` 的情况已消失。
+- 修掉 ops/storage 循环造成的真实缺陷：`load_mfe_cpu` 和 `make_mxfp4_range_runtime` 在 `ops/moe.cpp` 与 `storage/weight_loader.cpp` 各有一份定义（链接期重复定义，且两份实现不一致，只有 ops 版支持 NINT）。现只保留 weight_loader 版。
+- 完成 CUDA 侧 ops/storage 解耦：payload 解析、CPU 行切片、packed 重排、codebook 展开和 `to_device_*`/`to_gpu_*` 全部移到 `storage/*_weight_loader.cpp`，`ops/` 不再 include `storage/`，只剩 matmul/forward/dequant。当时规模：`ops` 13 文件 6811 行，`storage` 16 文件 12377 行。
+- 合并两个 MTP depth controller：`DepthController`（`mtp_depth_controller.h`）和 `CycleDepthController`（`mtp_policy.h`）暴露同样 12 个方法，`update_time`/`marginal_estimate`/`time_estimate`/`score`/`best_depth`/`best_rival`/`most_stale` 近乎逐行重复（62 条长行相同）。当时合并为一个类两种调参，`cycle_timed()` 是工厂，`GenerationPolicy` 去掉模板参数，995 行 → 789 行。同一时期记录的 Metal 未跟进：现在仍可在 `backends/metal/runtime/mlx_mtp.cpp:880` 看到 `GenerationPolicy<MlxDsparkDepthController>` 写法，而 `engine/requests/depth.h:352` 的 `GenerationPolicy` 已不是模板类——引用残留是源码可见事实；“因此 Metal 无法编译”仍是当时的记录口径，本轮没有 macOS/MLX 环境，未编译验证。见 [bugs.md B18](../../docs/bugs.md)。
+- 去掉 `mtp_depth_controller.h` 对进程级 `PrefillActivity` 的隐式读取：`busy` 改成显式参数，全局计数器只在 `speculative_sequence.h` 的 decode 循环读一次。
+- 拆开 `request_executor.h` 的三合一：`engine_instance.h`（`EngineInstance<Backend>` + session 命令分发）与 `request_executor.h`（`ExecutionRequest` + `RequestExecutor`）。
+- `mfq-models` 的 `cxx_std_17` 改为 `cxx_std_20`（头文件已使用 `co_yield` 和 `<span>`）。
+- 修掉 CUDA 13 下失效的 bench 调用：`cudaStreamGetCaptureInfo_v2` 和 `cudaGraphNodeGetDependentNodes` 签名变更。

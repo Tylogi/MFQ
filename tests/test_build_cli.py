@@ -107,6 +107,9 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
 
     assert plan.backend == "metal"
     assert plan.target == "mfq-decode-metal"
+    assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
+        "mfq-decode-metal",
+    )
     assert "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON" in plan.configure_command
     assert "-DMFQ_BUILD_METAL_RUNTIME=ON" in plan.configure_command
     assert "-DMFQ_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
@@ -136,7 +139,7 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     command = " ".join(plan.configure_command)
     assert plan.target == "mfq-runtime"
     assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
-        "mfq-runtime", "mfq-diagnostics", "mfq-eval"
+        "mfq-runtime",
     )
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
     assert "CMAKE_PREFIX_PATH" not in command

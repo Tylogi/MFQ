@@ -45,23 +45,17 @@ uv run mfq build --backend cuda
 
 ## Output and build manifest
 
-The default CMake build directory is `<repo>/build/csrc`. Executable
-paths:
+`mfq build` compiles the inference runtime only. The default CMake build
+directory is `<repo>/build/csrc`, where `<repo>` is this `cuda` checkout; from
+the MFQ workspace root that directory is `cuda/build/csrc`. Executable paths:
 
 | Backend | Executable |
 | --- | --- |
 | Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/csrc/mfq-runtime`, `mfq-diagnostics`, `mfq-eval` |
-| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe` (plus `mfq-diagnostics.exe`, `mfq-eval.exe`); multi-configuration generators may add `Release\` |
+| CUDA | `<repo>/build/csrc/mfq-runtime` |
+| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
 
-`mfq-runtime` runs inference and service mode; CUDA checks and benchmarks use
-`mfq-diagnostics`, and KL evaluation uses `mfq-eval kl`:
-
-```shell
-mfq-diagnostics --check-deepseek-v41
-mfq-eval kl --model model.mfq --kl-base reference.bin
-```
-
+`mfq serve` needs nothing else; normal serving works with the runtime alone.
 MFQ searches the build tree after compilation, so generators may place the
 executable in a configuration subdirectory.
 
@@ -82,6 +76,30 @@ uv run -m json.tool build/mfq-runtime.json
 `mfq serve` reads this manifest automatically. If the executable exists, it is
 used directly. If it was deleted, MFQ rebuilds it in the recorded directory with
 the recorded configuration.
+
+### Optional native tools
+
+The CUDA check, benchmark, and evaluation tools are separate CMake targets and
+are not built by default. `mfq build` has no target option, so build a tool
+with CMake in the build directory you use:
+
+```shell
+cmake --build build/csrc --config Release --target mfq-diagnostics
+cmake --build build/csrc --config Release --target mfq-eval
+
+build/csrc/mfq-diagnostics --check-deepseek-v41
+build/csrc/mfq-eval kl --model model.mfq --kl-base reference.bin
+```
+
+Use the directory and configuration of your own build. `--config` matters for
+multi-configuration generators such as Visual Studio, which place the
+executable in `<build-dir>\Release\`.
+
+CUDA KL evaluation is available only through the `mfq-eval kl` command line: a
+CUDA server does not offer the Metal-only tensor kernel benchmark or WikiText-2
+quality interfaces. A CUDA `model.validate` job reports `tool_unavailable` with
+the `mfq-diagnostics` CMake command when that executable is missing; the server
+keeps serving and other jobs keep running.
 
 ## Custom build directory
 
