@@ -101,6 +101,26 @@ quality interfaces. A CUDA `model.validate` job reports `tool_unavailable` with
 the `mfq-diagnostics` CMake command when that executable is missing; the server
 keeps serving and other jobs keep running.
 
+## Building without a device backend
+
+`mfq build` always builds one inference backend. CMake alone can configure the
+common engine with both backends off: that configuration does not look for the
+CUDA Toolkit, and the CPU targets it builds invoke no `nvcc` and link no CUDA
+or MLX library:
+
+```shell
+cmake -S csrc -B build/common -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DMFQ_BUILD_CUDA_RUNTIME=OFF -DMFQ_BUILD_METAL_RUNTIME=OFF
+cmake --build build/common --target mfq-engine-contract-test
+build/common/tests/mfq-engine-contract-test
+```
+
+`MFQ_BUILD_CUDA_RUNTIME` defaults to on except on Apple platforms, and it is the
+only switch that enables the CUDA language, finds the CUDA Toolkit, or adds the
+device tests. `mfq build --backend cuda` passes `-DMFQ_BUILD_CUDA_RUNTIME=ON`
+explicitly, so a build directory previously configured with the switch off still
+produces `mfq-runtime`.
+
 ## Custom build directory
 
 Use `--build-dir` when the build tree belongs on another disk:

@@ -133,8 +133,14 @@ target (`mfq-runtime` on CUDA); the CUDA tools above are built explicitly with
 `--target`, see [optional native tools](../docs/cli/build.md#optional-native-tools). `mfq-cuda-runtime` exports the Engine construction API
 and has no transport dependency. With `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`,
 the backend, prefix cache, tokenizer, diagnostics and evaluation still build;
-communication modules and `mfq-runtime` are omitted. The optional serving
-application `mfq-runtime-torch` requires communication to be enabled.
+communication modules and `mfq-runtime` are omitted. `MFQ_BUILD_CUDA_RUNTIME`
+defaults to ON on non-Apple platforms and to OFF on Apple platforms (ON with
+Apple is a configure error). Setting it to OFF omits the CUDA backend entirely:
+the CUDA language, toolkit lookup, device tests and CUDA executables are not
+configured, so the common engine and its CPU tests still configure, build and run
+without invoking a CUDA compiler or linking a CUDA library. The
+optional serving application `mfq-runtime-torch` requires communication to be
+enabled.
 
 The established Metal build output directory remains unchanged. Integrated upstream-derived
 code retains its original licensing as documented in the repository `NOTICE`

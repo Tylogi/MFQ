@@ -112,6 +112,7 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
     )
     assert "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON" in plan.configure_command
     assert "-DMFQ_BUILD_METAL_RUNTIME=ON" in plan.configure_command
+    assert "MFQ_BUILD_CUDA_RUNTIME" not in " ".join(plan.configure_command)
     assert "-DMFQ_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
     assert plan.build_command[-2:] == ("-j", "3")
 
@@ -141,6 +142,8 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
         "mfq-runtime",
     )
+    # A reused build directory cached with the backend off must not drop it.
+    assert "-DMFQ_BUILD_CUDA_RUNTIME=ON" in command
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
     assert "CMAKE_PREFIX_PATH" not in command
     assert "Python_EXECUTABLE" not in command

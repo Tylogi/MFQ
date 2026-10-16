@@ -272,9 +272,11 @@ def create_build_plan(
             ]
         )
     else:
+        # Explicit ON: a cache configured with the backend off would drop the runtime.
         configure.extend(
             [
                 "-DMFQ_BUILD_METAL_RUNTIME=OFF",
+                "-DMFQ_BUILD_CUDA_RUNTIME=ON",
                 "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF",
             ]
         )

@@ -28,6 +28,19 @@ option(
     ${APPLE}
 )
 
+# Only this backend enables the CUDA language or requires the CUDA toolkit.
+if(APPLE)
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT OFF)
+else()
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT ON)
+endif()
+option(
+    MFQ_BUILD_CUDA_RUNTIME
+    "Build the native CUDA runtime, which requires the CUDA toolkit"
+    ${_MFQ_BUILD_CUDA_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT)
+
 if(APPLE)
     set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT OFF)
 else()
@@ -42,6 +55,11 @@ unset(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT)
 
 if(MFQ_BUILD_METAL_RUNTIME AND NOT APPLE)
     message(FATAL_ERROR "MFQ_BUILD_METAL_RUNTIME requires macOS")
+endif()
+
+if(MFQ_BUILD_CUDA_RUNTIME AND APPLE)
+    message(FATAL_ERROR
+        "MFQ_BUILD_CUDA_RUNTIME requires the CUDA toolkit, which macOS does not provide")
 endif()
 
 # Common code is split by responsibility. JSON is defined first because the
@@ -71,7 +89,7 @@ if(MFQ_BUILD_METAL_RUNTIME)
     add_subdirectory(backends/metal metal)
 endif()
 
-if(NOT APPLE)
+if(MFQ_BUILD_CUDA_RUNTIME)
     add_subdirectory(backends/cuda cuda)
 endif()
 
