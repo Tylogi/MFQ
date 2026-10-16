@@ -1,5 +1,5 @@
-#include "device/env.h"
-#include "device/tensor/backend.h"
+#include "native/env.h"
+#include "native/tensor/backend.h"
 #include "csrc/backends/cuda/kernels/quant/fp8_sq.h"
 #include "csrc/backends/cuda/kernels/quant/mxfp4_sq.h"
 #include <cmath>

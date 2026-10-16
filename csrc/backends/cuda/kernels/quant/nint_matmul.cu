@@ -9,7 +9,7 @@
 // kernel; larger batches use its row decoder followed by GEMM.
 
 
-#include "device/env.h"
+#include "native/env.h"
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -26,7 +26,7 @@
 
 #include "kernels/cache/async_copy.cuh"
 #include "kernels/glu.cuh"
-#include "csrc/backends/cuda/device/tensor/backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include "kernels/quant/nint_route_hint.h"
 #include "packed_backward.cuh"
 #include "packed_nint.cuh"

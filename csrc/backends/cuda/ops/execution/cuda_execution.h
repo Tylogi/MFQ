@@ -6,7 +6,7 @@ class KvOffloadStore;
 bool decode_window_recording() noexcept;
 }
 
-#include "device/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include "tensor_parallel.h"
 
 #include <cuda_runtime_api.h>

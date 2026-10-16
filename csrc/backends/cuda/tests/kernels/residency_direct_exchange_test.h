@@ -1,6 +1,6 @@
 #pragma once
 
-#include "device/env.h"
+#include "native/env.h"
 #include "storage/weights/moe/cached_source_internal.h"
 
 // Seed real compressed transfer-cache fields without launching the unrelated

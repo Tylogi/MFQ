@@ -2,7 +2,7 @@
 // One block normalizes one row (last dim D). fp32. x viewed as [N, D] (caller flattens).
 
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/device/tensor/backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cstdint>

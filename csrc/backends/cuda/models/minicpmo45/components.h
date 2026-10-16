@@ -4,7 +4,7 @@
 
 #include "minicpmo45/causal_lm.h"
 #include "common/transformer_layer.h"
-#include "device/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

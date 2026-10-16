@@ -5,7 +5,7 @@ Every cross-directory include inside csrc/backends/cuda must be written as
 "<dir>/<name>", resolved against the backend root.  The directory graph must
 stay a DAG in the documented order:
 
-    device -> kernels -> ops -> storage -> models -> engine
+    native -> kernels -> ops -> storage -> models -> engine
 
 Run: python3 cuda/tests/cuda_include_graph.py [--verbose]
 """
@@ -19,7 +19,7 @@ BACKEND_ROOT = os.path.normpath(
 # Directories that hold the layered library.  Everything else under the
 # backend root (apps/, commands/, diagnostics/, eval/, tests/) is a top-level
 # consumer and may include anything below it.
-DIRS = ["device", "kernels", "ops", "storage", "models", "engine"]
+DIRS = ["native", "kernels", "ops", "storage", "models", "engine"]
 LAYERS = DIRS
 RANK = {d: i for i, d in enumerate(LAYERS)}
 SOURCE_EXT = (".cpp", ".cu", ".cuh", ".c", ".h", ".tpp")

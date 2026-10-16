@@ -1,6 +1,6 @@
-#include "device/env.h"
+#include "native/env.h"
 #include "ops_common.cuh"
-#include "device/matmul_rows.h"
+#include "native/matmul_rows.h"
 
 #include <cmath>
 #include <cstdlib>

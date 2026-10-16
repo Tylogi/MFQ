@@ -1,5 +1,5 @@
 #include "kernels/cache/paged_kv.h"
-#include "device/tensor/tensor.h"
+#include "native/tensor/tensor.h"
 
 #include <cuda_runtime_api.h>
 

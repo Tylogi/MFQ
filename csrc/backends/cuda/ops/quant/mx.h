@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/execution/cuda_execution.h"
-#include "device/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 #include <vector>

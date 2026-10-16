@@ -1,7 +1,7 @@
 // GLU activation helpers used by materialized prefill paths.
 
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/device/tensor/backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>

@@ -32,7 +32,7 @@ architecture-named entry point.
   `csrc/backends/<backend>/ops/` and `csrc/backends/<backend>/kernels/`.
   Shared CUDA kernel implementations still reside in `mfq/kernels/cuda/`
   pending the source/package move recorded in TODO.
-- CUDA `device/` owns tensors and contexts, `storage/` owns weight materialization
+- CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
   and physical cache storage, and `engine/` is the sole composition root for
   family selection, runtime components, batching and CUDA Graphs.
   `models/<family>/` supplies native operator/state bindings, with reusable

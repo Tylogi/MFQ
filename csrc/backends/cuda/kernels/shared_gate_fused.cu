@@ -1,5 +1,5 @@
 #include "kernels/shared_gate.h"
-#include "csrc/backends/cuda/device/context.h"
+#include "csrc/backends/cuda/native/context.h"
 #include "shared_gate_fused.cuh"
 
 std::optional<mfq_tensor_backend::Tensor> try_shared_gate_sigmoid_cuda(

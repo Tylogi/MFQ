@@ -2,7 +2,7 @@
 
 #include "storage/session/state.h"
 #include "predictor.h"
-#include "device/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include "models/common/causal_model_ops.h"
 
 #include <cstdint>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "device/env.h"
+#include "native/env.h"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -19,7 +19,7 @@
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 
 #include "mfq/host_parallel.h"
-#include "device/context.h"
+#include "native/context.h"
 #include "tensor.h"
 
 namespace mfq_tensor_backend = ::mfq::cuda;

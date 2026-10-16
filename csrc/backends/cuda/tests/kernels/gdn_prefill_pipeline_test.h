@@ -1,5 +1,5 @@
 #pragma once
-#include "device/env.h"
+#include "native/env.h"
 
 class GdnPipelineScope {
     std::string old_;

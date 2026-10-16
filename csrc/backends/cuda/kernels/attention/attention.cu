@@ -8,9 +8,9 @@
 // causal mask follows torch SDPA for Tq != Tk: query tq sees key s iff s <= tq + (Tk - T).
 // q/k/v may be fp16 or fp32; dot/softmax accumulation stays fp32.
 
-#include "device/env.h"
+#include "native/env.h"
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/device/tensor/backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cfloat>

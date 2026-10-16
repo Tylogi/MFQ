@@ -1,9 +1,9 @@
 #include "float_projection.h"
 
 #include <mma.h>
-#include "device/env.h"
+#include "native/env.h"
 #include "kernels/cache/async_copy.cuh"
-#include "device/nint_weight.h"
+#include "native/nint_weight.h"
 #include "qwen4_exp.h"
 
 #include <limits>

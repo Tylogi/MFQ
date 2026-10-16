@@ -1,5 +1,5 @@
 // Shared dense and index-selected attention mechanics.
-#include "device/env.h"
+#include "native/env.h"
 #include "selected_attention.h"
 #include "sparse_attn_mma_f16.cuh"
 

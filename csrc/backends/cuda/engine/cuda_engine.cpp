@@ -1,6 +1,6 @@
 #include "load_options.h"
 #include "cuda_runtime_config.h"
-#include "device/env.h"
+#include "native/env.h"
 #include "ops/execution/cuda_execution.h"
 #include "generation.h"
 #include "model_registry.h"

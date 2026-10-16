@@ -1,4 +1,4 @@
-#include "device/tensor/tensor.h"
+#include "native/tensor/tensor.h"
 
 #include <array>
 #include <cassert>

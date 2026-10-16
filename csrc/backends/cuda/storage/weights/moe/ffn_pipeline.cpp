@@ -1,4 +1,4 @@
-#include "device/env.h"
+#include "native/env.h"
 #include "ops/execution/execution_options.h"
 #include "ffn_pipeline.h"
 #include "cached_source_internal.h"
@@ -9,7 +9,7 @@
 #include "kernels/moe/ops.h"
 #include "ops/decode_window.h"
 #include "kernels/cache/dma_copy_batch.h"
-#include "device/context.h"
+#include "native/context.h"
 #include "ops/moe/mfe_ffn_runtime.h"
 #include "ops/quant/quant_linear.h"
 #include <cuda.h>

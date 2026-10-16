@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Niko1221 and the Strata contributors.
 // MIT license: csrc/third_party/strata.LICENSE.
 #pragma once
-#include "device/env.h"
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include <cstdlib>
 

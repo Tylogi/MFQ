@@ -1,7 +1,7 @@
 // The single-entry fallback shares the wide decoder; grouped weight chunks
 // retain their specialized, inlined dot loops below.
 #define MFQ_MFE_PROJECT_INLINE __noinline__
-#include "device/env.h"
+#include "native/env.h"
 #include "ffn_device.cuh"
 #include "ffn_token_groups.h"
 #include "ffn_compact.h"

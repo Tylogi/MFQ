@@ -1,5 +1,5 @@
 #pragma once
-#include "device/nint_weight.h"
+#include "native/nint_weight.h"
 #include <functional>
 #include <vector>
 

@@ -2,11 +2,11 @@
 // Greedy uses a parallel block reduction. Stochastic full-softmax keeps logits on GPU;
 // random uniforms are passed as a small GPU tensor.
 
-#include "device/env.h"
+#include "native/env.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/device/tensor/backend.h"
+#include "csrc/backends/cuda/native/tensor/backend.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
 #include <climits>

@@ -1,4 +1,4 @@
-#include "device/env.h"
+#include "native/env.h"
 #include "device.cuh"
 
 #include "kernels/quant/packed_nvq.cuh"

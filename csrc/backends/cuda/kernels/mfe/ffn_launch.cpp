@@ -1,4 +1,4 @@
-#include "device/env.h"
+#include "native/env.h"
 #include "ffn_launch.h"
 #include "ffn.h"
 #include "ffn_compact.h"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "device/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include "storage/state/batch_paged.h"
 #include "common/causal_metadata.h"
 

@@ -1,4 +1,4 @@
-#include "device/env.h"
+#include "native/env.h"
 #include "qwen4_exp.h"
 #include "kernels/norm_ops.h"
 

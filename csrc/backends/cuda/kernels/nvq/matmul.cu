@@ -1,5 +1,5 @@
 #define MFQ_NVQ_DENSE 1
-#include "device/env.h"
+#include "native/env.h"
 #include "matmul_impl.cuh"
 
 mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(

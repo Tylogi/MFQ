@@ -1,5 +1,5 @@
 #pragma once
-#include "device/env.h"
+#include "native/env.h"
 #include "ops/moe/mfe_ffn_runtime.h"
 #include <cstring>
 #include "storage/weights/moe/weight_loader.h"
