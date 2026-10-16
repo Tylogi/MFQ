@@ -274,11 +274,27 @@ Python 侧不 include 任何 engine 私有头，但 `mfq/kernels/cuda/_ext.py:52
 依赖检查（每条规则都带正/反例 fixture，规则失效会单独失败）：
 
 ```bash
-python3 tests/test_engine_include_graph.py   # engine 不含 backend；模块方向受限；DAG；私有头都有消费者
+python3 tests/test_engine_include_graph.py   # 所有消费者都判；engine 不含 backend；模块方向受限；全图 DAG；私有头都有消费者
 python3 tests/test_cuda_include_graph.py     # 后端 DAG，跨目录 include 全部限定
-python3 tests/test_layer_independence.py     # 共享层不 include engine 私有头
+python3 tests/test_layer_independence.py     # 共享层不命名后端；family 名只在 engine/model/<family> 与 models/；model 层可用 state/weights，不可碰 Executor
 ```
 
-构建与测试：`cmake --build build -j16` 通过；`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` 的 `build-nocomm` 通过；CTest 仍为 80/82，两个失败与基线相同（`mfq-float-projection-test` 真实缺陷、`mfq-cuda-runtime-state-test` 显存被外部进程占用 44.8GB）。`mfq-engine` 只链接 `mfq-core`（及可选 tokenizer/prefix-cache），不链接设备库。
+三个入口跑同一套规则与 fixture：上面的脚本形式、`pytest tests/test_engine_include_graph.py tests/test_cuda_include_graph.py tests/test_layer_independence.py`（24 项，每个 fixture 一个用例）、以及 CTest 里的 `mfq-engine-include-graph-test`、`mfq-cuda-include-graph-test`、`mfq-layer-independence-test`。include 解析与 engine 模块列表共用 `tests/include_graph.py`，模块列表从目录树读取，新增模块不会被漏掉。
+
+构建与测试：`cmake --build build -j16` 通过；`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` 的 `build-nocomm` 通过；CTest 共 84 项（含三项依赖检查），两个失败与基线相同（`mfq-float-projection-test` 真实缺陷、`mfq-cuda-runtime-state-test` 显存被外部进程占用 44.8GB）。`mfq-engine` 只链接 `mfq-core`（及可选 tokenizer/prefix-cache），不链接设备库。
 
 未做：`EngineImpl<B>` 公共装配骨架。现在没有任何消费者使用它，写出来就是死代码；它应随阶段 2 的 Qwen3.5 混合链路一起落地，由真实调用方约束形状。
+
+## R2/R3：依赖检查现在真的能拦什么
+
+`c11dd5ba`。修的是检查本身，不是代码风格；对应 bugs.md B06–B10。
+
+| 现在能拦住的 | 实测方式 |
+| --- | --- |
+| core / scheduler / transport 以任何写法 include engine 私有头 | 临时放 `csrc/core/side.cpp`（裸 `"table.h"`）与 `csrc/scheduler/side.cpp`（`"../engine/requests/table.h"`），两条都报违规 |
+| 后端设备代码依赖 WeightStore 驻留规则 | 临时放 `csrc/backends/cuda/ops/probe_blindspot.cpp` 含 `#include "slots.h"`，报 `may not include weights/` |
+| 公共契约与私有实现成环 | 临时让 `engine/include/engine.h` 与 `engine/requests/table.h` 互 include，报出 5 条环（已恢复） |
+| 共享模型层误用 Executor / 请求表 / 文本层 / 后端头 | fixture 内四个反例；同时确认 `state/`、`weights/` 正例通过 |
+| 通用请求、Planner、Store 里出现 family 分支 | fixture 里 `is_qwen35()` 与 `qwen35_slots()` 两个反例；正则改为匹配词干，`Qwen35`、`qwen3_5`、`is_qwen35` 都命中 |
+
+放宽的部分：family 名在 `engine/model/<family>/` 与 `models/` 允许，model 层允许 `state/`、`weights/`。真树上放宽后仍只有原有 3 个例外文件命中（`engine/include/engine.h`、`engine/src/processor.cpp`、`engine/src/media.cpp`），没有新增违规。
