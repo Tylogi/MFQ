@@ -410,6 +410,25 @@ def _native_e8_search_banks(
     return scales, indices.to(torch.int64)
 
 
+def _metal_d4_jsc_assignment_supported(
+    codebooks: torch.Tensor,
+    config: NvqJscConfig,
+    bank_for_state: torch.Tensor,
+) -> bool:
+    return (
+        codebooks.device.type == "mps"
+        and codebooks.dtype == torch.int8
+        and config.banks == 2
+        and config.spec.vector_size == 4
+        and config.spec.codebook_entries in {256, 512, 1024}
+        and tuple(codebooks.shape) == (2, config.spec.codebook_entries, 4)
+        and bool(
+            ((bank_for_state == 0).sum() == 8)
+            & ((bank_for_state == 1).sum() == 8)
+        )
+    )
+
+
 def _assign_groups(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
@@ -424,12 +443,16 @@ def _assign_groups(
     config: NvqJscConfig,
     raw_scales: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _metal_e8_jsc_assignment_supported(codebooks, config):
-        from mfq.quantize.metal.nvq_jsc import nvq2j_assign
+    if (
+        _metal_e8_jsc_assignment_supported(codebooks, config)
+        or _metal_d4_jsc_assignment_supported(codebooks, config, bank_for_state)
+    ):
+        from mfq.quantize.metal.nvq_jsc import nvq2j_assign, nvq3j_assign
 
         padded_width = ng * _GROUP_SIZE
         valid_width = (ng - 1) * _GROUP_SIZE + valid_last
-        state_2d, indices_3d = nvq2j_assign(
+        assign = nvq2j_assign if config.spec.vector_size == 8 else nvq3j_assign
+        state_2d, indices_3d = assign(
             xgroup.reshape(out, padded_width),
             wgroup.reshape(out, padded_width),
             neuron_scale,

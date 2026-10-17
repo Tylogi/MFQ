@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next: Metal runtime comparison
 
 This comparison collects 17 runtime/checkpoint configurations from
-MFQ-Publicity revision `9b7c1f7900f1fa877eecf4b25076e3a048748f4b`.
+MFQ-Publicity revision `f2f9b0fa00005740097b87bd2612a2b92d21bbe8`.
 All reported results use an Apple M5 Max with a 40-core GPU and 128 GB memory.
 The Strata, llama.cpp and oMLX protocols identify the 4K Python-code input as the
 same input used for the MFQ measurements.
@@ -45,8 +45,10 @@ reuse is zero, and each measured run follows 60 seconds idle. Prompt processing
 uses the engine's prompt time. Generation measures the 127 token intervals
 between the first and last emitted tokens.
 
-oMLX also excludes warmup, loading and compilation, with zero prefix reuse
-and 60 seconds idle before each measured run. Its prefill timing includes
+oMLX also excludes warmup, loading and compilation, with zero prefix reuse.
+The oQ2.5e/oQ3.5e runs cool for 60 seconds and oQ4e for 20 seconds with
+full-speed fans, retaining the official 0.5-second GPU keep-warm tick.
+Its prefill timing includes
 first-token overhead: 4,096 divided by the wall-clock time to the first
 producer-generated token. Generation uses 127 intervals between the first
 and last producer-generated token timestamps. These timings come from the
@@ -125,12 +127,14 @@ MTP results include those differences.
 
 | Checkpoint | Prefill: MTP off | Generation: MTP off | Prefill: adaptive MTP | Generation: adaptive MTP | Draft acceptance |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Jundot oQ2.5e | 2,010.4 | 51.5 | 2,064.8 | 84.9 | 87.8% |
-| Jundot oQ3.5e | 1,448.9 | 60.2 | 1,443.8 | 108.4 | 90.6% |
-| Jundot oQ4e | 1,497.0 | 64.2 | 1,484.3 | 75.3 | 91.0% |
+| Jundot oQ2.5e | 2,630.2 | 51.6 | 2,405.2 | 94.3 | 88.0% |
+| Jundot oQ3.5e | 2,647.4 | 61.5 | 2,575.4 | 111.0 | 92.6% |
+| Jundot oQ4e | 2,843.4 | 65.0 | 2,766.7 | 108.3 | 88.4% |
 
-oMLX uses the official `VLMBatchedEngine` streaming API with a 4,096-token
-prefill step. Experts remain resident and PLE uses SSD-backed mmap. KV
+oMLX uses the complete official macOS 26/27 DMG, including its native NAX
+kernels, and the `VLMBatchedEngine` streaming API with a 4,096-token prefill
+step and speed priority. The allocator cache uses the physical-memory limit,
+matching official server startup. Experts remain resident and PLE uses SSD-backed mmap. KV
 quantization, TurboQuant and ANE prefill are disabled. Normal warmup generates
 16 tokens; adaptive-MTP warmup generates 128 tokens to exercise verification
 depths. Ordinary and adaptive-MTP output text matches within each tier.
@@ -145,19 +149,18 @@ The source pins oQ2.5e to revision
 `ebfb10474baa3c1c78d38453ce0d5228febd32e9` and oQ3.5e to
 `e8216051d1a75ec4a523ed8c6b0ed4a01667bcda`. oQ4e uses a previously downloaded
 checkpoint with 106,294,664,646 bytes of weight shards; its repository revision
-is not reported. All oMLX runs enable High Power Mode. The oQ2.5e ordinary
-run uses AC power, while oQ3.5e is measured on battery. Separate short power
-diagnostics are excluded from the throughput table and do not establish a
-battery-versus-AC speed difference.
+is not reported. All oMLX runs enable High Power Mode. Recorded prefill GPU
+frequency samples were 1,620 MHz, with P13 dominant in request-contained
+performance-state samples.
 
 ## Sources and regeneration
 
 The source tables are pinned to the same MFQ-Publicity commit:
 
-- [MFQ Apple table](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/README.md#local-inference-speed).
-- [Strata configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md).
-- [llama.cpp configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md).
-- [oMLX configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md).
+- MFQ Apple table: `Qwen3.8-Flash-Next-EW-MFQ/README.md`.
+- Strata: `Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md`.
+- llama.cpp: `Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md`.
+- oMLX: `Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md`.
 
 The snapshot records source-file SHA-256 values and the input checksum.
 The original input excerpt is credited to the Apache-2.0
