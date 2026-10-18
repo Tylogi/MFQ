@@ -77,10 +77,24 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="",
         help="native MFQ, GGUF, or legacy llama.cpp importance matrix",
     )
-    precision.add_argument('--target-bpw', default='',
+    from mfq.calibration.ud_recipes import UD_TIERS
+    ceiling = precision.add_mutually_exclusive_group()
+    ceiling.add_argument('--target-bpw', default='',
         help='AlphaQ whole-file BPW ceiling, including PLE, native weights, headers and assets (HF)')
+    ceiling.add_argument('--ud-tier', choices=UD_TIERS, default='',
+        help='pinned UD nonexpert recipe and exact main-text whole-file byte ceiling')
+    precision.add_argument('--alphaq-allocator', choices=('alphaq', 'natscale'), default='alphaq')
+    precision.add_argument('--alphaq-vision', choices=('native', 'NINT8', 'exclude'), default='native')
+    precision.add_argument('--alphaq-mtp', choices=('quantize', 'exclude'), default='quantize')
+    precision.add_argument('--natscale-tau', type=float, default=1.0)
+    precision.add_argument('--natscale-sensitivity', default='uniform',
+        help='uniform, imatrix-energy, or gradient:PATH')
+    precision.add_argument('--natscale-error', choices=('measured', 'analytic'), default='measured')
+    precision.add_argument('--natscale-error-cache', default='', help='measured rho JSON cache')
+    precision.add_argument('--natscale-sample-layers', type=int, default=6)
+    precision.add_argument('--natscale-sample-experts', type=int, default=3)
     precision.add_argument('--alphaq-dense', choices=('auto', 'recipe', 'joint'), default='auto',
-        help='auto uses the evaluated UD recipe for Qwen3.8 Flash Next; otherwise joint allocation')
+        help='auto uses a registered model UD recipe; otherwise joint allocation')
     precision.add_argument('--alphaq-router', choices=('imatrix', 'none'), default='imatrix')
     precision.add_argument('--alphaq-router-cache', default='',
         help='optional verified native router frequency cache; otherwise use imatrix counts')
@@ -542,11 +556,16 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
-    if getattr(args, 'devices', '') and not getattr(args, 'target_bpw', ''):
-        raise ValueError('--devices requires --target-bpw')
-    if getattr(args, 'target_bpw', ''):
+    allocation = bool(getattr(args, 'target_bpw', '') or getattr(args, 'ud_tier', ''))
+    if getattr(args, 'devices', '') and not allocation:
+        raise ValueError('--devices requires --target-bpw or --ud-tier')
+    if getattr(args, 'alphaq_allocator', 'alphaq') == 'natscale' and not allocation:
+        raise ValueError('NatScale requires --target-bpw or --ud-tier')
+    if allocation:
         if source_format != 'hf' or not args.imatrix:
-            raise ValueError('--target-bpw requires an HF source and --imatrix')
+            raise ValueError('--target-bpw / --ud-tier requires an HF source and --imatrix')
+        if args.ud_tier and args.recipe:
+            raise ValueError('--ud-tier selects its pinned recipe; cannot combine with --recipe')
         conflicts = ('bf16', 'base_mfq', 'standard_preset', 'scheme', 'tensor_overrides',
             'nint_data_free', 'important_neurons', 'split_max_size', 'split_max_tensors',
             'quantize_vision', 'quantize_mtp', 'model_config', 'nvq3_jsc', 'nvq3_jsc_512',
@@ -649,7 +668,7 @@ def run(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     source_format = _detect_source(source, args.source_format)
     _validate(args, source_format)
-    if getattr(args, 'target_bpw', ''):
+    if getattr(args, 'target_bpw', '') or getattr(args, 'ud_tier', ''):
         from mfq.calibration.alphaq_workflow import quantize
         quantize(args)
         return 0

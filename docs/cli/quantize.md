@@ -115,6 +115,17 @@ indices for parallel statistics and training, and `--alphaq-cache` selects a
 reusable statistics and trained-tables directory. The allocation method is
 documented in [AlphaQ](../quantization/alphaq.md).
 
+`--ud-tier IQ1_S` selects a registered model's pinned nonexpert recipe and
+exact UD main-text byte ceiling; it cannot combine with `--target-bpw`.
+GLM-5.3-Flash provides IQ1_S, IQ1_M and IQ4_XS recipes. Select
+`--alphaq-allocator natscale` for [NatScale](../quantization/natscale.md).
+Its sensitivity defaults to `uniform`, tau to 1.0 and errors to `measured`;
+run `mfq calibrate natscale-errors` first. `--natscale-error analytic` selects
+the explicit bit-decay ablation. NatScale requires recipe dense mode.
+In these whole-file workflows, `--alphaq-vision {native,NINT8,exclude}` and
+`--alphaq-mtp {quantize,exclude}` default to native vision and quantized MTP
+when present, with both payloads reported outside the main-text ceiling.
+
 ## Format and scope options
 
 | Option | Meaning |

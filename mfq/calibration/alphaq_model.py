@@ -37,7 +37,8 @@ class AlphaQModelScope:
     model_weight_count: int
 
 
-def model_scope(plans: Sequence[TensorPlan], imatrix: ImportanceMatrix) -> AlphaQModelScope:
+def model_scope(plans: Sequence[TensorPlan], imatrix: ImportanceMatrix, *,
+                exclude_scaled_dense: bool = False) -> AlphaQModelScope:
     """Use all non-PLE rank-2 matrices with imatrix, including small routers.
 
     Plans must come from the normal converter with the same fused/split layout
@@ -52,6 +53,8 @@ def model_scope(plans: Sequence[TensorPlan], imatrix: ImportanceMatrix) -> Alpha
     for item in plans:
         if min(item.shape, default=1) <= 0:
             raise ValueError('model plans require positive tensor dimensions')
+        if item.name.startswith(('vision.', 'predictor.')):
+            continue  # Auxiliary payloads are reported outside the text ceiling.
         # Integer runtime constants occupy bytes but are not float parameters.
         if item.source_dtype not in {'I8', 'I16', 'I32', 'I64', 'U8', 'BOOL'} or item.source_quantization:
             count += math.prod(item.shape)
@@ -75,8 +78,15 @@ def model_scope(plans: Sequence[TensorPlan], imatrix: ImportanceMatrix) -> Alpha
         elif len(item.shape) == 2 and (
             descriptor.quantizable or item.source_dtype in {'BF16', 'F16', 'F32'}
         ):
-            if item.source_dtype not in {'BF16', 'F16', 'F32'} or item.source_quantization:
+            scaled_fp8 = (item.source_dtype == 'F8_E4M3' and item.source_quantization
+                          and item.source_quantization.startswith('fp8_block'))
+            if not scaled_fp8 and (item.source_dtype not in {'BF16', 'F16', 'F32'} or item.source_quantization):
                 raise ValueError(f'joint native candidate requires BF16/F16/F32 source: {item.name}')
+            if scaled_fp8 and exclude_scaled_dense:
+                # Joint mode has no block-scaled FP8 native dense codec.
+                # Keep decoded BF16 as a fixed matrix, explicitly in policy.
+                native.append(item)
+                continue
             match = imatrix.find(_hf_imatrix_names(item))
             if match is None:
                 native.append(item)
@@ -98,6 +108,7 @@ def imatrix_router_multipliers(
     topk: int,
     *,
     square_root: bool = False,
+    normalize: bool = True,
 ) -> tuple[dict[EwItemKey, float], dict[str, float]]:
     """Counts / actual router tokens, with one global normalization.
 
@@ -137,7 +148,7 @@ def imatrix_router_multipliers(
     for item in scope.experts:
         layer, projection = _BANK.fullmatch(item.name).groups()
         layer = int(layer)
-        result.update({EwItemKey(item.name, layer, projection, i): float(value/mean)
+        result.update({EwItemKey(item.name, layer, projection, i): float(value/mean if normalize else value)
                        for i, value in enumerate(rows[layer])})
     return result, exposures
 
@@ -163,6 +174,8 @@ def full_file_budget(
     artifact_root: str | Path | None = None,
     dense_dtype_tags: Mapping[str, str] | None = None,
     check_capacity: bool = True,
+    maximum_file_bytes: int | None = None,
+    excluded_payload_bytes: int = 0,
 ) -> AlphaQFileBudget:
     """Reserve the real header/table, assets, PLE and native/fixed weights.
 
@@ -177,6 +190,12 @@ def full_file_budget(
     if not bpw.is_finite() or bpw <= 0:
         raise ValueError('target BPW must be finite and positive')
     cap = int((bpw*scope.model_weight_count/8).to_integral_value(rounding=ROUND_FLOOR))
+    if maximum_file_bytes is not None:
+        if type(maximum_file_bytes) is not int or maximum_file_bytes <= 0:
+            raise ValueError('file ceiling must be a positive integer')
+        cap = maximum_file_bytes
+    if type(excluded_payload_bytes) is not int or excluded_payload_bytes < 0:
+        raise ValueError('excluded auxiliary bytes must be a nonnegative integer')
     names = [a.name for a in assets]
     if len(set(names)) != len(names) or set(names) & {p.name for p in scope.plans}:
         raise ValueError('runtime asset names must be distinct from model tensors')
@@ -184,7 +203,7 @@ def full_file_budget(
     variable_dense = {p.name for p in scope.dense} if joint_dense else set()
     if joint_dense and not preserve_missing_imatrix:
         raise ValueError('joint allocation must preserve matrices without imatrix')
-    native = ({p.name: p.source_dtype for p in scope.native_dense}
+    native = ({p.name: ('BF16' if p.source_quantization else p.source_dtype) for p in scope.native_dense}
               if preserve_missing_imatrix else {})
     records = [BlobRecord(a.name, ASSET_DTYPE, len(a.data), Path('.')) for a in assets]
     fixed_payload = sum(len(a.data) for a in assets)
@@ -203,7 +222,7 @@ def full_file_budget(
         records.append(BlobRecord(item.name, dtype, size, Path('.')))
     stream = io.BytesIO()
     _write_header_and_table(stream, replace(header, num_tensors=len(records)), records)
-    fixed = stream.tell()+fixed_payload
+    fixed = stream.tell()+fixed_payload-excluded_payload_bytes
     if check_capacity and cap <= fixed:
         raise ValueError('full-file cap leaves no space for allocated weights')
     return AlphaQFileBudget(cap, fixed, scope.model_weight_count, native, stream.tell(), fixed_payload)

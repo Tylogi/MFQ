@@ -280,8 +280,16 @@ trains or reuses every selected NVQ-JSC table, and calls the normal converter.
 Its ceiling is `floor(target_bpw * floating_model_parameters / 8)` bytes.
 PLE, native tensors, integer runtime constants, runtime assets, header and
 tensor table all consume that ceiling. Integer constants do not inflate the
-parameter denominator. The main text model is included; vision and MTP are
-excluded. The writer checks actual serialized size before publishing output.
+parameter denominator. The ceiling covers main text. When present, vision
+defaults to native storage and MTP to quantization; their separately reported
+payloads are outside the ceiling. `--alphaq-vision exclude` and
+`--alphaq-mtp exclude` omit them. The writer checks actual serialized size
+before publishing output.
+
+`--ud-tier` selects a pinned recipe and its exact UD byte ceiling for registered
+Qwen and GLM configurations. `--alphaq-allocator natscale` selects the
+[calibration-free NatScale allocator](natscale.md), with measured imatrix-weighted
+format errors and uniform sensitivity by default.
 
 `--alphaq-dense auto` uses pinned UD nonexpert recipes for the evaluated
 Qwen3.8-Flash-Next configuration, choosing the closest of the nine UD whole-file

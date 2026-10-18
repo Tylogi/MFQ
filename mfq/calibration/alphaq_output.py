@@ -88,6 +88,7 @@ class AlphaQOutput:
     assets: tuple[RuntimeAsset, ...]
     maximum_file_bytes: int
     payload_cache: object | None = None
+    excluded_components: tuple[str, ...] = ()
 
     def validate_plan(self, plans):
         if tuple(plans) != self.plans:
@@ -104,8 +105,10 @@ class AlphaQOutput:
         buffer = io.BytesIO()
         _write_header_and_table(buffer, self.header, records)
         total = buffer.tell()+sum(r.nbytes for r in records)
-        if total > self.maximum_file_bytes:
-            raise ValueError(f'AlphaQ serialized output exceeds file budget: {total} > {self.maximum_file_bytes}')
+        auxiliary = sum(r.nbytes for r in records
+                        if any(r.name.startswith(c+'.') for c in self.excluded_components))
+        if total-auxiliary > self.maximum_file_bytes:
+            raise ValueError(f'AlphaQ serialized output exceeds file budget: {total-auxiliary} > {self.maximum_file_bytes}')
         return total
 
     def write_cached(self, output, *, overwrite=False):

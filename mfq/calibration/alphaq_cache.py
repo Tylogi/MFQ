@@ -67,10 +67,43 @@ def rows_for_plan(root, item):
             source = q._PackedExpertProjectionSource(raw, item)
         elif len(item.shape) == 2:
             source = q._HfPlanRowSource(raw, item)
+        elif (item.transform or '').startswith('glm_kv_b_'):
+            source = _LatentRows(q._transform_glm_kv_b(raw.tensor(), item))
         yield source
     finally:
         if hasattr(raw, 'close'):
             raw.close()
+
+
+class _LatentRows:
+    def __init__(self, weight):
+        self.weight = weight
+
+    def read_rows(self, start, end=None, *, device='cpu'):
+        weight = self.weight.reshape(-1, self.weight.shape[-1])
+        return (weight[start] if end is None else weight[start:end]).to(device=device)
+
+    def tensor(self):
+        return self.weight
+
+    def read_expert_rows(self, expert, start, end, *, device='cpu'):
+        return self.weight[expert, start:end].to(device=device)
+
+    def __getitem__(self, key):
+        return self.weight[key]
+
+
+def _save_statistics(cache, value):
+    directory = cache/'column-energies'
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory/(hashlib.sha256(value.name.encode()).hexdigest()+'.npy')
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('wb') as stream:
+        np.save(stream, value.column_energy, allow_pickle=False)
+    os.replace(temporary, path)
+    doc = asdict(replace(value, column_energy=None))
+    doc['column_energy'] = dict(path=str(path.relative_to(cache)), sha256=file_sha256(path))
+    return doc
 
 
 def source_identity(root):
@@ -86,6 +119,10 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
         'format': 'mfq.alphaq-model-statistics.v1', 'identity': identity, 'tensors': {}}
     if saved.get('format') != 'mfq.alphaq-model-statistics.v1' or saved.get('identity') != identity:
         raise ValueError('AlphaQ statistics cache belongs to another model or method')
+    # Old spectral-only banks require recollection; completed new banks remain
+    # reusable after a restart, independently of the chosen imatrix.
+    saved['tensors'] = {name: doc for name, doc in saved['tensors'].items()
+                        if isinstance(doc.get('column_energy'), dict)}
     if mapper is not None:
         missing = [item for item in plans if item.name not in saved['tensors']]
         if missing:
@@ -94,7 +131,7 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
             for item, value in mapper('statistics', missing):
                 if value.name != item.name:
                     raise ValueError('AlphaQ worker returned statistics for another tensor')
-                saved['tensors'][item.name] = asdict(value)
+                saved['tensors'][item.name] = _save_statistics(cache, value)
                 _atomic_json(path, saved)
             return collect_statistics(root, plans, cache, device)
     results, started = [], time.monotonic()
@@ -105,25 +142,30 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
         projection = item.name.split('.')[-2] if len(item.shape) == 3 else 'dense'
         if item.name in saved['tensors']:
             doc = saved['tensors'][item.name]
+            energy_path = cache/doc['column_energy']['path']
+            if file_sha256(energy_path) != doc['column_energy']['sha256']:
+                raise ValueError(f'column energy cache checksum differs: {item.name}')
             value = AlphaQTensorStatistics(doc['name'], doc['layer'], doc['projection'],
-                tuple(doc['shape']), tuple(doc['alpha']), tuple(doc['variance']))
+                tuple(doc['shape']), tuple(doc['alpha']), tuple(doc['variance']),
+                np.load(energy_path, mmap_mode='r', allow_pickle=False))
             if (value.name, value.layer, value.projection, value.shape) != (item.name, layer, projection, shape):
                 raise ValueError(f'AlphaQ statistics identity mismatch: {item.name}')
         else:
-            alpha, variance, start, batch = [], [], 0, shape[0]
+            alpha, variance, energies, start, batch = [], [], [], 0, shape[0]
             with rows_for_plan(root, item) as source:
                 while start < shape[0]:
                     count = min(batch, shape[0]-start)
                     try:
-                        a, v = _collect(source, start, count, shape, device)
+                        a, v, energy = _collect(source, start, count, shape, device)
                     except torch.OutOfMemoryError:
                         if count == 1:
                             raise
                         batch = max(1, count//2)
                         continue
-                    alpha.extend(a.tolist()); variance.extend(v.tolist()); start += count
-            value = AlphaQTensorStatistics(item.name, layer, projection, shape, tuple(alpha), tuple(variance))
-            saved['tensors'][item.name] = asdict(value)
+                    alpha.extend(a.tolist()); variance.extend(v.tolist()); energies.append(energy); start += count
+            value = AlphaQTensorStatistics(item.name, layer, projection, shape, tuple(alpha), tuple(variance),
+                                           np.concatenate(energies))
+            saved['tensors'][item.name] = _save_statistics(cache, value)
             _atomic_json(path, saved)
         results.append(value)
         _progress(stage='alphaq_statistics', completed=len(results), total=len(plans),
@@ -133,7 +175,10 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
 
 def _collect(source, start, count, shape, device):
     weight = source.read_rows(start*shape[1], (start+count)*shape[1], device=device)
-    return alphaq_weight_statistics(weight.reshape(count, *shape[1:]))
+    weight = weight.reshape(count, *shape[1:]).float()
+    a, v = alphaq_weight_statistics(weight)
+    energy = weight.square().sum(dim=1).cpu().double().numpy()
+    return a, v, energy
 
 
 def training_rows(item, seed=20260716):

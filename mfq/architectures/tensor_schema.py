@@ -941,6 +941,69 @@ def _qwen4_source_mapper(
     return None
 
 
+def glm5_recipe_name(canonical_name: str, *, text_layers: int = 45) -> str | None:
+    """GLM-5-Next llama.cpp aliases, including the appended predictor block."""
+    roots = {
+        "model.token_embedding.weight": "token_embd.weight",
+        "model.output.weight": "output.weight",
+        "model.output_norm.weight": "output_norm.weight",
+        "predictor.embedding_norm.weight": f"blk.{text_layers}.nextn.enorm.weight",
+        "predictor.hidden_norm.weight": f"blk.{text_layers}.nextn.hnorm.weight",
+        "predictor.fusion.weight": f"blk.{text_layers}.nextn.eh_proj.weight",
+        "predictor.output_norm.weight": f"blk.{text_layers}.nextn.shared_head_norm.weight",
+    }
+    if canonical_name in roots:
+        return roots[canonical_name]
+    match = re.fullmatch(r"(model|predictor)\.block\.(\d+)\.(.+)", canonical_name)
+    if match is None:
+        return None
+    component, layer, suffix = match.groups()
+    layer = int(layer) + (text_layers if component == "predictor" else 0)
+    aliases = {
+        "attention.norm.weight": "attn_norm.weight",
+        "mlp.norm.weight": "ffn_norm.weight",
+        "attention.output.weight": "attn_output.weight",
+        "linear_attention.output.weight": "attn_output.weight",
+        "linear_attention.query.weight": "attn_q.weight",
+        "linear_attention.key.weight": "attn_k.weight",
+        "linear_attention.value.weight": "attn_v.weight",
+        "linear_attention.dt_bias": "ssm_dt.bias",
+        "linear_attention.a": "ssm_a",
+        "linear_attention.output_norm.weight": "ssm_norm.weight",
+        "linear_attention.beta.weight": "ssm_beta.weight",
+        "attention.query_a.weight": "attn_q_a.weight",
+        "attention.query_a_norm.weight": "attn_q_a_norm.weight",
+        "attention.query_b.weight": "attn_q_b.weight",
+        "attention.key_value_a.weight": "attn_kv_a_mqa.weight",
+        "attention.key_value_a_norm.weight": "attn_kv_a_norm.weight",
+        "attention.latent.query_embedding.weight": "attn_k_b.weight",
+        "attention.latent.output_unembedding.weight": "attn_v_b.weight",
+        "attention.indexer.query.weight": "indexer.attn_q_b.weight",
+        "attention.indexer.key.weight": "indexer.attn_k.weight",
+        "attention.indexer.score.weight": "indexer.proj.weight",
+        "attention.indexer.key_norm.weight": "indexer.k_norm.weight",
+        "attention.indexer.key_norm.bias": "indexer.k_norm.bias",
+        "attention.indexer.pool.gate": "indexer_compressor_gate.weight",
+        "attention.indexer.pool.position": "indexer_compressor_ape.weight",
+        "mlp.router.weight": "ffn_gate_inp.weight",
+        "mlp.router.bias": "exp_probs_b.bias",
+    }
+    for projection in ("gate", "up", "down"):
+        aliases[f"mlp.{projection}.weight"] = f"ffn_{projection}.weight"
+        aliases[f"mlp.experts.{projection}.weight"] = f"ffn_{projection}_exps.weight"
+        aliases[f"mlp.shared_expert.{projection}.weight"] = f"ffn_{projection}_shexp.weight"
+    for projection in ("query", "key", "value"):
+        aliases[f"linear_attention.{projection}_conv.weight"] = f"ssm_conv1d_{projection[0]}.weight"
+    for projection, alias in (("forget_a", "f_a"), ("forget_b", "f_b"),
+                              ("gate_a", "g_a"), ("gate_b", "g_b")):
+        aliases[f"linear_attention.{projection}.weight"] = f"ssm_{alias}.weight"
+    for scope, alias in (("attention", "attn"), ("mlp", "ffn")):
+        for field, leaf in (("function", "fn"), ("base", "base"), ("scale", "scale")):
+            aliases[f"{scope}.mhc.pre.{field}"] = f"hc_{alias}_{leaf}.weight"
+    alias = aliases.get(suffix)
+    return f"blk.{layer}.{alias}" if alias is not None else None
+
+
 _GLM5_LAYER_SUFFIXES: dict[str, str] = {
     "input_layernorm.weight": "attention.norm.weight",
     "post_attention_layernorm.weight": "mlp.norm.weight",
@@ -1045,7 +1108,7 @@ def _glm5_source_mapper(
     }
     root = roots.get(source_name)
     if root is not None:
-        return TensorNameMapping(root, TensorComponent.MODEL)
+        return TensorNameMapping(root, TensorComponent.MODEL, glm5_recipe_name(root))
 
     if source_name.startswith("model.visual."):
         relative = source_name.removeprefix("model.visual.")
@@ -1114,7 +1177,8 @@ def _glm5_source_mapper(
         }
         predictor_root = predictor_roots.get(source_suffix)
         if predictor_root is not None:
-            return TensorNameMapping(predictor_root, component)
+            return TensorNameMapping(predictor_root, component,
+                                     glm5_recipe_name(predictor_root, text_layers=topology.text_layers))
     suffix = _GLM5_LAYER_SUFFIXES.get(source_suffix)
     if source_suffix == "self_attn.o_proj.weight":
         raw_text = config.get("text_config", config)
@@ -1137,6 +1201,7 @@ def _glm5_source_mapper(
     return TensorNameMapping(
         _component_block(component, layer, suffix),
         component,
+        glm5_recipe_name(_component_block(component, layer, suffix), text_layers=topology.text_layers),
     )
 
 

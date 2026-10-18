@@ -522,6 +522,8 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
     calibrate = sub.add_parser("calibrate", help="build calibration artifacts")
     stages = calibrate.add_subparsers(dest="calibration_stage", metavar="<stage>", required=True)
     add_alphaq_parser(stages)
+    from mfq.calibration.natscale_errors import add_parsers as add_natscale_parsers
+    add_natscale_parsers(stages)
 
 
     data = stages.add_parser("data", help="tokenize eaddario calibration records")
