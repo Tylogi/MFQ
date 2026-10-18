@@ -148,6 +148,58 @@ void require_bytes(const std::vector<std::byte>& bytes) {
             "unexpected tensor bytes");
 }
 
+void test_hf_mla(const std::filesystem::path& root, bool fp8) {
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json") << R"({"model_type":"glm5_next","text_config":{"model_type":"glm5_next_text","num_hidden_layers":1,"num_attention_heads":2,"kv_lora_rank":256,"qk_nope_head_dim":128,"v_head_dim":128}})";
+    const std::string name = "model.language_model.layers.0.self_attn.kv_b_proj.weight";
+    const auto data_bytes = 512 * 256 * (fp8 ? 1 : 2);
+    const std::string header = "{\"" + name + "\":{\"dtype\":\"" + (fp8 ? "F8_E4M3" : "BF16") +
+        "\",\"shape\":[512,256],\"data_offsets\":[0," + std::to_string(data_bytes) + "]}" +
+        (fp8 ? ",\"" + name.substr(0, name.size() - 6) + "weight_scale_inv\":{\"dtype\":\"F32\",\"shape\":[4,2],\"data_offsets\":[" +
+            std::to_string(data_bytes) + "," + std::to_string(data_bytes + 32) + "]}" : "") + "}";
+    {
+        std::ofstream stream(root / "model.safetensors", std::ios::binary);
+        write_scalar<std::uint64_t>(stream, header.size());
+        stream.write(header.data(), header.size());
+        for (int row = 0; row < 512; ++row) for (int column = 0; column < 256; ++column) {
+            if (fp8) write_scalar<std::uint8_t>(stream, row == 0 && column == 0 ? 0xb8 : 0x38);
+            else {
+                const float value = row == 0 && column == 0 ? -1.f : float(1 + row / 128 * 2 + column / 128);
+                std::uint32_t bits;
+                std::memcpy(&bits, &value, 4);
+                write_scalar<std::uint16_t>(stream, bits >> 16);
+            }
+        }
+        if (fp8) for (int i = 1; i <= 8; ++i) write_scalar<float>(stream, float(i));
+    }
+    mfq::HfModelSource source(root);
+    for (bool query : {true, false}) {
+        const std::string target = std::string("model.block.0.attention.latent.") +
+            (query ? "query_embedding.weight" : "output_unembedding.weight");
+        const auto* record = source.find_tensor(target);
+        const std::vector<std::int64_t> shape = query ? std::vector<std::int64_t>{2,256,128}
+                                                     : std::vector<std::int64_t>{2,128,256};
+        require(record && record->dtype == (fp8 ? "F32" : "BF16") && record->shape == shape,
+                "derived MLA head lost source precision or geometry");
+        const auto bytes = source.read(target);
+        for (int head = 0; head < 2; ++head) for (int i = 0; i < shape[1]; ++i) for (int j = 0; j < shape[2]; ++j) {
+            const int row = head * 256 + (query ? j : 128 + i), column = query ? i : j;
+            const float expected = row == 0 && column == 0 ? -1.f : float(1 + row / 128 * 2 + column / 128);
+            float actual;
+            const auto element = (head * shape[1] + i) * shape[2] + j;
+            if (fp8) std::memcpy(&actual, bytes.data() + 28 + element * 4, 4);
+            else {
+                const auto bits = std::uint32_t(mfq::fp8sq::read_u16(
+                    reinterpret_cast<const std::uint8_t*>(bytes.data()), 28 + element * 2)) << 16;
+                std::memcpy(&actual, &bits, 4);
+            }
+            require(actual == expected, "MLA head split/transpose lost source values or scale offsets");
+        }
+        const auto cross = source.read(target, 27, 10);
+        require(std::equal(cross.begin(), cross.end(), bytes.begin() + 27), "derived MLA byte-range read differs");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -170,6 +222,8 @@ int main() {
         write_hf_mxfp8(root / "hf-mxfp8");
         write_hf_fp8_128(root / "hf-fp8-128");
         write_hf_fp8_128(root / "hf-fp8-128-explicit", true);
+        test_hf_mla(root / "hf-mla-fp8", true);
+        test_hf_mla(root / "hf-mla-bf16", false);
 
         {
         mfq::MfqModelSource mfq_source(mfq_path);

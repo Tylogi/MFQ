@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace mfq::cuda::commands {
@@ -37,7 +38,7 @@ tb::Tensor rows(const mfq::ModelSource& source, const std::string& name,
 template<class Model>
 int generate(CudaExecutionContext& execution, const CudaLoadOptions& options,
              const std::filesystem::path& input, const std::filesystem::path& output,
-             bool resident) {
+             bool resident, bool chunk_handoff) {
     std::ifstream tokens_file(input, std::ios::binary);
     std::uint32_t geometry[2]{};
     tokens_file.read(reinterpret_cast<char*>(geometry), sizeof(geometry));
@@ -60,9 +61,19 @@ int generate(CudaExecutionContext& execution, const CudaLoadOptions& options,
     const auto hidden_path = output.string() + ".hidden";
     std::fstream hidden(hidden_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     if (!hidden) throw std::runtime_error("cannot create reference hidden-state scratch");
-    const auto hidden_bytes = std::uint64_t(context) * width * sizeof(float);
-    std::vector<float> buffer(std::size_t(context) * width);
+    std::vector<std::int64_t> hidden_shape;
+    std::vector<tb::ScalarType> hidden_dtypes(chunks, tb::kFloat16);
+    std::uint64_t hidden_bytes = 0;
+    std::vector<float> buffer;
     auto store = [&](std::uint32_t chunk, tb::Tensor value) {
+        if (hidden_shape.empty()) {
+            hidden_shape = value.sizes().vec();
+            hidden_bytes = std::uint64_t(value.numel()) * sizeof(float);
+            buffer.resize(value.numel());
+        }
+        if (value.sizes().vec() != hidden_shape)
+            throw std::runtime_error("reference hidden-state shape changed between layers");
+        hidden_dtypes[chunk] = value.scalar_type();
         auto cpu = value.to(tb::kCPU, tb::kFloat32).contiguous();
         hidden.seekp(chunk * hidden_bytes);
         hidden.write(reinterpret_cast<const char*>(cpu.template data_ptr<float>()), hidden_bytes);
@@ -73,8 +84,8 @@ int generate(CudaExecutionContext& execution, const CudaLoadOptions& options,
         hidden.seekg(chunk * hidden_bytes);
         hidden.read(reinterpret_cast<char*>(buffer.data()), hidden_bytes);
         if (!hidden) throw std::runtime_error("cannot read reference hidden-state scratch");
-        return tb::from_blob(buffer.data(), {1, context, width}, tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32))
-            .to(tb::kCUDA, tb::kFloat16).contiguous();
+        return tb::from_blob(buffer.data(), hidden_shape, tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32))
+            .to(tb::kCUDA, hidden_dtypes[chunk]).contiguous();
     };
     for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
         auto embedded = tb::empty({1, context, width}, tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat16));
@@ -120,19 +131,29 @@ int generate(CudaExecutionContext& execution, const CudaLoadOptions& options,
     mfq_cuda_empty_cache();
     const auto head = !model.tie_word_embeddings() && source.find_tensor("model.output.weight")
         ? "model.output.weight" : "model.token_embedding.weight";
-    std::ofstream logits(output, std::ios::binary);
-    if (!logits) throw std::runtime_error("cannot create reference logits scratch");
+    std::ofstream logits;
+    if (!chunk_handoff) logits.open(output, std::ios::binary);
+    if (!chunk_handoff && !logits) throw std::runtime_error("cannot create reference logits scratch");
     const std::int64_t first = context / 2, scored = context - first - 1;
     for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        if (chunk_handoff) {
+            logits.open(output, std::ios::binary | std::ios::trunc);
+            if (!logits) throw std::runtime_error("cannot create reference chunk scratch");
+        }
         auto normalized = model.finalize_hidden(restore(chunk), 1, context);
         for (std::int64_t begin = 0; begin < scored; begin += 32) {
             const auto count = std::min<std::int64_t>(32, scored - begin);
-            auto value = normalized.narrow(1, first + begin, count).reshape({count, width}).to(tb::kFloat16);
+            // Existing official references keep their FP16 head arithmetic;
+            // GLM uses the source head precision.
+            constexpr bool source_head = std::is_same_v<Model, Glm5CausalLm>;
+            auto value = normalized.narrow(1, first + begin, count).reshape({count, width});
+            if constexpr (!source_head) value = value.to(tb::kFloat16);
             std::vector<float> row_logits(count * vocab);
             for (std::int64_t row = 0; row < vocab; row += 4096) {
                 const auto rows_count = std::min<std::int64_t>(4096, vocab - row);
-                auto weight = rows(source, head, row, rows_count).to(tb::kCUDA, tb::kFloat16);
-                auto result = model.apply_final_logit_softcap(tb::matmul(value, weight.transpose(0, 1)))
+                auto weight = rows(source, head, row, rows_count).to(tb::kCUDA);
+                if constexpr (!source_head) weight = weight.to(tb::kFloat16);
+                auto result = model.apply_final_logit_softcap(tb::matmul(value.to(weight.scalar_type()), weight.transpose(0, 1)))
                     .to(tb::kCPU, tb::kFloat32).contiguous();
                 for (std::int64_t token = 0; token < count; ++token)
                     std::memcpy(row_logits.data() + token * vocab + row,
@@ -141,11 +162,22 @@ int generate(CudaExecutionContext& execution, const CudaLoadOptions& options,
             logits.write(reinterpret_cast<const char*>(row_logits.data()), row_logits.size() * sizeof(float));
             if (!logits) throw std::runtime_error("cannot write reference logits scratch");
         }
+        if (chunk_handoff) {
+            logits.close();
+            if (!logits) throw std::runtime_error("cannot finalize reference chunk scratch");
+            std::cout << "{\"event\":\"wt2_logits_ready\",\"chunk\":" << chunk << "}" << std::endl;
+            std::string acknowledgement;
+            if (!std::getline(std::cin, acknowledgement) || acknowledgement != "continue")
+                throw std::runtime_error("reference chunk consumer disconnected");
+            std::filesystem::remove(output);
+        }
         std::cout << "{\"event\":\"wt2_head\",\"chunk\":" << chunk + 1
                   << ",\"chunks\":" << chunks << "}" << std::endl;
     }
-    logits.close();
-    if (!logits) throw std::runtime_error("cannot finalize reference logits scratch");
+    if (!chunk_handoff) {
+        logits.close();
+        if (!logits) throw std::runtime_error("cannot finalize reference logits scratch");
+    }
     hidden.close();
     std::filesystem::remove(hidden_path);
     return 0;
@@ -157,13 +189,14 @@ int run_reference(int argc, char** argv) {
         ArgCursor args(argc, argv, 2);
         CudaLoadOptions options;
         std::filesystem::path input, output;
-        bool resident = false;
+        bool resident = false, chunk_handoff = false;
         while (!args.empty()) {
             const auto option = args.next();
             if (parse_cuda_load_option(option, args, options)) continue;
             if (option == "--reference-input") input = args.value(option);
             else if (option == "--reference-output") output = args.value(option);
             else if (option == "--resident") resident = true;
+            else if (option == "--reference-chunk-handoff") chunk_handoff = true;
             else usage_error("unknown native reference option: " + std::string(option));
         }
         if (options.model_path.empty() || input.empty() || output.empty() || options.context_size < 32)
@@ -175,8 +208,9 @@ int run_reference(int argc, char** argv) {
         tb::NoGradGuard guard;
         auto source = mfq::open_model_source(options.model_path);
         const auto backbone = source->resolved_model_graph().backbone;
-        if (backbone == "qwen3_5") return generate<Qwen35CausalLm>(execution, options, input, output, resident);
-        if (backbone == "gemma4") return generate<Gemma4CausalLm>(execution, options, input, output, resident);
+        if (backbone == "qwen3_5") return generate<Qwen35CausalLm>(execution, options, input, output, resident, chunk_handoff);
+        if (backbone == "gemma4") return generate<Gemma4CausalLm>(execution, options, input, output, resident, chunk_handoff);
+        if (backbone == "glm5_next") return generate<Glm5CausalLm>(execution, options, input, output, resident, chunk_handoff);
         throw std::runtime_error("native reference architecture is unsupported: " + backbone);
     });
 }
