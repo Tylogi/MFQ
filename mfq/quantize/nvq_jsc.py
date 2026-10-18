@@ -777,9 +777,13 @@ def quantize_nvq_jsc_fixed(
         # target equals original weights times the encoded even-parity signs.
         # Comparing it with unsigned codewords retains sign-flip error exactly.
         if target.is_cuda:
-            from mfq.quantize.cuda.nvq_sse import jsc_row_sse
-            return jsc_row_sse(target, objective_weight, anchor, state, indices,
-                               alpha, bank_for_state, codebooks, spec.vector_size)
+            try:
+                from mfq.quantize.cuda.nvq_sse import jsc_row_sse
+            except ImportError:  # e.g. Windows without Triton: same sum in torch
+                jsc_row_sse = None
+            if jsc_row_sse is not None:
+                return jsc_row_sse(target, objective_weight, anchor, state, indices,
+                                   alpha, bank_for_state, codebooks, spec.vector_size)
         states = state.reshape(out, ng).long()
         banks = bank_for_state[states].repeat_interleave(_GROUP_SIZE // spec.vector_size, 1)
         codes = codebooks[banks, indices.reshape(out, -1).long()].float().reshape_as(target)

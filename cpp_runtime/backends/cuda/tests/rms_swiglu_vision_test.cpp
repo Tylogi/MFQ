@@ -62,10 +62,11 @@ int main(int argc, char** argv) {
                 if (!prepared.embeddings.defined()) throw std::runtime_error("vision preparation returned no embeddings");
                 result[repeat ? "cached_embeddings" : "embeddings"] = descriptor(prepared.embeddings);
                 if (!repeat) {
-                    result["positions"] = descriptor(prepared.positions);
+                    // Sequential prompts carry no position override.
+                    result["positions_override"] = prepared.positions.defined();
                     auto tokens = tb::tensor(ids, tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64)).reshape({1,-1});
                     model.reset(1);
-                    result["logits"] = descriptor(model.forward_inputs(tokens, prepared.embeddings, prepared.positions));
+                    result["logits"] = descriptor(model.forward_inputs(tokens, prepared.embeddings));
                 }
             }
             result["vision_available"] = components.vision_available;

@@ -36,9 +36,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
     const bool transformed_prompt = prepared != nullptr && prepared->transformed();
     require_execution(prepared == nullptr || prepared->token_ids == prompt,
         "prepared MTP prompt disagrees with rendered token IDs");
-    require_execution(!transformed_prompt ||
-                          (ops.defined(prepared->embeddings) && ops.defined(prepared->positions)),
-        "prepared MTP prompt is missing embeddings or positions");
+    // Positions are optional: sequential prompts leave them undefined and the
+    // model advances its own contiguous cache positions.
+    require_execution(!transformed_prompt || ops.defined(prepared->embeddings),
+        "prepared MTP prompt is missing embeddings");
+    const bool prepared_positions = transformed_prompt && ops.defined(prepared->positions);
     require_execution(
         reused_tokens == 0 || (mtp.supports_session_state() && ops.defined(restored_last_hidden) &&
                                   model.cache_pos == static_cast<int64_t>(reused_tokens) &&
@@ -134,7 +136,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 const auto chunk = next_prefill_chunk(pairs, offset, predictor_chunk);
                 auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
                 auto ids = ops.slice(input_ids, 1, ids_offset + chunk.offset, chunk.count);
-                auto positions = transformed_prompt
+                auto positions = prepared_positions
                     ? ops.slice(prepared->positions, -1, ids_offset + chunk.offset, chunk.count) : Tensor{};
                 if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
                     const auto elapsed=ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
@@ -235,7 +237,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 const auto chunk = mfq::engine::next_prefill_chunk(pairs, offset, chunk_size);
                 auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
                 auto ids = ops.slice(input_ids, 1, prime_ids_offset + chunk.offset, chunk.count);
-                auto positions = transformed_prompt
+                auto positions = prepared_positions
                     ? ops.slice(prepared->positions, -1, prime_ids_offset + chunk.offset, chunk.count)
                     : Tensor{};
                 if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
@@ -280,7 +282,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         auto bootstrap = [&](Tensor token_counts,const MfqTokenConstraintPtr& cursor) {
             if(mtp.teacher_forced_prompt_prime()) {
                 (void)ops.predictor_step(initial_hidden,ops.ids_for({pending}),
-                    transformed_prompt ? ops.decode_positions(model.cache_pos,1) : Tensor{});
+                    prepared_positions ? ops.decode_positions(model.cache_pos,1) : Tensor{});
             }
             auto next_hidden=ops.target_forward(ops.ids_for({pending}),&raw);
             committed_last_hidden=ops.slice(raw,1,ops.size(raw,1)-1,1);
@@ -354,7 +356,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             auto rows = pending_hidden.size() == 1 ? pending_hidden.front()
                 : ops.concatenate(pending_hidden, 1);
             auto ids=ops.ids_for(pending_ids);
-            auto positions=transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
+            auto positions=prepared_positions ? ops.decode_positions(predictor_history_position + 1,
                 static_cast<int64_t>(pending_ids.size())) : Tensor{};
             if constexpr(requires {ops.predictor_history_step(rows,ids,positions);})
                 ops.predictor_history_step(std::move(rows),std::move(ids),std::move(positions));
@@ -451,7 +453,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             const auto history_rows=static_cast<int64_t>(shifted.size());
             auto head = ops.predictor_step(std::move(hidden_rows),
                 ops.ids_for(std::move(shifted)),
-                transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
+                prepared_positions ? ops.decode_positions(predictor_history_position + 1,
                                          history_rows)
                                    : Tensor{});
             predictor_history_position += history_rows;
@@ -471,7 +473,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                         ops.prefetch_target_prefix(next_ids.back(),result.tokens);
                     auto next = ops.predictor_step(chain_hidden,
                         ops.ids_for({token}),
-                        transformed_prompt
+                        prepared_positions
                             ? ops.decode_positions(predictor_history_position + position + 1, 1)
                             : Tensor{});
                     sample_hidden = std::move(next.sample_hidden);

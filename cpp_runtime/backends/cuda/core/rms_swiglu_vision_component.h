@@ -180,8 +180,9 @@ class CudaRmsSwiGluVisionPromptComponent {
                 output.index_copy_(1, mfq_tensor_backend::tensor(placeholders, options),
                     vision.to(output.scalar_type()).unsqueeze(0));
             });
-        auto positions = mfq_tensor_backend::arange(static_cast<int64_t>(ids.size()), options).reshape({1, -1});
-        co_yield CudaPreparedPrompt{ids, std::move(embeddings), std::move(positions), 0, key};
+        // Sequential policy: no position override. The text model advances its
+        // own contiguous causal cache positions (GLM rejects explicit overrides).
+        co_yield CudaPreparedPrompt{ids, std::move(embeddings), {}, 0, key};
     }
 
   private:

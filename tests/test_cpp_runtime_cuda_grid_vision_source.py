@@ -148,7 +148,10 @@ def test_rms_swiglu_vision_reuses_backend_helpers_and_sequential_positions():
         assert helper in rms
     assert "make_grid_vision_layout" in rms
     assert "build_grid_mrope_positions" not in rms
-    assert "mfq_tensor_backend::arange" in rms
+    # Sequential prompts carry no position override; callers fall back to the
+    # model's contiguous cache positions.
+    assert "CudaPreparedPrompt{ids, std::move(embeddings), {}, 0, key}" in rms
+    assert "prepared->positions.defined()" in CUDA_APP
     assert "clamp_max(limit)" in rms
     assert ".permute({0, 3, 1, 2})" in rms
     assert "components.rms_vision->prepare(" in CUDA_APP

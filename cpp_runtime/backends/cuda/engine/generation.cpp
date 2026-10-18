@@ -125,7 +125,9 @@ template <typename Model> struct CudaGenerationOps {
                     std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
-                prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
+                prepared->positions.defined()
+                    ? MfqOptional<Tensor>(prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous())
+                    : MfqOptional<Tensor>(mfq_nullopt),
                 mfq_nullopt,
                 nullptr,
                 mfq_nullopt,
