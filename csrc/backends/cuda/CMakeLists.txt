@@ -416,7 +416,7 @@ set(MFQ_CUDA_LOADING_SOURCES
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
 target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_ENGINE_PRIVATE_DIRS})
-target_link_libraries(mfq-cuda-loading PRIVATE mfq-models)
+target_link_libraries(mfq-cuda-loading PRIVATE mfq-models mfq-cpu-execution)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -445,7 +445,7 @@ add_library(mfq-cuda-runtime STATIC
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
 target_include_directories(mfq-cuda-runtime PUBLIC ${MFQ_CUDA_ROOT}/include)
-target_link_libraries(mfq-cuda-runtime PUBLIC mfq-engine)
+target_link_libraries(mfq-cuda-runtime PUBLIC mfq-engine PRIVATE mfq-cpu-execution)
 
 if(BUILD_TESTING)
     add_executable(mfq-cuda-format-bench
@@ -883,6 +883,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         CUDA::cudart
         CUDA::cublas
         mfq-cuda-storage
+        mfq-cpu-execution
     )
     target_compile_definitions(mfq-runtime-torch PRIVATE NOMINMAX)
     target_compile_options(mfq-runtime-torch PRIVATE

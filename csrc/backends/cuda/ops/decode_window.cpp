@@ -2,7 +2,7 @@
 #include "ops/decode_window.h"
 #include "ops/execution/execution_options.h"
 #include "native/context.h"
-#include "mfq/moe/cpu_expert_pool.h"
+#include "mfq/cpu_topology.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>

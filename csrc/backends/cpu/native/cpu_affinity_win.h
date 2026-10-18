@@ -2,7 +2,7 @@
 
 // Adapted from Strata's src/kernels/cpu/pool_affinity_win.hpp.
 // Copyright (c) 2026 Niko1221 and the Strata contributors.
-// MIT license: ../third_party/strata.LICENSE
+// MIT license: ../../../third_party/strata.LICENSE
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

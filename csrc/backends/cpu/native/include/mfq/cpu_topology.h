@@ -1,8 +1,5 @@
 #pragma once
-#include "mfq/host_parallel.h"
 #include <cstdint>
-#include <functional>
-#include <memory>
 #include <vector>
 
 namespace mfq::cpu {
@@ -16,6 +13,7 @@ struct CpuTopology {
 };
 CpuTopology detect_cpu_topology(bool reserve_caller, PoolAffinity = PoolAffinity::All,
                               HostCore = HostCore::First);
+HostCore host_core_setting();
 int planned_host_core();
 std::vector<int> physical_cores(bool reserve_caller, PoolAffinity = PoolAffinity::All);
 struct ThreadAffinity {
@@ -34,23 +32,4 @@ public:
 private:
     ThreadAffinity previous_;
 };
-
-// Each projection contributes rows to one batch on MFQ's persistent workers.
-class ExpertPool {
-public:
-    explicit ExpertPool(int workers = 0, bool pin = true);
-    ~ExpertPool();
-    ExpertPool(const ExpertPool&) = delete;
-    ExpertPool& operator=(const ExpertPool&) = delete;
-    void rows(std::int64_t count,
-              const std::function<void(std::int64_t, std::int64_t)>& callback,
-              mfq::HostParallelProfile* profile=nullptr);
-    int participants() const { return participants_; }
-private:
-    CpuTopology topology_;
-    int participants_ = 1;
-    bool pin_ = true;
-    std::unique_ptr<mfq::HostParallelPool> pool_;
-};
-ExpertPool& expert_pool();
 } // namespace mfq::cpu
