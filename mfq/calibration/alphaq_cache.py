@@ -151,7 +151,8 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
             if (value.name, value.layer, value.projection, value.shape) != (item.name, layer, projection, shape):
                 raise ValueError(f'AlphaQ statistics identity mismatch: {item.name}')
         else:
-            alpha, variance, energies, start, batch = [], [], [], 0, shape[0]
+            alpha, variance, energies, start = [], [], [], 0
+            batch = _initial_batch(shape, device)
             with rows_for_plan(root, item) as source:
                 while start < shape[0]:
                     count = min(batch, shape[0]-start)
@@ -171,6 +172,21 @@ def collect_statistics(root, plans, cache, device, *, mapper=None):
         _progress(stage='alphaq_statistics', completed=len(results), total=len(plans),
                   tensor=item.name, elapsed_seconds=time.monotonic()-started)
     return tuple(results)
+
+
+def _initial_batch(shape, device):
+    """Start below the device's free memory instead of at a whole bank.
+
+    The batched spectrum peaks near 48 bytes per weight. A first attempt that
+    is far above free memory is expensive and, under Windows WDDM, can leave
+    the device unable to serve the following allocation.
+    """
+    import torch
+
+    if torch.device(device).type != 'cuda':
+        return shape[0]
+    free, _ = torch.cuda.mem_get_info(device)
+    return max(1, min(shape[0], int(free//2 // (48*shape[1]*shape[2]))))
 
 
 def _collect(source, start, count, shape, device):
