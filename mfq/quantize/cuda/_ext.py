@@ -69,10 +69,13 @@ def ext():
         _ensure_msvc()
         from torch.utils.cpp_extension import load
 
+        # CUDA 13 CCCL headers reject MSVC's traditional preprocessor.
+        conforming = ["/Zc:preprocessor"] if os.name == "nt" else []
         _module = load(
             name="mfq_nvq_quant_cuda",
             sources=_SOURCES,
-            extra_cuda_cflags=["-O3"],
+            extra_cflags=conforming,
+            extra_cuda_cflags=["-O3", *(f"-Xcompiler={flag}" for flag in conforming)],
             verbose=False,
         )
     return _module

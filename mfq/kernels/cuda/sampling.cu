@@ -632,9 +632,10 @@ static mfq_tensor_backend::Tensor sample_top_k_compact_impl(
         "sample_top_k_compact: unsupported rows, vocab or top-k");
     const int items=V<=8192?1:V<=65536?4:8;
     const int blocks=(V+SAMPLE_BD*items-1)/(SAMPLE_BD*items);
-    auto out=mfq_tensor_backend::empty({B,top_k},logits.options().dtype(mfq_tensor_backend::kInt64));
-    auto a=mfq_tensor_backend::empty({int64_t(B)*blocks*top_k},out.options());
-    auto b=mfq_tensor_backend::empty(a.sizes(),a.options());
+    // Explicit types keep these non-dependent for nvcc's MSVC-mode front end.
+    mfq_tensor_backend::Tensor out=mfq_tensor_backend::empty({B,top_k},logits.options().dtype(mfq_tensor_backend::kInt64));
+    mfq_tensor_backend::Tensor a=mfq_tensor_backend::empty({int64_t(B)*blocks*top_k},out.options());
+    mfq_tensor_backend::Tensor b=mfq_tensor_backend::empty(a.sizes(),a.options());
     auto* first=reinterpret_cast<uint64_t*>(a.data_ptr<int64_t>());
     auto* second=reinterpret_cast<uint64_t*>(b.data_ptr<int64_t>());
     const auto stream=mfq_current_cuda_stream();

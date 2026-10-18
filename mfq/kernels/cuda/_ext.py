@@ -112,8 +112,10 @@ def ext():
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,
             ],
-            extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
+            # CUDA 13 CCCL headers reject MSVC's traditional preprocessor.
+            extra_cflags=["/std:c++20", "/Zc:preprocessor"] if os.name == "nt" else ["-std=c++20"],
             extra_cuda_cflags=[
+                *(["-Xcompiler=/Zc:preprocessor"] if os.name == "nt" else []),
                 "-O3",
                 "--use_fast_math",
                 "--extended-lambda",
