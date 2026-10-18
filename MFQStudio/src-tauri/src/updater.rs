@@ -22,8 +22,6 @@ const CACHE_SECONDS: u64 = 6 * 60 * 60;
 const PREFERENCES_FILE: &str = "update-preferences.json";
 const RELEASES_FILE: &str = "releases.json";
 const INSTALL_METADATA_FILE: &str = "release.json";
-const STUDIO_CONFIG_FILE: &str = "studio.json";
-const SERVER_PID_FILE: &str = "mfq-server.pid";
 const HELPER_ARGUMENT: &str = "--mfq-update-helper";
 #[cfg(target_os = "macos")]
 const BUNDLE_IDENTIFIER: &str = "com.tylogi.mfq-studio";
@@ -145,11 +143,6 @@ struct ReleasesCache {
 struct InstalledMetadata {
     release: StudioRelease,
     installed_at_epoch_seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct StudioConnectionConfig {
-    local_service_port: u16,
 }
 
 fn now_epoch_seconds() -> u64 {
@@ -612,117 +605,6 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<bool, String> {
         digest.update(&buffer[..count]);
     }
     Ok(format!("{:x}", digest.finalize()) == expected)
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn local_server_is_mfq(port: u16) -> bool {
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-    else {
-        return false;
-    };
-    let Ok(response) = client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-    else {
-        return false;
-    };
-    response
-        .json::<serde_json::Value>()
-        .ok()
-        .and_then(|value| {
-            value
-                .get("service")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some("mfq-server")
-}
-
-#[cfg(target_os = "macos")]
-fn managed_server_process_matches(pid: u32, data_dir: &Path) -> bool {
-    let Ok(output) = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    command.contains("serve")
-        && (command.contains("mfq") || command.contains("python"))
-        && command.contains(&data_dir.to_string_lossy().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn process_is_running(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(target_os = "windows")]
-fn process_is_running(pid: u32) -> bool {
-    Command::new("tasklist.exe")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn stop_managed_server(data_dir: &Path) -> Result<(), String> {
-    let Some(config) = read_json::<StudioConnectionConfig>(&data_dir.join(STUDIO_CONFIG_FILE))
-    else {
-        return Ok(());
-    };
-    if !local_server_is_mfq(config.local_service_port) {
-        return Ok(());
-    }
-    let pid_path = data_dir.join(SERVER_PID_FILE);
-    let Some(pid) = fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-    else {
-        return Err("the local MFQ Server is running but its managed PID is unavailable".into());
-    };
-    #[cfg(target_os = "macos")]
-    {
-        if !managed_server_process_matches(pid, data_dir) {
-            return Err("the saved MFQ Server PID does not match the managed local process".into());
-        }
-        command_success("/bin/kill", &["-TERM", &pid.to_string()])?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let status = Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string()])
-            .status()
-            .map_err(|error| format!("could not stop the managed MFQ Server: {error}"))?;
-        if !status.success() {
-            return Err(format!("taskkill exited with {status}"));
-        }
-    }
-    for _ in 0..120 {
-        if !process_is_running(pid) {
-            let _ = fs::remove_file(pid_path);
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    Err(
-        "the managed MFQ Server did not stop within 30 seconds; finish active requests and retry"
-            .into(),
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1191,11 +1073,10 @@ pub async fn studio_update_install(
 ) -> Result<(), String> {
     let _guard = state.lock.lock().await;
     let root = update_root(&app)?;
-    let data_dir = root
-        .parent()
-        .ok_or_else(|| "update directory has no application data parent".to_string())?
-        .to_path_buf();
     let version = safe_version_directory(&version)?;
+    let studio = app.state::<crate::StudioState>();
+    let _server_guard = studio.start_lock.lock().await;
+    let server_app = app.clone();
     #[cfg(target_os = "macos")]
     {
         tokio::task::spawn_blocking(move || {
@@ -1204,7 +1085,7 @@ pub async fn studio_update_install(
             let target = current_bundle()?;
             ensure_bundle_parent_writable(&target)?;
             snapshot_current_bundle(&root, &target)?;
-            stop_managed_server(&data_dir)?;
+            server_app.state::<crate::StudioState>().stop_owned_server()?;
             launch_update_helper(&root, &source, &target)
         })
         .await
@@ -1217,7 +1098,7 @@ pub async fn studio_update_install(
         tokio::task::spawn_blocking(move || {
             let installer = cached_installable(&root.join("versions").join(version))
                 .ok_or_else(|| "selected version has not been downloaded".to_string())?;
-            stop_managed_server(&data_dir)?;
+            server_app.state::<crate::StudioState>().stop_owned_server()?;
             Command::new(installer)
                 .spawn()
                 .map(|_| ())

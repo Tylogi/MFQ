@@ -48,9 +48,14 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
     assert 'if [[ "${mfq_signing_identity}" != "-" ]]' in RELEASE_SCRIPT
     assert '"hardenedRuntime":true' in RELEASE_SCRIPT
-    assert "--remap-path-prefix=${HOME}=/mfq-build/home" in RELEASE_SCRIPT
-    assert "--remap-path-prefix=${mfq_project_dir}=/mfq-src" in RELEASE_SCRIPT
-    assert 'RUSTFLAGS="${mfq_release_rustflags}"' in RELEASE_SCRIPT
+    assert 'source "${mfq_script_dir}/macos_release_paths.sh"' in RELEASE_SCRIPT
+    assert "mfq_configure_release_paths" in RELEASE_SCRIPT
+    assert '-DCMAKE_C_FLAGS="${CFLAGS}"' in RELEASE_SCRIPT
+    assert '-DCMAKE_CXX_FLAGS="${CXXFLAGS}"' in RELEASE_SCRIPT
+    assert '-DCMAKE_OBJCXX_FLAGS="${OBJCXXFLAGS}"' in RELEASE_SCRIPT
+    assert '--additional-hooks-dir "${mfq_script_dir}/hooks"' in RELEASE_SCRIPT
+    assert '"${mfq_packaged_app}" "${mfq_release_dmg}"' in RELEASE_SCRIPT
+    assert '--python-cli "${mfq_packaged_app}/Contents/Resources/mfq-cli/mfq-cli"' in RELEASE_SCRIPT
     assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
 

@@ -142,6 +142,20 @@ impl StudioState {
         }
     }
 
+    fn stop_owned_server(&self) -> Result<(), String> {
+        let mut child = self.server_child.lock().map_err(|error| error.to_string())?;
+        let Some(process) = child.as_mut() else { return Ok(()); };
+        self.release_server(process.id());
+        for _ in 0..120 {
+            if process.try_wait().map_err(|error| format!("could not wait for MFQ Server: {error}"))?.is_some() {
+                child.take();
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err("MFQ Server did not stop within 30 seconds; finish active requests and retry".into())
+    }
+
     fn owns(&self, server: &ServerIdentity) -> bool {
         self.server_input.lock().ok().is_some_and(|input| input.as_ref().is_some_and(
             |(pid, instance, _)| *pid == server.pid && *instance == server.instance_id && server.launch_mode == "studio"))
@@ -813,7 +827,15 @@ mod tests {
         Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap()
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn pipe_child() -> Child {
+        let root = std::env::var_os("SystemRoot").expect("Windows system directory");
+        let mut command = Command::new(PathBuf::from(root).join("System32/sort.exe"));
+        command.stdin(Stdio::piped()).stdout(Stdio::null());
+        configure_detached(&mut command);
+        command.spawn().unwrap()
+    }
+
     fn wait_for_pipe_child(child: &mut Child) {
         for _ in 0..100 {
             if let Some(status) = child.try_wait().unwrap() {
@@ -827,7 +849,6 @@ mod tests {
         panic!("owned server did not receive lifecycle EOF");
     }
 
-    #[cfg(unix)]
     #[test]
     fn dropping_studio_closes_only_its_owned_server_pipe() {
         let mut owned = pipe_child();
@@ -843,7 +864,6 @@ mod tests {
         wait_for_pipe_child(&mut external);
     }
 
-    #[cfg(unix)]
     #[test]
     fn startup_cleanup_does_not_close_a_different_owned_server() {
         let mut owned = pipe_child();
@@ -853,6 +873,22 @@ mod tests {
         assert!(owned.try_wait().unwrap().is_none());
         state.release_server(owned.id());
         wait_for_pipe_child(&mut owned);
+    }
+
+    #[test]
+    fn update_shutdown_waits_for_owned_server_and_preserves_external_server() {
+        let state = StudioState::default();
+        let mut owned = pipe_child();
+        let mut external = pipe_child();
+        state.own_server(&mut owned, "owned-instance").unwrap();
+        *state.server_child.lock().unwrap() = Some(owned);
+        state.stop_owned_server().unwrap();
+        assert!(state.server_child.lock().unwrap().is_none());
+        assert!(state.server_input.lock().unwrap().is_none());
+        state.stop_owned_server().unwrap();
+        assert!(external.try_wait().unwrap().is_none());
+        drop(external.stdin.take());
+        wait_for_pipe_child(&mut external);
     }
 
     fn startup_test_dir() -> PathBuf {
@@ -901,7 +937,6 @@ mod tests {
         assert!(!state.owns(&server));
     }
 
-    #[cfg(unix)]
     #[test]
     fn ownership_needs_both_spawned_pid_and_instance_id_and_clears_after_exit() {
         let state = StudioState::default();
