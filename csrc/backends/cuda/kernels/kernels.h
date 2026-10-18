@@ -87,4 +87,49 @@ void nint8_zero_embedding_lookup(
     std::int64_t width,
     cudaStream_t stream);
 
+// Callers validate cache/input views and check launch errors. Extents retain
+// their original host-side int casts; launchers do not consume CUDA errors.
+void kv_cache_write(
+    void* k_cache,
+    void* v_cache,
+    const void* k,
+    const void* v,
+    const std::int64_t* positions,
+    ScalarType dtype,
+    int B,
+    int H,
+    int T,
+    int D,
+    int max_seq,
+    int pos_dim,
+    cudaStream_t stream);
+
+void kv_cache_write_ring(
+    void* k_cache,
+    void* v_cache,
+    const void* k,
+    const void* v,
+    ScalarType dtype,
+    std::int64_t position_start,
+    int B,
+    int H,
+    int T,
+    int D,
+    int capacity,
+    cudaStream_t stream);
+
+void kv_cache_write_ring_positions(
+    void* k_cache,
+    void* v_cache,
+    const void* k,
+    const void* v,
+    const std::int64_t* positions,
+    ScalarType dtype,
+    int B,
+    int H,
+    int T,
+    int D,
+    int capacity,
+    cudaStream_t stream);
+
 }  // namespace mfq::cuda::kernels

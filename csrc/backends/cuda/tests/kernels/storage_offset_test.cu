@@ -120,16 +120,40 @@ static void kv_case(ScalarType dtype, int tokens, int width, int unaligned, int 
                 std::copy_n(keys.data() + src, width, expected_k.data() + dst);
                 std::copy_n(values.data() + src, width, expected_v.data() + dst);
             }
-    const auto result = mode == 1 ? kv_cache_write_ring_cuda(kc.view, vc.view, k.view, v.view, 3)
-                        : mode == 2 ? kv_cache_write_ring_positions_cuda(kc.view, vc.view, k.view, v.view, pos.view)
-                                    : kv_cache_write_cuda(kc.view, vc.view, k.view, v.view, pos.view);
-    check(result[0].data_ptr() == kc.view.data_ptr() && result[1].data_ptr() == vc.view.data_ptr(),
-          "KV writer replaced the offset cache");
-    exact(kc.view, tensor(expected_k).reshape(kc.view.sizes().vec()).to(dtype));
-    exact(vc.view, tensor(expected_v).reshape(vc.view.sizes().vec()).to(dtype));
-    exact(k.view, tensor(keys).to(kCUDA, dtype).reshape(k.view.sizes().vec()).to(dtype));
-    exact(v.view, tensor(values).to(kCUDA, dtype).reshape(v.view.sizes().vec()).to(dtype));
-    for (const auto* tensor : {&k, &v, &kc, &vc, &pos}) tensor->guards();
+    for (bool raw : {false, true}) {
+        kc.view.fill_(-100);
+        vc.view.fill_(-100);
+        if (raw) {
+            const auto stream = mfq_current_cuda_stream();
+            if (mode == 1) {
+                mfq::cuda::kernels::kv_cache_write_ring(
+                    kc.view.data_ptr(), vc.view.data_ptr(), k.view.data_ptr(), v.view.data_ptr(),
+                    dtype, 3, batch, heads, tokens, width, capacity, stream);
+            } else if (mode == 2) {
+                mfq::cuda::kernels::kv_cache_write_ring_positions(
+                    kc.view.data_ptr(), vc.view.data_ptr(), k.view.data_ptr(), v.view.data_ptr(),
+                    pos.view.data_ptr<int64_t>(), dtype,
+                    batch, heads, tokens, width, capacity, stream);
+            } else {
+                mfq::cuda::kernels::kv_cache_write(
+                    kc.view.data_ptr(), vc.view.data_ptr(), k.view.data_ptr(), v.view.data_ptr(),
+                    pos.view.data_ptr<int64_t>(), dtype,
+                    batch, heads, tokens, width, capacity, batched_positions ? 2 : 1, stream);
+            }
+            MFQ_CUDA_CHECK(cudaGetLastError());
+        } else {
+            const auto result = mode == 1 ? kv_cache_write_ring_cuda(kc.view, vc.view, k.view, v.view, 3)
+                                : mode == 2 ? kv_cache_write_ring_positions_cuda(kc.view, vc.view, k.view, v.view, pos.view)
+                                            : kv_cache_write_cuda(kc.view, vc.view, k.view, v.view, pos.view);
+            check(result[0].data_ptr() == kc.view.data_ptr() && result[1].data_ptr() == vc.view.data_ptr(),
+                  "KV writer replaced the offset cache");
+        }
+        exact(kc.view, tensor(expected_k).reshape(kc.view.sizes().vec()).to(dtype));
+        exact(vc.view, tensor(expected_v).reshape(vc.view.sizes().vec()).to(dtype));
+        exact(k.view, tensor(keys).to(kCUDA, dtype).reshape(k.view.sizes().vec()).to(dtype));
+        exact(v.view, tensor(values).to(kCUDA, dtype).reshape(v.view.sizes().vec()).to(dtype));
+        for (const auto* tensor : {&k, &v, &kc, &vc, &pos}) tensor->guards();
+    }
 }
 
 int main() {

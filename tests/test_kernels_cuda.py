@@ -532,6 +532,98 @@ def test_kv_cache_write_batch_positions():
     torch.testing.assert_close(vc, v_ref, atol=0, rtol=0)
 
 
+def test_kv_cache_write_ring_positions_matches_modulo_assignment():
+    torch.manual_seed(240)
+    B, H, T, D, capacity = 2, 2, 9, 8, 5
+    k = torch.randn(B, H, T, D, device=DEV, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    kc = torch.full((B, H, capacity, D), -100, device=DEV, dtype=k.dtype)
+    vc = torch.full_like(kc, -100)
+    positions = torch.tensor([2, 4, 1, 3, 7, 8, 9, 10, 11], device=DEV)
+    result = ext().kv_cache_write_ring_positions_cuda(kc, vc, k, v, positions)
+    assert result[0].data_ptr() == kc.data_ptr()
+    assert result[1].data_ptr() == vc.data_ptr()
+    k_ref, v_ref = torch.full_like(kc, -100), torch.full_like(vc, -100)
+    for t in range(T - capacity, T):
+        slot = int(positions[t]) % capacity
+        k_ref[:, :, slot] = k[:, :, t]
+        v_ref[:, :, slot] = v[:, :, t]
+    torch.testing.assert_close(kc, k_ref, atol=0, rtol=0)
+    torch.testing.assert_close(vc, v_ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,width,offset",
+    [(torch.bfloat16, 8, 0), (torch.bfloat16, 9, 0),
+     (torch.bfloat16, 8, 1), (torch.float32, 8, 0)],
+    ids=["vector", "width-fallback", "alignment-fallback", "float-flat"],
+)
+def test_kv_cache_write_row_dispatch_and_invalid_positions(dtype, width, offset):
+    B, H, T, capacity = 2, 2, 1024, 1027
+    k_host = (torch.arange(B * H * T * width) % 127).reshape(B, H, T, width).to(dtype)
+    v_host = -k_host
+    k, v = k_host.to(DEV), v_host.to(DEV)
+    count = B * H * capacity * width
+    owner = torch.full((count + offset + 4,), -100, device=DEV, dtype=dtype)
+    kc = owner[offset:offset + count].view(B, H, capacity, width)
+    vc = torch.full_like(kc, -100)
+    assert kc.is_contiguous()
+    assert all(t.data_ptr() % 8 == 0 for t in (k, v, vc))
+    assert kc.data_ptr() % 8 == offset * kc.element_size()
+    positions = torch.arange(T).repeat(B, 1)
+    positions[0, 0], positions[1, 1] = -1, capacity
+    result = ext().kv_cache_write_cuda(kc, vc, k, v, positions.to(DEV))
+    assert result[0].data_ptr() == kc.data_ptr()
+    assert result[1].data_ptr() == vc.data_ptr()
+    k_ref = torch.full((B, H, capacity, width), -100, dtype=dtype)
+    v_ref = torch.full_like(k_ref, -100)
+    for b in range(B):
+        valid = (positions[b] >= 0) & (positions[b] < capacity)
+        k_ref[b, :, positions[b, valid], :] = k_host[b, :, valid, :]
+        v_ref[b, :, positions[b, valid], :] = v_host[b, :, valid, :]
+    torch.testing.assert_close(kc.cpu(), k_ref, atol=0, rtol=0)
+    torch.testing.assert_close(vc.cpu(), v_ref, atol=0, rtol=0)
+    assert torch.all(owner[:offset] == -100)
+    assert torch.all(owner[offset + count:] == -100)
+
+
+def test_kv_cache_write_ring_stream_and_graph_replay():
+    torch.manual_seed(241)
+    module = ext()
+    k = torch.randn(1, 2, 3, 8, device=DEV, dtype=torch.float16)
+    v = torch.randn_like(k)
+    kc = torch.full((1, 2, 8, 8), -100, device=DEV, dtype=k.dtype)
+    vc = torch.full_like(kc, -100)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        k.add_(1)
+        v.sub_(1)
+        warm = module.kv_cache_write_ring_cuda(kc, vc, k, v, 7)
+    torch.cuda.current_stream().wait_stream(stream)
+    k_ref, v_ref = torch.full_like(kc, -100), torch.full_like(vc, -100)
+    k_ref[:, :, [7, 0, 1]], v_ref[:, :, [7, 0, 1]] = k, v
+    assert warm[0].data_ptr() == kc.data_ptr()
+    assert warm[1].data_ptr() == vc.data_ptr()
+    torch.testing.assert_close(warm[0], k_ref, atol=0, rtol=0)
+    torch.testing.assert_close(warm[1], v_ref, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = module.kv_cache_write_ring_cuda(kc, vc, k, v, 7)
+    kc.fill_(-100)
+    vc.fill_(-100)
+    k.add_(7)
+    v.sub_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    k_ref[:, :, [7, 0, 1]], v_ref[:, :, [7, 0, 1]] = k, v
+    assert captured[0].data_ptr() == kc.data_ptr()
+    assert captured[1].data_ptr() == vc.data_ptr()
+    torch.testing.assert_close(captured[0], k_ref, atol=0, rtol=0)
+    torch.testing.assert_close(captured[1], v_ref, atol=0, rtol=0)
+
+
 def test_kv_cache_append_attention_matches_sdpa():
     torch.manual_seed(25)
     B, Hq, Hkv, D = 1, 4, 2, 16

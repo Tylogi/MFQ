@@ -32,6 +32,7 @@ _SOURCES = [
     os.path.join(_KERNEL_DIR, "attention", "gated_delta_net.cu"),
     os.path.join(_KERNEL_DIR, "attention", "ssm_conv.cu"),
     os.path.join(_KERNEL_DIR, "cache", "kv_cache.cu"),
+    os.path.join(_BACKEND_DIR, "ops", "kv_cache.cpp"),
     os.path.join(_KERNEL_DIR, "activation.cu"),
     os.path.join(_BACKEND_DIR, "ops", "activation.cpp"),
     os.path.join(_KERNEL_DIR, "embedding.cu"),

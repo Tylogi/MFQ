@@ -388,6 +388,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/quant/quant_linear.cpp
     ${MFQ_CUDA_ROOT}/ops/rope.cpp
     ${MFQ_CUDA_ROOT}/ops/quant/vq.cpp
+    ${MFQ_CUDA_ROOT}/ops/kv_cache.cpp
 )
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
