@@ -714,6 +714,17 @@ if(BUILD_TESTING)
     add_test(NAME mfq-cuda-execution-scope-test
         COMMAND mfq-cuda-execution-scope-test)
 
+    add_executable(mfq-rms-swiglu-vision-test
+        ${MFQ_CUDA_ROOT}/tests/rms_swiglu_vision_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-rms-swiglu-vision-test)
+    target_compile_definitions(mfq-rms-swiglu-vision-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-rms-swiglu-vision-test PRIVATE mfq-cuda-runtime)
+    if(MSVC)
+        target_compile_options(mfq-rms-swiglu-vision-test PRIVATE /utf-8 /EHsc /bigobj)
+    endif()
+    add_test(NAME mfq-rms-swiglu-vision-test COMMAND mfq-rms-swiglu-vision-test)
+    set_tests_properties(mfq-rms-swiglu-vision-test PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(mfq-cuda-runtime-state-test
         ${MFQ_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)

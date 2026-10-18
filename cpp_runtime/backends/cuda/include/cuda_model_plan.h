@@ -26,6 +26,7 @@ enum class CudaBackbone {
 enum class CudaVisionAdapter {
     none,
     grid_vit,
+    rms_swiglu_vit,
     minicpmo45,
 };
 
@@ -100,6 +101,12 @@ inline CudaModelPlan cuda_model_plan(
         vision->position_policy == kMfqGridMropePositionPolicy) {
         result.vision = CudaVisionAdapter::grid_vit;
     }
+    if (graph.backbone == "glm5_next" && vision != nullptr &&
+        vision->tensor_root == "vision" && vision->implementation == "rms_swiglu_vit" &&
+        vision->input_contract == kMfqGridVisionInputContract &&
+        vision->position_policy == kMfqSequentialPositionPolicy) {
+        result.vision = CudaVisionAdapter::rms_swiglu_vit;
+    }
     const auto* audio = graph.component("audio_input");
     const auto* tts = graph.component("audio_output");
     // The current CUDA MiniCPM adapter is one composite implementation.  Do
@@ -137,8 +144,10 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     if (!result.text) return result;
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
+        plan.vision == CudaVisionAdapter::rms_swiglu_vit ||
         plan.vision == CudaVisionAdapter::minicpmo45;
-    result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
+    result.video_input = plan.vision == CudaVisionAdapter::minicpmo45 ||
+        plan.vision == CudaVisionAdapter::rms_swiglu_vit;
     result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_output = plan.vision == CudaVisionAdapter::minicpmo45;
     result.full_duplex = plan.vision == CudaVisionAdapter::minicpmo45;

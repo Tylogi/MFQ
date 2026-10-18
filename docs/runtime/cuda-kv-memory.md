@@ -286,5 +286,8 @@ predictor budgets its compute workspace before borrowing expert capacity.
 Grid vision weights remain in RAM by default and move to VRAM for each encoder
 stage. Its workspace estimate includes decoded projection weights and MLP
 activations. Fused tanh GELU avoids retaining a chain of full-sized temporaries.
-Windows image requests support the authenticated binary tensor-file transport
+GLM-5.3-Flash uses the same staging policy for its RMSNorm/SwiGLU tower and
+channel-first downsampler, with sequential text positions for image/video
+prompts. `MFQ_CUDA_VISION_RESIDENT=1` retains the vision tower on the GPU.
+Windows image/video requests support the authenticated binary tensor-file transport
 used by the Python server, with file ownership, shape and token validation.

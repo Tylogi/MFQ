@@ -21,7 +21,7 @@ Model and feature support for CUDA, Metal, and ROCm (HIP).
 | DeepSeek V4 Flash Series | Native C++ | Native C++ | — | Compression, indexer, sparse attention, mHC, and routed MoE; Vision and DSpark availability depends on the artifact and backend |
 | DeepSeek V4.1 Flash | Native C++ | Native C++ | — | Engram, routed MoE, mHC, and graph-declared DSpark; native Metal Vision and raw-HF loading |
 | MiniCPM-o 4.5 | Native C++ | Native C++ | — | Text, image, video, audio input, audio output, and duplex serving |
-| GLM5–5.3 | Native C++ | Reference | — | DSA/KDA and Flash-Next families; Metal production C++ worker integration remains open |
+| GLM5–5.3 | Native C++ | Reference | — | DSA/KDA and Flash-Next families; GLM-5.3-Flash CUDA image/video Vision with optional MTP; Metal production C++ worker integration remains open |
 | Gemma 4 | Native C++ | Reference | — | Mixed full/sliding attention and MoE; Metal production C++ worker integration remains open |
 
 The HIP column reflects MI300X validation of the early HIP backend: dense
@@ -79,6 +79,44 @@ and explicit tensor/expert-parallel device groups; multi-rank deployments still
 require physical validation. Packed NINTv2, VQ-family, dense,
 routed-MoE, attention, recurrent-state, and
 sampling kernels are selected through the shared model graph and backend plan.
+
+GLM-5.3-Flash Vision uses the graph component `rms_swiglu_vit`, input contract
+`grid_vision.v1`, and `sequential` text positions. `mfq serve` selects
+`Glm5NextVisionProcessor` and sends its `grid_vision.v1` image/video payload through
+the native worker's stdio transport. Vision and MTP default on when declared
+and loaded. The tower accepts native BF16/F16/F32 or NINT projection weights;
+`MFQ_CUDA_VISION_RESIDENT=1` keeps vision weights on the GPU instead of staging
+each encoder stage from RAM.
+
+The numerical and stdio regression tests cover BF16/NINT8, image/video prompt
+order, sequential positions, cached embeddings, resident/staged weights, and
+MTP present/absent. Build the runtime and tests in Release with `sm_120`:
+
+```sh
+cmake -S cpp_runtime -B ~/work/build-vision -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=120 -DMFQ_CUDA_ARCHITECTURES=120 -DMFQ_BUILD_CUDA_RUNTIME=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build ~/work/build-vision -j 8
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+ctest --test-dir ~/work/build-vision --output-on-failure
+PYTHONPATH=. MFQ_CUDA_RESOURCE_TEST_RUNTIME=~/work/build-vision/mfq-runtime python -m pytest -q tests/test_cuda_glm5_vision_native.py tests/test_cuda_qwen4_vision_native.py
+```
+
+For native Windows, run from an MSVC 2022 x64 developer PowerShell with CUDA
+13.0 and the project's Python environment (no WSL path translation):
+
+```powershell
+cmake -S cpp_runtime -B build-vision-windows -G "Visual Studio 17 2022" -A x64 -T "cuda=$env:CUDA_PATH" -DMFQ_BUILD_CUDA_RUNTIME=ON -DMFQ_CUDA_ARCHITECTURES=120 -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_TESTING=ON
+cmake --build build-vision-windows --config Release --parallel 8
+ctest --test-dir build-vision-windows -C Release --output-on-failure
+$env:PYTHONPATH = (Get-Location).Path
+$env:MFQ_CUDA_RESOURCE_TEST_RUNTIME = (Resolve-Path build-vision-windows/Release/mfq-runtime.exe).Path
+$env:MFQ_CUDA_VISION_NATIVE_TEST = (Resolve-Path build-vision-windows/cuda/Release/mfq-rms-swiglu-vision-test.exe).Path
+python -m pytest -q tests/test_cuda_glm5_vision_native.py tests/test_cuda_qwen4_vision_native.py
+```
+
+On Linux the bridge is discovered at `cuda/mfq-rms-swiglu-vision-test` in the
+build directory; set `MFQ_CUDA_VISION_NATIVE_TEST` if it is elsewhere. The new
+GPU tests skip when the bridge reports no CUDA device. Compilation and CPU
+checks alone do not verify CUDA numerics or the native Windows build.
 
 ### Apple silicon and Metal
 

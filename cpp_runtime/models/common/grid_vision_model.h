@@ -5,6 +5,7 @@
 #include "gated_mlp.h"
 #include "grid_vision.h"
 #include "transformer_layer.h"
+#include "vision_prompt.h"
 #include <cmath>
 #include <utility>
 
@@ -58,18 +59,8 @@ auto prepare(const std::vector<int64_t> &ids, Tensor merged, int64_t merged_coun
              int64_t image_token, int64_t video_token, const GridVisionConfig &config,
              const std::vector<GridShape> &grids, Embed embed, Scatter scatter,
              Positions positions) {
-    auto embeddings = embed(ids);
-    std::vector<int64_t> placeholders;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] == image_token)
-            placeholders.push_back(static_cast<int64_t>(i));
-        else if (ids[i] == video_token)
-            throw std::invalid_argument(
-                "grid-Vision image preparation does not accept video placeholders");
-    }
-    if (static_cast<int64_t>(placeholders.size()) != merged_count)
-        throw std::invalid_argument("image placeholders disagree with merged vision patches");
-    scatter(embeddings, merged, placeholders);
+    auto embeddings = inject_vision_embeddings(ids, std::move(merged), merged_count,
+        image_token, video_token, false, embed, scatter);
     auto semantic = build_grid_mrope_positions(
         ids, image_token, video_token, static_cast<int32_t>(config.spatial_merge_size), grids, {});
     return Prepared<Tensor>{std::move(embeddings), positions(semantic), semantic.decode_delta};

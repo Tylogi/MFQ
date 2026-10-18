@@ -28,6 +28,7 @@ CANONICAL_TENSOR_SCHEMA_VERSION = 1
 CANONICAL_TENSOR_NAMESPACE = "mfq.tensor"
 GRID_VISION_INPUT_CONTRACT = "grid_vision.v1"
 GRID_MROPE_POSITION_POLICY = "grid_mrope"
+SEQUENTIAL_POSITION_POLICY = "sequential"
 
 
 class TensorComponent(str, Enum):
@@ -1983,6 +1984,16 @@ register_tensor_schema(
         architecture="glm5_next",
         aliases=("glm5_next_text",),
         source_mapper=_glm5_source_mapper,
+        component_specs=(
+            GraphComponentSpec(
+                TensorComponent.VISION,
+                "vision",
+                "rms_swiglu_vit",
+                input_contract=GRID_VISION_INPUT_CONTRACT,
+                position_policy=SEQUENTIAL_POSITION_POLICY,
+                capabilities=("vision",),
+            ),
+        ),
     )
 )
 

@@ -36,7 +36,7 @@ struct GridVisionConfig {
     double rope_theta = 10'000.0;
     double layer_norm_eps = 1e-6;
 
-    void validate() const;
+    void validate(bool learned_positions = true) const;
     std::int64_t head_dim() const noexcept;
     std::int64_t patch_width() const noexcept;
 };

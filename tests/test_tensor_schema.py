@@ -259,3 +259,13 @@ def test_flash_next_graphs_use_the_same_optional_component_contracts(
         "vision_layers": 2,
         "predictor_layers": 1,
     }
+
+
+def test_glm_vision_declares_rms_swiglu_with_sequential_text_positions():
+    config = dict(model_type="glm5_next", text_config=dict(model_type="glm5_next_text", num_hidden_layers=2),
+        vision_config=dict(depth=2))
+    graph = graph_spec_for_plan(config, ["model.token_embedding.weight", "vision.patch_embedding.weight"])
+    vision = next(c for c in graph.as_dict()["components"] if c["kind"] == "vision")
+    assert vision["implementation"] == "rms_swiglu_vit"
+    assert vision["input_contract"] == "grid_vision.v1"
+    assert vision["position_policy"] == "sequential"

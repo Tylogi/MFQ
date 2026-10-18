@@ -200,6 +200,26 @@ int main() {
             cuda_capability_matrix(glm_plan),
             {true, false, false, false, false, false, true},
             "GLM5 inferred unimplemented media capabilities");
+        auto glm_vision = graph_with("glm5_next", "rms_swiglu_vit", "next_token_prediction");
+        glm_vision.components.at(1).input_contract = mfq::kMfqGridVisionInputContract;
+        glm_vision.components.at(1).position_policy = mfq::kMfqSequentialPositionPolicy;
+        const auto glm_vision_plan = cuda_model_plan(glm_vision);
+        require(glm_vision_plan.vision == CudaVisionAdapter::rms_swiglu_vit,
+            "GLM RMS-SwiGLU adapter was not selected");
+        require_capabilities(cuda_runtime_capabilities(glm_vision, glm_vision_plan,
+            cuda_component_state(glm_vision, glm_vision_plan, true, true), true, false),
+            {true, true, true, false, false, false, true}, "GLM vision/video/MTP capabilities mismatch");
+        const auto unloaded_vision = cuda_component_state(glm_vision, glm_vision_plan, false, true);
+        require_capabilities(cuda_runtime_capabilities(glm_vision, glm_vision_plan, unloaded_vision, true, false),
+            {true, false, false, false, false, false, true}, "unloaded GLM vision was advertised");
+        for (const auto field : {0, 1, 2, 3}) {
+            auto invalid = glm_vision;
+            if (field == 0) invalid.components.at(1).position_policy = mfq::kMfqGridMropePositionPolicy;
+            if (field == 1) invalid.components.at(1).input_contract = "other.v1";
+            if (field == 2) invalid.components.at(1).tensor_root = "other";
+            if (field == 3) invalid.backbone = "qwen4_exp";
+            require_grid_rejected(invalid);
+        }
         for (const auto& graph:{qwen4,glm_next}) {
             const auto plan=cuda_model_plan(graph);
             const auto absent=cuda_component_state(graph,plan,false,false);
