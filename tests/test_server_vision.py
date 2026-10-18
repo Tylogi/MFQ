@@ -996,3 +996,33 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
         await client.aclose()
 
     asyncio.run(run())
+
+
+def test_backend_routes_glm_media_and_capabilities_to_native_worker() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/runtime/health":
+            return httpx.Response(200, json={"model": "GLM-5.3-Flash", "model_type": "glm5_next",
+                "model_capabilities": {"architecture_family": "glm5_next", "source": "runtime", "features": {
+                    "text": True, "image_input": True, "video_input": True, "mtp": True}}})
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+            text='data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
+            capabilities = await backend.capabilities()
+            assert capabilities.model_capabilities.features.image_input and capabilities.model_capabilities.features.video_input
+            image = Image.new("RGB", (28, 28), (20, 40, 60))
+            output = [item async for item in backend.stream(model="GLM-5.3-Flash",
+                messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": _data_url(image)}}]}],
+                sampling=SamplingParams(max_tokens=4))]
+            assert "".join(item.content_delta + item.reasoning_delta for item in output) == "ok"
+
+    asyncio.run(run())
+    assert captured["media"]["version"] == 3
+    assert captured["media"]["processor"] == "grid_vision.v1"
+    assert captured["media"]["vision_types"]["shape"] == [1]
+    assert "<|image|>" in captured["input"]["messages"][0]["content"]

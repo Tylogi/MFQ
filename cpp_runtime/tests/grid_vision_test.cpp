@@ -1,4 +1,5 @@
 #include "grid_vision.h"
+#include "../models/common/vision_prompt.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -45,6 +46,31 @@ int main() {
             rejected = true;
         }
         require(rejected, "multi-frame image grid was accepted");
+        mfq::GridVisionConfig config;
+        config.hidden_size = 8; config.intermediate_size = 16; config.depth = 1;
+        config.num_heads = 2; config.patch_size = 2; config.temporal_patch_size = 2;
+        config.spatial_merge_size = 2; config.out_hidden_size = 32;
+        config.validate(false);
+        rejected = false;
+        try { config.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "learned-position tower accepted a missing position table");
+        const auto embed = [](const auto& ids) { return std::vector<float>(ids.size(), -1.f); };
+        const auto scatter = [](auto& output, const auto& merged, const auto& indices) {
+            for (size_t i = 0; i < indices.size(); ++i) output[indices[i]] = merged[i];
+        };
+        const auto injected = mfq::models::inject_vision_embeddings(
+            std::vector<int64_t>{7, 100, 101, 100, 8}, std::vector<float>{1.f, 2.f, 3.f},
+            3, 100, 101, true, embed, scatter);
+        require(injected == std::vector<float>{-1.f, 1.f, 2.f, 3.f, -1.f},
+            "mixed image/video embeddings lost prompt order");
+        for (bool accept_video : {false, true}) {
+            rejected = false;
+            try {
+                (void)mfq::models::inject_vision_embeddings(std::vector<int64_t>{100, 101},
+                    std::vector<float>{1.f}, 1, 100, 101, accept_video, embed, scatter);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "invalid video/count prompt contract was accepted");
+        }
         std::cout << "grid-Vision core tests passed\n";
         return 0;
     } catch (const std::exception& error) {

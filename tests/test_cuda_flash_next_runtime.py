@@ -269,7 +269,7 @@ def glm_model_fixture(attention_types, sparse_ffn):
     return outer,w
 
 
-def glm_model_reference(config,w,mtp=None,return_hidden=False):
+def glm_model_reference(config,w,mtp=None,return_hidden=False,embeddings=None):
     c=config["text_config"]
     def sm(x,axis=-1):
         e=np.exp(x-np.max(x,axis=axis,keepdims=True));return e/e.sum(axis=axis,keepdims=True)
@@ -362,7 +362,7 @@ def glm_model_reference(config,w,mtp=None,return_hidden=False):
         branch=norm(residual,w[p+".mlp.norm.weight"]).astype(dtype)
         multi=residual+ffn(branch,p+".mlp","sparse").astype(np.float32)
         return norm(multi,w["predictor.output_norm.weight"]).astype(dtype),multi
-    hidden=w["model.token_embedding.weight"][np.arange(1,8)[None]].astype(np.float16)
+    hidden=(w["model.token_embedding.weight"][np.arange(1,8)[None]] if embeddings is None else embeddings).astype(np.float16)
     x=np.broadcast_to(hidden[...,None,:],(*hidden.shape[:2],2,hidden.shape[-1])).copy()
     for i,kind in enumerate(c["layer_types"]):
         p=f"model.block.{i}"

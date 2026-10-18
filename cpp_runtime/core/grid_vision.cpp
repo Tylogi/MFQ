@@ -53,7 +53,7 @@ std::vector<std::pair<std::int32_t, std::int32_t>> spatial_positions(
 
 } // namespace
 
-void GridVisionConfig::validate() const {
+void GridVisionConfig::validate(bool learned_positions) const {
     const int hidden = checked_int(hidden_size, "hidden size");
     const int heads = checked_int(num_heads, "head count");
     checked_int(intermediate_size, "intermediate size");
@@ -63,7 +63,7 @@ void GridVisionConfig::validate() const {
     checked_int(temporal_patch_size, "temporal patch size");
     checked_int(spatial_merge_size, "spatial merge size");
     checked_int(out_hidden_size, "output hidden size");
-    const int positions = checked_int(num_position_embeddings, "position table size");
+    const int positions = learned_positions ? checked_int(num_position_embeddings, "position table size") : 1;
     const int side = static_cast<int>(std::sqrt(positions));
     if (hidden % heads != 0 || (hidden / heads) % 4 != 0 ||
         side * side != positions || !std::isfinite(rope_theta) ||

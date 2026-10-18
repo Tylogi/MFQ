@@ -11,6 +11,7 @@ COMMON_CONFIG = (
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
 CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
+VISION_COMMON = (CUDA_ROOT / "core/vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -52,9 +53,9 @@ def test_grid_vision_policies_are_owned_by_core() -> None:
 
 
 def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None:
-    assert "load_quant_linear(execution, model, weight_name)" in CUDA
-    assert "mfq_tensor_backend::layer_norm(" in CUDA
-    assert "attention_cuda(" in CUDA
+    assert "load_quant_linear(execution, model, weight_name)" in VISION_COMMON
+    assert "mfq_tensor_backend::layer_norm(" in VISION_COMMON
+    assert "attention_cuda(" in VISION_COMMON
     assert "Tensor gelu_tanh(" in CUDA
     assert 'mfq_tensor_backend::gelu(input,"tanh")' in CUDA
     assert "mfq::models::grid_vision::merge(" in CUDA
@@ -117,7 +118,7 @@ def test_multimodal_model_type_prefers_outer_root() -> None:
     assert '"model_type", text.value("model_type"' in COMMON_CONFIG
 
 
-def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:
+def test_cuda_qwen_registration_is_exact_and_image_only() -> None:
     for value in (
         'graph.backbone == "qwen3_5"',
         'vision->implementation == "grid_vit"',
@@ -126,7 +127,7 @@ def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:
     ):
         assert value in PLAN
     assert (
-        "result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;"
+        "result.video_input = plan.vision == CudaVisionAdapter::minicpmo45 ||"
         in PLAN
     )
     assert "accepts exactly one image and no video" in CUDA
@@ -138,3 +139,18 @@ def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:
         "wrong_position",
     ):
         assert mutation in CUDA_PLAN_TEST
+
+
+def test_rms_swiglu_vision_reuses_backend_helpers_and_sequential_positions():
+    rms = (CUDA_ROOT / "core/rms_swiglu_vision_component.h").read_text()
+    assert '#include "vision_component.h"' in rms
+    for helper in ("detail::vision_workspace", "detail::to_cuda", "detail::cache_key", "detail::LoadingScope"):
+        assert helper in rms
+    assert "make_grid_vision_layout" in rms
+    assert "build_grid_mrope_positions" not in rms
+    assert "mfq_tensor_backend::arange" in rms
+    assert "clamp_max(limit)" in rms
+    assert ".permute({0, 3, 1, 2})" in rms
+    assert "components.rms_vision->prepare(" in CUDA_APP
+    assert "mfq::models::inject_vision_embeddings(" in rms
+    assert "auto inject_vision_embeddings(" in SHARED_MODELS

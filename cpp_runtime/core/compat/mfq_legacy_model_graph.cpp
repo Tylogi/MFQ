@@ -152,9 +152,9 @@ MfqModelGraph synthesize_legacy_model_graph(
             1, integer_value(vision, "depth",
                 integer_value(vision, "num_hidden_layers", 1)));
         add_optional(
-            "vision", "vision", "grid_vit",
+            "vision", "vision", glm_grid ? "rms_swiglu_vit" : "grid_vit",
             std::string(kMfqGridVisionInputContract),
-            std::string(kMfqGridMropePositionPolicy));
+            std::string(glm_grid ? kMfqSequentialPositionPolicy : kMfqGridMropePositionPolicy));
     }
 
     std::int64_t predictor_layers = integer_value(

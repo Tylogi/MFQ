@@ -20,6 +20,8 @@ inline constexpr std::string_view kMfqGridVisionInputContract =
 inline constexpr std::string_view kMfqGridMropePositionPolicy =
     "grid_mrope";
 
+inline constexpr std::string_view kMfqSequentialPositionPolicy = "sequential";
+
 struct MfqGraphTopology {
     std::int64_t text_layers = 0;
     std::int64_t vision_layers = 0;

@@ -397,10 +397,24 @@ RuntimeComponents<mfq::cuda::Glm5CausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::Glm5CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
-            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
-             result.plan.predictor !=
-                 mfq::cuda::CudaPredictorAdapter::flash_next)) {
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::rms_swiglu_vit) {
+        const auto document = nlohmann::json::parse(model.source->model_config_json());
+        const auto config = mfq::cuda::vision_runtime::RmsVisionConfig::parse(document.at("vision_config"));
+        const auto image = document.at("image_token_id").get<int64_t>();
+        const auto video = document.at("video_token_id").get<int64_t>();
+        if (config.grid.out_hidden_size != model.config.hidden || image < 0 || video < 0 ||
+            image >= model.config.vocab || video >= model.config.vocab || image == video)
+            throw std::runtime_error("invalid GLM vision text geometry or placeholder IDs");
+        const auto* component = result.graph.component("vision");
+        result.rms_vision.emplace(mfq::cuda::vision_runtime::CudaRmsSwiGluVisionPromptComponent::load(
+            *model.execution, *model.source, config, image, video,
+            component->input_contract, component->position_policy));
+        result.vision_available = true;
+    } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {
+        throw std::runtime_error("unsupported GLM5 CUDA vision adapter");
+    }
+    if (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+            result.plan.predictor != mfq::cuda::CudaPredictorAdapter::flash_next) {
         throw std::runtime_error(
             "unsupported GLM5 CUDA component adapter");
     }
