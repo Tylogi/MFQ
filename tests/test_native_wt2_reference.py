@@ -1,7 +1,10 @@
 import json
 import re
 import struct
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -222,3 +225,106 @@ def test_native_cuda_memory_plan_respects_visible_device(monkeypatch):
     assert not source.loading_plan('/source', backend='cuda', device='cuda:1')['resident_allowed']
     with pytest.raises(ValueError, match='not visible'):
         source.loading_plan('/source', backend='cuda', device='cuda:2')
+
+
+def test_glm_tokenizer_uses_plain_text_without_bos_or_chat(tmp_path):
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    tokenizer = Tokenizer(models.WordLevel({'a': 0, '<|endoftext|>': 1, '[gMASK]': 2, '<sop>': 3}, unk_token='a'))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.post_processor = processors.ByteLevel(add_prefix_space=True, trim_offsets=False)
+    tokenizer.save(str(tmp_path / 'tokenizer.json'))
+    (tmp_path / 'tokenizer_config.json').write_text(json.dumps({
+        'tokenizer_class': 'TokenizersBackend', 'eos_token': '<|endoftext|>', 'pad_token': '<|endoftext|>',
+        'extra_special_tokens': ['[gMASK]', '<sop>'], 'chat_template': '[gMASK]<sop>{{ messages }}'}))
+    tokens, metadata = tokenize_windows(tmp_path, ' '.join(['a'] * 1024), 512, 2)
+    assert tokens.shape == (2, 512) and np.all(tokens == 0)
+    assert metadata['bos_token'] is None and metadata['eos_token'] == metadata['pad_token'] == 1
+    assert not metadata['add_bos'] and not metadata['add_eos']
+
+
+@pytest.mark.parametrize('device', ['cuda:0', 'mps'])
+def test_glm_reference_gate_is_independent_of_imatrix_support(tmp_path, monkeypatch, device):
+    from mfq.evaluation import reference, reference_cuda
+    from mfq.server.services import evaluation_datasets
+    (tmp_path / 'config.json').write_text(json.dumps({'model_type': 'glm5_next', 'text_config': {
+        'model_type': 'glm5_next_text', 'hidden_size': 4, 'max_position_embeddings': 512, 'vocab_size': 19}}))
+    write_weights(tmp_path / 'model.safetensors', {'model.language_model.embed_tokens.weight': ('F32', np.ones((19, 4), np.float32))})
+    corpus = tmp_path / 'corpus.txt'
+    corpus.write_text('fixture corpus')
+    monkeypatch.setattr(evaluation_datasets, 'WT2_TEXT_SHA256', reference.sha256(corpus))
+    monkeypatch.setattr(reference, 'loading_plan', lambda *a, **k: {'resident_allowed': True})
+    monkeypatch.setattr(reference, 'tokenize_windows', lambda *a: (np.zeros((1, 512), dtype='<i4'), {'add_bos': False}))
+    def generate(source, tokens, writer, directory, **kwargs):
+        assert source.architecture == 'glm5_next_text' and not source.summary()['imatrix_supported']
+        return writer.logits(0, 0, np.zeros((255, 19), np.float32)), {
+            'runtime': 'test', 'dtype': 'float16', 'attention': 'native_kda_dsa'}
+    monkeypatch.setattr(reference_cuda, 'generate', generate)
+    output = tmp_path / 'reference.bin'
+    if device == 'mps':
+        with pytest.raises(ValueError, match='requires native CUDA'):
+            reference.generate_reference(tmp_path, corpus, output, chunks=1, device=device)
+        assert not output.exists()
+    else:
+        result = reference.generate_reference(tmp_path, corpus, output, chunks=1, device=device)
+        manifest = json.loads(Path(result['manifest']).read_text())
+        assert manifest['evaluation']['logit_positions'] == [256, 510]
+        assert manifest['evaluation']['target_positions'] == [257, 511]
+        assert result['scored_tokens'] == 255
+
+
+@pytest.mark.parametrize('failure', ['', 'size', 'order', 'missing', 'exit', 'nonfinite'])
+def test_cuda_chunk_handoff_preserves_f32_and_detects_failure(tmp_path, monkeypatch, failure):
+    from mfq.evaluation import reference_cuda
+    helper = tmp_path / 'runtime.py'
+    helper.write_text('''import json, struct, sys
+from pathlib import Path
+args = sys.argv
+assert '--reference-chunk-handoff' in args
+output = Path(args[args.index('--reference-output') + 1])
+failure = args[-1]
+print(json.dumps({'event': 'source_loading', 'layerwise': True}), flush=True)
+if failure == 'exit': sys.exit(7)
+if failure == 'missing': sys.exit(0)
+for chunk in range(2):
+    values = [i * .001234567 + chunk for i in range(15 * 19)]
+    if failure == 'nonfinite': values[0] = float('nan')
+    raw = struct.pack('<' + 'f' * len(values), *values)
+    output.write_bytes(raw[:-4] if failure == 'size' else raw)
+    print(json.dumps({'event': 'wt2_logits_ready', 'chunk': 1 if failure == 'order' else chunk}), flush=True)
+    if sys.stdin.readline() != 'continue\\n': sys.exit(9)
+    output.unlink()
+''')
+    popen = subprocess.Popen
+    processes = []
+    def launch(command, **kwargs):
+        assert kwargs['env']['CUDA_VISIBLE_DEVICES'] == '5'
+        process = popen([sys.executable, str(helper), *command[1:], failure], **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(reference_cuda.subprocess, 'Popen', launch)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3,5')
+    tokens = np.zeros((2, 32), dtype='<i4')
+    output = tmp_path / 'reference.bin'
+    with ReferenceWriter(output, tokens, 19) as writer:
+        if failure:
+            with pytest.raises((ValueError, RuntimeError)):
+                reference_cuda.generate(SimpleNamespace(architecture='glm5_next_text', path=tmp_path), tokens, writer, tmp_path,
+                    layerwise=False, runtime=sys.executable, device='cuda:1')
+        else:
+            expected_rows = []
+            original = writer.logits
+            def record(chunk, start, values):
+                expected = np.arange(15 * 19, dtype=np.float64).reshape(15, 19) * .001234567 + chunk
+                np.testing.assert_array_equal(values, expected.astype('<f4'))
+                expected_rows.append(chunk)
+                return original(chunk, start, values)
+            monkeypatch.setattr(writer, 'logits', record)
+            nll, metadata = reference_cuda.generate(SimpleNamespace(architecture='glm5_next_text', path=tmp_path), tokens, writer,
+                tmp_path, layerwise=False, runtime=sys.executable, device='cuda:1')
+            assert np.isfinite(nll) and expected_rows == [0, 1]
+            assert metadata['layerwise'] and metadata['logits_handoff'] == 'float32_per_chunk'
+            assert not (tmp_path / 'logits.f32').exists()
+            writer.commit()
+    assert processes[0].poll() is not None
+    assert output.exists() == (not failure)
+    assert not (tmp_path / 'reference.bin.partial').exists()

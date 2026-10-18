@@ -133,8 +133,9 @@ def generate_reference(model, dataset, output, *, context_size=512, chunks=8, de
         raise FileExistsError('reference output or manifest already exists')
     if sha256(dataset) != WT2_TEXT_SHA256:
         raise ValueError('WT2 generation requires the official mfq-wt2-text-v1 corpus')
-    if not source.summary()['imatrix_supported']:
-        raise ValueError('WT2 reference generation supports original Qwen3.5 and Gemma4 HF architectures')
+    architecture = source.architecture.removesuffix('_text')
+    if architecture not in {'qwen3_5', 'qwen3_5_moe', 'gemma4', 'glm5_next'}:
+        raise ValueError('WT2 reference generation supports original Qwen3.5, Gemma4 and GLM-5.3-Flash HF architectures')
     if context_size < 32 or chunks < 1:
         raise ValueError('invalid WT2 context or window count')
     if context_size > int(source.text['max_position_embeddings']):
@@ -142,6 +143,8 @@ def generate_reference(model, dataset, output, *, context_size=512, chunks=8, de
     backend = 'metal' if device in {'mps', 'metal'} else 'cuda' if device.startswith('cuda') else None
     if backend is None:
         raise ValueError('WT2 source generation requires Metal or CUDA')
+    if architecture == 'glm5_next' and backend != 'cuda':
+        raise ValueError('GLM-5.3-Flash WT2 reference generation requires native CUDA')
     plan = loading_plan(source.path, backend=backend, purpose='wt2', context_size=context_size, device=device)
     mode = {'layerwise': layerwise or not plan['resident_allowed'], 'requested_layerwise': layerwise,
         'fallback_reason': 'insufficient_memory' if not layerwise and not plan['resident_allowed'] else None, 'memory': plan}

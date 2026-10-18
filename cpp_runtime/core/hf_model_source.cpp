@@ -282,6 +282,9 @@ struct HfModelSource::Impl {
     struct Record {
         TensorMetadata metadata;
         std::vector<Segment> segments;
+        std::string derived_source;
+        std::int64_t head_rows = 0, split_begin = 0;
+        bool transpose = false;
     };
 
     explicit Impl(std::filesystem::path root, std::string source_prefix)
@@ -617,6 +620,57 @@ HfModelSource::HfModelSource(std::filesystem::path root, std::string source_pref
         impl_->records.emplace(name, std::move(aggregate));
     }
 
+    // Import absorbed MLA head projections lazily. The checkpoint stores K/V
+    // together; query absorption transposes K and output unembedding uses V.
+    // No weight payload is read until the corresponding layer is loaded.
+    std::vector<std::string> mla_sources;
+    for (const auto& [name, record] : impl_->records) {
+        if (ends_with(name, ".attention.key_value_b.source.weight"))
+            mla_sources.push_back(name);
+    }
+    if (!mla_sources.empty()) {
+        const auto outer = json::parse(impl_->source.model_config_json());
+        const auto& text = outer.contains("text_config") ? outer.at("text_config") : outer;
+        const auto heads = text.at("num_attention_heads").get<std::int64_t>();
+        const auto latent = text.at("kv_lora_rank").get<std::int64_t>();
+        const auto nope = text.at("qk_nope_head_dim").get<std::int64_t>();
+        const auto value = text.at("v_head_dim").get<std::int64_t>();
+        if (heads <= 0 || latent <= 0 || nope <= 0 || value <= 0 ||
+            nope > std::numeric_limits<std::int64_t>::max() - value ||
+            heads > std::numeric_limits<std::int64_t>::max() / (nope + value))
+            throw std::runtime_error("invalid HF MLA projection dimensions");
+        for (const auto& name : mla_sources) {
+            const auto& original = impl_->records.at(name).metadata;
+            if (!original.shape || *original.shape !=
+                    std::vector<std::int64_t>{heads * (nope + value), latent})
+                throw std::runtime_error("invalid HF MLA source geometry: " + name);
+            const auto prefix = name.substr(0, name.size() - std::string_view("key_value_b.source.weight").size());
+            for (bool query : {true, false}) {
+                const auto target = prefix + (query ? "latent.query_embedding.weight" : "latent.output_unembedding.weight");
+                if (impl_->records.count(target)) continue;
+                Impl::Record derived;
+                const std::vector<std::int64_t> shape = query
+                    ? std::vector<std::int64_t>{heads, latent, nope}
+                    : std::vector<std::int64_t>{heads, value, latent};
+                derived.metadata.name = target;
+                derived.metadata.dtype = derived.metadata.stored_dtype =
+                    mfq::fp8sq::is_dtype(original.dtype) ? "F32" : original.dtype;
+                const auto item_size = dense_item_size(derived.metadata.dtype);
+                if (derived.metadata.dtype != "F32" && derived.metadata.dtype != "BF16" && derived.metadata.dtype != "F16")
+                    throw std::runtime_error("unsupported HF MLA source dtype: " + original.dtype);
+                derived.metadata.shape = shape;
+                auto header = dense_prefix(shape);
+                derived.metadata.nbytes = checked_add(header.size(), checked_product(shape, item_size, target), "HF MLA projection");
+                derived.segments.push_back({0, std::move(header), {}, 0, 0});
+                derived.derived_source = name;
+                derived.head_rows = nope + value;
+                derived.split_begin = query ? 0 : nope;
+                derived.transpose = query;
+                impl_->records.emplace(target, std::move(derived));
+            }
+        }
+    }
+
     if (impl_->records.size() > kMaxRecords) {
         throw std::runtime_error("HF canonical tensor count exceeds the record limit");
     }
@@ -703,6 +757,46 @@ void HfModelSource::read_range_into(
                 segment.source_offset + begin - segment.offset,
                 destination + target_offset,
                 count);
+        }
+    }
+    const auto prefix_bytes = record.segments.front().inline_bytes.size();
+    if (!record.derived_source.empty() && request_end > prefix_bytes) {
+        const auto& original = impl_->records.at(record.derived_source);
+        std::vector<std::uint8_t> bytes(original.metadata.nbytes);
+        read_range_into(record.derived_source, 0,
+                        reinterpret_cast<std::byte*>(bytes.data()), bytes.size());
+        const auto& shape = *record.metadata.shape;
+        const auto latent = original.metadata.shape->at(1);
+        const auto head_elements = shape[1] * shape[2];
+        const auto item_size = dense_item_size(record.metadata.dtype);
+        const auto payload_begin = std::max<std::uint64_t>(relative_offset, prefix_bytes) - prefix_bytes;
+        const auto payload_end = request_end - prefix_bytes;
+        const bool fp8 = mfq::fp8sq::is_dtype(original.metadata.dtype);
+        mfq::fp8sq::Layout layout;
+        mfq::fp8sq::RowMetadata row_metadata;
+        if (fp8) {
+            layout = mfq::fp8sq::parse(original.metadata.dtype, bytes.data(), bytes.size());
+            row_metadata = mfq::fp8sq::row_metadata(bytes.data(), layout);
+        }
+        for (auto element = payload_begin / item_size; element < (payload_end + item_size - 1) / item_size; ++element) {
+            const auto head = element / head_elements, local = element % head_elements;
+            const auto row = head * record.head_rows + record.split_begin +
+                (record.transpose ? local % shape[2] : local / latent);
+            const auto column = record.transpose ? local / shape[2] : local % latent;
+            float value;
+            const std::byte* data;
+            if (fp8) {
+                value = mfq::fp8sq::decode_cpu(bytes.data(), layout, row_metadata.q.at(row),
+                    row_metadata.symbol_byte_offsets.at(row), int(row), int(column));
+                data = reinterpret_cast<const std::byte*>(&value);
+            } else {
+                const auto offset = original.segments.front().inline_bytes.size() + (row * latent + column) * item_size;
+                data = reinterpret_cast<const std::byte*>(bytes.data() + offset);
+            }
+            const auto begin = std::max<std::uint64_t>(payload_begin, element * item_size);
+            const auto end = std::min<std::uint64_t>(payload_end, element * item_size + item_size);
+            std::memcpy(destination + prefix_bytes + begin - relative_offset,
+                        data + begin - element * item_size, end - begin);
         }
     }
 }
