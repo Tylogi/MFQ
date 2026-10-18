@@ -230,7 +230,8 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
                         await generate(media, True)
                     binary, path = _binary_tensors([(k, *v) for k, v in tensors.items()])
                     try:
-                        await generate(dict(version=3, processor="grid_vision.v1", **binary), mtp)
+                        binary.update(version=media["version"], processor=media["processor"])
+                        await generate(binary, mtp)
                     finally:
                         path.unlink(missing_ok=True)
                     with pytest.raises(BackendError):

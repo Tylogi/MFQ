@@ -3072,7 +3072,7 @@ mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
     int split=1;
     static thread_local int cached_device=-1,processors=1;
     if(cached_device!=input.get_device()) {
-        MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&processors,cudaDevAttrMultiProcessorCount,input.get_device()));
+        MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&processors,cudaDevAttrMultiProcessorCount,input.get_device()));
         cached_device=input.get_device();
     }
     while(split<8 && output_tiles*split<processors*2 && input.size(1)>=int64_t(split*2)*kNintPrefillTileK)split*=2;

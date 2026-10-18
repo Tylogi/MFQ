@@ -656,7 +656,7 @@ static mfq_tensor_backend::Tensor sample_top_k_compact_impl(
             sample_radix_compact_finish<scalar_t,true,Conditional><<<dim3(1,B),SAMPLE_BD,0,stream>>>(
                 first,logits.data_ptr<scalar_t>(),reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),count,V,int(top_k),enabled);
         });
-    MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+    MFQ_CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
