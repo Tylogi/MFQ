@@ -496,17 +496,16 @@ void check_latent_moe(tb::ScalarType dtype, float tolerance) {
             "relu-squared activation swap was not detected: " +
                 std::to_string(activation_difference));
 
-    // Non-gated experts need a dense bank; an MFE cohort must fail loudly.
-    auto mfe = make_moe_ffn(g, dtype, weights, true);
-    mfe->moe_up.n_experts = g.experts;
+    // An ungated bank never carries a gate projection.
+    auto mixed = make_moe_ffn(g, dtype, weights, true);
+    mixed->moe_gate.n_experts = g.experts;
     bool rejected = false;
     try {
-        (void)mfe->forward(execution, input_tensor);
+        (void)mixed->forward(execution, input_tensor);
     } catch (const std::runtime_error& error) {
-        rejected = std::string(error.what()).find("MFE non-gated kernel") != std::string::npos ||
-                   std::string(error.what()).find("ungated routed MoE") != std::string::npos;
+        rejected = std::string(error.what()).find("cannot mix a gate") != std::string::npos;
     }
-    require(rejected, "non-gated routed MoE silently accepted an MFE cohort");
+    require(rejected, "ungated routed MoE silently accepted a gate projection");
 }
 
 // A long prompt must not gather every route's whole expert matrix at once:

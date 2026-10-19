@@ -314,6 +314,9 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext& execution,
         case mfq::models::nemotron_h::MixerKind::moe: {
             auto block = loader.moe_block();
             mfq::models::nemotron_h::load_moe(*block, loader, config, layer);
+            // An expert cache turns the routed bank into the two-stage MFE
+            // pipeline; without one the same FFN keeps the direct path.
+            block->ffn.prepare_moe_pipeline(execution);
             return BlockLoader::finish(std::move(block));
         }
         case mfq::models::nemotron_h::MixerKind::mlp: {

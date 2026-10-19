@@ -89,9 +89,14 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights,const tb::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared,const tb::Tensor& shared_gate,
         int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs,
-        bool combined_gate_up,int token_group_capacity_hint,double swiglu_limit)
+        bool combined_gate_up,int token_group_capacity_hint,double swiglu_limit,
+        bool ungated_experts,bool ungated_shared)
         :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights),combined_gate_up_(combined_gate_up) {
-    if(!projections[0] || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
+    // A relu-squared bank has no gate projection: projection 0 stays empty and
+    // every dimension comes from Up. The shared view applies the same rule.
+    ungated_experts_=ungated_experts;
+    const int first_projection=ungated_experts?1:0;
+    if((!projections[0] && !ungated_experts) || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
         input.scalar_type()!=tb::kFloat16 || !input.is_contiguous() || ids.dim()!=2 || ids.scalar_type()!=tb::kInt32 ||
         !ids.is_cuda() || ids.get_device()!=input.get_device() || !weights.is_cuda() ||
         weights.get_device()!=input.get_device() || !ids.is_contiguous() || ids.size(0)!=input.size(0) || weights.sizes()!=ids.sizes() ||
@@ -100,15 +105,21 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         sigmoid.scalar_type()!=tb::kFloat16 || sigmoid.dim()!=2 || sigmoid.size(0)!=2 || sigmoid.size(1)!=65536)
         throw std::invalid_argument("two-stage MFE tensor contract mismatch");
     batch_.swiglu_limit=float(swiglu_limit);
-    batch_.tokens=int(input.size(0));batch_.routes=int(ids.size(1));batch_.experts=projections[0]->n_experts;
+    batch_.expert_activation=ungated_experts?1:0;
+    batch_.shared_activation=ungated_shared?1:0;
+    batch_.tokens=int(input.size(0));batch_.routes=int(ids.size(1));batch_.experts=projections[first_projection]->n_experts;
     batch_.input_width=int(input.size(1));
     batch_.warp_multi_sum=mfq::cuda::runtime_options::warp_multi_sum();
-    batch_.intermediate=intermediate_columns?intermediate_columns:projections[0]->out_per_expert;
+    batch_.intermediate=intermediate_columns?intermediate_columns:projections[first_projection]->out_per_expert;
     batch_.output_width=output_columns?output_columns:projections[2]->out_per_expert;
     if(batch_.tokens<=0 || batch_.routes<=0 || batch_.experts<=0 || batch_.intermediate<=0 || batch_.output_width<=0 ||
-        batch_.intermediate>projections[0]->out_per_expert || batch_.output_width>projections[2]->out_per_expert)
+        batch_.intermediate>projections[first_projection]->out_per_expert ||
+        batch_.output_width>projections[2]->out_per_expert)
         throw std::invalid_argument("two-stage MFE dimensions invalid");
     std::vector<View> views;std::vector<int32_t> mapping;
+    // Projection 0 has no descriptors when ungated; keep the expert stride so
+    // phase-1/2 cohort lookups remain at their original indices.
+    if(ungated_experts)mapping.assign(batch_.experts,-1);
     batch_.nvq_format_mask=0;
     const bool nint_whole=mfq::cuda::mfe_ffn_nint_whole_requested();
     auto& quantizers=input_quantizers_;
@@ -129,10 +140,11 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     const bool align_late=late_option && *late_option && batch_.tokens<=8 &&
         (!grouped_option || *grouped_option) && (!hint_option || *hint_option) &&
         (!warp_option || *warp_option!=4);
-    for(int projection=0;projection<3;++projection) {
+    batch_.projection_offsets[0]=0;batch_.projection_counts[0]=0;
+    for(int projection=first_projection;projection<3;++projection) {
         auto& runtime=*projections[projection];
         if(runtime.n_experts!=batch_.experts || (projection<2 && runtime.neuron_len!=batch_.input_width) ||
-            (projection==1 && runtime.out_per_expert!=projections[0]->out_per_expert))
+            (projection==1 && runtime.out_per_expert!=projections[1]->out_per_expert))
             throw std::invalid_argument("two-stage MFE projection dimensions mismatch");
         batch_.projection_offsets[projection]=int(views.size());batch_.projection_counts[projection]=int(runtime.pools.size());
         std::vector<int32_t> indices(batch_.experts,-1);
@@ -178,26 +190,32 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     if(shared[0] || shared[1] || shared[2]) {
         const auto dense_math_option=mfq::cuda::runtime_options::mfe_shared_dense_math();
         batch_.shared_dense_math=dense_math_option && *dense_math_option;
-        if(!shared[0] || !shared[1] || !shared[2] || !shared_gate.defined() || shared_gate.numel()!=batch_.tokens)
+        const int shared_input_projection=ungated_shared?1:0;
+        if(!shared[shared_input_projection] || !shared[1] || !shared[2] ||
+            !shared_gate.defined() || shared_gate.numel()!=batch_.tokens)
             throw std::invalid_argument("two-stage MFE shared projection incomplete");
         shared_short_encoding_=std::all_of(shared.begin(),shared.end(),[](const NintWeight* w) {
-            return w->gs==24 || w->gs==28 || w->gs==32;
+            return !w || w->gs==24 || w->gs==28 || w->gs==32;
         });
-        batch_.shared_intermediate=int(shared[0]->out);
-        if(shared[1]->out!=shared[0]->out || shared[0]->neuron_len!=batch_.input_width ||
-            shared[1]->neuron_len!=batch_.input_width || shared[2]->neuron_len!=shared[0]->out ||
+        batch_.shared_intermediate=int(shared[1]->out);
+        if((!ungated_shared && shared[0]->out!=shared[1]->out) ||
+            shared[shared_input_projection]->neuron_len!=batch_.input_width ||
+            shared[1]->neuron_len!=batch_.input_width || shared[2]->neuron_len!=shared[1]->out ||
             shared[2]->out<batch_.output_width)throw std::invalid_argument("two-stage MFE shared geometry invalid");
         for(int p=0;p<3;++p) {
-            auto d=nint_view(*shared[p],int(shared[p]->out),1,owners_);d.expert_local=nullptr;
+            // An ungated shared expert has no gate; reuse Up's descriptor so the
+            // packed layout stays three slots while the kernel reads one bank.
+            const NintWeight& source=*shared[p?p:(ungated_shared?1:0)];
+            auto d=nint_view(source,int(source.out),1,owners_);d.expert_local=nullptr;
             const auto small_whole=mfq::cuda::runtime_options::mfe_shared_small_whole();
             const bool small_down=p==2 && d.group_size==24 && d.groups<=32 &&
                 (small_whole?*small_whole:(batch_.tokens==1 || batch_.tokens==5 || batch_.tokens==6));
             d.nint_whole=nint_whole && (d.group_size==28 || (p<2 && d.group_size==24) || small_down);
             const auto grouped=mfq::cuda::runtime_options::nint_group_dot();
-            if(batch_.shared_dense_math && shared[p]->aligned_q8)
+            if(batch_.shared_dense_math && source.aligned_q8)
                 d.dense_reduction_warps=-1; // Dense q8 uses four-value chunk accumulation.
             else if(batch_.shared_dense_math && (!grouped || *grouped) &&
-                !mfq::cuda::runtime_options::nint_dense_reference() && !shared[p]->aligned_q8 &&
+                !mfq::cuda::runtime_options::nint_dense_reference() && !source.aligned_q8 &&
                 (d.group_size==24 || d.group_size==28) &&
                 (reinterpret_cast<std::uintptr_t>(d.fields[0])&3u)==0)
                 d.dense_reduction_warps=d.groups<=32?1:4;
@@ -441,6 +459,8 @@ mfq::cuda::MfePackedProjection MfeFfnRuntime::projection_view(int p,View view)co
 mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
         const std::vector<int64_t>& bytes,int slot)const {
     if(p<0 || p>2 || expert<0 || expert>=batch_.experts)throw std::invalid_argument("MFE transfer projection/expert invalid");
+    // Ungated banks have no Gate descriptor; Gate transfers alias Up.
+    if(ungated_experts_ && p==0)p=1;
     const int pool=host_cohorts_[p*batch_.experts+expert];
     if(pool<0 || pool>=batch_.projection_counts[p])throw std::invalid_argument("MFE transfer cohort missing");
     auto view=host_views_[batch_.projection_offsets[p]+pool];

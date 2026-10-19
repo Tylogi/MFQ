@@ -33,7 +33,8 @@ __global__ void __launch_bounds__(256,Capacity==2 && LowParallelism?3:Capacity<=
     const int lane=threadIdx.x,warp=threadIdx.y;
     const int base=int(blockIdx.x)*8,first=base+(warp%4)*2;
     if(base>=b.shared_intermediate)return;
-    const auto& d=b.shared[warp>=4];
+    // An ungated shared expert has no gate descriptor; both warp teams read Up.
+    const auto& d=b.shared[b.shared_activation==1?1:(warp>=4)];
     const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
     #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
@@ -59,7 +60,7 @@ __global__ void __launch_bounds__(256,Capacity==2 && LowParallelism?3:Capacity<=
         const auto gate=projected[pair][k][row],up=projected[pair+4][k][row];
         const int slot=short_shared_slot<Capacity>(b,group,k);
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            mfe_ffn_swiglu(b,gate,up,b.sigmoid_table);
+            mfe_ffn_swiglu(b,gate,up,b.sigmoid_table,true);
       }
     }
 }

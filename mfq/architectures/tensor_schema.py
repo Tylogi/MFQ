@@ -2516,7 +2516,10 @@ register_tensor_schema(
             ".linear_attention.dt_bias",
             ".linear_attention.conv.weight",
             ".linear_attention.conv.bias",
-            ".linear_attention.norm.weight",
+            # Every normalization and router parameter stays exact.
+            ".norm.weight",
+            ".norm.bias",
+            ".output_norm.weight",
             ".mlp.router.weight",
             ".mlp.router.bias",
         ),

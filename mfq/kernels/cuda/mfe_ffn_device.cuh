@@ -845,7 +845,13 @@ __device__ MFQ_MFE_PROJECT_INLINE void project_quad(const MfePackedProjection* d
 __device__ __forceinline__ const MfePackedProjection* projection(const MfeFfnBatch& b,
         int which,int expert,bool shared,int& local,bool transferred=false) {
     local=-1;
-    if(shared) {local=0;return b.shared+which;}
+    if(shared) {
+        // A relu-squared shared expert has no gate projection.
+        if(which==0 && b.shared_activation==1)return nullptr;
+        local=0;return b.shared+which;
+    }
+    // A relu-squared routed bank stores only Up and Down.
+    if(which==0 && b.expert_activation==1)return nullptr;
     if(unsigned(expert)>=unsigned(b.experts))return nullptr;
     if(transferred) {
         const int index=reinterpret_cast<const volatile int32_t*>(b.transfer_index)[expert];
@@ -867,6 +873,8 @@ __device__ __forceinline__ bool aborted(const MfeFfnBatch& b) {
 }
 __device__ __forceinline__ int primary_residency_kind(const MfeFfnBatch& b,int expert) {
     for(int which=0;which<3;++which) {
+        // An ungated bank has no Gate cohort; Up and Down own the residency.
+        if(which==0 && b.expert_activation==1)continue;
         const int pool=b.cohort_by_expert[which*b.experts+expert];
         if(unsigned(pool)>=unsigned(b.projection_counts[which]))return which==2?6:2;
         const auto& d=b.projections[b.projection_offsets[which]+pool];
@@ -1028,7 +1036,7 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
 #pragma unroll
         for(int row=0;row<2;++row)if(first+row<width) {
             b.hidden[int64_t(slot)*b.hidden_stride+first+row]=
-                mfe_ffn_swiglu(b,gate[row],up[row],table);
+                mfe_ffn_swiglu(b,gate[row],up[row],table,shared);
         }
         if(b.completion)__threadfence();
     }
@@ -1113,7 +1121,7 @@ __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_ke
         const int pair=lane/2,row=lane&1;
         const auto gate=projected[pair][row],up=projected[pair+team][row];
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            mfe_ffn_swiglu(b,gate,up,table);
+            mfe_ffn_swiglu(b,gate,up,table,shared);
         if(b.completion)__threadfence();
     }
     __syncwarp();

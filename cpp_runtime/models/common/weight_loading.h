@@ -42,9 +42,12 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
             throw std::runtime_error(
                 "ungated routed MoE requires only Up and Down at layer " +
                 std::to_string(layer));
-        if constexpr (requires { result.moe_ungated_experts = true; })
+        if constexpr (requires { result.moe_ungated_experts = true; }) {
             result.moe_ungated_experts = true;
-        else
+            // Up lives in the split slot so prefetch/cache code sees a real
+            // single projection instead of an empty fused pair.
+            result.moe_split_gate_up = true;
+        } else
             throw std::runtime_error(
                 "this FFN type does not support ungated routed experts at layer " +
                 std::to_string(layer));
