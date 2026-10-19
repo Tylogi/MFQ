@@ -11,13 +11,14 @@ import torch
 
 
 def loading_plan(model, *, backend='auto', purpose='imatrix', context_size=16384, batch_size=1, device=None):
+    from mfq.architectures.hf_config import text_section
     from mfq.quantize.workbench import ModelSource
 
     source = ModelSource(model)
     try:
         if not source.path.is_dir():
             raise ValueError('generation requires an original HF model directory')
-        config = source.config.get('text_config', source.config)
+        config = text_section(source.config)
         weights = source.parameters() * 2
         hidden = int(config['hidden_size'])
         intermediate = max(hidden, int(config.get('intermediate_size', 0)), int(config.get('moe_intermediate_size', 0)))
@@ -57,6 +58,7 @@ def release(device):
 
 
 def embedding_hidden(backend, input_ids, embedding=None):
+    name = getattr(backend, 'embedding_name', 'model.language_model.embed_tokens.weight')
     ids = input_ids.detach().to(device='cpu', dtype=torch.int64)
     if embedding is not None:
         hidden = embedding.index_select(0, ids.reshape(-1).to(embedding.device))
@@ -66,10 +68,13 @@ def embedding_hidden(backend, input_ids, embedding=None):
         for block in unique.split(256):
             start, end = int(block[0]), int(block[-1]) + 1
             if end - start <= 8192:
-                weight = backend.index.tensor('model.language_model.embed_tokens.weight', row_start=start, row_end=end, device='cpu')
+                weight = backend.index.tensor(name, row_start=start, row_end=end, device='cpu')
                 rows.append(weight.index_select(0, block - start))
             else:
-                rows.extend(backend.index.tensor('model.language_model.embed_tokens.weight', row_start=int(row), row_end=int(row) + 1, device='cpu') for row in block)
+                rows.extend(
+                    backend.index.tensor(name, row_start=int(row), row_end=int(row) + 1, device='cpu')
+                    for row in block
+                )
         hidden = torch.cat(rows).index_select(0, inverse)
     if str(backend.config.model_type).removesuffix('_text') == 'gemma4':
         hidden = hidden * torch.tensor(backend.hidden_size**0.5, dtype=hidden.dtype, device=hidden.device)
@@ -101,8 +106,14 @@ class SourceLayers:
                 try:
                     for index in range(self.backend.num_layers):
                         self.layers.append(self.stack.enter_context(self.backend.layer(index, quantized=False)))
-                    self.embedding = self.backend.index.tensor('model.language_model.embed_tokens.weight',
-                        device=self.backend.device, dtype=self.backend.teacher_dtype)
+                    embedding_name = getattr(
+                        self.backend, 'embedding_name', 'model.language_model.embed_tokens.weight'
+                    )
+                    self.embedding = self.backend.index.tensor(
+                        embedding_name,
+                        device=self.backend.device,
+                        dtype=self.backend.teacher_dtype,
+                    )
                 except RuntimeError as error:
                     if not isinstance(error, torch.OutOfMemoryError) and 'MPS backend out of memory' not in str(error):
                         self.__exit__(*sys.exc_info())
