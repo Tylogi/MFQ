@@ -86,7 +86,15 @@ mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, int64_t neuron_len);
+mfq_tensor_backend::Tensor nint8_zero_dequant_f32_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, int64_t neuron_len);
 mfq_tensor_backend::Tensor nint_decode_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    int64_t neuron_len, int64_t gs);
+mfq_tensor_backend::Tensor nint_decode_f32_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,

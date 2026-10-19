@@ -324,6 +324,16 @@ def glm_v1s_nint_linear_reference(value, weight, spec):
     return _fp16(output).reshape(*shape, matrix.shape[0])
 
 
+def glm_logits_reference(hidden, weights):
+    """Run the model output head through its stored execution format."""
+
+    name = "model.output.weight"
+    spec = getattr(weights, "nint_specs", {}).get(name)
+    if spec is not None:
+        return glm_v1s_nint_linear_reference(hidden, weights[name], spec)
+    return hidden @ weights[name].T
+
+
 def glm_v1s_mfe_reference(value, weight, ids, spec):
     """Reference an NINT MFE routed projection, including input quantization."""
 
@@ -1255,7 +1265,7 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     for i,row in enumerate(raw["layers"]):
         expected=reference(config,reference_weights,mtp=(ids,previous,i,None))
         for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
-        np.testing.assert_allclose(array(row["logits"]),expected[0]@reference_weights["model.output.weight"].T,atol=2e-3,rtol=2e-3)
+        np.testing.assert_allclose(array(row["logits"]),glm_logits_reference(expected[0],reference_weights),atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
         np.testing.assert_allclose(array(row["chunked"]),array(row["full"]),atol=1.5e-2,rtol=1.5e-2)
         np.testing.assert_allclose(array(row["batch"]),np.repeat(array(row["full"]),2,axis=0),atol=2e-3,rtol=2e-3)

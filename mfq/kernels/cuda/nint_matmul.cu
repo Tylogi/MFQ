@@ -107,6 +107,17 @@ __global__ void nint8_one_quantize_reconstruct_kernel(
 }
 
 
+template <typename Output>
+__device__ __forceinline__ Output nint_decode_store(float value) {
+    if constexpr (std::is_same_v<Output, __half>) {
+        return __float2half_rn(value);
+    } else {
+        return value;
+    }
+}
+
+
+template <typename Output>
 __global__ void nint_decode_rows_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -115,7 +126,7 @@ __global__ void nint_decode_rows_kernel(
         const uint8_t * __restrict__ subgroup_minimum,
         const float * __restrict__ neuron_scale,
         const float * __restrict__ neuron_minimum,
-        __half * __restrict__ output,
+        Output * __restrict__ output,
         int rows,
         int groups,
         int group_size,
@@ -139,7 +150,7 @@ __global__ void nint_decode_rows_kernel(
             static_cast<float>(subgroup_scale[metadata]);
         const float minimum = neuron_minimum[row] *
             static_cast<float>(subgroup_minimum[metadata]);
-        output[index] = __float2half_rn(
+        output[index] = nint_decode_store<Output>(
             scale * static_cast<float>(code) - minimum);
     }
 }
@@ -1791,10 +1802,11 @@ __global__ void __launch_bounds__(128) nint_backward_input_kernel(
 }
 
 
+template <typename Output>
 __global__ void nint8_zero_decode_rows_kernel(
         const int8_t * __restrict__ quantized,
         const __half * __restrict__ scale,
-        __half * __restrict__ output,
+        Output * __restrict__ output,
         int rows,
         int groups,
         int width) {
@@ -1808,7 +1820,7 @@ __global__ void nint8_zero_decode_rows_kernel(
         const int group = column / 32;
         const int lane = column & 31;
         const size_t block = static_cast<size_t>(row) * groups + group;
-        output[index] = __float2half_rn(
+        output[index] = nint_decode_store<Output>(
             __half2float(scale[block]) * static_cast<float>(
                 quantized[block * 32 + lane]));
     }
@@ -2403,7 +2415,8 @@ mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f32acc_cuda(
 }
 
 
-mfq_tensor_backend::Tensor nint_decode_cuda(
+template <typename Output>
+static mfq_tensor_backend::Tensor nint_decode_impl(
         mfq_tensor_backend::Tensor bitstream,
         mfq_tensor_backend::Tensor row_q_bits,
         mfq_tensor_backend::Tensor row_q_bit_offsets,
@@ -2462,26 +2475,40 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
         "NINT tensors must share one CUDA device");
     auto output = mfq_tensor_backend::empty(
         {rows, width},
-        neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
+        neuron_scale.options().dtype(
+            std::is_same_v<Output, __half>
+                ? mfq_tensor_backend::kFloat16
+                : mfq_tensor_backend::kFloat32));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-    if ((group_size == 24 || group_size == 28) && width % 4 == 0 &&
-            (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
-            std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
-        const auto launch = [&](auto gs) {
-            nint_decode_vec4_kernel<decltype(gs)::value><<<
-                dim3((width / 4 + 127) / 128, std::min(rows, 65535)), 128, 0, mfq_current_cuda_stream()>>>(
-                bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(), row_q_bit_offsets.data_ptr<int64_t>(),
-                subgroup_scale.data_ptr<uint8_t>(), subgroup_minimum.data_ptr<uint8_t>(),
-                neuron_scale.data_ptr<float>(), neuron_minimum.data_ptr<float>(),
-                reinterpret_cast<half*>(output.data_ptr<mfq_half>()), rows, groups, int(width), uint64_t(bitstream.numel()));
-        };
-        if (group_size == 24) launch(std::integral_constant<int, 24>{});
-        else launch(std::integral_constant<int, 28>{});
-    } else {
-    nint_decode_rows_kernel<<<
+    if constexpr (std::is_same_v<Output, __half>) {
+        if ((group_size == 24 || group_size == 28) && width % 4 == 0 &&
+                (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
+                std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
+            const auto launch = [&](auto gs) {
+                nint_decode_vec4_kernel<decltype(gs)::value><<<
+                    dim3((width / 4 + 127) / 128, std::min(rows, 65535)), 128, 0, mfq_current_cuda_stream()>>>(
+                    bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(), row_q_bit_offsets.data_ptr<int64_t>(),
+                    subgroup_scale.data_ptr<uint8_t>(), subgroup_minimum.data_ptr<uint8_t>(),
+                    neuron_scale.data_ptr<float>(), neuron_minimum.data_ptr<float>(),
+                    reinterpret_cast<half*>(output.data_ptr<mfq_half>()), rows, groups, int(width), uint64_t(bitstream.numel()));
+            };
+            if (group_size == 24) launch(std::integral_constant<int, 24>{});
+            else launch(std::integral_constant<int, 28>{});
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+            return output;
+        }
+    }
+    const auto output_data = [&]() {
+        if constexpr (std::is_same_v<Output, __half>) {
+            return reinterpret_cast<__half *>(output.data_ptr<mfq_half>());
+        } else {
+            return output.data_ptr<float>();
+        }
+    }();
+    nint_decode_rows_kernel<Output><<<
         blocks, threads, 0, mfq_current_cuda_stream()>>>(
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
@@ -2490,14 +2517,49 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
             subgroup_minimum.data_ptr<uint8_t>(),
             neuron_scale.data_ptr<float>(),
             neuron_minimum.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            output_data,
             rows,
             groups,
             static_cast<int>(group_size),
             static_cast<int>(width));
-    }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+
+mfq_tensor_backend::Tensor nint_decode_cuda(
+        mfq_tensor_backend::Tensor bitstream,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        int64_t width,
+        int64_t group_size) {
+    return nint_decode_impl<__half>(
+        std::move(bitstream), std::move(row_q_bits),
+        std::move(row_q_bit_offsets), std::move(subgroup_scale),
+        std::move(subgroup_minimum), std::move(neuron_scale),
+        std::move(neuron_minimum), width, group_size);
+}
+
+
+mfq_tensor_backend::Tensor nint_decode_f32_cuda(
+        mfq_tensor_backend::Tensor bitstream,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        int64_t width,
+        int64_t group_size) {
+    return nint_decode_impl<float>(
+        std::move(bitstream), std::move(row_q_bits),
+        std::move(row_q_bit_offsets), std::move(subgroup_scale),
+        std::move(subgroup_minimum), std::move(neuron_scale),
+        std::move(neuron_minimum), width, group_size);
 }
 
 
@@ -3252,7 +3314,8 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
 }
 
 
-mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
+template <typename Output>
+static mfq_tensor_backend::Tensor nint8_zero_dequant_impl(
         mfq_tensor_backend::Tensor quantized,
         mfq_tensor_backend::Tensor scale,
         int64_t width) {
@@ -3264,22 +3327,50 @@ mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
     const int groups = static_cast<int>(quantized.size(1));
     auto output = mfq_tensor_backend::empty(
         {rows, width},
-        quantized.options().dtype(mfq_tensor_backend::kFloat16));
+        quantized.options().dtype(
+            std::is_same_v<Output, __half>
+                ? mfq_tensor_backend::kFloat16
+                : mfq_tensor_backend::kFloat32));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-    nint8_zero_decode_rows_kernel<<<
+    const auto output_data = [&]() {
+        if constexpr (std::is_same_v<Output, __half>) {
+            return reinterpret_cast<__half *>(output.data_ptr<mfq_half>());
+        } else {
+            return output.data_ptr<float>();
+        }
+    }();
+    nint8_zero_decode_rows_kernel<Output><<<
         blocks, threads, 0, mfq_current_cuda_stream()>>>(
             reinterpret_cast<const int8_t *>(
                 quantized.data_ptr<uint8_t>()),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            output_data,
             rows,
             groups,
             static_cast<int>(width));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+
+mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
+        mfq_tensor_backend::Tensor quantized,
+        mfq_tensor_backend::Tensor scale,
+        int64_t width) {
+    return nint8_zero_dequant_impl<__half>(
+        std::move(quantized), std::move(scale), width);
+}
+
+
+mfq_tensor_backend::Tensor nint8_zero_dequant_f32_cuda(
+        mfq_tensor_backend::Tensor quantized,
+        mfq_tensor_backend::Tensor scale,
+        int64_t width) {
+    return nint8_zero_dequant_impl<float>(
+        std::move(quantized), std::move(scale), width);
 }
 
 
