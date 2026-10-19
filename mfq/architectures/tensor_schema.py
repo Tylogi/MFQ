@@ -2243,8 +2243,9 @@ def _nemotron_h_vision_shape(
             vision.hidden_size,
         ),
         "vision.cls_register_token.weight": (vision.summary_tokens, vision.hidden_size),
-        "vision.input_conditioner.mean": (vision.num_channels,),
-        "vision.input_conditioner.std": (vision.num_channels,),
+        # RADIO stores the conditioner as [C, 1, 1] so it broadcasts over [C, H, W].
+        "vision.input_conditioner.mean": (vision.num_channels, 1, 1),
+        "vision.input_conditioner.std": (vision.num_channels, 1, 1),
         "vision.summary_indices": (len(vision.summary_idxs),),
     }
     temporal = vision.video_temporal_patch_size

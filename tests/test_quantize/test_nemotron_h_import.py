@@ -196,10 +196,10 @@ def synthetic_tensors() -> dict[str, torch.Tensor]:
     tensors[f"{radio}.blocks.0.mlp.fc2.weight"] = _matrix(VISION_HIDDEN, 64, 214)
     tensors[f"{radio}.blocks.0.mlp.fc2.bias"] = _vector(VISION_HIDDEN, 215)
     tensors["vision_model.radio_model.input_conditioner.norm_mean"] = torch.zeros(
-        3, dtype=torch.float32
+        3, 1, 1, dtype=torch.float32
     )
     tensors["vision_model.radio_model.input_conditioner.norm_std"] = torch.ones(
-        3, dtype=torch.float32
+        3, 1, 1, dtype=torch.float32
     )
     tensors["vision_model.summary_idxs"] = torch.tensor([0], dtype=torch.int64)
     tensors["vision_projector.vision_final_layernorm.weight"] = _vector(VISION_HIDDEN, 216)

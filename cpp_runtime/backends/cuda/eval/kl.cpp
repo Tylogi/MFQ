@@ -6,6 +6,7 @@
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
 #include "models/minicpmo45/ops.h"
+#include "models/nemotron_h/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "storage/weight_loader.h"
@@ -1121,5 +1122,6 @@ MFQ_INSTANTIATE_KL(mfq::cuda::Glm5CausalLm);
 MFQ_INSTANTIATE_KL(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV4CausalLm);
 MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV41CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::NemotronHCausalLm);
 
 #undef MFQ_INSTANTIATE_KL
