@@ -595,7 +595,8 @@ using State = std::variant<
     std::unique_ptr<CudaEngineState<Glm5CausalLm>>,
     std::unique_ptr<CudaEngineState<Qwen4CausalLm>>,
     std::unique_ptr<CudaEngineState<DeepseekV4CausalLm>>,
-    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>>;
+    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>,
+    std::unique_ptr<CudaEngineState<NemotronHCausalLm>>>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;

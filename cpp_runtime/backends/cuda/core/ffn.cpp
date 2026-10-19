@@ -460,10 +460,14 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     });
                 }
                 if (!use_pipeline) {
+                    // Dense (source-precision) banks are not MFE cohorts, so
+                    // their expert count comes from the bank itself.
+                    const auto routed_experts =
+                        moe_dense_up.defined() ? static_cast<int>(moe_dense_up.size(0))
+                                               : (moe_split_gate_up ? moe_gate.n_experts
+                                                                    : moe_gate_up.n_experts);
                     route = profiler.measure("moe.route_map", [&]() {
-                        return build_moe_route_plan(selected.at(0), moe_split_gate_up
-                                                                        ? moe_gate.n_experts
-                                                                        : moe_gate_up.n_experts);
+                        return build_moe_route_plan(selected.at(0), routed_experts);
                     });
                 }
                 return selected;

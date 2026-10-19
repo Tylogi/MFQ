@@ -969,7 +969,8 @@ static int run_qwen35_mtp_check(
         for (auto& block : model.blocks) {
             if (auto* linear = dynamic_cast<
                     mfq::cuda::qwen35::LinearAttentionBlock*>(block.get()))
-                states.emplace_back(linear->conv_state.clone(), linear->gdn_state.clone());
+                states.emplace_back(linear->mixer.convolution.clone(),
+                                    linear->mixer.recurrent.clone());
         }
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
@@ -1006,8 +1007,8 @@ static int run_qwen35_mtp_check(
                     mfq::cuda::qwen35::LinearAttentionBlock*>(block.get())) {
                 const auto conv_label = "conv_continuation_" + std::to_string(state);
                 const auto gdn_label = "gdn_continuation_" + std::to_string(state);
-                compare(states[state].first, linear->conv_state, .002, conv_label.c_str());
-                compare(states[state].second, linear->gdn_state, .002, gdn_label.c_str());
+                compare(states[state].first, linear->mixer.convolution, .002, conv_label.c_str());
+                compare(states[state].second, linear->mixer.recurrent, .002, gdn_label.c_str());
                 ++state;
             }
         }
@@ -1557,6 +1558,68 @@ static int run_flash_next_check(Model& model) {
     }
     result["architecture"] = model.graph.backbone;
     std::cout << "flash_next_check " << result.dump() << '\n';
+    return 0;
+}
+
+
+template <typename Model>
+static int run_nemotron_h_check(Model& model) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(model.vocab_size() >= 8 && model.max_position_embeddings() >= 16,
+        "Nemotron-H diagnostic requires vocab>=8 and context>=16");
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
+    auto ids=tb::tensor(std::vector<int64_t>{1,2,3,4,5,6,7},options).reshape({1,7});
+    const std::vector<int64_t> prompt{1,2,3,4};
+    const auto json_tensor=[](const tb::Tensor& value) {
+        auto host=value.to(tb::kFloat32).contiguous().cpu();
+        return nlohmann::json{{"shape",host.sizes().vec()},
+            {"data",std::vector<float>(host.template data_ptr<float>(),host.template data_ptr<float>()+host.numel())}};
+    };
+    nlohmann::json result;
+    model.reset(1);
+    auto hidden=model.hidden_forward(ids);
+    result["full_hidden"]=json_tensor(hidden);
+    result["full"]=json_tensor(model.logits_from_hidden(hidden.clone()));
+    model.reset(1);
+    std::vector<tb::Tensor> pieces;
+    for (auto [begin,count] : std::vector<std::pair<int64_t,int64_t>>{{0,2},{2,1},{3,4}})
+        pieces.push_back(model.forward(ids.narrow(1,begin,count)));
+    result["chunked"]=json_tensor(tb::cat(pieces,1));
+    model.reset(1);
+    model.forward(ids.narrow(1,0,5));
+    pieces.clear();
+    for (int64_t token=5;token<7;++token)
+        pieces.push_back(model.forward(ids.narrow(1,token,1)));
+    result["decode"]=json_tensor(tb::cat(pieces,1));
+    model.reset(1);
+    model.forward(ids.narrow(1,0,4));
+    auto snapshot=model.capture_text_session_state(prompt);
+    auto continued=model.forward(ids.narrow(1,4,1));
+    model.restore_text_session_state(snapshot);
+    result["restored"]=json_tensor(model.forward(ids.narrow(1,4,1)));
+    result["continued"]=json_tensor(continued);
+    for (bool accept : {false,true}) {
+        const std::string name=accept ? "committed" : "rejected";
+        model.reset(1);
+        model.forward(ids.narrow(1,0,2));
+        auto window=model.hidden_forward(ids.narrow(1,2,2),mfq_nullopt,mfq_nullopt,nullptr,
+            mfq_nullopt,nullptr,1);
+        result[name+"_verify"]=json_tensor(model.logits_from_hidden(window));
+        if (accept) model.commit_speculative(); else model.rollback_speculative();
+        MFQ_RUNTIME_CHECK(model.cache_pos==(accept?4:3),
+            "Nemotron-H transaction cache position mismatch");
+        result[name]=json_tensor(model.forward(ids.narrow(1,5,1)));
+        model.reset(1);
+        model.forward(ids.narrow(1,0,2));
+        model.forward(ids.narrow(1,2,accept?2:1));
+        result[name+"_reference"]=json_tensor(model.forward(ids.narrow(1,5,1)));
+    }
+    model.reset(2);
+    result["batch"]=json_tensor(model.forward(ids.repeat({2,1})));
+    model.reset(1);
+    result["reset"]=json_tensor(model.forward(ids));
+    result["architecture"]=model.graph.backbone;
+    std::cout << "nemotron_h_check " << result.dump() << '\n';
     return 0;
 }
 

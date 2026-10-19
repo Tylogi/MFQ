@@ -116,10 +116,10 @@ static void check_graph_warmup_state() {
     auto block = std::make_unique<qwen35::LinearAttentionBlock>();
     auto* recurrent = block.get();
     const auto options = TensorOptions().device(kCUDA).dtype(kFloat32);
-    recurrent->conv_state = ones({2}, options);
-    recurrent->gdn_state = ones({3}, options);
-    const auto* conv_address = recurrent->conv_state.data_ptr();
-    const auto* gdn_address = recurrent->gdn_state.data_ptr();
+    recurrent->mixer.convolution = ones({2}, options);
+    recurrent->mixer.recurrent = ones({3}, options);
+    const auto* conv_address = recurrent->mixer.convolution.data_ptr();
+    const auto* gdn_address = recurrent->mixer.recurrent.data_ptr();
     model.blocks.push_back(std::move(block));
     model.cache_pos = 5;
     for (bool fail : {false, true}) {
@@ -129,20 +129,20 @@ static void check_graph_warmup_state() {
         try {
             prepare_decode_graph_memory(model, graph, [&] {
                 ++calls;
-                recurrent->conv_state.zero_();
-                recurrent->gdn_state.zero_();
+                recurrent->mixer.convolution.zero_();
+                recurrent->mixer.recurrent.zero_();
                 if (fail) throw std::runtime_error("warmup failed");
             });
         } catch (const std::runtime_error&) { threw = true; }
         check(threw == fail && calls == (fail ? 1 : 2), "graph warmup execution changed");
-        check(model.cache_pos == 5 && recurrent->conv_state.data_ptr() == conv_address &&
-                  recurrent->gdn_state.data_ptr() == gdn_address,
+        check(model.cache_pos == 5 && recurrent->mixer.convolution.data_ptr() == conv_address &&
+                  recurrent->mixer.recurrent.data_ptr() == gdn_address,
               "graph warmup changed persistent state addresses");
-        check(recurrent->conv_state.sum().item<float>() == 2 &&
-                  recurrent->gdn_state.sum().item<float>() == 3,
+        check(recurrent->mixer.convolution.sum().item<float>() == 2 &&
+                  recurrent->mixer.recurrent.sum().item<float>() == 3,
               "graph warmup did not restore recurrent state");
     }
-    recurrent->speculative_pending = true;
+    recurrent->mixer.speculative_pending = true;
     bool rejected = false;
     try { (void)recurrent->graph_warmup_state(); }
     catch (const std::exception&) { rejected = true; }
@@ -514,8 +514,8 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         config.linear_key_head_dim = config.linear_value_head_dim = 2;
         const auto options = mfq_tensor_backend::TensorOptions()
             .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
-        linear->conv_state = mfq_tensor_backend::zeros({1, 1, 6}, options);
-        linear->gdn_state = mfq_tensor_backend::zeros({1, 1, 2, 2}, options);
+        linear->mixer.convolution = mfq_tensor_backend::zeros({1, 1, 6}, options);
+        linear->mixer.recurrent = mfq_tensor_backend::zeros({1, 1, 2, 2}, options);
         model.blocks.push_back(std::move(linear));
     }
     model.cache_pos = 2;

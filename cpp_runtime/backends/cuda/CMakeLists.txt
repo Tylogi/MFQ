@@ -363,6 +363,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/nemotron_h/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
 )

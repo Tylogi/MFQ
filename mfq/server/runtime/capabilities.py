@@ -58,9 +58,9 @@ _REGISTRY = (
         aliases=("gemma4", "gemma4_text"),
         features=ModelFeatureSet(),
     ),
-    # Nemotron-H is import-only today: the family is registered so artifacts
-    # report their real name, but no media, MTP or speculative capability is
-    # advertised until the runtime phases implement them.
+    # Nemotron-H CUDA text inference is implemented; the RADIO vision tower
+    # and the MTP predictor have no runtime adapter yet, so no media or
+    # speculative capability is advertised for the family.
     _CapabilityRegistration(
         family="nemotron_h",
         aliases=("nemotron_h", "nemotron_h_text", "nemotron_h_omni"),

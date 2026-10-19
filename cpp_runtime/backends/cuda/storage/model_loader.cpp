@@ -257,6 +257,7 @@ MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Glm5CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV41CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::NemotronHCausalLm);
 
 #undef MFQ_INSTANTIATE_CAUSAL_LM
 
@@ -482,6 +483,7 @@ load_runtime_components(
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::GlmDsaCausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
+MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::NemotronHCausalLm);
 
 
 #undef MFQ_INSTANTIATE_COMPONENTS

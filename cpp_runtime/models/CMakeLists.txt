@@ -7,6 +7,7 @@ add_library(mfq-models STATIC
     gemma4/config.cpp
     glm_dsa/config.cpp
     minicpmo45/config.cpp
+    nemotron_h/config.cpp
     qwen35/config.cpp
 )
 add_library(mfq::models ALIAS mfq-models)

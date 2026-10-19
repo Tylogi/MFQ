@@ -8,6 +8,7 @@
 #include "models/glm_dsa/ops.h"
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
+#include "models/nemotron_h/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "core/full_block.h"
 #include "cuda_sampling.h"
@@ -556,6 +557,7 @@ MFQ_INSTANTIATE_FLOW(mfq::cuda::Glm5CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen4CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV4CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV41CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::NemotronHCausalLm)
 
 #undef MFQ_INSTANTIATE_FLOW
 } // namespace mfq::cuda::internal

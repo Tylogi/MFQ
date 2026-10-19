@@ -20,6 +20,7 @@ enum class CudaBackbone {
     qwen4_exp,
     deepseek_v4,
     deepseek_v41,
+    nemotron_h,
     unsupported,
 };
 
@@ -84,6 +85,9 @@ inline constexpr CudaBackbone cuda_backbone(
     }
     if (implementation == "deepseek_v41") {
         return CudaBackbone::deepseek_v41;
+    }
+    if (implementation == "nemotron_h") {
+        return CudaBackbone::nemotron_h;
     }
     return CudaBackbone::unsupported;
 }

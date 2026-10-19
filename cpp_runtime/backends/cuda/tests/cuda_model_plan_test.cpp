@@ -164,13 +164,24 @@ int main() {
             "unknown model name inferred CUDA capabilities");
 
         for (const char* backbone : {
-                 "gemma4", "glm_dsa", "deepseek_v4"}) {
+                 "gemma4", "glm_dsa", "deepseek_v4", "nemotron_h"}) {
             auto text_model = graph_with(backbone);
             require_capabilities(
                 cuda_capability_matrix(cuda_model_plan(text_model)),
                 {true, false, false, false, false, false, false},
                 "text-only CUDA capability matrix mismatch");
         }
+        const auto nemotron = graph_with("nemotron_h", "radio",
+                                         "nemotron_h_mtp");
+        const auto nemotron_plan = cuda_model_plan(nemotron);
+        const auto nemotron_state = cuda_component_state(
+            nemotron, nemotron_plan, true, true);
+        require(
+            nemotron_plan.vision == CudaVisionAdapter::none &&
+                nemotron_plan.predictor == CudaPredictorAdapter::none &&
+                nemotron_state.vision_declared && !nemotron_state.vision_supported &&
+                nemotron_state.mtp_declared && !nemotron_state.mtp_supported,
+            "Nemotron-H advertised an unimplemented vision or predictor adapter");
         auto deepseek_v4_with_predictor = graph_with(
             "deepseek_v4", {}, "next_token_prediction");
         require_capabilities(

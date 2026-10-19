@@ -6,6 +6,7 @@
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
 #include "models/minicpmo45/ops.h"
+#include "models/nemotron_h/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "core/mtp.h"
@@ -155,6 +156,8 @@ auto with_loaded_cuda_model(
             return load.template operator()<DeepseekV4CausalLm>();
         case CudaBackbone::deepseek_v41:
             return load.template operator()<DeepseekV41CausalLm>();
+        case CudaBackbone::nemotron_h:
+            return load.template operator()<NemotronHCausalLm>();
         case CudaBackbone::unsupported:
             throw std::runtime_error("unsupported CUDA model backbone");
     }
