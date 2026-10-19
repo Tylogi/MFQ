@@ -332,7 +332,7 @@ def test_recipe_conversion_is_rejected_without_a_nemotron_recipe(tmp_path) -> No
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="no GGUF recipe mapping"):
+    with pytest.raises(ValueError, match="tensor is absent from GGUF recipe"):
         convert(root, tmp_path / "recipe.mfq", "--recipe-gguf", str(recipe))
 
 

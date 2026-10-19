@@ -291,14 +291,19 @@ configurations. `--alphaq-allocator natscale` selects the
 [calibration-free NatScale allocator](natscale.md), with measured imatrix-weighted
 format errors and uniform sensitivity by default.
 
-`--alphaq-dense auto` uses pinned UD nonexpert recipes for the evaluated
-Qwen3.8-Flash-Next configuration, choosing the closest of the nine UD whole-file
-budgets. These recipes retain revision
-`38bb39ee97821de2c9009abb7e93950eec396e66`; their expert precisions are replaced
-by AlphaQ. This reflects the Q2 experiment's selected recipe fallback and does
-not claim optimality at every budget or on other models. An explicit `--recipe`
-selects another compatible nonexpert recipe. Other model configurations use
-joint allocation by default.
+`--alphaq-dense auto` uses pinned UD nonexpert recipes for registered
+configurations, choosing the closest of that configuration's UD whole-file
+budgets. Qwen3.8-Flash-Next has nine budgets, retaining revision
+`38bb39ee97821de2c9009abb7e93950eec396e66`;
+NVIDIA-Nemotron-3.5-Super-VL-120B-A12B has its published `IQ2_M` and an
+`IQ4_XS` derived from the same tensor list by
+`mfq/tools/derive_gguf_recipe.py`, both retaining revision
+`75a5829055f69a0359085ae6bbd0a81b60bc05c6`. Expert precisions are replaced by
+AlphaQ, and recipes cover the main text only: MTP and vision keep their own
+policies and stay outside the ceiling. This reflects the Q2 experiment's
+selected recipe fallback and does not claim optimality at every budget or on
+other models. An explicit `--recipe` selects another compatible nonexpert
+recipe. Other model configurations use joint allocation by default.
 
 `--alphaq-dense joint` allocates all non-PLE rank-two matrices with matching
 imatrix entries together with routed experts. Missing-imatrix matrices keep
