@@ -2824,6 +2824,25 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    void prepare_history_projections() const {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const int rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    for (const auto& output : cache_projections_(hidden)) preparation->add(output);
+                }
+            });
+        }
+    }
+    bool can_defer_routes() const noexcept {
+        return batch_ == 1 && cache_ && cache_->position() > 0 &&
+            index_position_ == cache_->position() && !speculative_trim_;
+    }
+    int route_checkpoint() const {
+        if (!can_defer_routes()) throw std::logic_error("QSA route checkpoint is unavailable");
+        return cache_->position();
+    }
     std::vector<array> decode_input_projections(const array& hidden) override {
         return input_projections_(hidden);
     }
@@ -3706,15 +3725,24 @@ private:
 
 class Qwen4Layer {
 public:
-    std::optional<Qwen4CachedRoute> cached_gdn_route() const {
+    using RouteCheckpoint = std::variant<Qwen4GdnRouteCheckpoint, int>;
+
+    std::optional<Qwen4CachedRoute> cached_route() const {
+        if (ple_) return std::nullopt;
         const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get());
-        return !ple_ && gdn && gdn->can_defer_routes() ? moe_.cached_route() : std::nullopt;
+        const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
+        return (gdn && gdn->can_defer_routes()) || (qsa && qsa->can_defer_routes())
+            ? moe_.cached_route() : std::nullopt;
     }
-    Qwen4GdnRouteCheckpoint route_checkpoint() const {
-        return dynamic_cast<const Qwen4Gdn&>(*attention_).route_checkpoint();
+    RouteCheckpoint route_checkpoint() const {
+        if (const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get()))
+            return gdn->route_checkpoint();
+        return dynamic_cast<const Qwen4Qsa&>(*attention_).route_checkpoint();
     }
-    void restore_route_checkpoint(const Qwen4GdnRouteCheckpoint& state) {
-        dynamic_cast<Qwen4Gdn&>(*attention_).restore_route_checkpoint(state);
+    void restore_route_checkpoint(const RouteCheckpoint& state) {
+        if (const auto* gdn = std::get_if<Qwen4GdnRouteCheckpoint>(&state))
+            dynamic_cast<Qwen4Gdn&>(*attention_).restore_route_checkpoint(*gdn);
+        else dynamic_cast<Qwen4Qsa&>(*attention_).trim_cache_to(std::get<int>(state));
     }
     void exchange_cache(Qwen4RequestLayerCache& cache) {
         attention_->exchange_cache(cache);
@@ -3843,13 +3871,14 @@ public:
         std::size_t expert_cache_layer_base = 0) {
         const auto prefix =
             "predictor.block." + std::to_string(index);
+        auto attention = Qwen4Qsa::load(model, config, prefix + ".attention", maximum);
+        attention->prepare_history_projections();
         return Qwen4Layer(
             GatedResidual::load(
                 model, config, prefix + ".attention.mhc.pre"),
             GatedResidual::load(
                 model, config, prefix + ".mlp.mhc.pre"),
-            Qwen4Qsa::load(
-                model, config, prefix + ".attention", maximum),
+            std::move(attention),
             Qwen4Moe::load(
                 model,
                 config,
@@ -4869,9 +4898,9 @@ struct MlxQwen4CausalLm::Impl {
             if (use_cache && batch == 1 && tokens == 1 && !speculative_confirmed &&
                 !MlxMtpLora::current() && !detail::component_profile_active()) {
                 std::vector<Qwen4CachedRoute> routes;
-                std::vector<Qwen4GdnRouteCheckpoint> states;
+                std::vector<Qwen4Layer::RouteCheckpoint> states;
                 for (auto next = index; next < layers.size() && next < index + 4; ++next) {
-                    auto route = layers[next].cached_gdn_route();
+                    auto route = layers[next].cached_route();
                     if (!route) break;
                     routes.push_back(std::move(*route));
                     states.push_back(layers[next].route_checkpoint());
@@ -4886,7 +4915,8 @@ struct MlxQwen4CausalLm::Impl {
                         for (std::size_t offset = 0; offset < routes.size(); ++offset)
                             trial = layers[index + offset].forward(std::move(trial), ids,
                                 current_positions, full_positions, true, 0, nullptr, nullptr, &routes[offset]);
-                        trial.eval();
+                        mlx::core::async_eval({*routes.back().ids});
+                        mlx::core::async_eval({trial});
                         std::vector<bool> hits;
                         for (auto& route : routes) hits.push_back(route.all_resident());
                         const bool all_hit = std::all_of(hits.begin(), hits.end(), [](bool hit) { return hit; });
@@ -4897,6 +4927,7 @@ struct MlxQwen4CausalLm::Impl {
                             index += routes.size() - 1;
                             continue;
                         }
+                        trial.eval();
                     } catch (...) {
                         restore();
                         throw;

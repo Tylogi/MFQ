@@ -20,6 +20,12 @@
 namespace mfq::metal {
 
 class MlxWeightResidency {
+    template <typename Data>
+    static auto allocation_buffer(Data& data) {
+        if constexpr (requires { data.buffer(); }) return data.buffer();
+        else return data.buffer;
+    }
+
     struct Capture {
         std::mutex mutex;
         std::vector<std::weak_ptr<mlx::core::array::Data>> allocations;
@@ -58,8 +64,8 @@ public:
         {
             std::lock_guard lock(current->mutex);
             for (const auto& weak : current->allocations) {
-                if (auto data = weak.lock(); data && data->buffer.ptr()
-                    && seen.insert(data->buffer.ptr()).second) live.push_back(std::move(data));
+                if (auto data = weak.lock(); data && allocation_buffer(*data).ptr()
+                    && seen.insert(allocation_buffer(*data).ptr()).second) live.push_back(std::move(data));
             }
         }
         if (live.empty()) return {};
@@ -97,7 +103,7 @@ private:
         auto& device = mlx::core::metal::device(mlx::core::Device::gpu);
         std::size_t set_bytes = 0;
         for (const auto& data : live) {
-            auto* buffer = static_cast<MTL::Buffer*>(data->buffer.ptr());
+            auto* buffer = static_cast<MTL::Buffer*>(allocation_buffer(*data).ptr());
             const auto bytes = buffer->allocatedSize();
             if (bytes > limit - bytes_.load(std::memory_order_relaxed)) {
                 throw std::runtime_error("Metal weight residency exceeds the configured budget");

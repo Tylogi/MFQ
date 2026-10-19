@@ -35,8 +35,8 @@ int main() {
             const double ms=!valid?9000.0:depth==0?20.0:cycle<500?10.0+2.0*depth:35.0+30.0*depth;
             const auto started=cursor+std::chrono::microseconds(400);
             cursor=started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(ms));
-            const std::array<int,1> accepted{depth};
-            metal.observe(depth,accepted,started,cursor,valid,false);
+            const std::array<BatchAcceptance,1> accepted{{{depth,depth}}};
+            metal.observe(accepted,started,cursor,valid,false);
             if(parked)policy.observe_plain_window(started,cursor,valid);
             else policy.observe_window(depth,depth,started,cursor,valid);
             if(parked && !metal.remaining())++reentries;

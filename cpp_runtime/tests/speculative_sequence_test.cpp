@@ -1,6 +1,7 @@
 #include "speculative_sequence.h"
 #include "mtp_batch_policy.h"
 
+#include <cmath>
 #include <iostream>
 #include <thread>
 
@@ -492,11 +493,11 @@ void early_target_prefetch() {
 void batch_policy() {
     mtp::BatchDepthPolicy policy({"one", "two"}, 1);
     auto now = mtp::BatchDepthPolicy::Clock::time_point{};
-    const std::array<int, 2> rejected{0, 0};
     const auto observe = [&](int depth, int milliseconds, bool stable = true, bool interrupted = false) {
         const auto started = now;
         now += std::chrono::milliseconds(milliseconds);
-        policy.observe(depth, rejected, started, now, stable, interrupted);
+        const std::array<mtp::BatchAcceptance, 2> rejected{{{depth, 0}, {depth, 0}}};
+        policy.observe(rejected, started, now, stable, interrupted);
     };
     observe(0, 500, false);
     observe(0, 500, true, true);
@@ -508,7 +509,8 @@ void batch_policy() {
     now += std::chrono::seconds(3);
     observe(0, 10);
     if (policy.cost(0) != 10) throw std::runtime_error("prefill gap entered batch timing");
-    for (int index = 0; index < 30 && !policy.parks(); ++index) observe(1, 40);
+    for (int index = 0; index < 30 && !policy.parks(); ++index)
+        observe(policy.depth(), policy.depth() ? 40 : 10);
     if (policy.depth() != 0 || policy.parks() != 1 || policy.remaining() != 128)
         throw std::runtime_error("losing batch MTP did not park");
     mtp::BatchParkMemory memory;
@@ -542,6 +544,135 @@ void batch_policy() {
     for (int index = 0; index < 128; ++index) observe(0, 10);
     if (policy.remaining() || policy.depth() != 1 || policy.cost(1))
         throw std::runtime_error("batch MTP did not restart a clean depth sweep");
+}
+void batch_policy_short_response() {
+    mtp::BatchDepthPolicy policy({"one"}, 3);
+    auto now = mtp::BatchDepthPolicy::Clock::time_point{};
+    const std::array<double, 4> costs{22, 42.853896, 62.069792, 74.042291};
+    int produced = 0;
+    for (int cycle = 0; produced < 128; ++cycle) {
+        const int depth = policy.depth();
+        const std::array<mtp::BatchAcceptance, 1> accepted{{{depth, cycle == 7 && depth > 1 ? 1 : depth}}};
+        const auto started = now;
+        now += std::chrono::duration_cast<mtp::BatchDepthPolicy::Clock::duration>(
+            std::chrono::duration<double, std::milli>(costs[depth]));
+        policy.observe(accepted, started, now, true, false);
+        produced += accepted[0].accepted + 1;
+        if (policy.parks()) throw std::runtime_error("profitable short high-acceptance MTP was parked");
+    }
+}
+void batch_policy_adaptation() {
+    using Clock = mtp::BatchDepthPolicy::Clock;
+    const auto advance = [](mtp::BatchDepthPolicy& policy, Clock::time_point& now, int milliseconds) {
+        const int depth = policy.depth();
+        const auto started = now;
+        now += std::chrono::milliseconds(milliseconds);
+        const std::array<mtp::BatchAcceptance, 1> full{{{depth, depth}}};
+        policy.observe(full, started, now, true, false);
+    };
+    {
+        mtp::BatchDepthPolicy policy({"mtp"}, 3, 7);
+        auto now = Clock::time_point{};
+        for (int cycle = 0; cycle < 500; ++cycle)
+            advance(policy, now, 10 + policy.depth() * 5);
+        if (!policy.parks()) throw std::runtime_error("mixed batch ignored ordinary-row throughput loss");
+    }
+    {
+        mtp::BatchDepthPolicy policy({"one"}, 1);
+        auto now = Clock::time_point{};
+        for (int cycle = 0; cycle < 500 && !policy.parks(); ++cycle)
+            advance(policy, now, policy.depth() ? 25 : 10);
+        if (!policy.parks()) throw std::runtime_error("unprofitable MTP did not park");
+        mtp::BatchParkMemory memory;
+        memory.parked(policy);
+        for (int cycle = 0; cycle < 10 && policy.remaining(); ++cycle) advance(policy, now, 40);
+        if (policy.remaining() || !policy.depth())
+            throw std::runtime_error("refreshed profitable MTP was trapped in cooldown");
+        memory.resumed(policy);
+        mtp::BatchDepthPolicy next({"next"}, 1);
+        memory.seed(next);
+        if (next.remaining()) throw std::runtime_error("resumed MTP left an obsolete park verdict");
+    }
+    {
+        mtp::BatchDepthPolicy policy({"one"}, 1);
+        auto now = Clock::time_point{};
+        int plain = 0;
+        for (int cycle = 0; cycle < 100; ++cycle) {
+            const auto ms = policy.depth() ? 25 : ++plain <= 5 ? 10 : 40;
+            advance(policy, now, ms);
+            if (policy.parks()) throw std::runtime_error("stale scalar baseline parked profitable MTP");
+        }
+        if (plain <= 5 || policy.cost(0) != 40)
+            throw std::runtime_error("scalar baseline was not revalidated before parking");
+    }
+}
+void batch_policy_observations() {
+    using Sample = mtp::BatchAcceptance;
+    using Clock = mtp::BatchDepthPolicy::Clock;
+    const auto near = [](double actual, double expected) {
+        if (std::abs(actual - expected) > 1e-10)
+            throw std::runtime_error("batch MTP conditional acceptance is inconsistent");
+    };
+    {
+        mtp::BatchDepthPolicy policy({"one"}, 3);
+        const auto start = Clock::time_point{};
+        const std::array<Sample, 1> full{{{3, 3}}};
+        policy.observe(full, start, start + std::chrono::seconds(10), false, false);
+        near(policy.conditional_acceptance(0), 1);
+        near(policy.conditional_acceptance(1), 1);
+        near(policy.conditional_acceptance(2), 1);
+        policy.observe(full, start, start + std::chrono::seconds(20), true, true);
+        near(policy.conditional_acceptance(0), 1);
+        near(policy.conditional_acceptance(1), 1);
+        near(policy.conditional_acceptance(2), 1);
+        for (int depth = 0; depth <= 3; ++depth)
+            if (policy.cost(depth)) throw std::runtime_error("maintenance entered batch cost calibration");
+        const std::array<Sample, 1> invalid{{{1, 2}}};
+        bool rejected = false;
+        try { policy.observe(invalid, start, start, true, false); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid batch acceptance was admitted");
+        near(policy.conditional_acceptance(0), 1);
+        mtp::BatchDepthPolicy replacement({"new"}, 3);
+        near(replacement.conditional_acceptance(2), .6);
+    }
+    {
+        mtp::BatchDepthPolicy policy({"zero", "one", "two", "three"}, 3);
+        const auto start = Clock::time_point{};
+        const std::array<Sample, 4> mixed{{{0, 0}, {1, 1}, {3, 1}, {3, 3}}};
+        policy.observe(mixed, start, start + std::chrono::seconds(10), true, false);
+        near(policy.conditional_acceptance(0), 1);
+        near(policy.conditional_acceptance(1), .5);
+        near(policy.conditional_acceptance(2), 1);
+        for (int depth = 0; depth <= 3; ++depth)
+            if (policy.cost(depth)) throw std::runtime_error("mixed draft widths polluted a single-width cost");
+    }
+    {
+        mtp::BatchDepthPolicy policy({"one"}, 3);
+        auto now = Clock::time_point{};
+        const auto observe = [&](int depth, int milliseconds, int accepted = -1) {
+            const auto start = now;
+            now += std::chrono::milliseconds(milliseconds);
+            const std::array<Sample, 1> full{{{depth, accepted < 0 ? depth : accepted}}};
+            policy.observe(full, start, now, true, false);
+        };
+        for (int index = 0; index < 5; ++index) observe(0, 10);
+        for (int index = 0; index < 4; ++index) observe(3, 25);
+        if (policy.depth() != 2) throw std::runtime_error("batch depth transition was not exercised");
+        const auto previous = policy.conditional_acceptance(2);
+        observe(3, 25, 2);
+        if (policy.cost(2) || policy.cost(3) != 25 || policy.conditional_acceptance(2) >= previous)
+            throw std::runtime_error("queued old-depth round was attributed to the newly selected depth");
+    }
+    {
+        mtp::BatchDepthPolicy policy({"one"}, 1);
+        const auto start = Clock::time_point{};
+        const std::array<Sample, 1> rejected{{{1, 0}}}, accepted{{{1, 1}}};
+        policy.observe(rejected, start, start, false, false);
+        near(policy.conditional_acceptance(0), 0);
+        policy.observe(accepted, start, start, false, false);
+        near(policy.conditional_acceptance(0), 1 / 1.92);
+    }
 }
 }
 
@@ -586,5 +717,8 @@ int main() try {
     run_committed_route_hooks(false,false,true,false);
     early_target_prefetch();
     batch_policy();
+    batch_policy_short_response();
+    batch_policy_adaptation();
+    batch_policy_observations();
     std::cout << "shared speculative sequence output/cache/dispatch tests passed\n";
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

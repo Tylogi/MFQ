@@ -4,6 +4,12 @@ MFQ
 MFQ's original code is licensed under the Apache License 2.0 in `LICENSE`.
 The following integrated components retain their original license terms.
 
+zip
+---
+The Windows standalone updater uses the zip Rust crate to read release ZIPs.
+Copyright (c) 2014 Mathijs van de Nes
+License: MIT (`LICENSES/zip-MIT.txt`)
+
 oMLX
 ----
 Parts of MFQ's Metal scheduling and model-specific kernels are adapted from

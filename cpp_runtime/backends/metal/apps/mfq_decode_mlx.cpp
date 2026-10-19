@@ -2308,6 +2308,8 @@ public:
                 enforce_memory_budget(0); apply_expert_budget();
             }
             catch (...) { resident_budget = previous; resident_weight_budget = previous_weights; throw; }
+            if (batching && (resident_budget.load() != previous || resident_weight_budget.load() != previous_weights))
+                batching->invalidate_runtime_policy();
             const auto after = mlx::core::get_active_memory();
             return {before > after ? before - after : 0, {}};
         }

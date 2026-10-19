@@ -1,4 +1,4 @@
-# Build the Windows x64 MFQ Studio serve-only NSIS installer and CUDA sidecar.
+# Build the Windows x64 MFQ Studio installer, single-file app, and CUDA sidecar.
 #
 # The release Python environment is isolated from development environments. It
 # contains only the base dependencies needed by `mfq serve`; training,
@@ -14,6 +14,7 @@ param(
     [string] $OutputDirectory = $env:MFQ_RELEASE_OUTPUT_DIR,
     [string] $CudaArchitectures = $env:MFQ_RELEASE_CUDA_ARCHITECTURES,
     [int] $Jobs = 0,
+    [switch] $PortableOnly,
     [switch] $Clean
 )
 
@@ -611,8 +612,37 @@ function Build-NsisInstaller {
     Write-Host "copied $releaseInstaller"
 }
 
+function Build-PortableArchive {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $Context.StudioDirectory "src-tauri\target"
+    } else {
+        Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
+    }
+    $executable = Join-Path $cargoTargetDirectory "$($Context.TargetTriple)\release\mfq-studio.exe"
+    $makensis = Join-Path $cargoTargetDirectory ".tauri\NSIS\makensis.exe"
+    if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+        $makensis = Require-Command "makensis"
+    }
+    Assert-ReleasePaths $Context @(
+        $executable, $Context.SidecarDirectory, $Context.ResourceDirectory,
+        $Context.WindowsRuntimeDirectory, (Join-Path $Context.StudioDirectory "dist")
+    ) -PythonArchive
+    Invoke-Checked $Context.Python @(
+        (Join-Path $Context.ScriptDirectory "build_portable_windows.py"),
+        "--studio-executable", $executable,
+        "--output-directory", $Context.OutputDirectory,
+        "--makensis", $makensis
+    )
+}
+
 if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOperatingSystem) {
     Fail "this release target must be built on 64-bit Windows"
+}
+
+if ($Clean -and $PortableOnly) {
+    Fail "-PortableOnly reuses the existing build and cannot be combined with -Clean"
 }
 
 if ($Clean) {
@@ -640,6 +670,11 @@ $releaseOutputDirectory = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 }
 
 $context = New-BuildContext $venvDirectory $releaseOutputDirectory
+if ($PortableOnly) {
+    $context.Python = Join-Path $context.VenvDirectory "Scripts\python.exe"
+    Build-PortableArchive $context
+    exit 0
+}
 Initialize-BuildEnvironment $context
 Initialize-ReleaseDirectories $context
 Stage-LicenseNotices $context
@@ -652,6 +687,7 @@ try {
     Build-PythonCli $context
     Remove-PyInstallerCache $context
     Build-NsisInstaller $context
+    Build-PortableArchive $context
 }
 finally {
     Pop-Location

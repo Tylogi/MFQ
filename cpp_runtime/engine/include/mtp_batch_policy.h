@@ -8,12 +8,18 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 namespace mfq::engine::mtp {
+
+struct BatchAcceptance {
+    int drafted;
+    int accepted;
+};
 
 class BatchDepthPolicy {
 public:
@@ -36,47 +42,72 @@ public:
         const auto middle = sorted.size() / 2;
         return sorted.size() % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) * .5;
     }
-    void observe(int depth, std::span<const int> accepted, Clock::time_point started,
-        Clock::time_point finished, bool stable, bool interrupted) {
-        if (!stable || interrupted) { interrupt(); return; }
+    double conditional_acceptance(int position) const {
+        if (position < 0 || position >= maximum_)
+            throw std::out_of_range("batch MTP acceptance position is out of range");
+        while (!acceptance_[position]) --position;
+        return *acceptance_[position];
+    }
+    void observe(std::span<const BatchAcceptance> observations, Clock::time_point started,
+        Clock::time_point finished, bool time_sample, bool interrupted) {
+        if (observations.empty()) throw std::invalid_argument("batch MTP observations cannot be empty");
+        for (const auto& sample : observations)
+            if (sample.drafted < 0 || sample.drafted > maximum_ || sample.accepted < 0 ||
+                sample.accepted > sample.drafted)
+                throw std::invalid_argument("batch MTP acceptance observation is invalid");
+        for (int position = 0; position < maximum_; ++position) {
+            int reached = 0, hits = 0;
+            for (const auto& sample : observations) if (sample.drafted > position) {
+                reached += sample.accepted >= position;
+                hits += sample.accepted > position;
+            }
+            if (!reached) break;
+            if (!acceptance_[position]) acceptance_[position] = conditional_acceptance(position);
+            acceptance_weight_[position] += .08 * (1 - acceptance_weight_[position]);
+            *acceptance_[position] += .08 / acceptance_weight_[position] *
+                (double(hits) / reached - *acceptance_[position]);
+        }
+        const int depth = observations.front().drafted;
+        if (!time_sample || interrupted || std::any_of(observations.begin(), observations.end(),
+                [depth](const auto& sample) { return sample.drafted != depth; })) {
+            interrupt();
+            return;
+        }
         const auto begin = last_depth_ == depth && finished_ ? *finished_ : started;
         const bool same_depth = last_depth_ == depth;
         finished_ = finished;
         last_depth_ = depth;
         const auto ms = std::max(1e-6, std::chrono::duration<double, std::milli>(finished - begin).count());
+        elapsed_ms_ += ms;
         if (!depth) {
             if (standard_warmup_) --standard_warmup_;
-            else append(standard_, ms);
-            if (remaining_ && !--remaining_) {
-                costs_ = {};
-                last_seen_ = {};
-                acceptance_.fill(.6);
-                current_ = maximum_;
+            else {
+                append(standard_, ms);
+                last_seen_[0] = elapsed_ms_;
+                if (remaining_) ++parked_samples_;
+            }
+            if (remaining_) {
+                if (!--remaining_) resume(true);
+                else if (parked_samples_ >= 3 && score(best_depth()) > score(0) * 1.03) resume(false);
+            } else if (baseline_probe_ && standard_.size() >= 3) {
+                baseline_probe_ = false;
+                baseline_verified_ = true;
+                current_ = best_depth();
                 losing_ = clear_losing_ = 0;
+                if (score(current_) <= score(0) * 1.03) park();
             }
             return;
         }
-        for (int position = 0; position < depth; ++position) {
-            int reached = 0, hits = 0;
-            for (int count : accepted) {
-                reached += count >= position;
-                hits += count > position;
-            }
-            if (!reached) break;
-            acceptance_[position] += .08 * (double(hits) / reached - acceptance_[position]);
-        }
-        elapsed_ms_ += ms;
         if (!same_depth) return;
         append(costs_[depth], ms);
         last_seen_[depth] = elapsed_ms_;
+        if (remaining_ || baseline_probe_) return;
         for (int candidate = maximum_; candidate > 0; --candidate) if (costs_[candidate].size() < 3) {
             current_ = candidate;
             return;
         }
         ++decisions_;
-        int best = 1;
-        for (int candidate = 2; candidate <= maximum_; ++candidate)
-            if (score(candidate) > score(best)) best = candidate;
+        const int best = best_depth();
         if (score(best) > score(current_) * 1.03) current_ = best;
         losing_ = score(best) <= score(0) * 1.03 ? losing_ + 1 : 0;
         clear_losing_ = score(best) < score(0) * .9 ? clear_losing_ + 1 : 0;
@@ -91,16 +122,19 @@ public:
             }
         }
         if (losing_ >= 16 || clear_losing_ >= 4) {
-            start_parked(cooldown_);
-            standard_warmup_ = 2;
-            losing_ = clear_losing_ = 0;
-            ++parks_;
+            if (!baseline_verified_ || elapsed_ms_ - last_seen_[0] >= 1000) {
+                baseline_probe_ = true;
+                standard_.clear();
+                standard_warmup_ = 2;
+                losing_ = clear_losing_ = 0;
+            } else park();
         }
     }
     void start_parked(std::uint64_t remaining, std::uint64_t next = 0) {
         remaining_ = remaining;
         cooldown_ = next ? next : std::min<std::uint64_t>(4096, remaining * 2);
         decisions_ = 0;
+        parked_samples_ = 0;
     }
     std::uint64_t remaining() const noexcept { return remaining_; }
     std::uint64_t cooldown() const noexcept { return cooldown_; }
@@ -108,6 +142,31 @@ public:
     bool held_up() const noexcept { return decisions_ >= 32; }
 
 private:
+    int best_depth() const {
+        int best = 1;
+        for (int candidate = 2; candidate <= maximum_; ++candidate)
+            if (score(candidate) > score(best)) best = candidate;
+        return best;
+    }
+    void park() {
+        start_parked(cooldown_);
+        standard_warmup_ = 2;
+        losing_ = clear_losing_ = 0;
+        ++parks_;
+    }
+    void resume(bool restart) {
+        remaining_ = 0;
+        baseline_probe_ = false;
+        losing_ = clear_losing_ = 0;
+        if (restart) {
+            costs_ = {};
+            last_seen_ = {};
+            acceptance_ = {.6};
+            acceptance_weight_ = {};
+            baseline_verified_ = false;
+        }
+        current_ = restart ? maximum_ : best_depth();
+    }
     static void append(std::deque<double>& values, double value) {
         if (values.size() == 8) values.pop_front();
         values.push_back(value);
@@ -117,19 +176,22 @@ private:
         if (!milliseconds) return 0;
         double expected = 1, reach = 1;
         for (int position = 0; position < depth; ++position) {
-            reach *= acceptance_[position];
+            reach *= conditional_acceptance(position);
             expected += reach;
         }
-        return requests_.size() * expected / *milliseconds;
+        return (ordinary_requests_ + requests_.size() * expected) / *milliseconds;
     }
     std::vector<std::string> requests_;
     std::size_t ordinary_requests_;
     int maximum_, current_, standard_warmup_ = 2, losing_ = 0, clear_losing_ = 0, last_depth_ = -1;
-    std::array<double, 5> acceptance_{.6, .6, .6, .6, .6};
+    std::array<std::optional<double>, 5> acceptance_{.6};
+    std::array<double, 5> acceptance_weight_{};
     std::array<std::deque<double>, 6> costs_;
     std::deque<double> standard_;
     std::array<double, 6> last_seen_{};
     double elapsed_ms_ = 0, last_probe_ms_ = 0;
+    bool baseline_probe_ = false, baseline_verified_ = false;
+    std::size_t parked_samples_ = 0;
     std::optional<Clock::time_point> finished_;
     std::uint64_t remaining_ = 0, cooldown_ = 128, decisions_ = 0, parks_ = 0;
 };
@@ -145,6 +207,7 @@ public:
     void parked(const BatchDepthPolicy& policy) {
         verdicts_[key(policy)] = {clock_ + policy.remaining(), policy.cooldown()};
     }
+    void resumed(const BatchDepthPolicy& policy) { verdicts_.erase(key(policy)); }
     void retired(const BatchDepthPolicy& policy) {
         if (policy.held_up()) verdicts_.erase(key(policy));
     }

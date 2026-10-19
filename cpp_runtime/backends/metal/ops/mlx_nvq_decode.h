@@ -323,7 +323,7 @@ inline void mfq_nvq1_profile(
             state_offset + state_cursor.x, auxiliary_offset + (state_index >> 3u),
             index_cursor.y | (state_cursor.y << 3u) | ((state_index & 7u) << 6u));
     }
-    #pragma clang loop unroll_count(INPUT_ROWS == 1u ? 2 : 1)
+    #pragma clang loop unroll_count(MATRIX_ROWS == 1u && INPUT_ROWS == 1u ? 2 : 1)
     for (uint group = k_lane; group < GROUPS; group += K_LANES) {
         uint2 records[MATRIX_ROWS];
         float weight_scales[MATRIX_ROWS];
@@ -423,7 +423,7 @@ inline void mfq_nvq_banked_bits(
     constexpr bool FLAT_RECORDS = EXPANSION && INPUT_ROWS > 1u;
     constexpr uint WORK = FLAT_RECORDS ? SIGNS : GROUPS;
     constexpr bool STATIC_RECORDS = !FLAT_RECORDS && VECTOR_SIZE == 4u
-        && INDEX_BITS == 9u && INPUT_ROWS > 1u;
+        && INPUT_ROWS > 1u;
     uint state_rows[MATRIX_ROWS];
     uint4 cursors[MATRIX_ROWS];
     static_assert(K_LANES % 8u == 0u);
@@ -437,7 +437,7 @@ inline void mfq_nvq_banked_bits(
         cursors[row] = uint4(indices_offset + index.x, auxiliary_offset + sign.x,
             state_offset + (state >> 1u), index.y | (sign.y << 3u) | ((state & 1u) << 6u));
     }
-    #pragma clang loop unroll_count(2)
+    #pragma clang loop unroll_count(MATRIX_ROWS > 1u || (INPUT_ROWS > 1u && !EXPANSION) ? 1 : 2)
     for (uint work = k_lane; work < WORK; work += K_LANES) {
         uint group = FLAT_RECORDS ? work / 3u : work;
         float weight_scales[MATRIX_ROWS];

@@ -63,6 +63,7 @@ jobs:
         working-directory: .
         run: >-
           python -m pytest tests/test_mfq_studio_source.py
+          tests/test_windows_portable.py
           tests/test_release_paths.py
           tests/test_webui_markdown_prefill.py tests/test_cpp_runtime_chat_template_source.py
           tests/test_cpp_runtime_minicpmo45_source.py tests/test_model_capabilities.py -q

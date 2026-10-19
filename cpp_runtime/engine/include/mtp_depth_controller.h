@@ -429,6 +429,7 @@ public:
     void seed_batch(BatchDepthPolicy& policy) const { batch_memory_.seed(policy); }
     void tick_batch() { batch_memory_.tick(); }
     void park_batch(const BatchDepthPolicy& policy) { batch_memory_.parked(policy); }
+    void resume_batch(const BatchDepthPolicy& policy) { batch_memory_.resumed(policy); }
     void retire_batch(const BatchDepthPolicy& policy) { batch_memory_.retired(policy); }
     void record_loop_tax(double baseline_ms, const std::vector<double>& samples,bool periodic_mean=false) {
         if (baseline_ms <= 0.0 || samples.size() < 8 || PrefillActivity::recent()) return;
@@ -587,9 +588,9 @@ private:
         const bool was_parked=batch_->remaining()!=0;
         const auto previous_parks=batch_->parks();
         state_.tick_batch();
-        const std::array<int,1> counts{accepted};
-        batch_->observe(used,counts,started,finished,valid,false);
-        if(was_parked && !batch_->remaining())++reentries_;
+        const std::array<BatchAcceptance,1> counts{{{used,accepted}}};
+        batch_->observe(counts,started,finished,valid,false);
+        if(was_parked && !batch_->remaining()) { ++reentries_;state_.resume_batch(*batch_); }
         if(batch_->parks()!=previous_parks)state_.park_batch(*batch_);
         if(trace_ && (depth()!=trace_depth_ || batch_->parks()!=previous_parks ||
                 (was_parked && !batch_->remaining()))) {

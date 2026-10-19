@@ -16,7 +16,7 @@ struct MlxMtpBatchRound {
     std::shared_ptr<mfq::engine::mtp::BatchDepthPolicy> policy;
     mfq::engine::mtp::BatchDepthPolicy::Clock::time_point started;
     mfq::engine::mtp::BatchDepthPolicy::Clock::time_point finished;
-    std::vector<int> accepted;
+    std::vector<mfq::engine::mtp::BatchAcceptance> accepted;
     std::size_t expected;
     std::uint64_t prefill_epoch;
     int depth;
@@ -58,6 +58,7 @@ struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
     }
     bool mtp = false;
     std::shared_ptr<MlxMtpBatchRound> round;
+    int round_depth = 0;
     std::chrono::steady_clock::time_point draft_started;
     std::uint64_t draft_epoch = 0;
     bool draft_calibration = true;
@@ -190,12 +191,19 @@ public:
         for (const auto& round : completed_rounds_) {
             if (round->policy && round->policy == policy_) {
                 const auto previous_parks = policy_->parks();
-                policy_->observe(round->depth, round->accepted, round->started,
+                const bool was_parked = policy_->remaining() != 0;
+                policy_->observe(round->accepted, round->started,
                     round->finished, round->stable, round->prefill_epoch != prefill_epoch_);
                 if (policy_->parks() > previous_parks) park_memory_.parked(*policy_);
+                if (was_parked && !policy_->remaining()) park_memory_.resumed(*policy_);
             }
         }
         completed_rounds_.clear();
+    }
+    void invalidate_runtime_policy() {
+        completed_rounds_.clear();
+        policy_.reset();
+        park_memory_ = {};
     }
     void activate(const std::shared_ptr<Request>& request, const Sample& result) {
         if (!request->mtp) accept(request, result);
@@ -227,6 +235,7 @@ public:
             caches.push_back(request->cache);
             tokens.push_back(request->pending_token);
         }
+        if (!caches.empty()) park_memory_.tick();
         auto logits = runtime_.decode_requests(caches, tokens);
         ++decode_batches_;
         decode_rows_ += caches.size();
@@ -375,7 +384,7 @@ private:
             request->cache_length = runtime_.request_cache_position(*request->cache);
             checkpoint(*request, request->cache_length);
             if (auto round = std::exchange(request->round, {})) {
-                round->accepted.push_back(context.accepted_drafts);
+                round->accepted.push_back({request->round_depth, context.accepted_drafts});
                 if (round->accepted.size() == round->expected) {
                     round->finished = std::chrono::steady_clock::now();
                     const auto depth = std::clamp(round->depth, 0, 5);
@@ -461,8 +470,10 @@ private:
         if (!cohort.active.empty()) {
             std::vector<std::shared_ptr<MlxQwen4RequestCache>> caches;
             std::vector<std::vector<std::int64_t>> windows;
+            int actual_depth = 0;
             for (const auto& request : cohort.active) {
                 const int depth = request->mtp ? request->target_work->draft_count : 0;
+                actual_depth = std::max(actual_depth, depth);
                 caches.push_back(request->cache);
                 const auto token = request->mtp ? request->target_work->pending_token : request->pending_token;
                 windows.push_back({token});
@@ -485,10 +496,12 @@ private:
             round->expected = std::count_if(cohort.active.begin(), cohort.active.end(),
                 [](const auto& request) { return request->mtp; });
             round->prefill_epoch = prefill_epoch_;
-            round->depth = policy_ ? policy_->depth() : 0;
-            round->stable = policy_ && policy_->requests().size() == round->expected;
+            round->depth = actual_depth;
+            round->stable = policy_ && policy_->requests().size() == round->expected &&
+                policy_->ordinary_requests() == cohort.active.size() - round->expected;
             round->started = std::chrono::steady_clock::now();
             for (const auto& request : cohort.active) if (request->mtp) {
+                request->round_depth = request->target_work->draft_count;
                 round->started = std::min(round->started, request->draft_started);
                 round->prefill_epoch = std::min(round->prefill_epoch, request->draft_epoch);
                 round->stable = round->stable && request->draft_calibration &&

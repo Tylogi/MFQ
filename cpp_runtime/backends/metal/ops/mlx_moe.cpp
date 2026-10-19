@@ -75,6 +75,7 @@ using mlx::core::array;
 
 constexpr int kDescriptorSize = 32;
 std::atomic<std::size_t> uncached_packed_storage_bytes{0};
+constexpr int kMfeFoldedGateSimdPairs = 4;
 
 constexpr int kFamily = 0;
 constexpr int kLocalExpert = 1;
@@ -2486,6 +2487,15 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     return result;
 }
 
+template <typename Array = array>
+Array wrap_wire_buffer(mlx::core::allocator::Buffer buffer, const Shape& shape,
+    std::function<void(mlx::core::allocator::Buffer)> deleter) {
+    if constexpr (requires { Array(buffer, shape, mlx::core::uint8, deleter); })
+        return Array(buffer, shape, mlx::core::uint8, std::move(deleter));
+    else
+        return Array(typename Array::Data(buffer, std::move(deleter)), shape, mlx::core::uint8);
+}
+
 array allocate_wire_array(std::size_t bytes, bool account = false) {
     struct Storage {
         std::uint8_t* data = nullptr;
@@ -2512,7 +2522,7 @@ array allocate_wire_array(std::size_t bytes, bool account = false) {
         storage->accounted = true;
     }
     const auto buffer = storage->buffer;
-    return array(buffer, shape, mlx::core::uint8,
+    return wrap_wire_buffer(buffer, shape,
         [storage = std::move(storage)](mlx::core::allocator::Buffer) {});
 }
 
@@ -3159,7 +3169,7 @@ grouped_mmq_block_builder(bool cohort_ordered) {
             R"METAL(
                 const int M = indices_shape[0];
                 const int NUM_EXPERTS = int(threads_per_threadgroup.x);
-                const int MAX_BLOCKS = (M + BM - 1) / BM + NUM_EXPERTS;
+                const int MAX_BLOCKS = min(max(M, 1), M / BM + int(M % BM != 0) + NUM_EXPERTS);
                 const uint schedule_index = thread_index_in_threadgroup;
                 const uint expert = uint(
                     MFQ_SCHEDULED_EXPERT(schedule_index));
@@ -3365,10 +3375,11 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
         throw std::invalid_argument(
             "route order must contain one index per routed row");
     }
+    const auto population_bound =
+        (static_cast<std::size_t>(route_count) + block_rows - 1) / block_rows
+        + static_cast<std::size_t>(experts);
     const int max_blocks = checked_int(
-        static_cast<std::size_t>(
-            (route_count + block_rows - 1) / block_rows)
-            + static_cast<std::size_t>(experts),
+        std::min(static_cast<std::size_t>(std::max(route_count, 1)), population_bound),
         "grouped MMQ max blocks");
     auto sorted_ids = mlx::core::contiguous(
         mlx::core::take(
@@ -3767,16 +3778,19 @@ struct MfeNintDecodeConfig {
     std::shared_ptr<const std::vector<int>> down_nint_group_sizes;
     int shared_gate_group_size = 0;
     int shared_gate_groups = 0;
+    int shared_up_group_size = 0;
+    int shared_up_groups = 0;
     int shared_down_group_size = 0;
     int shared_down_groups = 0;
     int k_lanes = 16;
+    int down_k_lanes = 16;
     int down_rows_per_simd = 1;
     int stage_one_workgroups = 0;
     int stage_two_workgroups = 0;
 };
 
 bool mfe_paired_nint_down(const MfeNintDecodeConfig& config) {
-    return config.tokens == 1 && config.k_lanes == 16 &&
+    return config.tokens == 1 && config.down_k_lanes == 16 &&
         config.down_rows_per_simd == 2 && config.hidden > config.intermediate;
 }
 
@@ -3799,6 +3813,10 @@ std::string mfe_decode_kernel_name(
         name.append(buffer, result.ptr);
     };
     integer(stage);
+    if (stage == 1 && config.folded_topk) {
+        name.append("_gp");
+        integer(kMfeFoldedGateSimdPairs);
+    }
     for (const auto& field : std::array<std::pair<const char*, int>, 15>{{
              {"_r", config.routes}, {"_e", config.experts},
              {"_h", config.hidden}, {"_i", config.intermediate},
@@ -3806,7 +3824,7 @@ std::string mfe_decode_kernel_name(
              {"_df", config.down_family_mask}, {"_dv", config.down_vq_profile_mask},
              {"_ggs", config.shared_gate_group_size}, {"_gg", config.shared_gate_groups},
              {"_dgs", config.shared_down_group_size}, {"_dg", config.shared_down_groups},
-             {"_kl", config.k_lanes}, {"_dr", config.down_rows_per_simd},
+             {"_kl", stage == 1 ? config.k_lanes : config.down_k_lanes}, {"_dr", config.down_rows_per_simd},
              {"_gt", static_cast<int>((stage == 2 && config.shared_router_group_size
                  ? mlx::core::float16 : config.shared_gate_dtype).val())}}}) {
         name.append(field.first);
@@ -3828,6 +3846,9 @@ std::string mfe_decode_kernel_name(
     if (config.shared_gate_is_logits) name.append("_gate_logits");
     if (stage == 1 && config.shared_router_group_size)
         name.append("_srg").append(std::to_string(config.shared_router_group_size));
+    if (stage == 1 && config.shared_up_group_size != config.shared_gate_group_size)
+        name.append("_ugs").append(std::to_string(config.shared_up_group_size))
+            .append("_ug").append(std::to_string(config.shared_up_groups));
     if (config.packed_gate_up) name.append("_packed_gu");
     if (config.folded_topk) name.append("_folded_topk");
     if (stage == 2 && mfe_paired_nint_down(config)) name.append("_nint_pair");
@@ -3916,7 +3937,8 @@ void append_mfe_decode_constants(
         << "constexpr int FUSED_SWIGLU = " << (gate_up ? 1 : 0) << ";\n"
         << "constexpr int K = "
         << (gate_up ? config.hidden : config.intermediate) << ";\n"
-        << "constexpr int K_LANES_VALUE = " << config.k_lanes << ";\n"
+        << "constexpr int K_LANES_VALUE = "
+        << (gate_up ? config.k_lanes : config.down_k_lanes) << ";\n"
         << "constexpr int ROWS_PER_SIMD_VALUE = "
         << (gate_up ? 1 : config.down_rows_per_simd) << ";\n"
         << "constexpr int DESCRIPTOR_SIZE = "
@@ -3969,10 +3991,19 @@ void append_mfe_shared_nint_decoder(
         << "  device const uchar* nint_q = shared_q;\n"
         << "  device const uchar* nint_sub_scale = shared_sub_scale;\n"
         << "  device const uchar* nint_sub_min = shared_sub_min;\n"
-        << "  uint x_offset = " << (gate_up ? "0u" : "SHARED_OFFSET") << ";\n"
-        << "  uint q_offset = 0u, sub_offset = 0u, groups = " << groups << "u;\n"
-        << "  MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, "
-        << (gate_up ? config.shared_gate_q_dispatch : config.shared_down_q_dispatch) << ");\n";
+        << "  uint x_offset = " << (gate_up ? "0u" : "SHARED_OFFSET") << ";\n";
+    if (gate_up && config.shared_up_group_size != group_size) {
+        source << "  uint q_offset = 0u, sub_offset = 0u;\n"
+            << "  if (projection == 0u) { uint groups = " << groups << "u;\n"
+            << "    MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, " << config.shared_gate_q_dispatch << ");\n"
+            << "  } else { uint groups = " << config.shared_up_groups << "u;\n"
+            << "    MFQ_MFE_NINT_CALL_WITH(" << config.shared_up_group_size << "u, " << config.shared_gate_q_dispatch << ");\n"
+            << "  }\n";
+    } else {
+        source << "  uint q_offset = 0u, sub_offset = 0u, groups = " << groups << "u;\n"
+            << "  MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, "
+            << (gate_up ? config.shared_gate_q_dispatch : config.shared_down_q_dispatch) << ");\n";
+    }
 }
 
 constexpr const char* kFoldedTopKHeader = R"METAL(
@@ -4118,7 +4149,9 @@ std::string make_mfe_nint_gate_up_source(
         << "constexpr bool SPLIT_SWIGLU = true;\n"
         << "constexpr bool PACKED_SWIGLU = false;\n"
         << "constexpr uint MATRIX_ROWS = ROWS_PER_SIMD;\n"
-        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = LANE_GROUPS * ROWS_PER_SIMD;\n"
+        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = "
+        << (config.folded_topk ? kMfeFoldedGateSimdPairs : 1)
+        << "u * LANE_GROUPS * ROWS_PER_SIMD;\n"
         << "constexpr uint ROWS_PER_TG = ROWS_PER_PHYSICAL_SIMD;\n"
         << "constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;\n"
         << "constexpr uint ROUTED_SIZE = uint(ROUTES) * uint(OUT);\n"
@@ -4126,13 +4159,13 @@ std::string make_mfe_nint_gate_up_source(
         << "constexpr uint GATE_OFFSET = SHARED_OFFSET + uint(OUT);\n"
         << "uint lane = thread_index_in_simdgroup;\n"
         << "uint k_lane = lane & (K_LANES - 1u);\n"
-        << "uint lane_group = lane / K_LANES;\n"
-        << "uint simd_group = simdgroup_index_in_threadgroup;\n"
+        << "uint lane_group = lane / K_LANES + (simdgroup_index_in_threadgroup >> 1u) * LANE_GROUPS;\n"
+        << "uint simd_group = simdgroup_index_in_threadgroup & 1u;\n"
         << "uint workgroup = threadgroup_position_in_grid."
         << (config.tokens > 1 ? "y" : "x") << ";\n"
         << "if (workgroup == 0u) {\n"
-        << (config.folded_topk ? "  if (simd_group == 1u) mfq_topk_write<uint(EXPERTS), uint(ROUTES)>(router_logits, lane, routing);\n" : "")
-        << "  if (simd_group == 0u) {\n";
+        << (config.folded_topk ? "  if (simdgroup_index_in_threadgroup == 1u) mfq_topk_write<uint(EXPERTS), uint(ROUTES)>(router_logits, lane, routing);\n" : "")
+        << "  if (simdgroup_index_in_threadgroup == 0u) {\n";
     if (config.shared_router_group_size) {
         if (config.tokens == 1)
             source << "    mfq_shared_router<true>(shared_gate_weight, x, y + GATE_OFFSET, lane, 0u);\n";
@@ -4193,9 +4226,15 @@ std::string make_mfe_nint_gate_up_source(
         source << "uint grouped_route = token_row * uint(ROUTES) + route;\n"
                << "uint2 route_group = uint2(*(device const packed_uint2*)(route_groups + grouped_route * 8u));\n"
                << "int logical_expert = int(route_group.x);\n";
-    else source << (config.folded_topk
-        ? "int logical_expert = int(mfq_topk_nth<uint(EXPERTS)>(router_logits, lane, route));\n"
-        : "int logical_expert = expert_ids[route];\n");
+    else if (config.folded_topk)
+        source << "threadgroup uint selected_expert;\n"
+               << "if (simdgroup_index_in_threadgroup == 0u) {\n"
+               << "  uint selected = mfq_topk_nth<uint(EXPERTS)>(router_logits, lane, route);\n"
+               << "  if (lane == 0u) selected_expert = selected;\n"
+               << "}\n"
+               << "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+               << "int logical_expert = int(selected_expert);\n";
+    else source << "int logical_expert = expert_ids[route];\n";
     source << "int expert = logical_expert;\n";
     if (config.packed_gate_up) {
         source
@@ -4467,7 +4506,7 @@ public:
                 1),
             MTL::Size(
                 stage_ == 1
-                    ? 64
+                    ? 64 * (config_.folded_topk ? kMfeFoldedGateSimdPairs : 1)
                     : (config_.routes + 1) * 32,
                 1,
                 1));
@@ -12361,6 +12400,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         : 16;
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
+        (folded ? kMfeFoldedGateSimdPairs : 1) *
         (32 / decode_k_lanes) * kGateRowsPerSimd;
     const int gate_tiles =
         (intermediate + gate_rows_per_workgroup - 1) /
@@ -12370,8 +12410,12 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
             ((std::uint32_t{1} << kFamilyNint) |
              (std::uint32_t{1} << kFamilyVq));
     const int down_rows_per_simd = mixed_decode_two_rows ? 2 : 1;
+    const int down_k_lanes = down.impl_->k_lanes_override != 0
+        ? down.impl_->k_lanes_override
+        : (tokens == 1 && impl_->neuron_len > intermediate && down_rows_per_simd > 1
+            ? 32 : decode_k_lanes);
     const int down_rows_per_workgroup =
-        (32 / decode_k_lanes) * down_rows_per_simd;
+        (32 / down_k_lanes) * down_rows_per_simd;
     const int down_tiles =
         (down.impl_->out_per_expert + down_rows_per_workgroup - 1) /
         down_rows_per_workgroup;
@@ -12421,9 +12465,12 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         .down_nint_group_sizes = down.impl_->nint_group_sizes,
         .shared_gate_group_size = shared_gate_up.group_size(),
         .shared_gate_groups = shared_gate_up.groups(),
+        .shared_up_group_size = shared_gate_up.up_group_size(),
+        .shared_up_groups = shared_gate_up.up_groups(),
         .shared_down_group_size = shared_down.group_size(),
         .shared_down_groups = shared_down.groups(),
         .k_lanes = decode_k_lanes,
+        .down_k_lanes = down_k_lanes,
         .down_rows_per_simd = down_rows_per_simd,
         .stage_one_workgroups = 1 + (routes + 1) * gate_tiles,
         .stage_two_workgroups = down_tiles,

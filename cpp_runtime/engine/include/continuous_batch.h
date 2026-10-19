@@ -124,6 +124,9 @@ template <class Ops> class ContinuousBatch {
 
   public:
     bool empty() const noexcept { return requests.empty(); }
+    void invalidate_runtime_policy() {
+        if constexpr (requires { operations.invalidate_runtime_policy(); }) operations.invalidate_runtime_policy();
+    }
     void release_idle_buffers() {
         if(!empty())throw std::runtime_error("cannot release active batch buffers");
         operations.suspend_decode();
