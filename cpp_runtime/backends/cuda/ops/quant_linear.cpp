@@ -178,11 +178,10 @@ mfq_tensor_backend::Tensor load_dense_gpu(
             return dequant_nint8_zero_cpu(source);
         }
         const auto packed = to_gpu_nint8_zero(source);
-        auto dense = nint8_zero_dequant_cuda(
+        auto dense = nint8_zero_dequant_f32_cuda(
             packed.q_packed,
             packed.q8_zero_scale,
             packed.neuron_len)
-            .to(mfq_tensor_backend::kFloat32)
             .contiguous();
         if (packed.shape.size() != 2 ||
             dense.size(0) != packed.shape[0] ||
@@ -1606,17 +1605,14 @@ DenseLinearGroup make_dense_group(const std::vector<mfq_tensor_backend::Tensor> 
 }
 
 static mfq_tensor_backend::Tensor dequant_nint_dense_f32(const NintWeight & w) {
-    mfq_tensor_backend::Tensor dense;
     if (w.q8_zero) {
-        dense = nint8_zero_dequant_cuda(
-            w.q_packed, w.q8_zero_scale, w.neuron_len);
-    } else {
-        dense = nint_decode_cuda(
-            w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
-            w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            w.neuron_len, w.gs);
+        return nint8_zero_dequant_f32_cuda(
+            w.q_packed, w.q8_zero_scale, w.neuron_len).contiguous();
     }
-    return dense.to(mfq_tensor_backend::kFloat32).contiguous();
+    return nint_decode_f32_cuda(
+        w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+        w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+        w.neuron_len, w.gs).contiguous();
 }
 
 static mfq_tensor_backend::Tensor dequant_mxfp4_sq_cpu(

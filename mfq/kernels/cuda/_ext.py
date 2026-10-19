@@ -25,54 +25,39 @@ _GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
 _GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")
-# Keep this kernel portion in the same order as
-# cpp_runtime/backends/cuda/CMakeLists.txt:MFQ_CUDA_KERNEL_SOURCES.  The JIT
-# extension shares implementation objects with the native runtime; omitting a
-# translation unit can therefore compile successfully but fail at link time.
-_SOURCES = [
-    os.path.join(_DIR, "acc.cu"),
-    os.path.join(_DIR, "activation.cu"),
-    os.path.join(_DIR, "attention.cu"),
-    os.path.join(_DIR, "attention_mma.cu"),
-    os.path.join(_DIR, "deepseek_v4_attention.cu"),
-    os.path.join(_DIR, "deepseek_v4_hc.cu"),
-    os.path.join(_DIR, "deepseek_v41.cu"),
-    os.path.join(_DIR, "embedding.cu"),
-    os.path.join(_DIR, "selected_attention.cu"),
-    os.path.join(_DIR, "qwen4_exp.cu"),
-    os.path.join(_DIR, "ple_fused.cu"),
-    os.path.join(_DIR, "glm5_next.cu"),
-    os.path.join(_DIR, "gated_delta_net.cu"),
-    os.path.join(_DIR, "gdn_decode_window.cu"),
-    os.path.join(_DIR, "glm_dsa.cu"),
-    os.path.join(_DIR, "kv_cache.cu"),
-    os.path.join(_DIR, "paged_kv.cu"),
-    os.path.join(_DIR, "moe.cu"),
-    os.path.join(_DIR, "mfe_ffn.cu"),
-    os.path.join(_DIR, "mfe_ffn_compact.cu"),
-    os.path.join(_DIR, "mfe_ffn_parity_read.cu"),
-    os.path.join(_DIR, "mfe_ffn_cached_reduce.cu"),
-    os.path.join(_DIR, "mfe_ffn_shared.cu"),
-    os.path.join(_DIR, "mfe_ffn_token_groups.cu"),
-    os.path.join(_DIR, "mfe_ffn_prepare.cu"),
-    os.path.join(_DIR, "mfe_ffn_launch.cpp"),
-    os.path.join(_DIR, "mx_matmul.cu"),
-    os.path.join(_DIR, "fp8_sq.cu"),
-    os.path.join(_DIR, "mxfp4_sq.cu"),
-    os.path.join(_DIR, "nepq.cu"),
-    os.path.join(_DIR, "nepq_residual.cu"),
-    os.path.join(_DIR, "nint_matmul.cu"),
-    os.path.join(_DIR, "nint_short_decode.cu"),
-    os.path.join(_DIR, "nint_q8_decode.cu"),
-    os.path.join(_DIR, "norm.cu"),
-    os.path.join(_DIR, "nvq_matmul.cu"),
-    os.path.join(_DIR, "nvq_routed_reuse.cu"),
-    os.path.join(_DIR, "nvq1_decode.cu"),
-    os.path.join(_DIR, "rope.cu"),
-    os.path.join(_DIR, "sampling.cu"),
-    os.path.join(_DIR, "ssm_conv.cu"),
-    os.path.join(_DIR, "mfq_cuda.cpp"),
-]
+# This is the closure of the functions bound by mfq_cuda.cpp, plus providers
+# called from those units.  It is deliberately not the native runtime's full
+# MFQ_CUDA_KERNEL_SOURCES list: attention_mma.cu requires ggml CUDA objects,
+# and gdn_decode_window.cu is a native-runtime-only decode path.  In contrast,
+# nvq_matmul.cu calls the provider in nvq_routed_reuse.cu, so both belong here.
+_JIT_KERNEL_SOURCES = (
+    "norm.cu",
+    "acc.cu",
+    "rope.cu",
+    "attention.cu",
+    "gated_delta_net.cu",
+    "kv_cache.cu",
+    "activation.cu",
+    "embedding.cu",
+    "selected_attention.cu",
+    "qwen4_exp.cu",
+    "glm5_next.cu",
+    "sampling.cu",
+    "ssm_conv.cu",
+    "moe.cu",
+    "mx_matmul.cu",
+    "fp8_sq.cu",
+    "mxfp4_sq.cu",
+    "nint_matmul.cu",
+    "nint_short_decode.cu",
+    "nint_q8_decode.cu",
+    "nvq_matmul.cu",
+    "nvq_routed_reuse.cu",
+    "nepq.cu",
+    "nepq_residual.cu",
+    "mfq_cuda.cpp",
+)
+_SOURCES = [os.path.join(_DIR, source) for source in _JIT_KERNEL_SOURCES]
 _module = None
 
 
