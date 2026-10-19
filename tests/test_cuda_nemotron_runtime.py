@@ -34,6 +34,9 @@ DENSE_INTERMEDIATE = 32
 VOCAB = 32
 
 LAYER_MIXERS = ("mamba", "moe", "attention", "moe", "mamba", "attention")
+MTP_MIXERS = ("attention", "moe")
+MTP_COMPONENT = dict(kind="predictor", tensor_root="predictor",
+                     implementation="nemotron_h_mtp", policy="optional")
 
 
 def sigmoid(x):
@@ -55,7 +58,7 @@ def rms_norm(x, weight, eps):
     return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * weight
 
 
-def config_dict(mixers):
+def config_dict(mixers, mtp=False):
     llm = dict(
         model_type="nemotron_h",
         vocab_size=VOCAB,
@@ -102,6 +105,12 @@ def config_dict(mixers):
         tie_word_embeddings=False,
         eos_token_id=11,
     )
+    if mtp:
+        # One Megatron-Core MultiTokenPredictionLayer with two sub-blocks.
+        llm["num_nextn_predict_layers"] = 1
+        llm["mtp_layers_block_type"] = list(MTP_MIXERS)
+        # Speculation needs a prompt plus a drafted window of context.
+        llm["max_position_embeddings"] = 64
     return dict(
         model_type="nemotron_h_omni",
         llm_config=llm,
@@ -110,10 +119,55 @@ def config_dict(mixers):
     )
 
 
-def model_fixture(mixers=LAYER_MIXERS):
+def mixer_weights(rng, prefix, kind):
+    """Build one pre-normed mixer block under a canonical block prefix."""
+
+    def rand(shape, scale=0.08):
+        return rng.normal(scale=scale, size=shape).astype(np.float32)
+
+    weights = {prefix + ".attention.norm.weight": np.ones(HIDDEN, np.float32)}
+    inner = MAMBA_HEADS * MAMBA_HEAD_DIM
+    conv_width = inner + 2 * MAMBA_GROUPS * SSM_STATE
+    projection = inner + conv_width + MAMBA_HEADS
+    if kind == "mamba":
+        name = prefix + ".linear_attention."
+        weights[name + "in_projection.weight"] = rand((projection, HIDDEN))
+        weights[name + "conv.weight"] = rand((conv_width, 1, CONV_KERNEL), 0.05)
+        weights[name + "conv.bias"] = rand((conv_width,), 0.02)
+        weights[name + "a"] = rand((MAMBA_HEADS,), 0.05)
+        weights[name + "d"] = rand((MAMBA_HEADS,), 0.05)
+        weights[name + "dt_bias"] = rand((MAMBA_HEADS,), 0.05)
+        weights[name + "norm.weight"] = np.ones(inner, np.float32)
+        weights[name + "output.weight"] = rand((HIDDEN, inner))
+    elif kind == "attention":
+        name = prefix + ".attention."
+        weights[name + "query.weight"] = rand((HIDDEN, HIDDEN))
+        weights[name + "key.weight"] = rand((KV_HEADS * HEAD_DIM, HIDDEN))
+        weights[name + "value.weight"] = rand((KV_HEADS * HEAD_DIM, HIDDEN))
+        weights[name + "output.weight"] = rand((HIDDEN, HIDDEN))
+    elif kind == "moe":
+        name = prefix + ".mlp."
+        weights[name + "router.weight"] = rand((EXPERTS, HIDDEN))
+        weights[name + "router.bias"] = rand((EXPERTS,), 0.02)
+        weights[name + "latent.down.weight"] = rand((MOE_LATENT, HIDDEN))
+        weights[name + "latent.up.weight"] = rand((HIDDEN, MOE_LATENT))
+        weights[name + "experts.up.weight"] = rand((EXPERTS, MOE_INTERMEDIATE, MOE_LATENT))
+        weights[name + "experts.down.weight"] = rand((EXPERTS, MOE_LATENT, MOE_INTERMEDIATE))
+        weights[name + "shared_expert.up.weight"] = rand((SHARED_INTERMEDIATE, HIDDEN))
+        weights[name + "shared_expert.down.weight"] = rand((HIDDEN, SHARED_INTERMEDIATE))
+    elif kind == "mlp":
+        name = prefix + ".mlp."
+        weights[name + "up.weight"] = rand((DENSE_INTERMEDIATE, HIDDEN))
+        weights[name + "down.weight"] = rand((HIDDEN, DENSE_INTERMEDIATE))
+    else:
+        raise AssertionError(kind)
+    return weights
+
+
+def model_fixture(mixers=LAYER_MIXERS, mtp=False):
     from mfq.architectures.nemotron_h import NemotronHConfig
 
-    config = config_dict(mixers)
+    config = config_dict(mixers, mtp)
     # The fixture must satisfy the same contract as a converted checkpoint.
     NemotronHConfig.from_hf_config(config)
     rng = np.random.default_rng(5306)
@@ -126,44 +180,26 @@ def model_fixture(mixers=LAYER_MIXERS):
         "model.output.weight": rand((VOCAB, HIDDEN), 0.1),
         "model.output_norm.weight": np.ones(HIDDEN, np.float32),
     }
-    inner = MAMBA_HEADS * MAMBA_HEAD_DIM
-    conv_width = inner + 2 * MAMBA_GROUPS * SSM_STATE
-    projection = inner + conv_width + MAMBA_HEADS
     for layer, kind in enumerate(mixers):
-        prefix = f"model.block.{layer}"
-        weights[prefix + ".attention.norm.weight"] = np.ones(HIDDEN, np.float32)
-        if kind == "mamba":
-            name = prefix + ".linear_attention."
-            weights[name + "in_projection.weight"] = rand((projection, HIDDEN))
-            weights[name + "conv.weight"] = rand((conv_width, 1, CONV_KERNEL), 0.05)
-            weights[name + "conv.bias"] = rand((conv_width,), 0.02)
-            weights[name + "a"] = rand((MAMBA_HEADS,), 0.05)
-            weights[name + "d"] = rand((MAMBA_HEADS,), 0.05)
-            weights[name + "dt_bias"] = rand((MAMBA_HEADS,), 0.05)
-            weights[name + "norm.weight"] = np.ones(inner, np.float32)
-            weights[name + "output.weight"] = rand((HIDDEN, inner))
-        elif kind == "attention":
-            name = prefix + ".attention."
-            weights[name + "query.weight"] = rand((HIDDEN, HIDDEN))
-            weights[name + "key.weight"] = rand((KV_HEADS * HEAD_DIM, HIDDEN))
-            weights[name + "value.weight"] = rand((KV_HEADS * HEAD_DIM, HIDDEN))
-            weights[name + "output.weight"] = rand((HIDDEN, HIDDEN))
-        elif kind == "moe":
-            name = prefix + ".mlp."
-            weights[name + "router.weight"] = rand((EXPERTS, HIDDEN))
-            weights[name + "router.bias"] = rand((EXPERTS,), 0.02)
-            weights[name + "latent.down.weight"] = rand((MOE_LATENT, HIDDEN))
-            weights[name + "latent.up.weight"] = rand((HIDDEN, MOE_LATENT))
-            weights[name + "experts.up.weight"] = rand((EXPERTS, MOE_INTERMEDIATE, MOE_LATENT))
-            weights[name + "experts.down.weight"] = rand((EXPERTS, MOE_LATENT, MOE_INTERMEDIATE))
-            weights[name + "shared_expert.up.weight"] = rand((SHARED_INTERMEDIATE, HIDDEN))
-            weights[name + "shared_expert.down.weight"] = rand((HIDDEN, SHARED_INTERMEDIATE))
-        elif kind == "mlp":
-            name = prefix + ".mlp."
-            weights[name + "up.weight"] = rand((DENSE_INTERMEDIATE, HIDDEN))
-            weights[name + "down.weight"] = rand((HIDDEN, DENSE_INTERMEDIATE))
-        else:
-            raise AssertionError(kind)
+        weights.update(mixer_weights(rng, f"model.block.{layer}", kind))
+    if mtp:
+        # output_norm must not be uniform: the references hand the MTP head the
+        # post-output_norm hidden, and with a uniform norm weight that value is
+        # only a rescaling of the pre-norm hidden (RMSNorm is scale invariant),
+        # which would hide a wrong hidden source from the oracle.
+        weights["model.output_norm.weight"] = (
+            np.linspace(0.5, 1.5, HIDDEN).astype(np.float32))
+        weights["predictor.embedding_norm.weight"] = np.ones(HIDDEN, np.float32)
+        weights["predictor.hidden_norm.weight"] = np.ones(HIDDEN, np.float32)
+        # Non-uniform as well: the depth chain must feed the head's finalized
+        # output, which only differs from its pre-norm input beyond a rescaling
+        # when the final norm weight is not constant.
+        weights["predictor.output_norm.weight"] = (
+            np.linspace(0.6, 1.4, HIDDEN).astype(np.float32))
+        # eh_proj reads cat([embedding, hidden]) and keeps the hidden width.
+        weights["predictor.fusion.weight"] = rand((HIDDEN, 2 * HIDDEN))
+        for layer, kind in enumerate(MTP_MIXERS):
+            weights.update(mixer_weights(rng, f"predictor.block.{layer}", kind))
     return config, weights
 
 
@@ -299,6 +335,64 @@ def model_reference(config, weights):
     return finalized, logits
 
 
+def mtp_head(config, weights, hidden, ids, cache, offset):
+    """One MTP head step against an explicit predictor KV history."""
+
+    from mfq.architectures.nemotron_h import NemotronHConfig
+
+    contract = NemotronHConfig.from_hf_config(config)
+    eps = contract.norm_epsilon
+    embedded = weights["model.token_embedding.weight"][ids]
+    e = rms_norm(embedded, weights["predictor.embedding_norm.weight"], eps)
+    # `hidden` is already the target's post-output_norm hidden (llama.cpp, vLLM
+    # and SGLang); the head only renormalizes it with hnorm.
+    h = rms_norm(hidden, weights["predictor.hidden_norm.weight"], eps)
+    # eh_proj reads the embedding first and the previous hidden second.
+    hidden = np.concatenate([e, h], axis=-1) @ weights["predictor.fusion.weight"].T
+    for layer, kind in enumerate(contract.mtp_mixer_types):
+        prefix = f"predictor.block.{layer}."
+        normalized = rms_norm(hidden, weights[prefix + "attention.norm.weight"], eps)
+        if kind == "full_attention":
+            branch = attention_reference(normalized, weights, prefix + "attention.", cache, offset)
+        elif kind == "moe":
+            branch = moe_reference(normalized, weights, prefix + "mlp.", contract)
+        else:
+            branch = dense_mlp_reference(normalized, weights, prefix + "mlp.")
+        hidden = hidden + branch
+    finalized = rms_norm(hidden, weights["predictor.output_norm.weight"], eps)
+    return finalized, finalized @ weights["model.output.weight"].T, hidden
+
+
+def predictor_cache():
+    return [np.zeros((1, KV_HEADS, 32, HEAD_DIM), np.float16),
+            np.zeros((1, KV_HEADS, 32, HEAD_DIM), np.float16)]
+
+
+def mtp_reference(config, weights, previous, ids):
+    """NumPy reference for one batched MTP head pass starting at position 0."""
+
+    finalized, logits, _ = mtp_head(config, weights, previous, ids, predictor_cache(), 0)
+    return finalized, logits
+
+
+def mtp_chain_reference(config, weights, hidden, id_rows, *, chain_finalized=True):
+    """NumPy reference for consecutive single-row draft steps.
+
+    By default each step's final-norm output becomes the next step's hidden
+    state, exactly like the runtime's depth chain. ``chain_finalized=False``
+    chains the pre-final-norm hidden instead (the DeepSeek-V3 convention), which
+    the negative test uses to prove step two reads the finalized value.
+    """
+
+    cache = predictor_cache()
+    results = []
+    for offset, ids in enumerate(id_rows):
+        finalized, logits, pre_norm = mtp_head(config, weights, hidden, ids, cache, offset)
+        results.append((finalized, logits))
+        hidden = finalized if chain_finalized else pre_norm
+    return results
+
+
 def write_nemotron_fixture(path, config, weights, extra_components=()):
     from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
     from mfq.formats.header import FileHeader
@@ -308,8 +402,15 @@ def write_nemotron_fixture(path, config, weights, extra_components=()):
                        policy="decoder"), *extra_components]
     roots = ["model", *(component["tensor_root"] for component in extra_components)]
     topology = dict(text_layers=len(config["llm_config"]["layers_block_type"]))
+    capabilities = ["text"]
     for component in extra_components:
-        topology[component["kind"] + "_layers"] = 1
+        if component["kind"] == "predictor":
+            # One predictor stage; the runtime applies every declared sub-block.
+            topology["predictor_layers"] = len(
+                config["llm_config"].get("mtp_layers_block_type") or ("attention",))
+            capabilities.append("speculative_prediction")
+        else:
+            topology[component["kind"] + "_layers"] = 1
     graph = dict(
         schema_version=1,
         architecture="nemotron_h_omni",
@@ -317,7 +418,7 @@ def write_nemotron_fixture(path, config, weights, extra_components=()):
         topology=topology,
         graph=dict(kind="causal_lm", backbone="nemotron_h"),
         components=components,
-        capabilities=["text"],
+        capabilities=capabilities,
     )
     save(path, FileHeader(version=2, model_arch="nemotron_h_omni"),
          {**weights, MODEL_CONFIG_ASSET: json.dumps(config).encode(),
@@ -349,6 +450,28 @@ def parse(process):
     assert raw.pop("architecture") == "nemotron_h"
     return {key: np.asarray(value["data"], np.float32).reshape(value["shape"])
             for key, value in raw.items()}
+
+
+def run_mtp_fixture(path):
+    return subprocess.run(
+        [str(diagnostics_binary()), "--model", str(path), "--ctx-size", "64",
+         "--check-nemotron-h-mtp"],
+        text=True, capture_output=True, timeout=300)
+
+
+def parse_mtp(process):
+    raw = json.loads(next(line.removeprefix("nemotron_h_mtp_check ")
+                          for line in process.stdout.splitlines()
+                          if line.startswith("nemotron_h_mtp_check ")))
+    assert raw.pop("architecture") == "nemotron_h"
+    return raw
+
+
+def mtp_fixture(tmp_path, mixers=LAYER_MIXERS):
+    config, weights = model_fixture(mixers, mtp=True)
+    path = tmp_path / "nemotron-mtp.mfq"
+    write_nemotron_fixture(path, config, weights, extra_components=(MTP_COMPONENT,))
+    return config, weights, path
 
 
 @pytest.mark.parametrize("mixers", [
@@ -412,20 +535,138 @@ def test_native_rejects_inconsistent_config(tmp_path, error):
     assert "nemotron_h_check " not in process.stdout
 
 
-@pytest.mark.parametrize("extra,placeholder", [
-    (dict(kind="vision", tensor_root="vision", implementation="radio", policy="optional"),
-     "vision.patch_embedding.weight"),
-    (dict(kind="predictor", tensor_root="predictor", implementation="nemotron_h_mtp",
-          policy="optional"), "predictor.fusion.weight"),
-])
-def test_native_rejects_declared_media_and_mtp_components(tmp_path, extra, placeholder):
+def test_native_rejects_declared_vision_component(tmp_path):
     config, weights = model_fixture(("mamba", "moe", "attention"))
     # The component inventory only needs one tensor under its root; the
     # adapter must still refuse to load a graph it cannot execute.
-    weights[placeholder] = np.ones((4, 4), np.float32)
+    weights["vision.patch_embedding.weight"] = np.ones((4, 4), np.float32)
     path = tmp_path / "components.mfq"
-    write_nemotron_fixture(path, config, weights, extra_components=(extra,))
+    write_nemotron_fixture(
+        path, config, weights,
+        extra_components=(dict(kind="vision", tensor_root="vision",
+                               implementation="radio", policy="optional"),))
     process = run_fixture(path)
     assert process.returncode != 0
     assert "not implemented" in process.stderr
     assert "nemotron_h_check " not in process.stdout
+
+
+def test_native_mtp_head_matches_reference(tmp_path):
+    config, weights, path = mtp_fixture(tmp_path)
+    process = run_mtp_fixture(path)
+    assert process.returncode == 0, process.stdout + process.stderr
+    actual = parse_mtp(process)
+    previous = np.asarray(actual["previous"]["data"], np.float32).reshape(
+        actual["previous"]["shape"])
+    ids = np.asarray(actual["ids"]["data"], np.int64).reshape(actual["ids"]["shape"])
+    expected_hidden, expected_logits = mtp_reference(config, weights, previous, ids)
+    np.testing.assert_allclose(actual["head"]["data"], expected_hidden.reshape(-1),
+                               atol=2e-3, rtol=2e-3)
+    np.testing.assert_allclose(actual["logits"]["data"], expected_logits.reshape(-1),
+                               atol=2e-3, rtol=2e-3)
+    # A rejected draft row is fully discarded: the replay before the rollback
+    # boundary and the continuation after it agree with one uninterrupted pass.
+    np.testing.assert_allclose(actual["replayed"]["data"], actual["rollback"]["data"],
+                               atol=2e-3, rtol=2e-3)
+    # An accepted draft is committed as history: the committed rows match the
+    # same rows of one uninterrupted predictor pass.
+    np.testing.assert_allclose(actual["committed"]["data"],
+                               actual["head"]["data"][4 * HIDDEN:7 * HIDDEN],
+                               atol=2e-3, rtol=2e-3)
+
+
+def test_native_mtp_target_hidden_is_post_output_norm(tmp_path):
+    """The head consumes output_norm(h), not the raw backbone hidden."""
+
+    config, weights, path = mtp_fixture(tmp_path)
+    process = run_mtp_fixture(path)
+    assert process.returncode == 0, process.stdout + process.stderr
+    actual = parse_mtp(process)
+    target_hidden = np.asarray(actual["target_hidden"]["data"], np.float32).reshape(
+        actual["target_hidden"]["shape"])
+    target_normalized = np.asarray(actual["target_normalized"]["data"], np.float32).reshape(
+        actual["target_normalized"]["shape"])
+    # a. the hidden captured for the predictor is the lm_head input itself.
+    np.testing.assert_allclose(target_hidden, target_normalized, atol=0.0, rtol=0.0)
+    ids = np.asarray(actual["ids"]["data"], np.int64).reshape(actual["ids"]["shape"])
+    expected_hidden, _ = mtp_reference(config, weights, target_hidden[:, :6], ids[:, 1:])
+    np.testing.assert_allclose(actual["head_from_target"]["data"],
+                               expected_hidden.reshape(-1), atol=2e-3, rtol=2e-3)
+    # b. negative: feeding the pre-output_norm hidden (output_norm's own input,
+    # i.e. post_norm / weight up to the scale RMSNorm discards) must not match.
+    pre_norm_equivalent = target_hidden[:, :6] / weights["model.output_norm.weight"]
+    wrong_hidden, _ = mtp_reference(config, weights, pre_norm_equivalent, ids[:, 1:])
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(actual["head_from_target"]["data"],
+                                   wrong_hidden.reshape(-1), atol=2e-3, rtol=2e-3)
+
+
+def test_native_mtp_depth_chain_matches_reference(tmp_path):
+    """Step 2 consumes step 1's own final-norm output as its hidden state."""
+
+    config, weights, path = mtp_fixture(tmp_path)
+    process = run_mtp_fixture(path)
+    assert process.returncode == 0, process.stdout + process.stderr
+    actual = parse_mtp(process)
+    previous = np.asarray(actual["previous"]["data"], np.float32).reshape(
+        actual["previous"]["shape"])
+    ids = np.asarray(actual["ids"]["data"], np.int64).reshape(actual["ids"]["shape"])
+    first, second = mtp_chain_reference(config, weights, previous[:, :1],
+                                        [ids[:, :1], ids[:, 1:2]])
+    np.testing.assert_allclose(actual["chain_first"]["data"], first[0].reshape(-1),
+                               atol=2e-3, rtol=2e-3)
+    np.testing.assert_allclose(actual["chain_second"]["data"], second[0].reshape(-1),
+                               atol=2e-3, rtol=2e-3)
+    # Negative: chaining the *pre*-final-norm hidden would change step 2.
+    wrong = mtp_chain_reference(config, weights, previous[:, :1],
+                                [ids[:, :1], ids[:, 1:2]], chain_finalized=False)
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(actual["chain_second"]["data"],
+                                   wrong[1][0].reshape(-1), atol=2e-3, rtol=2e-3)
+
+
+def test_native_mtp_generation_matches_plain_decode(tmp_path):
+    _, _, path = mtp_fixture(tmp_path)
+    process = run_mtp_fixture(path)
+    assert process.returncode == 0, process.stdout + process.stderr
+    actual = parse_mtp(process)
+    # b: the primary correctness guarantee - speculation never changes the
+    # tokens greedy decoding emits.
+    assert actual["greedy_mtp"] == actual["greedy_plain"]
+    assert actual["cycles"] > 0
+    # d: weights are loaded but the request switch disables speculation.
+    assert actual["greedy_disabled"] == actual["greedy_plain"]
+
+
+def test_native_text_only_load_ignores_present_mtp_weights(tmp_path):
+    _, _, path = mtp_fixture(tmp_path)
+    # The MTP component is declared and its weights exist; a text-only load
+    # must degrade to the backbone instead of failing.
+    process = run_fixture(path)
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "nemotron_h_check " in process.stdout
+
+
+def test_native_rejects_declared_mtp_without_weights(tmp_path):
+    config, weights = model_fixture(("mamba", "moe", "attention"))
+    path = tmp_path / "missing-mtp.mfq"
+    write_nemotron_fixture(path, config, weights, extra_components=(MTP_COMPONENT,))
+    process = run_mtp_fixture(path)
+    assert process.returncode != 0
+    # The container validator and the component loader both name the missing
+    # predictor instead of silently serving a text-only model.
+    assert "declares predictor" in process.stderr and "missing" in process.stderr
+    assert "nemotron_h_mtp_check " not in process.stdout
+
+
+def test_native_rejects_incomplete_mtp_head(tmp_path):
+    config, weights = model_fixture(("mamba", "moe"), mtp=True)
+    # Only the fusion tensor survives; the norms and both sub-blocks are gone.
+    weights = {name: value for name, value in weights.items()
+               if not name.startswith("predictor.") or name == "predictor.fusion.weight"}
+    path = tmp_path / "incomplete-mtp.mfq"
+    write_nemotron_fixture(path, config, weights, extra_components=(MTP_COMPONENT,))
+    process = run_mtp_fixture(path)
+    assert process.returncode != 0
+    assert "predictor" in process.stderr
+    assert "nemotron_h_mtp_check " not in process.stdout

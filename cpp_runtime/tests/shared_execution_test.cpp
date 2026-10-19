@@ -15,9 +15,11 @@
 #include "models/glm5_next/causal_lm.h"
 #include "models/glm_dsa/causal_lm.h"
 #include "models/minicpmo45/causal_lm.h"
+#include "models/nemotron_h/causal_lm.h"
 #include "models/qwen35/causal_lm.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "sampling.h"
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <numeric>
@@ -769,6 +771,85 @@ void predictor_flow_test() {
         }
         assert(ops.model.cache_pos == 4 && ops.visited.size() == layer_calls);
     }
+}
+
+// Nemotron-H runs one MTP stage made of every declared sub-block, and it
+// declares its own history capacity instead of the family config field.
+struct NemotronPredictorOps {
+    struct Tensor {
+        std::vector<int64_t> shape;
+        int value = 0;
+    };
+    struct Model {
+        struct Config {
+            int hidden_size = 4;
+            std::int64_t num_nextn_predict_layers = 1;
+            std::vector<mfq::models::nemotron_h::MixerKind> mtp_mixers = {
+                mfq::models::nemotron_h::MixerKind::full_attention,
+                mfq::models::nemotron_h::MixerKind::moe};
+        } config;
+        // Smaller than predictor_capacity(): the shared fallback must not win.
+        int64_t maximum = 2;
+        std::vector<int64_t> lengths{0};
+        int64_t batch = 0;
+        int64_t predictor_capacity() const noexcept { return 6; }
+        void reset(int64_t next) {
+            batch = next;
+            std::fill(lengths.begin(), lengths.end(), 0);
+        }
+    } model;
+    std::vector<int> stages;
+    static int rank(const Tensor &t) { return t.shape.size(); }
+    static int64_t size(const Tensor &t, int axis) {
+        return t.shape.at(axis < 0 ? t.shape.size() + axis : axis);
+    }
+    static int64_t elements(const Tensor &t) {
+        int64_t count = 1;
+        for (auto n : t.shape)
+            count *= n;
+        return count;
+    }
+    static bool defined(const Tensor &t) { return !t.shape.empty(); }
+    static Tensor embed(Tensor ids, const Tensor &like) { return {like.shape, ids.value + 2}; }
+    static Tensor normalize(Tensor t, mfq::models::nemotron_h::PredictorNorm role) {
+        t.value += static_cast<int>(role) + 1;
+        return t;
+    }
+    static Tensor positions(Tensor t, int64_t start, int64_t tokens) {
+        return defined(t) ? t : Tensor{{tokens}, static_cast<int>(start)};
+    }
+    static Tensor fuse(Tensor e, Tensor h) {
+        h.value += e.value * 10;
+        return h;
+    }
+    Tensor mixer_blocks(Tensor h, int64_t stage, const Tensor &) {
+        stages.push_back(static_cast<int>(stage));
+        for (std::size_t block = 0; block < model.config.mtp_mixers.size(); ++block)
+            h.value = h.value * 3 + static_cast<int>(stage) + static_cast<int>(block);
+        return h;
+    }
+};
+
+void nemotron_predictor_flow_test() {
+    using mfq::models::nemotron_h::mtp_predictor;
+    NemotronPredictorOps ops;
+    auto run = [&](int64_t tokens) {
+        return mtp_predictor(ops, {{1, tokens, 4}, 3}, {{1, tokens}, 5}, {}, 0, true);
+    };
+    // e=7, h=5, fusion=85, then both declared sub-blocks, then the output norm.
+    assert(run(2).first.value == 769 && ops.model.lengths.front() == 2);
+    // Both declared sub-blocks run inside the single predictor stage.
+    assert((ops.stages == std::vector<int>{0}));
+    // The declared capacity (6) allows more history than config.maximum (2).
+    assert(run(4).first.value == 769 && ops.model.lengths.front() == 6);
+    const auto stages = ops.stages.size();
+    assert((ops.stages == std::vector<int>{0, 0}));
+    try {
+        run(1); // Context overflow at the declared capacity.
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(ops.model.lengths.front() == 6 && ops.stages.size() == stages);
 }
 
 // A non-CUDA tensor exercises the actual shared CausalLm class end to end.
@@ -1957,6 +2038,7 @@ int main() {
     causal_lm_test();
     inner_model_flow_test();
     predictor_flow_test();
+    nemotron_predictor_flow_test();
     batch_test();
     packed_prefill_plain_sample_test();
     batch_failure_test();

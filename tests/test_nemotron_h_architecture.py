@@ -728,7 +728,7 @@ def test_graph_spec_separates_radio_vision_from_the_text_backbone() -> None:
     assert "mtp." not in encoded
 
 
-def test_capabilities_register_the_family_without_advertising_media_or_mtp() -> None:
+def test_capabilities_register_the_family_without_advertising_media() -> None:
     for model_type in ("nemotron_h", "nemotron_h_text", "nemotron_h_omni"):
         profile = capabilities_for_architecture(model_type)
         assert profile.architecture_family == "nemotron_h"
@@ -739,5 +739,5 @@ def test_capabilities_register_the_family_without_advertising_media_or_mtp() -> 
             "audio_input": False,
             "audio_output": False,
             "full_duplex": False,
-            "mtp": False,
+            "mtp": True,
         }

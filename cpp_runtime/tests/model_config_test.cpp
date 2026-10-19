@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/config.h"
 #include "models/gemma4/config.h"
 #include "models/glm_dsa/config.h"
+#include "models/nemotron_h/config.h"
 #include "models/minicpmo45/config.h"
 #include "models/qwen35/config.h"
 #include "models/common/model_config.h"
@@ -161,6 +162,57 @@ int main() {
             rejected = true;
         }
         require(rejected, "unknown positional_encoding was accepted");
+
+        auto released = nlohmann::json::parse(R"({
+            "model_type":"nemotron_h_omni","tie_word_embeddings":false,
+            "llm_config":{"model_type":"nemotron_h","vocab_size":128,
+            "hidden_size":64,"intermediate_size":128,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":16,"max_position_embeddings":4096,
+            "layer_norm_epsilon":1e-5,"layers_block_type":["mamba","moe","attention"],
+            "mamba_num_heads":4,"mamba_head_dim":8,"ssm_state_size":32,
+            "n_groups":2,"conv_kernel":4,"use_conv_bias":true,
+            "mamba_hidden_act":"silu","mamba_ssm_cache_dtype":"float32",
+            "time_step_limit":[0.001,0.1],"n_routed_experts":4,
+            "num_experts_per_tok":2,"moe_intermediate_size":8,"moe_latent_size":16,
+            "moe_shared_expert_intermediate_size":12,"mlp_hidden_act":"relu2",
+            "norm_topk_prob":true,"routed_scaling_factor":5.0,"n_shared_experts":1,
+            "n_group":1,"topk_group":1,"num_nextn_predict_layers":1,
+            "mtp_layers_block_type":["attention","moe"]}})");
+        const auto predictor =
+            mfq::models::nemotron_h::Config::from_json(released.dump(), mfq::MfqModelGraph{});
+        require(predictor.num_nextn_predict_layers == 1 &&
+                    predictor.mtp_mixers ==
+                        std::vector<mfq::models::nemotron_h::MixerKind>{
+                            mfq::models::nemotron_h::MixerKind::full_attention,
+                            mfq::models::nemotron_h::MixerKind::moe},
+                "Nemotron-H MTP schedule was not normalized");
+        // The predictor stage owns attention history only; a mamba sub-block
+        // and a second stage have no runtime representation.
+        for (const auto& [field, value] :
+             std::vector<std::pair<std::string, nlohmann::json>>{
+                 {"mtp_layers_block_type", nlohmann::json::array({"mamba", "moe"})},
+                 {"num_nextn_predict_layers", 2}}) {
+            auto broken = released;
+            broken["llm_config"][field] = value;
+            rejected = false;
+            try {
+                static_cast<void>(
+                    mfq::models::nemotron_h::Config::from_json(broken.dump(), mfq::MfqModelGraph{}));
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            require(rejected, "invalid Nemotron-H MTP schedule was accepted");
+        }
+        auto orphaned = released;
+        orphaned["llm_config"].erase("num_nextn_predict_layers");
+        rejected = false;
+        try {
+            static_cast<void>(
+                mfq::models::nemotron_h::Config::from_json(orphaned.dump(), mfq::MfqModelGraph{}));
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "orphaned Nemotron-H MTP schedule was accepted");
 
         auto flash = nlohmann::json::parse(R"({
             "model_type":"qwen4_exp_text","vocab_size":128,"hidden_size":32,

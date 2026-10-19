@@ -37,13 +37,20 @@ GEOMETRY = ("mamba", "moe", "attention", "moe")
 
 
 def _source_name(canonical: str) -> str:
-    """Translate one canonical text tensor to the released checkpoint spelling."""
-    name = canonical
-    name = name.replace("model.token_embedding.weight",
-                        "language_model.backbone.embeddings.weight")
-    name = name.replace("model.output.weight", "language_model.lm_head.weight")
-    name = name.replace("model.output_norm.weight", "language_model.backbone.norm_f.weight")
-    name = name.replace("model.block.", "language_model.backbone.layers.")
+    """Translate one canonical text/predictor tensor to the released spelling."""
+    roots = {
+        "model.token_embedding.weight": "language_model.backbone.embeddings.weight",
+        "model.output.weight": "language_model.lm_head.weight",
+        "model.output_norm.weight": "language_model.backbone.norm_f.weight",
+        "predictor.fusion.weight": "language_model.mtp.layers.0.eh_proj.weight",
+        "predictor.embedding_norm.weight": "language_model.mtp.layers.0.enorm.weight",
+        "predictor.hidden_norm.weight": "language_model.mtp.layers.0.hnorm.weight",
+        "predictor.output_norm.weight": "language_model.mtp.layers.0.final_layernorm.weight",
+    }
+    name = roots.get(canonical)
+    if name is None:
+        name = canonical.replace("model.block.", "language_model.backbone.layers.")
+        name = name.replace("predictor.block.", "language_model.mtp.layers.")
     name = name.replace(".attention.norm.weight", ".norm.weight")
     name = name.replace(".linear_attention.dt_bias", ".mixer.dt_bias")
     name = name.replace(".linear_attention.a", ".mixer.A_log")
@@ -81,6 +88,11 @@ def _write_hf_checkpoint(root: Path, config: dict, weights: dict) -> None:
                 r"language_model.backbone.layers.\1.mixer.experts",
                 bank.group(1),
             )
+            prefix = re.sub(
+                r"^predictor\.block\.(\d+)\.mlp\.experts$",
+                r"language_model.mtp.layers.\1.mixer.experts",
+                prefix,
+            )
             for expert in range(array.shape[0]):
                 tensors[f"{prefix}.{expert}.{bank.group(2)}_proj.weight"] = (
                     torch.from_numpy(np.ascontiguousarray(array[expert]))
@@ -105,7 +117,7 @@ def _dequantized(path: Path) -> tuple[dict[str, np.ndarray], object]:
     try:
         weights: dict[str, np.ndarray] = {}
         for name in store.records:
-            if not name.startswith("model."):
+            if not name.startswith(("model.", "predictor.")):
                 continue
             value = store[name]
             if isinstance(value, NintTensor):
@@ -161,6 +173,113 @@ def _run_bridge(path: Path, cache: bool) -> dict[str, np.ndarray]:
         key: np.asarray(value["data"], np.float32).reshape(value["shape"])
         for key, value in raw.items()
     }
+
+
+def _run_mtp_bridge(path: Path, cache: bool) -> dict:
+    value = os.environ.get("MFQ_NEMOTRON_H_NATIVE_TEST")
+    if not value:
+        pytest.skip("MFQ_NEMOTRON_H_NATIVE_TEST required")
+    binary = Path(value)
+    if not binary.name.startswith("mfq-diagnostics"):
+        binary = binary.with_name("mfq-diagnostics" + binary.suffix)
+    environment = dict(os.environ)
+    command = [str(binary), "--model", str(path), "--ctx-size", "64",
+               "--check-nemotron-h-mtp"]
+    if cache:
+        # Force every routed expert resident so the predictor MoE sub-block
+        # also runs the two-stage MFE pipeline instead of the direct path.
+        environment.update(
+            MFQ_MOE_HOST_CACHE_BYTES=str(64 << 20),
+            MFQ_MOE_PIPELINE="1",
+            MFQ_MOE_PRELOAD_ALL="1",
+            MFQ_MOE_ASSERT_RESIDENT="1",
+            MFQ_MOE_TWO_STAGE_FFN="1",
+            MFQ_MOE_RAM_PCIE="1",
+        )
+        command[command.index("--check-nemotron-h-mtp"):command.index(
+            "--check-nemotron-h-mtp")] = ["--moe-gpu-cache-gb", "0.05"]
+    process = subprocess.run(command, text=True, capture_output=True,
+                             env=environment, timeout=300)
+    assert process.returncode == 0, process.stdout + process.stderr
+    return json.loads(next(
+        line.removeprefix("nemotron_h_mtp_check ")
+        for line in process.stdout.splitlines()
+        if line.startswith("nemotron_h_mtp_check ")
+    ))
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_quantized_mtp_matches_dequantized_reference(tmp_path: Path, cache: bool) -> None:
+    config, weights = oracle.model_fixture(GEOMETRY, mtp=True)
+    root = tmp_path / "hf"
+    _write_hf_checkpoint(root, config, weights)
+    artifact = tmp_path / "mtp.mfq"
+    _convert(root, artifact, "--preset", "S5-S", "--quantize-mtp")
+    dequantized, records = _dequantized(artifact)
+
+    # The predictor MoE sub-block is banked exactly like a backbone MoE layer:
+    # the non-gated bank stores Up and Down at the latent geometry.
+    bank = "predictor.block.1.mlp.experts"
+    assert records[f"{bank}.up.weight"].dtype == "MFE"
+    assert records[f"{bank}.down.weight"].dtype == "MFE"
+    assert dequantized[f"{bank}.up.weight"].shape == (
+        oracle.EXPERTS, oracle.MOE_INTERMEDIATE, oracle.MOE_LATENT)
+    assert dequantized[f"{bank}.down.weight"].shape == (
+        oracle.EXPERTS, oracle.MOE_LATENT, oracle.MOE_INTERMEDIATE)
+    # Every predictor control tensor stays float32.
+    for name in (
+        "predictor.embedding_norm.weight",
+        "predictor.hidden_norm.weight",
+        "predictor.output_norm.weight",
+        "predictor.block.0.attention.norm.weight",
+        "predictor.block.1.attention.norm.weight",
+        "predictor.block.1.mlp.router.weight",
+        "predictor.block.1.mlp.router.bias",
+    ):
+        assert records[name].dtype == "F32", name
+
+    actual = _run_mtp_bridge(artifact, cache)
+    previous = np.asarray(actual["previous"]["data"], np.float32).reshape(
+        actual["previous"]["shape"])
+    ids = np.asarray(actual["ids"]["data"], np.int64).reshape(actual["ids"]["shape"])
+    expected_hidden, expected_logits = oracle.mtp_reference(config, dequantized, previous, ids)
+    np.testing.assert_allclose(actual["head"]["data"], expected_hidden.reshape(-1),
+                               atol=3e-2, rtol=5e-2)
+    np.testing.assert_allclose(actual["logits"]["data"], expected_logits.reshape(-1),
+                               atol=3e-2, rtol=5e-2)
+    # The head consumes the target's post-output_norm hidden, and step two
+    # chains the head's own final-norm output.
+    target_hidden = np.asarray(actual["target_hidden"]["data"], np.float32).reshape(
+        actual["target_hidden"]["shape"])
+    ids_rows = ids[:, 1:]
+    tile_expected, _ = oracle.mtp_reference(config, dequantized, target_hidden[:, :6],
+                                            ids_rows)
+    np.testing.assert_allclose(actual["head_from_target"]["data"],
+                               tile_expected.reshape(-1), atol=3e-2, rtol=5e-2)
+    first, second = oracle.mtp_chain_reference(
+        config, dequantized, previous[:, :1], [ids[:, :1], ids[:, 1:2]])
+    np.testing.assert_allclose(actual["chain_first"]["data"], first[0].reshape(-1),
+                               atol=3e-2, rtol=5e-2)
+    np.testing.assert_allclose(actual["chain_second"]["data"], second[0].reshape(-1),
+                               atol=3e-2, rtol=5e-2)
+    # Negative: the pre-output_norm hidden and a pre-final-norm chain must both
+    # disagree, so the quantized tolerances still pin the hidden source.
+    pre_norm, _ = oracle.mtp_reference(
+        config, dequantized, target_hidden[:, :6] / dequantized["model.output_norm.weight"],
+        ids_rows)
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(actual["head_from_target"]["data"],
+                                   pre_norm.reshape(-1), atol=3e-2, rtol=5e-2)
+    wrong_chain = oracle.mtp_chain_reference(
+        config, dequantized, previous[:, :1], [ids[:, :1], ids[:, 1:2]],
+        chain_finalized=False)
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(actual["chain_second"]["data"],
+                                   wrong_chain[1][0].reshape(-1), atol=3e-2, rtol=5e-2)
+    # b. speculation still cannot change the greedy sequence.
+    assert actual["greedy_mtp"] == actual["greedy_plain"]
+    assert actual["greedy_disabled"] == actual["greedy_plain"]
+    assert actual["cycles"] > 0
 
 
 @pytest.mark.parametrize("preset,extra,tolerance", [

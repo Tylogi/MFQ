@@ -4,6 +4,7 @@
 #include "generation_result.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/qwen4_exp/ops.h"
+#include "models/nemotron_h/mtp.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
@@ -1620,6 +1621,154 @@ static int run_nemotron_h_check(Model& model) {
     result["reset"]=json_tensor(model.forward(ids));
     result["architecture"]=model.graph.backbone;
     std::cout << "nemotron_h_check " << result.dump() << '\n';
+    return 0;
+}
+
+template <typename Model>
+static int run_nemotron_h_mtp_check(Model& model, mfq::cuda::nemotron_h::NemotronHMtp& mtp) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(model.vocab_size() >= 8 && model.max_position_embeddings() >= 32,
+        "Nemotron-H MTP diagnostic requires vocab>=8 and context>=32");
+    const MtpTarget target(model);
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
+    auto ids=tb::tensor(std::vector<int64_t>{1,2,3,4,5,6,7},options).reshape({1,7});
+    // A deterministic previous-hidden batch keeps the head comparison
+    // independent of the target model under test.
+    const auto width=model.hidden_size();
+    auto previous=(tb::arange(7*width,options).remainder(31).to(tb::kFloat32)*.01-.15)
+        .reshape({1,7,width});
+    const auto json_tensor=[](const tb::Tensor& value) {
+        auto host=value.to(tb::kFloat32).contiguous().cpu();
+        return nlohmann::json{{"shape",host.sizes().vec()},
+            {"data",std::vector<float>(host.template data_ptr<float>(),host.template data_ptr<float>()+host.numel())}};
+    };
+    const auto close=[&](const tb::Tensor& actual,const tb::Tensor& expected,const char* label) {
+        auto a=actual.to(tb::kFloat32).contiguous().cpu();
+        auto b=expected.to(tb::kFloat32).contiguous().cpu();
+        MFQ_RUNTIME_CHECK(a.sizes()==b.sizes(),"Nemotron-H MTP ",label," changed its shape");
+        const auto* av=a.template data_ptr<float>();
+        const auto* bv=b.template data_ptr<float>();
+        double worst=0;
+        for(int64_t index=0;index<a.numel();++index) {
+            const double error=std::abs(double(av[index])-bv[index])/(.003+.003*std::abs(bv[index]));
+            worst=std::max(worst,error);
+        }
+        MFQ_RUNTIME_CHECK(worst<=1.0,"Nemotron-H MTP ",label," changed its value normalized_error=",
+            worst);
+    };
+    nlohmann::json result;
+    result["architecture"]=model.graph.backbone;
+    result["previous"]=json_tensor(previous);
+    result["ids"]=json_tensor(ids);
+    result["embedding"]=json_tensor(target.embed(ids.clone()));
+    mtp.reset();
+    auto full=mtp.forward(target,previous,ids);
+    result["head"]=json_tensor(full);
+    result["logits"]=json_tensor(model.logits_from_hidden(full.clone()));
+    // Chunk boundaries must not change the predictor: the attention sub-block
+    // appends to its own history, the MoE sub-block is stateless.
+    mtp.reset();
+    std::vector<tb::Tensor> pieces;
+    for (auto [begin,count] : std::vector<std::pair<int64_t,int64_t>>{{0,2},{2,1},{3,4}})
+        pieces.push_back(mtp.forward(target,previous.narrow(1,begin,count),
+                                     ids.narrow(1,begin,count)));
+    close(tb::cat(pieces,1),full,"chunked forward");
+    // A rejected draft row is discarded by moving the history boundary; the
+    // replay must reproduce the speculative row and leave later rows intact.
+    mtp.reset();
+    auto prefix=mtp.forward(target,previous.narrow(1,0,4),ids.narrow(1,0,4));
+    auto committed=mtp.cache_position();
+    MFQ_RUNTIME_CHECK(committed==4,"Nemotron-H MTP history did not advance");
+    auto rejected=mtp.forward(target,previous.narrow(1,4,1),ids.narrow(1,4,1));
+    mtp.trim_cache_to(committed);
+    auto replayed=mtp.forward(target,previous.narrow(1,4,1),ids.narrow(1,4,1));
+    close(replayed,rejected,"rollback replay");
+    auto tail=tb::cat({replayed,mtp.forward(target,previous.narrow(1,5,2),ids.narrow(1,5,2))},1);
+    close(tail,full.narrow(1,4,3),"continuation after rollback");
+    result["replayed"]=json_tensor(replayed);
+    result["rollback"]=json_tensor(full.narrow(1,4,1));
+    // An accepted draft row is committed as ordinary history, so the committed
+    // rows and the following draft must match one uninterrupted pass.
+    mtp.reset();
+    (void)mtp.forward(target,previous.narrow(1,0,4),ids.narrow(1,0,4));
+    auto committed_draft=mtp.forward(target,previous.narrow(1,4,1),ids.narrow(1,4,1));
+    auto committed_next=mtp.forward(target,previous.narrow(1,5,2),ids.narrow(1,5,2));
+    auto committed_rows=tb::cat({committed_draft,committed_next},1);
+    close(committed_rows,full.narrow(1,4,3),"continuation after commit");
+    result["committed"]=json_tensor(committed_rows);
+    // Depth chaining: the engine feeds the previous step's chain_hidden back as
+    // the next step's hidden. Nemotron-H chains this module's final_layernorm
+    // output, so chain_hidden must equal sample_hidden and the two single-row
+    // steps must equal separate forwards over the same growing history.
+    mtp.reset();
+    auto first_step=mtp.step(target,previous.narrow(1,0,1),ids.narrow(1,0,1));
+    close(first_step.chain_hidden,first_step.sample_hidden,"depth chain value");
+    // The first step consumes the same target hidden as the batched pass, so
+    // its row must match; the second step instead consumes the head's own
+    // output and therefore no longer matches the teacher-forced row.
+    close(first_step.sample_hidden,full.narrow(1,0,1),"first depth step");
+    auto second_step=mtp.step(target,first_step.chain_hidden,ids.narrow(1,1,1));
+    close(second_step.chain_hidden,second_step.sample_hidden,"depth chain value");
+    result["chain_first"]=json_tensor(first_step.sample_hidden);
+    result["chain_second"]=json_tensor(second_step.sample_hidden);
+    // The backbone hands the predictor its post-output_norm hidden, so the
+    // hidden captured for the MTP head is the same tensor the lm_head sees.
+    model.reset(1);
+    tb::Tensor target_hidden;
+    auto target_normalized=model.hidden_forward(ids,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,
+        &target_hidden);
+    close(target_hidden,target_normalized,"post-output_norm target hidden");
+    result["target_hidden"]=json_tensor(target_hidden);
+    result["target_normalized"]=json_tensor(target_normalized);
+    mtp.reset();
+    auto target_head=mtp.forward(target,target_hidden.narrow(1,0,6),ids.narrow(1,1,6));
+    result["head_from_target"]=json_tensor(target_head);
+    // Session snapshots own the predictor history, not just its boundary.
+    mtp.reset();
+    (void)mtp.forward(target,previous.narrow(1,0,3),ids.narrow(1,1,3));
+    auto saved=mtp.capture_session_state(4,previous.narrow(1,3,1));
+    auto expected_next=mtp.forward(target,previous.narrow(1,3,1),ids.narrow(1,4,1));
+    (void)mtp.forward(target,previous.narrow(1,4,2),ids.narrow(1,5,2));
+    mtp.restore_session_state(saved);
+    MFQ_RUNTIME_CHECK(mtp.cache_position()==3,"Nemotron-H MTP restore position changed");
+    close(mtp.forward(target,previous.narrow(1,3,1),ids.narrow(1,4,1)),expected_next,
+        "session restore");
+    static const MfqSamplingParams greedy=[] {
+        MfqSamplingParams value;
+        value.max_tokens=32;
+        value.temperature=0.;
+        value.top_k=1;
+        value.top_p=1.;
+        return value;
+    }();
+    const std::vector<int64_t> prompt{1,2,3,4,5};
+    model.reset(1);mtp.reset(1);
+    const auto speculative=check_mtp_steps(model,mtp,prompt,greedy);
+    result["greedy_mtp"]=speculative;
+    result["cycles"]=mtp.last_stats.cycles;
+    result["accepted"]=mtp.last_accepted;
+    result["rejected"]=mtp.last_rejected;
+    MFQ_RUNTIME_CHECK(mtp.last_stats.cycles>0,"Nemotron-H MTP diagnostic ran no speculative cycle");
+    const auto config=resolve_cuda_runtime_config({});
+    const auto ordinary=[&](MtpModule *predictor,bool enable_mtp) {
+        DecodeGraphCache graph(model.max_position_embeddings());
+        TextSessionCache cache(config.session_cache,config.prefix_cache);
+        mfq::engine::InferenceRequest request;
+        request.prompt=prompt;request.sampling=greedy;request.sampling.enable_mtp=enable_mtp;
+        mfq::engine::InferenceOutput output(request,nullptr,"nemotron-h-mtp");
+        model.reset(1);mtp.reset(1);
+        return collect_generation(generate(model,graph,cache,config,request,output,predictor)).tokens;
+    };
+    const auto plain=ordinary(nullptr,false);
+    result["greedy_plain"]=plain;
+    MFQ_RUNTIME_CHECK(speculative==plain,
+        "Nemotron-H MTP greedy generation differs from ordinary decode");
+    // The predictor stays loaded; only the request switch turns speculation off.
+    const auto disabled=ordinary(&mtp,false);
+    result["greedy_disabled"]=disabled;
+    MFQ_RUNTIME_CHECK(disabled==plain && mtp.last_stats.cycles==0,
+        "disabled Nemotron-H MTP still ran speculative cycles");
+    std::cout << "nemotron_h_mtp_check " << result.dump() << '\n';
     return 0;
 }
 

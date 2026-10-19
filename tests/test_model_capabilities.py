@@ -99,6 +99,9 @@ def test_every_mtp_runtime_family_registers_architecture_support() -> None:
         "qwen3_5_text",
         "qwen4_exp",
         "glm5_next",
+        "nemotron_h",
+        "nemotron_h_text",
+        "nemotron_h_omni",
     ):
         assert capabilities_for_architecture(model_type).features.mtp
 

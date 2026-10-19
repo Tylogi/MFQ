@@ -22,7 +22,8 @@ using Config = mfq::models::nemotron_h::Config;
 
 std::unique_ptr<::Block> load_block(CudaExecutionContext& execution,
                                     const mfq::ModelSource& source, const Config& config, int layer,
-                                    const std::string& type);
+                                    const std::string& type,
+                                    std::string_view tensor_root = "model");
 
 bool supports_text_session_state(const std::vector<std::unique_ptr<::Block>>& blocks);
 
@@ -44,6 +45,11 @@ struct NemotronHModel : CausalResources {
     void adapter_validate_components(const mfq::ModelGraph& graph) const;
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource& source, int layer, int device,
                                               const std::string& type);
+    // Nemotron-H's MTP head consumes the backbone hidden state *after*
+    // output_norm (unlike DeepSeek-V3); see the implementation for sources.
+    mfq_tensor_backend::Tensor
+    adapter_raw_hidden(const mfq_tensor_backend::Tensor& hidden,
+                       const mfq_tensor_backend::Tensor& finalized) const;
 };
 
 template <> struct CudaSessionCodec<NemotronHModel> {

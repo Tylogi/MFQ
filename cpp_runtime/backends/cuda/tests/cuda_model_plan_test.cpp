@@ -178,10 +178,16 @@ int main() {
             nemotron, nemotron_plan, true, true);
         require(
             nemotron_plan.vision == CudaVisionAdapter::none &&
-                nemotron_plan.predictor == CudaPredictorAdapter::none &&
+                nemotron_plan.predictor == CudaPredictorAdapter::nemotron_h &&
                 nemotron_state.vision_declared && !nemotron_state.vision_supported &&
-                nemotron_state.mtp_declared && !nemotron_state.mtp_supported,
-            "Nemotron-H advertised an unimplemented vision or predictor adapter");
+                nemotron_state.mtp_declared && nemotron_state.mtp_supported &&
+                nemotron_state.mtp_enabled,
+            "Nemotron-H optional component selection mismatch");
+        const auto nemotron_text = graph_with("nemotron_h");
+        require(
+            cuda_model_plan(nemotron_text).predictor ==
+                CudaPredictorAdapter::none,
+            "Nemotron-H text-only graph selected a predictor");
         auto deepseek_v4_with_predictor = graph_with(
             "deepseek_v4", {}, "next_token_prediction");
         require_capabilities(

@@ -79,6 +79,20 @@ MixerKind Config::mixer_kind(std::string_view type) {
     throw std::runtime_error("unsupported Nemotron-H mixer type: " + std::string(type));
 }
 
+std::string_view Config::mixer_name(MixerKind kind) {
+    switch (kind) {
+        case MixerKind::linear_attention:
+            return "linear_attention";
+        case MixerKind::full_attention:
+            return "full_attention";
+        case MixerKind::moe:
+            return "moe";
+        case MixerKind::mlp:
+            return "mlp";
+    }
+    throw std::runtime_error("unknown Nemotron-H mixer kind");
+}
+
 Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
     const auto document = json::parse(payload.begin(), payload.end(), nullptr, false);
     if (!document.is_object())
@@ -99,24 +113,9 @@ Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
     std::vector<std::string> runtime_types;
     runtime_types.reserve(schedule.size());
     for (const auto& type : schedule) {
-        switch (mixer_kind(type)) {
-            case MixerKind::linear_attention:
-                config.mixers.push_back(MixerKind::linear_attention);
-                runtime_types.emplace_back("linear_attention");
-                break;
-            case MixerKind::full_attention:
-                config.mixers.push_back(MixerKind::full_attention);
-                runtime_types.emplace_back("full_attention");
-                break;
-            case MixerKind::moe:
-                config.mixers.push_back(MixerKind::moe);
-                runtime_types.emplace_back("moe");
-                break;
-            case MixerKind::mlp:
-                config.mixers.push_back(MixerKind::mlp);
-                runtime_types.emplace_back("mlp");
-                break;
-        }
+        const auto kind = mixer_kind(type);
+        config.mixers.push_back(kind);
+        runtime_types.emplace_back(mixer_name(kind));
     }
     const auto declared_layers = integer(text, "num_hidden_layers", 0);
     if (declared_layers > 0 && declared_layers != static_cast<std::int64_t>(schedule.size()))
@@ -134,6 +133,31 @@ Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
     if (!text.contains("tie_word_embeddings") && document.contains("tie_word_embeddings"))
         normalized["tie_word_embeddings"] = document.at("tie_word_embeddings");
     static_cast<ModelConfig&>(config) = ModelConfig::from_json(normalized.dump());
+
+    // One predictor stage holds every declared sub-block; the schedule alone
+    // decides whether that stage contains an attention, MoE or dense mixer.
+    config.num_nextn_predict_layers = integer(text, "num_nextn_predict_layers", 0);
+    if (config.num_nextn_predict_layers < 0)
+        throw std::runtime_error("Nemotron-H num_nextn_predict_layers must not be negative");
+    if (config.num_nextn_predict_layers > 1)
+        throw std::runtime_error(
+            "Nemotron-H supports one multi-token-prediction stage; its sub-blocks are listed "
+            "in mtp_layers_block_type");
+    if (config.num_nextn_predict_layers > 0) {
+        for (const auto& type : strings(text, "mtp_layers_block_type")) {
+            const auto kind = mixer_kind(type);
+            if (kind == MixerKind::linear_attention)
+                throw std::runtime_error(
+                    "Nemotron-H MTP cannot declare a mamba sub-block: the predictor keeps no "
+                    "recurrent state in the shared predictor graph");
+            config.mtp_mixers.push_back(kind);
+        }
+        if (config.mtp_mixers.empty())
+            throw std::runtime_error("Nemotron-H mtp_layers_block_type must not be empty");
+    } else if (text.contains("mtp_layers_block_type")) {
+        throw std::runtime_error(
+            "Nemotron-H mtp_layers_block_type requires num_nextn_predict_layers");
+    }
 
     if (text.value("mamba_hidden_act", std::string("silu")) != "silu")
         throw std::runtime_error("Nemotron-H mamba activation must be silu");
@@ -166,10 +190,12 @@ Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
             throw std::runtime_error("Nemotron-H time_step_limit low must not exceed high");
     }
 
-    const bool has_moe = std::any_of(config.mixers.begin(), config.mixers.end(), [](auto kind) {
+    const auto needs_moe = std::any_of(config.mixers.begin(), config.mixers.end(), [](auto kind) {
+        return kind == MixerKind::moe;
+    }) || std::any_of(config.mtp_mixers.begin(), config.mtp_mixers.end(), [](auto kind) {
         return kind == MixerKind::moe;
     });
-    if (!has_moe)
+    if (!needs_moe)
         return config;
     if (text.value("mlp_hidden_act", std::string("relu2")) != "relu2")
         throw std::runtime_error(

@@ -291,12 +291,13 @@ struct BlockLoader : TransformerWeightLoader {
 
 std::unique_ptr<::Block> load_block(CudaExecutionContext& execution,
                                     const mfq::ModelSource& source, const Config& config, int layer,
-                                    const std::string& type) {
+                                    const std::string& type, std::string_view tensor_root) {
     BlockLoader loader{{execution, source}};
     switch (Config::mixer_kind(type)) {
         case mfq::models::nemotron_h::MixerKind::linear_attention: {
             auto block = loader.mamba_block();
-            mfq::models::nemotron_h::load_linear_attention(*block, loader, config, layer);
+            mfq::models::nemotron_h::load_linear_attention(*block, loader, config, layer,
+                                                           tensor_root);
             block->conv_weight = block->conv_weight.to(mfq_tensor_backend::kFloat32).contiguous();
             block->a_log = block->a_log.to(mfq_tensor_backend::kFloat32).contiguous();
             block->d = block->d.to(mfq_tensor_backend::kFloat32).contiguous();
@@ -308,12 +309,12 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext& execution,
         }
         case mfq::models::nemotron_h::MixerKind::full_attention: {
             auto block = loader.full_block();
-            mfq::models::nemotron_h::load_attention(*block, loader, config, layer);
+            mfq::models::nemotron_h::load_attention(*block, loader, config, layer, tensor_root);
             return BlockLoader::finish(std::move(block));
         }
         case mfq::models::nemotron_h::MixerKind::moe: {
             auto block = loader.moe_block();
-            mfq::models::nemotron_h::load_moe(*block, loader, config, layer);
+            mfq::models::nemotron_h::load_moe(*block, loader, config, layer, tensor_root);
             // An expert cache turns the routed bank into the two-stage MFE
             // pipeline; without one the same FFN keeps the direct path.
             block->ffn.prepare_moe_pipeline(execution);
@@ -321,7 +322,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext& execution,
         }
         case mfq::models::nemotron_h::MixerKind::mlp: {
             auto block = loader.moe_block();
-            mfq::models::nemotron_h::load_dense_mlp(*block, loader, config, layer);
+            mfq::models::nemotron_h::load_dense_mlp(*block, loader, config, layer, tensor_root);
             return BlockLoader::finish(std::move(block));
         }
     }
@@ -433,22 +434,32 @@ void restore_text_session_state(std::vector<std::unique_ptr<::Block>>& blocks,
 namespace mfq::cuda {
 
 void NemotronHModel::adapter_validate_components(const mfq::ModelGraph& graph) const {
-    // Phase 1 is text-only. A declared vision or predictor component stays
-    // reported as unsupported by the capability matrix instead of loading a
-    // partial graph.
+    // The RADIO tower has no runtime adapter yet. A declared vision component
+    // stays reported as unsupported instead of loading a partial graph.
     if (graph.component("vision") != nullptr)
         throw std::runtime_error(
             "Nemotron-H CUDA vision is not implemented; load the text model without the "
             "vision component");
-    if (graph.component("predictor") != nullptr)
+    if (graph.component("predictor") != nullptr &&
+        cuda_model_plan(graph).predictor != CudaPredictorAdapter::nemotron_h)
         throw std::runtime_error(
-            "Nemotron-H CUDA multi-token prediction is not implemented; load the text "
-            "model without the predictor component");
+            "Nemotron-H CUDA multi-token prediction requires the nemotron_h_mtp predictor "
+            "implementation under the predictor tensor root");
 }
 
 std::unique_ptr<Block> NemotronHModel::adapter_load_block(const mfq::ModelSource& source, int layer,
                                                           int, const std::string& type) {
     return nemotron_h::load_block(*execution, source, config, layer, type);
+}
+
+mfq_tensor_backend::Tensor
+NemotronHModel::adapter_raw_hidden(const mfq_tensor_backend::Tensor&,
+                                   const mfq_tensor_backend::Tensor& finalized) const {
+    // llama.cpp (src/models/nemotron-h-moe.cpp), vLLM and SGLang all hand the
+    // MTP head the backbone hidden state after output_norm, unlike DeepSeek-V3.
+    // The predictor therefore receives the same normalized hidden that the
+    // lm_head sees, and its own hnorm renormalizes it.
+    return finalized;
 }
 
 TextSessionStateKind CudaSessionCodec<NemotronHModel>::kind(const Model& model) {

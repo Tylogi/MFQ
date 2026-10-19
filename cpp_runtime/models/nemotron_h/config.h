@@ -36,6 +36,11 @@ struct Config : ModelConfig {
     std::int64_t moe_shared_intermediate_size = 0;
     bool norm_topk_prob = false;
     double routed_scaling_factor = 1.0;
+    // Megatron-Core MultiTokenPredictionLayer schedule. The released
+    // checkpoint stores one predictor stage whose sub-blocks are listed in
+    // mtp_layers_block_type, so the runtime applies them in declaration order.
+    std::int64_t num_nextn_predict_layers = 0;
+    std::vector<MixerKind> mtp_mixers;
 
     std::int64_t mamba_inner_size() const noexcept { return mamba_heads * mamba_head_dim; }
 
@@ -52,6 +57,7 @@ struct Config : ModelConfig {
     MixerKind mixer(int64_t layer) const { return mixers.at(static_cast<std::size_t>(layer)); }
 
     static MixerKind mixer_kind(std::string_view type);
+    static std::string_view mixer_name(MixerKind kind);
     static Config from_json(std::string_view payload, const MfqModelGraph& graph);
 };
 

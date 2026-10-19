@@ -75,6 +75,12 @@ load_runtime_components(
     mfq::cuda::DeepseekV41CausalLm& model,
     bool load_optional_components);
 
+template <>
+RuntimeComponents<mfq::cuda::NemotronHCausalLm>
+load_runtime_components(
+    mfq::cuda::NemotronHCausalLm& model,
+    bool load_optional_components);
+
 
 template <>
 RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>

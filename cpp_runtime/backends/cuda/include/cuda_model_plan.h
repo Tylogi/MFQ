@@ -35,6 +35,7 @@ enum class CudaPredictorAdapter {
     qwen35,
     flash_next,
     deepseek_v41_dspark,
+    nemotron_h,
 };
 
 struct CudaModelPlan {
@@ -130,6 +131,11 @@ inline CudaModelPlan cuda_model_plan(
         predictor->implementation == "deepseek_v41_dspark" &&
         predictor->tensor_root == "predictor") {
         result.predictor = CudaPredictorAdapter::deepseek_v41_dspark;
+    }
+    if (graph.backbone == "nemotron_h" && predictor != nullptr &&
+        predictor->implementation == "nemotron_h_mtp" &&
+        predictor->tensor_root == "predictor") {
+        result.predictor = CudaPredictorAdapter::nemotron_h;
     }
     return result;
 }
