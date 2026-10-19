@@ -518,11 +518,11 @@ def _add_candidate_arguments(
 def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
 
     from mfq.commands.alphaq import add_parser as add_alphaq_parser
+    from mfq.commands.natscale import add_parsers as add_natscale_parsers
 
     calibrate = sub.add_parser("calibrate", help="build calibration artifacts")
     stages = calibrate.add_subparsers(dest="calibration_stage", metavar="<stage>", required=True)
     add_alphaq_parser(stages)
-    from mfq.calibration.natscale_errors import add_parsers as add_natscale_parsers
     add_natscale_parsers(stages)
 
 

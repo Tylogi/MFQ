@@ -15,6 +15,17 @@ from pathlib import Path
 from mfq.formats.shards import parse_size
 
 QUANT_BACKENDS = ("auto", "cuda", "metal", "cpu")
+_UD_TIER_CHOICES = (
+    "IQ1_S",
+    "IQ1_M",
+    "Q2_K_XL",
+    "IQ3_XXS",
+    "Q3_K_XL",
+    "IQ4_XS",
+    "Q4_K_XL",
+    "Q5_K_XL",
+    "Q6_K_XL",
+)
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -77,11 +88,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="",
         help="native MFQ, GGUF, or legacy llama.cpp importance matrix",
     )
-    from mfq.calibration.ud_recipes import UD_TIERS
     ceiling = precision.add_mutually_exclusive_group()
     ceiling.add_argument('--target-bpw', default='',
         help='AlphaQ whole-file BPW ceiling, including PLE, native weights, headers and assets (HF)')
-    ceiling.add_argument('--ud-tier', choices=UD_TIERS, default='',
+    ceiling.add_argument('--ud-tier', choices=_UD_TIER_CHOICES, default='',
         help='pinned UD nonexpert recipe and exact main-text whole-file byte ceiling')
     precision.add_argument('--alphaq-allocator', choices=('alphaq', 'natscale'), default='alphaq')
     precision.add_argument('--alphaq-vision', choices=('native', 'NINT8', 'exclude'), default='native')

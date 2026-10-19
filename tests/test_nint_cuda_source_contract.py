@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
 
@@ -324,18 +323,9 @@ def test_dense_nint_loader_decodes_directly_to_f32():
 def test_python_jit_extension_has_its_own_link_closure():
     block = CMAKE.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     native = re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.(?:cu|cpp))", block)
-    tree = ast.parse(EXTENSION)
-    sources = next(
-        node.value
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id == "_JIT_KERNEL_SOURCES"
-            for target in node.targets
-        )
+    jit = tuple(
+        re.findall(r'os\.path\.join\(_DIR, "([^\"]+\.(?:cu|cpp))"\)', EXTENSION)
     )
-    jit = ast.literal_eval(sources)
 
     assert jit == (
         "norm.cu",
