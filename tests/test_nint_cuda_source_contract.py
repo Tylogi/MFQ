@@ -298,3 +298,12 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert ": kNintStoreOutput" in METAL_NINT
     assert "make_nint_matmul_kernel" not in METAL_NINT
     assert "make_nint_matmul_add_kernel" not in METAL_NINT
+
+
+def test_python_jit_extension_includes_every_native_cuda_kernel_unit():
+    block = CMAKE.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
+    native = re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.(?:cu|cpp))", block)
+    jit = re.findall(r'os\.path\.join\(_DIR, "([^"]+)"\)', EXTENSION)
+
+    assert jit[-1] == "mfq_cuda.cpp"
+    assert jit[:-1] == native

@@ -35,7 +35,10 @@ def vision_fixture(storage="bf16", mtp=True, text_storage="dense"):
     config, weights = mtp_fixture("glm", int(mtp))
     if not mtp:
         weights = {name: value for name, value in weights.items() if not name.startswith("predictor.")}
-    oracle = weights
+    # Storage and the NumPy oracle intentionally diverge for packed tensors.
+    # Keep independent mappings so replacing an oracle value cannot replace the
+    # serialized tensor with its decoded float32 representation.
+    oracle = weights.copy()
     if text_storage == "v1s":
         weights, oracle = glm_v1s_storage(weights)
     def store_bf16(name, value):
@@ -191,6 +194,7 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
     request = tmp_path / "input.json"
     request.write_text(json.dumps(dict(ids=ids, pixels=pixels.ravel().tolist(), pixel_shape=list(pixels.shape), grids=grids, types=types)))
     resident_bytes = []
+    tokenizer = _worker_tokenizer(tmp_path, cacheable_tokens=True)
     for resident in (True, False):
         env = dict(os.environ, MFQ_CUDA_VISION_RESIDENT=str(int(resident)), MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1")
         proc = subprocess.run([str(bridge), str(model), str(request)], capture_output=True, text=True, env=env, timeout=120)
@@ -211,7 +215,6 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
         native_oracle = glm_model_reference(config, reference_weights, embeddings=array("embeddings").astype(np.float16))
         np.testing.assert_allclose(array("logits"), native_oracle, atol=7e-3, rtol=7e-3)
         np.testing.assert_array_equal(array("cached_embeddings"), array("embeddings"))
-        tokenizer = _worker_tokenizer(tmp_path, cacheable_tokens=True)
         async def run_worker():
             with (tmp_path / f"worker-{resident}.log").open("wb") as log:
                 process = await asyncio.create_subprocess_exec(str(runtime), "--model", str(model), "--tokenizer", str(tokenizer),
@@ -263,10 +266,11 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
     assert resident_bytes[1] < resident_bytes[0]
 
 
-@pytest.mark.parametrize("storage", ["bf16", "nint8"])
-def test_glm_vision_fixture_storage_and_graph(tmp_path, storage):
+@pytest.mark.parametrize("storage,text_storage", [("bf16", "dense"), ("nint8", "dense"), ("bf16", "v1s")])
+def test_glm_vision_fixture_storage_and_graph(tmp_path, storage, text_storage):
     from mfq.formats.io import load, is_bfloat16_array
-    config, weights, oracle = vision_fixture(storage, False)
+    config, weights, oracle = vision_fixture(storage, False, text_storage)
+    assert weights is not oracle
     graph = graph_spec_for_plan(config, list(weights)).as_dict()
     assert not any(c["kind"] == "predictor" for c in graph["components"])
     component = next(c for c in graph["components"] if c["kind"] == "vision")
@@ -279,6 +283,7 @@ def test_glm_vision_fixture_storage_and_graph(tmp_path, storage):
     value = restored["vision.patch_embedding.weight"]
     if storage == "bf16":
         assert is_bfloat16_array(value)
+        assert value.dtype == np.dtype("<u2")
     else:
         assert value.spec.bits == 8
     assert oracle["vision.downsample.weight"].shape == (32, 8, 2, 2)
