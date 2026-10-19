@@ -607,6 +607,95 @@ def test_native_hf_prefers_tokenizer_config_template_over_standalone_file(
     )
 
 
+TEKKEN_SPLIT = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+    r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def _set_tokenizer_pipeline(
+    root: Path,
+    *,
+    split: str,
+    post_processor: dict[str, object],
+) -> None:
+    """Give the fixture an HF pre-tokenizer and post-processor and drop add_bos_token."""
+
+    tokenizer_path = root / "tokenizer.json"
+    tokenizer = json.loads(tokenizer_path.read_text())
+    tokenizer["pre_tokenizer"] = {
+        "type": "Sequence",
+        "pretokenizers": [
+            {
+                "type": "Split",
+                "pattern": {"Regex": split},
+                "behavior": "Isolated",
+                "invert": False,
+            },
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": True,
+                "use_regex": False,
+            },
+        ],
+    }
+    tokenizer["post_processor"] = post_processor
+    tokenizer_path.write_text(json.dumps(tokenizer))
+    tokenizer_config_path = root / "tokenizer_config.json"
+    tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    tokenizer_config.pop("add_bos_token")
+    tokenizer_config_path.write_text(json.dumps(tokenizer_config))
+
+
+def test_unlisted_family_selects_pre_tokenizer_from_split_regex(tmp_path: Path) -> None:
+    model = tmp_path / "Tekken-Test"
+    _hf_fixture(model, model_type="unlisted_hybrid", tensor_name="embed.weight")
+    _set_tokenizer_pipeline(
+        model,
+        split=TEKKEN_SPLIT,
+        post_processor={"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": False},
+    )
+
+    reader = GGUFReader(ensure_hf_tokenizer_gguf(model, tmp_path / "cache"), "r")
+
+    assert reader.get_field("tokenizer.ggml.pre").contents() == "tekken"
+    assert reader.get_field("tokenizer.ggml.add_bos_token").contents() is False
+
+
+def test_template_post_processor_records_its_bos(tmp_path: Path) -> None:
+    model = tmp_path / "Tekken-Bos-Test"
+    _hf_fixture(model, model_type="unlisted_hybrid", tensor_name="embed.weight")
+    _set_tokenizer_pipeline(
+        model,
+        split=TEKKEN_SPLIT,
+        post_processor={
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+            ],
+        },
+    )
+
+    reader = GGUFReader(ensure_hf_tokenizer_gguf(model, tmp_path / "cache"), "r")
+
+    assert reader.get_field("tokenizer.ggml.add_bos_token").contents() is True
+
+
+def test_unknown_split_regex_is_still_rejected(tmp_path: Path) -> None:
+    model = tmp_path / "Unknown-Test"
+    _hf_fixture(model, model_type="unlisted_hybrid", tensor_name="embed.weight")
+    _set_tokenizer_pipeline(model, split=r"\s+", post_processor={"type": "ByteLevel"})
+
+    with pytest.raises(
+        HfTokenizerError,
+        match="unsupported native HF tokenizer family: unlisted_hybrid",
+    ):
+        ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+
+
 def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
