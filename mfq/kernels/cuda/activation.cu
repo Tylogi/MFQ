@@ -217,6 +217,52 @@ mfq_tensor_backend::Tensor gelu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_te
         mfq_current_cuda_stream());
     return out;
 }
+// relu(x)^2: the ungated expert / projector activation. One line per element,
+// f32 accumulation, the result is rounded back to the input dtype.
+template <typename scalar_t>
+__global__ void relu_squared_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ out,
+    size_t n)
+{
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const float value = fmaxf(activation_as_float(input[i]), 0.0f);
+        out[i] = activation_from_float<scalar_t>(value * value);
+    }
+}
+
+mfq_tensor_backend::Tensor relu_squared_cuda(mfq_tensor_backend::Tensor input)
+{
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous(),
+        "relu_squared: input must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(
+        input.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        input.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        input.scalar_type() == mfq_tensor_backend::kBFloat16,
+        "relu_squared: dtype must be f32, f16, or bf16");
+    auto out = mfq_tensor_backend::empty_like(input);
+    const size_t elements = (size_t)input.numel();
+    if (elements == 0) return out;
+    constexpr int block = 256;
+    const int grid = (int)std::min<size_t>(4096, (elements + block - 1) / block);
+    cudaStream_t stream = mfq_current_cuda_stream();
+    if (input.scalar_type() == mfq_tensor_backend::kFloat32) {
+        relu_squared_kernel<float><<<grid, block, 0, stream>>>(
+            input.data_ptr<float>(), out.data_ptr<float>(), elements);
+    } else if (input.scalar_type() == mfq_tensor_backend::kFloat16) {
+        relu_squared_kernel<__half><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), elements);
+    } else {
+        relu_squared_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<mfq_bfloat16>()), elements);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 
 
 template <typename scalar_t>

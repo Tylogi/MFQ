@@ -107,6 +107,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/selective_state_scan.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
 )
 
@@ -235,6 +236,11 @@ if(BUILD_TESTING)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_activation_test.cu
         mfq-cuda-native-kernels)
+    mfq_add_cuda_test(mfq-recurrent-mixer-ops-test
+        ${MFQ_CUDA_ROOT}/tests/recurrent_mixer_ops_test.cpp
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-recurrent-mixer-ops-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-nint-q8-test
         ${MFQ_CUDA_ROOT}/tests/mfq_nint_q8_test.cu
         mfq-cuda-native-kernels)
