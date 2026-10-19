@@ -58,6 +58,14 @@ _REGISTRY = (
         aliases=("gemma4", "gemma4_text"),
         features=ModelFeatureSet(),
     ),
+    # Nemotron-H is import-only today: the family is registered so artifacts
+    # report their real name, but no media, MTP or speculative capability is
+    # advertised until the runtime phases implement them.
+    _CapabilityRegistration(
+        family="nemotron_h",
+        aliases=("nemotron_h", "nemotron_h_text", "nemotron_h_omni"),
+        features=ModelFeatureSet(),
+    ),
     _CapabilityRegistration(
         family="qwen3_5",
         aliases=("qwen3_5", "qwen35"),

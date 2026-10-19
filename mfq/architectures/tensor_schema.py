@@ -21,6 +21,13 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from mfq.architectures.hf_config import text_section
+from mfq.architectures.nemotron_h import (
+    NemotronHConfig,
+    layer_mixers_from_config,
+    mtp_mixers_from_config,
+)
+
 if TYPE_CHECKING:
     from mfq.formats.assets import RuntimeAsset
 
@@ -175,6 +182,10 @@ SourceMapper = Callable[
     [str, GraphTopology, Mapping[str, object]],
     TensorNameMapping | None,
 ]
+SourceShapeValidator = Callable[
+    [Mapping[str, object], Mapping[str, tuple[int, ...]]],
+    None,
+]
 SourceAssetBuilder = Callable[
     [Path, Mapping[str, object]],
     Sequence["RuntimeAsset"],
@@ -203,6 +214,16 @@ class TensorSchemaRegistration:
     backbone: str = ""
     component_specs: tuple[GraphComponentSpec, ...] = ()
     source_asset_builder: SourceAssetBuilder | None = None
+    # Routed-expert projections this family stores one expert at a time.  The
+    # shared importer banks exactly these projections and derives the bank
+    # geometry from ``up``, so a non-gated family needs no importer branch.
+    expert_projections: tuple[str, ...] = ("gate", "up", "down")
+    # Canonical suffixes that must keep float32 storage on import (recurrent
+    # state, convolution and router-bias parameters).
+    float32_weight_roles: tuple[str, ...] = ()
+    # Optional import-boundary check between the declared geometry and the
+    # checkpoint payload, keyed by source tensor name.
+    source_shape_validator: SourceShapeValidator | None = None
 
     def __post_init__(self) -> None:
         if not self.backbone:
@@ -227,8 +248,7 @@ def register_tensor_schema(registration: TensorSchemaRegistration) -> None:
 def tensor_schema_for_config(
     config: Mapping[str, object],
 ) -> TensorSchemaRegistration | None:
-    raw_text = config.get("text_config", config)
-    text = raw_text if isinstance(raw_text, Mapping) else {}
+    text = text_section(config)
     for value in (text.get("model_type"), config.get("model_type")):
         registration = _SCHEMAS.get(str(value or "").lower())
         if registration is not None:
@@ -237,11 +257,16 @@ def tensor_schema_for_config(
 
 
 def topology_from_config(config: Mapping[str, object]) -> GraphTopology:
-    raw_text = config.get("text_config", config)
-    text = raw_text if isinstance(raw_text, Mapping) else {}
+    text = text_section(config)
     raw_vision = config.get("vision_config", {})
     vision = raw_vision if isinstance(raw_vision, Mapping) else {}
     text_layers = int(text.get("num_hidden_layers", 0) or 0)
+    # Hybrid schedules declare one mixer per layer and no layer count; the
+    # block list is authoritative there (as in transformers) because the
+    # stored ``num_hidden_layers`` is a deprecated, possibly stale echo.
+    block_types = text.get("layers_block_type")
+    if isinstance(block_types, Sequence) and not isinstance(block_types, (str, bytes)) and block_types:
+        text_layers = len(block_types)
     predictor_layers = int(
         text.get(
             "mtp_num_hidden_layers",
@@ -249,6 +274,15 @@ def topology_from_config(config: Mapping[str, object]) -> GraphTopology:
         )
         or 0
     )
+    # A predictor body may itself be a block list (Nemotron-H attention + moe).
+    mtp_types = text.get("mtp_layers_block_type")
+    if (
+        predictor_layers > 0
+        and isinstance(mtp_types, Sequence)
+        and not isinstance(mtp_types, (str, bytes))
+        and mtp_types
+    ):
+        predictor_layers = len(mtp_types)
     model_type = str(text.get("model_type", config.get("model_type", ""))).lower()
     if model_type in {"deepseek_v4", "deepseek_v41_text"}:
         target_layers = text.get("dspark_target_layer_ids", ())
@@ -651,6 +685,11 @@ def _already_canonical(source_name: str) -> TensorNameMapping | None:
             "vision.resampler.",
             "vision.aligner.",
             "vision.special_token.",
+            "vision.projector.",
+            "vision.cls_register_token.",
+            "vision.video_patch_embedding.",
+            "vision.input_conditioner.",
+            "vision.summary_indices",
         )
     ):
         return TensorNameMapping(source_name, TensorComponent.VISION)
@@ -1117,8 +1156,7 @@ def _glm5_source_mapper(
             return TensorNameMapping(predictor_root, component)
     suffix = _GLM5_LAYER_SUFFIXES.get(source_suffix)
     if source_suffix == "self_attn.o_proj.weight":
-        raw_text = config.get("text_config", config)
-        text = raw_text if isinstance(raw_text, Mapping) else {}
+        text = text_section(config)
         layer_types = text.get("layer_types", ())
         is_linear = (
             component is TensorComponent.MODEL
@@ -1937,6 +1975,378 @@ def _gemma4_source_mapper(
     )
 
 
+_NEMOTRON_BACKBONE_LAYER_RE = re.compile(r"^language_model\.backbone\.layers\.(\d+)\.(.+)$")
+_NEMOTRON_MTP_LAYER_RE = re.compile(r"^language_model\.mtp\.layers\.(\d+)\.(.+)$")
+
+_NEMOTRON_ROOTS = {
+    "language_model.backbone.embeddings.weight": "model.token_embedding.weight",
+    "language_model.backbone.norm_f.weight": "model.output_norm.weight",
+    "language_model.lm_head.weight": "model.output.weight",
+}
+
+# Every Nemotron-H block is one pre-normed mixer, so the block-scoped norm keeps
+# the existing pre-mixer role whatever the mixer kind is.
+_NEMOTRON_BLOCK_NORM = "attention.norm.weight"
+
+_NEMOTRON_MIXER_SUFFIXES: dict[str, dict[str, str]] = {
+    "linear_attention": {
+        "mixer.A_log": "linear_attention.a",
+        "mixer.D": "linear_attention.d",
+        "mixer.conv1d.weight": "linear_attention.conv.weight",
+        "mixer.conv1d.bias": "linear_attention.conv.bias",
+        "mixer.dt_bias": "linear_attention.dt_bias",
+        "mixer.in_proj.weight": "linear_attention.in_projection.weight",
+        "mixer.norm.weight": "linear_attention.norm.weight",
+        "mixer.out_proj.weight": "linear_attention.output.weight",
+    },
+    "full_attention": {
+        "mixer.q_proj.weight": "attention.query.weight",
+        "mixer.k_proj.weight": "attention.key.weight",
+        "mixer.v_proj.weight": "attention.value.weight",
+        "mixer.o_proj.weight": "attention.output.weight",
+    },
+    "moe": {
+        "mixer.gate.weight": "mlp.router.weight",
+        "mixer.gate.e_score_correction_bias": "mlp.router.bias",
+        "mixer.fc1_latent_proj.weight": "mlp.latent.down.weight",
+        "mixer.fc2_latent_proj.weight": "mlp.latent.up.weight",
+        "mixer.shared_experts.up_proj.weight": "mlp.shared_expert.up.weight",
+        "mixer.shared_experts.down_proj.weight": "mlp.shared_expert.down.weight",
+    },
+    "mlp": {
+        "mixer.up_proj.weight": "mlp.up.weight",
+        "mixer.down_proj.weight": "mlp.down.weight",
+    },
+}
+
+_NEMOTRON_EXPERT_RE = re.compile(r"^mixer\.experts\.(\d+)\.(up|down)_proj\.weight$")
+
+# The MTP fusion roots live next to the first predictor block in the payload;
+# they are shared by every stage and therefore keep unindexed canonical names.
+_NEMOTRON_MTP_ROOTS = {
+    "eh_proj.weight": "predictor.fusion.weight",
+    "enorm.weight": "predictor.embedding_norm.weight",
+    "hnorm.weight": "predictor.hidden_norm.weight",
+    "final_layernorm.weight": "predictor.output_norm.weight",
+}
+
+_NEMOTRON_VISION_ROOTS = {
+    "vision_model.radio_model.input_conditioner.norm_mean": "vision.input_conditioner.mean",
+    "vision_model.radio_model.input_conditioner.norm_std": "vision.input_conditioner.std",
+    "vision_model.radio_model.model.patch_generator.embedder.weight": (
+        "vision.patch_embedding.weight"
+    ),
+    "vision_model.radio_model.model.patch_generator.video_embedder.weight": (
+        "vision.video_patch_embedding.weight"
+    ),
+    "vision_model.radio_model.model.patch_generator.pos_embed": (
+        "vision.position_embedding.weight"
+    ),
+    "vision_model.radio_model.model.patch_generator.cls_token.token": (
+        "vision.cls_register_token.weight"
+    ),
+    "vision_model.summary_idxs": "vision.summary_indices",
+    "vision_projector.vision_final_layernorm.weight": "vision.projector.norm.weight",
+    "vision_projector.vision_final_layernorm.bias": "vision.projector.norm.bias",
+    "mlp1.0.weight": "vision.projector.mlp.norm.weight",
+    "mlp1.1.weight": "vision.projector.mlp.up.weight",
+    "mlp1.3.weight": "vision.projector.mlp.down.weight",
+}
+
+_NEMOTRON_VISION_BLOCK_RE = re.compile(
+    r"^vision_model\.radio_model\.model\.blocks\.(\d+)\.(.+)$"
+)
+_NEMOTRON_VISION_BLOCK_SUFFIXES = {
+    "norm1.weight": "norm1.weight",
+    "norm1.bias": "norm1.bias",
+    "norm2.weight": "norm2.weight",
+    "norm2.bias": "norm2.bias",
+    "attn.qkv.weight": "attention.qkv.weight",
+    "attn.qkv.bias": "attention.qkv.bias",
+    "attn.proj.weight": "attention.output.weight",
+    "attn.proj.bias": "attention.output.bias",
+    "mlp.fc1.weight": "mlp.up.weight",
+    "mlp.fc1.bias": "mlp.up.bias",
+    "mlp.fc2.weight": "mlp.down.weight",
+    "mlp.fc2.bias": "mlp.down.bias",
+}
+
+_NEMOTRON_CANONICAL_BLOCK_RE = re.compile(r"^(model|predictor)\.block\.(\d+)\.(.+)$")
+_NEMOTRON_CANONICAL_EXPERT_RE = re.compile(r"^mlp\.experts\.(\d+)\.(up|down)\.weight$")
+_NEMOTRON_CANONICAL_VISION_BLOCK_RE = re.compile(r"^vision\.block\.(\d+)\.(.+)$")
+
+
+def _nemotron_h_block_suffix(
+    layer: int,
+    source_suffix: str,
+    config: Mapping[str, object],
+    *,
+    predictor: bool = False,
+) -> str | None:
+    """Resolve one Nemotron-H block tensor to its canonical leaf.
+
+    The mixer kind is taken from the declared block schedule, never inferred
+    from the tensor name: a MoE block and a Mamba block both carry a
+    ``...norm.weight`` and an ``...mixer.*`` prefix.
+    """
+
+    if source_suffix == "norm.weight":
+        return _NEMOTRON_BLOCK_NORM
+    mixers = mtp_mixers_from_config(config) if predictor else layer_mixers_from_config(config)
+    if layer >= len(mixers):
+        return None
+    mixer = mixers[layer]
+    suffixes = _NEMOTRON_MIXER_SUFFIXES[mixer]
+    expert = _NEMOTRON_EXPERT_RE.match(source_suffix)
+    if expert is not None:
+        if mixer != "moe":
+            return None
+        return f"mlp.experts.{int(expert.group(1))}.{expert.group(2)}.weight"
+    return suffixes.get(source_suffix)
+
+
+def _nemotron_h_source_mapper(
+    source_name: str,
+    _topology: GraphTopology,
+    config: Mapping[str, object],
+) -> TensorNameMapping | None:
+    """Map one Nemotron-H text/omni tensor into the canonical vocabulary."""
+
+    canonical = _already_canonical(source_name)
+    if canonical is not None:
+        return canonical
+    root = _NEMOTRON_ROOTS.get(source_name)
+    if root is not None:
+        return TensorNameMapping(root, TensorComponent.MODEL)
+    vision = _NEMOTRON_VISION_ROOTS.get(source_name)
+    if vision is not None:
+        return TensorNameMapping(vision, TensorComponent.VISION)
+    match = _NEMOTRON_VISION_BLOCK_RE.match(source_name)
+    if match is not None:
+        suffix = _NEMOTRON_VISION_BLOCK_SUFFIXES.get(match.group(2))
+        if suffix is None:
+            return None
+        return TensorNameMapping(
+            vision_block(int(match.group(1)), suffix),
+            TensorComponent.VISION,
+        )
+
+    match = _NEMOTRON_BACKBONE_LAYER_RE.match(source_name)
+    if match is not None:
+        suffix = _nemotron_h_block_suffix(int(match.group(1)), match.group(2), config)
+        if suffix is None:
+            return None
+        return TensorNameMapping(
+            model_block(int(match.group(1)), suffix),
+            TensorComponent.MODEL,
+        )
+
+    match = _NEMOTRON_MTP_LAYER_RE.match(source_name)
+    if match is None:
+        return None
+    layer = int(match.group(1))
+    source_suffix = match.group(2)
+    predictor_root = _NEMOTRON_MTP_ROOTS.get(source_suffix)
+    if predictor_root is not None:
+        return TensorNameMapping(predictor_root, TensorComponent.PREDICTOR)
+    suffix = _nemotron_h_block_suffix(layer, source_suffix, config, predictor=True)
+    if suffix is None:
+        return None
+    return TensorNameMapping(
+        predictor_block(layer, suffix),
+        TensorComponent.PREDICTOR,
+    )
+
+
+def _nemotron_h_block_shape(
+    contract: NemotronHConfig,
+    mixer: str,
+    suffix: str,
+) -> tuple[int, ...] | None:
+    """Return the payload shape one canonical block tensor must have."""
+
+    hidden = contract.hidden_size
+    if suffix == _NEMOTRON_BLOCK_NORM:
+        return (hidden,)
+    if mixer == "linear_attention":
+        heads = contract.mamba_num_heads
+        return {
+            "linear_attention.in_projection.weight": (
+                contract.mamba_in_projection_width,
+                hidden,
+            ),
+            "linear_attention.conv.weight": (
+                contract.mamba_conv_width,
+                1,
+                contract.conv_kernel,
+            ),
+            "linear_attention.conv.bias": (contract.mamba_conv_width,),
+            "linear_attention.a": (heads,),
+            "linear_attention.d": (heads,),
+            "linear_attention.dt_bias": (heads,),
+            "linear_attention.norm.weight": (contract.mamba_inner_size,),
+            "linear_attention.output.weight": (hidden, contract.mamba_inner_size),
+        }.get(suffix)
+    if mixer == "full_attention":
+        return {
+            "attention.query.weight": (contract.attention_width, hidden),
+            "attention.key.weight": (contract.key_value_width, hidden),
+            "attention.value.weight": (contract.key_value_width, hidden),
+            "attention.output.weight": (hidden, contract.attention_width),
+        }.get(suffix)
+    if mixer == "mlp":
+        return {
+            "mlp.up.weight": (contract.intermediate_size, hidden),
+            "mlp.down.weight": (hidden, contract.intermediate_size),
+        }.get(suffix)
+    expert = _NEMOTRON_CANONICAL_EXPERT_RE.match(suffix)
+    if expert is not None:
+        index = int(expert.group(1))
+        if index >= contract.num_experts:
+            raise ValueError(
+                f"Nemotron-H expert index {index} exceeds n_routed_experts "
+                f"{contract.num_experts}"
+            )
+        expert_hidden = contract.moe_intermediate_size
+        latent = contract.moe_latent_size
+        return (
+            (expert_hidden, latent)
+            if expert.group(2) == "up"
+            else (latent, expert_hidden)
+        )
+    latent = contract.moe_latent_size
+    return {
+        "mlp.router.weight": (contract.num_experts, hidden),
+        "mlp.router.bias": (contract.num_experts,),
+        "mlp.latent.down.weight": (latent, hidden),
+        "mlp.latent.up.weight": (hidden, latent),
+        "mlp.shared_expert.up.weight": (contract.moe_shared_intermediate_size, hidden),
+        "mlp.shared_expert.down.weight": (hidden, contract.moe_shared_intermediate_size),
+    }.get(suffix)
+
+
+def _nemotron_h_vision_shape(
+    contract: NemotronHConfig,
+    canonical_name: str,
+) -> tuple[int, ...] | None:
+    """Return the payload shape one canonical RADIO/projector tensor must have."""
+
+    vision = contract.vision
+    if vision is None:
+        return None
+    patch_width = vision.num_channels * vision.patch_size * vision.patch_size
+    shapes = {
+        "vision.patch_embedding.weight": (vision.hidden_size, patch_width),
+        "vision.position_embedding.weight": (
+            1,
+            vision.position_side * vision.position_side,
+            vision.hidden_size,
+        ),
+        "vision.cls_register_token.weight": (vision.summary_tokens, vision.hidden_size),
+        "vision.input_conditioner.mean": (vision.num_channels,),
+        "vision.input_conditioner.std": (vision.num_channels,),
+        "vision.summary_indices": (len(vision.summary_idxs),),
+    }
+    temporal = vision.video_temporal_patch_size
+    if temporal:
+        shapes["vision.video_patch_embedding.weight"] = (
+            vision.hidden_size,
+            temporal * patch_width,
+        )
+    projector = contract.projector
+    if projector is not None:
+        shapes.update(
+            {
+                "vision.projector.norm.weight": (projector.vision_hidden_size,),
+                "vision.projector.norm.bias": (projector.vision_hidden_size,),
+                "vision.projector.mlp.norm.weight": (projector.patch_width,),
+                "vision.projector.mlp.up.weight": (
+                    projector.intermediate_size,
+                    projector.patch_width,
+                ),
+                "vision.projector.mlp.down.weight": (
+                    projector.text_hidden_size,
+                    projector.intermediate_size,
+                ),
+            }
+        )
+    shape = shapes.get(canonical_name)
+    if shape is not None:
+        return shape
+    match = _NEMOTRON_CANONICAL_VISION_BLOCK_RE.match(canonical_name)
+    if match is None:
+        return None
+    return {
+        "norm1.weight": (vision.hidden_size,),
+        "norm1.bias": (vision.hidden_size,),
+        "norm2.weight": (vision.hidden_size,),
+        "norm2.bias": (vision.hidden_size,),
+        "attention.qkv.weight": (3 * vision.hidden_size, vision.hidden_size),
+        "attention.qkv.bias": (3 * vision.hidden_size,),
+        "attention.output.weight": (vision.hidden_size, vision.hidden_size),
+        "attention.output.bias": (vision.hidden_size,),
+        "mlp.up.weight": (vision.intermediate_size, vision.hidden_size),
+        "mlp.up.bias": (vision.intermediate_size,),
+        "mlp.down.weight": (vision.hidden_size, vision.intermediate_size),
+        "mlp.down.bias": (vision.hidden_size,),
+    }.get(match.group(2))
+
+
+def _nemotron_h_canonical_shape(
+    contract: NemotronHConfig,
+    canonical_name: str,
+) -> tuple[int, ...] | None:
+    """Return the payload shape implied by the config for one canonical name."""
+
+    hidden = contract.hidden_size
+    root = {
+        "model.token_embedding.weight": (contract.vocab_size, hidden),
+        "model.output.weight": (contract.vocab_size, hidden),
+        "model.output_norm.weight": (hidden,),
+        "predictor.fusion.weight": (hidden, 2 * hidden),
+        "predictor.embedding_norm.weight": (hidden,),
+        "predictor.hidden_norm.weight": (hidden,),
+        "predictor.output_norm.weight": (hidden,),
+    }.get(canonical_name)
+    if root is not None:
+        return root
+    match = _NEMOTRON_CANONICAL_BLOCK_RE.match(canonical_name)
+    if match is None:
+        return _nemotron_h_vision_shape(contract, canonical_name)
+    component, raw_layer, suffix = match.groups()
+    mixers = contract.mixer_types if component == "model" else contract.mtp_mixer_types
+    layer = int(raw_layer)
+    if layer >= len(mixers):
+        return None
+    return _nemotron_h_block_shape(contract, mixers[layer], suffix)
+
+
+def _nemotron_h_source_shape_validator(
+    config: Mapping[str, object],
+    shapes: Mapping[str, tuple[int, ...]],
+) -> None:
+    """Reject a Nemotron-H payload whose geometry contradicts its config.
+
+    Runs at the import boundary before any tensor is read, so a config that
+    was copied between variants fails loudly instead of producing a container
+    that cannot be loaded.
+    """
+
+    contract = NemotronHConfig.from_hf_config(config)
+    topology = GraphTopology(text_layers=contract.num_hidden_layers)
+    for source_name, actual in shapes.items():
+        mapped = _nemotron_h_source_mapper(source_name, topology, config)
+        if mapped is None:
+            continue
+        expected = _nemotron_h_canonical_shape(contract, mapped.canonical_name)
+        if expected is None or tuple(int(value) for value in actual) == expected:
+            continue
+        raise ValueError(
+            f"Nemotron-H source tensor shape mismatch for {source_name}: "
+            f"checkpoint={tuple(actual)}, expected={expected}"
+        )
+
+
 def _minicpmo_source_assets(
     _root: Path,
     _config: Mapping[str, object],
@@ -1952,8 +2362,7 @@ def _deepseek_v41_source_assets(
 ) -> Sequence["RuntimeAsset"]:
     from mfq.formats.assets import deepseek_v41_engram_asset
 
-    raw_text = config.get("text_config", config)
-    text = raw_text if isinstance(raw_text, Mapping) else {}
+    text = text_section(config)
     layer_ids = text.get("engram_layer_ids", ())
     if not isinstance(layer_ids, Sequence) or isinstance(layer_ids, (str, bytes)):
         return ()
@@ -2087,6 +2496,46 @@ register_tensor_schema(
         architecture="gemma4",
         aliases=("gemma4_text",),
         source_mapper=_gemma4_source_mapper,
+    )
+)
+
+register_tensor_schema(
+    TensorSchemaRegistration(
+        architecture="nemotron_h_omni",
+        aliases=("nemotron_h", "nemotron_h_text"),
+        source_mapper=_nemotron_h_source_mapper,
+        backbone="nemotron_h",
+        # Routed experts are plain relu-squared MLPs: the bank stores up/down
+        # only, so a non-gated family needs no importer-side special case.
+        expert_projections=("up", "down"),
+        # Recurrent state, depthwise convolution and router parameters must
+        # not be narrowed on import.
+        float32_weight_roles=(
+            ".linear_attention.a",
+            ".linear_attention.d",
+            ".linear_attention.dt_bias",
+            ".linear_attention.conv.weight",
+            ".linear_attention.conv.bias",
+            ".linear_attention.norm.weight",
+            ".mlp.router.weight",
+            ".mlp.router.bias",
+        ),
+        source_shape_validator=_nemotron_h_source_shape_validator,
+        component_specs=(
+            GraphComponentSpec(
+                TensorComponent.VISION,
+                "vision",
+                "radio",
+                input_contract="radio_cpe.v1",
+                capabilities=("vision",),
+            ),
+            GraphComponentSpec(
+                TensorComponent.PREDICTOR,
+                "predictor",
+                "nemotron_h_mtp",
+                capabilities=("speculative_prediction",),
+            ),
+        ),
     )
 )
 

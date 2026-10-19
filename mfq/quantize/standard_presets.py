@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from mfq.architectures.hf_config import text_section
+
 STANDARD_PRESET_NAMES = (
     "S2-S",
     "S2-M",
@@ -84,16 +86,24 @@ class ModelTopology:
 
     @classmethod
     def from_hf_config(cls, config: Mapping[str, object]) -> ModelTopology:
-        raw_text = config.get("text_config", config)
-        text = raw_text if isinstance(raw_text, Mapping) else {}
+        text = text_section(config)
         raw_vision = config.get("vision_config", {})
         vision = raw_vision if isinstance(raw_vision, Mapping) else {}
         text_heads = int(text.get("num_attention_heads", 0) or 0)
         text_kv_heads = int(text.get("num_key_value_heads", text_heads) or text_heads or 1)
         vision_heads = int(vision.get("num_heads", vision.get("num_attention_heads", 0)) or 0)
         vision_kv_heads = int(vision.get("num_key_value_heads", vision_heads) or vision_heads or 1)
+        text_layers = int(text.get("num_hidden_layers", 0) or 0)
+        # Hybrid schedules declare one mixer per layer and no layer count.
+        block_types = text.get("layers_block_type")
+        if (
+            isinstance(block_types, Sequence)
+            and not isinstance(block_types, (str, bytes))
+            and block_types
+        ):
+            text_layers = len(block_types)
         return cls(
-            text_layers=int(text.get("num_hidden_layers", 0) or 0),
+            text_layers=text_layers,
             text_heads=text_heads,
             text_kv_heads=text_kv_heads,
             vision_layers=int(vision.get("depth", vision.get("num_hidden_layers", 0)) or 0),

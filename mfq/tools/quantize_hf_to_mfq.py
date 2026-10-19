@@ -34,7 +34,7 @@ import torch
 from safetensors import safe_open
 
 from mfq.architectures.deepseek_v41 import parse_deepseek_v41_config
-from mfq.architectures.hf_config import load_hf_model_config
+from mfq.architectures.hf_config import load_hf_model_config, text_section
 from mfq.architectures.tensor_schema import (
     TensorComponent,
     graph_spec_for_plan,
@@ -2436,6 +2436,8 @@ _MOSTLY_BF16_F32_WEIGHT_MARKERS = (
     "router.proj.weight",
     "ssm_conv1d",
     "linear_attn.conv1d",
+    "mixer.conv1d",
+    "mixer.gate.weight",
     "shortconv.conv",
     "time_mix",
     "indexer",
@@ -3067,6 +3069,7 @@ def _calibration_target(selection) -> str:
 
 
 _FLASH_NEXT_TEXT_TYPES = frozenset({"qwen4_exp_text", "glm5_next_text"})
+_NEMOTRON_TEXT_TYPES = frozenset({"nemotron_h", "nemotron_h_text"})
 _CANONICAL_SEPARATE_EXPERT_RE = re.compile(
     r"^((?:model|vision)\.block\.\d+\.mlp\.experts|"
     r"predictor\.(?:block|stage)\.\d+\.mlp\.experts)\."
@@ -3176,6 +3179,13 @@ def _separate_hf_expert_plans(
             tuple(scale_dtypes),
         )
 
+    registration = tensor_schema_for_config(config)
+    required_projections = (
+        registration.expert_projections
+        if registration is not None
+        else ("gate", "up", "down")
+    )
+
     for prefix, experts in sorted(groups.items()):
         preserve_source = (
             prefix.startswith("predictor.")
@@ -3191,57 +3201,50 @@ def _separate_hf_expert_plans(
             raise ValueError(
                 f"incomplete expert set under {prefix}: missing={missing[:8]} extra={extra[:8]}"
             )
-        gate_names: list[tuple[str, ...]] = []
-        gate_shards: list[tuple[str, ...]] = []
-        up_names: list[tuple[str, ...]] = []
-        up_shards: list[tuple[str, ...]] = []
-        down_names: list[tuple[str, ...]] = []
-        down_shards: list[tuple[str, ...]] = []
+        projection_names: dict[str, list[tuple[str, ...]]] = {
+            projection: [] for projection in required_projections
+        }
+        projection_shards: dict[str, list[tuple[str, ...]]] = {
+            projection: [] for projection in required_projections
+        }
+        expert_hidden = 0
+        width = 0
         for expert in range(expected_experts):
             projections = experts[expert]
-            if set(projections) != {"gate", "up", "down"}:
+            if set(projections) != set(required_projections):
                 raise ValueError(
-                    f"incomplete expert {expert} under {prefix}: {sorted(projections)}"
+                    f"incomplete expert {expert} under {prefix}: {sorted(projections)} "
+                    f"(this architecture stores {sorted(required_projections)})"
                 )
-            gate = projections["gate"]
-            up = projections["up"]
-            down = projections["down"]
-            gate_shape = logical_shape(gate)
-            down_shape = logical_shape(down)
-            if len(gate_shape) != 2:
-                raise ValueError(f"routed Gate source must be rank-2: {gate}")
-            expert_hidden, hidden = map(int, gate_shape)
-            for name, expected_shape in (
-                (gate, (expert_hidden, hidden)),
-                (up, (expert_hidden, hidden)),
-                (down, (hidden, expert_hidden)),
-            ):
+            up_shape = logical_shape(projections["up"])
+            if len(up_shape) != 2:
+                raise ValueError(f"routed Up source must be rank-2: {projections['up']}")
+            if expert == 0:
+                expert_hidden, width = map(int, up_shape)
+                expected_shapes = {
+                    "up": (expert_hidden, width),
+                    "down": (width, expert_hidden),
+                }
+                if "gate" in required_projections:
+                    expected_shapes["gate"] = (expert_hidden, width)
+            for projection in required_projections:
+                name = projections[projection]
+                expected_shape = expected_shapes[projection]
                 actual_shape = logical_shape(name)
                 if actual_shape != expected_shape:
                     raise ValueError(
                         f"expert source shape differs for {name}: "
                         f"{actual_shape} != {expected_shape}"
                     )
-            gate_names.append((gate,))
-            gate_shards.append((inventory[gate].shard,))
-            up_names.append((up,))
-            up_shards.append((inventory[up].shard,))
-            down_names.append((down,))
-            down_shards.append((inventory[down].shard,))
-            consumed.update((gate, up, down))
+                projection_names[projection].append((name,))
+                projection_shards[projection].append((inventory[name].shard,))
+                consumed.add(name)
 
-        projection_shape = (expected_experts, expert_hidden, hidden)
-        down_shape = (expected_experts, hidden, expert_hidden)
+        projection_shape = (expected_experts, expert_hidden, width)
+        down_shape = (expected_experts, width, expert_hidden)
         gate_target = prefix + ".gate.weight"
         up_target = prefix + ".up.weight"
         down_target = prefix + ".down.weight"
-        gate_q, gate_scale_names, gate_scale_shards, gate_scale_dtypes = source_fields(
-            gate_names
-        )
-        up_q, up_scale_names, up_scale_shards, up_scale_dtypes = source_fields(up_names)
-        down_q, down_scale_names, down_scale_shards, down_scale_dtypes = source_fields(
-            down_names
-        )
 
         def target_fields(
             names: list[tuple[str, ...]],
@@ -3287,50 +3290,58 @@ def _separate_hf_expert_plans(
                 ),
             }
 
-        plans.extend(
-            (
-                TensorPlan(
-                    name=gate_target,
-                    shard=gate_shards[0][0],
-                    shape=projection_shape,
-                    source_dtype=logical_dtype(gate_names[0][0]),
-                    transform="hf_expert_gate",
-                    expert_source_names=tuple(gate_names),
-                    expert_source_shards=tuple(gate_shards),
-                    expert_source_quantizations=gate_q,
-                    expert_source_scale_names=gate_scale_names,
-                    expert_source_scale_shards=gate_scale_shards,
-                    expert_source_scale_dtypes=gate_scale_dtypes,
-                    **target_fields(gate_names, gate_target, projection_shape),
-                ),
-                TensorPlan(
-                    name=up_target,
-                    shard=up_shards[0][0],
-                    shape=projection_shape,
-                    source_dtype=logical_dtype(up_names[0][0]),
-                    transform="hf_expert_up",
-                    expert_source_names=tuple(up_names),
-                    expert_source_shards=tuple(up_shards),
-                    expert_source_quantizations=up_q,
-                    expert_source_scale_names=up_scale_names,
-                    expert_source_scale_shards=up_scale_shards,
-                    expert_source_scale_dtypes=up_scale_dtypes,
-                    **target_fields(up_names, up_target, projection_shape),
-                ),
-                TensorPlan(
-                    name=down_target,
-                    shard=down_shards[0][0],
-                    shape=down_shape,
-                    source_dtype=logical_dtype(down_names[0][0]),
-                    transform="hf_expert_down",
-                    expert_source_names=tuple(down_names),
-                    expert_source_shards=tuple(down_shards),
-                    expert_source_quantizations=down_q,
-                    expert_source_scale_names=down_scale_names,
-                    expert_source_scale_shards=down_scale_shards,
-                    expert_source_scale_dtypes=down_scale_dtypes,
-                    **target_fields(down_names, down_target, down_shape),
-                ),
+        def expert_plan(
+            projection: str,
+            target_name: str,
+            target_shape: tuple[int, int, int],
+            names: list[tuple[str, ...]],
+            shards: list[tuple[str, ...]],
+        ) -> TensorPlan:
+            schemes, scale_names, scale_shards, scale_dtypes = source_fields(names)
+            return TensorPlan(
+                name=target_name,
+                shard=shards[0][0],
+                shape=target_shape,
+                source_dtype=logical_dtype(names[0][0]),
+                transform=f"hf_expert_{projection}",
+                expert_source_names=tuple(names),
+                expert_source_shards=tuple(shards),
+                expert_source_quantizations=schemes,
+                expert_source_scale_names=scale_names,
+                expert_source_scale_shards=scale_shards,
+                expert_source_scale_dtypes=scale_dtypes,
+                **target_fields(names, target_name, target_shape),
+            )
+
+        # A non-gated family stores no ``gate`` projection, so its bank keeps
+        # only up/down and the loader sees the missing role instead of an
+        # empty or duplicated gate.
+        if "gate" in projection_names:
+            plans.append(
+                expert_plan(
+                    "gate",
+                    gate_target,
+                    projection_shape,
+                    projection_names["gate"],
+                    projection_shards["gate"],
+                )
+            )
+        plans.append(
+            expert_plan(
+                "up",
+                up_target,
+                projection_shape,
+                projection_names["up"],
+                projection_shards["up"],
+            )
+        )
+        plans.append(
+            expert_plan(
+                "down",
+                down_target,
+                down_shape,
+                projection_names["down"],
+                projection_shards["down"],
             )
         )
     return plans, consumed
@@ -3506,7 +3517,15 @@ def _plan(
     # use canonical names whenever a registered mapping exists.
     legacy_mfq_input = root.is_file() and source_inventory is not None
     canonical_schema = tensor_schema_for_config(raw_config)
-    model_config = raw_config.get("text_config", raw_config)
+    if canonical_schema is not None and canonical_schema.source_shape_validator is not None:
+        canonical_schema.source_shape_validator(
+            raw_config,
+            {name: metadata.shape for name, metadata in inventory.items()},
+        )
+    float32_weight_roles = (
+        canonical_schema.float32_weight_roles if canonical_schema is not None else ()
+    )
+    model_config = text_section(raw_config)
     if not isinstance(model_config, dict):
         raise ValueError("HF text_config must be an object")
     mtp_included, _mtp_layers = _mtp_inventory_status(
@@ -3518,6 +3537,7 @@ def _plan(
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
     is_deepseek_v41 = model_config.get("model_type") == "deepseek_v41_text"
+    is_nemotron_h = model_config.get("model_type") in _NEMOTRON_TEXT_TYPES
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
@@ -3531,6 +3551,11 @@ def _plan(
         raise ValueError(
             "DeepSeek-V4.1 has no GGUF recipe mapping; use an MFQ standard "
             "preset or a calibration scheme"
+        )
+    if is_nemotron_h and recipe_types is not None:
+        raise ValueError(
+            "Nemotron-H has no GGUF recipe mapping; use the native HF "
+            "conversion policy or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
     preserved_ple_scale_names: set[str] = set()
@@ -3768,6 +3793,10 @@ def _plan(
                 target = source_dtype
             elif preserve_scope or name in _MTP_PROTECTED_TENSORS:
                 target = source_dtype if source_dtype in {"BF16", "F16", "F32"} else dense_dtype
+            elif float32_weight_roles and canonical_name.endswith(float32_weight_roles):
+                # Recurrent-state, depthwise-convolution and router-bias
+                # parameters stay exact; the family declares these roles.
+                target = "F32"
             elif descriptor.role is TensorRole.PLE_EMBEDDING and not quantize_ple:
                 target = (
                     "MXFP8"
@@ -7844,7 +7873,7 @@ def convert(args: argparse.Namespace) -> None:
             config = (
                 load_hf_model_config(root) if config_path.exists() else {}
             )
-        config_text = config.get("text_config", config)
+        config_text = text_section(config)
         mtp_plan_names = [
             item.name
             for item in plan
@@ -7867,7 +7896,7 @@ def convert(args: argparse.Namespace) -> None:
             # A stripped head must not leave a capability bit behind.  Copy
             # through JSON so callers' config dictionaries remain untouched.
             config = json.loads(json.dumps(config))
-            config_text = config.get("text_config", config)
+            config_text = text_section(config)
             if isinstance(config_text, dict):
                 if "num_nextn_predict_layers" in config_text:
                     config_text["num_nextn_predict_layers"] = 0
