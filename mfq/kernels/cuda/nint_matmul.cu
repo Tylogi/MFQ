@@ -2493,7 +2493,7 @@ static mfq_tensor_backend::Tensor nint_decode_impl(
                     bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(), row_q_bit_offsets.data_ptr<int64_t>(),
                     subgroup_scale.data_ptr<uint8_t>(), subgroup_minimum.data_ptr<uint8_t>(),
                     neuron_scale.data_ptr<float>(), neuron_minimum.data_ptr<float>(),
-                    reinterpret_cast<half*>(output.data_ptr<mfq_half>()), rows, groups, int(width), uint64_t(bitstream.numel()));
+                    reinterpret_cast<half*>(output.template data_ptr<mfq_half>()), rows, groups, int(width), uint64_t(bitstream.numel()));
             };
             if (group_size == 24) launch(std::integral_constant<int, 24>{});
             else launch(std::integral_constant<int, 28>{});
@@ -2503,9 +2503,9 @@ static mfq_tensor_backend::Tensor nint_decode_impl(
     }
     const auto output_data = [&]() {
         if constexpr (std::is_same_v<Output, __half>) {
-            return reinterpret_cast<__half *>(output.data_ptr<mfq_half>());
+            return reinterpret_cast<__half *>(output.template data_ptr<mfq_half>());
         } else {
-            return output.data_ptr<float>();
+            return output.template data_ptr<float>();
         }
     }();
     nint_decode_rows_kernel<Output><<<
@@ -3337,9 +3337,9 @@ static mfq_tensor_backend::Tensor nint8_zero_dequant_impl(
         (total + threads - 1) / threads, 65535));
     const auto output_data = [&]() {
         if constexpr (std::is_same_v<Output, __half>) {
-            return reinterpret_cast<__half *>(output.data_ptr<mfq_half>());
+            return reinterpret_cast<__half *>(output.template data_ptr<mfq_half>());
         } else {
-            return output.data_ptr<float>();
+            return output.template data_ptr<float>();
         }
     }();
     nint8_zero_decode_rows_kernel<Output><<<
