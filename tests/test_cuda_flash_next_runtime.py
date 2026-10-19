@@ -1268,7 +1268,12 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
         np.testing.assert_allclose(array(row["logits"]),glm_logits_reference(expected[0],reference_weights),atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
         np.testing.assert_allclose(array(row["chunked"]),array(row["full"]),atol=1.5e-2,rtol=1.5e-2)
-        np.testing.assert_allclose(array(row["batch"]),np.repeat(array(row["full"]),2,axis=0),atol=2e-3,rtol=2e-3)
+        batch=np.repeat(array(row["full"]),2,axis=0)
+        if storage=="v1s":
+            # B*T=14 selects V1-S's decoded-F16 NINT prefill path, not GEMV.
+            batch_ids=np.repeat(ids,2,axis=0);batch_previous=np.repeat(previous,2,axis=0)
+            batch=reference(config,reference_weights,mtp=(batch_ids,batch_previous,i,None))[0]
+        np.testing.assert_allclose(array(row["batch"]),batch,atol=2e-3,rtol=2e-3)
         positions=np.arange(7)+3
         if family=="qwen":
             positions=np.stack((positions,positions+2,positions+4))
