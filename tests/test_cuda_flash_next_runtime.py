@@ -269,6 +269,55 @@ def glm_model_fixture(attention_types, sparse_ffn):
     return outer,w
 
 
+def glm_v1s_storage(weights):
+    """Pack GLM text weights using the storage families present in V1-S."""
+    from mfq.formats.mfe import MfePool, MfeTensor
+    from mfq.formats.nint import NintSpec
+    from mfq.quantize.nint_quant import dequantize, quantize
+
+    nint_suffixes = (
+        ".attention.indexer.key.weight", ".attention.indexer.query.weight",
+        ".attention.indexer.pool.gate", ".attention.key_value_a.weight",
+        ".attention.output.weight", ".attention.query_a.weight",
+        ".attention.query_b.weight", ".linear_attention.beta.weight",
+        ".linear_attention.forget_a.weight", ".linear_attention.forget_b.weight",
+        ".linear_attention.gate_a.weight", ".linear_attention.gate_b.weight",
+        ".linear_attention.key.weight", ".linear_attention.output.weight",
+        ".linear_attention.query.weight", ".linear_attention.value.weight",
+        ".mlp.down.weight", ".mlp.gate.weight", ".mlp.up.weight",
+        ".mlp.shared_expert.down.weight", ".mlp.shared_expert.gate.weight",
+        ".mlp.shared_expert.up.weight", ".mhc.pre.function",
+        "model.token_embedding.weight", "model.output.weight",
+        "predictor.fusion.weight",
+    )
+
+    def pack_mfe(name, value):
+        experts, output, width = value.shape
+        packed = quantize(value.reshape(experts * output, width), NintSpec(4, 8, 6))
+        stored = MfeTensor(value.shape, (MfePool(np.arange(experts, dtype=np.int32), packed),))
+        effective = dequantize(packed).reshape(value.shape)
+        return stored, effective
+
+    stored, effective = {}, {}
+    for name, value in weights.items():
+        if name.endswith(".experts.gate_up.weight"):
+            base = name.removesuffix("gate_up.weight")
+            gate, up = np.split(value, 2, axis=1)
+            stored[base + "gate.weight"], gate_effective = pack_mfe(base + "gate.weight", gate)
+            stored[base + "up.weight"], up_effective = pack_mfe(base + "up.weight", up)
+            effective[name] = np.concatenate((gate_effective, up_effective), axis=1)
+        elif ".experts." in name or ".attention.latent." in name:
+            stored[name], effective[name] = pack_mfe(name, value)
+        elif name.endswith(nint_suffixes):
+            packed = quantize(np.ascontiguousarray(value).reshape(value.shape[0], -1), NintSpec(8, 8, 6))
+            stored[name] = packed
+            effective[name] = dequantize(packed).reshape(value.shape)
+        else:
+            stored[name] = value
+            effective[name] = value
+    return stored, effective
+
+
 def glm_model_reference(config,w,mtp=None,return_hidden=False,embeddings=None):
     c=config["text_config"]
     def sm(x,axis=-1):
@@ -412,9 +461,12 @@ def run_glm_fixture(path):
 @pytest.mark.parametrize("types",[("linear_attention",)*2,("deepseek_sparse_attention",)*2,
                                   ("linear_attention","deepseek_sparse_attention")])
 @pytest.mark.parametrize("sparse_ffn",[False,True])
-def test_glm_native_complete_graph(tmp_path,types,sparse_ffn):
+@pytest.mark.parametrize("storage",["dense","v1s"])
+def test_glm_native_complete_graph(tmp_path,types,sparse_ffn,storage):
     config,weights=glm_model_fixture(types,sparse_ffn)
-    expected=glm_model_reference(config,weights)
+    reference_weights=weights
+    if storage=="v1s":weights,reference_weights=glm_v1s_storage(weights)
+    expected=glm_model_reference(config,reference_weights)
     path=tmp_path/"glm-graph.mfq";write_glm_fixture(path,config,weights)
     process=run_glm_fixture(path)
     assert process.returncode==0,process.stdout+process.stderr
@@ -1034,10 +1086,13 @@ def run_mtp_fixture(path):
 @pytest.mark.parametrize("family",["qwen","glm"])
 @pytest.mark.parametrize("layers",[1,2])
 @pytest.mark.parametrize('independent', [False, True])
-def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent):
+@pytest.mark.parametrize("storage",["dense","v1s"])
+def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent,storage):
     if independent and family != 'qwen': pytest.skip('independent Qwen projections')
+    if storage=="v1s" and family!="glm":pytest.skip("V1-S GLM storage variant")
     config,w=mtp_fixture(family,layers);path=tmp_path/"predictor.mfq"
     reference_weights = w
+    if storage=="v1s":w,reference_weights=glm_v1s_storage(w)
     if independent: w = independent_qwen_attention(config, w)
     (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
     process=run_mtp_fixture(path);assert process.returncode==0,process.stdout+process.stderr
@@ -1048,7 +1103,7 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     for i,row in enumerate(raw["layers"]):
         expected=reference(config,reference_weights,mtp=(ids,previous,i,None))
         for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
-        np.testing.assert_allclose(array(row["logits"]),expected[0]@w["model.output.weight"].T,atol=2e-3,rtol=2e-3)
+        np.testing.assert_allclose(array(row["logits"]),expected[0]@reference_weights["model.output.weight"].T,atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
         np.testing.assert_allclose(array(row["chunked"]),array(row["full"]),atol=1.5e-2,rtol=1.5e-2)
         np.testing.assert_allclose(array(row["batch"]),np.repeat(array(row["full"]),2,axis=0),atol=2e-3,rtol=2e-3)

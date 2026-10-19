@@ -159,6 +159,12 @@ mfq_tensor_backend::Tensor load_dense_gpu(
     const bool cpu_layer = execution.loading_cpu_layer;
     MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
+    if (rec.dtype == "MFE") {
+        auto dense = materialize_mfe_dense(mfq, name)
+            .to(mfq_tensor_backend::kFloat32)
+            .contiguous();
+        return cpu_layer ? dense.cpu().contiguous() : dense;
+    }
     if (rec.dtype != "NINT8-0" && rec.dtype != "NINT") {
         auto value = load_dense_cpu(execution, mfq, name);
         if (rec.dtype == "BF16" || rec.dtype == "F16")

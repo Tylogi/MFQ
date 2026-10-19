@@ -22,7 +22,7 @@ from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import dequantize, quantize
 from mfq.server.runtime.client import BackendError, StdioRuntimeClient
 from mfq.server.vision.decode import _tensor, _binary_tensors
-from tests.test_cuda_flash_next_runtime import glm_model_reference, mtp_fixture
+from tests.test_cuda_flash_next_runtime import glm_model_reference, glm_v1s_storage, mtp_fixture
 from tests.test_native_nint_ple import _worker_tokenizer
 
 
@@ -31,10 +31,17 @@ def bf16(value):
     return ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype(np.uint16).view(BFloat16Array)
 
 
-def vision_fixture(storage="bf16", mtp=True):
+def vision_fixture(storage="bf16", mtp=True, text_storage="dense"):
     config, weights = mtp_fixture("glm", int(mtp))
     if not mtp:
         weights = {name: value for name, value in weights.items() if not name.startswith("predictor.")}
+    oracle = weights
+    if text_storage == "v1s":
+        weights, oracle = glm_v1s_storage(weights)
+    def store_bf16(name, value):
+        packed = bf16(value)
+        weights[name] = packed
+        oracle[name] = (packed.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
     config.update(image_token_id=5, video_token_id=6, vision_config=dict(
         model_type="glm5_next_vision", hidden_size=8, intermediate_size=16,
         depth=2, num_heads=2, patch_size=2, temporal_patch_size=2,
@@ -52,7 +59,6 @@ def vision_fixture(storage="bf16", mtp=True):
             "attention.qkv": (24, 8), "attention.output": (8, 8),
             "mlp.gate": (16, 8), "mlp.up": (16, 8), "mlp.down": (8, 16),
         }.items()})
-    oracle = {}
     for name, shape in shapes.items():
         value = rng.normal(0, .12, shape).astype(np.float32)
         if storage == "nint8":
@@ -67,14 +73,24 @@ def vision_fixture(storage="bf16", mtp=True):
             weights[f"vision.{name}.weight"] = oracle[f"vision.{name}.weight"] = value
         if not name.startswith("merger."):
             value = rng.normal(0, .02, shape[0]).astype(np.float32)
-            weights[f"vision.{name}.bias"] = oracle[f"vision.{name}.bias"] = value
+            if text_storage == "v1s" and storage == "bf16":
+                store_bf16(f"vision.{name}.bias", value)
+            else:
+                weights[f"vision.{name}.bias"] = oracle[f"vision.{name}.bias"] = value
     for name, width in {"output_norm": 8, "merger.norm": 32, **{
         f"block.{i}.{name}": width for i in range(2) for name, width in
         (("norm1", 8), ("norm2", 8), ("attention.query_norm", 4), ("attention.key_norm", 4))
     }}.items():
         value = rng.uniform(.8, 1.2, width).astype(np.float32)
-        weights[f"vision.{name}.weight"] = oracle[f"vision.{name}.weight"] = value
-    weights["vision.merger.norm.bias"] = oracle["vision.merger.norm.bias"] = rng.normal(0, .02, 32).astype(np.float32)
+        if text_storage == "v1s" and storage == "bf16":
+            store_bf16(f"vision.{name}.weight", value)
+        else:
+            weights[f"vision.{name}.weight"] = oracle[f"vision.{name}.weight"] = value
+    merger_bias = rng.normal(0, .02, 32).astype(np.float32)
+    if text_storage == "v1s" and storage == "bf16":
+        store_bf16("vision.merger.norm.bias", merger_bias)
+    else:
+        weights["vision.merger.norm.bias"] = oracle["vision.merger.norm.bias"] = merger_bias
     return config, weights, oracle
 
 
@@ -155,11 +171,11 @@ def test_numpy_vision_reference_segments_and_bounded_merger():
     assert together.shape == (6, 32) and np.isfinite(together).all()
 
 
-@pytest.mark.parametrize("storage", ["bf16", "nint8"])
+@pytest.mark.parametrize("storage,text_storage", [("bf16", "dense"), ("nint8", "dense"), ("bf16", "v1s")])
 @pytest.mark.parametrize("mtp", [False, True])
-def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storage, mtp):
+def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storage, text_storage, mtp):
     runtime, bridge = binaries
-    config, weights, reference_weights = vision_fixture(storage, mtp)
+    config, weights, reference_weights = vision_fixture(storage, mtp, text_storage)
     graph = graph_spec_for_plan(config, list(weights)).as_dict()
     model = tmp_path / "glm-vision.mfq"
     save(model, FileHeader(version=2, model_arch="glm5_next"), {**weights,
@@ -170,7 +186,7 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
     # frames represented by image placeholders by the real GLM processor.
     ids = [1, 5, 5, 5, 6, 2, 3]
     merged = vision_reference(config, reference_weights, pixels, grids)
-    expected = weights["model.token_embedding.weight"][np.array(ids)[None]].astype(np.float16)
+    expected = reference_weights["model.token_embedding.weight"][np.array(ids)[None]].astype(np.float16)
     expected[0, 1:5] = merged.astype(np.float16)
     request = tmp_path / "input.json"
     request.write_text(json.dumps(dict(ids=ids, pixels=pixels.ravel().tolist(), pixel_shape=list(pixels.shape), grids=grids, types=types)))
@@ -192,7 +208,7 @@ def test_cuda_glm_vision_embeddings_logits_and_worker(tmp_path, binaries, storag
         # Check the injected-embedding text path on the native embeddings: the
         # tiny random model amplifies the ~5e-4 BF16 vision rounding about 30x,
         # which says nothing about the text path itself.
-        native_oracle = glm_model_reference(config, weights, embeddings=array("embeddings").astype(np.float16))
+        native_oracle = glm_model_reference(config, reference_weights, embeddings=array("embeddings").astype(np.float16))
         np.testing.assert_allclose(array("logits"), native_oracle, atol=7e-3, rtol=7e-3)
         np.testing.assert_array_equal(array("cached_embeddings"), array("embeddings"))
         tokenizer = _worker_tokenizer(tmp_path, cacheable_tokens=True)

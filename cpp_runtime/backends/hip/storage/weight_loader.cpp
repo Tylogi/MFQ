@@ -263,9 +263,12 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     const auto& dtype=require_tensor(file, name).dtype;
-    MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
+    const bool dense_storage = dtype=="F32" || dtype=="F16" || dtype=="BF16";
+    const bool quantized_storage = dtype=="NINT" || dtype=="NINT8-0" || dtype=="MFE";
+    MFQ_RUNTIME_CHECK(dense_storage || quantized_storage,
         "expected a dense parameter: ",name);
     auto value=load_dense_gpu(execution, file,name);
+    if (!dense_storage) return value;
     return value.to(dtype=="F16" ? tb::kFloat16 : dtype=="BF16" ? tb::kBFloat16 : tb::kFloat32);
 }
 
