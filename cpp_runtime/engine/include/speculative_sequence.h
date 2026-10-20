@@ -723,7 +723,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             committed_last_hidden = ops.slice(verified_raw, 1, emitted_accepted, 1);
             mtp.last_stats.rollback_ms+=std::chrono::duration<double,std::milli>(Clock::now()-resolve_started).count();
             if (output.stopped()) {
-                if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
+                if (mtp.blockwise_drafting()) {
+                    // Block predictors retain the committed target rows rather
+                    // than shifted input/hidden pairs. EOS can truncate an
+                    // accepted draft, so use the target's actual cache boundary.
+                    const auto rows=model.cache_pos-predictor_history_position;
+                    require_execution(rows>=0 && rows<=ops.size(verified_raw,1),
+                        "block predictor final target boundary is incompatible");
+                    if(rows>0) {
+                        mtp.append_target_context(ops.slice(verified_raw,1,0,rows),predictor_history_position);
+                        predictor_history_position+=rows;
+                    }
+                } else if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
                     std::vector<int32_t> committed_ids(
                         delta.token_ids.begin(), delta.token_ids.end());
                     (void)prepare_draft(ops.slice(verified_raw, 1, 0, committed_ids.size()),

@@ -52,8 +52,14 @@ struct Predictor {
         if(!blockwise || position || value.shape.at(1)>tokens)throw std::logic_error("invalid context seed");
         position=tokens-value.shape.at(1);append_target_context(value,position);
     }
-    Tensor draft_block(int, Tensor, int) { throw std::logic_error("not blockwise"); }
-    Tensor draft_next(Tensor, Tensor) { throw std::logic_error("not blockwise"); }
+    Tensor draft_block(int, Tensor, int depth) {
+        if(!blockwise)throw std::logic_error("not blockwise");
+        return {{1,depth,1},true};
+    }
+    Tensor draft_next(Tensor hidden, Tensor) {
+        if(!blockwise)throw std::logic_error("not blockwise");
+        hidden.shape.back()=3;hidden.proposal=true;return hidden;
+    }
 };
 
 struct Prepared {
@@ -784,6 +790,35 @@ void run_restored_blockwise_context() {
     assert(rejected && predictor.context_appends.empty() && model.cache_pos==4);
 }
 
+void run_blockwise_final_context() {
+    for(bool accepted:{false,true})for(bool eos:{false,true})for(int limit:{2,3,4,7,8}) {
+        struct BlockOps:Ops {
+            bool accepted;
+            std::vector<int32_t> greedy_tokens(Tensor logits) {
+                return std::vector<int32_t>(size(logits,0),accepted?1:0);
+            }
+        };
+        Model model;Predictor predictor;predictor.blockwise=true;
+        InferenceRequest request;request.prompt={0,0,0};request.sampling.max_tokens=limit;
+        if(eos)request.stop_token_ids={1};
+        InferenceOutput output(request,nullptr,"blockwise-final-context");
+        Tensor hidden;
+        auto generation=speculative_sequence(BlockOps{{model,predictor},accepted},request,output,
+            16,0,Tensor{},&hidden);
+        while(generation.next()){}
+        const int expected=eos && accepted?2:limit;
+        if(output.result.completion_tokens!=expected || predictor.cache_position()!=model.cache_pos ||
+                !Ops::defined(hidden))
+            throw std::runtime_error("block predictor final snapshot lost committed target context");
+        int64_t position=0;
+        for(const auto& [start,rows]:predictor.context_appends) {
+            if(start!=position || rows<=0)throw std::runtime_error("block predictor duplicated or skipped final history");
+            position+=rows;
+        }
+        if(position!=model.cache_pos)throw std::runtime_error("block predictor final history is incomplete");
+    }
+}
+
 int main() try {
     for (const bool dspark : {false, true}) {
         Model model;
@@ -807,6 +842,7 @@ int main() try {
     }
     run_prepared_default_positions();
     run_restored_blockwise_context();
+    run_blockwise_final_context();
     run(false);
     run(false,true);
     run(false,true,true);

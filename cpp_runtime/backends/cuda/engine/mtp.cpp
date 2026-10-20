@@ -75,7 +75,30 @@ template <class Model> struct CudaMtpOps {
   bool target_maintenance = false;
   std::uint64_t target_graph_captures = 0;
   std::uint64_t target_transfer_bytes=0;
+  std::array<double,6> target_profile{};
   std::shared_ptr<MoeExpertCache> target_route_cache;
+  static bool profile_target() {
+    static const bool enabled=[] {
+      const auto* option=std::getenv("MFQ_PROFILE_MTP");
+      return option && option[0]=='1';
+    }();
+    return enabled;
+  }
+  std::array<double,6> target_costs() const {
+    std::array<double,6> result{};
+    for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+      if(name=="expert_route_wait_ms")result[0]=value;
+      else if(name=="expert_host_fetch_ms")result[1]=value;
+      else if(name=="expert_host_copy_ms")result[2]=value;
+      else if(name=="ssd_expert_read_wait_ms")result[3]=value;
+    }
+    if(model.source) {
+      const auto io=model.source->file_read_stats();
+      result[4]=double(io.read_nanoseconds)/1e6;
+      result[5]=double(io.physical_bytes)/1048576.0;
+    }
+    return result;
+  }
   CudaMtpOps(CudaMtpOps&&)=default;
   ~CudaMtpOps() {
     if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
@@ -195,10 +218,16 @@ template <class Model> struct CudaMtpOps {
   void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
       const auto* option=std::getenv("MFQ_PROFILE_MTP");
       const bool profile=option && option[0]=='1';
-      if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
+      if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0)) {
         std::cerr<<(profile?"runtime_mtp_cycle_profile cycle=":"runtime_mtp_slow_cycle cycle=")<<cycle<<" depth="<<depth<<" accepted="<<accepted
             <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
-            <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
+            <<" target_transfer_mb="<<target_transfer_bytes/1048576.0;
+        if(profile)
+          std::cerr<<" target_route_ms="<<target_profile[0]<<" target_fetch_ms="<<target_profile[1]
+              <<" target_host_copy_ms="<<target_profile[2]<<" target_ssd_wait_ms="<<target_profile[3]
+              <<" target_parallel_read_ms="<<target_profile[4]<<" target_physical_read_mb="<<target_profile[5];
+        std::cerr<<'\n';
+      }
   }
 
   CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
@@ -263,6 +292,12 @@ template <class Model> struct CudaMtpOps {
     projected_target_greedy.clear();
     target_transfer_bytes = 0;
     const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
+    const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
+    const auto finish_profile=[&] {
+      if(!profile_target())return;
+      const auto costs_after=target_costs();
+      for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]=costs_after[i]-costs_before[i];
+    };
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt) {
         bool initialized=false;
@@ -275,6 +310,7 @@ template <class Model> struct CudaMtpOps {
           target_maintenance=target_maintenance || initialized;
           projected_target_hidden = *hidden; projected_target_logits = std::move(logits);
           projected_target_compact=mfq::cuda::qwen4_decode_graph_compact_topk(model);
+          finish_profile();
           return std::move(*hidden);
         }
       }
@@ -282,13 +318,22 @@ template <class Model> struct CudaMtpOps {
     auto hidden=model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
                                      mfq_nullopt, raw, confirmed);
     target_transfer_bytes=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
+    finish_profile();
     return hidden;
   }
   Tensor target_suffix(Tensor ids, Tensor *raw) {
     projected_target_hidden = {}; projected_target_logits = {};
     projected_target_compact={};
     projected_target_greedy.clear();
-    return model.hidden_forward_speculative_suffix(ids, raw);
+    const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
+    const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
+    auto hidden=model.hidden_forward_speculative_suffix(ids, raw);
+    target_transfer_bytes+=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
+    if(profile_target()) {
+      const auto costs_after=target_costs();
+      for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]+=costs_after[i]-costs_before[i];
+    }
+    return hidden;
   }
   struct PrefillResult {
     Tensor hidden, raw;
