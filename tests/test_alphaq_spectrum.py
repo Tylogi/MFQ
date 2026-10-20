@@ -75,3 +75,15 @@ def test_gram_oom_retries_only_unfinished_blocks(monkeypatch):
     np.testing.assert_allclose(actual[0], expected[0], rtol=1e-4)
     np.testing.assert_array_equal(actual[1], expected[1])
     assert calls[0] == 6 and sum(c for c in calls if c <= 2) == 6
+
+
+def test_gram_nonconvergence_uses_the_exact_svd_spectrum(monkeypatch):
+    import mfq.calibration.alphaq_spectrum as spectrum
+    weight = torch.randn((2, 128, 384), generator=torch.Generator().manual_seed(93))
+    expected = alphaq_weight_statistics(weight, backend='svd')
+    def unconverged(blocks):
+        raise ArithmeticError('batched symmetric eigensolver did not converge')
+    monkeypatch.setattr(spectrum, 'gram_eigenvalues', unconverged)
+    actual = alphaq_weight_statistics(weight, backend='gram')
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-6)
+    np.testing.assert_array_equal(actual[1], expected[1])
