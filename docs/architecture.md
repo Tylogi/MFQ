@@ -115,7 +115,7 @@ ControlResult control(ControlRequest request);
 - `csrc/engine/model/` 已收拢共享配置、旧 family 组合、视觉几何与 YaRN，原 `csrc/models/` 与 `mfq-models` 已删除；编译实现归 `mfq-engine`，模型根目录仅供实际消费者显式使用。尚无新 family forward、`Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
 - K1 底层依赖迁移已完成。schema、范围解码和码表归 `formats/`，输入与旧名称读取归 `model_source/`，视觉几何由 `mfq-engine` 编译；文件 I/O 与 host 原语已独立。`mfq-model-graph` 与 `mfq-model-source` 不再依赖 core，CUDA kernel 不再取得 core 的 include 路径或链接 `mfq-core`。
 - 旧 dtype 在 MFQ 元数据和 MFE cohort 输入解析处规范化，VQ/SQ 算子只分派规范格式；ModelSource 只暴露 TensorLayout，名称映射保留在 compat 读取实现。
-- 请求/媒体值、唯一 SamplingParams、语法游标、资源错误与 StepSequence 已归 `engine/include/`；CUDA native 只取得公共错误声明的 include 路径，不再依赖 core。`core/` 聚合随 K3/K4 拆除。Metal MFE 输入解析暂与 offload 缓存同在 `mlx_moe.cpp`，其缓存拆分随 K3/后端迁移推进。见 plan §1.6。
+- K2 契约与模型归位已完成。请求/媒体值、唯一 SamplingParams、语法游标、资源错误与 StepSequence 已归 `engine/include/`；CUDA native 只取得公共错误声明的 include 路径，不再依赖 core。`core/` 聚合随 K3/K4 拆除。Metal MFE 输入解析暂与 offload 缓存同在 `mlx_moe.cpp`，其缓存拆分随 K3/后端迁移推进。见 plan §1.6。
 - 已知非绿：`mfq-float-projection-test`（[B11](bugs.md)）、`mfq-cuda-include-graph-test` 重复注册（[B15](bugs.md)）、普通 MXFP8 的 16 行反向回退误差（[B35](bugs.md)）。
 
 ## 7. 规则与目标在哪里
