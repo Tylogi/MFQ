@@ -452,3 +452,17 @@ def test_ud_tier_dry_run_plans_a_synthetic_nemotron(tmp_path, monkeypatch, capsy
     assert budget["dense_mode"] == "recipe"
     assert budget["parameters"] == parameters
     assert budget["mtp_bytes"] > 0
+
+
+def test_alphaq_routing_reads_top_k_from_the_nested_llm_config() -> None:
+    from types import SimpleNamespace
+
+    from mfq.calibration.alphaq_workflow import routing
+
+    # NVIDIA Omni wrappers nest the text model under llm_config, not text_config.
+    config = {"llm_config": {"num_experts_per_tok": 22}, "vision_config": {}}
+    scope = SimpleNamespace(experts=[SimpleNamespace(name="model.block.1.mlp.experts.up.weight",
+                                                     shape=(512, 2688, 1024))])
+    multipliers, exposure = routing(scope, None, config, "none", "", Path("."))
+    assert multipliers is None
+    assert exposure == {"model.block.1.mlp.experts.up.weight": 22 / 512}

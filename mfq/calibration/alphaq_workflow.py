@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mfq.architectures.hf_config import text_section
 from mfq.calibration.alphaq import ALPHAQ_PROFILES, alphaq_builtin_candidates
 from mfq.calibration.alphaq_cache import collect_statistics, source_identity, trained_tables
 from mfq.calibration.alphaq_joint import allocate_joint, dense_choices
@@ -51,7 +52,7 @@ def planned(root, recipe, scheme, overrides, ple, *, vision='exclude', mtp='excl
 
 def routing(scope, imatrix, config, mode, cache_path, root, *, absolute=False):
     from mfq.tools import quantize_hf_to_mfq as q
-    topk = config.get('text_config', config).get('num_experts_per_tok')
+    topk = text_section(config).get('num_experts_per_tok')
     if type(topk) is not int or topk <= 0:
         raise ValueError('AlphaQ needs num_experts_per_tok in the model configuration')
     if mode == 'none':
