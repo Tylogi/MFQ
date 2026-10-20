@@ -1,10 +1,10 @@
 # MFQ development rules
 
-The workspace [runtime architecture](../docs/architecture.md) describes the
+The [runtime architecture](docs/architecture.md) describes the
 architecture as it is implemented today, including its transitional limits. The
-target refactor architecture is [refactor.md](../docs/refactor.md), the
-migration order and exit gates are [plan.md](../docs/plan.md), and known defects
-are tracked in [bugs.md](../docs/bugs.md); non-refactor follow-ups remain in the
+target refactor architecture is [refactor.md](docs/refactor.md), the
+migration order and exit gates are [plan.md](docs/plan.md), and known defects
+are tracked in [bugs.md](docs/bugs.md); non-refactor follow-ups remain in the
 workspace [TODO](../docs/todo.md). Existing backend code is not a precedent for
 duplicating shared behavior.
 
@@ -26,9 +26,9 @@ architecture-named entry point.
 
 - Backend-neutral value contracts, schemas, canonical names and model sources
   live in `csrc/core/` today. That aggregation is transitional, not the target:
-  [refactor.md](../docs/refactor.md) assigns them to `formats/`,
+  [refactor.md](docs/refactor.md) assigns them to `formats/`,
   `model_source/`, `components/io/`, `backends/cpu/` and the Engine modules, and
-  [plan.md](../docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
+  [plan.md](docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
   Do not add new code to `core/` that belongs in one of those owners.
 - Logical scheduling, cancellation, deadlines and output backpressure belong
   in `csrc/scheduler/`; wire protocols belong in `csrc/transport/`.
@@ -40,8 +40,8 @@ architecture-named entry point.
   `csrc/models/common/`. Family equations, positions and topology are defined
   once and composed with backend operations. The target moves each family to
   `csrc/engine/model/<family>/` composed with complete backend operators;
-  [refactor.md](../docs/refactor.md) defines that end state and
-  [bugs.md](../docs/bugs.md) B28 tracks the current binding chain
+  [refactor.md](docs/refactor.md) defines that end state and
+  [bugs.md](docs/bugs.md) B28 tracks the current binding chain
   (`CausalModelBase → CudaCausalOps → native model`) as debt, not as a rule to
   reproduce.
 - Reusable mathematical operations and packed kernels belong in
@@ -59,7 +59,7 @@ architecture-named entry point.
   are relative to `csrc/backends/cuda/`. In the target, backend storage is the
   physical implementation that a shared StateStore/WeightStore composes, and the
   backend `engine.cpp` only assembles; see
-  [refactor.md](../docs/refactor.md) and plan §1.4 R4.
+  [refactor.md](docs/refactor.md) and plan §1.4 R4.
 - CLI parsing and application composition belong in backend `commands/` and
   `apps/`, compiled into the corresponding executable.
 
@@ -155,9 +155,7 @@ semantics, component names, canonical roles and the meaning of a model family's
 equations. They must not share a fake `supported = true`.
 
 Actual capability is per backend and per feature, and is stated item by item in
-the support matrix and the acceptance records
-([runtime-support.md](docs/runtime-support.md),
-[refactor-baseline.md](docs/refactor-baseline.md)), not assumed equal across
+the [runtime support matrix](docs/runtime/support.md), not assumed equal across
 backends. CUDA and Metal may use different kernels, physical layouts and float
 results, and one backend may lack a mechanism the other has (for example
 interleaved batching and CUDA Graphs today). Architecture support is registered
@@ -182,7 +180,7 @@ Before submitting a runtime or quantization change:
    change touches shared runtime dependencies. The authoritative test contract -
    which entry points cover which behavior, what environment they need, and what
    counts as a pass - is
-   [plan.md §4 全阶段测试与验收](../docs/plan.md#4-全阶段测试与验收); build scope
+   [plan.md §4 全阶段测试与验收](docs/plan.md#4-全阶段测试与验收); build scope
    follows its §1.5 G4 table, so a tool cold build stays conditional. Build a
    target before running `ctest` against it, and treat a CTest skip
    (`SKIP_RETURN_CODE 77`) or a `model_branch=skipped` line as not verified. For
