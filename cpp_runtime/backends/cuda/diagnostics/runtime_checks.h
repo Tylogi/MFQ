@@ -5,6 +5,7 @@
 #include "models/deepseek_v4/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "models/nemotron_h/mtp.h"
+#include "models/nemotron_h/radio_vision.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
@@ -1621,6 +1622,107 @@ static int run_nemotron_h_check(Model& model) {
     result["reset"]=json_tensor(model.forward(ids));
     result["architecture"]=model.graph.backbone;
     std::cout << "nemotron_h_check " << result.dump() << '\n';
+    return 0;
+}
+
+// Deterministic patch values shared with the Python oracle: k / 64 is exactly
+// representable in binary, so both sides feed the tower bit-identical pixels.
+inline float nemotron_h_vision_pixel(std::int64_t index) {
+    return static_cast<float>((index * 37 + 11) % 101) / 64.0f;
+}
+
+// RADIO vision gate: runs the tower + projector through the prompt component on
+// two non-square images and prints the resulting language embeddings.  The
+// oracle recomputes them from the same pixels and token ids.
+template <typename Model>
+static int run_nemotron_h_vision_check(
+        Model& model, const mfq::cuda::nemotron_h::CudaRadioPromptComponent& vision) {
+    namespace tb = mfq_tensor_backend;
+    const auto& config = vision.config();
+    MFQ_RUNTIME_CHECK(config.image_token_id >= 1 && model.vocab_size() > 3,
+                      "Nemotron-H vision diagnostic requires image/vocab token ids");
+    // Non-square patch grids in both orientations; both sides divide the pixel
+    // shuffle factor, as the preprocessor guarantees.
+    const std::vector<std::pair<std::int64_t, std::int64_t>> image_grids{{4, 6}, {6, 2}};
+    const auto json_tensor = [](const tb::Tensor& value) {
+        auto host = value.to(tb::kFloat32).contiguous().cpu();
+        return nlohmann::json{
+            {"shape", host.sizes().vec()},
+            {"data", std::vector<float>(host.template data_ptr<float>(),
+                                        host.template data_ptr<float>() + host.numel())}};
+    };
+    MfqMultimodalInput media;
+    media.processor = MfqMultimodalProcessor::grid_vision;
+    media.processor_name = vision.input_contract();
+    std::vector<std::int64_t> token_ids{1, 2};
+    std::vector<std::int32_t> grids;
+    std::int64_t patches = 0;
+    std::int64_t pixel_index = 0;
+    std::int64_t expected_tokens = 0;
+    for (const auto& [rows, columns] : image_grids) {
+        const auto count = rows * columns;
+        for (std::int64_t index = 0; index < count * config.patch_width(); ++index)
+            media.pixel_values.push_back(nemotron_h_vision_pixel(pixel_index++));
+        grids.insert(grids.end(), {1, static_cast<std::int32_t>(rows),
+                                   static_cast<std::int32_t>(columns)});
+        media.vision_types.push_back(1);
+        patches += count;
+        const auto tokens = count / (config.downsample_factor * config.downsample_factor);
+        token_ids.insert(token_ids.end(), static_cast<std::size_t>(tokens),
+                         config.image_token_id);
+        token_ids.push_back(3);
+        expected_tokens += tokens;
+    }
+    media.pixel_shape = std::vector<std::int64_t>{patches, config.patch_width()};
+    media.vision_grid = grids;
+    media.vision_grid_shape = std::vector<std::int64_t>{
+        static_cast<std::int64_t>(image_grids.size()), 3};
+    media.image_grid = grids;
+    media.image_grid_shape = media.vision_grid_shape;
+
+    model.reset(1);
+    auto prepared = mfq::finish_steps(vision.prepare(model, token_ids, media));
+    MFQ_RUNTIME_CHECK(prepared.embeddings.dim() == 3 &&
+                          prepared.embeddings.size(1) ==
+                              static_cast<std::int64_t>(token_ids.size()),
+                      "Nemotron-H vision prompt shape disagrees with the prompt length");
+    MFQ_RUNTIME_CHECK(
+        std::count(token_ids.begin(), token_ids.end(), config.image_token_id) == expected_tokens,
+        "Nemotron-H vision diagnostic placeholder count is inconsistent");
+    nlohmann::json result;
+    result["architecture"] = model.graph.backbone;
+    result["image_grids"] = nlohmann::json::array();
+    for (const auto& [rows, columns] : image_grids)
+        result["image_grids"].push_back({rows, columns});
+    result["patch_width"] = config.patch_width();
+    result["hidden_size"] = config.hidden_size;
+    result["downsample_factor"] = config.downsample_factor;
+    result["position_side"] = config.position_side();
+    result["summary_tokens"] = config.summary_tokens();
+    result["heads"] = config.num_heads;
+    result["depth"] = config.depth;
+    result["image_token_id"] = config.image_token_id;
+    result["layer_norm_eps"] = config.layer_norm_eps;
+    result["projector_norm_eps"] = config.projector_norm_eps;
+    result["ids"] = token_ids;
+    result["pixels"] = std::vector<float>(media.pixel_values.begin(),
+                                          media.pixel_values.end());
+    result["embeddings"] = json_tensor(prepared.embeddings);
+    result["positions"] = json_tensor(prepared.positions);
+    // The component must reject a prompt whose `<image>` runs disagree with the
+    // payload before it touches the text cache.
+    bool rejected = false;
+    try {
+        auto short_prompt = token_ids;
+        short_prompt.erase(
+            std::remove(short_prompt.begin(), short_prompt.end(), config.image_token_id));
+        auto unused = mfq::finish_steps(vision.prepare(model, short_prompt, media));
+        (void)unused;
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    result["placeholder_mismatch_rejected"] = rejected;
+    std::cout << "nemotron_h_vision_check " << result.dump() << '\n';
     return 0;
 }
 

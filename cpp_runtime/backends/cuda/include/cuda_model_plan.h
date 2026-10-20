@@ -29,6 +29,7 @@ enum class CudaVisionAdapter {
     grid_vit,
     minicpmo45,
     deepseek_v41,
+    radio,
 };
 
 enum class CudaPredictorAdapter {
@@ -122,6 +123,15 @@ inline CudaModelPlan cuda_model_plan(
         tts->implementation == "minicpmo45_tts") {
         result.vision = CudaVisionAdapter::minicpmo45;
     }
+    // Cropped-position-embedding towers are selected by their declared data
+    // contract alone: the graph names the implementation and the patch
+    // contract, and RADIO's graph carries no multimodal position policy.
+    if (vision != nullptr && vision->tensor_root == "vision" &&
+        vision->implementation == "radio" &&
+        vision->input_contract == kMfqRadioCpeInputContract &&
+        vision->position_policy.empty()) {
+        result.vision = CudaVisionAdapter::radio;
+    }
     const auto* predictor = graph.component("predictor");
     if (graph.backbone == "qwen3_5" && predictor != nullptr &&
         predictor->implementation == "next_token_prediction" &&
@@ -153,7 +163,8 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
         plan.vision == CudaVisionAdapter::minicpmo45 ||
-        plan.vision == CudaVisionAdapter::deepseek_v41;
+        plan.vision == CudaVisionAdapter::deepseek_v41 ||
+        plan.vision == CudaVisionAdapter::radio;
     result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_output = plan.vision == CudaVisionAdapter::minicpmo45;

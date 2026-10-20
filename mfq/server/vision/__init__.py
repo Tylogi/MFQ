@@ -23,6 +23,7 @@ from mfq.server.vision.deepseek import (
 from mfq.server.vision.glm5_next import Glm5NextVisionProcessor
 from mfq.server.vision.minicpm import MiniCPMO45VisionProcessor
 from mfq.server.vision.qwen import Qwen4ExpVisionProcessor, Qwen35VisionProcessor
+from mfq.server.vision.radio import RadioVisionProcessor
 from mfq.server.vision.video import _DecodedVideo as _DecodedVideo
 from mfq.server.vision.video import _PreparedVideoFrame as _PreparedVideoFrame
 
@@ -58,6 +59,8 @@ def multimodal_processor_for_architecture(
         return Qwen35VisionProcessor(avfoundation_library=avfoundation_library)
     if identity in {"glm5_next", "glm5_next_text"}:
         return Glm5NextVisionProcessor(avfoundation_library=avfoundation_library)
+    if identity in {"nemotron_h", "nemotron_h_text", "nemotron_h_omni"}:
+        return RadioVisionProcessor()
     return None
 
 
@@ -71,6 +74,7 @@ __all__ = [
     "ProcessedVisionRequest",
     "Qwen4ExpVisionProcessor",
     "Qwen35VisionProcessor",
+    "RadioVisionProcessor",
     "VisionProcessingError",
     "multimodal_processor_for_architecture",
 ]

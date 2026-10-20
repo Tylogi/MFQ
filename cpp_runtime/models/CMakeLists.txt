@@ -8,6 +8,7 @@ add_library(mfq-models STATIC
     glm_dsa/config.cpp
     minicpmo45/config.cpp
     nemotron_h/config.cpp
+    nemotron_h/vision.cpp
     qwen35/config.cpp
 )
 add_library(mfq::models ALIAS mfq-models)

@@ -434,12 +434,13 @@ void restore_text_session_state(std::vector<std::unique_ptr<::Block>>& blocks,
 namespace mfq::cuda {
 
 void NemotronHModel::adapter_validate_components(const mfq::ModelGraph& graph) const {
-    // The RADIO tower has no runtime adapter yet. A declared vision component
-    // stays reported as unsupported instead of loading a partial graph.
-    if (graph.component("vision") != nullptr)
+    // A declared vision component must resolve to the RADIO adapter this
+    // backend implements; anything else stays reported as unsupported instead
+    // of loading a partial graph.
+    if (graph.component("vision") != nullptr &&
+        cuda_model_plan(graph).vision != CudaVisionAdapter::radio)
         throw std::runtime_error(
-            "Nemotron-H CUDA vision is not implemented; load the text model without the "
-            "vision component");
+            "Nemotron-H CUDA vision requires the radio/radio_cpe.v1 vision component");
     if (graph.component("predictor") != nullptr &&
         cuda_model_plan(graph).predictor != CudaPredictorAdapter::nemotron_h)
         throw std::runtime_error(

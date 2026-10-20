@@ -81,6 +81,19 @@ target_link_libraries(mfq-packed-nint-cpu-test PRIVATE mfq-cpu-ops)
 mfq_add_core_test(mfq-nvq-group-cpu-test nvq_group_cpu_test.cpp)
 target_link_libraries(mfq-nvq-group-cpu-test PRIVATE mfq-cpu-ops)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
+
+# RADIO cropped-position geometry: backend-neutral, no CUDA or weights needed.
+add_executable(mfq-nemotron-vision-geometry-test nemotron_vision_geometry_test.cpp)
+target_link_libraries(mfq-nemotron-vision-geometry-test PRIVATE mfq-models)
+target_compile_features(mfq-nemotron-vision-geometry-test PRIVATE cxx_std_17)
+add_test(NAME mfq-nemotron-vision-geometry-test
+    COMMAND mfq-nemotron-vision-geometry-test)
+
+add_executable(mfq-nemotron-vision-config-test nemotron_vision_config_test.cpp)
+target_link_libraries(mfq-nemotron-vision-config-test PRIVATE mfq-models)
+target_compile_features(mfq-nemotron-vision-config-test PRIVATE cxx_std_17)
+add_test(NAME mfq-nemotron-vision-config-test
+    COMMAND mfq-nemotron-vision-config-test)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
 target_link_libraries(mfq-deepseek-v41-config-test PRIVATE mfq-models)
 target_compile_features(mfq-deepseek-v41-config-test PRIVATE cxx_std_20)

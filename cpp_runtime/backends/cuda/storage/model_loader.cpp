@@ -457,11 +457,24 @@ RuntimeComponents<mfq::cuda::NemotronHCausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::NemotronHCausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
+    if ((result.plan.vision != mfq::cuda::CudaVisionAdapter::none &&
+         result.plan.vision != mfq::cuda::CudaVisionAdapter::radio) ||
             (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
              result.plan.predictor != mfq::cuda::CudaPredictorAdapter::nemotron_h)) {
         throw std::runtime_error(
             "unsupported Nemotron-H CUDA component adapter");
+    }
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::radio) {
+        const auto* component = result.graph.component("vision");
+        MFQ_RUNTIME_CHECK(component != nullptr,
+            "Nemotron-H graph declares a RADIO adapter without a vision component");
+        const auto vision = mfq::models::nemotron_h::RadioVisionConfig::from_json(
+            model.source->model_config_json());
+        result.radio_vision.emplace(
+            mfq::cuda::nemotron_h::CudaRadioPromptComponent::load(
+                *model.execution, *model.source, vision, component->input_contract,
+                component->position_policy));
+        result.vision_available = true;
     }
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;

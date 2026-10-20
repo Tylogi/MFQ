@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/vision_block.h"
 #include "storage/weight_loader.h"
 #include "models/common/transformer_layer.h"
 #include "models/minicpmo45/causal_lm.h"
@@ -19,41 +20,9 @@
 inline constexpr const char *MINICPMO45_RESAMPLER_POS_EMBED_ASSET =
     "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
 
-struct MiniCPMO45Linear {
-    QuantLinear weight;
-    mfq_tensor_backend::Tensor bias;
-
-    static MiniCPMO45Linear load(CudaExecutionContext &execution, const mfq::ModelSource &mfq,
-                                 const std::string &prefix, bool with_bias = true) {
-        MiniCPMO45Linear result;
-        result.weight = load_quant_linear(execution, mfq, prefix + ".weight");
-        const std::string bias_name = prefix + ".bias";
-        if (with_bias && has_tensor(mfq, bias_name)) {
-            result.bias = load_dense_gpu(execution, mfq, bias_name);
-        }
-        return result;
-    }
-
-    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
-                                       mfq_tensor_backend::Tensor input) const {
-        const auto output_dtype = input.scalar_type();
-        if (weight.is_dense()) {
-            const auto dense_dtype = weight.dense.scalar_type();
-            std::optional<mfq_tensor_backend::Tensor> dense_bias = std::nullopt;
-            if (bias.defined()) {
-                dense_bias = bias.to(dense_dtype);
-            }
-            return mfq_linear(input.to(dense_dtype), weight.dense, dense_bias)
-                .to(output_dtype)
-                .contiguous();
-        }
-        auto output = weight.forward(execution, input);
-        if (bias.defined()) {
-            output = output + bias.to(output.scalar_type());
-        }
-        return output.to(output_dtype).contiguous();
-    }
-};
+// The SigLIP tower shares its projection and normalization primitives with the
+// other CUDA vision encoders; the name stays because audio and TTS reuse them.
+using MiniCPMO45Linear = mfq::cuda::BiasLinear;
 
 inline mfq_tensor_backend::Tensor
 minicpmo45_embedding(const QuantLinear &embedding, mfq_tensor_backend::Tensor ids,
@@ -63,121 +32,42 @@ minicpmo45_embedding(const QuantLinear &embedding, mfq_tensor_backend::Tensor id
     return output.to(output_dtype).contiguous();
 }
 
-inline mfq_tensor_backend::Tensor minicpmo45_layer_norm(mfq_tensor_backend::Tensor input,
-                                                        const mfq_tensor_backend::Tensor &weight,
-                                                        const mfq_tensor_backend::Tensor &bias,
-                                                        double eps) {
-    const auto dtype = input.scalar_type();
-    auto output = mfq_tensor_backend::layer_norm(input, {input.size(-1)}, weight.to(dtype),
-                                                 bias.to(dtype), eps);
-    return output.to(dtype).contiguous();
+inline mfq_tensor_backend::Tensor minicpmo45_layer_norm(
+        mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor &weight,
+        const mfq_tensor_backend::Tensor &bias, double eps) {
+    return mfq::cuda::vision_layer_norm(std::move(input), weight, bias, eps);
 }
 
-inline mfq_tensor_backend::Tensor
-minicpmo45_attention(mfq_tensor_backend::Tensor query, mfq_tensor_backend::Tensor key,
-                     mfq_tensor_backend::Tensor value,
-                     MfqOptional<mfq_tensor_backend::Tensor> additive_mask, double scale) {
-    auto scores = mfq_tensor_backend::matmul(query, key.transpose(-2, -1)) * scale;
-    if (additive_mask.has_value()) {
-        scores = scores + additive_mask.value().to(scores.scalar_type());
-    }
-    auto probabilities = mfq_tensor_backend::softmax(scores, -1, mfq_tensor_backend::kFloat32)
-                             .to(value.scalar_type());
-    return mfq_tensor_backend::matmul(probabilities, value).contiguous();
+// Load one SigLIP block into the shared pre-LayerNorm vision block.  SigLIP
+// keeps q/k/v separate and approximates GELU with tanh.
+inline mfq::cuda::VisionBlock load_minicpmo45_vision_block(
+        CudaExecutionContext &execution, const mfq::ModelSource &mfq, int index,
+        int64_t heads, int64_t head_dim) {
+    const std::string prefix = "vision.block." + std::to_string(index);
+    mfq::cuda::VisionBlock result;
+    result.query = MiniCPMO45Linear::load(execution, mfq, prefix + ".attention.query");
+    result.key = MiniCPMO45Linear::load(execution, mfq, prefix + ".attention.key");
+    result.value = MiniCPMO45Linear::load(execution, mfq, prefix + ".attention.value");
+    result.output = MiniCPMO45Linear::load(execution, mfq, prefix + ".attention.output");
+    result.norm1_weight = load_dense_native_gpu(execution, mfq, prefix + ".norm1.weight");
+    result.norm1_bias = load_dense_native_gpu(execution, mfq, prefix + ".norm1.bias");
+    result.norm2_weight = load_dense_native_gpu(execution, mfq, prefix + ".norm2.weight");
+    result.norm2_bias = load_dense_native_gpu(execution, mfq, prefix + ".norm2.bias");
+    result.fc1 = MiniCPMO45Linear::load(execution, mfq, prefix + ".mlp.up");
+    result.fc2 = MiniCPMO45Linear::load(execution, mfq, prefix + ".mlp.down");
+    result.heads = heads;
+    result.head_dim = head_dim;
+    result.layer_norm_eps = 1e-6;
+    result.activation = mfq::cuda::VisionActivation::gelu_tanh;
+    return result;
 }
-
-struct MiniCPMO45VisionAttention {
-    MiniCPMO45Linear q;
-    MiniCPMO45Linear k;
-    MiniCPMO45Linear v;
-    MiniCPMO45Linear output;
-    int64_t heads = 16;
-    int64_t head_dim = 72;
-
-    static MiniCPMO45VisionAttention load(CudaExecutionContext &execution,
-                                          const mfq::ModelSource &mfq, const std::string &prefix) {
-        MiniCPMO45VisionAttention result;
-        result.q = MiniCPMO45Linear::load(execution, mfq, prefix + ".query");
-        result.k = MiniCPMO45Linear::load(execution, mfq, prefix + ".key");
-        result.v = MiniCPMO45Linear::load(execution, mfq, prefix + ".value");
-        result.output = MiniCPMO45Linear::load(execution, mfq, prefix + ".output");
-        return result;
-    }
-
-    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
-                                       mfq_tensor_backend::Tensor input,
-                                       MfqOptional<mfq_tensor_backend::Tensor> mask) const {
-        const int64_t batch = input.size(0);
-        const int64_t tokens = input.size(1);
-        auto reshape = [&](mfq_tensor_backend::Tensor value) {
-            return value.reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
-        };
-        using Tensor = mfq_tensor_backend::Tensor;
-        return mfq::models::minicpmo45::encoder_attention(
-            input, false, [&](const Tensor &x) { return reshape(q.forward(execution, x)); },
-            [&](const Tensor &x) { return reshape(k.forward(execution, x)); },
-            [&](const Tensor &x) { return reshape(v.forward(execution, x)); },
-            [](Tensor &, Tensor &) {},
-            [&](Tensor q, Tensor k, Tensor v) {
-                return minicpmo45_attention(q, k, v, mask,
-                                            1.0 / std::sqrt(static_cast<double>(head_dim)));
-            },
-            [&](Tensor attended) {
-                return output.forward(
-                    execution, attended.transpose(1, 2).reshape({batch, tokens, heads * head_dim}));
-            });
-    }
-};
-
-struct MiniCPMO45VisionLayer {
-    MiniCPMO45VisionAttention attention;
-    mfq_tensor_backend::Tensor norm1_weight;
-    mfq_tensor_backend::Tensor norm1_bias;
-    mfq_tensor_backend::Tensor norm2_weight;
-    mfq_tensor_backend::Tensor norm2_bias;
-    MiniCPMO45Linear fc1;
-    MiniCPMO45Linear fc2;
-
-    static MiniCPMO45VisionLayer load(CudaExecutionContext &execution, const mfq::ModelSource &mfq,
-                                      int index) {
-        const std::string prefix = "vision.block." + std::to_string(index);
-        MiniCPMO45VisionLayer result;
-        result.attention = MiniCPMO45VisionAttention::load(execution, mfq, prefix + ".attention");
-        result.norm1_weight = load_dense_native_gpu(execution, mfq, prefix + ".norm1.weight");
-        result.norm1_bias = load_dense_native_gpu(execution, mfq, prefix + ".norm1.bias");
-        result.norm2_weight = load_dense_native_gpu(execution, mfq, prefix + ".norm2.weight");
-        result.norm2_bias = load_dense_native_gpu(execution, mfq, prefix + ".norm2.bias");
-        result.fc1 = MiniCPMO45Linear::load(execution, mfq, prefix + ".mlp.up");
-        result.fc2 = MiniCPMO45Linear::load(execution, mfq, prefix + ".mlp.down");
-        return result;
-    }
-
-    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
-                                       mfq_tensor_backend::Tensor input,
-                                       MfqOptional<mfq_tensor_backend::Tensor> mask) const {
-        using Tensor = mfq_tensor_backend::Tensor;
-        return mfq::models::pre_norm_layer(
-            std::move(input),
-            [&](const Tensor &x, int stage) {
-                return minicpmo45_layer_norm(x, stage == 0 ? norm1_weight : norm2_weight,
-                                             stage == 0 ? norm1_bias : norm2_bias, 1e-6);
-            },
-            [&](Tensor x) { return attention.forward(execution, x, mask); },
-            [&](Tensor x) {
-                return mfq::models::mlp(
-                    x, [&](Tensor x) { return fc1.forward(execution, x); },
-                    [](Tensor x) { return mfq_tensor_backend::gelu(x, "tanh"); },
-                    [&](Tensor x) { return fc2.forward(execution, x); });
-            },
-            [](Tensor residual, Tensor branch) { return (residual + branch).contiguous(); });
-    }
-};
 
 struct MiniCPMO45VisionEncoder {
     mfq_tensor_backend::Tensor patch_weight;
     mfq_tensor_backend::Tensor patch_bias;
     mfq_tensor_backend::Tensor position_embedding;
-    std::vector<MiniCPMO45VisionLayer> layers;
+    // SigLIP blocks: 16 heads of 1152/16 = 72 features each.
+    std::vector<mfq::cuda::VisionBlock> layers;
     mfq_tensor_backend::Tensor post_norm_weight;
     mfq_tensor_backend::Tensor post_norm_bias;
     int64_t patch_size = 14;
@@ -196,7 +86,7 @@ struct MiniCPMO45VisionEncoder {
         result.post_norm_bias = load_dense_native_gpu(execution, mfq, "vision.output_norm.bias");
         result.layers.reserve(27);
         for (int index = 0; index < 27; ++index) {
-            result.layers.push_back(MiniCPMO45VisionLayer::load(execution, mfq, index));
+            result.layers.push_back(load_minicpmo45_vision_block(execution, mfq, index, 16, 72));
         }
         if (result.patch_weight.sizes().vec() != std::vector<int64_t>({1152, 3, 14, 14}) ||
             result.position_embedding.sizes().vec() != std::vector<int64_t>({4900, 1152})) {
