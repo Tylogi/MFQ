@@ -25,6 +25,8 @@ import { ModelPressureBars } from './ModelMemoryPressure';
 import { variantMemoryPressureRows, type PressureRow } from './memoryPressure';
 import { RepositoryFiles } from './RepositoryFiles';
 import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemory } from './KvCachePlanner';
+import { useJobStore } from '../../stores/jobStore';
+import { useDownloadReuse, type DownloadReuse } from './useDownloadReuse';
 
 type Translate = (chinese: string, english: string) => string;
 function attentionLabel(profile: ModelAttentionProfile | null | undefined, tr: Translate): string {
@@ -181,11 +183,19 @@ function safeSegment(value: string): string {
   return value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "model";
 }
 
+function isSharedEngram(name: string): boolean {
+  return /(?:^|\/)Engram\/.*\.mfq$/i.test(name);
+}
+
+function repositoryDownloadPath(source: Pick<HubModelSummary, 'provider' | 'repo_id'>): string {
+  return `models/${source.provider}/${source.repo_id.split('/').map(safeSegment).join('/')}`;
+}
+
 function downloadPatterns(variant: HubModelVariant | null): string[] {
   if (!variant) return [];
   if (variant.format === "unknown") return variant.files;
   const weights = variant.files.length <= 48
-    ? variant.files
+    ? variant.files.filter(name => !isSharedEngram(name))
     : variant.format === "mfq"
       ? [`${variant.label}*.mfq`]
       : variant.format === "hf"
@@ -193,7 +203,8 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
         : variant.format === "gguf"
           ? ["*.gguf"]
           : variant.files.slice(0, 48);
-  return Array.from(new Set([...weights, ...SUPPORT_FILES]));
+  const shared = variant.files.filter(isSharedEngram);
+  return Array.from(new Set([...weights, ...shared, ...SUPPORT_FILES]));
 }
 
 function ConfigurationDetails({ status, planned = false, rows, tr }: { status: ModelConfigurationStatus; planned?: boolean; rows?: PressureRow[]; tr: Translate }) {
@@ -232,6 +243,7 @@ function VariantList({
   cacheBytes = 0,
   system,
   moe = false,
+  reuse,
 }: {
   disabled: boolean;
   onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
@@ -240,6 +252,7 @@ function VariantList({
   cacheBytes?: number;
   system?: HubSystemProfile;
   moe?: boolean;
+  reuse?: DownloadReuse;
 }) {
   if (!variants.length) {
     return <div className="model-browser-empty compact">{tr("仓库暂未返回可下载权重。", "No downloadable weights were returned by this repository.")}</div>;
@@ -247,11 +260,21 @@ function VariantList({
   return (
     <div className="model-variant-list">
       {variants.map((variant) => {
+        const hasEngram = variant.files.some(isSharedEngram);
+        const reused = variant.files.reduce((total, name) => total + (reuse?.reusableFiles[name] ?? 0), 0);
+        const reusedEngram = variant.files.filter(isSharedEngram).reduce((total, name) => total + (reuse?.reusableFiles[name] ?? 0), 0);
+        const downloadBytes = Math.max(0, variant.byte_size - reused);
+        const downloaded = hasEngram && !reuse?.checking && downloadBytes === 0 && variant.byte_size > 0;
         return (
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
               <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · ${tr("常驻", "resident")} ${formatBytes(Math.max(0, variant.byte_size - (variant.ssd_ple_bytes ?? 0)))} · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              {hasEngram && (reuse?.checking ? <small>{tr('正在检查本地文件…', 'Checking local files…')}</small>
+                : <div className="model-download-reuse" aria-live="polite">
+                    <span>{tr('本次需下载', 'Download needed')} {downloadBytes === 0 ? '0 B' : formatBytes(downloadBytes)}</span>
+                    {reusedEngram > 0 && <span className="model-engram-reuse">{tr('Engram 可复用', 'Engram reusable')} · {formatBytes(reusedEngram)}</span>}
+                  </div>)}
               {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
             <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
@@ -260,11 +283,11 @@ function VariantList({
               available={variant.configuration.available_memory_bytes}
               label={tr("预计占当前推理预算", "Estimated share of runtime budget")}
               tr={tr} />
-            <button disabled={disabled} onClick={(event) => {
+            <button disabled={disabled || downloaded} onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               onDownload(variant, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
             }} type="button">
-              {tr("下载", "Download")}
+              {downloaded ? tr('已下载', 'Downloaded') : tr("下载", "Download")}
             </button>
           </div>
         );
@@ -350,6 +373,15 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
     (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
+  const downloadRevision = useJobStore(state => state.jobs.filter(job => job.kind.startsWith('download.'))
+    .map(job => `${job.id}:${job.status}`).join('|'));
+  const directoryReady = !downloadDirectoryControl || downloadDirectory !== undefined;
+  const officialReuse = useDownloadReuse(directoryReady && selectedSource && officialVariants.some(variant => variant.files.some(isSharedEngram))
+    ? { provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision,
+        destination: repositoryDownloadPath(selectedSource), download_directory: downloadDirectory } : null, downloadRevision);
+  const communityReuse = useDownloadReuse(directoryReady && communityModel && communityModel.variants.some(variant => variant.files.some(isSharedEngram))
+    ? { provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision,
+        destination: repositoryDownloadPath(communityModel), download_directory: downloadDirectory } : null, downloadRevision);
 
   async function loadOfficial(refresh = false) {
     const request = ++catalogRequest.current;
@@ -477,11 +509,11 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     const marker = `${source.provider}:${source.repo_id}:${variant.id}`;
     setDownloading(marker);
     try {
-      const repositoryPath = source.repo_id.split("/").map(safeSegment).join("/");
       const variantPath = safeSegment(variant.label);
+      const sharedEngram = variant.files.some(isSharedEngram);
       const created = await jobsApi.createJob(`download.${source.provider}`, {
         repo_id: source.repo_id,
-        destination: `models/${source.provider}/${repositoryPath}/${variantPath}`,
+        destination: `${repositoryDownloadPath(source)}${sharedEngram ? "" : `/${variantPath}`}`,
         ...(downloadDirectory ? { download_directory: downloadDirectory } : {}),
         revision: source.revision,
         include: downloadPatterns(variant),
@@ -562,7 +594,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   {selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 <p className="model-weight-pressure-note">{tr('下方压力条与百分比表示常驻权重对当前剩余显存、内存或统一内存推理预算的压力，不是磁盘占用。', 'The bars and percentages below show resident-weight pressure on the currently available VRAM, RAM or unified-memory inference budget, not disk usage.')}<br />{tr('基于不同模型架构的推理特性，在非统一内存设备上，MoE 模型的推理预算统计内存 + 显存，Dense 模型的推理预算仅统计显存。', 'Because inference characteristics vary by architecture, on devices without unified memory, MoE inference budgets include RAM + VRAM, while Dense inference budgets include only VRAM.')}</p>
-                <VariantList disabled={officialLoading || sourceProbing || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
+                <VariantList disabled={officialLoading || sourceProbing || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} reuse={officialReuse} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(officialSourceInfo!, {
@@ -603,7 +635,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 </dl>
                 <KvCachePlanner key={`kv:${communityPlanKey}`} profile={communityModel.cache_profile} appliedContext={communityContext} onApply={(context) => applyPlan(communityPlanKey, context)} tr={tr} />
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} system={official?.system} moe={(communityModel.parameter_breakdown?.routed_experts ?? 0) > 0} />
+                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} reuse={communityReuse} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} system={official?.system} moe={(communityModel.parameter_breakdown?.routed_experts ?? 0) > 0} />
                 <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}
                   disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(communityModel, {

@@ -409,13 +409,16 @@ int main() {
     }
     {
         DsparkDepthController controller(3);
-        require(controller.depth() == 3);
-        controller.observe(3, 3, 30.0);
-        controller.observe(3, 3, 29.0);
+        require(controller.depth() == 2);
+        controller.observe(2, 2, 30.0);
+        controller.observe(2, 2, 29.0);
         controller.observe(0, 0, 22.0);
         controller.observe(0, 0, 21.0);
         controller.observe(0, 0, 23.0);
-        for(int depth : {3,2,1})controller.observe(depth,depth,26.0+depth);
+        controller.observe(2,2,29.0);
+        for(int cycle=0;cycle<12;++cycle) {
+            const int depth=controller.depth();controller.observe(depth,depth,26.0+depth);
+        }
         require(controller.depth() == 3);
         require(controller.measured_cycle_ms(3).has_value());
         require(controller.conditional_acceptance(0) > 0.6);
@@ -427,17 +430,18 @@ int main() {
         controller.observe(0, 0, 40.0);
         controller.observe(0, 0, 39.0);
         controller.observe(0, 0, 41.0);
+        controller.observe(1, 0, 75.0);
         require(controller.depth() == 0);
         require(controller.measured_cycle_ms(0).has_value());
     }
     {
         DsparkDepthController controller(3);
-        controller.observe(3, 0, 70.0);
-        controller.observe(3, 0, 65.0);
+        controller.observe(2, 0, 70.0);
+        controller.observe(2, 0, 65.0);
         controller.observe(0, 0, 30.0);
         controller.observe(0, 0, 29.0);
         controller.observe(0, 0, 31.0);
-        for(int depth : {3,2,1})controller.observe(depth,0,60.0+depth);
+        controller.observe(2,0,62.0);
         require(controller.depth() == 0);
         // Depth zero is a reversible scheduling choice, not a permanent exit
         // from the common MTP state machine. Periodic exploration must remain
@@ -455,17 +459,29 @@ int main() {
     }
     {
         DsparkDepthController controller(3);
-        controller.observe(3,3,9000.0,false);
-        require(controller.depth()==3 && !controller.measured_cycle_ms(3));
+        controller.observe(2,2,9000.0,false);
+        require(controller.depth()==2 && !controller.measured_cycle_ms(2));
         controller.observe(1,1,20.0);
-        require(controller.depth()==3 && !controller.measured_cycle_ms(3));
-        for (const auto [depth,ms] : std::array<std::pair<int,double>,8>{
-                {{3,700.0},{3,657.0},{0,60.0},{0,30.0},{0,20.0},
-                 {3,35.0},{2,30.0},{1,25.0}}}) {
+        require(controller.depth()==2 && !controller.measured_cycle_ms(2));
+        for (const auto [depth,ms] : std::array<std::pair<int,double>,6>{
+                {{2,700.0},{2,657.0},{0,60.0},{0,30.0},{0,20.0},{2,35.0}}}) {
             require(controller.depth()==depth);
             controller.observe(depth,depth,ms);
         }
-        require(controller.depth()==3 && *controller.measured_cycle_ms(3)==35.0);
+        require(controller.depth()>0 && *controller.measured_cycle_ms(2)==35.0);
+    }
+    {
+        DsparkDepthController controller(5);
+        require(controller.depth()==2 && controller.maximum_depth()==5);
+        bool explored_maximum=false;
+        for(int cycle=0;cycle<1500;++cycle) {
+            const int depth=controller.depth();explored_maximum|=depth==5;
+            controller.observe(depth,depth,depth?24.0+2*depth:20.0);
+        }
+        require(explored_maximum && controller.depth()==5);
+        require(DsparkDepthController(1).depth()==1);
+        require(DsparkDepthController(3,5).depth()==3);
+        require(DsparkDepthController(3,0).depth()==1);
     }
     {
         // SSD verification can cost several ordinary decode cycles. Charge

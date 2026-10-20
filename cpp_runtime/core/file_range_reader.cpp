@@ -39,6 +39,9 @@ namespace {
 std::size_t direct_chunk_limit(std::size_t alignment) {
     return std::max<std::size_t>(1,(1u<<20)/alignment)*alignment;
 }
+std::size_t direct_wave_limit(std::size_t alignment) {
+    return std::max<std::size_t>(8u<<20,alignment);
+}
 void report_direct_chunking(std::size_t bytes,std::size_t limit) {
     if(bytes<=limit)return;
     static std::atomic<bool> reported{false};
@@ -491,13 +494,14 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         // projection is needed. Each bounded wave still owns one staging arena.
         const auto limit = std::min(std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment,
             direct_chunk_limit(alignment));
+        const auto wave_limit=direct_wave_limit(alignment);
         std::size_t span_index = 0, span_offset = 0;
         while (span_index < spans.size()) {
-            std::size_t batch_bytes=0;
-            // Large PLE gathers can contain thousands of row ranges. Bound
-            // aligned staging and outstanding IRPs, reusing the same events
-            // after each fully drained batch.
-            while (count < requests.size() && span_index < spans.size()) {
+            std::size_t batch_bytes=0,wave_bytes=0;
+            // Bound both staging bytes and outstanding IRPs. Large expert
+            // batches reuse the 8 MiB arena instead of allocating a larger,
+            // uncached payload on every read. Events follow drained batches.
+            while (count < requests.size() && wave_bytes<wave_limit && span_index < spans.size()) {
                 const auto& span = spans[span_index];
                 if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
                 const auto offset = span.offset + span_offset;
@@ -508,6 +512,10 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 request->bytes = std::min(span.size - span_offset, limit - request->prefix);
                 const auto required = request->prefix + request->bytes;
                 request->allocation = required + (alignment - required % alignment) % alignment;
+                if(count && request->allocation>wave_limit-wave_bytes) {
+                    requests[count].reset();break;
+                }
+                wave_bytes+=request->allocation;
                 request->destination = span.destination + span_offset;
                 request->aligned_target=!request->prefix && request->bytes==request->allocation &&
                     reinterpret_cast<std::uintptr_t>(request->destination)%alignment==0;
@@ -593,7 +601,7 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         while(index<spans.size()) {
             std::array<Part,64> parts{};std::size_t count=0,bytes=0,staging_bytes=0;
             const auto alignment=impl_->alignment;
-            const auto wave_limit=std::max<std::size_t>(8u<<20,alignment);
+            const auto wave_limit=direct_wave_limit(alignment);
             const auto request_limit=direct_chunk_limit(alignment);
             while(count<parts.size() && index<spans.size()) {
                 const auto& span=spans[index];

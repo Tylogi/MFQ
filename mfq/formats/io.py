@@ -54,6 +54,7 @@ from typing import TypeAlias
 import numpy as np
 
 from mfq.formats.assets import ASSET_DTYPE
+from mfq.formats.companions import is_engram_shard, is_engram_table
 from mfq.formats.compat import (
     FP8_128SQ_DTYPE,
     MFE_DTYPE,
@@ -1857,6 +1858,10 @@ def open_mmap(path: str | Path, *, cache: bool = False) -> MMapTensorStore:
                 )
             if header.version != reference_version or header.model_arch != reference_arch:
                 raise ValueError(f"MFQ shard architecture/version mismatch: {paths[index]}")
+            if is_engram_shard(paths[index].as_posix()) and (
+                not records or any(not is_engram_table(name) for name in records)
+            ):
+                raise ValueError(f"shared Engram shard contains non-table records: {paths[index]}")
             if expected_tensors is None:
                 expected_tensors = tensors
             elif tensors is not None and tensors != expected_tensors:

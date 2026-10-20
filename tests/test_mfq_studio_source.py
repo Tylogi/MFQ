@@ -113,9 +113,10 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
 def test_model_hub_resolves_links_and_downloads_selected_variants():
     assert "modelsApi.resolveHubModel(reference, provider)" in MODEL_BROWSER
     assert (
-        "destination: `models/${source.provider}/${repositoryPath}/${variantPath}`"
+        'destination: `${repositoryDownloadPath(source)}${sharedEngram ? "" : `/${variantPath}`}`'
         in MODEL_BROWSER
     )
+    assert "return `models/${source.provider}/${source.repo_id.split('/').map(safeSegment).join('/')}`" in MODEL_BROWSER
     assert "downloadPatterns(variant)" in MODEL_BROWSER
     assert "jobsApi.createJob" in MODEL_BROWSER
     assert 'tr("官方模型", "Official")' in MODEL_BROWSER

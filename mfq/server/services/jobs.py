@@ -291,7 +291,7 @@ class JobManager:
             task.cancel()
         return job
 
-    async def retry(self, job_id: UUID) -> JobResource:
+    async def retry(self, job_id: UUID, *, payload: dict[str, Any] | None = None) -> JobResource:
         await self.start()
         previous = await asyncio.to_thread(self.store.get_job, job_id)
         if previous.kind in {'download.huggingface', 'download.modelscope'}:
@@ -304,7 +304,7 @@ class JobManager:
                 with suppress(asyncio.CancelledError):
                     await asyncio.shield(task)
                 self._forget(job_id, task)
-            resumed = await asyncio.to_thread(self.store.requeue_job, job_id)
+            resumed = await asyncio.to_thread(self.store.requeue_job, job_id, payload=payload)
             self._schedule(job_id)
             return resumed
         if previous.status not in {

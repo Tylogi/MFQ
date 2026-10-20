@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -59,12 +60,20 @@ std::string row_table_payload() {
 
 void write_fixture(const std::filesystem::path& path,
                    const std::string& dtype = "MXFP8",
-                   const std::string& payload = row_table_payload()) {
-    const std::string name = "table.weight";
+                   const std::string& payload = row_table_payload(),
+                   const std::string& name = "table.weight", int split_no = -1) {
     std::string bytes{"MFQ1", 4};
     append_little<std::uint32_t>(bytes, 2);
     append_string(bytes, "unit-test");
-    append_little<std::uint32_t>(bytes, 0);
+    append_little<std::uint32_t>(bytes, split_no < 0 ? 0 : 4);
+    if (split_no >= 0) {
+        for (const auto& field : std::vector<std::pair<std::string, std::string>>{
+                {"split.no", std::to_string(split_no)}, {"split.count", "3"},
+                {"split.tensors.count", "3"}, {"split.records.count", "3"}}) {
+            append_string(bytes, field.first);
+            append_string(bytes, field.second);
+        }
+    }
     append_little<std::uint32_t>(bytes, 1);
     append_string(bytes, name);
     append_string(bytes, dtype);
@@ -267,6 +276,38 @@ void require_row(
         "decoded MXFP8 row mismatch");
 }
 
+void test_shared_engram_rows(const std::filesystem::path& root) {
+    const std::string name = "model.block.1.associative_memory.embedding.weight";
+    const auto shared = root / "Engram" / "model-EW-Engram-MXFP8-00002-of-00003.mfq";
+    std::filesystem::create_directories(shared.parent_path());
+    write_fixture(shared, "MXFP8", row_table_payload(), name, 1);
+    for (const std::string precision : {"Q3", "Q2.5"}) {
+        const auto directory = root / precision;
+        std::filesystem::create_directories(directory);
+        const auto first = directory / ("model-EW-" + precision + "-00001-of-00003.mfq");
+        const auto last = directory / ("model-EW-" + precision + "-00003-of-00003.mfq");
+        write_fixture(first, "MXFP8", row_table_payload(), "model.input.weight", 0);
+        write_fixture(last, "MXFP8", row_table_payload(), "model.output.weight", 2);
+        for (const auto& entry : {first, last}) {
+            mfq::metal::MfqContainer model(entry);
+            require(model.source_paths().size() == 3 &&
+                model.record(name).source_path == std::filesystem::canonical(shared),
+                "Metal did not resolve the original shared Engram file");
+            mfq::metal::MlxQuantizedRowStore store(model, name, 4, 32, 2, 2);
+            const std::array<std::int64_t, 4> request{3, 0, 3, 2};
+            const auto output = values(store.gather(request));
+            for (std::size_t row = 0; row < request.size(); ++row)
+                require_row(output, row, request[row] % 2 ? 2.0f : 1.0f);
+            require(store.stats().rows_loaded == 3 && store.cached_rows() == 2,
+                "shared MXFP8 Engram did not keep bounded row residency");
+            store.clear();
+            require_row(values(store.prepare_rows(std::span(request).first(1)).decode()), 0, 2.0f);
+            require(!std::filesystem::exists(directory / shared.filename()),
+                "shared Engram was copied into a precision directory");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -275,6 +316,7 @@ int main() {
             std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         std::filesystem::create_directories(root);
+        test_shared_engram_rows(root / "shared");
         const auto path = root / "fixture.mfq";
         write_fixture(path);
         mfq::metal::MfqContainer model(path);

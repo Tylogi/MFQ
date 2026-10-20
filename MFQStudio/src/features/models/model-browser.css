@@ -138,6 +138,8 @@
 .model-variant > div:first-child { display: grid; min-width: 0; gap: 5px; padding: 12px 0 12px 12px; }
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
+.model-download-reuse { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 11px; font-weight: 400; }
+.model-engram-reuse { padding: 3px 7px; border-radius: 5px; color: var(--accent-ink); background: var(--accent-soft); font-size: 10px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
 .variant-memory-tiers { display: grid; min-width: 0; gap: 8px; }
 .variant-memory-caption { display: block; overflow: hidden; margin-bottom: 4px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }

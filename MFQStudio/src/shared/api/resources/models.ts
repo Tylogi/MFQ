@@ -7,6 +7,8 @@ import type {
   ModelDirectoryList,
   HubModelSummary,
   HubModelInfo,
+  HubDownloadReuseRequest,
+  HubDownloadReuseResponse,
   OfficialModelList,
   ArtifactLineage,
 } from '../types';
@@ -34,6 +36,9 @@ export interface DownloadDirectoryStatus {
 }
 
 export const modelsApi = {
+  downloadReuse(payload: HubDownloadReuseRequest, signal?: AbortSignal): Promise<HubDownloadReuseResponse> {
+    return request('/api/v1/hub/download-reuse', { method: 'POST', body: JSON.stringify(payload), signal });
+  },
   downloadDirectory(): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory');
   },

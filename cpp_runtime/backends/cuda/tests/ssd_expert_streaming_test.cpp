@@ -1216,6 +1216,28 @@ int main(int argc,char** argv)try {
                 for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(targets[i][f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
                     "SSD prefill worker did not recover or changed a queued packet");
             }
+            for(bool fail_gate_up:{false,true}) {
+                std::array<std::vector<MoeExpertCache::SsdExpertCopy>,2> requests;
+                requests[0].push_back({quant,31,fail_gate_up?std::vector<tb::Tensor>{}:targets[0]});
+                requests[1].push_back({quant,31,fail_gate_up?targets[1]:std::vector<tb::Tensor>{}});
+                auto phases=candidate.cache->queue_ssd_prefill_phases(std::move(requests));
+                bool gate_up_failed=false,down_failed=false;
+                try{phases[0].get();}catch(const std::invalid_argument&){gate_up_failed=true;}
+                try{phases[1].get();}catch(const std::invalid_argument&){down_failed=true;}
+                check(gate_up_failed==fail_gate_up && down_failed,
+                    "SSD prefill projection phase lost an error or invalidated ready Gate/Up");
+            }
+            std::array<std::vector<MoeExpertCache::SsdExpertCopy>,2> phase_requests;
+            for(int i=0;i<2;++i) {
+                for(auto& field:targets[i])if(field.nbytes())std::memset(field.data_ptr(),0xa5,field.nbytes());
+                phase_requests[i].push_back({quant,31,targets[i]});
+            }
+            auto phases=candidate.cache->queue_ssd_prefill_phases(std::move(phase_requests));
+            for(int i=0;i<2;++i) {
+                phases[i].get();
+                for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(targets[i][f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
+                    "SSD prefill phase did not recover or changed its projection fields");
+            }
         }
         for(const auto& quant:candidate.sources)for(std::size_t pool=0;pool<quant->store().pool_count();++pool) {
             if(quant->metadata()->pools[pool].family!=MixedMoeFamily::Nvq)continue;

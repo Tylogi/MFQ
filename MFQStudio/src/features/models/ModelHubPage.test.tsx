@@ -6,6 +6,7 @@ import { jobsApi } from '../../shared/api/resources/jobs';
 import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelHubPage } from './ModelHubPage';
+import { DownloadQueue } from './DownloadQueue';
 
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn(), configureDownloadReclaim: vi.fn(), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }) } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
@@ -34,6 +35,14 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); useJobStore.getState().setJobs([]); });
+
+it.each(['Q3/model-EW-Q3-00001-of-00043.mfq', 'Q3/model-EW-Q3*.mfq'])(
+  'keeps the selected precision visible when a shared Engram file appears first: %s', (primary) => {
+    const job = download();
+    job.payload.include = ['Engram/model-EW-Engram-MXFP8-00002-of-00043.mfq', primary];
+    const { container } = render(<DownloadQueue jobs={[job]} onJobCreated={vi.fn()} />);
+    expect(container.querySelector('.download-item-heading strong')).toHaveTextContent(primary);
+  });
 
 it('keeps a submitted download on this page, animates into the circle and opens the third tab', async () => {
   vi.mocked(jobsApi.createJob).mockResolvedValue(download());

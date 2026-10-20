@@ -148,6 +148,69 @@ void require_bytes(const std::vector<std::byte>& bytes) {
             "unexpected tensor bytes");
 }
 
+void write_shared_fixture(const std::filesystem::path& path, int index,
+                          std::string_view name, std::string_view architecture = "test-shared") {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream stream(path, std::ios::binary);
+    stream.write("MFQ1", 4);
+    write_scalar<std::uint32_t>(stream, 2);
+    write_string(stream, architecture);
+    write_scalar<std::uint32_t>(stream, 4);
+    for (const auto& field : std::vector<std::pair<std::string, std::string>>{
+            {"split.no", std::to_string(index)}, {"split.count", "3"},
+            {"split.tensors.count", "3"}, {"split.records.count", "3"}}) {
+        write_string(stream, field.first);
+        write_string(stream, field.second);
+    }
+    write_scalar<std::uint32_t>(stream, 1);
+    write_string(stream, name);
+    write_string(stream, "BF16");
+    write_scalar<std::uint64_t>(stream, 14);
+    write_scalar<std::uint32_t>(stream, 1);
+    write_scalar<std::int64_t>(stream, 1);
+    write_scalar<std::uint16_t>(stream, static_cast<std::uint16_t>(index + 10));
+}
+
+void test_shared_engram_shards(const std::filesystem::path& root) {
+    const std::string table_name = "model.block.1.associative_memory.embedding.weight";
+    const auto shared = root / "Engram" / "model-EW-Engram-MXFP8-00002-of-00003.mfq";
+    write_shared_fixture(shared, 1, table_name);
+    for (const std::string precision : {"Q2.5", "Q3"}) {
+        const auto first = root / precision / ("model-EW-" + precision + "-00001-of-00003.mfq");
+        const auto last = root / precision / ("model-EW-" + precision + "-00003-of-00003.mfq");
+        write_shared_fixture(first, 0, "model.token_embedding.weight");
+        write_shared_fixture(last, 2, "model.output.weight");
+        for (auto mode : {mfq::FileReadMode::Buffered, mfq::FileReadMode::Direct}) {
+            mfq::MfqModelSource source(last, mode);
+            require(source.source_paths().size() == 3, "shared checkpoint lost shards");
+            require(source.source_paths()[1] == std::filesystem::canonical(shared), "shared table was copied or not resolved");
+            const auto bytes = source.read(table_name);
+            require(bytes.size() == 14 && std::to_integer<int>(bytes[12]) == 11,
+                    "shared table read returned incorrect bytes");
+        }
+    }
+    const auto first = root / "Q3" / "model-EW-Q3-00001-of-00003.mfq";
+    auto rejects = [&] {
+        try { mfq::MfqModelSource source(first); return false; }
+        catch (const std::runtime_error&) { return true; }
+    };
+    const auto duplicate = root / "Engram" / "model-EW-Engram-MXFP4-00002-of-00003.mfq";
+    write_shared_fixture(duplicate, 1, table_name);
+    require(rejects(), "ambiguous shared table precision was guessed");
+    std::filesystem::remove(duplicate);
+    write_shared_fixture(shared, 1, "model.output.other.weight");
+    require(rejects(), "shared filename allowed a non-table substitution");
+    write_shared_fixture(shared, 1, table_name, "wrong-architecture");
+    require(rejects(), "shared table from incompatible architecture was accepted");
+    std::filesystem::remove(shared);
+    require(rejects(), "missing shared Engram table was accepted");
+    // An ordinary complete checkpoint remains loadable beside unusable tables.
+    write_shared_fixture(root / "Q3" / "model-EW-Q3-00002-of-00003.mfq", 1, table_name);
+    write_shared_fixture(shared, 1, "invalid.weight");
+    mfq::MfqModelSource legacy(first);
+    require(legacy.source_paths()[1].parent_path().filename() == "Q3", "legacy shard was replaced");
+}
+
 } // namespace
 
 int main() {
@@ -156,6 +219,7 @@ int main() {
         ("mfq-model-source-test-" + std::to_string(nonce));
     try {
         std::filesystem::create_directories(root);
+        test_shared_engram_shards(root / "shared");
         const auto mfq_path = root / "model.mfq";
         const auto legacy_mfq_path = root / "legacy-model.mfq";
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";

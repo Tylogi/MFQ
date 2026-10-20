@@ -79,12 +79,15 @@ class DownloadDirectorySettings:
             self.evict_prefix_cache = reclaim
             return await asyncio.to_thread(self.status)
 
-    def directory(self, path: str) -> Path:
+    def directory(self, path: str, *, create: bool = True) -> Path:
         directory = Path(path).resolve()
         if directory not in self.roots.values():
             raise ValueError("download directory has not been selected on this server")
         if directory == self.default_directory:
-            directory.mkdir(parents=True, exist_ok=True)
+            if create:
+                directory.mkdir(parents=True, exist_ok=True)
+            elif not directory.exists():
+                return directory
         if not directory.is_dir():
             raise ValueError("download directory is unavailable")
         return directory

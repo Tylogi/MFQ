@@ -23,6 +23,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from mfq.formats.companions import with_engram_shards
 
 from mfq.server.api.network import download_environment, hub_download_url
 from mfq.server.protocol.models import ErrorDetail
@@ -253,6 +254,7 @@ class ToolJobHandlers:
         self.root = paths.work_root.expanduser().resolve()
         self.model_root = catalog.roots[0] if catalog.roots else self.root / "models"
         self.download_directories = DownloadDirectorySettings(self.root, self.model_root)
+        self._download_locks: dict[Path, asyncio.Lock] = {}
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
         self.runtime_manager = runtime_manager
@@ -575,15 +577,7 @@ class ToolJobHandlers:
         env, proxy = await self._download_environment('modelscope', request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
-        await self._run_download(context, argv, env, destination, request.expected_bytes)
-        return await self._download_result(
-            context,
-            destination,
-            request.repo_id,
-            provider="modelscope",
-            revision=request.revision,
-            parameters=request.model_dump(mode="json"),
-        )
+        return await self._download_and_register(context, argv, env, destination, request, 'modelscope')
 
     async def download_huggingface(
         self, context: JobContext, payload: dict[str, Any]
@@ -618,23 +612,55 @@ class ToolJobHandlers:
         await context.progress(0.01, message="Starting Hugging Face download")
         env, proxy = await self._download_environment('huggingface', request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
-        await self._run_download(context, argv, env, destination, request.expected_bytes)
-        return await self._download_result(
-            context,
-            destination,
-            request.repo_id,
-            provider="huggingface",
-            revision=request.revision,
-            parameters=request.model_dump(mode="json"),
-        )
+        return await self._download_and_register(context, argv, env, destination, request, 'huggingface')
 
-    async def _run_download(self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path, expected_bytes: int | None) -> None:
+    async def _download_and_register(
+        self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path,
+        request: ModelScopeDownloadPayload | HuggingFaceDownloadPayload,
+        provider: Literal['modelscope', 'huggingface'],
+    ) -> dict[str, Any]:
+        lock = self._download_locks.setdefault(destination, asyncio.Lock())
+        if lock.locked():
+            await context.log('Waiting for the other model download in this folder')
+        async with lock:
+            await self._run_download(context, argv, env, destination, request.expected_bytes, selection=request)
+            return await self._download_result(
+                context, destination, request.repo_id, provider=provider,
+                revision=request.revision, parameters=request.model_dump(mode='json'))
+
+    async def _run_download(
+        self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path,
+        expected_bytes: int | None, *,
+        selection: ModelScopeDownloadPayload | HuggingFaceDownloadPayload | None = None,
+    ) -> None:
+        def selected(path: Path) -> bool:
+            if selection is None:
+                return True
+            relative = path.relative_to(destination)
+            name = relative.as_posix()
+            # Both SDKs keep resumable files under hidden download directories;
+            # HF appends the content hash and .incomplete after the filename.
+            if any(part.startswith('.') for part in relative.parts) or path.suffix in {'.partial', '.incomplete'}:
+                match = re.search(r'\.(?:mfq|safetensors|gguf|bin)(?=\.|$)', name, re.IGNORECASE)
+                if match:
+                    name = name[:match.end()]
+                else:
+                    name = name.removesuffix('.partial').removesuffix('.incomplete')
+                candidates = [name, *(name[index + 1:] for index, char in enumerate(name) if char == '/')]
+            else:
+                candidates = [name]
+            return any((not selection.include or any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.include))
+                       and not any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.exclude)
+                       for value in candidates)
+
         def observed() -> tuple[int, int, int]:
             size = files = allocated = 0
             seen = set()
             for path in destination.rglob("*"):
                 try:
                     if path.is_symlink() or not path.is_file() or path.suffix in {".lock", ".metadata"}:
+                        continue
+                    if not selected(path):
                         continue
                     status = path.stat()
                     identity = (status.st_dev, status.st_ino)
@@ -1344,9 +1370,36 @@ class ToolJobHandlers:
         return destinations
 
     @staticmethod
-    def download_files_present(destination: Path, request, files, *, mfq_only: bool = False) -> bool:
+    def selected_download_files(request, files):
         selected = [item for item in files if (not request.include or any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.include))
             and not any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.exclude)]
+        by_name = {item.name: item for item in files}
+        names = with_engram_shards([item.name for item in selected], list(by_name))
+        if any(any(fnmatch.fnmatchcase(name, pattern) for pattern in request.exclude) for name in names):
+            raise ValueError('Required Engram tables cannot be excluded from the model download.')
+        return [by_name[name] for name in names]
+
+    @staticmethod
+    def reusable_download_files(destination: Path, files) -> dict[str, int]:
+        result = {}
+        for item in files:
+            if not item.name.lower().endswith('.mfq') or item.byte_size <= 0:
+                continue
+            try:
+                path = (destination / item.name).resolve()
+                if path.is_relative_to(destination) and path.is_file() and path.stat().st_size == item.byte_size:
+                    result[item.name] = item.byte_size
+            except OSError:
+                continue
+        return result
+
+    def download_reuse(self, destination: str, directory: str | None, files) -> dict[str, int]:
+        path = self._download_output(destination, directory, create=False)
+        return self.reusable_download_files(path, files)
+
+    @staticmethod
+    def download_files_present(destination: Path, request, files, *, mfq_only: bool = False) -> bool:
+        selected = ToolJobHandlers.selected_download_files(request, files)
         if mfq_only:
             weights = [item for item in selected if item.name.lower().endswith(('.mfq', '.gguf'))]
             if weights:
@@ -1370,7 +1423,7 @@ class ToolJobHandlers:
                 path.mkdir(parents=True, exist_ok=True)
             return path
         try:
-            root = self.download_directories.directory(directory)
+            root = self.download_directories.directory(directory, create=create)
         except ValueError as error:
             raise self._failure("invalid_download_directory", str(error)) from error
         relative = Path(value)

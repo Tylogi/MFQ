@@ -1011,6 +1011,15 @@ class HubDownloadProbeRequest(ProtocolModel):
     sources: list[HubDownloadSource] = Field(min_length=1, max_length=2)
 
 
+class HubDownloadReuseRequest(HubDownloadSource):
+    destination: str = Field(min_length=1, max_length=1024)
+    download_directory: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class HubDownloadReuseResponse(ProtocolModel):
+    reusable_files: dict[str, Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
+
+
 class HubModelSummary(ProtocolModel):
     provider: Literal["huggingface", "modelscope"]
     repo_id: str = Field(min_length=3, max_length=255)

@@ -104,7 +104,7 @@ def test_downloads_keep_their_chosen_folder_and_register_external_results(tmp_pa
         artifacts = []
         async def register(**values):
             registrations.append(values['path'])
-        async def transfer(context, argv, env, destination, expected):
+        async def transfer(context, argv, env, destination, expected, *, selection=None):
             (destination / 'model-00001-of-00002.mfq').write_bytes(b'first')
             (destination / 'model-00002-of-00002.mfq').write_bytes(b'second')
         async def environment(*args, **kwargs):

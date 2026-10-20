@@ -214,8 +214,13 @@ void run_dspark_draft_cost() {
     while(auto step=generation.next())if(step.value)
         if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
             tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
-    if(tokens!=std::vector<int64_t>(10,0) || output.metrics.mtp.head_ms<75.0 ||
-            output.metrics.mtp.measured_depth_ms[3]<75.0)
+    bool sampled_drafts=false;
+    for(int depth=1;depth<=3;++depth)if(output.metrics.mtp.measured_depth_ms[depth]>0) {
+        sampled_drafts=true;
+        if(output.metrics.mtp.measured_depth_ms[depth]<25.0*depth)
+            throw std::runtime_error("DSpark measured cycle omitted completed draft work");
+    }
+    if(tokens!=std::vector<int64_t>(10,0) || output.metrics.mtp.head_ms<75.0 || !sampled_drafts)
         throw std::runtime_error("DSpark depth selection omitted completed draft work from its cycle cost");
 }
 

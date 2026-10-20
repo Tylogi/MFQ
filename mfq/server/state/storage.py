@@ -2079,7 +2079,8 @@ class SessionStore:
             ).fetchall()
         return [self._job_from_row(row) for row in rows]
 
-    def requeue_job(self, job_id: UUID, *, now: datetime | None = None) -> JobResource:
+    def requeue_job(self, job_id: UUID, *, now: datetime | None = None,
+                    payload: dict[str, Any] | None = None) -> JobResource:
         resumed_at = now or _utcnow()
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -2090,6 +2091,9 @@ class SessionStore:
                 return self._job_from_row(row)
             if row['status'] not in {JobStatus.FAILED.value, JobStatus.CANCELLED.value, JobStatus.INTERRUPTED.value}:
                 raise InvalidJobStateError(f"cannot resume job in state {row['status']}")
+            if payload is not None:
+                connection.execute('UPDATE jobs SET payload_json = ? WHERE id = ?',
+                                   (json.dumps(payload), str(job_id)))
             connection.execute(
                 'UPDATE jobs SET status = ?, cancel_requested = 0, error_json = NULL, result_json = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?',
                 (JobStatus.QUEUED.value, _timestamp(resumed_at), str(job_id)),

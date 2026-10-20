@@ -67,19 +67,23 @@ inline ChainVerification verify_greedy(
 
 class DsparkDepthController {
 public:
-    explicit DsparkDepthController(int maximum_depth = 3)
+    explicit DsparkDepthController(int maximum_depth = 3, int initial_depth = 2)
         : maximum_depth_(std::clamp(maximum_depth, 1, kMaximumDraftDepth)),
-          current_depth_(maximum_depth_),
+          current_depth_(std::clamp(initial_depth, 1, maximum_depth_)),
           acceptance_(static_cast<std::size_t>(maximum_depth_), 0.6),
           warmup_accepts_(static_cast<std::size_t>(maximum_depth_), 0),
           warmup_trials_(static_cast<std::size_t>(maximum_depth_), 0),
           cycle_ms_(static_cast<std::size_t>(maximum_depth_ + 1)),
           cycle_age_ms_(static_cast<std::size_t>(maximum_depth_ + 1)) {
-        warmup_.insert(warmup_.end(), {maximum_depth_, maximum_depth_});
+        // A wide cold window can load several GiB of unrelated SSD experts.
+        // Match Metal's shallow start, measure plain decode, then refresh that
+        // width after residency has warmed. The normal cost model and probes
+        // still explore every allowed depth without a forced full-width sweep.
+        warmup_.insert(warmup_.end(), {current_depth_, current_depth_});
         warmup_.insert(warmup_.end(), {0, 0, 0});
-        if (maximum_depth_ > 1)
-            for (int depth = maximum_depth_; depth > 0; --depth)
-                warmup_.push_back(depth);
+        warmup_.push_back(current_depth_);
+        std::fprintf(stderr,"runtime_dspark_warmup initial_depth=%d maximum_depth=%d strategy=shallow_baseline_refresh\n",
+            current_depth_,maximum_depth_);
     }
 
     int depth() const noexcept { return current_depth_; }
