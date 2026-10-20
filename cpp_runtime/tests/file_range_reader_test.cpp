@@ -17,6 +17,45 @@
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void exercise_large_batches(const std::filesystem::path& base) {
+    const auto path=std::filesystem::path(base.string()+"-large-batch");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup(){std::error_code ignored;std::filesystem::remove(path,ignored);}
+    } cleanup{path};
+    constexpr std::size_t mib=1u<<20;
+    std::vector<std::byte> expected(20*mib+4096);
+    for(std::size_t i=0;i<expected.size();++i)expected[i]=std::byte((i*37+i/257)&255);
+    {std::ofstream stream(path,std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());
+        require(bool(stream),"cannot write large batch fixture");}
+    mfq::FileRangeReader reader(path,mfq::FileReadMode::Direct);
+    const std::array<std::size_t,3> offsets{3,37,7*mib+5};
+    const std::array<std::size_t,3> sizes{17,11*mib+17,9*mib+33};
+    std::array<std::vector<std::byte>,3> output;
+    std::vector<mfq::ReadSpan> spans;
+    for(std::size_t i=0;i<sizes.size();++i) {
+        output[i].resize(sizes[i]+2);
+        spans.push_back({offsets[i],output[i].data()+1,sizes[i]});
+    }
+    std::uint64_t allocations=0;
+    for(int round=0;round<2;++round) {
+        for(auto& field:output)std::fill(field.begin(),field.end(),std::byte{0x5a});
+        reader.read_batch(spans);
+        for(std::size_t i=0;i<sizes.size();++i) {
+            require(output[i].front()==std::byte{0x5a} && output[i].back()==std::byte{0x5a},
+                "large batch wave overwrote destination guards");
+            require(std::equal(output[i].begin()+1,output[i].end()-1,expected.begin()+offsets[i]),
+                "large batch wave changed field bytes");
+        }
+        const auto stats=reader.stats();
+        require(!stats.staging_bytes && stats.staging_peak_bytes<=std::max<std::size_t>(8*mib,reader.alignment()),
+            "large batch exceeded reusable staging capacity");
+        if(!round)allocations=stats.staging_allocations;
+        else require(stats.staging_allocations==allocations,
+            "large batch discarded its staging arena between reads");
+    }
+}
 void exercise_coalesced_staging(const std::filesystem::path& base) {
     const auto path=std::filesystem::path(base.string()+"-coalesced");
     struct Cleanup {
@@ -200,6 +239,7 @@ int main() {
         { std::ofstream stream(path,std::ios::binary); stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());
           require(bool(stream),"cannot write fixture"); }
         exercise_coalesced_staging(path);
+        exercise_large_batches(path);
         {
             const auto sector=mfq::FileRangeReader(path,mfq::FileReadMode::Direct).alignment();
             std::vector<std::byte> large(256*sector+13);
