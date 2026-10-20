@@ -84,6 +84,41 @@ void write_mfq(
     stream.write(config.data(), static_cast<std::streamsize>(config.size()));
 }
 
+void test_dtype_normalization(const std::filesystem::path& path) {
+    const std::vector<std::pair<std::string_view, std::string_view>> dtypes{
+        {"NINTv2", "NINT"}, {"NINT1", "NINT"}, {"NINT8", "NINT"},
+        {"NINTM", "MFE"}, {"NINTMD", "MFED"}, {"NIQ2", "NVQ"},
+        {"NVQ2J-XL", "NVQ"}, {"NPQ0-S", "NPQ"}, {"NEPQ1-A", "NEPQ"},
+        {"MXFP4-SQ2", "MXFP4-SQ"}, {"MXFP4-SQ3", "MXFP4-SQ"},
+        {"NVQ", "NVQ"}, {"MXFP8-SQ", "MXFP8-SQ"}, {"NVQ4", "NVQ4"},
+    };
+    {
+        std::ofstream stream(path, std::ios::binary);
+        stream.write("MFQ1", 4);
+        write_scalar<std::uint32_t>(stream, 2);
+        write_string(stream, "unit-test");
+        write_scalar<std::uint32_t>(stream, 0);
+        write_scalar<std::uint32_t>(stream, dtypes.size());
+        for (std::size_t i = 0; i < dtypes.size(); ++i) {
+            write_string(stream, "tensor." + std::to_string(i));
+            write_string(stream, dtypes[i].first);
+            write_scalar<std::uint64_t>(stream, 1);
+        }
+        for (std::size_t i = 0; i < dtypes.size(); ++i) stream.put(static_cast<char>(i));
+    }
+    const mfq::MfqModelSource source(path);
+    for (std::size_t i = 0; i < dtypes.size(); ++i) {
+        const auto name = "tensor." + std::to_string(i);
+        const auto* tensor = source.find_tensor(name);
+        require(tensor && tensor->dtype == dtypes[i].second &&
+                    tensor->stored_dtype == dtypes[i].first && tensor->nbytes == 1,
+                "model input did not normalize dtype while preserving its stored identity");
+        const auto payload = source.read(name);
+        require(payload.size() == 1 && std::to_integer<std::size_t>(payload[0]) == i,
+                "dtype normalization changed payload bytes or record bounds");
+    }
+}
+
 void write_hf(const std::filesystem::path& root) {
     std::filesystem::create_directories(root / ".mfq-assets" / "hf");
     std::ofstream(root / "config.json") << R"({"model_type":"qwen3_5"})";
@@ -156,6 +191,7 @@ int main() {
         ("mfq-model-source-test-" + std::to_string(nonce));
     try {
         std::filesystem::create_directories(root);
+        test_dtype_normalization(root / "dtype-input.mfq");
         const auto mfq_path = root / "model.mfq";
         const auto legacy_mfq_path = root / "legacy-model.mfq";
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";

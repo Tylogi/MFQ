@@ -10,6 +10,7 @@
 #include "runtime/mlx_resident_budget.h"
 
 #include "storage/mfq_container.h"
+#include "compat/format.h"
 #include "mfq/host_parallel.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_nint.h"
@@ -8780,7 +8781,7 @@ struct MlxMfeOffloadCache::Impl {
             || count > limit / output)
             throw std::runtime_error("invalid streamed NINT expert geometry: " + name);
         auto pool = std::make_shared<MfeStreamPool>();
-        pool->dtype = std::string(mfq::canonical_format_dtype(record.dtype));
+        pool->dtype = record.dtype;
         pool->expert_count = static_cast<int>(count);
         pool->payload_bytes = record.nbytes;
         pool->layout = parse_streamed_nint_layout(model, name, 0, record.nbytes,

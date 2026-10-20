@@ -9,7 +9,7 @@
 | 阶段 | 剩余工作 |
 | --- | --- |
 | 0 验证入口 | 补模型 logits、chunked prefill、随机采样分布与并发延迟的对照和回归 |
-| 1 公共骨架 | 完成 K1/K2 剩余依赖迁移，明确 Engine、Store 与 Executor 的装配和所有权 |
+| 1 公共骨架 | 完成 K2 剩余依赖迁移，明确 Engine、Store 与 Executor 的装配和所有权 |
 | 2 首条共享模型链 | 实现 Qwen35 hybrid eager 路径，替换旧继承链与双层 batch 驱动 |
 | 3 第二模型与动态资源 | 验证第二种数学/状态结构，接入专家驻留、offload 与动态 I/O，完成 core 拆除 |
 | 4 第二后端 | 将 Metal 接入共享 Engine 和 family forward，再稳定公共接口 |
@@ -23,7 +23,6 @@
 
 终态目录与逐文件归属以 [refactor.md](refactor.md) 为准，剩余迁移包括：
 
-- 收口旧格式标识输入边界；schema、范围读取与 model_source 已按职责拆出。
 - 将共享配置和 forward 收敛到 `engine/model/<family>/`，删除旧 Ops/继承/ForwardOps 绑定链。
 - 将状态、权重与执行规则分别落实到 `engine/state/`、`engine/weights/` 和 `engine/executor/`；后端保留物理存储与数值执行。
 - 将 CUDA `engine/` 收敛为装配入口，迁走其中的生成、事务和可复用模型行为。
@@ -42,7 +41,7 @@
 
 ### 1.3 CMake 与规范同步
 
-公共非模板实现由 `mfq-engine` 编译，模板由实际后端和测试实例化；公共库不链接设备库，也不公开全部 implementation 目录。
+公共 Engine/模型非模板实现由 `mfq-engine` 编译，模板由实际后端和测试实例化；公共库不链接设备库，也不公开全部 implementation 目录。
 
 每批迁移同步 CUDA、Metal、CPU、工具绑定、bench 与测试的实际消费者，以及 [CONTRIBUTING.md](../CONTRIBUTING.md)、[运行时说明](../csrc/README.md) 和本文。旧路径直接更新，不保留转发头或聚合库。
 
@@ -69,11 +68,10 @@
 
 原生推理、诊断/评估和工具扩展保持独立构建。共享源码变化同时验证原生与实际工具调用；依赖图和源码清单检查不能代替数值行为测试。
 
-### 1.6 拆除 core：K1–K4
+### 1.6 拆除 core：K2–K4
 
 | 步骤 | 剩余工作 |
 | --- | --- |
-| K1 底层依赖 | 收口旧格式标识输入边界，使原生算子只分派规范格式 |
 | K2 契约与模型 | 合并请求/采样值契约，归位 StepSequence 与公共头，迁移旧模型对共享视觉几何的临时依赖 |
 | K3 状态与放置 | 将 prefix/QSA、在线 CPU 成本测量、MoE 放置和分片规则接入 Store/Executor |
 | K4 删除入口 | 删除 `csrc/core/`、`mfq-core`/`mfq::core` 及全部活动消费者 |
@@ -88,7 +86,7 @@
 
 ### 阶段 1：公共骨架与构建关系
 
-完成 K1 与独立的 K2 迁移。用真实调用明确输入、状态要求、lease 和 completion，避免空接口；保持公共 target 无设备链接依赖。Store 行为随阶段 2/3 的实际路径落实。
+完成 K2 契约与模型迁移。用真实调用明确输入、状态要求、lease 和 completion，避免空接口；保持公共 target 无设备链接依赖。Store 行为随阶段 2/3 的实际路径落实。
 
 ### 阶段 2：共享 Qwen35 hybrid eager 链
 

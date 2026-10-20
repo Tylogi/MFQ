@@ -3,7 +3,7 @@
 
 The rules are about responsibility, not about directory names:
 
-  1. core, formats, scheduler, transport, engine, models and file I/O never name a backend
+  1. core, formats, model_source, scheduler, transport, engine, models and file I/O never name a backend
      (mfq::cuda, mfq::metal, mfq_tensor_backend, backends/ includes).
   2. A model family may be named in engine/model/<family>/ and in models/, where
      the family lives.  The generic request table, the Planner, both Stores, the

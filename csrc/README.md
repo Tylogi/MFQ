@@ -28,7 +28,8 @@ has landed.
   Model sources and backend operators consume the headers directly; CUDA
   native kernels no longer depend on `mfq-core`. Persisted model schema and
   validation live in `formats/model_graph/` (`mfq-model-graph`); that target
-  contains no vision algorithm or old model reader;
+  contains no vision algorithm or old model reader. Legacy dtype spellings are
+  normalized at metadata/cohort input; VQ/SQ operators accept canonical IDs;
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,

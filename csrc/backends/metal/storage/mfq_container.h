@@ -2,7 +2,6 @@
 
 #include "hf_model_source.h"
 #include "tensor_layout.h"
-#include "compat/format.h"
 #include "model_graph/model_graph.h"
 
 #include <cstdint>

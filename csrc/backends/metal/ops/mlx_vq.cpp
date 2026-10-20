@@ -2,7 +2,7 @@
 #include "mlx_nvq_decode.h"
 #include "runtime/mlx_weight_residency.h"
 
-#include "compat/format.h"
+#include "dtype.h"
 #include "generated/nvq_codebooks.generated.h"
 #include "runtime/mlx_staging_allocator.h"
 #include <mlx/allocator.h>
@@ -3218,7 +3218,7 @@ common_templates(
 detail::ParsedVqStorage detail::parse_vq_blob(std::string_view dtype,
     std::span<const std::uint8_t> blob, std::span<const std::uint8_t> runtime_payload,
     bool borrow_streams) {
-    return parse_vq(mfq::canonical_format_dtype(dtype), blob, runtime_payload, borrow_streams);
+    return parse_vq(dtype, blob, runtime_payload, borrow_streams);
 }
 
 bool detail::vq_native_jsc(int layout, int group_size, int state_bits, int table_banks,
@@ -3251,29 +3251,27 @@ VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
-    const auto canonical = mfq::canonical_format_dtype(dtype);
-    if (!is_vq_dtype(canonical)) {
+    if (!is_vq_dtype(dtype)) {
         throw std::runtime_error(
             "unsupported native Metal VQ dtype: "
             + std::string(dtype));
     }
-    if (canonical == mfq::kNepqDtype) {
+    if (dtype == mfq::kNepqDtype) {
         return inspect_nepq_header(
-            canonical,
+            dtype,
             blob,
             runtime_payload);
     }
     return inspect_matrix_vq_header(
-        canonical,
+        dtype,
         blob,
         runtime_payload);
 }
 
 bool is_vq_dtype(std::string_view dtype) noexcept {
-    const auto canonical = mfq::canonical_format_dtype(dtype);
-    return canonical == mfq::kNvqDtype ||
-        canonical == mfq::kNpqDtype ||
-        canonical == mfq::kNepqDtype;
+    return dtype == mfq::kNvqDtype ||
+        dtype == mfq::kNpqDtype ||
+        dtype == mfq::kNepqDtype;
 }
 
 MlxVqWeight::MlxVqWeight(

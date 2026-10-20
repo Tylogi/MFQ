@@ -71,6 +71,7 @@ ParsedVqStorage parse_vq_blob(std::string_view dtype,
     bool borrow_streams = false);
 }
 
+// Dtype is canonical; stored aliases are normalized by the input reader.
 bool is_vq_dtype(std::string_view dtype) noexcept;
 
 struct VqTensorMetadata {

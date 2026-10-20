@@ -1,3 +1,5 @@
+#include "compat/format.h"
+
 #include "ops/mlx_vq.h"
 #include "ops/mlx_nvq_decode.h"
 #include "runtime/mlx_tensor.h"
@@ -919,7 +921,7 @@ std::vector<Fixture> fixtures() {
 
 Fixture varied_projection_fixture(const Fixture& seed, int outputs, int width, int group_size = 0) {
     using namespace mlx::core;
-    const auto metadata = mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob);
+    const auto metadata = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(seed.dtype), seed.blob);
     const int gs = group_size == 0 ? metadata.group_size() : group_size;
     const int vs = metadata.vector_size();
     const int groups = (width + gs - 1) / gs;
@@ -1250,7 +1252,7 @@ void test_fixture(const Fixture& fixture) {
     using namespace mlx::core;
     const auto metadata =
         mfq::metal::inspect_vq_blob(
-            fixture.dtype,
+            mfq::canonical_format_dtype(fixture.dtype),
             fixture.blob,
             fixture.runtime_payload);
     if (metadata.format_label != fixture.dtype ||
@@ -1264,7 +1266,7 @@ void test_fixture(const Fixture& fixture) {
     }
     const auto weight =
         mfq::metal::MlxVqWeight::from_blob(
-            fixture.dtype,
+            mfq::canonical_format_dtype(fixture.dtype),
             fixture.blob,
             fixture.runtime_payload);
     if (weight.format_label() != fixture.dtype ||
@@ -1409,7 +1411,7 @@ void test_fixture(const Fixture& fixture) {
         fixture.rotation_block == 0) {
         const mfq::metal::MlxLinear linear(
             mfq::metal::MlxVqWeight::from_blob(
-                fixture.dtype,
+                mfq::canonical_format_dtype(fixture.dtype),
                 fixture.blob,
                 fixture.runtime_payload));
         const auto integration_input = input_values(
@@ -1430,7 +1432,7 @@ void test_fixture(const Fixture& fixture) {
 
         const mfq::metal::MlxEmbedding embedding(
             mfq::metal::MlxVqWeight::from_blob(
-                fixture.dtype,
+                mfq::canonical_format_dtype(fixture.dtype),
                 fixture.blob,
                 fixture.runtime_payload));
         const array ids(
@@ -1528,8 +1530,8 @@ void test_nvq3jl_projection_shapes() {
         auto expansion = make_nvq3jl_shape(wide, width);
         test_fixture(contraction);
         test_fixture(expansion);
-        auto a = mfq::metal::MlxVqWeight::from_blob(contraction.dtype, contraction.blob);
-        auto b = mfq::metal::MlxVqWeight::from_blob(expansion.dtype, expansion.blob);
+        auto a = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(contraction.dtype), contraction.blob);
+        auto b = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(expansion.dtype), expansion.blob);
         if (!a.uses_native_jsc() || !b.uses_native_jsc()
             || a.packed_nbytes() > contraction.blob.size() + 4 * narrow + 256
             || b.packed_nbytes() > expansion.blob.size() + 4 * wide + 256) {
@@ -1591,11 +1593,11 @@ void test_nvq_dequantize_tails() {
                             make_jsc("NVQ2J-XL", 5, 8, 12, true), make_jsc("NVQ3J", 2, 4, 8),
                             make_jsc("NVQ3J-512", 3, 4, 9), make_jsc("NVQ3J-L", 6, 4, 10),
                             make_nvq1_l(), make_nvq1_s()}) {
-        const int vector_size = mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob).vector_size();
+        const int vector_size = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(seed.dtype), seed.blob).vector_size();
         for (const int width : {1, 2, 3, 5, 8, 16, 24, 25, 27, 29, 31, 36, 40, 56, 64, 72}) {
             if (seed.dtype != "NVQ2" && seed.dtype != "NVQ3" && width % vector_size != 0) continue;
             const auto fixture = varied_projection_fixture(seed, 3, width);
-            const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+            const auto weight = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob);
             for (const auto dtype : {float16, float32}) {
                 auto actual = astype(weight.dequantize(dtype), float32);
                 auto expected = astype(astype(array(fixture.dense.begin(), Shape{3, width}), dtype), float32);
@@ -1622,11 +1624,11 @@ void test_nvq1_projection_dispatch() {
     for (const int output_size : {13, 104}) {
         for (const auto& first_seed : {l_seed, s_seed}) {
             const auto first_fixture = varied_projection_fixture(first_seed, output_size, 88);
-            const auto first = mfq::metal::MlxVqWeight::from_blob(first_fixture.dtype, first_fixture.blob);
+            const auto first = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(first_fixture.dtype), first_fixture.blob);
             for (const auto& second_seed : {l_seed, s_seed}) {
                 for (const int second_output : {output_size, output_size + 4}) {
                     const auto second_fixture = varied_projection_fixture(second_seed, second_output, 88);
-                    const auto second = mfq::metal::MlxVqWeight::from_blob(second_fixture.dtype, second_fixture.blob);
+                    const auto second = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(second_fixture.dtype), second_fixture.blob);
                     const mfq::metal::MlxGroupedLinear pair({&first, &second});
                     for (int rows = 1; rows <= 6; ++rows) {
                         for (const auto dtype : {float16, float32}) {
@@ -1659,7 +1661,7 @@ void test_nvq1_unaligned_inputs() {
     using namespace mlx::core;
     for (const auto& seed : {make_nvq1_l(), make_nvq1_s()}) {
         const auto fixture = varied_projection_fixture(seed, 13, 88);
-        const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+        const auto weight = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob);
         const mfq::metal::MlxGroupedLinear grouped({&weight, &weight});
         for (const int rows : {2, 3, 4, 5, 6}) {
             const auto values = input_values(rows, fixture.input_size);
@@ -1697,7 +1699,7 @@ void test_nvq_group64_validation() {
     const auto check = [](const Fixture& fixture, const char* expected) {
         for (const bool borrowed : {false, true}) {
             try {
-                (void)mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}, borrowed);
+                (void)mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {}, borrowed);
                 if (expected) throw std::runtime_error("group64 corruption was accepted");
             } catch (const std::runtime_error& error) {
                 if (!expected || std::string(error.what()) != expected) throw;
@@ -1752,8 +1754,8 @@ void test_nvq_jsc_borrowed_codebooks() {
              make_jsc("NVQ2J-L", 4, 8, 10), make_jsc("NVQ2J-XL", 5, 8, 12),
              make_jsc("NVQ2J-XL", 5, 8, 12, true), make_jsc("NVQ3J-512", 3, 4, 9),
              make_jsc("NVQ3J-L", 6, 4, 10)}) {
-        const auto owned = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {});
-        const auto borrowed = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}, true);
+        const auto owned = mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {});
+        const auto borrowed = mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {}, true);
         const auto table = borrowed.borrowed_codebooks;
         const auto* begin = reinterpret_cast<const std::int8_t*>(fixture.blob.data());
         if (!owned.borrowed_codebooks.empty() || !borrowed.codebooks.empty()
@@ -1770,7 +1772,7 @@ void test_nvq_group64_large_shapes() {
     const auto seed = make_jsc("NVQ2J-XL", 5, 8, 12, true, 4);
     for (const auto& shape : {std::array<int, 2>{2560, 6144}, std::array<int, 2>{6144, 2560}}) {
         const auto fixture = varied_projection_fixture(seed, shape[0], shape[1]);
-        const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+        const auto weight = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob);
         if (weight.execution_layout() != 1 || weight.uses_native_jsc()
             || weight.jsc_execution_records() != &weight.packed_indices()) {
             throw std::runtime_error("NVQ2J-XL compact group64 execution was not preserved");
@@ -1825,7 +1827,7 @@ void test_nvq_projection_batches() {
                 bool supported = true;
                 for (std::size_t offset = 0; offset < 3; ++offset) {
                     const auto& seed = seeds[(index + offset) % seeds.size()];
-                    supported &= mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob).vector_size() == 4;
+                    supported &= mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(seed.dtype), seed.blob).vector_size() == 4;
                 }
                 if (!supported) continue;
             }
@@ -1837,9 +1839,9 @@ void test_nvq_projection_batches() {
                 shape(seeds[index], 13),
                 shape(seeds[(index + 1) % seeds.size()], width + 17),
                 shape(seeds[(index + 2) % seeds.size()], 7)};
-            const auto a = mfq::metal::MlxVqWeight::from_blob(shapes[0].dtype, shapes[0].blob);
-            const auto b = mfq::metal::MlxVqWeight::from_blob(shapes[1].dtype, shapes[1].blob);
-            const auto c = mfq::metal::MlxVqWeight::from_blob(shapes[2].dtype, shapes[2].blob);
+            const auto a = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(shapes[0].dtype), shapes[0].blob);
+            const auto b = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(shapes[1].dtype), shapes[1].blob);
+            const auto c = mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(shapes[2].dtype), shapes[2].blob);
             const mfq::metal::MlxGroupedLinear qkv({&a, &b, &c});
             const mfq::metal::MlxLinear la(a), lb(b), lc(c);
             const mfq::metal::MlxProjectionBatch batch({&la, &lb, &lc, &lb});
@@ -1941,6 +1943,12 @@ int main() {
             }
         }
 
+        for (const auto dtype : legacy_dtypes) {
+            if (mfq::metal::is_vq_dtype(dtype)) {
+                throw std::runtime_error("operator accepted an unnormalized legacy VQ dtype");
+            }
+        }
+
         auto all = fixtures();
         if (all.size() != legacy_dtypes.size()) {
             throw std::runtime_error(
@@ -1966,14 +1974,14 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::inspect_vq_blob(
-                    rotated.dtype,
+                    mfq::canonical_format_dtype(rotated.dtype),
                     rotated.blob);
             },
             "rotated NEPQ metadata missing HSG1");
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    rotated.dtype,
+                    mfq::canonical_format_dtype(rotated.dtype),
                     rotated.blob);
             },
             "rotated NEPQ missing HSG1");
@@ -1982,7 +1990,7 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    rotated.dtype,
+                    mfq::canonical_format_dtype(rotated.dtype),
                     rotated.blob,
                     corrupt_runtime);
             },
@@ -2004,7 +2012,7 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::inspect_vq_blob(
-                    unrotated_a.dtype,
+                    mfq::canonical_format_dtype(unrotated_a.dtype),
                     unrotated_a.blob);
             },
             "NEPQ-A header without Hadamard rotation");
@@ -2014,7 +2022,7 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    truncated_a.dtype,
+                    mfq::canonical_format_dtype(truncated_a.dtype),
                     truncated_a.blob,
                     truncated_a.runtime_payload);
             },
@@ -2025,7 +2033,7 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    trailing_a.dtype,
+                    mfq::canonical_format_dtype(trailing_a.dtype),
                     trailing_a.blob,
                     trailing_a.runtime_payload);
             },
@@ -2051,7 +2059,7 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    trailing.dtype,
+                    mfq::canonical_format_dtype(trailing.dtype),
                     trailing.blob);
             },
             "VQ trailing bytes");

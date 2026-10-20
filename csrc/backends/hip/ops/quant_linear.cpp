@@ -11,7 +11,6 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
-#include "compat/format.h"
 #include "mfe_expert_store.h"
 #include "generated/nvq_codebooks.generated.h"
 #include "quant/mxfp4_sq_decode.h"

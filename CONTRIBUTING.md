@@ -32,6 +32,8 @@ architecture-named entry point.
   normalizes metadata and retains bounded readers; neither may depend on core,
   Engine or model execution. Keep alias maps in `model_source/compat/`; public
   source headers expose only layout values. Headers sit beside implementations.
+  Normalize legacy dtype spellings in input parsing; operator dispatch receives
+  canonical IDs. Tests and synthetic benchmarks normalize their fixture input.
 - Packed format headers and frozen codebooks live in `csrc/formats/`
   (`mfq-formats`), without a model-source, Engine or backend dependency.
   Compiled range readers in `formats/quant/` use `mfq-quant-readers`; keep them
@@ -128,7 +130,7 @@ directory share a name prefix, the prefix becomes a subdirectory
 (`kernels/nvq/device.cuh`, not `kernels/nvq_device.cuh`).  The include rule is
 unchanged, the path is still rooted at the layer directory.
 
-`engine/<module>` (`requests`, `batch`, `state`, `weights`, `executor`, `text`,
+`engine/<module>` (`model`, `requests`, `batch`, `state`, `weights`, `executor`, `text`,
 `src`) is PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add
 those directories to their include path and include their headers bare. That is
 the only way a backend drives the shared generation loop, so it is allowed for
