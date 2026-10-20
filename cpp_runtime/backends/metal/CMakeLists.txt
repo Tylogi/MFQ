@@ -11,6 +11,7 @@ set(MFQ_METAL_INCLUDE_DIRS
     ${MFQ_METAL_ROOT}/models/flash_next
     ${MFQ_METAL_ROOT}/models/qwen35
     ${MFQ_METAL_ROOT}/models/minicpmo45
+    ${MFQ_METAL_ROOT}/models/nemotron_h
 )
 
 set(MFQ_MLX_ROOT "" CACHE PATH
@@ -258,6 +259,7 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_ane_matmul.cpp
     runtime/mtp_lora_sessions.cpp
     runtime/mlx_multimodal.cpp
+    runtime/mlx_pre_ln_vision.cpp
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
     runtime/mlx_kernel_cache.cpp
@@ -304,6 +306,13 @@ add_library(mfq-metal-runtime STATIC
     models/qwen35/mlx_qwen35_full_attention.cpp
     models/qwen35/mlx_qwen35_linear_attention.cpp
     models/qwen35/qwen35_model.cpp
+    models/nemotron_h/mlx_nemotron_h_attention.cpp
+    models/nemotron_h/mlx_nemotron_h_causal_lm.cpp
+    models/nemotron_h/mlx_nemotron_h_linear_attention.cpp
+    models/nemotron_h/mlx_nemotron_h_moe.cpp
+    models/nemotron_h/mlx_nemotron_h_ops.cpp
+    models/nemotron_h/mlx_nemotron_h_vision.cpp
+    models/nemotron_h/nemotron_h_model.cpp
 )
 add_library(mfq::metal-runtime ALIAS mfq-metal-runtime)
 target_include_directories(mfq-metal-runtime PUBLIC
@@ -1333,6 +1342,19 @@ add_test(
     COMMAND mfq-metal-qwen35-causal-lm-test
 )
 
+add_executable(mfq-metal-nemotron-test
+    tests/mlx_nemotron_h_test.cpp
+)
+target_link_libraries(
+    mfq-metal-nemotron-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-nemotron-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-nemotron-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
 add_executable(mfq-metal-minicpmo45-test
     tests/mlx_minicpmo45_test.cpp
 )

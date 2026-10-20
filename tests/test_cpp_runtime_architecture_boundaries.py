@@ -26,6 +26,9 @@ QWEN4_HEADER = (
 DSV = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp").read_text(
     encoding="utf-8"
 )
+NEMOTRON = (
+    MODELS / "nemotron_h" / "mlx_nemotron_h_causal_lm.cpp"
+).read_text(encoding="utf-8")
 DSV_MOE = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_moe.cpp").read_text(
     encoding="utf-8"
 )
@@ -1099,7 +1102,7 @@ def test_mtp_policy_and_lifecycle_are_runtime_owned() -> None:
 
 
 def test_every_mtp_architecture_is_a_thin_client_of_one_engine() -> None:
-    clients = (QWEN, QWEN4, DSV, DSV41)
+    clients = (QWEN, QWEN4, DSV, DSV41, NEMOTRON)
     for source in clients:
         assert source.count("run_mlx_mtp_generation(") == 1
         assert source.count("mlx_mtp_verification_ids(") == 1
@@ -1144,7 +1147,7 @@ def test_server_exposes_predictors_by_role_not_architecture_name() -> None:
     assert SERVER_COMPONENTS.count(
         'component_declared(graph, "predictor")'
     ) == 3
-    assert SERVER_COMPONENTS.count("return make_grid_vision_engine_components(") == 2
+    assert SERVER_COMPONENTS.count("return make_grid_vision_engine_components(") == 3
     assert re.search(
         r'component_with_implementation\([^;]*"predictor"',
         SERVER_COMPONENTS,
