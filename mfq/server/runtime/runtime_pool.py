@@ -132,6 +132,10 @@ _RUNTIME_OUTPUT_DRAIN_TIMEOUT_SECONDS = 10.0
 # file). Keep room for the service, WSL, and other workloads instead of handing
 # all remaining commit headroom to resident experts.
 _WINDOWS_COMMIT_RESERVE_BYTES = 16 << 30
+# Pinned expert memory cannot be paged, and other workloads (a WSL VM, for
+# example) keep growing after the worker starts; the reserve scales with the
+# commit limit so large machines keep proportionate headroom.
+_WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
@@ -4528,7 +4532,7 @@ class RuntimePool:
         physical_budget = budget
         commit_bytes = commit_available = footprint = None
         if architecture == "discrete":
-            commit_available = host_commit_capacity()[1]
+            commit_limit, commit_available = host_commit_capacity()
             if commit_available is not None:
                 # Windows charges the worker's VRAM allocations to the same
                 # commit limit as its host weights. Experts that do not fit
@@ -4544,7 +4548,10 @@ class RuntimePool:
                 if device_limit is not None:
                     footprint = max(footprint, device_limit)
                 commit_bytes = max(
-                    0, commit_available - footprint - _WINDOWS_COMMIT_RESERVE_BYTES
+                    0, commit_available - footprint - max(
+                        _WINDOWS_COMMIT_RESERVE_BYTES,
+                        (commit_limit or 0) // _WINDOWS_COMMIT_RESERVE_FRACTION,
+                    )
                 )
                 budget = min(budget, commit_bytes)
         configured = self.runtime_environment.get("MFQ_MOE_HOST_CACHE_BYTES", os.environ.get("MFQ_MOE_HOST_CACHE_BYTES"))
