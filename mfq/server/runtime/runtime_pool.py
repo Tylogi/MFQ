@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -78,7 +79,13 @@ from mfq.server.runtime.native import (
     native_tokenizer_arguments,
     supports_cuda_ram_expert_pipeline,
 )
-from mfq.server.services.hardware import hardware_identity, host_memory_capacity, memory_topology, gpu_memory_status
+from mfq.server.services.hardware import (
+    gpu_memory_status,
+    hardware_identity,
+    host_commit_capacity,
+    host_memory_capacity,
+    memory_topology,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +128,32 @@ _AUTOMATIC_MEMORY_TARGET_RATIO = 0.85
 _RUNTIME_MAINTENANCE_WAIT_SECONDS = 30.0
 _RUNTIME_LOG_MAX_CHARS = 4096
 _RUNTIME_OUTPUT_DRAIN_TIMEOUT_SECONDS = 10.0
+# WDDM charges device allocations to the process commit limit (RAM plus page
+# file). Keep room for the service, WSL, and other workloads instead of handing
+# all remaining commit headroom to resident experts.
+_WINDOWS_COMMIT_RESERVE_BYTES = 16 << 30
+# Pinned expert memory cannot be paged, and other workloads (a WSL VM, for
+# example) keep growing after the worker starts; the reserve scales with the
+# commit limit so large machines keep proportionate headroom.
+_WINDOWS_COMMIT_RESERVE_FRACTION = 8
+# CUDA contexts, KV staging, and kernels are committed but absent from the
+# weight estimate; price them before deciding how many experts stay in RAM.
+_WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
+
+
+@dataclass(frozen=True)
+class _ExpertHostBudget:
+    """Resident expert allowance together with the limit that produced it."""
+
+    bytes: int
+    physical_bytes: int
+    commit_bytes: int | None = None
+    commit_available_bytes: int | None = None
+    commit_footprint_bytes: int | None = None
+
+    @property
+    def commit_limited(self) -> bool:
+        return self.commit_bytes is not None and self.commit_bytes < self.physical_bytes
 
 
 def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:
@@ -3691,6 +3724,13 @@ class RuntimePool:
             return None
         return sum(device.capacity_bytes for device in selected if device is not None)
 
+    def _cuda_device_vram_limit(self, request: ModelLoadRequest) -> int | None:
+        """VRAM the native worker may allocate on discrete GPUs (MFQ_CUDA_VRAM_LIMIT_GIB)."""
+        capacity = self._cuda_discrete_device_capacity(request)
+        if not capacity:
+            return None
+        return max(1, capacity - max(1 << 30, capacity // 16))
+
     def _apply_automatic_expert_residency(
         self,
         artifact: DiscoveredModel,
@@ -3706,12 +3746,11 @@ class RuntimePool:
             else self.max_runtime_memory_bytes
         )
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
-            capacity = self._cuda_discrete_device_capacity(request)
-            if capacity:
+            device_ceiling = self._cuda_device_vram_limit(request)
+            if device_ceiling:
                 # The native worker prices concrete dense/KV allocations and
                 # decode scratch after load; prefill borrows expert storage.
                 # Do not reserve another third before that calculation.
-                device_ceiling = max(1, capacity - max(1 << 30, capacity // 16))
                 ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
@@ -4477,6 +4516,20 @@ class RuntimePool:
         raise RuntimeManagementError("unable to reserve a unique runtime port")
 
     def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
+        return self._cuda_expert_host_budget_plan(artifact, request).bytes
+
+    @staticmethod
+    def _cuda_expert_preload_bytes(artifact: DiscoveredModel) -> int:
+        """Host bytes held by the complete preload of the routed expert set."""
+        # Preload keeps a host image of every routed expert, including the ones
+        # uploaded to the GPU cache, so the requirement is not the cold subset.
+        # The native guard is moe_preload_fits_host() on the same definition.
+        return max(0, artifact.routed_expert_bytes)
+
+    def _cuda_expert_host_budget_plan(
+        self, artifact: DiscoveredModel, request: ModelLoadRequest
+    ) -> _ExpertHostBudget:
+        """Price the resident expert tier against physical RAM and commit."""
         total, available = host_memory_capacity()
         budget = max(0, min(available or 0, max(0, (total or 0) - (4 << 30))) - (2 << 30))
         # KV has priority over the evictable expert tier. Price the target KV
@@ -4493,8 +4546,34 @@ class RuntimePool:
             if not request.kv_memory.ram_preallocated:
                 reserve = min(reserve, request.kv_memory.ram_budget_bytes or (4 << 30))
             budget = max(0, budget - reserve)
-        if memory_topology()["memory_architecture"] == "unified":
+        architecture = memory_topology()["memory_architecture"]
+        if architecture == "unified":
             budget = max(0, budget - self._estimated_load_bytes(artifact, request))
+        physical_budget = budget
+        commit_bytes = commit_available = footprint = None
+        if architecture == "discrete":
+            commit_limit, commit_available = host_commit_capacity()
+            if commit_available is not None:
+                # Windows charges the worker's VRAM allocations to the same
+                # commit limit as its host weights. Experts that do not fit
+                # fall back to the existing SSD streaming path.
+                footprint = self._estimated_load_bytes(artifact, request)
+                if plan is not None:
+                    footprint += plan.gpu_budget_bytes
+                footprint += _WINDOWS_GPU_WORKSPACE_BYTES
+                # Workspaces, transfer staging and KV growth fill VRAM up to the
+                # worker's limit, and WDDM commits whatever it allocates
+                # (measured: 96 GB used on a 96 GB card with a 40 GB expert cache).
+                device_limit = self._cuda_device_vram_limit(request)
+                if device_limit is not None:
+                    footprint = max(footprint, device_limit)
+                commit_bytes = max(
+                    0, commit_available - footprint - max(
+                        _WINDOWS_COMMIT_RESERVE_BYTES,
+                        (commit_limit or 0) // _WINDOWS_COMMIT_RESERVE_FRACTION,
+                    )
+                )
+                budget = min(budget, commit_bytes)
         configured = self.runtime_environment.get("MFQ_MOE_HOST_CACHE_BYTES", os.environ.get("MFQ_MOE_HOST_CACHE_BYTES"))
         if configured is not None:
             try:
@@ -4504,18 +4583,25 @@ class RuntimePool:
             if value < 0:
                 raise _job_error("runtime_ram_expert_budget_invalid", "expert RAM cache budget must be a non-negative byte count")
             budget = min(budget, value)
-        return budget
+        return _ExpertHostBudget(
+            budget, physical_budget, commit_bytes, commit_available, footprint
+        )
 
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
         if available is not None:
             resident_weights = max(0, artifact.resource.total_bytes - artifact.always_streamed_bytes)
-            cold_experts = max(0, resident_weights - self._estimated_load_bytes(artifact, request))
+            host_experts = max(0, resident_weights - self._estimated_load_bytes(artifact, request))
             if (self.backend == "cuda" and (request.moe_gpu_cache_gb or 0) > 0
                     and supports_cuda_ram_expert_pipeline(artifact.path)):
-                cold_experts = min(cold_experts, self._cuda_expert_host_budget(artifact, request))
-            available = max(0, available - cold_experts - (2 << 30))
+                budget = self._cuda_expert_host_budget(artifact, request)
+                host_experts = min(host_experts, budget)
+                if budget >= self._cuda_expert_preload_bytes(artifact):
+                    # Preload keeps the complete routed set in host memory,
+                    # including experts mirrored in the GPU cache.
+                    host_experts = self._cuda_expert_preload_bytes(artifact)
+            available = max(0, available - host_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit
 
@@ -4590,10 +4676,25 @@ class RuntimePool:
             process_environment.setdefault("MFQ_MEMORY_ARCHITECTURE", memory_topology()["memory_architecture"])
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
                 and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0):
-            host_budget = self._cuda_expert_host_budget(artifact, request)
-            cold_bytes = max(0, artifact.routed_expert_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
+            budget = self._cuda_expert_host_budget_plan(artifact, request)
+            host_budget = budget.bytes
+            if budget.commit_limited:
+                logger.info(
+                    "cuda_expert_host_budget limited_by=commit budget_bytes=%d "
+                    "physical_budget_bytes=%d commit_budget_bytes=%d "
+                    "commit_available_bytes=%d device_footprint_bytes=%d",
+                    host_budget, budget.physical_bytes, budget.commit_bytes,
+                    budget.commit_available_bytes, budget.commit_footprint_bytes,
+                )
+            preload_bytes = self._cuda_expert_preload_bytes(artifact)
             if supports_cuda_ram_expert_pipeline(artifact.path):
-                streaming = host_budget < cold_bytes or process_environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
+                # Preload needs room for the complete routed set, not only for
+                # the experts missing from the GPU cache; otherwise Windows
+                # commit (and physical RAM on Linux) is exhausted after load.
+                streaming = (
+                    host_budget < preload_bytes
+                    or process_environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
+                )
                 allow_ssd = process_environment.get("MFQ_MOE_SSD_EXPERTS", "1") != "0"
                 if streaming and not allow_ssd:
                     raise _job_error("runtime_ram_expert_budget_exceeded",
@@ -4613,12 +4714,11 @@ class RuntimePool:
                     "MFQ_MOE_PREFILL_LAYER_ASYNC": "1",
                     "MFQ_MOE_RESIDENCY_INTERVAL": "4",
                 }
-                capacity = self._cuda_discrete_device_capacity(request)
-                if capacity:
+                device_limit = self._cuda_device_vram_limit(request)
+                if device_limit:
                     # WDDM can page overcommitted allocations into host RAM
                     # without reporting OOM. The native limit also trims idle
                     # pool pages before a new allocation reaches that boundary.
-                    device_limit = max(1, capacity - max(1 << 30, capacity // 16))
                     defaults["MFQ_CUDA_VRAM_LIMIT_GIB"] = str(device_limit / float(1 << 30))
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
@@ -4633,7 +4733,7 @@ class RuntimePool:
                     if process_environment.setdefault("MFQ_MODEL_FILE_IO", "direct") == "direct":
                         process_environment.setdefault("MFQ_PLE_FILE_MAP", "1")
             else:
-                if host_budget < cold_bytes:
+                if host_budget < preload_bytes:
                     raise _job_error("runtime_ram_expert_budget_exceeded",
                         "this expert container requires complete RAM residency; use a canonical MFQ checkpoint for SSD streaming")
                 # Older expert containers use the resident CPU loader, followed

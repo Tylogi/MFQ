@@ -7,7 +7,15 @@
 class MoeExpertCache;
 class MoeResidencyManager {
 public:
-    struct MemorySample {std::uint64_t resident_bytes=0,available_bytes=0;};
+    struct MemorySample {
+        std::uint64_t resident_bytes=0,available_bytes=0,commit_available_bytes=0;
+        // WDDM also charges device allocations to the commit limit, so the
+        // smaller of physical and commit headroom bounds new host allocations.
+        std::uint64_t available_host_bytes() const noexcept {
+            return commit_available_bytes && commit_available_bytes<available_bytes
+                ?commit_available_bytes:available_bytes;
+        }
+    };
     struct Stats {
         std::uint64_t observed_routes=0,scheduled_rounds=0,candidate_bundles=0;
         std::uint64_t planned_bundles=0,committed_bundles=0,memory_rejections=0;

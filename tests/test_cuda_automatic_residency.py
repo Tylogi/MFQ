@@ -28,6 +28,13 @@ def make_nvq_fixture():
 GIB = 1 << 30
 
 
+@pytest.fixture(autouse=True)
+def _no_host_commit_accounting(monkeypatch):
+    monkeypatch.setattr(
+        "mfq.server.runtime.runtime_pool.host_commit_capacity", lambda: (None, None)
+    )
+
+
 def artifact(tmp_path):
     path = tmp_path / "model.mfq"
     experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
@@ -146,6 +153,122 @@ def test_cuda_ssd_experts_respect_explicit_ram_cache_limit(tmp_path, monkeypatch
     with pytest.raises(JobExecutionError) as raised:
         pool._launch_configuration(model, request, port=1234)
     assert raised.value.detail.code == "runtime_ram_expert_budget_exceeded"
+
+
+def _commit_budget_pool(
+    tmp_path, monkeypatch, *, architecture, commit_available, available=100 * GIB
+):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology",
+                        lambda: {"memory_architecture": architecture})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity",
+                        lambda: (128 * GIB, available))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_commit_capacity",
+                        lambda: (224 * GIB, commit_available))
+    monkeypatch.setattr(
+        "mfq.server.runtime.runtime_pool.hardware_identity",
+        lambda: HardwareIdentity("cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 96 * GIB),)),
+    )
+    return RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda",
+                       automatic_memory_budget=False)
+
+
+def test_windows_discrete_expert_budget_is_limited_by_commit(tmp_path, monkeypatch):
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=120 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    plan = pool._cuda_expert_host_budget_plan(model, request)
+    # 20 GiB device weights (dense plus cached experts) and 4 GiB workspace
+    # are committed from 120 GiB headroom before the reserve, an eighth of
+    # the 224 GiB commit limit (28 GiB).
+    assert plan.commit_footprint_bytes == 24 * GIB
+    assert plan.commit_bytes == 68 * GIB
+    assert plan.physical_bytes == 98 * GIB
+    assert plan.commit_limited
+    assert pool._cuda_expert_host_budget(model, request) == 68 * GIB
+
+
+def test_windows_commit_footprint_covers_the_worker_vram_limit(tmp_path, monkeypatch):
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=120 * GIB)
+    monkeypatch.setattr(pool, "_cuda_discrete_device_capacity", lambda _request: 96 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    plan = pool._cuda_expert_host_budget_plan(model, request)
+    # The worker may grow to its VRAM limit (96 GiB minus 1/16), which WDDM
+    # commits even though the load estimate is only 24 GiB.
+    assert plan.commit_footprint_bytes == 90 * GIB
+    assert plan.commit_bytes == 2 * GIB
+    assert pool._cuda_expert_host_budget(model, request) == 2 * GIB
+
+
+def test_expert_budget_ignores_commit_without_windows_accounting(tmp_path, monkeypatch):
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=None)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    plan = pool._cuda_expert_host_budget_plan(model, request)
+    assert plan.commit_bytes is None and not plan.commit_limited
+    assert pool._cuda_expert_host_budget(model, request) == 98 * GIB
+
+
+def test_unified_expert_budget_keeps_physical_accounting(tmp_path, monkeypatch):
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="unified",
+                               commit_available=4 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    # Unified memory already subtracts the estimated load from RAM; commit
+    # headroom must not shrink the shared-memory budget a second time.
+    assert pool._cuda_expert_host_budget(model, request) == 78 * GIB
+
+
+def test_windows_commit_pressure_streams_experts_from_ssd(tmp_path, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delenv("MFQ_MODEL_FILE_IO", raising=False)
+    monkeypatch.delenv("MFQ_PLE_FILE_MAP", raising=False)
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=40 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
+    assert pool._cuda_expert_host_budget(model, request) == 0
+    with caplog.at_level(logging.INFO, logger="mfq.server.runtime.runtime_pool"):
+        _, environment = pool._launch_configuration(model, request, port=1234)
+    assert "limited_by=commit" in caplog.text
+    assert environment["MFQ_MOE_PRELOAD_ALL"] == "0"
+    assert environment["MFQ_MOE_HOST_CACHE_BYTES"] == "0"
+    assert environment["MFQ_MOE_SSD_EXPERTS"] == "1"
+
+
+def test_preload_requires_room_for_every_routed_expert(tmp_path, monkeypatch):
+    monkeypatch.delenv("MFQ_MODEL_FILE_IO", raising=False)
+    monkeypatch.delenv("MFQ_PLE_FILE_MAP", raising=False)
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=None, available=36 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
+    # Routed experts need 44 GiB and the cold subset only 28 GiB. The 34 GiB
+    # host budget fits the cold subset but not a complete preload.
+    assert pool._cuda_expert_host_budget(model, request) == 34 * GIB
+    _, environment = pool._launch_configuration(model, request, port=1234)
+    assert environment["MFQ_MOE_PRELOAD_ALL"] == "0"
+    assert environment["MFQ_MOE_HOST_CACHE_BYTES"] == str(34 * GIB)
+    assert environment["MFQ_MOE_SSD_EXPERTS"] == "1"
+
+
+def test_preload_kv_ram_limit_charges_the_complete_expert_set(tmp_path, monkeypatch):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology",
+                        lambda: {"memory_architecture": "discrete"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity",
+                        lambda: (64 * GIB, 52 * GIB))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda",
+                       automatic_memory_budget=False)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    assert pool._cuda_expert_host_budget(model, request) == 50 * GIB
+    # Preload holds all 44 GiB of routed experts, not only the 28 GiB that
+    # the GPU cache cannot mirror, so KV RAM gets 52 - 44 - 2 GiB.
+    assert pool._kv_ram_limit(model, request) == 6 * GIB
 
 
 def test_cuda_expert_cache_leaves_ram_for_preallocated_kv(tmp_path, monkeypatch):

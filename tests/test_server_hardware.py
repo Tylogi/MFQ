@@ -52,6 +52,31 @@ def test_windows_cpu_gpu_and_ram_names(monkeypatch):
     assert value.physical_memory_bytes == 64 << 30
 
 
+def test_windows_commit_capacity_reads_page_file_counters(monkeypatch):
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Windows")
+
+    def global_memory_status(status):
+        status._obj.ullTotalPageFile = 224 << 30
+        status._obj.ullAvailPageFile = 37 << 30
+        return 1
+
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+        kernel32=SimpleNamespace(GlobalMemoryStatusEx=global_memory_status)), raising=False)
+    assert hardware.host_commit_capacity() == (224 << 30, 37 << 30)
+
+
+def test_commit_capacity_is_unavailable_without_windows_accounting(monkeypatch):
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    assert hardware.host_commit_capacity() == (None, None)
+
+
+def test_windows_commit_capacity_reports_query_failure(monkeypatch):
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+        kernel32=SimpleNamespace(GlobalMemoryStatusEx=lambda status: 0)), raising=False)
+    assert hardware.host_commit_capacity() == (None, None)
+
+
 def test_linux_physical_cores_not_smt_threads_and_multiple_gpus(monkeypatch):
     monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
     monkeypatch.setattr(hardware.Path, "read_text", lambda self: "\n\n".join(
@@ -135,6 +160,7 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
 ])
 def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, gpus, architecture, capacity, hot):
     monkeypatch.setattr(hardware, "host_memory_capacity", lambda: (128 << 30, 37 << 30))
+    monkeypatch.setattr(hardware, "host_commit_capacity", lambda: (224 << 30, 64 << 30))
     monkeypatch.setattr(hardware, "hardware_identity", lambda: hardware.HardwareIdentity(
         "CPU", 16, tuple(gpu.name for gpu in gpus), physical_memory_bytes=128 << 30, gpu_memory=gpus))
     value = hardware.memory_topology()
@@ -144,6 +170,8 @@ def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, g
     assert value["prefix_cache_cold_tier"] == "ssd"
     assert value["host_memory_total_bytes"] == 128 << 30
     assert value["host_memory_available_bytes"] == 37 << 30
+    assert value["host_commit_limit_bytes"] == 224 << 30
+    assert value["host_commit_available_bytes"] == 64 << 30
 
 
 def test_gb10_keeps_unified_topology_when_capacity_queries_are_unavailable(monkeypatch):

@@ -106,6 +106,15 @@ target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
+add_executable(mfq-moe-host-memory-test
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/moe_host_memory_test.cpp
+)
+target_include_directories(mfq-moe-host-memory-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda
+)
+target_compile_features(mfq-moe-host-memory-test PRIVATE cxx_std_20)
+add_test(NAME mfq-moe-host-memory-test COMMAND mfq-moe-host-memory-test)
+
 add_executable(mfq-inference-test inference_test.cpp)
 target_link_libraries(mfq-inference-test PRIVATE mfq-engine)
 add_test(NAME mfq-inference-test COMMAND mfq-inference-test)
