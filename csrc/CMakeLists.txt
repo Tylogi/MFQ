@@ -92,7 +92,6 @@ add_subdirectory(formats)
 add_subdirectory(backends/cpu)
 add_subdirectory(components/io)
 add_subdirectory(model_source)
-add_subdirectory(core)
 
 add_subdirectory(components/ggml)
 add_subdirectory(components/tokenizer)

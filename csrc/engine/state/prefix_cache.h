@@ -1,6 +1,6 @@
 #pragma once
 #include "prefix_blocks.h"
-#include <atomic>
+#include <mutex>
 
 namespace mfq::cache {
 struct PrefixMatch {
@@ -13,6 +13,10 @@ struct PagedPrefixCacheMetrics : PrefixBlockStoreMetrics {
 };
 // Logical prefix identity and matching own one host byte store.
 class PagedPrefixCache {
+private:
+    // Counters outlive the storage worker and its reservation callbacks.
+    mutable std::mutex metrics_mutex_;
+    std::uint64_t queries_=0,hits_=0,hit_tokens_=0;
 public:
     explicit PagedPrefixCache(PrefixBlockStoreConfig config);
     std::size_t block_size_tokens() const noexcept {return blocks.block_size_tokens();}
@@ -27,7 +31,5 @@ public:
         PagedPrefixPayload payload,std::string_view extra_key={});
     PagedPrefixCacheMetrics metrics() const;
     PrefixBlockStore blocks;
-private:
-    std::atomic<std::uint64_t> queries_{0},hits_{0},hit_tokens_{0};
 };
 } // namespace mfq::cache

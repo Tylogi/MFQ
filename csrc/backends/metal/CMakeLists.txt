@@ -314,7 +314,10 @@ target_include_directories(mfq-metal-runtime PRIVATE
     ${MFQ_ENGINE_PRIVATE_DIRS}
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
-    mfq-core
+    mfq-model-source
+    mfq-quant-readers
+    mfq-prefix-blocks
+    mfq-qsa-kv-store
     mfq-engine
     mfq-mlx
     mfq-jaccl
@@ -325,7 +328,7 @@ target_link_libraries(mfq-metal-runtime PUBLIC
     ${MFQ_QUARTZCORE_FRAMEWORK}
     ${MFQ_ACCELERATE_FRAMEWORK}
 )
-target_link_libraries(mfq-metal-runtime PRIVATE mfq-json)
+target_link_libraries(mfq-metal-runtime PRIVATE mfq-json mfq-host-parallel)
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
 target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
@@ -359,6 +362,8 @@ target_link_libraries(mfq-decode-metal PRIVATE
     mfq-metal-runtime
 )
 target_compile_features(mfq-decode-metal PRIVATE cxx_std_20)
+target_include_directories(mfq-decode-metal PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
+target_link_libraries(mfq-decode-metal PRIVATE mfq-json)
 
 if(TARGET mfq-prefix-blocks)
     target_sources(mfq-decode-metal PRIVATE
@@ -1200,6 +1205,7 @@ add_test(
 
 add_executable(mfq-metal-qwen4-batching-test tests/mlx_qwen4_batching_test.cpp)
 target_link_libraries(mfq-metal-qwen4-batching-test PRIVATE mfq-metal-runtime mfq-engine)
+target_include_directories(mfq-metal-qwen4-batching-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 target_compile_features(mfq-metal-qwen4-batching-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-qwen4-batching-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 

@@ -5,7 +5,7 @@
 #include "execution/moe_ffn_pipeline.h"
 #include "storage/moe_cached_source_internal.h"
 #include "storage/cpu_projection_rows.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include "runtime/graph_registry.h"
 #include "runtime/moe_pipeline.h"
 #include "mfq_hip_moe_ops.h"

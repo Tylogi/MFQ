@@ -24,7 +24,8 @@ target_include_directories(mfq-engine
     PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS}
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
-target_link_libraries(mfq-engine PRIVATE mfq-core)
+target_link_libraries(mfq-engine PRIVATE
+    mfq-model-source mfq-json mfq-prefix-blocks mfq-qsa-kv-store)
 set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(TARGET mfq-tokenizer)

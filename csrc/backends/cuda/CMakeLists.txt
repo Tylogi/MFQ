@@ -268,7 +268,7 @@ if(BUILD_TESTING)
     # the runtime target that carries them.
     mfq_add_cuda_test(mfq-nint-rows-cuda-test
         ${MFQ_CUDA_ROOT}/tests/ops/nint_rows_test.cu
-        mfq-cuda-native-kernels mfq-core mfq-cuda-runtime)
+        mfq-cuda-native-kernels mfq-cuda-runtime)
     target_compile_definitions(mfq-nint-rows-cuda-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     mfq_add_cuda_test(mfq-nvq-dequant-test
@@ -279,7 +279,7 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-packed-prefill-test
         ${MFQ_CUDA_ROOT}/tests/kernels/packed_prefill_test.cu
-        mfq-cuda-native-kernels mfq-core)
+        mfq-cuda-native-kernels mfq-quant-readers mfq-model-source)
     target_compile_definitions(mfq-packed-prefill-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-packed-prefill-test PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
     mfq_add_cuda_test(mfq-paged-kv-test
@@ -334,13 +334,13 @@ find_package(OpenMP QUIET)
 function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
         ${PROJECT_SOURCE_DIR}/engine/include
-        ${MFQ_ENGINE_PRIVATE_DIRS}
+        ${PROJECT_SOURCE_DIR}/engine/model
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
     target_link_libraries(${target} PRIVATE
-        mfq-core
+        mfq-formats
         mfq-cpu-ops
         mfq-json
         mfq-ggml-internal-headers
@@ -357,7 +357,7 @@ function(mfq_configure_cuda_backend_target target)
 endfunction()
 
 # Model implementations compile separately from the CUDA Engine composition root.
-# Loading primitives and kernel/quant ops have no Engine/tokenizer dependency.
+# Kernel/quant ops do not link Engine or tokenizer; loading uses shared configs.
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
@@ -365,7 +365,9 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
     )
-    target_link_libraries(${target} PRIVATE mfq-engine mfq-tokenizer)
+    target_link_libraries(${target} PRIVATE
+        mfq-engine mfq-tokenizer mfq-model-source mfq-quant-readers
+        mfq-prefix-blocks mfq-qsa-kv-store mfq-cpu-execution)
 endfunction()
 
 function(mfq_configure_cuda_model_target target)
@@ -374,7 +376,8 @@ function(mfq_configure_cuda_model_target target)
         ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_CUDA_ROOT}
     )
-    target_link_libraries(${target} PRIVATE mfq-engine)
+    target_link_libraries(${target} PRIVATE
+        mfq-engine mfq-model-source mfq-quant-readers mfq-qsa-kv-store)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
@@ -409,7 +412,6 @@ set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/activation.cpp
     ${MFQ_CUDA_ROOT}/ops/embedding.cpp
-    ${MFQ_CUDA_ROOT}/execution/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/quant/fp8_sq.cpp
@@ -425,14 +427,13 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-ops)
-target_include_directories(mfq-cuda-ops PRIVATE ${PROJECT_SOURCE_DIR}/engine/model ${PROJECT_SOURCE_DIR}/engine/weights)
+target_link_libraries(mfq-cuda-ops PRIVATE mfq-model-source mfq-quant-readers)
 target_compile_definitions(mfq-cuda-ops PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/weights/moe/expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/execution/moe_ffn_pipeline.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/moe/weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/loaders/mx.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/loaders/sq.cpp
@@ -449,10 +450,24 @@ set(MFQ_CUDA_LOADING_SOURCES
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
 target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_ENGINE_PRIVATE_DIRS})
-target_link_libraries(mfq-cuda-loading PRIVATE mfq-engine mfq-cpu-execution)
+target_link_libraries(mfq-cuda-loading PRIVATE
+    mfq-engine mfq-model-source mfq-quant-readers mfq-cpu-execution
+    mfq-prefix-blocks mfq-qsa-kv-store)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Physical work submission consumes shared planning and observation rules.
+add_library(mfq-cuda-execution OBJECT
+    ${MFQ_CUDA_ROOT}/execution/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/execution/moe_ffn_pipeline.cpp)
+mfq_configure_cuda_backend_target(mfq-cuda-execution)
+target_include_directories(mfq-cuda-execution PRIVATE
+    ${PROJECT_SOURCE_DIR}/engine/weights ${PROJECT_SOURCE_DIR}/engine/executor)
+target_link_libraries(mfq-cuda-execution PRIVATE
+    mfq-model-source mfq-quant-readers mfq-qsa-kv-store mfq-cpu-execution)
+target_compile_definitions(mfq-cuda-execution PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+set_target_properties(mfq-cuda-execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Cross-family composition and explicit template bindings stay in this source
 # group for both native and optional Torch builds.
@@ -474,6 +489,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
 add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-ops>
     $<TARGET_OBJECTS:mfq-cuda-loading>
+    $<TARGET_OBJECTS:mfq-cuda-execution>
     $<TARGET_OBJECTS:mfq-cuda-models>
     ${MFQ_CUDA_INSTANTIATION_SOURCES}
 )
@@ -784,7 +800,7 @@ target_compile_definitions(mfq-cuda-runtime PRIVATE
     NOMINMAX
 )
 if(MSVC)
-    foreach(target mfq-cuda-ops mfq-cuda-loading mfq-cuda-models mfq-cuda-runtime)
+    foreach(target mfq-cuda-ops mfq-cuda-loading mfq-cuda-execution mfq-cuda-models mfq-cuda-runtime)
         target_compile_options(${target} PRIVATE
             "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
             "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"

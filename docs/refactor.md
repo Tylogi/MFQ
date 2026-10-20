@@ -426,7 +426,7 @@ Duplex 是允许追加输入 chunk 的长请求。输入追加、关闭和取消
 
 ## 目录与构建职责
 
-五个 Module、模型和文本在 `engine/` 内形成公共实现。后端目录保留真实设备差异；不能把 CUDA 宿主实现整体搬进 engine 后仍称它公共层。终态没有 `core/` 聚合目录：它现在同时包含模型文件读取、格式解码、模型几何、请求值契约、线程池、KV 磁盘存储与专家放置策略，这些能力按职责归到下列位置，不整体改名为 common/base 后保留聚合依赖。
+五个 Module、模型和文本在 `engine/` 内形成公共实现。后端目录保留真实设备差异；不能把 CUDA 宿主实现整体搬进 engine 后仍称它公共层。`core/` 聚合目录已删除：原先混合的模型输入、格式解码、几何、值契约、线程、磁盘存储与专家放置职责已按下列位置拆分；剩余执行链与 Store 所有权仍按计划落实，不重新建立 common/base 聚合依赖。
 
 ```text
 cuda/csrc/
@@ -468,9 +468,9 @@ cuda/csrc/
 
 原生基础设施使用 `native/`；目录迁移必须同步 `mfq/kernels/cuda/_ext.py` 的源码清单。
 
-### `core/` 的终态归属
+### 原 `core/` 的职责归属
 
-下表来源相对 `csrc/core/`，目标相对 `csrc/`。目录迁移与职责拆分一起进行；不能只改 include 拼写而保留原来的整包依赖。
+下表旧路径相对已删除的 `csrc/core/`，落点相对 `csrc/`。职责拆分和所有消费者的 include/target 迁移已完成；Store 所有权与新模型执行链仍按阶段 2/3 验收。
 
 | 当前内容 | 目标归属 |
 | --- | --- |
@@ -488,7 +488,7 @@ cuda/csrc/
 | `include/mfq/moe/cpu_calibration.h` | 异步任务推进归 `engine/executor/`；CPU 测量工作归 `backends/cpu/execution/`；观测结果回写 weights 成本模型。这是推理期间的在线测量，不是离线量化校准 |
 | `mfq_paged_prefix_cache.*` | prefix 身份、匹配、失效与预算归 `engine/state/`；文件、字节缓存和读写队列归 `backends/cpu/storage/`。后端 session codec 不另建 prefix 策略 |
 | `qsa_kv_store.cpp`、`include/mfq/qsa_kv_store.h` | RAM/SSD 字节块存储归 `backends/cpu/storage/`；sequence/snapshot 的逻辑状态归 `engine/state/`；QSA 设备布局仍归本后端 |
-| `include/mfq/quant/nint_row_cache.h` | `backends/cpu/storage/`；实际消费者包括 CUDA/HIP 行读取路径，物理编码行租约共用 `backends/cpu/storage/` 的实现，逻辑预算/lease 与 WeightStore 对齐 |
+| `include/mfq/quant/nint_row_cache.h` | `backends/cpu/storage/`；实际消费者包括 CUDA/HIP 行读取路径，物理编码行租约共用 `backends/cpu/storage/` 的实现，保留不可变行租约，整体预算与 WeightStore 所有权随 R4 继续落实 |
 | `grid_vision.h/.cpp` | `engine/model/common/vision/`；模型配置、patch 几何和 canonical tensor roles 保留一份，model-graph target 不再夹带视觉模型算法 |
 
 线程、拓扑、亲和性与 host copy 原语已归 `backends/cpu/native/`，CPU 专家调度已归 `backends/cpu/execution/`；CUDA native 仅依赖 host 原语，不经它引入专家调度。

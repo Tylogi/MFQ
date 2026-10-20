@@ -1,7 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "moe_quant_range_source.h"
 #include "cpu_projection_rows.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include "quant_linear.h"
 
 #include <algorithm>

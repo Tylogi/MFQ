@@ -11,7 +11,7 @@ PrefixMatch PagedPrefixCache::match(const std::vector<std::int64_t>& tokens,
     PrefixMatch result;
     BlockHash parent{};
     const auto size=block_size_tokens();
-    if(record_query)++queries_;
+    if(record_query) {std::lock_guard<std::mutex> lock(metrics_mutex_);++queries_;}
     for(std::size_t index=0;index<tokens.size()/size;++index) {
         const auto hash=block_hash(parent,tokens.data()+index*size,size,extra_key);
         if(!blocks.contains(hash,parent,size))break;
@@ -26,10 +26,14 @@ PrefixMatch PagedPrefixCache::match(const std::vector<std::int64_t>& tokens,
         result.matched_tokens+=count;
         break;
     }
-    if(record_query && result.matched_tokens) {++hits_;hit_tokens_+=result.matched_tokens;}
+    if(record_query && result.matched_tokens) {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        ++hits_;hit_tokens_+=result.matched_tokens;
+    }
     return result;
 }
 void PagedPrefixCache::record_match(std::size_t tokens) {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
     ++queries_;
     if(tokens) {++hits_;hit_tokens_+=tokens;}
 }
@@ -46,6 +50,7 @@ BlockHash PagedPrefixCache::replace(const BlockHash& parent,const std::int64_t* 
 PagedPrefixCacheMetrics PagedPrefixCache::metrics() const {
     PagedPrefixCacheMetrics result;
     static_cast<PrefixBlockStoreMetrics&>(result)=blocks.metrics();
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
     result.queries=queries_;result.hits=hits_;result.hit_tokens=hit_tokens_;
     return result;
 }

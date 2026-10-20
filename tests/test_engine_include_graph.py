@@ -8,17 +8,17 @@ drive the shared generation loop, so the arrangement is allowed -- but only for
 them.
 
 Rules:
-  1. engine/** never includes backends/**.
+  1. engine/** only consumes the three listed CPU host contracts in backends/**.
   2. engine private module headers are included only from engine/, backends/,
      tests/ and bench/.  Every scanned file is judged, including core/,
      scheduler/ and transport/, whichever way the include is spelled.
   3. Inside engine, modules only point one way (FORBIDDEN below): the request
      table, the Planner, the Store rules and the text layer never reach the
      Executor driver.
-  4. A backend's device implementation (ops, kernels, native primitives,
-     execution) never reaches the shared execution driver or either Store;
-     backend storage is the Store's physical implementation, so it may use the
-     shared state and weight rules.  Listed exceptions carry open debt.
+  4. Numeric ops, kernels and native primitives never reach shared execution or
+     Store policies. Physical execution may consume weight/observation rules,
+     but never the shared driver or request flow. Backend storage may use shared
+     state/weight rules. Listed exceptions carry open debt.
   5. The engine header graph -- public, private and model headers alike -- is a
      DAG, and every private header has a consumer.
   6. A bare include never names two different files, which is what makes the

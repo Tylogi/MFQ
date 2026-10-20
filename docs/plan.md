@@ -11,7 +11,7 @@
 | 0 验证入口 | 补模型 logits、chunked prefill、随机采样分布与并发延迟的对照和回归 |
 | 1 公共骨架 | 明确 Engine、Store 与 Executor 的装配和所有权 |
 | 2 首条共享模型链 | 实现 Qwen35 hybrid eager 路径，替换旧继承链与双层 batch 驱动 |
-| 3 第二模型与动态资源 | 验证第二种数学/状态结构，接入专家驻留、offload 与动态 I/O，完成 core 拆除 |
+| 3 第二模型与动态资源 | 验证第二种数学/状态结构，接入专家驻留、offload 与动态 I/O，落实 Store 动态资源管理 |
 | 4 第二后端 | 将 Metal 接入共享 Engine 和 family forward，再稳定公共接口 |
 | 5 状态事务 | 统一 session/prefix、MTP、回滚与输出提交 |
 | 6 优化与消费者 | 接入 Graph、并行、多模态和 Duplex，逐模型迁移实际调用方 |
@@ -68,15 +68,6 @@
 
 原生推理、诊断/评估和工具扩展保持独立构建。共享源码变化同时验证原生与实际工具调用；依赖图和源码清单检查不能代替数值行为测试。
 
-### 1.6 拆除 core：K3/K4
-
-| 步骤 | 剩余工作 |
-| --- | --- |
-| K3 状态与放置 | 将 prefix/QSA、在线 CPU 成本测量、MoE 放置和分片规则接入 Store/Executor |
-| K4 删除入口 | 删除 `csrc/core/`、`mfq-core`/`mfq::core` 及全部活动消费者 |
-
-每批更新实际 include/target 闭包、扩展清单和生成文件路径。公共能力不复制进各后端，也不整体改名成另一个聚合目录。core 删除不等于 Store 或跨后端迁移完成。
-
 ## 2. 实施阶段
 
 ### 阶段 0：补齐验证入口
@@ -95,7 +86,7 @@
 
 ### 阶段 3：第二模型与动态资源
 
-接入 DeepSeek 等第二种数学/状态结构，覆盖动态专家、QSA、offload 与 I/O；通用 Planner/Executor/Store 不新增 family 分支。完成 K3/K4 与 R4 的动态资源管理。
+接入 DeepSeek 等第二种数学/状态结构，覆盖动态专家、QSA、offload 与 I/O；通用 Planner/Executor/Store 不新增 family 分支。完成 R4 的动态资源管理。
 
 ### 阶段 4：Metal 验证公共设计
 

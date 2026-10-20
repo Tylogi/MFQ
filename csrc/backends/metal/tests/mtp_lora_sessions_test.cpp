@@ -1,5 +1,5 @@
 #include "runtime/mtp_lora_sessions.h"
-#include "prefix_cache.h"
+#include "../../../engine/state/prefix_cache.h"
 
 #include <chrono>
 #include <condition_variable>

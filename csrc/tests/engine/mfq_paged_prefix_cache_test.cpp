@@ -334,12 +334,20 @@ int main() try {
                 cache.blocks.trim_hot(0);
             }
         });
+        std::thread observations([&] {
+            for (int sample = 0; sample < 4096; ++sample) cache.record_match(4);
+        });
         for (std::int64_t index = 0; index < 64; ++index) {
             const std::vector<std::int64_t> sequence{index, 1, 2, 3};
             cache.store({}, sequence.data(), sequence.size(), payload({1, 2, 3}));
-            (void)cache.metrics();
+            const auto sample = cache.metrics();
+            require(sample.hits <= sample.queries && sample.hit_tokens == sample.hits * 4,
+                "concurrent prefix observations produced inconsistent metrics");
         }
         budgets.join();
+        observations.join();
+        require(cache.metrics().queries == 4096 && cache.metrics().hits == 4096,
+            "concurrent prefix observations were lost");
         cache.blocks.set_disk_limit(0);
         cache.blocks.set_hot_limit(0);
         cache.blocks.flush();

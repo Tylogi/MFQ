@@ -2,7 +2,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER_HEADER = (ROOT / "csrc" / "core" / "include" / "mfq" / "runtime.h").read_text(
+SERVER_HEADER = (ROOT / "csrc" / "engine" / "include" / "request.h").read_text(
     encoding="utf-8"
 )
 TRANSPORT_SRC = ROOT / "csrc" / "transport"
@@ -16,7 +16,7 @@ RUNTIME = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
     for name in (
         "execution/cuda_execution.h",
-        "ops/execution/cuda_execution.cpp",
+        "execution/cuda_execution.cpp",
         "engine/generation.h",
         "engine/generation.cpp",
     )

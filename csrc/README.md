@@ -2,8 +2,8 @@
 
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
-target layout removes the remaining `core/` aggregation and replaces the old
-model binding chain with complete backend operators.
+core aggregation is gone; the target replaces the old model binding chain
+with complete backend operators.
 Format schemas, range readers and frozen codebooks live in `formats/`,
 model input lives in `model_source/`, and file
 I/O lives in `components/io/`. That end state is defined in
@@ -11,8 +11,6 @@ I/O lives in `components/io/`. That end state is defined in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — only the transitional `mfq-core` aggregation remains for K4 in
-  [docs/plan.md](../docs/plan.md);
 - `model_source/` — input discovery, metadata normalization and bounded reads,
   built as `mfq-model-source`. Headers sit beside implementations; old graph/name
   readers stay in `compat/`. The public source contract exposes layout facts,
@@ -102,7 +100,8 @@ results after execution returns. Engine owns physical request state, model
 composition, tokenization, sampling semantics, MTP commit rules and session/cache
 lifecycle. Backend operations own numerical execution and native resources;
 they do not receive output/cancellation callbacks or transport objects. Shared
-model and Engine code must not depend on concrete backend headers.
+model code does not depend on backend headers; Engine state/executor use only
+the three CPU host contracts listed by the include-boundary check.
 
 CUDA's public header is `backends/cuda/include/cuda_engine.h`, containing
 load options and `load_cuda_engine()`. Tensor/context headers stay in `native/`,

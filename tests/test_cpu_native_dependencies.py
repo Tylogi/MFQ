@@ -117,6 +117,15 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     assert not readers & {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json",
                           "mfq-engine", "mfq-models", "mfq-cpu-execution"}
     graph = (tmp_path / "native-closure/targets.dot").read_text()
+    assert not (CSRC / "core").exists()
+    assert 'label = "mfq-core' not in graph and 'mfq::core' not in graph
+    for target in ("mfq-prefix-blocks", "mfq-qsa-kv-store"):
+        deps = _target_dependencies(graph, target)
+        assert "mfq-formats" in deps
+        assert not deps & {"mfq-engine", "mfq-model-source", "mfq-model-graph", "mfq-json",
+                           "mfq-quant-readers", "mfq-cpu-execution"}
+    cpu = _target_dependencies(graph, "mfq-cpu-execution")
+    assert not cpu & {"mfq-engine", "mfq-model-source", "mfq-model-graph", "mfq-json", "mfq-formats"}
     for target in ("mfq-model-graph", "mfq-model-source"):
         deps = _target_dependencies(graph, target)
         assert not deps & {"mfq-core", "mfq-engine", "mfq-models", "mfq-cpu-execution",
@@ -126,7 +135,11 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     inputs = [item for item in commands if any(target in item["command"] for target in
               ("mfq-model-source.dir", "mfq-model-graph.dir"))]
     assert inputs
-    assert all((CSRC / "core").as_posix() not in item["command"] for item in inputs)
+    assert all((CSRC / "core").as_posix() not in item["command"] for item in commands)
+    storage = [item for item in commands if any(target in item["command"] for target in
+               ("mfq-prefix-blocks.dir", "mfq-qsa-kv-store.dir", "mfq-cpu-execution.dir"))]
+    assert storage
+    assert all((CSRC / "engine").as_posix() not in item["command"] for item in storage)
     clients = [item for item in commands if any(target in item["command"] for target in
                ("mfq-engine-contract-test.dir", "mfq-runtime-scheduler.dir"))]
     assert clients

@@ -1327,7 +1327,7 @@ public:
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 clear_live_sessions();
-                return paged_cache_->clear();
+                return paged_cache_->blocks.clear();
             }
         }
         return clear_live_sessions();
@@ -1337,7 +1337,7 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if constexpr (Codec::available) {
             if (paged_cache_) {
-                const auto released = paged_cache_->trim_hot(target_bytes);
+                const auto released = paged_cache_->blocks.trim_hot(target_bytes);
                 if (released > 0) release_host_allocator_cache();
                 return released;
             }
@@ -1349,7 +1349,7 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_hot_budget_ = max_bytes;
-        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        const auto released = paged_cache_->blocks.set_hot_limit(max_bytes);
         if (released > 0) release_host_allocator_cache();
         return released;
     }
@@ -1358,12 +1358,12 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_disk_budget_ = max_bytes;
-        return paged_cache_->set_disk_limit(max_bytes);
+        return paged_cache_->blocks.set_disk_limit(max_bytes);
     }
 
     std::uint64_t refresh_disk_index() {
         if (!paged_cache_) return 0;
-        const auto removed = paged_cache_->refresh_disk_index();
+        const auto removed = paged_cache_->blocks.refresh_disk_index();
         if (removed > 0) release_host_allocator_cache();
         return removed;
     }
@@ -1412,7 +1412,7 @@ private:
             return 0;
         }
 
-        auto payloads = paged_cache_->load_prefix(match.blocks);
+        auto payloads = paged_cache_->blocks.load_prefix(match.blocks);
         if (payloads.empty()) {
             paged_cache_->record_match(0);
             return 0;
@@ -1459,7 +1459,7 @@ private:
                 paged_cache_->block_size_tokens()));
         } catch (const std::exception& error) {
             if (!match.blocks.empty()) {
-                paged_cache_->invalidate(match.blocks.back());
+                paged_cache_->blocks.invalidate(match.blocks.back());
             }
             paged_cache_->record_match(0);
             reset_runtime(runtime);
@@ -1553,7 +1553,7 @@ private:
             }) {
             if (Codec::refresh_final_block &&
                 existing_blocks == full_blocks && !blocks.empty()) {
-                auto final_payload = paged_cache_->load_prefix(
+                auto final_payload = paged_cache_->blocks.load_prefix(
                     {blocks.back()});
                 const bool exact = final_payload.size() == 1 &&
                     Codec::has_exact_boundary(final_payload.front());

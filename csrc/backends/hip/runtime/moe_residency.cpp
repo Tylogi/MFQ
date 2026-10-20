@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 #include "moe_residency.h"
 #include "storage/moe_cached_source_internal.h"
-#include "mfq/cpu_expert_pool.h"
+#include "mfq/moe/cpu_expert_pool.h"
 #include "host_memory_copy.h"
-#include "mfq/moe_residency_ranker.h"
+#include "ranker.h"
 #include <algorithm>
 #include <array>
 #include <exception>
@@ -77,7 +77,7 @@ struct MoeResidencyManager::Impl {
     int pending_tokens=0;
     std::vector<std::vector<float>> heat;
     std::vector<std::vector<float>> observations;
-    std::unique_ptr<mfq::MoeResidencyRanker> ranking;
+    std::unique_ptr<mfq::engine::MoeResidencyRanker> ranking;
     struct TransferStage {std::string key;MoeGpuArena* arena=nullptr;};
     std::vector<std::vector<TransferStage>> transfer_stages;
     bool direct=false;
@@ -154,7 +154,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
                 stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr});
         }
     }
-    using Expert=mfq::MoeResidencyRanker::Expert;
+    using Expert=mfq::engine::MoeResidencyRanker::Expert;
     std::vector<std::vector<Expert>> layout;
     if(cache->config_.moe_residency_warm && cache->config_.moe_residency_projection_heat) {
         std::map<MoeGpuArena*,std::vector<Expert>> groups;
@@ -181,7 +181,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         }
         for(auto& item:groups)layout.push_back(std::move(item.second));
     }
-    s.ranking=std::make_unique<mfq::MoeResidencyRanker>(std::move(layout));
+    s.ranking=std::make_unique<mfq::engine::MoeResidencyRanker>(std::move(layout));
     MFQ_CUDA_CHECK(hipStreamCreateWithFlags(&s.stream,hipStreamNonBlocking));
     const auto event=hipEventCreateWithFlags(&s.done,hipEventDisableTiming);
     if(event!=hipSuccess){hipStreamDestroy(s.stream);s.stream=nullptr;MFQ_CUDA_CHECK(event);}
@@ -259,7 +259,7 @@ void MoeResidencyManager::prepare() {
     auto& s=*impl_;auto& cache=*s.cache;
     const PhaseClock clock(s.prepare_ns,s.pending_tokens<=8?&s.decode_prepare_ns:nullptr);
     const MfqCudaGuard guard(cache.sources_.front()->cohorts_.front().active.expert_local.device());
-    using Expert=mfq::MoeResidencyRanker::Expert;
+    using Expert=mfq::engine::MoeResidencyRanker::Expert;
     if(cache.pipeline_transfer_cache_)for(auto& stages:s.transfer_stages)for(auto& stage:stages)
         if(!stage.arena) {
             const auto found=cache.pipeline_stages_.find(stage.key);

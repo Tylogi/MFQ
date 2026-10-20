@@ -144,7 +144,12 @@ function(mfq_configure_hip_backend_target target)
         ${MFQ_HIP_KERNEL_ROOT}
     )
     target_link_libraries(${target} PRIVATE
-        mfq-core
+        mfq-formats
+        mfq-model-source
+        mfq-quant-readers
+        mfq-qsa-kv-store
+        mfq-prefix-blocks
+        mfq-cpu-execution
         mfq-cpu-ops
         mfq-json
         mfq-ggml-internal-headers
@@ -331,7 +336,7 @@ if(BUILD_TESTING)
     # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the
     # cuda_* runtime API names onto hip.
     set(MFQ_HIP_TEST_INCLUDES
-        ${MFQ_REPOSITORY_ROOT}/csrc/core
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_HIP_ROOT}/tests/cuda_compat
         ${MFQ_REPOSITORY_ROOT}/csrc/components/ggml/src/ggml-hip/vendors
         ${MFQ_REPOSITORY_ROOT}
@@ -373,7 +378,7 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-attention-mma-test
         ${MFQ_HIP_ROOT}/tests/attention_mma_test.cu)
     target_link_libraries(mfq-hip-attention-mma-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core mfq-ggml)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-ggml)
 
     mfq_add_hip_test(mfq-hip-native-tensor-test
         ${MFQ_HIP_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
@@ -388,12 +393,12 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-nint-rows-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_rows_test.cu)
     target_link_libraries(mfq-hip-nint-rows-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-quant-readers)
 
     mfq_add_hip_test(mfq-hip-packed-prefill-test
         ${MFQ_HIP_ROOT}/tests/mfq_packed_prefill_test.cu)
     target_link_libraries(mfq-hip-packed-prefill-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-quant-readers)
 
     mfq_add_hip_test(mfq-hip-paged-kv-test
         ${MFQ_HIP_ROOT}/tests/mfq_paged_kv_test.cu)
