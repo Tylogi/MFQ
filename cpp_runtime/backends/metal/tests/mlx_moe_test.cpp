@@ -7207,11 +7207,11 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
                 ? runtime.last_mtp_stats().accepted_tokens < runtime.last_mtp_stats().drafted_tokens
                 : runtime.last_mtp_stats().accepted_tokens > 0,
             "V4.1 DSpark fixture did not exercise its acceptance/rollback branch");
-        for (bool mtp : {false, true}) {
+        for (bool mtp : {false, true}) for (std::size_t block_size : {8, 32}) {
             auto history = prompt;
             std::vector<std::int64_t> output;
             std::vector<MlxDeepseekV41TextSessionState> checkpoints;
-            MlxPrefixCacheHooks hooks{8, prompt.size(), true, [&](std::size_t position) {
+            MlxPrefixCacheHooks hooks{block_size, prompt.size(), true, [&](std::size_t position) {
                 require(position <= history.size(), "V4.1 checkpoint precedes delivered history");
                 checkpoints.push_back(runtime.capture_text_session_state(
                     std::vector<std::int64_t>(history.begin(), history.begin() + position), true));
@@ -7224,6 +7224,9 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
             require(!checkpoints.empty() && checkpoints.back().cache_position == 24 &&
                     checkpoints.back().dspark.has_value() == mtp,
                 "V4.1 did not cache committed generated tokens and predictor history");
+            require(std::any_of(checkpoints.begin(), checkpoints.end(), [&](const auto& state) {
+                    return state.tokens.size() == prompt.size() - 1;
+                }), "V4.1 omitted the same-prompt resumable checkpoint");
             const auto restored = persist(checkpoints.back());
             runtime.restore_text_session_state(restored);
             const auto before = evaluated_floats(runtime.decode(next));

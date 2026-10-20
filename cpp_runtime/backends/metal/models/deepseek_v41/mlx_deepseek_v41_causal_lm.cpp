@@ -1564,7 +1564,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_impl(
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
     std::optional<std::size_t> stable_prefix_tokens, int prefill_chunk_size,
-    const MlxPrefixCacheHooks& prefix_cache,
+    const MlxPrefixCacheHooks& requested_prefix_cache,
     const std::vector<MlxDeepseekV41ImageInput>* images) {
     if (prompt.empty() || max_tokens < 0 || prefill_chunk_size <= 0) {
         throw std::invalid_argument(
@@ -1595,10 +1595,12 @@ std::int32_t MlxDeepseekV41CausalLm::generate_impl(
     std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
         : 0;
+    auto prefix_cache = requested_prefix_cache;
     if (prefix_cache) requested_stable_count = std::min(requested_stable_count, prompt.size() - 1);
     if (images) for (const auto& image : *images)
         if (requested_stable_count > std::size_t(image.begin) && requested_stable_count < std::size_t(image.end))
             requested_stable_count = image.begin;
+    prefix_cache.input_tokens = requested_stable_count;
     const bool retain_stable_prefix =
         requested_stable_count > 0;
     const std::size_t stable_count = retain_stable_prefix
