@@ -83,14 +83,15 @@ static MlxEngineComponents make_grid_vision_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<Runtime>> runtime_holder,
-    mlx::core::Stream runtime_stream) {
+    mlx::core::Stream runtime_stream,
+    std::string_view vision_implementation = "grid_vit") {
     MlxEngineComponents result;
     result.mtp_available =
         component_declared(graph, "predictor") &&
         runtime_holder->has_value() &&
         runtime_holder->value().supports_mtp();
     if (component_with_implementation(
-            graph, "vision", "grid_vit") == nullptr ||
+            graph, "vision", vision_implementation) == nullptr ||
         !runtime_holder->has_value() ||
         !runtime_holder->value().supports_multimodal()) {
         return result;
@@ -177,6 +178,21 @@ MlxEngineComponents make_mlx_engine_components(
     mlx::core::Stream runtime_stream) {
     return make_grid_vision_engine_components(graph, std::move(runtime_mutex),
         std::move(runtime_holder), runtime_stream);
+}
+
+MlxEngineComponents make_mlx_engine_components(
+    const MfqModelGraph* graph,
+    std::shared_ptr<std::mutex> runtime_mutex,
+    std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime_holder,
+    mlx::core::Stream runtime_stream) {
+    // RADIO is the only vision implementation this backbone declares; the
+    // grid-vision adapter already owns the media payload conversion.
+    return make_grid_vision_engine_components(
+        graph,
+        std::move(runtime_mutex),
+        std::move(runtime_holder),
+        runtime_stream,
+        "radio");
 }
 
 MlxEngineComponents make_mlx_engine_components(

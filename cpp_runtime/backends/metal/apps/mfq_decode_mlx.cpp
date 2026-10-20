@@ -3,6 +3,8 @@
 #include "mlx_deepseek_v41_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
+#include "mlx_nemotron_h_causal_lm.h"
+#include "nemotron_h_model.h"
 #include "mlx_moe.h"
 #include "mlx_memory_residency.h"
 #include "mlx_resident_budget.h"
@@ -1799,6 +1801,33 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxNemotronHCausalLm& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& = {}) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
+    (void)cache_plan;
+    return runtime.generate(
+        prompt,
+        sampling,
+        max_tokens,
+        callback,
+        prefill_chunk_size,
+        token_constraint);
+}
+
+std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxMiniCPMO45Runtime& runtime,
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
@@ -3227,6 +3256,49 @@ int run_native_runtime(
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
+            runtime_stream);
+    }
+
+    if (backbone == "nemotron_h") {
+        const auto config = mfq::metal::load_nemotron_h_config(container);
+        const auto components = mfq::metal::resolve_nemotron_h_components(container);
+        preparation.set_routes(static_cast<int>(config.num_experts_per_tok));
+        const int context = static_cast<int>(std::min<std::int64_t>(
+            arguments.context_size, config.max_position_embeddings));
+        std::cout
+            << "Loading native C++/MLX Nemotron-H model on Apple GPU..."
+            << std::endl;
+        auto runtime = mfq::metal::MlxNemotronHCausalLm::load(container, context);
+        release_model_load_staging_memory(runtime_stream);
+        const auto load_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        std::cout
+            << "Loaded " << runtime.layer_count()
+            << " Nemotron-H layers in " << load_seconds << " s"
+            << " mtp=" << (runtime.supports_mtp() ? "on" : "off")
+            << " vision=" << (runtime.supports_multimodal() ? "on" : "off")
+            << std::endl;
+        const auto load_runtime =
+            [&container, native_context = config.max_position_embeddings](
+                std::int64_t requested_context) {
+                if (requested_context < 1 ||
+                    requested_context > std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument(
+                        "Metal runtime context is out of range");
+                }
+                return mfq::metal::MlxNemotronHCausalLm::load(
+                    container,
+                    std::min<std::int64_t>(requested_context, native_context));
+            };
+        return run_loaded_runtime(
+            arguments,
+            container,
+            std::move(runtime),
+            load_runtime,
+            components.has_vision ? std::string("nemotron_h_vision")
+                                  : config.model_type,
+            config.max_position_embeddings,
+            config.vocab_size,
             runtime_stream);
     }
 
