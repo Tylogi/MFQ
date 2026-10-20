@@ -18,8 +18,7 @@ public:
     bool stopped() const noexcept { return stopped_; }
 
 private:
-    bool emit_prefix(std::size_t limit);
-    bool emit_bytes(std::size_t count);
+    bool emit_prefix(std::size_t limit, bool at_end = false);
 
     std::vector<std::string> stops_;
     std::string output_;

@@ -6,31 +6,59 @@
 namespace mfq::engine {
 namespace {
 
-std::size_t complete_utf8_prefix(const std::string& value, std::size_t limit) {
-    std::size_t i = 0;
-    std::size_t complete = 0;
-    limit = std::min(limit, value.size());
-    while (i < limit) {
-        const unsigned char lead = static_cast<unsigned char>(value[i]);
-        std::size_t width = 1;
-        if ((lead & 0x80u) == 0) width = 1;
-        else if ((lead & 0xE0u) == 0xC0u) width = 2;
-        else if ((lead & 0xF0u) == 0xE0u) width = 3;
-        else if ((lead & 0xF8u) == 0xF0u) width = 4;
-        else break;
-        if (i + width > limit) break;
-        bool valid = true;
-        for (std::size_t j = 1; j < width; ++j) {
-            if ((static_cast<unsigned char>(value[i + j]) & 0xC0u) != 0x80u) {
-                valid = false;
-                break;
-            }
-        }
-        if (!valid) break;
-        i += width;
-        complete = i;
+constexpr char kReplacement[] = "\xEF\xBF\xBD";
+
+struct Utf8Step {
+    std::size_t width;
+    bool valid;
+    bool truncated;
+};
+
+// Decodes one code point at value[i] with the well-formed byte ranges of
+// Unicode Table 3-7, so overlong forms, surrogates and values past U+10FFFF
+// are rejected. An invalid step covers one maximal subpart.
+Utf8Step utf8_step(const std::string& value, std::size_t i, std::size_t limit) {
+    const unsigned char lead = static_cast<unsigned char>(value[i]);
+    if (lead < 0x80u) return {1, true, false};
+    std::size_t width = 0;
+    unsigned char low = 0x80u;
+    unsigned char high = 0xBFu;
+    if (lead >= 0xC2u && lead <= 0xDFu) {
+        width = 2;
+    } else if (lead >= 0xE0u && lead <= 0xEFu) {
+        width = 3;
+        if (lead == 0xE0u) low = 0xA0u;
+        if (lead == 0xEDu) high = 0x9Fu;
+    } else if (lead >= 0xF0u && lead <= 0xF4u) {
+        width = 4;
+        if (lead == 0xF0u) low = 0x90u;
+        if (lead == 0xF4u) high = 0x8Fu;
+    } else {
+        return {1, false, false};
     }
-    return complete;
+    for (std::size_t j = 1; j < width; ++j) {
+        if (i + j >= limit) return {j, false, true};
+        const unsigned char next = static_cast<unsigned char>(value[i + j]);
+        if (next < (j == 1 ? low : 0x80u) || next > (j == 1 ? high : 0xBFu)) {
+            return {j, false, false};
+        }
+    }
+    return {width, true, false};
+}
+
+// Appends value[0, limit) to out as well-formed UTF-8 and returns the bytes
+// consumed. A sequence cut off at limit waits for the next piece unless at_end.
+std::size_t append_utf8_prefix(const std::string& value, std::size_t limit, bool at_end, std::string& out) {
+    limit = std::min(limit, value.size());
+    std::size_t i = 0;
+    while (i < limit) {
+        const Utf8Step step = utf8_step(value, i, limit);
+        if (step.truncated && !at_end) break;
+        if (step.valid) out.append(value, i, step.width);
+        else out += kReplacement;
+        i += step.width;
+    }
+    return i;
 }
 
 } // namespace
@@ -52,7 +80,7 @@ bool TextEmitter::append(const std::string& piece) {
         }
     }
     if (stop_pos != std::string::npos) {
-        if (!emit_prefix(stop_pos)) return false;
+        if (!emit_prefix(stop_pos, true)) return false;
         pending_.clear();
         stopped_ = true;
         return false;
@@ -71,25 +99,11 @@ bool TextEmitter::append(const std::string& piece) {
 }
 
 bool TextEmitter::flush() {
-    const std::size_t complete = complete_utf8_prefix(pending_, pending_.size());
-    if (complete > 0 && !emit_bytes(complete)) return false;
-    if (!pending_.empty()) {
-        pending_.clear();
-        output_ += "\xEF\xBF\xBD";
-        return true;
-    }
-    return true;
+    return emit_prefix(pending_.size(), true);
 }
 
-bool TextEmitter::emit_prefix(std::size_t limit) {
-    const std::size_t complete = complete_utf8_prefix(pending_, limit);
-    return complete == 0 || emit_bytes(complete);
-}
-
-bool TextEmitter::emit_bytes(std::size_t count) {
-    std::string text = pending_.substr(0, count);
-    pending_.erase(0, count);
-    output_ += text;
+bool TextEmitter::emit_prefix(std::size_t limit, bool at_end) {
+    pending_.erase(0, append_utf8_prefix(pending_, limit, at_end, output_));
     return true;
 }
 
