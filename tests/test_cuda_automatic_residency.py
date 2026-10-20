@@ -33,6 +33,8 @@ def _no_host_commit_accounting(monkeypatch):
     monkeypatch.setattr(
         "mfq.server.runtime.runtime_pool.host_commit_capacity", lambda: (None, None)
     )
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool._wddm_host", lambda: False)
+    monkeypatch.delenv("MFQ_CUDA_VRAM_LIMIT_GIB", raising=False)
 
 
 def artifact(tmp_path):
@@ -66,6 +68,29 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
         assert pool._estimated_load_bytes(model, selected) == capacity - max(GIB, capacity // 16)
     explicit = request.model_copy(update={"moe_gpu_cache_gb": 7})
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
+
+
+@pytest.mark.parametrize("wddm,capacity,configured,limit", [
+    (False, 96 * GIB, None, 90 * GIB),
+    # The desktop shares a WDDM device; a fifth of it stays free.
+    (True, 96 * GIB, None, 96 * GIB - 96 * GIB // 5),
+    (True, 16 * GIB, None, 12 * GIB),
+    # An explicit limit wins on every platform.
+    (True, 96 * GIB, "40", 40 * GIB),
+])
+def test_cuda_vram_limit_leaves_headroom_for_the_windows_desktop(tmp_path, monkeypatch, wddm,
+                                                                 capacity, configured, limit):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", capacity),)))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool._wddm_host", lambda: wddm)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
+    if configured:
+        pool.runtime_environment["MFQ_CUDA_VRAM_LIMIT_GIB"] = configured
+    request = ModelLoadRequest(model="model", device_ids=["0"])
+    assert pool._cuda_device_vram_limit(request) == limit
+    selected = pool._apply_automatic_expert_residency(artifact(tmp_path), request)
+    # Automatic residency fills the worker's limit, never the whole device.
+    assert pool._estimated_load_bytes(artifact(tmp_path), selected) <= limit
 
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
