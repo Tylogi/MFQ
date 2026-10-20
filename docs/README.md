@@ -45,6 +45,10 @@ through the inference API.
 ## Develop MFQ
 
 - [Architecture and contribution rules](../CONTRIBUTING.md)
+- [Current project architecture](architecture.md)
+- [Native runtime refactor design](refactor.md)
+- [Remaining refactor work and validation](plan.md)
+- [Open defects and validation gaps](bugs.md)
 - [Repository README](../README.md)
 
 Runtime support is checkpoint- and backend-dependent. Use the support matrix

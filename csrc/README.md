@@ -5,16 +5,16 @@ by model family. The tree below is the **current transitional layout**; the
 target layout removes the `core/` aggregation, moves each family to
 `engine/model/<family>/`, and adds `formats/`, `model_source/` and
 `components/io/`. That end state is defined in
-[docs/refactor.md](../../docs/refactor.md) and sequenced in
-[docs/plan.md](../../docs/plan.md); nothing here claims the new execution chain
+[docs/refactor.md](../docs/refactor.md) and sequenced in
+[docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
 - `core/` — canonical model graph, request/value contracts, policies, and
   generated tables; temporary old-artifact name adapters live in
   `core/compat/`. This is a transitional aggregation target (`mfq-core`), not a
   target module: its responsibilities are reassigned in
-  [docs/refactor.md](../../docs/refactor.md) and removed by K1–K4 in
-  [docs/plan.md](../../docs/plan.md);
+  [docs/refactor.md](../docs/refactor.md) and removed by K1–K4 in
+  [docs/plan.md](../docs/plan.md);
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
@@ -50,10 +50,10 @@ polymorphic boundary. Python owns runtime process lifecycle and the public
 server API.
 
 The mandatory ownership and canonicalization rules are defined in the
-workspace [runtime architecture](../../docs/architecture.md) (current state) and
+repository [runtime architecture](../docs/architecture.md) (current state) and
 repository [development rules](../CONTRIBUTING.md); the target architecture is
-[docs/refactor.md](../../docs/refactor.md) and known defects are
-[docs/bugs.md](../../docs/bugs.md). In particular, reusable
+[docs/refactor.md](../docs/refactor.md) and known defects are
+[docs/bugs.md](../docs/bugs.md). In particular, reusable
 state machines, cache lifecycle, sampling, dispatch, metrics, multimodal
 pipelines, and MTP orchestration must never live in a model-architecture
 directory.
@@ -109,8 +109,10 @@ packing and global cache-position restoration, not a shared StateAdapter protoco
 Paged allocation, chunks and page tables live in `storage/state/batch_paged.h`,
 which accepts native geometry rather than a model. Model Ops associate native
 request/storage types; only Engine composition enables supported batch execution.
-Production batching is currently bound only to Qwen35. A synthetic dense CUDA
-model with independent request histories tests runner reuse, not other-family support.
+Production batch bindings currently include Qwen35 and a separate
+`Qwen4BatchExecution` for Qwen4/Flash-Next. These bindings do not establish
+shared Executor ownership or real-weight validation for every family. A synthetic
+dense CUDA model with independent request histories tests runner reuse.
 Concrete model, batch and request-state types are selected only at Engine composition;
 generation accepts an owned sequence, never a concrete batching pointer.
 Concurrent admission and physical batching are distinct.
@@ -120,7 +122,7 @@ and batch generation share CUDA sampling buffer/count initialization. Model
 users include their actual family headers directly; there is no include-only
 model registry or CUDA MXFP4 blob forwarding header.
 Metal integration and duplex control remain pending
-([docs/bugs.md](../../docs/bugs.md) B26 and B28);
+([docs/bugs.md](../docs/bugs.md) B26 and B28);
 multi-device and non-Qwen3.5 real-weight validation are also incomplete.
 Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.
@@ -134,8 +136,9 @@ target (`mfq-runtime` on CUDA); the CUDA tools above are built explicitly with
 and has no transport dependency. With `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`,
 the backend, prefix cache, tokenizer, diagnostics and evaluation still build;
 communication modules and `mfq-runtime` are omitted. `MFQ_BUILD_CUDA_RUNTIME`
-defaults to ON on non-Apple platforms and to OFF on Apple platforms (ON with
-Apple is a configure error). Setting it to OFF omits the CUDA backend entirely:
+defaults to ON when a CUDA compiler is detected on a non-Apple platform and HIP
+is not selected; otherwise it defaults to OFF. Enabling it on Apple is a
+configure error. Setting it to OFF omits the CUDA backend entirely:
 the CUDA language, toolkit lookup, device tests and CUDA executables are not
 configured, so the common engine and its CPU tests still configure, build and run
 without invoking a CUDA compiler or linking a CUDA library. The

@@ -115,7 +115,8 @@ cmake --build build/common --target mfq-engine-contract-test
 build/common/tests/mfq-engine-contract-test
 ```
 
-`MFQ_BUILD_CUDA_RUNTIME` defaults to on except on Apple platforms, and it is the
+`MFQ_BUILD_CUDA_RUNTIME` defaults to on when a CUDA compiler is detected on a
+non-Apple platform and HIP is not selected; otherwise it defaults to off. It is the
 only switch that enables the CUDA language, finds the CUDA Toolkit, or adds the
 device tests. `mfq build --backend cuda` passes `-DMFQ_BUILD_CUDA_RUNTIME=ON`
 explicitly, so a build directory previously configured with the switch off still
