@@ -99,6 +99,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 : (kl_capacity > 0 ? std::max<int64_t>(cache_pos + T, kl_capacity)
                                    : max_position_embeddings);
     const RopeCache &active_rope = attention_rope.cos.defined() ? attention_rope : rope;
+    const bool apply_rotary = !no_rope;
     if (!cache.defined()) {
         cache =
             KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
@@ -150,7 +151,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             const bool grid_mrope_positions =
                 B == 1 && cache_positions.has_value() && pos.dim() == 2 && pos.size(0) == 3;
             const bool fused_qk_rope_kv =
-                official_bf16 && x.is_cuda() && write_positions.dim() == 1 && pos.dim() == 1 &&
+                apply_rotary && official_bf16 && x.is_cuda() &&
+                write_positions.dim() == 1 && pos.dim() == 1 &&
                 T == 1 && !cache.is_paged() && !cache.ring && !cache.quantization.enabled() && !v_norm.defined() &&
                 q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
                 active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
@@ -299,7 +301,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     auto &k = heads.key;
                     auto &v = heads.value;
                     const bool fused_rope_kv =
-                        official_bf16 && x.is_cuda() && write_positions.dim() == 1 &&
+                        apply_rotary && official_bf16 && x.is_cuda() &&
+                        write_positions.dim() == 1 &&
                         pos.dim() == 1 && T == 1 && !cache.is_paged() && !cache.ring &&
                         active_rope.rotary_dim == 128 && active_rope.sections.numel() == 0 &&
                         nh == 32 && nkh == 8 && hd == 128 &&
@@ -735,7 +738,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         oo = oo.to(mfq_tensor_backend::kBFloat16).contiguous();
                     }
                     return oo;
-                });
+                },
+                apply_rotary);
         },
         [&](mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor oo) {
             return forward_ffn(execution, std::move(residual), std::move(oo), B, T, H);

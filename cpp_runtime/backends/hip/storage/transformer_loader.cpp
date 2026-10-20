@@ -106,6 +106,7 @@ FFN load_moe_weights(CudaExecutionContext& execution, const mfq::ModelSource& so
     TransformerWeightLoader loader{execution, source};
     loader.cpu_offloaded = options.cpu_offloaded;
     loader.shared_gate_up_compatible_prefix = options.shared_gate_up_compatible_prefix;
-    return mfq::models::load_moe_weights<FFN>(loader, std::string(prefix), options.layer,
-                                             options.router_bias_required);
+    return mfq::models::load_moe_weights<FFN>(
+        loader, std::string(prefix), options.layer, options.router_bias_required,
+        options.ungated_experts, options.ungated_shared);
 }

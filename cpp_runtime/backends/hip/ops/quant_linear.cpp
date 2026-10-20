@@ -1564,6 +1564,8 @@ QuantLinearGroup load_paired_gate_up(
         const QuantLinear & down,
         size_t required_compatible_prefix,
         bool preserve_projection_boundaries) {
+    // An ungated MLP has one Up projection; only the available prefix may fuse.
+    required_compatible_prefix = std::min(required_compatible_prefix, names.size());
     auto slices =
         tensor_parallel_output_slices_for_input(
             down);
