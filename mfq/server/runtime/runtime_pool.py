@@ -1160,8 +1160,12 @@ class RuntimePool:
         return sampling.model_copy(update={"enable_mtp": False})
 
     def memory_policy_status(self) -> dict[str, Any]:
+        effective_total = self._effective_runtime_memory_budget_locked()
+        automatic_total = effective_total if self.memory_policy.total_limit_bytes is None else self._effective_runtime_memory_budget_locked(
+            self.memory_policy.model_copy(update={"total_limit_bytes": None}))
         return {**memory_topology(), **self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory()),
-            "effective_total_limit_bytes": self._effective_runtime_memory_budget_locked(),
+            "effective_total_limit_bytes": effective_total,
+            "automatic_total_limit_bytes": automatic_total,
             "total_capacity_limit_bytes": self._resident_total_limit(),
             "effective_prefix_limit_bytes": self._prefix_total_limit(),
             "effective_prefix_ram_limit_bytes": self._prefix_ram_total_limit(), **self._prefix_disk_status}
@@ -3563,8 +3567,8 @@ class RuntimePool:
             cpu += max(0, used - gpu)
         return physical, cpu
 
-    def _effective_runtime_memory_budget_locked(self) -> int | None:
-        ceiling = self._resident_total_limit()
+    def _effective_runtime_memory_budget_locked(self, policy: RuntimeMemoryPolicy | None = None) -> int | None:
+        ceiling = self._resident_total_limit(policy)
         if ceiling is None or self.backend != "metal":
             return ceiling
         physical, cpu = self._resident_process_usage_locked()
