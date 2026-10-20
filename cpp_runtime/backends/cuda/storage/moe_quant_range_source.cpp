@@ -3,6 +3,7 @@
 #include "moe_pinned_expert_arena.h"
 #include "cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
+#include "mfq/host_copy.h"
 #include "quant_linear.h"
 #include "format.h"
 
@@ -19,6 +20,13 @@ using mfq::cuda::quant_format::cpu_u8_tensor;
 using mfq::cuda::quant_format::cpu_f16_to_f32_tensor;
 
 namespace {
+void copy_neuron_anchors(std::vector<uint16_t>& anchors,const tb::Tensor& target) {
+    const auto count=int64_t(anchors.size());
+    auto output=tb::from_blob(target.data_ptr(),{count},
+        tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+    output.copy_(tb::from_blob(anchors.data(),{count},
+        tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat16)));
+}
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 struct NvqFieldOwner {
     mfq::NvqRows::Fields fields;
@@ -241,7 +249,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             const auto size=fields[f].numel()*fields[f].element_size();
             if(size!=targets[f].numel()*targets[f].element_size())
                 throw std::invalid_argument("SSD field copy shape differs");
-            if(size)std::memcpy(targets[f].data_ptr(),fields[f].data_ptr(),size);
+            mfq::copy_host_range({targets[f].data_ptr(),fields[f].data_ptr(),size});
         }
     };
     if(host_cache_)if(auto cached=host_cache_->find(host_key(expert),touch_cache)) {copy(cached->weights);return;}
@@ -293,8 +301,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             throw std::logic_error("NINT range source differs from prototype");
         const auto read_done=profile?Clock::now():Clock::time_point{};
         for(std::size_t f=5;f<7;++f) {
-            const auto converted=cpu_f16_to_f32_tensor(anchors[f-5],std::int64_t(rows));
-            std::memcpy(targets[f].data_ptr(),converted.data_ptr(),rows*4);
+            copy_neuron_anchors(anchors[f-5],targets[f]);
         }
         ++direct_field_reads_;++materializations_;
         if(preloaded_.load()) {
@@ -328,8 +335,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             const auto read_done=profile?Clock::now():Clock::time_point{};
             if(targets[3].numel()*targets[3].element_size()!=anchors.size()*4)
                 throw std::invalid_argument("SSD neuron scale target differs");
-            const auto scale=cpu_f16_to_f32_tensor(anchors,store_->out_per_expert());
-            std::memcpy(targets[3].data_ptr(),scale.data_ptr(),anchors.size()*4);
+            copy_neuron_anchors(anchors,targets[3]);
             ++direct_field_reads_;++materializations_;
             if(preloaded_.load()) {
                 ++disk_reads_after_preload_;
@@ -372,8 +378,7 @@ bool MoeQuantRangeSource::copy_nvq_expert_fields(const std::vector<int>& experts
     std::size_t source_bytes=0;
     if(!store_->copy_nvq_fields(experts,fields,&source_bytes))return false;
     const auto read_done=profile?Clock::now():Clock::time_point{};
-    const auto scale=cpu_f16_to_f32_tensor(anchors,std::int64_t(rows));
-    std::memcpy(targets[3].data_ptr(),scale.data_ptr(),rows*4);
+    copy_neuron_anchors(anchors,targets[3]);
     direct_field_reads_.fetch_add(experts.size(),std::memory_order_relaxed);
     materializations_.fetch_add(experts.size(),std::memory_order_relaxed);
     ++bulk_field_reads_;
