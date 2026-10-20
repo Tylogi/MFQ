@@ -1,0 +1,849 @@
+// Rotary Position Embedding, rotate-half (HF/GPT-J style, Qwen convention).
+// Supports full RoPE, partial RoPE, per-batch positions, and MRoPE sections.
+// x [..., T, D], pos [T], [B,T], or [A,T]. rotary_dim <= D.
+// freq_j = base^(-2j/rotary_dim). One block per (m, t) row, threads cover j in [0, rotary_dim/2):
+//   out[t,j]      = x0*cos - x1*sin
+//   out[t,j+half] = x1*cos + x0*sin
+
+#include <cuda_runtime.h>
+#include "native/tensor/backend.h"
+#include <cuda_bf16.h>
+#include <cmath>
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+constexpr int ROPE_BD = 256;
+
+struct RotaryProjectionLayout {
+    int64_t batch, token, head, column;
+};
+
+__device__ int64_t rotary_position(const void* positions, bool wide, int64_t index) {
+    return wide ? static_cast<const int64_t*>(positions)[index]
+                : static_cast<const int32_t*>(positions)[index];
+}
+
+template<class Value>
+__global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* weight,const void* positions,
+        bool wide_positions,const int64_t* cache,const float* frequencies,const int32_t* selected_axes,Value* output,
+        int tokens,int width,int pool,int maximum,int rotary_maximum,int pairs,int axes,float eps,
+        int64_t row_stride,int64_t column_stride) {
+    const int token=blockIdx.x,column=threadIdx.x;
+    const int64_t block=cache[token]/pool,start=block*pool;
+    // A verify batch can touch one block repeatedly. Only its last query writes
+    // the pooled entry; all queries observe the same completed raw cache.
+    if(token+1<tokens && cache[token+1]/pool==block)return;
+    __shared__ float means[256],partial[256];
+    float mean=0;
+    if(column<width) {
+        float sum=0;
+        for(int i=0;i<pool;++i) {
+            const int64_t row=min(max(int64_t(0),start+i),int64_t(maximum)-1);
+            sum=__fadd_rn(sum,float(index[row*row_stride+column*column_stride]));
+        }
+        mean=float(Value(__fdiv_rn(sum,float(pool))));
+    }
+    means[column]=mean;partial[column]=__fadd_rn(0.f,__fmul_rn(mean,mean));
+    __syncthreads();
+    // Retain the normalized rotary kernel's reduction tree and intermediate
+    // FP16 rounding, including the rounding before rotate-half.
+    for(int stride=blockDim.x/2;stride>0;stride/=2) {
+        if(column<stride)partial[column]=__fadd_rn(partial[column],partial[column+stride]);
+        __syncthreads();
+    }
+    const float inverse=__fdiv_rn(1.f,__fsqrt_rn(__fadd_rn(__fdiv_rn(partial[0],float(width)),eps)));
+    const auto normalized=[&](int col){return Value(__fmul_rn(__fmul_rn(means[col],inverse),__fadd_rn(weight[col],1.f)));};
+    if(column>=width-pairs)return;
+    if(column>=pairs){output[block*width+column+pairs]=normalized(column+pairs);return;}
+    int axis=selected_axes[column];if(axis>=axes)axis=0;
+    const int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token)-cache[token]+start;
+    int position;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    position=wide_positions?__double2int_rz(double(raw)):int(raw);
+#else
+    position=int(raw);
+#endif
+    position=max(0,min(rotary_maximum-1,position));
+    const float angle=__fmul_rn(float(position),frequencies[column]);
+    const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+    const float first=float(normalized(column)),second=float(normalized(column+pairs));
+    output[block*width+column]=Value(__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine)));
+    output[block*width+column+pairs]=Value(__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine)));
+}
+
+void qsa_pool_rotary_cache_cuda(const mfq_tensor_backend::Tensor& index,const mfq_tensor_backend::Tensor& weight,
+        const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache,
+        const mfq_tensor_backend::Tensor& frequencies,const mfq_tensor_backend::Tensor& axes,
+        const mfq_tensor_backend::Tensor& output,int64_t pool,int64_t maximum,int64_t rotary_maximum,double eps) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(2)>0 && index.size(2)<=256 &&
+        (index.scalar_type()==tb::kFloat16 || index.scalar_type()==tb::kFloat32) && pool>0 && pool<=INT_MAX &&
+        maximum>0 && maximum<=index.size(1) && maximum<=INT_MAX && rotary_maximum>0 && rotary_maximum<=INT_MAX &&
+        std::isfinite(eps) && eps>=0,"invalid pooled rotary geometry");
+    MFQ_RUNTIME_CHECK(cache.device()==index.device() && cache.is_contiguous() && cache.dim()==1 &&
+        cache.numel()>0 && cache.numel()<=32 && cache.scalar_type()==tb::kInt64 &&
+        positions.device()==index.device() && positions.is_contiguous() && positions.dim()>=1 && positions.dim()<=3 &&
+        positions.size(-1)==cache.numel() && (positions.dim()<3 || positions.size(1)==1) &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64),"invalid pooled rotary positions");
+    MFQ_RUNTIME_CHECK(output.device()==index.device() && output.is_contiguous() && output.dim()==3 && output.size(0)==1 &&
+        output.size(1)>=(maximum+pool-1)/pool && output.size(2)==index.size(2) && output.scalar_type()==index.scalar_type() &&
+        weight.device()==index.device() && weight.is_contiguous() && weight.scalar_type()==tb::kFloat32 && weight.numel()==index.size(2) &&
+        frequencies.device()==index.device() && frequencies.is_contiguous() && frequencies.scalar_type()==tb::kFloat32 &&
+        frequencies.dim()==1 && frequencies.numel()>0 && frequencies.numel()<=index.size(2)/2 &&
+        axes.device()==index.device() && axes.is_contiguous() && axes.scalar_type()==tb::kInt32 && axes.sizes()==frequencies.sizes(),
+        "invalid pooled rotary storage");
+    MfqCudaGuard guard(index.device());const int width=int(index.size(2));
+    const int threads=width<=32?32:width<=64?64:width<=128?128:256;
+    const auto launch=[&](auto* source,auto* target) {
+        qsa_pool_rotary_cache_kernel<<<unsigned(cache.numel()),threads,0,mfq_current_cuda_stream()>>>(source,
+            weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==tb::kInt64,cache.data_ptr<int64_t>(),
+            frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),target,int(cache.numel()),width,int(pool),int(maximum),
+            int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),float(eps),index.stride(1),index.stride(2));
+    };
+    if(index.scalar_type()==tb::kFloat16)launch(reinterpret_cast<const __half*>(index.data_ptr()),reinterpret_cast<__half*>(output.data_ptr()));
+    else launch(index.data_ptr<float>(),output.data_ptr<float>());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template<class Value>
+__device__ __forceinline__ void rotary_normalized_row(
+    const Value* input, const float* weight, const void* positions, bool wide_positions,
+    const float* frequencies, const int32_t* selected_axes, Value* output,
+    int heads, int tokens, int width, int pairs, int axes, int batches, int maximum,
+    float eps, RotaryProjectionLayout layout, __half* key_cache,
+    const void* cache_positions, bool wide_cache_positions, int64_t capacity,
+    const void* projected_value, bool float_value, RotaryProjectionLayout value_layout,
+    __half* value_cache, int64_t row, int active_threads) {
+    const int64_t batch = row / (int64_t(heads) * tokens);
+    const int head = int((row / tokens) % heads), token = int(row % tokens);
+    const int64_t source = batch * layout.batch + token * layout.token + head * layout.head;
+    float sum = 0;
+    for (int column = threadIdx.x; column < width; column += active_threads) {
+        const float x = float(input[source + int64_t(column) * layout.column]);
+        sum = __fadd_rn(sum, __fmul_rn(x, x));
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = active_threads / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] = __fadd_rn(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float mean = __fdiv_rn(partial[0], float(width));
+    const float inverse = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(mean, eps)));
+    const auto normalized = [&](int column) {
+        const float scaled = __fmul_rn(float(input[source + int64_t(column) * layout.column]), inverse);
+        return Value(__fmul_rn(scaled, __fadd_rn(weight[column], 1.f)));
+    };
+    int64_t cache_base = -1;
+    if (key_cache) {
+        const auto slot = rotary_position(cache_positions, wide_cache_positions, token);
+        if (slot >= 0 && slot < capacity) cache_base = ((batch * heads + head) * capacity + slot) * width;
+    }
+    const auto store = [&](int column, Value value) {
+        if (output) output[row * width + column] = value;
+        if (cache_base >= 0) key_cache[cache_base + column] = __float2half_rn(float(value));
+    };
+    for (int column = threadIdx.x; column < width - pairs; column += active_threads) {
+        if (column >= pairs) {
+            store(column + pairs, normalized(column + pairs));
+            continue;
+        }
+        int axis = selected_axes[column];
+        if (axis >= axes) axis = 0;
+        const int64_t position_index = (int64_t(axis) * batches + (batches == 1 ? 0 : batch)) * tokens + token;
+        const int64_t raw_position = rotary_position(positions, wide_positions, position_index);
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        // Preserve native tensor conversion through double, including overflow.
+        int position = wide_positions ? __double2int_rz(double(raw_position)) : int(raw_position);
+#else
+        int position = static_cast<int32_t>(raw_position);
+#endif
+        position = max(0, min(maximum - 1, position));
+        const float angle = __fmul_rn(float(position), frequencies[column]);
+        const float cosine = float(::cos(double(angle))), sine = float(::sin(double(angle)));
+        const float first = float(normalized(column)), second = float(normalized(column + pairs));
+        store(column, Value(__fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))));
+        store(column + pairs, Value(__fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine))));
+    }
+    if (value_cache && cache_base >= 0) {
+        const int64_t value_base = batch * value_layout.batch + token * value_layout.token + head * value_layout.head;
+        for (int column = threadIdx.x; column < width; column += active_threads) {
+            const int64_t at = value_base + int64_t(column) * value_layout.column;
+            const float value = float_value ? static_cast<const float*>(projected_value)[at]
+                : float(static_cast<const __half*>(projected_value)[at]);
+            value_cache[cache_base + column] = __float2half_rn(value);
+        }
+    }
+}
+
+template<class Value>
+__global__ void rotary_normalized_cached_kernel(
+    const Value* input, const float* weight, const void* positions, bool wide_positions,
+    const float* frequencies, const int32_t* selected_axes, Value* output,
+    int heads, int tokens, int width, int pairs, int axes, int batches, int maximum,
+    float eps, RotaryProjectionLayout layout, __half* key_cache,
+    const void* cache_positions, bool wide_cache_positions, int64_t capacity,
+    const void* projected_value, bool float_value, RotaryProjectionLayout value_layout,
+    __half* value_cache) {
+    rotary_normalized_row<Value>(input,weight,positions,wide_positions,frequencies,selected_axes,output,
+        heads,tokens,width,pairs,axes,batches,maximum,eps,layout,key_cache,
+        cache_positions,wide_cache_positions,capacity,projected_value,float_value,value_layout,value_cache,blockIdx.x,blockDim.x);
+}
+
+struct RotaryNormalizedProjection {
+    const void* input;
+    const float* weight;
+    const void* positions;
+    const float* frequencies;
+    const int32_t* selected_axes;
+    void* output;
+    int heads,tokens,width,pairs,axes,batches,maximum,threads;
+    bool wide_positions;
+    float eps;
+    RotaryProjectionLayout layout;
+    __half* key_cache;
+    const void* cache_positions;
+    bool wide_cache_positions;
+    int64_t capacity;
+    const void* projected_value;
+    bool float_value;
+    RotaryProjectionLayout value_layout;
+    __half* value_cache;
+    int64_t rows;
+};
+struct RotaryNormalizedGroup { RotaryNormalizedProjection entries[3]; int count; };
+template<class Value>
+__global__ void rotary_normalized_grouped_kernel(RotaryNormalizedGroup group) {
+    int64_t row=blockIdx.x;int selected=0;
+    while(selected+1<group.count && row>=group.entries[selected].rows) {
+        row-=group.entries[selected].rows;++selected;
+    }
+    const auto& p=group.entries[selected];
+    rotary_normalized_row<Value>(static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
+        p.frequencies,p.selected_axes,static_cast<Value*>(p.output),p.heads,p.tokens,p.width,p.pairs,
+        p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
+        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache,row,p.threads);
+}
+template<class Value>
+void launch_rotary_normalized(const RotaryNormalizedProjection& p) {
+    rotary_normalized_cached_kernel<Value><<<unsigned(p.rows),p.threads,0,mfq_current_cuda_stream()>>>(
+        static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
+        p.frequencies,p.selected_axes,static_cast<Value*>(p.output),p.heads,p.tokens,p.width,p.pairs,
+        p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
+        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static std::pair<mfq_tensor_backend::Tensor,RotaryNormalizedProjection> prepare_rotary_normalized(
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight,
+    mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor frequencies,
+    mfq_tensor_backend::Tensor axes, int64_t maximum, double eps,
+    mfq_tensor_backend::Tensor key_cache, mfq_tensor_backend::Tensor cache_positions,
+    mfq_tensor_backend::Tensor projected_value, mfq_tensor_backend::Tensor value_cache) {
+    namespace tb = mfq_tensor_backend;
+    const auto half_or_float = [](const auto& x) { return x.scalar_type() == tb::kFloat16 || x.scalar_type() == tb::kFloat32; };
+    const auto integer = [](const auto& x) { return x.scalar_type() == tb::kInt32 || x.scalar_type() == tb::kInt64; };
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.dim() == 4 && half_or_float(input) &&
+        weight.is_cuda() && weight.device() == input.device() && weight.is_contiguous() &&
+        weight.scalar_type() == tb::kFloat32 && weight.dim() == 1 && weight.numel() == input.size(3),
+        "normalized rotary input/weight mismatch");
+    const auto batches = input.size(0), tokens = input.size(1), heads = input.size(2), width = input.size(3);
+    MFQ_RUNTIME_CHECK(batches > 0 && tokens > 0 && heads > 0 && width > 0 && width <= INT_MAX &&
+        tokens <= INT_MAX && heads <= INT_MAX && input.numel() / width <= INT_MAX &&
+        maximum > 0 && maximum <= INT_MAX && std::isfinite(eps) && eps >= 0,
+        "normalized rotary geometry/epsilon mismatch");
+    MFQ_RUNTIME_CHECK(positions.is_cuda() && positions.device() == input.device() && positions.is_contiguous() &&
+        integer(positions) && positions.dim() >= 1 && positions.dim() <= 3 && positions.size(-1) == tokens,
+        "normalized rotary positions mismatch");
+    const auto position_axes = positions.dim() == 1 ? 1 : positions.size(0);
+    const auto position_batches = positions.dim() < 3 ? 1 : positions.size(1);
+    MFQ_RUNTIME_CHECK(position_axes > 0 && position_axes <= INT_MAX && position_batches <= INT_MAX &&
+        (position_batches == 1 || position_batches == batches) && frequencies.is_cuda() && axes.is_cuda() &&
+        frequencies.device() == input.device() && axes.device() == input.device() &&
+        frequencies.is_contiguous() && axes.is_contiguous() && frequencies.scalar_type() == tb::kFloat32 &&
+        axes.scalar_type() == tb::kInt32 && frequencies.dim() == 1 && frequencies.sizes() == axes.sizes() &&
+        frequencies.numel() > 0 && frequencies.numel() <= width / 2,
+        "normalized rotary frequency/axis mismatch");
+    MFQ_RUNTIME_CHECK(key_cache.defined() == cache_positions.defined() &&
+        projected_value.defined() == value_cache.defined() && (!value_cache.defined() || key_cache.defined()),
+        "normalized rotary cache arguments must be complete");
+    int64_t capacity = 0;
+    if (key_cache.defined()) {
+        MFQ_RUNTIME_CHECK(key_cache.is_cuda() && key_cache.device() == input.device() && key_cache.is_contiguous() &&
+            key_cache.scalar_type() == tb::kFloat16 && key_cache.dim() == 4 && key_cache.size(0) == batches &&
+            key_cache.size(1) == heads && key_cache.size(2) > 0 && key_cache.size(3) == width &&
+            cache_positions.is_cuda() && cache_positions.device() == input.device() && cache_positions.is_contiguous() &&
+            integer(cache_positions) && cache_positions.dim() == 1 && cache_positions.numel() == tokens,
+            "normalized rotary key cache mismatch");
+        capacity = key_cache.size(2);
+    }
+    if (value_cache.defined()) {
+        MFQ_RUNTIME_CHECK(value_cache.is_cuda() && value_cache.device() == input.device() && value_cache.is_contiguous() &&
+            value_cache.scalar_type() == tb::kFloat16 && value_cache.sizes() == key_cache.sizes() &&
+            projected_value.is_cuda() && projected_value.device() == input.device() &&
+            half_or_float(projected_value) && projected_value.sizes() == input.sizes(), "normalized rotary value cache mismatch");
+    }
+    MfqCudaGuard guard(input.device());
+    auto output = key_cache.defined() ? tb::Tensor{} : tb::empty({batches, heads, tokens, width}, input.options());
+    const auto layout = [](const auto& x) { return RotaryProjectionLayout{x.stride(0), x.stride(1), x.stride(2), x.stride(3)}; };
+    const auto threads = width <= 32 ? 32 : width <= 64 ? 64 : width <= 128 ? 128 : 256;
+    RotaryNormalizedProjection projection{
+        input.data_ptr(),weight.data_ptr<float>(),positions.data_ptr(),frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),
+        output.defined()?output.data_ptr():nullptr,int(heads),int(tokens),int(width),int(frequencies.numel()),
+        int(position_axes),int(position_batches),int(maximum),int(threads),positions.scalar_type()==tb::kInt64,
+        float(eps),layout(input),key_cache.defined()?reinterpret_cast<__half*>(key_cache.data_ptr()):nullptr,
+        cache_positions.defined()?cache_positions.data_ptr():nullptr,
+        cache_positions.defined() && cache_positions.scalar_type()==tb::kInt64,capacity,
+        projected_value.defined()?projected_value.data_ptr():nullptr,
+        projected_value.defined() && projected_value.scalar_type()==tb::kFloat32,
+        projected_value.defined()?layout(projected_value):RotaryProjectionLayout{},
+        value_cache.defined()?reinterpret_cast<__half*>(value_cache.data_ptr()):nullptr,input.numel()/width};
+    return {output,projection};
+}
+
+mfq_tensor_backend::Tensor rotary_normalized_cached_cuda(
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight,
+    mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor frequencies,
+    mfq_tensor_backend::Tensor axes, int64_t maximum, double eps,
+    mfq_tensor_backend::Tensor key_cache, mfq_tensor_backend::Tensor cache_positions,
+    mfq_tensor_backend::Tensor projected_value, mfq_tensor_backend::Tensor value_cache) {
+
+    auto prepared=prepare_rotary_normalized(input,weight,positions,frequencies,axes,maximum,eps,
+        key_cache,cache_positions,projected_value,value_cache);
+    MfqCudaGuard guard(input.device());
+    if(input.scalar_type()==mfq_tensor_backend::kFloat32)launch_rotary_normalized<float>(prepared.second);
+    else launch_rotary_normalized<__half>(prepared.second);
+    return prepared.first;
+}
+
+std::vector<mfq_tensor_backend::Tensor> rotary_normalized_grouped_cuda(
+    const std::vector<mfq_tensor_backend::Tensor>& inputs,
+    const std::vector<mfq_tensor_backend::Tensor>& weights,
+    mfq_tensor_backend::Tensor positions,mfq_tensor_backend::Tensor frequencies,
+    mfq_tensor_backend::Tensor axes,int64_t maximum,double eps,int cache_entry,
+    mfq_tensor_backend::Tensor key_cache,mfq_tensor_backend::Tensor cache_positions,
+    mfq_tensor_backend::Tensor projected_value,mfq_tensor_backend::Tensor value_cache) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(!inputs.empty() && inputs.size()<=3 && weights.size()==inputs.size(),
+        "normalized rotary group must contain one to three input/weight pairs");
+    MFQ_RUNTIME_CHECK((cache_entry>=0 && cache_entry<int(inputs.size())) ||
+        (!key_cache.defined() && !cache_positions.defined() && !projected_value.defined() && !value_cache.defined()),
+        "normalized rotary cache entry is outside the group");
+    RotaryNormalizedGroup group{};group.count=int(inputs.size());
+    std::vector<tb::Tensor> outputs;outputs.reserve(inputs.size());
+    int64_t rows=0;int threads=32;bool uniform=true;
+    for(size_t i=0;i<inputs.size();++i) {
+        auto prepared=prepare_rotary_normalized(inputs[i],weights[i],positions,frequencies,axes,maximum,eps,
+            int(i)==cache_entry?key_cache:tb::Tensor{},int(i)==cache_entry?cache_positions:tb::Tensor{},
+            int(i)==cache_entry?projected_value:tb::Tensor{},int(i)==cache_entry?value_cache:tb::Tensor{});
+        MFQ_RUNTIME_CHECK(inputs[i].device()==inputs[0].device(),"normalized rotary group device mismatch");
+        uniform=uniform && inputs[i].scalar_type()==inputs[0].scalar_type();
+        group.entries[i]=prepared.second;outputs.push_back(std::move(prepared.first));
+        rows+=prepared.second.rows;threads=std::max(threads,prepared.second.threads);
+    }
+    MfqCudaGuard guard(inputs[0].device());
+    if(!uniform || rows>INT_MAX) {
+        for(size_t i=0;i<inputs.size();++i) {
+            if(inputs[i].scalar_type()==tb::kFloat32)launch_rotary_normalized<float>(group.entries[i]);
+            else launch_rotary_normalized<__half>(group.entries[i]);
+        }
+    } else {
+        if(inputs[0].scalar_type()==tb::kFloat32)
+            rotary_normalized_grouped_kernel<float><<<unsigned(rows),threads,0,mfq_current_cuda_stream()>>>(group);
+        else rotary_normalized_grouped_kernel<__half><<<unsigned(rows),threads,0,mfq_current_cuda_stream()>>>(group);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return outputs;
+}
+
+template<typename Value>
+__global__ void rotary_embedding_cached_kernel(
+    const Value* __restrict__ input,const int32_t* __restrict__ positions,
+    const float* __restrict__ frequencies,const int32_t* __restrict__ selected_axes,
+    Value* __restrict__ output,int64_t rows,int heads,int tokens,int width,int pairs,
+    int axes,int batches,int maximum) {
+    const int columns=width-pairs;
+    const int64_t total=rows*columns;
+    for(int64_t linear=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+        linear<total;linear+=int64_t(blockDim.x)*gridDim.x) {
+        const int64_t row=linear/columns;
+        const int column=int(linear-row*columns);
+        const size_t offset=size_t(row)*width;
+        if(column>=pairs) {
+            output[offset+column+pairs]=input[offset+column+pairs];
+            continue;
+        }
+        int axis=selected_axes[column];if(axis>=axes)axis=0;
+        const int batch=batches==1?0:int(row/(int64_t(heads)*tokens));
+        const int token=int(row%tokens);
+        int position=positions[(size_t(axis)*batches+batch)*tokens+token];
+        position=max(0,min(maximum-1,position));
+        const float angle=__fmul_rn(float(position),frequencies[column]);
+        // Match native tensor sin/cos promotion and every stored FP32 product.
+        const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+        const float first=float(input[offset+column]),second=float(input[offset+column+pairs]);
+        const float a=__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine));
+        const float b=__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine));
+        output[offset+column]=Value(a);output[offset+column+pairs]=Value(b);
+    }
+}
+
+mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
+    mfq_tensor_backend::Tensor input,mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor frequencies,mfq_tensor_backend::Tensor axes,int64_t maximum) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && positions.is_cuda() && frequencies.is_cuda() && axes.is_cuda() &&
+        input.device()==positions.device() && input.device()==frequencies.device() && input.device()==axes.device(),
+        "cached rotary tensors must share a CUDA device");
+    MFQ_RUNTIME_CHECK(input.is_contiguous() && positions.is_contiguous() && frequencies.is_contiguous() && axes.is_contiguous() &&
+        input.dim()==4 && positions.dim()>=1 && positions.dim()<=3 && frequencies.dim()==1 && axes.sizes()==frequencies.sizes() &&
+        positions.scalar_type()==tb::kInt32 && frequencies.scalar_type()==tb::kFloat32 && axes.scalar_type()==tb::kInt32 &&
+        (input.scalar_type()==tb::kFloat16 || input.scalar_type()==tb::kFloat32),"cached rotary layout/dtype mismatch");
+    const int64_t pairs=frequencies.numel();
+    const int64_t batches=positions.dim()<3?1:positions.size(1),position_axes=positions.dim()==1?1:positions.size(0);
+    MFQ_RUNTIME_CHECK(pairs>0 && pairs<=input.size(3)/2 && input.size(0)>0 && input.size(1)>0 && input.size(2)>0 &&
+        positions.size(-1)==input.size(2) && (batches==1 || batches==input.size(0)) && position_axes>0 && maximum>0 && maximum<=INT_MAX &&
+        input.size(1)<=INT_MAX && input.size(2)<=INT_MAX && input.size(3)<=INT_MAX &&
+        batches<=INT_MAX && position_axes<=INT_MAX,"cached rotary geometry mismatch");
+    auto output=tb::empty_like(input);
+    const int64_t rows=input.numel()/input.size(3),total=rows*(input.size(3)-pairs);
+    const auto blocks=static_cast<unsigned int>((total+127)/128);
+    auto launch=[&](auto tag) {
+        using Value=decltype(tag);
+        rotary_embedding_cached_kernel<Value><<<blocks,128,0,mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const Value*>(input.data_ptr()),positions.data_ptr<int32_t>(),frequencies.data_ptr<float>(),
+            axes.data_ptr<int32_t>(),reinterpret_cast<Value*>(output.data_ptr()),rows,int(input.size(1)),int(input.size(2)),
+            int(input.size(3)),int(pairs),int(position_axes),int(batches),int(maximum));
+    };
+    if(input.scalar_type()==tb::kFloat32)launch(float{});else launch(__half{});
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
+
+mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base, int64_t rotary_dim, mfq_tensor_backend::Tensor sections);
+mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                              int64_t rotary_dim, mfq_tensor_backend::Tensor sections);
+mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+                                   mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                                   int64_t rotary_dim);
+mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    int64_t rotary_dim);
+
+__device__ int rope_axis_for_pair(int j, int s0, int s1, int s2)
+{
+    if (s0 <= 0 && s1 <= 0 && s2 <= 0) {
+        return 0;
+    }
+    if (j < s0) {
+        return 0;
+    }
+    if (j < s0 + s1) {
+        return 1;
+    }
+    return 2;
+}
+
+__global__ void rope_kernel(const float* __restrict__ x, const float* __restrict__ pos,
+                            float* __restrict__ out, int MT, int T, int D, int rotary_dim,
+                            int pos_axes, int pos_batches,
+                            int s0, int s1, int s2, float base)
+{
+    int mt = blockIdx.x;
+    if (mt >= MT) {
+        return;
+    }
+    int m = mt / T;
+    int t = mt % T;
+    int half = rotary_dim / 2;
+    size_t base0 = ((size_t)m * T + t) * D;
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < D; i += ROPE_BD) {
+        out[base0 + i] = x[base0 + i];
+    }
+    __syncthreads();
+
+    for (int j = tid; j < half; j += ROPE_BD) {
+        float p;
+        if (pos_batches > 0) {
+            const int leading_rows = MT / T;
+            const int rows_per_batch = leading_rows / pos_batches;
+            const int batch = m / rows_per_batch;
+            p = pos[(size_t)batch * T + t];
+        } else {
+            int axis = rope_axis_for_pair(j, s0, s1, s2);
+            if (axis >= pos_axes) {
+                axis = 0;
+            }
+            p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
+        }
+        float freq = powf(base, -2.0f * (float)j / (float)rotary_dim);
+        float ang = p * freq;
+        float cs = cosf(ang);
+        float sn = sinf(ang);
+        float x0 = x[base0 + j];
+        float x1 = x[base0 + j + half];
+        out[base0 + j] = x0 * cs - x1 * sn;
+        out[base0 + j + half] = x1 * cs + x0 * sn;
+    }
+}
+
+__global__ void rope_table_kernel(const float* __restrict__ x, const int64_t* __restrict__ pos,
+                                  const float* __restrict__ cos, const float* __restrict__ sin,
+                                  float* __restrict__ out, int MT, int T, int D, int rotary_dim,
+                                  int table_len, int pos_axes, int pos_batches,
+                                  int s0, int s1, int s2)
+{
+    int mt = blockIdx.x;
+    if (mt >= MT) {
+        return;
+    }
+    int m = mt / T;
+    int t = mt % T;
+    int half = rotary_dim / 2;
+    size_t base0 = ((size_t)m * T + t) * D;
+    int tid = threadIdx.x;
+
+    for (int i = rotary_dim + tid; i < D; i += ROPE_BD) {
+        out[base0 + i] = x[base0 + i];
+    }
+
+    for (int j = tid; j < half; j += ROPE_BD) {
+        int64_t p;
+        if (pos_batches > 0) {
+            const int leading_rows = MT / T;
+            const int rows_per_batch = leading_rows / pos_batches;
+            const int batch = m / rows_per_batch;
+            p = pos[(size_t)batch * T + t];
+        } else {
+            int axis = rope_axis_for_pair(j, s0, s1, s2);
+            if (axis >= pos_axes) {
+                axis = 0;
+            }
+            p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
+        }
+        if (p < 0) {
+            p = 0;
+        }
+        if (p >= table_len) {
+            p = table_len - 1;
+        }
+        float cs = cos[(size_t)p * half + j];
+        float sn = sin[(size_t)p * half + j];
+        float x0 = x[base0 + j];
+        float x1 = x[base0 + j + half];
+        out[base0 + j] = x0 * cs - x1 * sn;
+        out[base0 + j + half] = x1 * cs + x0 * sn;
+    }
+}
+
+__global__ void rope_table_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const int64_t* __restrict__ pos,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    __nv_bfloat16* __restrict__ out,
+    int rows, int T, int D, int rotary_dim, int table_len)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int t = row % T;
+    const int half = rotary_dim / 2;
+    const size_t offset = (size_t)row * D;
+    int64_t p = pos[t];
+    p = p < 0 ? 0 : (p >= table_len ? table_len - 1 : p);
+
+    for (int i = rotary_dim + threadIdx.x; i < D; i += ROPE_BD) {
+        out[offset + i] = x[offset + i];
+    }
+
+    for (int j = threadIdx.x; j < half; j += ROPE_BD) {
+        const __nv_bfloat16 cs = __float2bfloat16_rn(
+            cos[(size_t)p * half + j]);
+        const __nv_bfloat16 sn = __float2bfloat16_rn(
+            sin[(size_t)p * half + j]);
+        const __nv_bfloat16 x0 = x[offset + j];
+        const __nv_bfloat16 x1 = x[offset + j + half];
+        const __nv_bfloat16 x0c = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(cs));
+        const __nv_bfloat16 x1s = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(sn));
+        const __nv_bfloat16 x1c = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(cs));
+        const __nv_bfloat16 x0s = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(sn));
+        out[offset + j] = __float2bfloat16_rn(
+            __bfloat162float(x0c) - __bfloat162float(x1s));
+        out[offset + j + half] = __float2bfloat16_rn(
+            __bfloat162float(x1c) + __bfloat162float(x0s));
+    }
+}
+
+__global__ void minicpm_bf16_rope_cache_write_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const int64_t* __restrict__ rope_pos,
+    const int64_t* __restrict__ write_pos,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    int Hq, int Hk, int D, int half, int table_len, int max_seq)
+{
+    const int row = blockIdx.x;
+    const int hq = row % Hq;
+    const int b = row / Hq;
+    const int tid = threadIdx.x;
+    int64_t p = rope_pos[0];
+    p = p < 0 ? 0 : (p >= table_len ? table_len - 1 : p);
+    const int64_t wp = write_pos[0];
+
+    const size_t q_offset = (size_t)row * D;
+    if (tid < half) {
+        const __nv_bfloat16 cs = __float2bfloat16_rn(
+            cos[(size_t)p * half + tid]);
+        const __nv_bfloat16 sn = __float2bfloat16_rn(
+            sin[(size_t)p * half + tid]);
+        const __nv_bfloat16 x0 = q[q_offset + tid];
+        const __nv_bfloat16 x1 = q[q_offset + tid + half];
+        const __nv_bfloat16 x0c = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(cs));
+        const __nv_bfloat16 x1s = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(sn));
+        const __nv_bfloat16 x1c = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(cs));
+        const __nv_bfloat16 x0s = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(sn));
+        q_out[q_offset + tid] = __float2bfloat16_rn(
+            __bfloat162float(x0c) - __bfloat162float(x1s));
+        q_out[q_offset + tid + half] = __float2bfloat16_rn(
+            __bfloat162float(x1c) + __bfloat162float(x0s));
+    }
+
+    if (hq < Hk && wp >= 0 && wp < max_seq) {
+        const size_t src = ((size_t)b * Hk + hq) * D;
+        const size_t dst = (((size_t)b * Hk + hq) * max_seq + wp) * D;
+        if (tid < half) {
+            const __nv_bfloat16 cs = __float2bfloat16_rn(
+                cos[(size_t)p * half + tid]);
+            const __nv_bfloat16 sn = __float2bfloat16_rn(
+                sin[(size_t)p * half + tid]);
+            const __nv_bfloat16 x0 = k[src + tid];
+            const __nv_bfloat16 x1 = k[src + tid + half];
+            const __nv_bfloat16 x0c = __float2bfloat16_rn(
+                __bfloat162float(x0) * __bfloat162float(cs));
+            const __nv_bfloat16 x1s = __float2bfloat16_rn(
+                __bfloat162float(x1) * __bfloat162float(sn));
+            const __nv_bfloat16 x1c = __float2bfloat16_rn(
+                __bfloat162float(x1) * __bfloat162float(cs));
+            const __nv_bfloat16 x0s = __float2bfloat16_rn(
+                __bfloat162float(x0) * __bfloat162float(sn));
+            k_cache[dst + tid] = __float2bfloat16_rn(
+                __bfloat162float(x0c) - __bfloat162float(x1s));
+            k_cache[dst + tid + half] = __float2bfloat16_rn(
+                __bfloat162float(x1c) + __bfloat162float(x0s));
+        }
+        if (tid < D) {
+            v_cache[dst + tid] = v[src + tid];
+        }
+    }
+}
+
+mfq_tensor_backend::Tensor rope_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base)
+{
+    return rope_ext_cuda(
+        x, pos, base, x.size(-1),
+        mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU)));
+}
+
+mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base, int64_t rotary_dim, mfq_tensor_backend::Tensor sections)
+{
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope: x must be cuda contiguous f32");
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope: pos must be cuda contiguous f32");
+    int T = (int)x.size(-2);
+    int D = (int)x.size(-1);
+    int RD = (int)rotary_dim;
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope: rotary_dim must be positive even and <= D");
+    MFQ_RUNTIME_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope: pos must be [T] or [A,T]");
+    int pos_axes = pos.dim() == 1 ? 1 : (int)pos.size(0);
+    MFQ_RUNTIME_CHECK(pos.size(-1) == T, "rope: pos last dim must match T");
+    int s0 = 0, s1 = 0, s2 = 0;
+    if (sections.numel() > 0) {
+        MFQ_RUNTIME_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == mfq_tensor_backend::kInt64,
+                    "rope: sections must be CPU contiguous int64");
+        MFQ_RUNTIME_CHECK(sections.numel() == 3, "rope: sections must have 3 entries");
+        const int64_t* sp = sections.data_ptr<int64_t>();
+        s0 = (int)sp[0];
+        s1 = (int)sp[1];
+        s2 = (int)sp[2];
+        MFQ_RUNTIME_CHECK(s0 + s1 + s2 == RD / 2, "rope: sections must sum to rotary_dim/2");
+    }
+    int MT = (int)(x.numel() / ((size_t)T * D));
+    const int pos_batches = sections.numel() == 0 && pos.dim() == 2
+        ? (int)pos.size(0) : 0;
+    MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
+                "rope: batch positions do not match x leading dimensions");
+    auto out = mfq_tensor_backend::empty_like(x);
+    rope_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
+        x.data_ptr<float>(), pos.data_ptr<float>(), out.data_ptr<float>(),
+        MT * T, T, D, RD, pos_axes, pos_batches, s0, s1, s2, (float)base);
+    return out;
+}
+
+mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                              int64_t rotary_dim, mfq_tensor_backend::Tensor sections)
+{
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope_table: x must be cuda contiguous f32");
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == mfq_tensor_backend::kInt64,
+                "rope_table: pos must be cuda contiguous int64");
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && cos.is_contiguous() && cos.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope_table: cos must be cuda contiguous f32");
+    MFQ_RUNTIME_CHECK(sin.is_cuda() && sin.is_contiguous() && sin.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope_table: sin must be cuda contiguous f32");
+    int T = (int)x.size(-2);
+    int D = (int)x.size(-1);
+    int RD = (int)rotary_dim;
+    int half = RD / 2;
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope_table: rotary_dim must be positive even and <= D");
+    MFQ_RUNTIME_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope_table: pos must be [T] or [A,T]");
+    int pos_axes = pos.dim() == 1 ? 1 : (int)pos.size(0);
+    MFQ_RUNTIME_CHECK(pos.size(-1) == T, "rope_table: pos last dim must match T");
+    MFQ_RUNTIME_CHECK(cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes(),
+                "rope_table: cos/sin must be [table_len, rotary_dim/2]");
+    MFQ_RUNTIME_CHECK(cos.size(1) == half, "rope_table: cos/sin width mismatch");
+    int table_len = (int)cos.size(0);
+    int s0 = 0, s1 = 0, s2 = 0;
+    if (sections.numel() > 0) {
+        MFQ_RUNTIME_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == mfq_tensor_backend::kInt64,
+                    "rope_table: sections must be CPU contiguous int64");
+        MFQ_RUNTIME_CHECK(sections.numel() == 3, "rope_table: sections must have 3 entries");
+        const int64_t* sp = sections.data_ptr<int64_t>();
+        s0 = (int)sp[0];
+        s1 = (int)sp[1];
+        s2 = (int)sp[2];
+        MFQ_RUNTIME_CHECK(s0 + s1 + s2 == half, "rope_table: sections must sum to rotary_dim/2");
+    }
+    int MT = (int)(x.numel() / ((size_t)T * D));
+    const int pos_batches = sections.numel() == 0 && pos.dim() == 2
+        ? (int)pos.size(0) : 0;
+    MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
+                "rope_table: batch positions do not match x leading dimensions");
+    auto out = mfq_tensor_backend::empty_like(x);
+    rope_table_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
+        x.data_ptr<float>(), pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
+        out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, pos_batches,
+        s0, s1, s2);
+    return out;
+}
+
+mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+                                   mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                                   int64_t rotary_dim)
+{
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                    x.scalar_type() == mfq_tensor_backend::kBFloat16,
+                "rope_table_bf16: x must be cuda contiguous bf16");
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() &&
+                    pos.scalar_type() == mfq_tensor_backend::kInt64 && pos.dim() == 1,
+                "rope_table_bf16: pos must be cuda contiguous int64 [T]");
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && cos.is_contiguous() &&
+                    cos.scalar_type() == mfq_tensor_backend::kFloat32,
+                "rope_table_bf16: cos must be cuda contiguous f32");
+    MFQ_RUNTIME_CHECK(sin.is_cuda() && sin.is_contiguous() &&
+                    sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                    cos.sizes() == sin.sizes(),
+                "rope_table_bf16: sin must match cos");
+    const int T = (int)x.size(-2);
+    const int D = (int)x.size(-1);
+    const int RD = (int)rotary_dim;
+    MFQ_RUNTIME_CHECK(pos.numel() == T,
+                "rope_table_bf16: position count must match T");
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0 &&
+                    cos.dim() == 2 && cos.size(1) == RD / 2,
+                "rope_table_bf16: invalid rotary geometry");
+    const int rows = (int)(x.numel() / D);
+    auto out = mfq_tensor_backend::empty_like(x);
+    rope_table_bf16_kernel<<<
+        rows, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            x.data_ptr<mfq_bfloat16>()),
+        pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(
+            out.data_ptr<mfq_bfloat16>()),
+        rows, T, D, RD, (int)cos.size(0));
+    return out;
+}
+
+mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    int64_t rotary_dim)
+{
+    const auto bf16 = mfq_tensor_backend::kBFloat16;
+    MFQ_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
+                    q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
+                    q.scalar_type() == bf16 && k.scalar_type() == bf16 &&
+                    v.scalar_type() == bf16,
+                "minicpm_rope_kv: q/k/v must be cuda contiguous bf16");
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && v_cache.is_cuda() &&
+                    k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                    k_cache.scalar_type() == bf16 && v_cache.scalar_type() == bf16,
+                "minicpm_rope_kv: caches must be cuda contiguous bf16");
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+                    k_cache.dim() == 4 && v_cache.dim() == 4,
+                "minicpm_rope_kv: tensors must be rank four");
+    MFQ_RUNTIME_CHECK(k.sizes() == v.sizes() && k_cache.sizes() == v_cache.sizes(),
+                "minicpm_rope_kv: k/v shapes must match");
+    MFQ_RUNTIME_CHECK(q.size(0) == k.size(0) && q.size(2) == 1 && k.size(2) == 1 &&
+                    q.size(1) == 32 && k.size(1) == 8 &&
+                    q.size(3) == 128 && k.size(3) == 128,
+                "minicpm_rope_kv: expected Bx32x1x128 Q and Bx8x1x128 K/V");
+    MFQ_RUNTIME_CHECK(k_cache.size(0) == k.size(0) &&
+                    k_cache.size(1) == k.size(1) &&
+                    k_cache.size(3) == k.size(3),
+                "minicpm_rope_kv: cache shape mismatch");
+    MFQ_RUNTIME_CHECK(rope_pos.is_cuda() && write_pos.is_cuda() &&
+                    rope_pos.is_contiguous() && write_pos.is_contiguous() &&
+                    rope_pos.scalar_type() == mfq_tensor_backend::kInt64 &&
+                    write_pos.scalar_type() == mfq_tensor_backend::kInt64 &&
+                    rope_pos.numel() == 1 && write_pos.numel() == 1,
+                "minicpm_rope_kv: positions must be cuda contiguous int64[1]");
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && sin.is_cuda() &&
+                    cos.is_contiguous() && sin.is_contiguous() &&
+                    cos.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                    sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                    cos.sizes() == sin.sizes() && cos.dim() == 2,
+                "minicpm_rope_kv: cos/sin must be matching cuda contiguous f32 tables");
+    MFQ_RUNTIME_CHECK(rotary_dim == 128 && cos.size(1) == 64,
+                "minicpm_rope_kv: expected rotary_dim 128");
+
+    auto q_out = mfq_tensor_backend::empty_like(q);
+    const int B = (int)q.size(0);
+    const int Hq = (int)q.size(1);
+    const int Hk = (int)k.size(1);
+    minicpm_bf16_rope_cache_write_kernel<<<
+        B * Hq, 128, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<mfq_bfloat16>()),
+        rope_pos.data_ptr<int64_t>(), write_pos.data_ptr<int64_t>(),
+        cos.data_ptr<float>(), sin.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_cache.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(v_cache.data_ptr<mfq_bfloat16>()),
+        Hq, Hk, 128, 64, (int)cos.size(0), (int)k_cache.size(2));
+    return q_out;
+}

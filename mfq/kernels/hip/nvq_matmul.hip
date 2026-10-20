@@ -3795,7 +3795,7 @@ void launch_aligned_group_row_tiled_m1(
         FORMAT, NWARPS, ROWS_PER_WARP, MULTI2,
         STAGE_E8_THREE_BANKS, ADD_RESIDUAL>)
         , dim3((total_rows + rows_per_block - 1) / rows_per_block),
-           dim3(dim3(32, NWARPS)), shared_bytes, stream, 
+           dim3(dim3(32, NWARPS)), shared_bytes, stream,
             first, second, qx, xscale, output, residual);
 }
 
@@ -3853,15 +3853,15 @@ void launch_aligned_group_m1(
     const int rows = aligned_group_rows_per_block(FORMAT);
     if (rows == 4) {
        hipLaunchKernelGGL(( aligned_group_gemv_m1_kernel<FORMAT, 4, 4, ADD_RESIDUAL>)
-            , dim3((weight.N + 3) / 4), dim3(dim3(32, 16)), 0, stream, 
+            , dim3((weight.N + 3) / 4), dim3(dim3(32, 16)), 0, stream,
                 weight, qx, xscale, output, residual);
     } else if (rows == 2) {
        hipLaunchKernelGGL(( aligned_group_gemv_m1_kernel<FORMAT, 4, 2, ADD_RESIDUAL>)
-            , dim3((weight.N + 1) / 2), dim3(dim3(32, 8)), 0, stream, 
+            , dim3((weight.N + 1) / 2), dim3(dim3(32, 8)), 0, stream,
                 weight, qx, xscale, output, residual);
     } else {
        hipLaunchKernelGGL(( aligned_group_gemv_m1_kernel<FORMAT, 4, 1, ADD_RESIDUAL>)
-            , dim3(weight.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(weight.N), dim3(dim3(32, 4)), 0, stream,
                 weight, qx, xscale, output, residual);
     }
 }
@@ -3912,15 +3912,15 @@ void launch_aligned_group_multi2_m1(
     const int rows = aligned_group_rows_per_block(FORMAT);
     if (rows == 4) {
        hipLaunchKernelGGL(( aligned_group_multi2_m1_kernel<FORMAT, 4, 4>)
-            , dim3((blocks + 3) / 4), dim3(dim3(32, 16)), 0, stream, 
+            , dim3((blocks + 3) / 4), dim3(dim3(32, 16)), 0, stream,
                 first, second, qx, xscale, output);
     } else if (rows == 2) {
        hipLaunchKernelGGL(( aligned_group_multi2_m1_kernel<FORMAT, 4, 2>)
-            , dim3((blocks + 1) / 2), dim3(dim3(32, 8)), 0, stream, 
+            , dim3((blocks + 1) / 2), dim3(dim3(32, 8)), 0, stream,
                 first, second, qx, xscale, output);
     } else {
        hipLaunchKernelGGL(( aligned_group_multi2_m1_kernel<FORMAT, 4, 1>)
-            , dim3(blocks), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(blocks), dim3(dim3(32, 4)), 0, stream,
                 first, second, qx, xscale, output);
     }
 }
@@ -3944,7 +3944,7 @@ void launch_m1_vec8_by_format(
     int sign_mode,
     hipStream_t stream) {
     if (format == kNvq2 && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3953,7 +3953,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq2Exec && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2Exec, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2Exec, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3962,7 +3962,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq2Jsc && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2Jsc, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2Jsc, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3971,7 +3971,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq2JscExec && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2JscExec, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq2JscExec, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3980,7 +3980,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq3 && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq3, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq3, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3989,7 +3989,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq3Jsc && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq3Jsc, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<kNvq3Jsc, NWARPS, true>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -3998,7 +3998,7 @@ void launch_m1_vec8_by_format(
         return;
     }
     if (format == kNvq3Jsc2 && sub_bits == 4) {
-       hipLaunchKernelGGL(( nvq3j2_gemv_m1_group_kernel<NWARPS>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq3j2_gemv_m1_group_kernel<NWARPS>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -4027,7 +4027,7 @@ void launch_m1_vec8_by_format(
     }
     launch_by_format(format, [&](auto tag) {
         constexpr int F = decltype(tag)::value;
-       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<F, NWARPS>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_m1_vec8_kernel<F, NWARPS>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -4057,7 +4057,7 @@ void launch_batch_vec8_by_format(
     hipStream_t stream) {
     launch_by_format(format, [&](auto tag) {
         constexpr int F = decltype(tag)::value;
-       hipLaunchKernelGGL(( nvq_gemv_batch_vec8_kernel<F, NWARPS, MAX_M>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream, 
+       hipLaunchKernelGGL(( nvq_gemv_batch_vec8_kernel<F, NWARPS, MAX_M>), dim3(N), dim3(dim3(32, NWARPS)), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -4228,7 +4228,7 @@ void launch_multi2_vec8(
     int M,
     hipStream_t stream) {
    hipLaunchKernelGGL(( nvq_gemv_multi2_vec8_kernel<FORMAT, NWARPS, MAX_M, FAST_NVQ2_S4>)
-        , dim3(first.N + second.N), dim3(dim3(32, NWARPS)), 0, stream, 
+        , dim3(first.N + second.N), dim3(dim3(32, NWARPS)), 0, stream,
             first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
             reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), M);
 }
@@ -4386,7 +4386,7 @@ mfq_tensor_backend::Tensor nepq_dequant_cuda(
     hipStream_t stream = mfq_current_cuda_stream();
     launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
-       hipLaunchKernelGGL(( nepq_dequant_kernel<F>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( nepq_dequant_kernel<F>), dim3(grid), dim3(block), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
@@ -4439,7 +4439,7 @@ mfq_tensor_backend::Tensor nepq_gemv_ws_cuda(
     const int table_stride = static_cast<int>(table_pool.size(1));
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
 
@@ -4525,7 +4525,7 @@ mfq_tensor_backend::Tensor nepq_mmq_ws_cuda(
     const int table_stride = static_cast<int>(table_pool.size(1));
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     const dim3 block(32, 8);
@@ -4711,7 +4711,7 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
     const int grouped_table_stride =
         static_cast<int>(grouped_table_pool.size(1));
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
 
@@ -5996,7 +5996,7 @@ static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
         active_plan.numel()==1+int64_t(pairs)*3,"NVQ active route plan geometry/device mismatch");
     const hipStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
-       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
@@ -6017,7 +6017,7 @@ static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
             constexpr int warps=decltype(warp_tag)::value;
             const int blocks=int(std::min<int64_t>(nvq_active_resident_blocks<warps>(),
                 ((out_per_expert-1)/2+1)*pairs));
-           hipLaunchKernelGGL(( nvq_moe_mmvq_hetero_kernel<warps,2,false,true>), dim3(blocks),dim3(dim3(32,warps)),0,stream, 
+           hipLaunchKernelGGL(( nvq_moe_mmvq_hetero_kernel<warps,2,false,true>), dim3(blocks),dim3(dim3(32,warps)),0,stream,
                 weight_ptrs.data_ptr<int64_t>(),weight_sizes.data_ptr<int64_t>(),pool_params.data_ptr<int32_t>(),
                 expert_pool.data_ptr<int32_t>(),expert_local.data_ptr<int32_t>(),qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(),ids.data_ptr<int32_t>(),reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
@@ -6200,7 +6200,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     const int nsign = (K + 7) / 8;
     hipStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
-       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
@@ -6469,7 +6469,7 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
         static_cast<int>(grouped_table_pool.size(1));
     hipStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
-       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(input_rows, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
@@ -6577,7 +6577,7 @@ mfq_tensor_backend::Tensor nvq_dequant_cuda(
     hipStream_t stream = mfq_current_cuda_stream();
     launch_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
-       hipLaunchKernelGGL(( nvq_dequant_kernel<F>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( nvq_dequant_kernel<F>), dim3(grid), dim3(block), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
@@ -6705,8 +6705,8 @@ void launch_nvq_backward_quad_small_m(
     const dim3 grid(
         static_cast<unsigned>((K + 127) / 128),
         static_cast<unsigned>((N + output_tile - 1) / output_tile));
-   hipLaunchKernelGGL(( nvq_backward_quad_partial_kernel<FORMAT, Rows>), 
-        dim3(grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_backward_quad_partial_kernel<FORMAT, Rows>),
+        dim3(grid), dim3(32), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
@@ -6841,8 +6841,8 @@ void launch_nvq_backward_vec8_small_m(
         static_cast<unsigned>((K + 255) / 256),
         static_cast<unsigned>((N + output_tile - 1) / output_tile),
         static_cast<unsigned>((M + Rows - 1) / Rows));
-   hipLaunchKernelGGL(( nvq_backward_vec8_partial_kernel<FORMAT, Rows>), 
-        dim3(grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_backward_vec8_partial_kernel<FORMAT, Rows>),
+        dim3(grid), dim3(32), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
@@ -6997,8 +6997,8 @@ void launch_nvq_backward_mma_m8(
         int sub_bits,
         int sign_mode,
         hipStream_t stream) {
-   hipLaunchKernelGGL(( nvq_backward_mma_m8_kernel<FORMAT>), 
-        dim3((K + 15) / 16), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( nvq_backward_mma_m8_kernel<FORMAT>),
+        dim3((K + 15) / 16), dim3(256), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
@@ -7158,8 +7158,8 @@ void launch_nepq_backward_mma_m8(
         int table_stride,
         int state_bits,
         hipStream_t stream) {
-   hipLaunchKernelGGL(( nepq_backward_mma_m8_kernel<FORMAT>), 
-        dim3((K + 15) / 16), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( nepq_backward_mma_m8_kernel<FORMAT>),
+        dim3((K + 15) / 16), dim3(256), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
             state_stream.data_ptr<uint8_t>(), state_stream.numel(),
@@ -7300,7 +7300,7 @@ void launch_nepq_backward_small_m(
         static_cast<unsigned>((K + 255) / 256),
         static_cast<unsigned>((N + output_tile - 1) / output_tile),
         static_cast<unsigned>((M + Rows - 1) / Rows));
-   hipLaunchKernelGGL(( nepq_backward_partial_kernel<FORMAT, Rows>), dim3(grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nepq_backward_partial_kernel<FORMAT, Rows>), dim3(grid), dim3(32), 0, stream,
         indices.data_ptr<uint8_t>(), indices.numel(),
         aux.data_ptr<uint8_t>(), aux.numel(),
         state_stream.data_ptr<uint8_t>(), state_stream.numel(),
@@ -7684,7 +7684,7 @@ mfq_tensor_backend::Tensor nvq_gemv_m1_vec8_ws_cuda(
     const int nsign = (K + 7) / 8;
     auto output = mfq_tensor_backend::empty({1, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     switch (static_cast<int>(nwarps)) {
@@ -7746,7 +7746,7 @@ mfq_tensor_backend::Tensor nvq_gemv_batch_vec8_ws_cuda(
     const int nsign = (K + 7) / 8;
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
 #define NVQ_LAUNCH_BATCH_VEC8(NW)                                                       \
@@ -7817,7 +7817,7 @@ mfq_tensor_backend::Tensor nvq_gemv_ws_cuda(
     const int nsign = (K + 7) / 8;
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     if (M == 1) {
@@ -8002,7 +8002,7 @@ mfq_tensor_backend::Tensor nvq_gemv_multi2_ws_cuda(
     auto output = mfq_tensor_backend::empty(
         {M, first.N + second.N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     launch_selected_multi2_vec8(
@@ -8059,45 +8059,45 @@ mfq_tensor_backend::Tensor nvq_gemv_swiglu_ws_cuda(
         static_cast<int>(up_format), static_cast<int>(up_sign_mode));
     auto output = mfq_tensor_backend::empty({1, gate.N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     if (gate_format == kNvq2JscXLGroupExec &&
         gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( aligned_group_swiglu_pair_kernel<kNvq2JscXLGroupExec, 4>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq3JscLGroupExec &&
                gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( aligned_group_swiglu_pair_kernel<kNvq3JscLGroupExec, 4>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2, 4, false, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2Exec && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2Exec, 4, false, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2Jsc && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2Jsc, 4, false, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2JscExec && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2JscExec, 4, false, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else {
         launch_by_format(static_cast<int>(gate_format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
-           hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<F, 4>), dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+           hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<F, 4>), dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
         });
@@ -8156,12 +8156,12 @@ mfq_tensor_backend::Tensor nvq2_gemv_swiglu_vec4_ordered_ws_cuda(
         K, static_cast<int>(gs), 4, kNvq2, static_cast<int>(up_sign_mode));
     auto output = mfq_tensor_backend::empty({1, gate.N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     const size_t shared_bytes = static_cast<size_t>(nsign) * sizeof(uint32_t);
    hipLaunchKernelGGL(( nvq2_gemv_swiglu_vec4_ordered_kernel<4>)
-        , dim3(gate.N), dim3(dim3(32, 4)), shared_bytes, stream, 
+        , dim3(gate.N), dim3(dim3(32, 4)), shared_bytes, stream,
             gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
             reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     MFQ_RUNTIME_CHECK(hipGetLastError() == hipSuccess,
@@ -8237,7 +8237,7 @@ void nvq_ffn_swiglu_quant_ws_cuda(
         K, static_cast<int>(gs), static_cast<int>(up_sub_bits),
         static_cast<int>(up_format), static_cast<int>(up_sign_mode));
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(1, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), input_qx.data_ptr<int8_t>(),
         input_xscale.data_ptr<float>(), 1, K, ng);
     bool aligned_independent_rows = false;
@@ -8258,35 +8258,35 @@ void nvq_ffn_swiglu_quant_ws_cuda(
         aligned_independent_rows = true;
     } else if (gate_format == kNvq2Exec && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2Exec, 4, true, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
     } else if (gate_format == kNvq2JscExec && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2JscExec, 4, true, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
     } else if (gate_format == kNvq2Jsc && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2Jsc, 4, true, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
     } else if (use_vec4 && gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4 &&
         gate.nsign % 4 == 0 && up.nsign % 4 == 0) {
         const size_t shared_bytes = static_cast<size_t>(gate.nsign) * sizeof(uint32_t);
        hipLaunchKernelGGL(( nvq2_gemv_swiglu_vec4_ordered_kernel<4, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), shared_bytes, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), shared_bytes, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
     } else if (gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4) {
        hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<kNvq2, 4, true, true>)
-            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+            , dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
     } else {
         launch_by_format(static_cast<int>(gate_format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
-           hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<F, 4, true>), dim3(gate.N), dim3(dim3(32, 4)), 0, stream, 
+           hipLaunchKernelGGL(( nvq_gemv_swiglu_pair_kernel<F, 4, true>), dim3(gate.N), dim3(dim3(32, 4)), 0, stream,
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
                 nullptr, swiglu_scratch.data_ptr<float>());
         });
@@ -8294,36 +8294,36 @@ void nvq_ffn_swiglu_quant_ws_cuda(
     switch (static_cast<int>(down_gs)) {
         case 24:
             if (aligned_independent_rows) {
-               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<24>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<24>), dim3(down_ng), dim3(32), 0, stream,
                     reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
                     output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
                     N, down_k_pad);
             } else {
-               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<24>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<24>), dim3(down_ng), dim3(32), 0, stream,
                     swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
                     output_xscale.data_ptr<float>(), N, down_k_pad);
             }
             break;
         case 28:
             if (aligned_independent_rows) {
-               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<28>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<28>), dim3(down_ng), dim3(32), 0, stream,
                     reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
                     output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
                     N, down_k_pad);
             } else {
-               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<28>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<28>), dim3(down_ng), dim3(32), 0, stream,
                     swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
                     output_xscale.data_ptr<float>(), N, down_k_pad);
             }
             break;
         case 32:
             if (aligned_independent_rows) {
-               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<32>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_swiglu_quantize_f16_pair_kernel<32>), dim3(down_ng), dim3(32), 0, stream,
                     reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
                     output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
                     N, down_k_pad);
             } else {
-               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<32>), dim3(down_ng), dim3(32), 0, stream, 
+               hipLaunchKernelGGL(( nvq_quantize_f32_kernel<32>), dim3(down_ng), dim3(32), 0, stream,
                     swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
                     output_xscale.data_ptr<float>(), N, down_k_pad);
             }
@@ -8372,12 +8372,12 @@ mfq_tensor_backend::Tensor nvq_gemv_gate_ws_cuda(
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
     if (mode == 1) {
-       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<1>), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<1>), dim3(dim3(M, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     } else {
-       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<2>), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<2>), dim3(dim3(M, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
@@ -8432,7 +8432,7 @@ mfq_tensor_backend::Tensor nvq_mmq_ws_cuda(
     const int nsign = (K + 7) / 8;
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nvq_quantize_x_gs24_kernel), dim3(dim3(M, ng)), dim3(32), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     const dim3 block(32, 8);
@@ -8508,12 +8508,12 @@ mfq_tensor_backend::Tensor nvq_mmq_gate_ws_cuda(
     auto output = mfq_tensor_backend::empty({M, N}, x.options());
     hipStream_t stream = mfq_current_cuda_stream();
     if (mode == 1) {
-       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<1>), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<1>), dim3(dim3(M, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     } else {
-       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<2>), dim3(dim3(M, ng)), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( nvq_quantize_x_gate_gs24_kernel<2>), dim3(dim3(M, ng)), dim3(32), 0, stream,
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
@@ -8583,7 +8583,7 @@ mfq_tensor_backend::Tensor nvq_embedding_lookup_cuda(
     hipStream_t stream = mfq_current_cuda_stream();
     launch_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
-       hipLaunchKernelGGL(( nvq_embedding_kernel<F>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( nvq_embedding_kernel<F>), dim3(grid), dim3(block), 0, stream,
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), token_ids.data_ptr<int64_t>(),

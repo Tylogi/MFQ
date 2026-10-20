@@ -1,13 +1,14 @@
 #pragma once
 #include "timing.h"
-#include "mfq_cuda_quant_ops.h"
-#include "storage/moe_quant_range_source.h"
-#include "mfq/model_source.h"
+#include "kernels/quant_ops.h"
+#include "storage/weights/moe/quant_range_source.h"
+#include "model_source.h"
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <type_traits>
+#include "storage/weights/loaders/quant.h"
 
 namespace tb=mfq_tensor_backend;
 namespace fb=format_bench;

@@ -82,7 +82,7 @@ mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_in
     MFQ_RUNTIME_CHECK(T > 0 && conv_input.size(1) == T + K - 1, "ssm_conv_silu: conv_input length must be K-1+T");
     auto out = mfq_tensor_backend::empty({B, T, C}, conv_input.options());
     dim3 blocks(B, (C + SSM_CONV_BD - 1) / SSM_CONV_BD);
-   hipLaunchKernelGGL(( ssm_conv_silu_kernel), dim3(blocks), dim3(SSM_CONV_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( ssm_conv_silu_kernel), dim3(blocks), dim3(SSM_CONV_BD), 0, mfq_current_cuda_stream(),
         conv_input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(),
         B, T, C, K, layout, has_bias);
     return out;
@@ -161,7 +161,7 @@ mfq_tensor_backend::Tensor ssm_conv_silu_decode_cuda(mfq_tensor_backend::Tensor 
     }
     auto out = mfq_tensor_backend::empty({B, 1, C}, x.options());
     dim3 blocks(B, (C + SSM_CONV_BD - 1) / SSM_CONV_BD);
-   hipLaunchKernelGGL(( ssm_conv_silu_decode_kernel), dim3(blocks), dim3(SSM_CONV_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( ssm_conv_silu_decode_kernel), dim3(blocks), dim3(SSM_CONV_BD), 0, mfq_current_cuda_stream(),
         state.data_ptr<float>(), x.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
         out.data_ptr<float>(), B, C, K, layout, has_bias);
     return out;
@@ -366,7 +366,7 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_decode_cuda(
     const dim3 grid(unsigned(2*nk+(nv*dv+255)/256+(nv+255)/256),unsigned(B));
     const auto launch=[&](auto tag) {
         using Gate=decltype(tag);
-       hipLaunchKernelGGL(( ssm_conv_qkv_gate_decode_kernel<Gate>), dim3(grid),dim3(256),0,mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( ssm_conv_qkv_gate_decode_kernel<Gate>), dim3(grid),dim3(256),0,mfq_current_cuda_stream(),
             state.data_ptr<float>(),reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
             reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()),weight.data_ptr<float>(),
             alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),
@@ -430,13 +430,13 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(
     auto k = mfq_tensor_backend::empty({B, (int)nk, 1, (int)dk}, opts);
     auto vo = mfq_tensor_backend::empty({B, (int)nv, 1, (int)dv}, opts);
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( ssm_conv_qk_norm_decode_kernel<256>), dim3(B * 2 * (int)nk), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( ssm_conv_qk_norm_decode_kernel<256>), dim3(B * 2 * (int)nk), dim3(256), 0, stream,
         state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
         reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), weight.data_ptr<float>(),
         bias.data_ptr<float>(), q.data_ptr<float>(), k.data_ptr<float>(), B, (int)nk, (int)nv,
         (int)dk, (int)dv, K, layout, has_bias, (float)eps);
     dim3 v_blocks(B, (vsz + SSM_CONV_BD - 1) / SSM_CONV_BD);
-   hipLaunchKernelGGL(( ssm_conv_v_decode_kernel), dim3(v_blocks), dim3(SSM_CONV_BD), 0, stream, 
+   hipLaunchKernelGGL(( ssm_conv_v_decode_kernel), dim3(v_blocks), dim3(SSM_CONV_BD), 0, stream,
         state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
         reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), weight.data_ptr<float>(),
         bias.data_ptr<float>(), vo.data_ptr<float>(), B, (int)nk, (int)nv, (int)dk, (int)dv,
@@ -613,16 +613,16 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_prefill_cuda(
     auto vo = mfq_tensor_backend::empty({B, (int)nv, T, (int)dv}, opts);
     auto new_state = mfq_tensor_backend::empty_like(state);
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( linear_conv_qk_norm_prefill_kernel<256>), dim3(B * T * 2 * (int)nk), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( linear_conv_qk_norm_prefill_kernel<256>), dim3(B * T * 2 * (int)nk), dim3(256), 0, stream,
         state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
         weight.data_ptr<float>(), bias.data_ptr<float>(), qo.data_ptr<float>(), ko.data_ptr<float>(),
         B, T, (int)nk, (int)dk, C, K, layout, has_bias, (float)eps);
-   hipLaunchKernelGGL(( linear_conv_v_prefill_kernel), dim3(dim3(B * T, (vsz + 255) / 256)), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( linear_conv_v_prefill_kernel), dim3(dim3(B * T, (vsz + 255) / 256)), dim3(256), 0, stream,
         state.data_ptr<float>(), reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()),
         weight.data_ptr<float>(), bias.data_ptr<float>(), vo.data_ptr<float>(),
         B, T, (int)nk, (int)nv, (int)dk, (int)dv, C, K, layout, has_bias);
     int state_total = B * (K - 1) * C;
-   hipLaunchKernelGGL(( linear_conv_state_prefill_kernel), dim3((state_total + 255) / 256), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( linear_conv_state_prefill_kernel), dim3((state_total + 255) / 256), dim3(256), 0, stream,
         state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
         reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), new_state.data_ptr<float>(),
         B, T, qkC, vsz, C, K);

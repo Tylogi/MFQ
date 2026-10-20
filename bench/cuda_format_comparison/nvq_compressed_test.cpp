@@ -1,7 +1,8 @@
-#include "vq.h"
+#include "ops/quant/vq.h"
 #include <array>
 #include <cstring>
 #include <iostream>
+#include "storage/weights/loaders/quant.h"
 
 namespace tb=mfq_tensor_backend;
 static void clear_flag(const char* name) {

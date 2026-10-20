@@ -209,7 +209,7 @@ def test_native_cuda_flash_mtp_graph_position_buffer(tmp_path, quantized_experts
 
 @pytest.mark.parametrize("ple_layer", [1, 3])
 def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path, ple_layer):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     fp8, nint = _models(tmp_path, ple_layer=ple_layer)
@@ -376,7 +376,7 @@ def test_native_flash_short_prefix_survives_worker_restart(tmp_path, mtp, toggle
 
 
 def test_native_qwen_ple_rejects_mixed_fp8_nint_shards(tmp_path):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     fp8, nint = _models(tmp_path)
@@ -433,7 +433,7 @@ def _mhc_models(tmp_path, *, adaptive, projections):
 @pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("projections", ["down", "all"])
 def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projections):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     reference, packed = _mhc_models(tmp_path, adaptive=adaptive, projections=projections)
@@ -485,7 +485,7 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes, d
     "model.block.0.attention.mhc.pre.norm.weight",
 ])
 def test_native_qwen_nint_mhc_does_not_relax_metadata_loading(tmp_path, name):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     reference, packed = _mhc_models(tmp_path, adaptive=True, projections="down")

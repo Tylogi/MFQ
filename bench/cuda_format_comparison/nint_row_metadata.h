@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq_tensor_backend.h"
+#include "native/tensor/backend.h"
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>

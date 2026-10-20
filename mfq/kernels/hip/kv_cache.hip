@@ -182,15 +182,15 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
             const int grid = static_cast<int>(
                 (rows + KV_WARPS_PER_BLOCK - 1) / KV_WARPS_PER_BLOCK);
             if (D % elements_per_vector == 0 && vector_aligned) {
-               hipLaunchKernelGGL(( kv_cache_write_rows_kernel<scalar_t, true>), 
-                    dim3(grid), dim3(KV_BLOCK_SIZE), 0, mfq_current_cuda_stream(), 
+               hipLaunchKernelGGL(( kv_cache_write_rows_kernel<scalar_t, true>),
+                    dim3(grid), dim3(KV_BLOCK_SIZE), 0, mfq_current_cuda_stream(),
                     k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
                     k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
                     positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
                     pos_dim);
             } else {
-               hipLaunchKernelGGL(( kv_cache_write_rows_kernel<scalar_t, false>), 
-                    dim3(grid), dim3(KV_BLOCK_SIZE), 0, mfq_current_cuda_stream(), 
+               hipLaunchKernelGGL(( kv_cache_write_rows_kernel<scalar_t, false>),
+                    dim3(grid), dim3(KV_BLOCK_SIZE), 0, mfq_current_cuda_stream(),
                     k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
                     k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
                     positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
@@ -201,8 +201,8 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
             const size_t elements = rows * D;
             const int grid = static_cast<int>(std::min<size_t>(
                 4096, (elements + block - 1) / block));
-           hipLaunchKernelGGL(( kv_cache_write_flat_kernel<scalar_t>), 
-                dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+           hipLaunchKernelGGL(( kv_cache_write_flat_kernel<scalar_t>),
+                dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
                     k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
                     k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
                     positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
@@ -285,7 +285,7 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_cuda(
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         k_cache.scalar_type(), "kv_cache_write_ring_cuda", [&] {
-       hipLaunchKernelGGL(( kv_cache_write_ring_kernel<scalar_t>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( kv_cache_write_ring_kernel<scalar_t>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
             k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
             position_start, B, H, T, D, capacity, source_start);
@@ -368,8 +368,8 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         k_cache.scalar_type(), "kv_cache_write_ring_positions_cuda", [&] {
-       hipLaunchKernelGGL(( kv_cache_write_ring_positions_kernel<scalar_t>), 
-            dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( kv_cache_write_ring_positions_kernel<scalar_t>),
+            dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
             k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
             positions.data_ptr<int64_t>(), B, H, T, D, capacity, source_start);

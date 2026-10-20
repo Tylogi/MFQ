@@ -231,7 +231,7 @@ mfq_tensor_backend::Tensor attention_flash256_cuda(mfq_tensor_backend::Tensor q,
     constexpr int shmem = 96 * 1024;
     hipFuncSetAttribute(reinterpret_cast<const void*>(attention_flash256_f16_kernel),
                          hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
-   hipLaunchKernelGGL(( attention_flash256_f16_kernel), dim3(grid), dim3(512), shmem, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( attention_flash256_f16_kernel), dim3(grid), dim3(512), shmem, mfq_current_cuda_stream(),
         reinterpret_cast<const half*>(q.data_ptr<mfq_half>()),
         reinterpret_cast<const half*>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const half*>(v.data_ptr<mfq_half>()),

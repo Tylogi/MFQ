@@ -1,0 +1,1753 @@
+#include "models/deepseek_v4/mlx_deepseek_v4_attention.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_attention.h"
+#include "ops/mlx_csa2.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_sparse_attention.h"
+#include "ops/mlx_mx.h"
+#include "runtime/mlx_transformer.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace {
+
+using mfq::metal::DeepseekV4Config;
+using mfq::metal::MlxDeepseekV4Attention;
+using mfq::metal::MlxDeepseekV4AttentionComponents;
+using mfq::metal::MlxDeepseekV4LayerState;
+using mfq::metal::MlxDeepseekV4PoolState;
+using mfq::metal::MlxLinear;
+using mfq::metal::deepseek_v4_image_visibility;
+using mlx::core::Shape;
+using mlx::core::array;
+
+void require(
+    bool condition,
+    const std::string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+template <typename Function>
+void require_invalid(
+    Function&& function,
+    const std::string& message) {
+    bool rejected = false;
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, message);
+}
+
+array float_array(
+    const std::vector<float>& values,
+    Shape shape) {
+    return array(values.begin(), std::move(shape));
+}
+
+std::vector<float> evaluated_float(array value) {
+    if (value.dtype() != mlx::core::float32) {
+        value = mlx::core::astype(
+            value,
+            mlx::core::float32);
+    }
+    value = mlx::core::contiguous(value);
+    value.eval();
+    return {
+        value.data<float>(),
+        value.data<float>() + value.size(),
+    };
+}
+
+std::vector<std::int32_t> evaluated_int(array value) {
+    if (value.dtype() != mlx::core::int32) {
+        value = mlx::core::astype(
+            value,
+            mlx::core::int32);
+    }
+    value.eval();
+    return {
+        value.data<std::int32_t>(),
+        value.data<std::int32_t>() + value.size(),
+    };
+}
+
+void require_close(
+    const std::vector<float>& actual,
+    const std::vector<float>& expected,
+    float tolerance,
+    const std::string& label) {
+    require(
+        actual.size() == expected.size(),
+        label + " size mismatch");
+    for (std::size_t index = 0;
+         index < actual.size();
+         ++index) {
+        if (actual[index] == expected[index]) {
+            continue;
+        }
+        if (!std::isfinite(actual[index]) ||
+            !std::isfinite(expected[index]) ||
+            std::fabs(actual[index] - expected[index]) >
+                tolerance) {
+            throw std::runtime_error(
+                label + " mismatch at " +
+                std::to_string(index) +
+                ": actual=" +
+                std::to_string(actual[index]) +
+                " expected=" +
+                std::to_string(expected[index]));
+        }
+    }
+}
+
+void test_image_visibility_starts_at_image_start() {
+    constexpr std::int64_t vocab = 100;
+    auto visibility = deepseek_v4_image_visibility(
+        {
+            7,
+            vocab + 1,
+            vocab + 1,
+            vocab + 0,
+            vocab + 2,
+            vocab + 3,
+            vocab + 1,
+            vocab + 4,
+            8,
+            vocab + 0,
+            vocab + 4,
+        },
+        vocab,
+        384);
+    require(
+        evaluated_int(visibility.left) ==
+            std::vector<std::int32_t>{0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 1},
+        "image visibility included pre-start alignment padding");
+    require(
+        evaluated_int(visibility.right) ==
+            std::vector<std::int32_t>{0, 0, 0, 4, 3, 2, 1, 0, 0, 1, 0},
+        "image visibility right distances mismatch");
+    require_invalid(
+        [&] {
+            (void)deepseek_v4_image_visibility(
+                {vocab, 3}, vocab, 384);
+        },
+        "unterminated image visibility span was accepted");
+}
+
+array token_slice(
+    const array& input,
+    int begin,
+    int end) {
+    return mlx::core::slice(
+        input,
+        Shape{0, begin, 0},
+        Shape{
+            input.shape(0),
+            end,
+            input.shape(2),
+        });
+}
+
+DeepseekV4Config test_config() {
+    DeepseekV4Config config;
+    config.n_layers = 3;
+    config.hidden = 4;
+    config.n_experts = 1;
+    config.top_k = 1;
+    config.moe_inter = 4;
+    config.n_shared = 1;
+    config.n_heads = 64;
+    config.head_dim = 512;
+    config.q_lora_rank = 1;
+    config.o_lora_rank = 1;
+    config.o_groups = 64;
+    config.kv_dim = 512;
+    config.qk_rope_head_dim = 64;
+    config.n_kv_heads = 1;
+    config.vocab = 8;
+    config.rms_eps = 1e-6;
+    config.scoring_func = "sqrtsoftplus";
+    config.norm_topk_prob = true;
+    config.routed_scaling = 1.0;
+    config.swiglu_limit = 0.0;
+    config.n_hash_layers = 0;
+    config.sliding_window = 4;
+    config.rope_theta = 10'000.0;
+    config.index_n_heads = 64;
+    config.index_head_dim = 128;
+    config.index_topk = 512;
+    config.max_position_embeddings = 256;
+    config.hc_mult = 4;
+    config.hc_eps = 1e-6;
+    config.hc_sinkhorn_iters = 20;
+    config.compress_rope_theta = 160'000.0;
+    config.compress_ratios = {0, 4, 128};
+    config.validate();
+    return config;
+}
+
+array dense_weight(
+    int rows,
+    int columns,
+    const std::vector<std::pair<int, float>>& entries = {}) {
+    std::vector<float> values(
+        static_cast<std::size_t>(rows) * columns,
+        0.0f);
+    for (const auto& [index, value] : entries) {
+        values.at(index) = value;
+    }
+    return float_array(
+        values,
+        Shape{rows, columns});
+}
+
+MlxDeepseekV4AttentionComponents components(
+    const DeepseekV4Config& config,
+    int ratio) {
+    const int hidden =
+        static_cast<int>(config.hidden);
+    const int heads =
+        static_cast<int>(config.n_heads);
+    const int head_dim =
+        static_cast<int>(config.head_dim);
+    const int attention = heads * head_dim;
+    const int groups =
+        static_cast<int>(config.o_groups);
+    const int rank =
+        static_cast<int>(config.o_lora_rank);
+    const int group_width = attention / groups;
+
+    auto kv_weight = dense_weight(
+        head_dim,
+        hidden,
+        {{0, 1.0f}});
+    std::vector<std::pair<int, float>> wo_a_entries;
+    for (int group = 0; group < groups; ++group) {
+        wo_a_entries.emplace_back(
+            group * group_width,
+            1.0f);
+    }
+    MlxDeepseekV4AttentionComponents result{
+        MlxLinear(dense_weight(1, hidden)),
+        MlxLinear(std::move(kv_weight)),
+        MlxLinear(dense_weight(attention, 1)),
+        MlxLinear(
+            dense_weight(
+                groups * rank,
+                group_width,
+                wo_a_entries)),
+        MlxLinear(
+            dense_weight(
+                hidden,
+                groups * rank,
+                {{0, 1.0f}})),
+        mlx::core::ones(
+            Shape{1},
+            mlx::core::float32),
+        mlx::core::ones(
+            Shape{head_dim},
+            mlx::core::float32),
+        mlx::core::zeros(
+            Shape{heads},
+            mlx::core::float32),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+    };
+    if (ratio != 0) {
+        const int width =
+            head_dim * (ratio == 4 ? 2 : 1);
+        std::vector<std::pair<int, float>> entries;
+        entries.reserve(width);
+        for (int row = 0; row < width; ++row) {
+            entries.emplace_back(
+                row * hidden,
+                0.5f);
+        }
+        result.main_kv.emplace(
+            dense_weight(
+                width,
+                hidden,
+                entries));
+        result.main_gate.emplace(
+            dense_weight(width, hidden));
+        result.main_ape = mlx::core::zeros(
+            Shape{ratio, width},
+            mlx::core::float32);
+        result.main_norm = mlx::core::ones(
+            Shape{head_dim},
+            mlx::core::float32);
+    }
+    if (ratio == 4) {
+        const int index_heads =
+            static_cast<int>(config.index_n_heads);
+        const int index_dim =
+            static_cast<int>(config.index_head_dim);
+        const int index_width =
+            index_heads * index_dim;
+        const int compressor_width = 2 * index_dim;
+        std::vector<std::pair<int, float>> entries;
+        entries.reserve(compressor_width);
+        for (int row = 0;
+             row < compressor_width;
+             ++row) {
+            entries.emplace_back(
+                row * hidden,
+                0.5f);
+        }
+        result.index_q_b.emplace(
+            dense_weight(index_width, 1));
+        result.index_kv.emplace(
+            dense_weight(
+                compressor_width,
+                hidden,
+                entries));
+        result.index_gate.emplace(
+            dense_weight(
+                compressor_width,
+                hidden));
+        result.index_weights.emplace(
+            dense_weight(index_heads, hidden));
+        result.index_ape = mlx::core::zeros(
+            Shape{4, compressor_width},
+            mlx::core::float32);
+        result.index_norm = mlx::core::ones(
+            Shape{index_dim},
+            mlx::core::float32);
+    }
+    return result;
+}
+
+MlxDeepseekV4Attention attention(
+    const DeepseekV4Config& config,
+    int layer,
+    int ratio,
+    int max_context) {
+    auto base =
+        mfq::metal::mlx_yarn_tables(
+            static_cast<int>(
+                config.qk_rope_head_dim),
+            max_context,
+            static_cast<float>(config.rope_theta));
+    auto compressed =
+        mfq::metal::mlx_yarn_tables(
+            static_cast<int>(
+                config.qk_rope_head_dim),
+            max_context,
+            static_cast<float>(
+                config.compress_rope_theta));
+    return MlxDeepseekV4Attention(
+        config,
+        layer,
+        ratio,
+        max_context,
+        components(config, ratio),
+        std::move(base),
+        std::move(compressed));
+}
+
+array input_tokens(
+    const std::vector<float>& first_feature);
+
+void test_attention_copy_move_lifetime_stress() {
+    const auto config = test_config();
+    constexpr int iterations = 128;
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration) {
+        const int schedule = iteration % 3;
+        const int layer =
+            schedule == 0 ? 0 : schedule == 1 ? 1 : 2;
+        const int ratio =
+            schedule == 0 ? 0 : schedule == 1 ? 4 : 128;
+        const int max_context =
+            ratio == 0 ? 4 : ratio == 4 ? 8 : 128;
+
+        auto operation = attention(
+            config,
+            layer,
+            ratio,
+            max_context);
+
+        // Reallocation moves the public wrapper while all projection-batch
+        // pointers must continue to target the address-stable shared Impl.
+        std::vector<MlxDeepseekV4Attention> owners;
+        owners.push_back(operation);
+        owners.push_back(std::move(operation));
+        auto survivor = std::move(owners.back());
+        owners.clear();
+        require(
+            survivor.layer() == layer &&
+                survivor.ratio() == ratio &&
+                survivor.max_context() == max_context,
+            "attention copy/move lifetime metadata mismatch");
+
+        // Periodically execute after every other wrapper has been destroyed.
+        // The four sampled iterations cover ratio 0, 4, and 128.
+        if (iteration % 32 == 0) {
+            auto state =
+                MlxDeepseekV4LayerState::allocate(
+                    config,
+                    ratio,
+                    1,
+                    max_context);
+            auto output = survivor(
+                input_tokens({0.25f}),
+                state,
+                0);
+            output.eval();
+            require(
+                output.shape() == Shape{1, 1, 4},
+                "attention copy/move lifetime output mismatch");
+        }
+    }
+}
+
+array input_tokens(
+    const std::vector<float>& first_feature) {
+    std::vector<float> values(
+        first_feature.size() * 4,
+        0.0f);
+    for (std::size_t token = 0;
+         token < first_feature.size();
+         ++token) {
+        values[token * 4] = first_feature[token];
+    }
+    return float_array(
+        values,
+        Shape{
+            1,
+            static_cast<int>(first_feature.size()),
+            4,
+        });
+}
+
+void materialize_state(const MlxDeepseekV4LayerState& state) {
+    std::vector<array> values{state.local_state()};
+    const auto append_pool = [&](const MlxDeepseekV4PoolState& pool) {
+        values.push_back(pool.pool());
+        values.push_back(pool.state_kv());
+        values.push_back(pool.state_gate());
+        if (pool.prev_kv()) values.push_back(*pool.prev_kv());
+        if (pool.prev_gate()) values.push_back(*pool.prev_gate());
+        if (pool.pool_prefix_backup()) {
+            values.push_back(*pool.pool_prefix_backup());
+        }
+    };
+    if (state.main()) append_pool(*state.main());
+    if (state.indexer()) append_pool(*state.indexer());
+    for (auto value : values) value.eval();
+}
+
+void require_pool_state_close(
+    const MlxDeepseekV4PoolState& actual,
+    const MlxDeepseekV4PoolState& expected,
+    const std::string& label) {
+    require(
+        actual.pool_len() == expected.pool_len() &&
+            actual.remainder() == expected.remainder(),
+        label + " metadata mismatch");
+    require_close(
+        evaluated_float(actual.state_kv()),
+        evaluated_float(expected.state_kv()),
+        2e-4f,
+        label + " KV tail");
+    require_close(
+        evaluated_float(actual.state_gate()),
+        evaluated_float(expected.state_gate()),
+        2e-4f,
+        label + " gate tail");
+    if (actual.pool_len() > 0) {
+        const auto live = [](const MlxDeepseekV4PoolState& pool) {
+            return mlx::core::slice(
+                pool.pool(),
+                Shape{0, 0, 0},
+                Shape{
+                    pool.batch(),
+                    pool.pool_len(),
+                    pool.head_dim(),
+                });
+        };
+        require_close(
+            evaluated_float(live(actual)),
+            evaluated_float(live(expected)),
+            2e-4f,
+            label + " live pool");
+    }
+    require(
+        static_cast<bool>(actual.prev_kv()) ==
+                static_cast<bool>(expected.prev_kv()) &&
+            static_cast<bool>(actual.prev_gate()) ==
+                static_cast<bool>(expected.prev_gate()),
+        label + " overlap state mismatch");
+    if (actual.prev_kv()) {
+        require_close(
+            evaluated_float(*actual.prev_kv()),
+            evaluated_float(*expected.prev_kv()),
+            2e-4f,
+            label + " previous KV");
+        require_close(
+            evaluated_float(*actual.prev_gate()),
+            evaluated_float(*expected.prev_gate()),
+            2e-4f,
+            label + " previous gate");
+    }
+}
+
+void require_layer_state_close(
+    const MlxDeepseekV4LayerState& actual,
+    const MlxDeepseekV4LayerState& expected,
+    const std::string& label) {
+    require(actual.position() == expected.position(), label + " position");
+    require_close(
+        evaluated_float(actual.local_state()),
+        evaluated_float(expected.local_state()),
+        2e-4f,
+        label + " local ring");
+    require(
+        static_cast<bool>(actual.main()) ==
+                static_cast<bool>(expected.main()) &&
+            static_cast<bool>(actual.indexer()) ==
+                static_cast<bool>(expected.indexer()),
+        label + " topology mismatch");
+    if (actual.main()) {
+        require_pool_state_close(
+            *actual.main(), *expected.main(), label + " main");
+    }
+    if (actual.indexer()) {
+        require_pool_state_close(
+            *actual.indexer(), *expected.indexer(), label + " indexer");
+    }
+}
+
+void test_speculative_cache_transaction() {
+    const auto config = test_config();
+    for (const auto [layer, ratio, context] : {
+             std::array<int, 3>{1, 4, 16},
+             std::array<int, 3>{2, 128, 128},
+         }) {
+        auto expected_operation = attention(config, layer, ratio, context);
+        auto actual_operation = attention(config, layer, ratio, context);
+        auto reference_operation = attention(config, layer, ratio, context);
+        auto expected = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        auto actual = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        auto reference = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        const std::vector<float> prefix = ratio == 4
+            ? std::vector<float>{
+                  0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f}
+            : std::vector<float>{0.2f, 0.4f};
+        const int start = static_cast<int>(prefix.size());
+        expected_operation(input_tokens(prefix), expected, 0).eval();
+        actual_operation(input_tokens(prefix), actual, 0).eval();
+        reference_operation(input_tokens(prefix), reference, 0).eval();
+        materialize_state(expected);
+        materialize_state(actual);
+        materialize_state(reference);
+
+        actual.begin_speculative(1, 3);
+        const auto& checkpoint = actual.speculative_checkpoint();
+        require(
+            checkpoint.local_state().shape(1) == 3,
+            "speculative checkpoint copied the full local ring");
+        if (checkpoint.main()) {
+            require(
+                !checkpoint.main()->pool_prefix_backup(),
+                "speculative checkpoint copied the main pool prefix");
+        }
+        if (checkpoint.indexer()) {
+            require(
+                !checkpoint.indexer()->pool_prefix_backup(),
+                "speculative checkpoint copied the indexer pool prefix");
+        }
+        materialize_state(checkpoint);
+        auto speculative_output = actual_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
+        auto reference_output = reference_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), reference, start);
+        const auto speculative_values = evaluated_float(speculative_output);
+        require_close(
+            speculative_values,
+            evaluated_float(reference_output),
+            3e-4f,
+            "speculative direct sparse-attention output");
+        materialize_state(actual);
+        actual.restart_speculative_attempt();
+        materialize_state(actual);
+        auto retried_output = actual_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
+        require_close(
+            evaluated_float(retried_output),
+            speculative_values,
+            3e-4f,
+            "restarted speculative attention output");
+        materialize_state(actual);
+        actual_operation.rollback_speculative(actual, 1);
+        materialize_state(actual);
+
+        expected_operation(
+            input_tokens({0.7f, 0.8f}), expected, start).eval();
+        materialize_state(expected);
+        require_layer_state_close(
+            actual,
+            expected,
+            "speculative compressed-cache rollback");
+
+        auto expected_next = expected_operation(
+            input_tokens({1.0f}), expected, start + 2);
+        auto actual_next = actual_operation(
+            input_tokens({1.0f}), actual, start + 2);
+        require_close(
+            evaluated_float(actual_next),
+            evaluated_float(expected_next),
+            3e-4f,
+            "post-rollback attention output");
+    }
+}
+
+float normalized_kv(
+    float value,
+    float eps) {
+    const float normalized = value /
+        std::sqrt(
+            value * value / 512.0f + eps);
+    const float raw_scale =
+        std::max(std::fabs(normalized), 1.0e-4f) /
+        448.0f;
+    const float scale = std::exp2(
+        std::ceil(std::log2(raw_scale)));
+    const float magnitude = std::fabs(normalized / scale);
+    float quantized = 0.0f;
+    if (magnitude < std::exp2(-6.0f)) {
+        quantized = std::rint(magnitude * 512.0f) / 512.0f;
+    } else {
+        const float exponent = std::floor(std::log2(magnitude));
+        const float step = std::exp2(exponent - 3.0f);
+        quantized = std::min(
+            std::rint(magnitude / step) * step,
+            448.0f);
+    }
+    return std::copysign(quantized * scale, normalized);
+}
+
+std::vector<float> local_attention_reference(
+    const std::vector<float>& inputs,
+    int window,
+    float eps) {
+    std::vector<float> result(inputs.size() * 4, 0.0f);
+    std::vector<float> normalized(inputs.size());
+    for (std::size_t token = 0;
+         token < inputs.size();
+         ++token) {
+        normalized[token] = normalized_kv(
+            inputs[token],
+            eps);
+    }
+    for (std::size_t token = 0;
+         token < inputs.size();
+         ++token) {
+        const std::size_t begin =
+            token + 1 >
+                    static_cast<std::size_t>(window)
+            ? token + 1 - window
+            : 0;
+        float sum = 0.0f;
+        for (std::size_t item = begin;
+             item <= token;
+             ++item) {
+            sum += normalized[item];
+        }
+        result[token * 4] =
+            sum /
+            static_cast<float>(token - begin + 2);
+    }
+    return result;
+}
+
+void test_yarn_rope_and_rms() {
+    auto tables =
+        mfq::metal::mlx_yarn_tables(
+            4,
+            3,
+            100.0f);
+    const auto cosine = evaluated_float(tables.first);
+    const auto sine = evaluated_float(tables.second);
+    const std::vector<float> frequencies{1.0f, 0.1f};
+    for (int position = 0; position < 3; ++position) {
+        for (int pair = 0; pair < 2; ++pair) {
+            const float angle =
+                position * frequencies[pair];
+            require(
+                std::fabs(
+                    cosine[position * 2 + pair] -
+                    std::cos(angle)) < 1e-6f,
+                "Yarn cosine mismatch");
+            require(
+                std::fabs(
+                    sine[position * 2 + pair] -
+                    std::sin(angle)) < 1e-6f,
+                "Yarn sine mismatch");
+        }
+    }
+
+    const auto value = float_array(
+        {1.0f, 2.0f, 3.0f, 4.0f},
+        Shape{1, 4});
+    const float angle0 = 0.3f;
+    const float angle1 = -0.2f;
+    const auto cos_pair = float_array(
+        {std::cos(angle0), std::cos(angle1)},
+        Shape{1, 2});
+    const auto sin_pair = float_array(
+        {std::sin(angle0), std::sin(angle1)},
+        Shape{1, 2});
+    const auto rotated =
+        mfq::metal::mlx_rope_adjacent(
+            value,
+            cos_pair,
+            sin_pair);
+    const auto restored =
+        mfq::metal::mlx_rope_adjacent(
+            rotated,
+            cos_pair,
+            sin_pair,
+            true);
+    require_close(
+        evaluated_float(restored),
+        {1.0f, 2.0f, 3.0f, 4.0f},
+        2e-6f,
+        "adjacent inverse RoPE");
+
+    const auto rms =
+        mfq::metal::deepseek_v4_unweighted_rms(
+            float_array(
+                {3.0f, 4.0f},
+                Shape{1, 2}),
+            1e-6f);
+    const float inverse =
+        1.0f /
+        std::sqrt(12.5f + 1e-6f);
+    require_close(
+        evaluated_float(rms),
+        {3.0f * inverse, 4.0f * inverse},
+        1e-6f,
+        "unweighted RMS");
+
+    mfq::metal::MlxYarnScaling scaled;
+    scaled.enabled = true;
+    scaled.factor = 2.0;
+    scaled.beta_fast = 32.0;
+    scaled.beta_slow = 1.0;
+    scaled.original_max_position_embeddings = 64;
+    auto scaled_tables =
+        mfq::metal::mlx_yarn_tables(
+            64,
+            4,
+            10'000.0f,
+            scaled);
+    require(
+        scaled_tables.first.shape() ==
+            Shape{4, 32},
+        "scaled Yarn table shape mismatch");
+}
+
+void test_v41_fused_window_kv_matches_composition() {
+    constexpr int batch = 2;
+    constexpr int tokens = 3;
+    constexpr int width = 512;
+    constexpr int rotary = 64;
+    std::vector<float> input_values(batch * tokens * width);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] =
+            std::sin(static_cast<float>(index) * 0.013f) * 1.7f +
+            std::cos(static_cast<float>(index) * 0.003f) * 0.2f;
+    }
+    std::vector<float> norm_values(width);
+    for (int index = 0; index < width; ++index) {
+        norm_values[index] = 0.75f + static_cast<float>(index % 19) * 0.025f;
+    }
+    std::vector<float> cosine_values(tokens * rotary / 2);
+    std::vector<float> sine_values(tokens * rotary / 2);
+    for (int token = 0; token < tokens; ++token) {
+        for (int pair = 0; pair < rotary / 2; ++pair) {
+            const float angle =
+                static_cast<float>((token + 1) * (pair + 1)) * 0.002f;
+            const auto index = token * rotary / 2 + pair;
+            cosine_values[index] = std::cos(angle);
+            sine_values[index] = std::sin(angle);
+        }
+    }
+    const auto input = mlx::core::astype(
+        float_array(
+            input_values,
+            Shape{batch, tokens, width}),
+        mlx::core::float16);
+    const auto norm = float_array(norm_values, Shape{width});
+    const auto cosine = float_array(
+        cosine_values,
+        Shape{tokens, rotary / 2});
+    const auto sine = float_array(
+        sine_values,
+        Shape{tokens, rotary / 2});
+
+    ::setenv("MFQ_METAL_FUSED_KV_PREP", "0", 1);
+    const auto reference = evaluated_float(
+        mfq::metal::mlx_weighted_rms_rope_mxfp8_sim(
+            input, norm, 1.0e-6f, rotary, cosine, sine));
+    ::setenv("MFQ_METAL_FUSED_KV_PREP", "1", 1);
+    const auto fused = evaluated_float(
+        mfq::metal::mlx_weighted_rms_rope_mxfp8_sim(
+            input, norm, 1.0e-6f, rotary, cosine, sine));
+    ::unsetenv("MFQ_METAL_FUSED_KV_PREP");
+    require_close(
+        fused,
+        reference,
+        0.03125f,
+        "V4.1 fused window KV preparation");
+}
+
+void test_v41_ced_encoder_source_and_replay() {
+    using namespace mfq::metal;
+    DeepseekV41Config config;
+    config.vocab = 8;
+    config.hidden = 4;
+    config.n_layers = 4;
+    config.causal_encoder_layers = 2;
+    config.n_heads = 64;
+    config.n_kv_heads = 1;
+    config.head_dim = 512;
+    config.rope_head_dim = 64;
+    config.q_lora_rank = 1;
+    config.o_lora_rank = 1;
+    config.o_groups = 64;
+    config.moe_inter = 4;
+    config.n_experts = 2;
+    config.n_shared = 1;
+    config.top_k = 1;
+    config.rms_eps = 1e-6;
+    config.sliding_window = 4;
+    config.max_position_embeddings = 64;
+    config.compress_ratios = {0, 2, 1, 1};
+    config.kv_source_layers = {1, 2};
+    config.index_source_layers = {1, 2, 3};
+    config.index_n_heads = 32;
+    config.index_head_dim = 128;
+    config.index_topk = 4;
+    config.candidate_source_layer = 2;
+    config.candidate_topk_blocks = 4;
+    config.candidate_block_size = 2;
+    config.hc_mult = 4;
+    config.hc_sinkhorn_iters = 20;
+    config.validate();
+    const auto linear = [](int output, int input, float salt) {
+        std::vector<float> values(output * input);
+        for (std::size_t index = 0; index < values.size(); ++index)
+            values[index] = std::sin(index * 0.017f + salt) * 0.1f;
+        return MlxLinear(mlx::core::astype(float_array(values, {output, input}), mlx::core::float16));
+    };
+    const auto make_attention = [&]() {
+        MlxDeepseekV41AttentionComponents c{
+            linear(1, 4, 1), linear(64 * 512, 1, 2), linear(512, 4, 3),
+            linear(64, 512, 4), linear(4, 64, 5),
+            mlx::core::ones({1}), mlx::core::ones({512}), mlx::core::zeros({64}),
+            linear(512, 4, 6), std::nullopt, mlx::core::ones({512}),
+            linear(32 * 128, 1, 7), linear(128, 512, 8),
+            mlx::core::ones({128}), linear(32, 4, 9),
+        };
+        auto rope = mlx_yarn_tables(64, 64, 10000.0f);
+        return MlxDeepseekV41Attention(config, 2, 64, std::move(c), rope, rope);
+    };
+    for (const int batch : {1, 2}) for (const int prefix : {0, 3}) {
+        auto full = make_attention(), replay = make_attention();
+        auto full_state = MlxDeepseekV41AttentionState::allocate(config, 2, batch, 64);
+        auto replay_state = MlxDeepseekV41AttentionState::allocate(config, 2, batch, 64);
+        MlxDeepseekV41SharedAttentionState full_shared, replay_shared;
+        const auto input = [&](int count, int start) {
+            std::vector<float> values(batch * count * 4);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = std::sin(index * 0.13f + start) * 0.2f;
+            return mlx::core::astype(float_array(values, {batch, count, 4}), mlx::core::float16);
+        };
+        if (prefix) {
+            auto x = input(prefix, 0);
+            full.forward(x, full_state, full_shared, 0).eval();
+            replay.forward(x, replay_state, replay_shared, 0).eval();
+        }
+        const int count = 17;
+        auto source = input(count, prefix);
+        auto expected = full.forward(source, full_state, full_shared, prefix);
+        expected.eval();
+        auto actual = replay.forward(token_slice(source, count - 4, count),
+            replay_state, replay_shared, prefix + count - 4, true, &source);
+        actual.eval();
+        require(replay_state.position == prefix + count &&
+                replay_state.compressed_length == prefix + count,
+            "CED replay failed to advance the full encoder KV pool");
+        require_close(evaluated_float(*replay_state.compressed_kv),
+            evaluated_float(*full_state.compressed_kv), 0, "CED global KV");
+        require_close(evaluated_float(*replay_state.index_k),
+            evaluated_float(*full_state.index_k), 0, "CED global Indexer cache");
+        require_close(evaluated_float(token_slice(actual, 3, 4)),
+            evaluated_float(token_slice(expected, count - 1, count)), 0.002f,
+            "CED last query with complete local window");
+        auto next = input(1, prefix + count);
+        require_close(evaluated_float(replay.forward(next, replay_state, replay_shared, prefix + count)),
+            evaluated_float(full.forward(next, full_state, full_shared, prefix + count)), 0.002f,
+            "CED subsequent decode cache continuity");
+        require_invalid([&] {
+            (void)replay.forward(next, replay_state, replay_shared, replay_state.position, true);
+        }, "CED accepted an incomplete replay window");
+    }
+}
+
+void test_v41_attention_snapshot_is_detached() {
+    using mfq::metal::MlxDeepseekV41AttentionState;
+    MlxDeepseekV41AttentionState state;
+    state.local_kv = mlx::core::ones(
+        Shape{1, 8, 16}, mlx::core::float16);
+    state.compressed_kv = mlx::core::ones(
+        Shape{1, 4, 16}, mlx::core::float16);
+    state.index_k = mlx::core::ones(
+        Shape{1, 4, 8}, mlx::core::float16);
+    state.partial_kv = mlx::core::zeros(
+        Shape{1, 2, 16}, mlx::core::float32);
+    state.partial_score = mlx::core::zeros(
+        Shape{1, 2, 16}, mlx::core::float32);
+    state.position = 7;
+    state.compressed_length = 3;
+    state.partial_length = 1;
+
+    auto snapshot = state.snapshot();
+    state.local_kv.eval();
+    snapshot.local_kv.eval();
+    require(
+        snapshot.local_kv.buffer().ptr() != state.local_kv.buffer().ptr(),
+        "DeepSeek-V4.1 attention snapshot aliases live local cache");
+    const std::size_t expected_bytes =
+        snapshot.local_kv.nbytes() + snapshot.compressed_kv->nbytes()
+        + snapshot.index_k->nbytes() + snapshot.partial_kv->nbytes()
+        + snapshot.partial_score->nbytes();
+    require(snapshot.nbytes() == expected_bytes,
+            "DeepSeek-V4.1 attention snapshot byte count mismatch");
+
+    MlxDeepseekV41AttentionState restored;
+    restored.local_kv = mlx::core::zeros(
+        state.local_kv.shape(), state.local_kv.dtype());
+    restored.compressed_kv = mlx::core::zeros(
+        state.compressed_kv->shape(), state.compressed_kv->dtype());
+    restored.index_k = mlx::core::zeros(
+        state.index_k->shape(), state.index_k->dtype());
+    restored.partial_kv = mlx::core::zeros(
+        state.partial_kv->shape(), state.partial_kv->dtype());
+    restored.partial_score = mlx::core::zeros(
+        state.partial_score->shape(), state.partial_score->dtype());
+    restored.restore_snapshot(std::move(snapshot));
+    require(
+        restored.position == 7 && restored.compressed_length == 3
+            && restored.partial_length == 1 && !restored.speculation,
+        "DeepSeek-V4.1 attention snapshot metadata was not restored");
+
+    restored.local_kv.eval();
+    restored.compressed_kv->eval();
+    restored.index_k->eval();
+    restored.partial_kv->eval();
+    restored.partial_score->eval();
+    const auto* local_storage = restored.local_kv.buffer().ptr();
+    const auto* compressed_storage = restored.compressed_kv->buffer().ptr();
+    const auto* index_storage = restored.index_k->buffer().ptr();
+    const auto* partial_storage = restored.partial_kv->buffer().ptr();
+    const auto* score_storage = restored.partial_score->buffer().ptr();
+    restored.reset();
+    require(
+        restored.position == 0 && restored.compressed_length == 0
+            && restored.partial_length == 0 && !restored.speculation,
+        "DeepSeek-V4.1 logical attention reset retained live metadata");
+    require(
+        local_storage == restored.local_kv.buffer().ptr()
+            && compressed_storage == restored.compressed_kv->buffer().ptr()
+            && index_storage == restored.index_k->buffer().ptr()
+            && partial_storage == restored.partial_kv->buffer().ptr()
+            && score_storage == restored.partial_score->buffer().ptr(),
+        "DeepSeek-V4.1 logical attention reset reallocated cache storage");
+}
+
+void test_csa2_packed_execution() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    const auto values = [](Shape shape) {
+        std::size_t count = 1;
+        for (int size : shape) count *= size;
+        return contiguous(astype(reshape(sin(arange(int(count), float32) * 0.017f) * 0.2f, shape), float16));
+    };
+    for (const auto [bits, group, e4] : {
+            std::tuple{8, 32, false}, std::tuple{4, 32, false}, std::tuple{4, 16, true}}) {
+        auto input = values({2, 17, 512});
+        auto packed = mlx_csa2_pack(input, bits, group, e4);
+        auto decoded = mlx_csa2_unpack(packed, bits, group, e4);
+        auto expected = bits == 8 ? mlx_mxfp8_sim(input)
+            : e4 ? mlx_mxfp4_e4m3_scale_sim(input) : mlx_mxfp4_sim(input);
+        require_close(evaluated_float(decoded), evaluated_float(expected), 0,
+            "CSA2 packed activation round trip");
+    }
+    for (int rows : {1, 2, 6, 128, 256}) {
+        constexpr int position = 4096, window = 128, pool_size = 4096;
+        auto query = values({1, rows, 64, 512});
+        auto local = values({1, rows == 1 ? window : window + rows, 512});
+        auto pooled = values({1, pool_size, 512});
+        auto local_packed = mlx_csa2_pack(local, 8, 32);
+        auto pooled_packed = mlx_csa2_pack(pooled, 4, 16, true);
+        auto local_dense = mlx_mxfp8_sim(local);
+        auto pooled_dense = mlx_mxfp4_e4m3_scale_sim(pooled);
+        auto indices = broadcast_to(reshape(remainder(arange(512, int32) * 7,
+            array(pool_size, int32)), {1, 1, 512}), {1, rows, 512});
+        indices = where(remainder(indices, array(17, int32)) == array(0, int32),
+            array(-1, int32), indices);
+        auto sinks = zeros({64}, float32);
+        auto expected = rows == 1
+            ? mlx_sparse_circular_mla_decode_attention(transpose(query, {0, 2, 1, 3}),
+                  local_dense, pooled_dense, pool_size, indices, sinks, position + 1, 1, window)
+            : mlx_sparse_circular_mla_attention(transpose(query, {0, 2, 1, 3}),
+                  local_dense, pooled_dense, pool_size, indices, sinks, position, 1, window);
+        auto actual = mlx_csa2_attention(query, local_packed, pooled_packed,
+            pool_size, indices, sinks, position, 1, window);
+        require_close(evaluated_float(actual), evaluated_float(expected),
+            0.0002f, "CSA2 packed attention/unpacked reference M=" + std::to_string(rows));
+    }
+    for (int rows : {9, 128, 256}) for (int position : {0, 4096}) {
+        auto query = values({1, rows, 64, 512});
+        auto local = values({1, position == 0 ? rows : 128 + rows, 512});
+        auto indices = zeros({1, rows, 0}, int32);
+        auto sinks = sin(arange(64, float32));
+        auto expected = mlx_sparse_circular_mla_attention(transpose(query, {0, 2, 1, 3}),
+            mlx_mxfp8_sim(local), std::nullopt, 0, indices, sinks, position, 1, 128);
+        auto actual = mlx_csa2_attention(query, mlx_csa2_pack(local,8,32), std::nullopt,
+            0, indices, sinks, position, 1, 128);
+        require_close(evaluated_float(actual), evaluated_float(expected), 0.0002f,
+            "CSA2 local-only prefill M=" + std::to_string(rows));
+    }
+    for (int rows : {1, 2, 6}) {
+        auto query = mlx_mxfp4_sim(values({1, rows, 32, 128}));
+        auto keys = values({1, 4096, 128});
+        auto weights = reshape(sin(arange(rows * 32, float32) * 0.13f), {1, rows, 32});
+        auto actual = mlx_csa2_index_scores(query, mlx_csa2_pack(keys, 4, 32), weights, 4096, 1);
+        auto expected = rows == 1
+            ? mlx_dsa_indexer_scores_decode(query, mlx_mxfp4_sim(keys), weights, 4096, 1, 4096)
+            : mlx_dsa_indexer_scores(query, mlx_mxfp4_sim(keys), weights, 4096, 1);
+        require_close(evaluated_float(actual), evaluated_float(expected), 0.0002f,
+            "CSA2 packed Indexer/unpacked reference");
+        auto candidates = broadcast_to(reshape(arange(257, int32) * 7, {1, 1, 257}), {1, rows, 257});
+        candidates = where(remainder(candidates, array(11, int32)) == array(0, int32), array(-1, int32), candidates);
+        auto filtered = mlx_csa2_index_scores(query, mlx_csa2_pack(keys, 4, 32), weights, 4096, 1, candidates);
+        auto reference = take_along_axis(expected, maximum(candidates, array(0, int32)), -1);
+        reference = where(candidates >= array(0, int32), reference,
+            array(-std::numeric_limits<float>::infinity(), float32));
+        require_close(evaluated_float(filtered), evaluated_float(reference), 0.0002f,
+            "CSA2 candidate-only Indexer/unpacked reference");
+    }
+    for (int rows : {1, 2, 9}) for (int width : {17, 512, 1025, 4096, 4103}) {
+        const int count = std::min(width, 512);
+        for (bool explicit_ids : {false, true}) {
+            std::vector<float> scores(2 * rows * width);
+            std::vector<std::int32_t> ids(scores.size());
+            std::vector<std::int32_t> expected;
+            for (int row = 0; row < 2 * rows; ++row) {
+                std::vector<int> order(width);
+                std::iota(order.begin(), order.end(), 0);
+                const int offset = row * width;
+                for (int column = 0; column < width; ++column) {
+                    scores[offset + column] = row == 0 || column % 23 == 0
+                        ? -std::numeric_limits<float>::infinity()
+                        : float((column * 71 + row * 13) % 997);
+                    ids[offset + column] = explicit_ids ? width - column - 1 : column;
+                }
+                std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int a, int b) {
+                    return scores[offset + a] != scores[offset + b]
+                        ? scores[offset + a] > scores[offset + b] : ids[offset + a] < ids[offset + b];
+                });
+                std::vector<std::int32_t> selected;
+                for (int index = 0; index < count; ++index) {
+                    const int column = order[index];
+                    selected.push_back(std::isfinite(scores[offset + column]) ? ids[offset + column] : -1);
+                }
+                std::sort(selected.begin(), selected.end());
+                expected.insert(expected.end(), selected.begin(), selected.end());
+            }
+            auto actual = mlx_csa2_topk(array(scores.begin(), Shape{2, rows, width}), count,
+                explicit_ids ? std::optional<array>{array(ids.begin(), Shape{2, rows, width})} : std::nullopt);
+            require(evaluated_int(contiguous(actual)) == expected,
+                "CSA2 top-k CPU oracle mismatch M=" + std::to_string(rows) + " N=" + std::to_string(width));
+        }
+    }
+}
+
+void test_pool_and_ratio_schedule() {
+    const auto config = test_config();
+    auto zero = MlxDeepseekV4LayerState::allocate(
+        config,
+        0,
+        1,
+        8);
+    auto four = MlxDeepseekV4LayerState::allocate(
+        config,
+        4,
+        1,
+        8);
+    auto one_twenty_eight =
+        MlxDeepseekV4LayerState::allocate(
+            config,
+            128,
+            1,
+            128);
+    require(
+        !zero.main().has_value() &&
+            !zero.indexer().has_value(),
+        "ratio-zero state allocated compressors");
+    require(
+        four.main().has_value() &&
+            four.indexer().has_value() &&
+            four.main()->overlap() &&
+            four.indexer()->overlap(),
+        "ratio-four state schedule mismatch");
+    require(
+        one_twenty_eight.main().has_value() &&
+            !one_twenty_eight.indexer().has_value() &&
+            !one_twenty_eight.main()->overlap(),
+        "ratio-128 state schedule mismatch");
+
+    auto pool = MlxDeepseekV4PoolState::allocate(
+        4,
+        128,
+        true,
+        1,
+        8);
+    auto tables =
+        mfq::metal::mlx_yarn_tables(
+            64,
+            8,
+            160'000.0f);
+    const auto token = mlx::core::astype(
+        float_array(
+            std::vector<float>(256, 0.5f),
+            Shape{1, 1, 256}),
+        mlx::core::float16);
+    const auto gate = mlx::core::zeros(
+        Shape{1, 1, 256},
+        mlx::core::float16);
+    const auto ape = mlx::core::zeros(
+        Shape{4, 256},
+        mlx::core::float32);
+    const auto norm = mlx::core::ones(
+        Shape{128},
+        mlx::core::float32);
+    const auto pool_cosine = mlx::core::contiguous(
+        mlx::core::slice(
+            tables.first,
+            Shape{0, 0},
+            tables.first.shape(),
+            Shape{4, 1}));
+    const auto pool_sine = mlx::core::contiguous(
+        mlx::core::slice(
+            tables.second,
+            Shape{0, 0},
+            tables.second.shape(),
+            Shape{4, 1}));
+    for (int length = 1; length <= 4; ++length) {
+        pool.update(
+            token,
+            gate,
+            ape,
+            norm,
+            length,
+            pool_cosine,
+            pool_sine,
+            0,
+            1e-6f);
+    }
+    require(
+        pool.pool_len() == 1 &&
+            pool.remainder() == 0 &&
+            pool.prev_kv().has_value(),
+        "pool boundary state mismatch");
+    require_invalid(
+        [&] {
+            pool.update(
+                token,
+                gate,
+                ape,
+                norm,
+                6,
+                pool_cosine,
+                pool_sine,
+                0,
+                1e-6f);
+        },
+        "non-contiguous pool update was accepted");
+}
+
+void test_local_attention_cpu_reference() {
+    const auto config = test_config();
+    auto operation = attention(
+        config,
+        0,
+        0,
+        40);
+    auto state = MlxDeepseekV4LayerState::allocate(
+        config,
+        0,
+        1,
+        40);
+    const std::vector<float> values{
+        0.25f,
+        -0.5f,
+    };
+    auto first = operation(
+        input_tokens(values),
+        state,
+        0);
+    auto decoded = operation(
+        input_tokens({0.75f}),
+        state,
+        2);
+    auto expected =
+        local_attention_reference(
+            {0.25f, -0.5f, 0.75f},
+            4,
+            static_cast<float>(config.rms_eps));
+    auto actual = evaluated_float(
+        mlx::core::concatenate(
+            {first, decoded},
+            1));
+    require_close(
+        actual,
+        expected,
+        3e-2f,
+        "prefill/decode CPU reference");
+    require(
+        state.position() == 3,
+        "decode cache position did not advance");
+    const auto positions =
+        evaluated_int(state.local_positions());
+    require(
+        positions[0] == 0 &&
+            positions[1] == 1 &&
+            positions[2] == 2,
+        "local cache positions mismatch");
+
+    require_invalid(
+        [&] {
+            (void)operation(
+                input_tokens({1.0f}),
+                state,
+                2);
+        },
+        "non-contiguous attention position was accepted");
+}
+
+void test_prefill_mma_cpu_reference() {
+    const auto config = test_config();
+    auto operation = attention(
+        config,
+        0,
+        0,
+        32);
+    auto state = MlxDeepseekV4LayerState::allocate(
+        config,
+        0,
+        1,
+        32);
+    std::vector<float> values(32);
+    for (int token = 0; token < 32; ++token) {
+        values[token] =
+            (token & 1) == 0
+            ? 0.25f + token * 0.01f
+            : -0.25f - token * 0.01f;
+    }
+    auto actual = operation(
+        input_tokens(values),
+        state,
+        0);
+    const auto expected =
+        local_attention_reference(
+            values,
+            4,
+            static_cast<float>(config.rms_eps));
+    require_close(
+        evaluated_float(actual),
+        expected,
+        4e-2f,
+        "prefill-MMA CPU reference");
+}
+
+void test_ratio_four_continuity() {
+    const auto config = test_config();
+    auto chunked = attention(
+        config,
+        1,
+        4,
+        8);
+    auto one_shot = attention(
+        config,
+        1,
+        4,
+        8);
+    auto chunked_state =
+        MlxDeepseekV4LayerState::allocate(
+            config,
+            4,
+            1,
+            8);
+    auto one_shot_state =
+        MlxDeepseekV4LayerState::allocate(
+            config,
+            4,
+            1,
+            8);
+    const auto all = input_tokens(
+        {0.25f, -0.5f, 0.75f, -1.0f});
+    auto first = chunked(
+        token_slice(all, 0, 2),
+        chunked_state,
+        0);
+    auto third = chunked(
+        token_slice(all, 2, 3),
+        chunked_state,
+        2);
+    auto fourth = chunked(
+        token_slice(all, 3, 4),
+        chunked_state,
+        3);
+    auto expected = one_shot(
+        all,
+        one_shot_state,
+        0);
+    require_close(
+        evaluated_float(
+            mlx::core::concatenate(
+                {first, third, fourth},
+                1)),
+        evaluated_float(expected),
+        4e-2f,
+        "ratio-four prefill/decode continuity");
+    require(
+        chunked_state.main()->pool_len() == 1 &&
+            chunked_state.indexer()->pool_len() == 1 &&
+            one_shot_state.main()->pool_len() == 1 &&
+            chunked_state.position() == 4,
+        "ratio-four compressor continuity mismatch");
+    require_close(
+        evaluated_float(
+            chunked_state.main()->pool()),
+        evaluated_float(
+            one_shot_state.main()->pool()),
+        2e-3f,
+        "ratio-four main pool continuity");
+    require_close(
+        evaluated_float(
+            chunked_state.indexer()->pool()),
+        evaluated_float(
+            one_shot_state.indexer()->pool()),
+        2e-3f,
+        "ratio-four index pool continuity");
+}
+
+void test_ratio_four_index_query_projection() {
+    auto config = test_config();
+    config.index_topk = 1;
+    config.validate();
+    auto chunked = attention(config, 1, 4, 8);
+    auto one_shot = attention(config, 1, 4, 8);
+    auto chunked_state = MlxDeepseekV4LayerState::allocate(
+        config, 4, 1, 8);
+    auto one_shot_state = MlxDeepseekV4LayerState::allocate(
+        config, 4, 1, 8);
+    const auto all = input_tokens({
+        0.25f,
+        -0.5f,
+        0.75f,
+        -1.0f,
+        1.25f,
+        -1.5f,
+        1.75f,
+        -2.0f,
+    });
+    std::vector<array> pieces;
+    pieces.reserve(8);
+    for (int token = 0; token < 8; ++token) {
+        pieces.push_back(chunked(
+            token_slice(all, token, token + 1),
+            chunked_state,
+            token));
+    }
+    auto expected = one_shot(all, one_shot_state, 0);
+    require_close(
+        evaluated_float(mlx::core::concatenate(std::move(pieces), 1)),
+        evaluated_float(expected),
+        5e-2f,
+        "ratio-four grouped Indexer query continuity");
+    require(
+        chunked_state.main()->pool_len() == 2 &&
+            chunked_state.indexer()->pool_len() == 2 &&
+            one_shot_state.main()->pool_len() == 2,
+        "ratio-four Indexer query did not cross the sparse threshold");
+}
+
+void test_ratio_128_forward() {
+    const auto config = test_config();
+    auto operation = attention(
+        config,
+        2,
+        128,
+        128);
+    auto state =
+        MlxDeepseekV4LayerState::allocate(
+            config,
+            128,
+            1,
+            128);
+    const std::vector<float> values{
+        0.25f,
+        -0.5f,
+    };
+    auto output = operation(
+        input_tokens(values),
+        state,
+        0);
+    require_close(
+        evaluated_float(output),
+        local_attention_reference(
+            values,
+            4,
+            static_cast<float>(config.rms_eps)),
+        3e-2f,
+        "ratio-128 forward");
+    require(
+        state.main().has_value() &&
+            !state.indexer().has_value() &&
+            state.main()->pool_len() == 0 &&
+            state.main()->remainder() == 2 &&
+            state.position() == 2,
+        "ratio-128 forward state mismatch");
+}
+
+template <typename T>
+void append_scalar(
+    std::vector<std::uint8_t>& bytes,
+    T value) {
+    const auto* source =
+        reinterpret_cast<const std::uint8_t*>(&value);
+    bytes.insert(
+        bytes.end(),
+        source,
+        source + sizeof(value));
+}
+
+std::vector<std::uint8_t> dense_payload(
+    const Shape& shape,
+    const std::vector<float>& values) {
+    std::size_t elements = 1;
+    for (const int extent : shape) {
+        elements *= static_cast<std::size_t>(extent);
+    }
+    require(
+        values.size() == elements,
+        "synthetic dense payload size mismatch");
+    std::vector<std::uint8_t> result;
+    append_scalar<std::uint32_t>(
+        result,
+        static_cast<std::uint32_t>(shape.size()));
+    for (const int extent : shape) {
+        append_scalar<std::int64_t>(result, extent);
+    }
+    const auto* first =
+        reinterpret_cast<const std::uint8_t*>(
+            values.data());
+    result.insert(
+        result.end(),
+        first,
+        first + values.size() * sizeof(float));
+    return result;
+}
+
+void write_string(
+    std::ostream& stream,
+    std::string_view value) {
+    const auto size =
+        static_cast<std::uint32_t>(value.size());
+    stream.write(
+        reinterpret_cast<const char*>(&size),
+        sizeof(size));
+    stream.write(
+        value.data(),
+        static_cast<std::streamsize>(value.size()));
+}
+
+template <typename T>
+void write_scalar(
+    std::ostream& stream,
+    T value) {
+    stream.write(
+        reinterpret_cast<const char*>(&value),
+        sizeof(value));
+}
+
+struct Record {
+    std::string name;
+    std::vector<std::uint8_t> payload;
+};
+
+void write_attention_container(
+    const std::filesystem::path& path,
+    const DeepseekV4Config& config) {
+    const int hidden =
+        static_cast<int>(config.hidden);
+    const int head_dim =
+        static_cast<int>(config.head_dim);
+    const int attention =
+        static_cast<int>(
+            config.n_heads * config.head_dim);
+    const int groups =
+        static_cast<int>(config.o_groups);
+    const int group_width = attention / groups;
+    const auto name =
+        [](std::string_view suffix) {
+            return std::string("model.block.0.") +
+                std::string(suffix);
+        };
+    std::vector<Record> records{
+        {
+            name("attention.query_a.weight"),
+            dense_payload(
+                Shape{1, hidden},
+                std::vector<float>(hidden, 0.0f)),
+        },
+        {
+            name("attention.key_value_a.weight"),
+            dense_payload(
+                Shape{head_dim, hidden},
+                std::vector<float>(
+                    head_dim * hidden,
+                    0.0f)),
+        },
+        {
+            name("attention.query_b.weight"),
+            dense_payload(
+                Shape{attention, 1},
+                std::vector<float>(
+                    attention,
+                    0.0f)),
+        },
+        {
+            name("attention.output_a.weight"),
+            dense_payload(
+                Shape{groups, group_width},
+                std::vector<float>(
+                    groups * group_width,
+                    0.0f)),
+        },
+        {
+            name("attention.output_b.weight"),
+            dense_payload(
+                Shape{hidden, groups},
+                std::vector<float>(
+                    hidden * groups,
+                    0.0f)),
+        },
+        {
+            name("attention.query_a_norm.weight"),
+            dense_payload(
+                Shape{1},
+                std::vector<float>(1, 1.0f)),
+        },
+        {
+            name("attention.key_value_a_norm.weight"),
+            dense_payload(
+                Shape{head_dim},
+                std::vector<float>(
+                    head_dim,
+                    1.0f)),
+        },
+        {
+            name("attention.sink"),
+            dense_payload(
+                Shape{
+                    static_cast<int>(
+                        config.n_heads),
+                },
+                std::vector<float>(
+                    config.n_heads,
+                    0.0f)),
+        },
+    };
+    std::ofstream stream(path, std::ios::binary);
+    require(
+        static_cast<bool>(stream),
+        "cannot create synthetic attention container");
+    stream.write("MFQ1", 4);
+    write_scalar<std::uint32_t>(stream, 2);
+    write_string(stream, "attention-test");
+    write_scalar<std::uint32_t>(stream, 0);
+    write_scalar<std::uint32_t>(
+        stream,
+        static_cast<std::uint32_t>(
+            records.size()));
+    for (const auto& record : records) {
+        write_string(stream, record.name);
+        write_string(stream, "F32");
+        write_scalar<std::uint64_t>(
+            stream,
+            record.payload.size());
+    }
+    for (const auto& record : records) {
+        stream.write(
+            reinterpret_cast<const char*>(
+                record.payload.data()),
+            static_cast<std::streamsize>(
+                record.payload.size()));
+    }
+}
+
+void test_container_load_and_rejections() {
+    const auto config = test_config();
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        "mfq-dsv4-attention-test.mfq";
+    write_attention_container(path, config);
+    try {
+        const mfq::metal::MfqContainer model(path);
+        auto loaded = MlxDeepseekV4Attention::load(
+            model,
+            config,
+            0,
+            0,
+            4);
+        auto state =
+            MlxDeepseekV4LayerState::allocate(
+                config,
+                0,
+                1,
+                4);
+        require_close(
+            evaluated_float(
+                loaded(
+                    input_tokens({0.0f}),
+                    state,
+                    0)),
+            std::vector<float>(4, 0.0f),
+            1e-6f,
+            "container-loaded attention");
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+
+    require_invalid(
+        [&] {
+            auto operation = attention(
+                config,
+                0,
+                0,
+                4);
+            auto state =
+                MlxDeepseekV4LayerState::allocate(
+                    config,
+                    0,
+                    1,
+                    4);
+            (void)operation(
+                mlx::core::zeros(
+                    Shape{1, 1, 3},
+                    mlx::core::float16),
+                state,
+                0);
+        },
+        "wrong attention hidden width was accepted");
+    require_invalid(
+        [&] {
+            (void)attention(
+                config,
+                0,
+                4,
+                4);
+        },
+        "wrong layer compression schedule was accepted");
+    require_invalid(
+        [&] {
+            auto operation = attention(
+                config,
+                0,
+                0,
+                4);
+            auto wrong_state =
+                MlxDeepseekV4LayerState::allocate(
+                    config,
+                    4,
+                    1,
+                    4);
+            (void)operation(
+                input_tokens({0.0f}),
+                wrong_state,
+                0);
+        },
+        "wrong attention cache schedule was accepted");
+}
+
+} // namespace
+
+int main() {
+    try {
+        test_image_visibility_starts_at_image_start();
+        test_yarn_rope_and_rms();
+        test_v41_fused_window_kv_matches_composition();
+        test_v41_ced_encoder_source_and_replay();
+        test_v41_attention_snapshot_is_detached();
+        test_csa2_packed_execution();
+        test_pool_and_ratio_schedule();
+        test_local_attention_cpu_reference();
+        test_prefill_mma_cpu_reference();
+        test_ratio_four_continuity();
+        test_ratio_four_index_query_projection();
+        test_ratio_128_forward();
+        test_speculative_cache_transaction();
+        test_attention_copy_move_lifetime_stress();
+        test_container_load_and_rejections();
+        std::cout
+            << "MFQ C++ DeepSeek-V4 attention/cache "
+               "Metal tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << "\n";
+        return 1;
+    }
+}

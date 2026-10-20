@@ -404,7 +404,7 @@ Tensor launch(
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
         causal && positions.scalar_type() == mfq_tensor_backend::kInt64};
-   hipLaunchKernelGGL(( kernel), dim3(rounded_blocks), dim3(dim3(32, nwarps, 1)), shmem, stream, 
+   hipLaunchKernelGGL(( kernel), dim3(rounded_blocks), dim3(dim3(32, nwarps, 1)), shmem, stream,
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const half *>(v.data_ptr<mfq_half>()),
@@ -431,7 +431,7 @@ Tensor launch(
             static_cast<uint32_t>(iter_j * iter_z_gqa));
         const uint3 fd2 = sparse_fastdiv_values(static_cast<uint32_t>(iter_j));
        hipLaunchKernelGGL(( flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>)
-            , dim3(dim3(ntiles_dst, ncols1, ncols2)), dim3(DV), 0, stream, 
+            , dim3(dim3(ntiles_dst, ncols1, ncols2)), dim3(DV), 0, stream,
                 out.data_ptr<float>(),
                 reinterpret_cast<const float2 *>(meta.data_ptr<float>()),
                 M, heads, kv_heads, rounded_blocks, gqa_ratio,

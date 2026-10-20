@@ -360,8 +360,8 @@ mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
     const std::size_t count = std::size_t(values.numel());
     constexpr int threads = 256;
     const int blocks = int((count + threads - 1) / threads);
-   hipLaunchKernelGGL(( mxfp8_dequant_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( mxfp8_dequant_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
@@ -391,8 +391,8 @@ mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
-       hipLaunchKernelGGL(( mxfp8_embedding_kernel), 
-            dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( mxfp8_embedding_kernel),
+            dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
@@ -456,8 +456,8 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
     const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
-   hipLaunchKernelGGL(( mxfp8_matmul_kernel<__half>), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( mxfp8_matmul_kernel<__half>),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
@@ -519,8 +519,8 @@ mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
     const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
-   hipLaunchKernelGGL(( mxfp8_matmul_kernel<float>), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( mxfp8_matmul_kernel<float>),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
@@ -904,8 +904,8 @@ mfq_tensor_backend::Tensor mxfp4_dequant_cuda(
     const std::size_t count = static_cast<std::size_t>(outputs) * width;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
-   hipLaunchKernelGGL(( mxfp4_dequant_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( mxfp4_dequant_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
@@ -935,8 +935,8 @@ mfq_tensor_backend::Tensor mxfp4_embedding_lookup_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
-       hipLaunchKernelGGL(( mxfp4_embedding_kernel), 
-            dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( mxfp4_embedding_kernel),
+            dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
@@ -969,8 +969,8 @@ mfq_tensor_backend::Tensor mxfp4_matmul_f16_cuda(
     const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
-   hipLaunchKernelGGL(( mxfp4_matmul_f16_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( mxfp4_matmul_f16_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
@@ -1019,7 +1019,7 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
         const int max_tiles = (pairs + 7) / 8 + static_cast<int>(global_experts);
         const int blocks = static_cast<int>(std::min<int64_t>(
             static_cast<int64_t>(max_tiles) * row_tiles, 4096));
-       hipLaunchKernelGGL(( mxfp4_moe_grouped_f16_kernel<true>), dim3(blocks), dim3(threads), 0, stream, 
+       hipLaunchKernelGGL(( mxfp4_moe_grouped_f16_kernel<true>), dim3(blocks), dim3(threads), 0, stream,
             values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
@@ -1032,7 +1032,7 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     } else {
         const int blocks = static_cast<int>(std::min<int64_t>(
             static_cast<int64_t>(pairs) * row_tiles, 4096));
-       hipLaunchKernelGGL(( mxfp4_moe_grouped_f16_kernel<false>), dim3(blocks), dim3(threads), 0, stream, 
+       hipLaunchKernelGGL(( mxfp4_moe_grouped_f16_kernel<false>), dim3(blocks), dim3(threads), 0, stream,
             values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
@@ -1157,8 +1157,8 @@ void launch_mxfp8_backward_mma(
         int width,
         hipStream_t stream) {
     const int blocks = (width + Columns - 1) / Columns;
-   hipLaunchKernelGGL(( mxfp8_backward_mma_kernel<Rows, Columns>), 
-        dim3(blocks), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( mxfp8_backward_mma_kernel<Rows, Columns>),
+        dim3(blocks), dim3(256), 0, stream,
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
@@ -1247,7 +1247,7 @@ void launch_mxfp4_backward_vec4_small_m(
     const dim3 partial_grid(
         static_cast<unsigned>((width + 127) / 128),
         static_cast<unsigned>(output_groups));
-   hipLaunchKernelGGL(( mxfp4_backward_vec4_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( mxfp4_backward_vec4_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream,
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
@@ -1421,7 +1421,7 @@ void launch_mxfp8_backward_scalar_small_m(
     const dim3 partial_grid(
         static_cast<unsigned>((width + 31) / 32),
         static_cast<unsigned>(output_groups));
-   hipLaunchKernelGGL(( mxfp8_backward_scalar_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( mxfp8_backward_scalar_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream,
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
@@ -1515,7 +1515,7 @@ void launch_mxfp8_backward_vec4_small_m(
     const dim3 partial_grid(
         static_cast<unsigned>((width + 127) / 128),
         static_cast<unsigned>(output_groups));
-   hipLaunchKernelGGL(( mxfp8_backward_vec4_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( mxfp8_backward_vec4_partial_kernel<Rows>), dim3(partial_grid), dim3(32), 0, stream,
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),

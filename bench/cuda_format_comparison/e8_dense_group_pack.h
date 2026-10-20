@@ -1,5 +1,5 @@
 #pragma once
-#include "vq.h"
+#include "ops/quant/vq.h"
 #include <vector>
 #include <cstdint>
 #include <stdexcept>

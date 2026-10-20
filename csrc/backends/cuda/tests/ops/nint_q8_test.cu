@@ -1,0 +1,409 @@
+#include "native/env.h"
+#include "kernels/quant_ops.h"
+
+#include <cuda_runtime_api.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+using namespace mfq::cuda;
+bool benchmark_online=false;
+void single_path(bool enabled) {
+    mfq::cuda::env_set("MFQ_NINT_SINGLE_ROW",enabled ? "1" : "0");
+}
+
+void group_path(bool enabled) {
+    mfq::cuda::env_set("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0");
+}
+void whole_path(bool enabled) {
+    mfq::cuda::env_set("MFQ_NINT_WHOLE_GROUP", enabled ? "1" : "0");
+}
+void exact_batch_path(bool enabled) {
+    mfq::cuda::env_set("MFQ_NINT_EXACT_BATCH",enabled ? "1" : "0");
+}
+
+double grouped_max_nrmse = 0.0;
+double grouped_max_absolute = 0.0;
+int grouped_q8_cases=0;
+
+void require(bool condition, const char *message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+void exact_half(const Tensor &actual, const Tensor &expected) {
+    require(actual.sizes() == expected.sizes() &&
+            actual.scalar_type() == kFloat16 &&
+            expected.scalar_type() == kFloat16, "NINT output contract mismatch");
+    auto a = actual.to(kCPU).contiguous();
+    auto b = expected.to(kCPU).contiguous();
+    require(std::memcmp(a.data_ptr(), b.data_ptr(),
+            static_cast<std::size_t>(a.numel()) * sizeof(std::uint16_t)) == 0,
+            "NINT q8 output differs from the original generic path");
+}
+
+void grouped_half(const Tensor &actual, const Tensor &expected) {
+    require(actual.sizes() == expected.sizes() && actual.scalar_type() == kFloat16 &&
+        expected.scalar_type() == kFloat16, "NINT grouped output contract mismatch");
+    auto a = actual.to(kCPU).to(kFloat32).contiguous();
+    auto b = expected.to(kCPU).to(kFloat32).contiguous();
+    const auto* av = a.data_ptr<float>();
+    const auto* bv = b.data_ptr<float>();
+    double error = 0.0, signal = 0.0;
+    for (std::int64_t i = 0; i < a.numel(); ++i) {
+        const double difference = std::abs(double(av[i]) - bv[i]);
+        // Integer group dots reassociate the FP32 reduction before FP16 storage.
+        // Keep a bounded numerical check; exact quantizer/legacy checks remain separate.
+        if(!std::isfinite(av[i]) || !std::isfinite(bv[i]) ||
+                difference > 0.002 + 0.002 * std::abs(double(bv[i]))) {
+            std::cerr<<"NINT comparison index="<<i<<" actual="<<av[i]<<" expected="<<bv[i]<<std::endl;
+            throw std::runtime_error("NINT grouped output exceeds FP16 reduction tolerance");
+        }
+        error += difference * difference;
+        signal += double(bv[i]) * bv[i];
+        grouped_max_absolute = std::max(grouped_max_absolute, difference);
+    }
+    grouped_max_nrmse = std::max(grouped_max_nrmse, std::sqrt(error / std::max(signal, 1e-20)));
+}
+
+void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
+                int mode, int &cases, int &graphs) {
+    const Device gpu{DeviceType::cuda, 0};
+    const auto options = TensorOptions().device(gpu);
+    constexpr int n = 5;  // Exercises a partial four-warp output block.
+    const int k = gs * ng;
+    const int stride = (k + 3) / 4 * 4;
+    std::vector<std::uint8_t> bytes(n * stride + storage_offset, 0);
+    std::vector<std::int64_t> offsets(n);
+    for (int row = 0; row < n; ++row) {
+        offsets[row] = static_cast<std::int64_t>(row) * stride * 8;
+        for (int col = 0; col < k; ++col) {
+            bytes[storage_offset + row * stride + col] =
+                static_cast<std::uint8_t>((row * 97 + col * 31) % 256);
+        }
+    }
+    auto q = tensor(bytes).to(gpu).narrow(0, storage_offset, n * stride);
+    auto bits = tensor(std::vector<std::uint8_t>(n, 8)).to(gpu);
+    auto off = tensor(offsets).to(gpu);
+    std::vector<std::uint8_t> scales(n * ng), minima(n * ng);
+    for (int i = 0; i < n * ng; ++i) {
+        scales[i] = static_cast<std::uint8_t>(i % 13);
+        minima[i] = static_cast<std::uint8_t>(i % 7);
+    }
+    auto s = tensor(scales).reshape({n, ng}).to(gpu);
+    auto mn = tensor(minima).reshape({n, ng}).to(gpu);
+    auto ns = tensor<float>({0.0001f, 0.0002f, 0.0003f, 0.0004f, 0.0005f}).to(gpu);
+    auto nm = tensor<float>({0.01f, 0.02f, 0.03f, 0.04f, 0.05f}).to(gpu);
+    std::vector<float> input(m * (k - width_tail));
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<float>(static_cast<int>(i % 37) - 18) / 8;
+    }
+    auto x = tensor(input).reshape({m, k - width_tail}).to(gpu, kFloat16);
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<float>(static_cast<int>(i % 53) - 26) / 2;
+    }
+    auto gate = tensor(input).reshape({m, k - width_tail}).to(gpu, kFloat16);
+    auto qx = empty({m, k}, options.dtype(kInt8));
+    auto xs = empty({m, ng}, options.dtype(kFloat32));
+    auto run = [&](bool fast) {
+        if (mode == 0) {
+            return fast
+                ? nint_matmul_q8_ws_cuda(q, bits, off, s, mn, ns, nm, x, gs, qx, xs)
+                : nint_matmul_ws_cuda(q, bits, off, s, mn, ns, nm, x, gs, qx, xs);
+        }
+        return fast
+            ? nint_matmul_input_mul_q8_ws_cuda(
+                q, bits, off, s, mn, ns, nm, x, gate, mode, gs, qx, xs)
+            : nint_matmul_input_mul_ws_cuda(
+                q, bits, off, s, mn, ns, nm, x, gate, mode, gs, qx, xs);
+    };
+    exact_batch_path(false);
+    const auto expected = run(false);
+    exact_batch_path(true);
+    const auto actual = run(true);
+    MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto* q8_option=mfq::cuda::env_lookup("MFQ_NINT_Q8_DECODE");
+    const bool reassociated=gs==48 && m>1 && storage_offset==0 &&
+        (!q8_option || std::atoi(q8_option)==2);
+    const auto compare=[&](const Tensor& value) {
+        if(reassociated)grouped_half(value,expected);else exact_half(value,expected);
+    };
+    compare(actual);
+    if(reassociated)++grouped_q8_cases;
+    ++cases;
+
+    // Compare both specialization branches during capture/replay. Odd group
+    // widths and offset storage also exercise the existing generic fallback.
+    if (ng == 3 && width_tail == 0 && storage_offset == 0 && (m == 1 || m == 8)) {
+        const auto stream = mfq_get_stream_from_pool(false);
+        MfqCudaStreamGuard guard(stream);
+        MfqCudaGraph graph;
+        mfq_prepare_cuda_graph_memory(graph);
+        Tensor result = run(true);
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        result = Tensor();
+        graph.capture_begin();
+        result = run(true);
+        graph.capture_end();
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            graph.replay();
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+            compare(result);
+        }
+        ++graphs;
+    }
+}
+void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false,int rows=1,bool online=false) {
+    const Device gpu{DeviceType::cuda,0};
+    const int ng=(width+gs-1)/gs,k=ng*gs;
+    std::vector<std::uint8_t> row_bits(n);
+    std::vector<std::int64_t> offsets(n);
+    std::uint64_t total=5; // Non-byte-aligned rows exercise every word shift.
+    for(int row=0;row<n;++row) {
+        row_bits[row]=preset ? preset : 1+row%8;
+        offsets[row]=static_cast<std::int64_t>(total);total+=std::uint64_t(k)*row_bits[row];
+    }
+    const auto packed_bytes=static_cast<std::size_t>((total+7)/8)+padding;
+    std::vector<std::uint8_t> bytes(storage_offset+packed_bytes,0);
+    for(int row=0;row<n;++row)for(int column=0;column<k;++column) {
+        const auto value=std::uint32_t((row*97+column*31+19)&((1u<<row_bits[row])-1));
+        const auto bit=std::uint64_t(offsets[row])+std::uint64_t(column)*row_bits[row];
+        for(int b=0;b<row_bits[row];++b)if((value>>b)&1u)
+            bytes[storage_offset+(bit+b)/8]|=std::uint8_t(1u<<((bit+b)&7));
+    }
+    auto q=tensor(bytes).to(gpu).narrow(0,storage_offset,packed_bytes);
+    auto bits=tensor(row_bits).to(gpu),off=tensor(offsets).to(gpu);
+    std::vector<std::uint8_t> scales(n*ng),minima(n*ng);
+    std::vector<float> outer(n),minimum(n),input(rows*width);
+    for(int i=0;i<n*ng;++i){scales[i]=std::uint8_t((i*13)%37);minima[i]=std::uint8_t(i%19);}
+    for(int row=0;row<n;++row){outer[row]=.000123f*float(row%13-6);minimum[row]=.004731f*float(row%5-2);}
+    for(int column=0;column<rows*width;++column)input[column]=std::sin(float(column+7)*.193f)*.31f;
+    auto s=tensor(scales).reshape({n,ng}).to(gpu),mn=tensor(minima).reshape({n,ng}).to(gpu);
+    auto ns=tensor(outer).to(gpu),nm=tensor(minimum).to(gpu);
+    auto x=tensor(input).reshape({rows,width}).to(gpu,kFloat16);
+    const auto options=TensorOptions().device(gpu);
+    auto qx=empty({rows,k},options.dtype(kInt8)),xs=empty({rows,ng},options.dtype(kFloat32));
+    const auto run=[&]{return online ? nint_matmul_online_f16_cuda(q,bits,off,s,mn,ns,nm,x,gs)
+        : nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
+    // Keep the FP16 operands while using an FP32 GEMM reference; a long FP16
+    // GEMM may use reduced-precision intermediate reductions in cuBLAS.
+    const auto reference=[&]{return online ? matmul(x.to(kFloat32),
+        nint_decode_cuda(q,bits,off,s,mn,ns,nm,width,gs).to(kFloat32).transpose(0,1)).to(kFloat16) : run();};
+    exact_batch_path(false);
+    single_path(false);group_path(rows>1);whole_path(rows==1);auto expected=reference();
+    exact_batch_path(true);
+    whole_path(true);
+    single_path(true);group_path(grouped);auto actual=run();
+    const auto compare=[&](const Tensor& a,const Tensor& b) {
+        try {if(online || (grouped && rows==1))grouped_half(a,b);else exact_half(a,b);}
+        catch(...) {std::cerr<<"NINT case gs="<<gs<<" width="<<width<<" preset="<<preset<<" offset="<<storage_offset
+            <<" padding="<<padding<<" outputs="<<n<<" rows="<<rows<<" online="<<online<<std::endl;throw;}
+    };
+    compare(actual,expected);++cases;
+    const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph;mfq_prepare_cuda_graph_memory(graph);
+    actual=run();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));actual=Tensor{};
+    graph.capture_begin();actual=run();graph.capture_end();
+    for(int step=0;step<2;++step) {
+        for(int column=0;column<rows*width;++column)input[column]=std::sin(float(column+step*31)*.173f)*.13f;
+        x.copy_(tensor(input).reshape({rows,width}).to(gpu,kFloat16));
+        exact_batch_path(false);
+        single_path(false);group_path(rows>1);whole_path(rows==1);expected=reference();
+        exact_batch_path(true);
+        graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));compare(actual,expected);++cases;
+    }
+    single_path(false);
+    group_path(false);
+    whole_path(true);
+    if(online && benchmark_online && n>128) {
+        const auto measure=[&](MfqCudaGraph& measured) {
+            struct Events {cudaEvent_t start{},end{};~Events(){if(start)cudaEventDestroy(start);if(end)cudaEventDestroy(end);}} events;
+            MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&events.start));MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&events.end));
+            MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(events.start,stream.stream()));
+            for(int i=0;i<128;++i)measured.replay();
+            MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(events.end,stream.stream()));
+            MFQ_NATIVE_CUDA_CHECK(cudaEventSynchronize(events.end));
+            float milliseconds=0;MFQ_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&milliseconds,events.start,events.end));
+            return milliseconds*1000/128;
+        };
+        const float online_us=measure(graph);
+        actual={};expected={};graph.reset();
+        const auto expanded=[&]{return matmul(x,nint_decode_cuda(q,bits,off,s,mn,ns,nm,width,gs).transpose(0,1));};
+        MfqCudaGraph baseline;mfq_prepare_cuda_graph_memory(baseline);
+        auto baseline_output=expanded();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));baseline_output={};
+        baseline.capture_begin();baseline_output=expanded();baseline.capture_end();
+        const float expanded_us=measure(baseline);
+        std::cout<<"NINT online_benchmark rows="<<rows<<" outputs="<<n<<" width="<<width<<" gs="<<gs
+            <<" online_us="<<online_us<<" expanded_us="<<expanded_us<<std::endl;
+    }
+}
+
+void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& changing) {
+    const Device gpu{DeviceType::cuda,0};
+    const auto options=TensorOptions().device(gpu);
+    constexpr int n=9,ng=3;
+    const int padded=gs*ng,width=padded-1;
+    std::vector<std::uint8_t> row_bits(n),packed;
+    std::vector<std::int64_t> offsets(n);
+    std::uint64_t end=kind==0?5:0;
+    for(int row=0;row<n;++row) {
+        row_bits[row]=kind==0?1+row%8:8;
+        if(kind!=0)end=(end+31)/32*32;
+        offsets[row]=end;end+=std::uint64_t(padded)*row_bits[row];
+    }
+    packed.resize((end+7)/8);
+    for(int row=0;row<n;++row)for(int col=0;col<padded;++col) {
+        const unsigned value=(row*97+col*31+19)&((1u<<row_bits[row])-1);
+        const auto start=std::uint64_t(offsets[row])+std::uint64_t(col)*row_bits[row];
+        for(int b=0;b<row_bits[row];++b)if((value>>b)&1u)
+            packed[(start+b)/8]|=std::uint8_t(1u<<((start+b)&7));
+    }
+    auto q=tensor(packed).to(gpu),bits=tensor(row_bits).to(gpu),off=tensor(offsets).to(gpu);
+    auto sub=tensor(std::vector<std::uint8_t>(n*ng,7)).reshape({n,ng}).to(gpu);
+    auto minima=tensor(std::vector<std::uint8_t>(n*ng,3)).reshape({n,ng}).to(gpu);
+    auto scale=tensor(std::vector<float>(n,1e-9f)).to(gpu);
+    auto minimum=tensor(std::vector<float>(n,2e-9f)).to(gpu);
+    if(kind==2) {
+        std::vector<std::uint8_t> codes(n*ng*32);
+        for(size_t i=0;i<codes.size();++i)codes[i]=std::uint8_t(i*31+17);
+        q=tensor(codes).reshape({n,ng,32}).to(gpu);
+        scale=tensor(std::vector<float>(n*ng,1e-6f)).reshape({n,ng}).to(gpu,kFloat16);
+    }
+    auto x=empty({rows,width},options.dtype(kFloat32));
+    auto gate=empty({rows,width},options.dtype(kind==1?kFloat16:kFloat32));
+    Tensor qx[2]={empty({rows,padded},options.dtype(kInt8)),empty({rows,padded},options.dtype(kInt8))};
+    Tensor xs[2]={empty({rows,ng},options.dtype(kFloat32)),empty({rows,ng},options.dtype(kFloat32))};
+    const auto change=[&](int step) {
+        const float midpoint=1.f+1.f/2048.f;
+        const std::vector<float> edges={0.f,-0.f,std::ldexp(1.f,-25),-std::ldexp(1.f,-25),
+            std::ldexp(3.f,-25),std::ldexp(1.f,-24),std::ldexp(1.f,-14),
+            std::nextafter(midpoint,0.f),midpoint,std::nextafter(midpoint,2.f),
+            1.f+3.f/2048.f,-midpoint,127.4999695f,65504.f,-65504.f};
+        std::vector<float> values(rows*width),gates(rows*width);
+        for(size_t i=0;i<values.size();++i) {
+            values[i]=step==0?edges[i%edges.size()]:step==1?0.f:
+                std::sin(float(i+step*31)*.193f)*(step==2?.031339f:31.733f);
+            gates[i]=step==1?0.f:float(int(i%7)-3)*29.333f;
+        }
+        x.copy_(tensor(values).reshape({rows,width}).to(gpu));
+        gate.copy_(tensor(gates).reshape({rows,width}).to(gpu,gate.scalar_type()));
+    };
+    const auto run=[&](bool direct) {
+        const int slot=direct?1:0;
+        auto activation=direct?x:x.to(kFloat16);
+        if(kind==2)return nint8_zero_gemv_ws_cuda(q,scale,activation,qx[slot],xs[slot]);
+        if(mode==0)return kind==1
+            ?nint_matmul_q8_ws_cuda(q,bits,off,sub,minima,scale,minimum,activation,gs,qx[slot],xs[slot])
+            :nint_matmul_ws_cuda(q,bits,off,sub,minima,scale,minimum,activation,gs,qx[slot],xs[slot]);
+        auto gates=direct?gate:gate.to(kFloat16);
+        return kind==1
+            ?nint_matmul_input_mul_q8_ws_cuda(q,bits,off,sub,minima,scale,minimum,activation,gates,mode,gs,qx[slot],xs[slot])
+            :nint_matmul_input_mul_ws_cuda(q,bits,off,sub,minima,scale,minimum,activation,gates,mode,gs,qx[slot],xs[slot]);
+    };
+    const auto bytes=[](const Tensor& actual,const Tensor& expected) {
+        require(actual.sizes()==expected.sizes() && actual.scalar_type()==expected.scalar_type(),
+            "NINT Float quantizer workspace contract mismatch");
+        auto a=actual.cpu().contiguous(),b=expected.cpu().contiguous();
+        require(std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size())==0,
+            "NINT Float quantizer codes/scales differ from separately rounded Half input");
+    };
+    change(0);auto expected=run(false);auto actual=run(true);
+    exact_half(actual,expected);bytes(qx[1],qx[0]);bytes(xs[1],xs[0]);++ordinary;
+    const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph;mfq_prepare_cuda_graph_memory(graph);
+    actual=run(true);MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));actual=Tensor{};
+    graph.capture_begin();actual=run(true);graph.capture_end();
+    for(int step=1;step<=3;++step) {
+        change(step);expected=run(false);graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        exact_half(actual,expected);bytes(qx[1],qx[0]);bytes(xs[1],xs[0]);++changing;
+    }
+}
+}  // namespace
+
+int main(int argc,char** argv) {
+    try {
+        benchmark_online=argc>1 && std::strcmp(argv[1],"--benchmark-online")==0;
+        int devices = 0;
+        const auto status = cudaGetDeviceCount(&devices);
+        if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver ||
+                (status == cudaSuccess && devices == 0)) {
+            return 77;
+        }
+        MFQ_NATIVE_CUDA_CHECK(status);
+        int cases = 0, graphs = 0;
+        group_path(true);
+        int float_ordinary=0,float_changing=0;
+        for(int gs:{5,24,28,32,48,64})for(int rows:{1,3,8})
+            for(int kind:{0,1})for(int mode:{0,1,2})
+                check_float_input(gs,rows,kind,mode,float_ordinary,float_changing);
+        for(int rows:{1,3,8})check_float_input(32,rows,2,0,float_ordinary,float_changing);
+        std::cout<<"NINT Float activation rounding ordinary="<<float_ordinary
+                 <<" changing_graph="<<float_changing<<" quantized/scales/output bytes exact PASS\n";
+        int single_cases=0;
+        for(int gs:{5,24,28,32,48,64})for(int width:{53,640,2560})
+            for(int preset:{0,4,5,8})for(int offset:{0,1})for(int padding:{0,8})
+                check_single(gs,width,preset,offset,padding,9,single_cases);
+        for(int gs:{24,28}) {
+            check_single(gs,2560,5,0,8,640,single_cases);
+            check_single(gs,640,0,0,8,2560,single_cases);
+            check_single(gs,2560,5,0,8,6144,single_cases);
+        }
+        std::cout<<"NINT single-row original Half bits ordinary/changing graphs cases="<<single_cases<<" PASS\n";
+        int batch_whole_cases=0;
+        for(int gs:{24,28})for(int width:{1536,2560})for(int rows:{2,3,4,5,6,7,8})
+            for(int preset:{0,4,5,8})for(int padding:{0,8})
+                check_single(gs,width,preset,0,padding,9,batch_whole_cases,true,rows);
+        std::cout<<"NINT batched whole-group exact Half/changing graphs cases="<<batch_whole_cases<<" PASS\n";
+        int exact_capacity_cases=0;
+        for(int gs:{5,24,28,32,48,64})for(int width:{77,640})for(int rows:{2,3,4,5,6})
+            check_single(gs,width,0,0,8,9,exact_capacity_cases,true,rows);
+        std::cout<<"NINT exact batch capacity original Half/changing graphs cases="<<exact_capacity_cases<<" PASS\n";
+        int online_cases=0;
+        for(int gs:{5,24,28,32,48,64})for(int width:{53,640,2560})for(int rows:{9,16,17,32})
+            for(int preset:{0,5,8})for(int offset:{0,1})for(int padding:{0,8})
+                check_single(gs,width,preset,offset,padding,9,online_cases,false,rows,true);
+        check_single(28,2560,5,0,8,640,online_cases,false,16,true);
+        check_single(24,640,0,0,8,2560,online_cases,false,32,true);
+        check_single(28,2560,5,0,8,6144,online_cases,false,32,true);
+        check_single(24,6144,6,0,8,2560,online_cases,false,16,true);
+        check_single(24,6144,6,0,8,2560,online_cases,false,32,true);
+        std::cout<<"NINT online Tensor Core projection dense-reference/changing graphs cases="<<online_cases<<" PASS\n";
+        for (int gs : {4, 12, 28, 32, 48, 64, 5, 47, 63}) {
+            for (int ng : {1, 3, 22}) {
+                for (int m = 1; m <= 8; ++m) {
+                    for (int tail : {0, 1}) {
+                        for (int offset : {0, 1}) {
+                            for (int mode : {0, 1, 2}) {
+                                check_case(gs, ng, m, tail, offset, mode, cases, graphs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::cout << "NINT q8 bit-exact FP16 cases=" << cases-grouped_q8_cases
+                  << " grouped_fp16_cases=" << grouped_q8_cases
+                  << " graph_cases=" << graphs << " replays_per_case=3\n";
+        int grouped_cases = 0;
+        struct GroupedCase { int group_size, width, bits; };
+        for (const auto fixture : {GroupedCase{5, 640, 0}, GroupedCase{24, 2560, 4}, GroupedCase{28, 2560, 5},
+                GroupedCase{48, 2560, 8}, GroupedCase{24, 1536, 0}})
+            for (int offset : {0, 1})
+                check_single(fixture.group_size, fixture.width, fixture.bits, offset, 8, 9,
+                    grouped_cases, true);
+        std::cout << "NINT grouped reduction ordinary/changing graphs cases=" << grouped_cases
+                  << " max_nrmse=" << grouped_max_nrmse
+                  << " max_absolute=" << grouped_max_absolute << " PASS\n";
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

@@ -95,7 +95,7 @@ torch::Tensor nvq_pack_group64_cuda(torch::Tensor state, torch::Tensor indices,
     const auto count = state.numel();
     auto output = torch::empty({count * 8}, state.options().dtype(torch::kUInt8));
     if (!count) return output;
-   hipLaunchKernelGGL(( pack_group64), dim3((count + 255) / 256), dim3(256), 0, at::cuda::getCurrentCUDAStream(), 
+   hipLaunchKernelGGL(( pack_group64), dim3((count + 255) / 256), dim3(256), 0, at::cuda::getCurrentCUDAStream(),
         state.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), signs.data_ptr<int32_t>(),
         reinterpret_cast<uint64_t*>(output.data_ptr<uint8_t>()), count, groups, vectors);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

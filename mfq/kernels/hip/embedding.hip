@@ -243,8 +243,8 @@ mfq_tensor_backend::Tensor embedding_lookup_cuda(
                 const size_t tiles = (vectors + threads - 1) / threads;
                 const int vector_blocks = launch_blocks(
                     static_cast<size_t>(token_count) * tiles * threads);
-               hipLaunchKernelGGL(( dense_embedding_vector_kernel<scalar_t>), 
-                    dim3(vector_blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+               hipLaunchKernelGGL(( dense_embedding_vector_kernel<scalar_t>),
+                    dim3(vector_blocks), dim3(threads), 0, mfq_current_cuda_stream(),
                         weight.data_ptr<scalar_t>(),
                         token_ids.data_ptr<int64_t>(),
                         output.data_ptr<scalar_t>(),
@@ -254,8 +254,8 @@ mfq_tensor_backend::Tensor embedding_lookup_cuda(
             } else {
                 const int flat_blocks = launch_blocks(
                     static_cast<size_t>(token_count) * width);
-               hipLaunchKernelGGL(( dense_embedding_flat_kernel<scalar_t>), 
-                    dim3(flat_blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+               hipLaunchKernelGGL(( dense_embedding_flat_kernel<scalar_t>),
+                    dim3(flat_blocks), dim3(threads), 0, mfq_current_cuda_stream(),
                         weight.data_ptr<scalar_t>(),
                         token_ids.data_ptr<int64_t>(),
                         output.data_ptr<scalar_t>(),
@@ -290,7 +290,7 @@ mfq_tensor_backend::Tensor nint_selected_rows_cuda(
     if (descriptors.size(0) == 0) return output;
     MFQ_RUNTIME_CHECK(packed.numel() > 0, "NINT selected payload is empty");
     const size_t total = static_cast<size_t>(descriptors.size(0)) * width;
-   hipLaunchKernelGGL(( nint_selected_rows_kernel), dim3(launch_blocks(total)), dim3(256), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint_selected_rows_kernel), dim3(launch_blocks(total)), dim3(256), 0, mfq_current_cuda_stream(),
         packed.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(descriptors.data_ptr<int32_t>()),
         nullptr,
@@ -320,7 +320,7 @@ void nint_selected_rows_into_cuda(
         "NINT selected inverse/output geometry differs");
     if (!output.numel()) return;
     const MfqCudaGuard guard(packed.device());
-   hipLaunchKernelGGL(( nint_selected_rows_kernel), dim3(launch_blocks(output.numel())), dim3(256), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint_selected_rows_kernel), dim3(launch_blocks(output.numel())), dim3(256), 0, mfq_current_cuda_stream(),
         packed.data_ptr<uint8_t>(), reinterpret_cast<const uint32_t*>(descriptors.data_ptr<int32_t>()),
         inverse.data_ptr<int64_t>(), reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
         output.numel(), static_cast<int>(output.size(1)));
@@ -401,8 +401,8 @@ mfq_tensor_backend::Tensor nint_embedding_cuda(
     constexpr int threads = 256;
     const int blocks = launch_blocks(
         static_cast<size_t>(token_count) * width);
-   hipLaunchKernelGGL(( nint_embedding_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint_embedding_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
@@ -460,8 +460,8 @@ mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
     constexpr int threads = 256;
     const int blocks = launch_blocks(
         static_cast<size_t>(token_count) * width);
-   hipLaunchKernelGGL(( nint8_zero_embedding_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint8_zero_embedding_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             reinterpret_cast<const int8_t *>(
                 quantized.data_ptr<uint8_t>()),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),

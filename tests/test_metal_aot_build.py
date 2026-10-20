@@ -5,7 +5,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-METAL = ROOT / "cpp_runtime/backends/metal"
+METAL = ROOT / "csrc/backends/metal"
 SCRIPT = ROOT / "packaging/compile_metal_libraries.py"
 
 

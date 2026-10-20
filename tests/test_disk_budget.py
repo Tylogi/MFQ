@@ -200,10 +200,10 @@ int main(int argc, char** argv) {
 }
 '''
     result = subprocess.run([compiler, '-std=c++17', '-pthread', '-Wno-deprecated-declarations',
-        '-I' + str(root / 'cpp_runtime/core'), '-I' + str(root / 'cpp_runtime/core/include'),
-        '-x', 'c++', '-', str(root / 'cpp_runtime/core/mfq_paged_prefix_cache.cpp'),
-        str(root / 'cpp_runtime/core/qsa_kv_store.cpp'), '-o', str(output),
-        *(['-lcrypto'] if sys.platform != 'darwin' else [])], input=source, text=True, capture_output=True)
+        '-I' + str(root / 'csrc/core'), '-I' + str(root / 'csrc/core/include'),
+        '-x', 'c++', '-', str(root / 'csrc/core/mfq_paged_prefix_cache.cpp'),
+        str(root / 'csrc/core/qsa_kv_store.cpp'), '-o', str(output),
+], input=source, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     return output
 

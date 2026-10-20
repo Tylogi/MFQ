@@ -32,11 +32,11 @@ jobs:
           echo "TMPDIR=$GITHUB_WORKSPACE/.cuda-ci-tmp" >> "$GITHUB_ENV"
       - name: Build native CUDA regression targets
         run: |
-          cmake -S cpp_runtime -B build/cuda-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON -DMFQ_BUILD_METAL_RUNTIME=OFF
-          cmake --build build/cuda-ci --target mfq-native-tensor-cuda-test mfq-cuda-context-test mfq-nint-q8-test mfq-mxfp4-sq-test mfq-packed-prefill-test mfq-sq-linear-test
+          cmake -S csrc -B build/cuda-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON -DMFQ_BUILD_METAL_RUNTIME=OFF
+          cmake --build build/cuda-ci --target mfq-native-tensor-cuda-test mfq-cuda-context-test mfq-nint-q8-test mfq-mxfp4-sq-test mfq-packed-prefill-test mfq-sq-linear-test mfq-cuda-env-test mfq-cuda-dma-batch-test mfq-cuda-execution-scope-test mfq-cuda-include-graph-test
       - name: Run GPU numerical, graph and timing checks
         run: |
-          ctest --test-dir build/cuda-ci --output-on-failure -V -R '^mfq-(native-tensor-cuda|cuda-context|nint-q8|packed-prefill)-test$'
+          ctest --test-dir build/cuda-ci --output-on-failure -V -R '^mfq-(native-tensor-cuda|cuda-context|nint-q8|packed-prefill|cuda-env|cuda-dma-batch|cuda-execution-scope|cuda-include-graph)-test$'
           python3 bench/cuda_mxfp4_sq_fixtures.py build/cuda-ci/sq-fixtures
           build/cuda-ci/cuda/mfq-mxfp4-sq-test build/cuda-ci/sq-fixtures
           build/cuda-ci/cuda/mfq-sq-linear-test build/cuda-ci/sq-fixtures

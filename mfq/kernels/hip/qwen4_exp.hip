@@ -35,10 +35,10 @@ Tensor gated_residual_activation(const Tensor& input,int64_t streams) {
         if(!count)return output;
         const int blocks=int((count+255)/256);
         if(input.scalar_type()==tb::kFloat16)
-           hipLaunchKernelGGL(( gated_residual_activation_kernel<mfq_half,Injection>), dim3(blocks),dim3(256),0,mfq_current_cuda_stream(), 
+           hipLaunchKernelGGL(( gated_residual_activation_kernel<mfq_half,Injection>), dim3(blocks),dim3(256),0,mfq_current_cuda_stream(),
                 input.data_ptr<mfq_half>(),output.data_ptr<mfq_half>(),count,float(streams));
         else
-           hipLaunchKernelGGL(( gated_residual_activation_kernel<float,Injection>), dim3(blocks),dim3(256),0,mfq_current_cuda_stream(), 
+           hipLaunchKernelGGL(( gated_residual_activation_kernel<float,Injection>), dim3(blocks),dim3(256),0,mfq_current_cuda_stream(),
                 input.data_ptr<float>(),output.data_ptr<float>(),count,float(streams));
         MFQ_CUDA_CHECK(hipGetLastError());
         return output;
@@ -123,8 +123,8 @@ void launch_residual_post_norm(const Tensor& branch,const Tensor& residual,const
     const Tensor& norm,Tensor& updated,Tensor& normalized,int hidden,int streams,double eps) {
     using Output=ResidualOutput<Branch,Residual,Injection>;
     const int threads=hidden<=32?32:hidden<=64?64:hidden<=128?128:256;
-   hipLaunchKernelGGL(( gated_residual_post_norm_kernel<Branch,Residual,Injection>), 
-        dim3(updated.numel()/hidden),dim3(threads),0,mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( gated_residual_post_norm_kernel<Branch,Residual,Injection>),
+        dim3(updated.numel()/hidden),dim3(threads),0,mfq_current_cuda_stream(),
         branch.data_ptr<Branch>(),residual.data_ptr<Residual>(),injection.data_ptr<Injection>(),
         norm.data_ptr<float>(),updated.data_ptr<Output>(),normalized.data_ptr<Output>(),hidden,streams,float(eps));
 }

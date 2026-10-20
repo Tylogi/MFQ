@@ -1,7 +1,8 @@
+#include "storage/weights/loaders/weight.h"
 #include "packed_bench_utils.h"
-#include "mfq_cuda_moe_ops.h"
-#include "moe.h"
-#include "mfq/model_source.h"
+#include "kernels/moe/ops.h"
+#include "ops/moe/moe.h"
+#include "model_source.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>

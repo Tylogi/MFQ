@@ -349,7 +349,9 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
     store = SessionStore(database_path, media_root=media_root)
     backend = ClusterBackend(runtime_manager, store)
     binary_dir = Path(sys.executable).parent
-    perplexity = executable.with_name("mfq-perplexity")
+    perplexity = (
+        executable.with_name("mfq-perplexity") if selected_backend == "metal" else None
+    )
     handlers = ToolJobHandlers(
         catalog,
         ToolJobPaths(
@@ -359,8 +361,13 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
                 (binary_dir / "modelscope") if (binary_dir / "modelscope").is_file() else None
             ),
             huggingface=(binary_dir / "hf") if (binary_dir / "hf").is_file() else None,
-            runtime=executable,
-            perplexity=perplexity if perplexity.is_file() else None,
+            # benchmark.kernel passes Metal-only runtime flags (--tensor, --benchmark-reps).
+            runtime=executable if selected_backend == "metal" else None,
+            perplexity=(
+                perplexity
+                if perplexity is not None and perplexity.is_file()
+                else None
+            ),
             diagnostics=(
                 executable.with_name("mfq-diagnostics" + executable.suffix)
                 if selected_backend == "cuda" else executable

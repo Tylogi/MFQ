@@ -273,7 +273,7 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
         const int64_t total = rows * padded_count;
         const int blocks = static_cast<int>(std::min<int64_t>(
             65535, std::max<int64_t>(1, (total + 255) / 256)));
-       hipLaunchKernelGGL(( prepare_sparse_indices_kernel), dim3(blocks), dim3(256), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( prepare_sparse_indices_kernel), dim3(blocks), dim3(256), 0, mfq_current_cuda_stream(),
             indices.data_ptr<int32_t>(), safe_indices.data_ptr<int32_t>(),
             reinterpret_cast<half *>(mask.data_ptr<mfq_half>()), rows,
             static_cast<int>(source_count), static_cast<int>(padded_count),
@@ -503,7 +503,7 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
         if (!blocks) return tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
             q.options().dtype(half_output ? tb::kFloat16 : tb::kFloat32));
         const auto layout = AttentionLayout{q.stride(0), q.stride(2), q.stride(1), q.stride(3)};
-       hipLaunchKernelGGL(( prepare_causal_attention_kernel), dim3(blocks), dim3(256), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( prepare_causal_attention_kernel), dim3(blocks), dim3(256), 0, mfq_current_cuda_stream(),
             q.data_ptr(), q.scalar_type() == tb::kFloat16, layout, query.data_ptr<float>(), query.numel(),
             q.size(1), q.size(2), q.size(3), cache_positions.data_ptr(), cache_positions.scalar_type() == tb::kInt64,
             indices.data_ptr<int32_t>(), reinterpret_cast<half*>(mask.data_ptr()), indices.numel(),

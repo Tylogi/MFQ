@@ -86,7 +86,7 @@ for mfq_mlx_file in \
   [[ -f "${mfq_mlx_file}" ]] || fail "missing MLX runtime file: ${mfq_mlx_file}"
 done
 
-cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja \
+cmake -S "${mfq_project_dir}/csrc" -B "${mfq_native_build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_FLAGS="${CFLAGS}" \
   -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \

@@ -1780,9 +1780,9 @@ void launch_nint_matmul_routed_cuda(
     const dim3 grid = use_compact
         ? dim3(compact_blocks)
         : dim3(row_blocks, routes, token_blocks);
-   hipLaunchKernelGGL(( nint_matmul_kernel<false>), 
+   hipLaunchKernelGGL(( nint_matmul_kernel<false>),
         dim3(grid),
-        dim3(dim3(32, warps_per_block)), 0, stream, 
+        dim3(dim3(32, warps_per_block)), 0, stream,
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
@@ -1831,8 +1831,8 @@ std::vector<mfq_tensor_backend::Tensor> nint8_one_quantize_reconstruct_cuda(
     auto scale = mfq_tensor_backend::empty({rows, groups}, input.options());
     auto sum = mfq_tensor_backend::empty({rows, groups}, input.options());
     auto reconstructed = mfq_tensor_backend::empty_like(input);
-   hipLaunchKernelGGL(( nint8_one_quantize_reconstruct_kernel), 
-        dim3(rows * groups), dim3(32), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint8_one_quantize_reconstruct_kernel),
+        dim3(rows * groups), dim3(32), 0, mfq_current_cuda_stream(),
             reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             quantized.data_ptr<int8_t>(),
             reinterpret_cast<__half *>(scale.data_ptr<mfq_half>()),
@@ -2006,8 +2006,8 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( nint_decode_rows_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint_decode_rows_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
@@ -2291,8 +2291,8 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         {activation_rows, output_rows}, input.options().dtype(mfq_tensor_backend::kFloat16));
     const hipStream_t stream = mfq_current_cuda_stream();
     const int quantize_threads = group_size <= 32 ? 32 : 64;
-   hipLaunchKernelGGL(( nint_quantize_activation_kernel), 
-        dim3(dim3(activation_rows, groups)), dim3(quantize_threads), 0, stream, 
+   hipLaunchKernelGGL(( nint_quantize_activation_kernel),
+        dim3(dim3(activation_rows, groups)), dim3(quantize_threads), 0, stream,
             input.data_ptr(),
             gate == nullptr
                 ? nullptr
@@ -2311,8 +2311,8 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         (reinterpret_cast<uintptr_t>(bitstream.data_ptr<uint8_t>()) & 3u) == 0) {
         // Specialize only the proven one-row input, independent of device.
         if (activation_rows == 1) {
-       hipLaunchKernelGGL(( nint_matmul_aligned_q8_kernel<1>), 
-            dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream, 
+       hipLaunchKernelGGL(( nint_matmul_aligned_q8_kernel<1>),
+            dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream,
                 bitstream.data_ptr<uint8_t>(),
                 row_q_bit_offsets.data_ptr<int64_t>(),
                 subgroup_scale.data_ptr<uint8_t>(),
@@ -2325,8 +2325,8 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
                 activation_rows, output_rows, groups, padded_width,
                 static_cast<int>(group_size));
         } else {
-       hipLaunchKernelGGL(( nint_matmul_aligned_q8_kernel<8>), 
-            dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream, 
+       hipLaunchKernelGGL(( nint_matmul_aligned_q8_kernel<8>),
+            dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream,
                 bitstream.data_ptr<uint8_t>(),
                 row_q_bit_offsets.data_ptr<int64_t>(),
                 subgroup_scale.data_ptr<uint8_t>(),
@@ -2341,8 +2341,8 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         }
     } else {
     const auto launch=[&](auto single,auto grouped) {
-   hipLaunchKernelGGL(( nint_matmul_kernel<decltype(single)::value,decltype(grouped)::value>), 
-        dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream, 
+   hipLaunchKernelGGL(( nint_matmul_kernel<decltype(single)::value,decltype(grouped)::value>),
+        dim3(dim3((output_rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream,
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
@@ -2407,9 +2407,9 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         const bool use_group=!group_disabled && groups>=32 && group_size>=1 && group_size<=64;
         if (use_cache) {
             const auto launch_cache=[&](auto grouped) {
-           hipLaunchKernelGGL(( nint_matmul_activation_cache_kernel<decltype(grouped)::value>), 
+           hipLaunchKernelGGL(( nint_matmul_activation_cache_kernel<decltype(grouped)::value>),
                 dim3(dim3((output_rows + cache_warps - 1) / cache_warps)),
-                dim3(dim3(32, cache_warps)), shared_bytes, stream, 
+                dim3(dim3(32, cache_warps)), shared_bytes, stream,
                     bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(),
                     row_q_bit_offsets.data_ptr<int64_t>(),
                     subgroup_scale.data_ptr<uint8_t>(),
@@ -2589,13 +2589,13 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
     const int chunks_per_group =
         (static_cast<int>(group_size) + 3) / 4;
     const int total_chunks = groups * chunks_per_group;
-   hipLaunchKernelGGL(( nint_backward_input_kernel), 
+   hipLaunchKernelGGL(( nint_backward_input_kernel),
         dim3(
             (total_chunks + warps_per_block - 1) / warps_per_block,
             (activation_rows + rows_per_tile - 1) / rows_per_tile),
         dim3(dim3(32, warps_per_block)),
         0,
-        mfq_current_cuda_stream(), 
+        mfq_current_cuda_stream(),
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
@@ -2633,8 +2633,8 @@ mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( nint8_zero_decode_rows_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nint8_zero_decode_rows_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
             reinterpret_cast<const int8_t *>(
                 quantized.data_ptr<uint8_t>()),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
@@ -2688,8 +2688,8 @@ mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
     auto output = mfq_tensor_backend::empty(
         {activation_rows, output_rows}, input.options().dtype(mfq_tensor_backend::kFloat16));
     const hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nint_quantize_activation_kernel), 
-        dim3(dim3(activation_rows, groups)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( nint_quantize_activation_kernel),
+        dim3(dim3(activation_rows, groups)), dim3(32), 0, stream,
             input.data_ptr(),
             nullptr,
             quantized_input.data_ptr<int8_t>(),
@@ -2702,11 +2702,11 @@ mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
             0,
             input.scalar_type() == mfq_tensor_backend::kFloat32,
             false);
-   hipLaunchKernelGGL(( nint8_zero_matmul_kernel), 
+   hipLaunchKernelGGL(( nint8_zero_matmul_kernel),
         dim3(dim3((output_rows + 3) / 4, activation_rows)),
         dim3(dim3(32, 4)),
         0,
-        stream, 
+        stream,
             reinterpret_cast<const int8_t *>(
                 quantized.data_ptr<uint8_t>()),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),

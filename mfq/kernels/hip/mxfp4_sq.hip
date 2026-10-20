@@ -449,7 +449,7 @@ void launch_mmq(
                 mfq::sq::Layout q, int rows, hipStream_t stream) {
     const auto tasks = ((std::int64_t(q.outputs) + 3) / 4) * ((std::int64_t(rows) + M - 1) / M);
     const int blocks = int(std::min<std::int64_t>(tasks, 65535));
-   hipLaunchKernelGGL(( sq_mmq<M, T>), dim3(blocks), dim3(128), 0, stream, 
+   hipLaunchKernelGGL(( sq_mmq<M, T>), dim3(blocks), dim3(128), 0, stream,
         blob, row_q, row_symbol_byte_offsets, row_auxiliary,
         x, y, q, rows,
         nullptr, nullptr, 0, 0, q.outputs, 1, false);
@@ -475,7 +475,7 @@ void launch_routed_mmq(
     const auto tasks =
         std::int64_t(route_count) * ((std::int64_t(out_per_expert) + 3) / 4);
     const int blocks = int(std::min<std::int64_t>(tasks, 65535));
-   hipLaunchKernelGGL(( sq_mmq<1, __half, true>), dim3(blocks), dim3(128), 0, stream, 
+   hipLaunchKernelGGL(( sq_mmq<1, __half, true>), dim3(blocks), dim3(128), 0, stream,
         blob,
         row_q,
         row_symbol_byte_offsets,
@@ -525,8 +525,8 @@ void launch_backward_matrix(
     const dim3 grid(
         static_cast<unsigned>((q.width + 127) / 128),
         static_cast<unsigned>((q.outputs + output_tile - 1) / output_tile));
-   hipLaunchKernelGGL(( sq_backward_matrix<Rows>), 
-        dim3(grid), dim3(128), 0, stream, 
+   hipLaunchKernelGGL(( sq_backward_matrix<Rows>),
+        dim3(grid), dim3(128), 0, stream,
         blob, row_q, row_symbol_byte_offsets, row_auxiliary,
         output_gradient, partials, q, rows, output_tile);
 }
@@ -639,7 +639,7 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
         if (rows > 8 && (profitable || (force_tensor_core != nullptr && force_tensor_core[0] == '1')) &&
             (disable_tensor_core == nullptr || disable_tensor_core[0] != '1')) {
            hipLaunchKernelGGL(( sq_packed_gemm)
-                , dim3(dim3((q.outputs + 63) / 64, (rows + 31) / 32)), dim3(256), 0, stream, 
+                , dim3(dim3((q.outputs + 63) / 64, (rows + 31) / 32)), dim3(256), 0, stream,
                     {data, q_data, symbol_offsets, auxiliary, q}, x, y, rows, q.outputs, q.width);
         } else {
             dispatch_mmq(data, q_data, symbol_offsets, auxiliary, x, y, q, rows, stream);

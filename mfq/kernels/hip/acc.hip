@@ -48,8 +48,8 @@ mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_bac
     auto out = mfq_tensor_backend::empty_like(a);
     constexpr int BD = 256;
     if (a.scalar_type() == mfq_tensor_backend::kBFloat16) {
-       hipLaunchKernelGGL(( acc_bf16_kernel), 
-            dim3((n + BD - 1) / BD), dim3(BD), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( acc_bf16_kernel),
+            dim3((n + BD - 1) / BD), dim3(BD), 0, mfq_current_cuda_stream(),
             reinterpret_cast<const __hip_bfloat16*>(
                 a.data_ptr<mfq_bfloat16>()),
             reinterpret_cast<const __hip_bfloat16*>(
@@ -60,7 +60,7 @@ mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_bac
     } else {
         MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_cuda", [&] {
            hipLaunchKernelGGL(( acc_kernel<scalar_t>), dim3((n + BD - 1) / BD), dim3(BD), 0,
-                mfq_current_cuda_stream(), 
+                mfq_current_cuda_stream(),
                 a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(),
                 out.data_ptr<scalar_t>(), n);
         });
@@ -172,7 +172,7 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Te
     auto norm = mfq_tensor_backend::empty(a.sizes(), a.options().dtype(mfq_tensor_backend::kFloat32));
     MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_rms_norm_cuda", [&] {
         constexpr bool reuse_stored_sum = std::is_same_v<scalar_t, float>;
-       hipLaunchKernelGGL(( acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD, reuse_stored_sum>), dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD, reuse_stored_sum>), dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(),
             a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), weight.data_ptr<float>(),
             sum.data_ptr<scalar_t>(), norm.data_ptr<float>(), N, D,
             (float)eps, (float)weight_offset);
@@ -198,7 +198,7 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend
 
     auto sum = mfq_tensor_backend::empty_like(a);
     auto norm = mfq_tensor_backend::empty_like(a);
-   hipLaunchKernelGGL(( acc_rms_norm_kernel<mfq_half, mfq_half, ACC_RMS_BD, false>), dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( acc_rms_norm_kernel<mfq_half, mfq_half, ACC_RMS_BD, false>), dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(),
         a.data_ptr<mfq_half>(), b.data_ptr<mfq_half>(), weight.data_ptr<float>(),
         sum.data_ptr<mfq_half>(), norm.data_ptr<mfq_half>(), N, D,
         (float)eps, (float)weight_offset);
@@ -226,8 +226,8 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_bf16_cuda(
                 "acc_rms_norm_bf16: weight length mismatch");
     auto sum = mfq_tensor_backend::empty_like(a);
     auto norm = mfq_tensor_backend::empty_like(a);
-   hipLaunchKernelGGL(( acc_rms_norm_bf16_kernel<ACC_RMS_BD>), 
-        dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( acc_rms_norm_bf16_kernel<ACC_RMS_BD>),
+        dim3(N), dim3(ACC_RMS_BD), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __hip_bfloat16*>(a.data_ptr<mfq_bfloat16>()),
         reinterpret_cast<const __hip_bfloat16*>(b.data_ptr<mfq_bfloat16>()),
         weight.data_ptr<float>(),
@@ -325,7 +325,7 @@ std::vector<mfq_tensor_backend::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
     constexpr int BD = ACC_RMS_BD;
     const size_t shared_bytes = (size_t)D * sizeof(mfq_half);
    hipLaunchKernelGGL(( gemma4_attn_residual_pre_norms_f16_kernel<BD>)
-        , dim3(N), dim3(BD), shared_bytes, mfq_current_cuda_stream(), 
+        , dim3(N), dim3(BD), shared_bytes, mfq_current_cuda_stream(),
             residual.data_ptr<mfq_half>(), attn.data_ptr<mfq_half>(),
             attn_post_weight.data_ptr<float>(), dense_pre_weight.data_ptr<float>(),
             router_weight.data_ptr<float>(), moe_pre_weight.data_ptr<float>(),
@@ -425,7 +425,7 @@ mfq_tensor_backend::Tensor gemma4_ffn_merge_f16_cuda(
     constexpr int BD = ACC_RMS_BD;
     const size_t shared_bytes = (size_t)D * sizeof(mfq_half);
    hipLaunchKernelGGL(( gemma4_ffn_merge_f16_kernel<BD>)
-        , dim3(N), dim3(BD), shared_bytes, mfq_current_cuda_stream(), 
+        , dim3(N), dim3(BD), shared_bytes, mfq_current_cuda_stream(),
             dense.data_ptr<mfq_half>(), moe.data_ptr<mfq_half>(), residual.data_ptr<mfq_half>(),
             dense_post_weight.data_ptr<float>(), moe_post_weight.data_ptr<float>(),
             final_post_weight.data_ptr<float>(), layer_scale.data_ptr<mfq_half>(),
@@ -464,7 +464,7 @@ void decode_graph_commit_cuda(mfq_tensor_backend::Tensor next, mfq_tensor_backen
                 "decode_graph_commit: pos must be cuda int64[1]");
     MFQ_RUNTIME_CHECK(len.is_cuda() && len.is_contiguous() && len.scalar_type() == mfq_tensor_backend::kInt64 && len.numel() == 1,
                 "decode_graph_commit: len must be cuda int64[1]");
-   hipLaunchKernelGGL(( decode_graph_commit_kernel), dim3(1), dim3(1), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( decode_graph_commit_kernel), dim3(1), dim3(1), 0, mfq_current_cuda_stream(),
         next.data_ptr<int64_t>(), generated.data_ptr<int64_t>(), step.data_ptr<int64_t>(),
         input.data_ptr<int64_t>(), pos.data_ptr<int64_t>(), len.data_ptr<int64_t>());
 }

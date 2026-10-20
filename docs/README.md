@@ -29,7 +29,7 @@ matches what you want to do.
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
 - [HIP runtime validation](runtime/hip-validation.md)
 - [HIP model benchmarks](runtime/hip-model-benchmarks.md)
-- [C++ runtime layout](../cpp_runtime/README.md)
+- [C++ runtime layout](../csrc/README.md)
 
 ## APIs
 
@@ -45,6 +45,10 @@ through the inference API.
 ## Develop MFQ
 
 - [Architecture and contribution rules](../CONTRIBUTING.md)
+- [Current project architecture](architecture.md)
+- [Native runtime refactor design](refactor.md)
+- [Remaining refactor work and validation](plan.md)
+- [Open defects and validation gaps](bugs.md)
 - [Repository README](../README.md)
 
 Runtime support is checkpoint- and backend-dependent. Use the support matrix

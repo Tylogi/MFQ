@@ -54,7 +54,7 @@ def ext():
         build_directory = Path(_get_build_directory("mfq_hip", verbose=False))
         root = stage_sources(Path(_REPOSITORY_ROOT), build_directory)
         kernel = root / "mfq/kernels/hip"
-        ggml = root / "cpp_runtime/components/ggml"
+        ggml = root / "csrc/components/ggml"
         _module = load(
             name="mfq_hip",
             sources=[str(kernel / Path(source).name) for source in _SOURCES],
@@ -62,8 +62,8 @@ def ext():
             extra_include_paths=[
                 str(kernel),
                 str(root),
-                str(root / "cpp_runtime/backends/hip/include"),
-                str(root / "cpp_runtime/core/include"),
+                str(root / "csrc/backends/hip/include"),
+                str(root / "csrc/formats"),
                 str(ggml / "include"),
                 str(ggml / "src"),
                 str(ggml / "src/ggml-hip"),

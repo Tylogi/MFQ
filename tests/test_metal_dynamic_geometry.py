@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 
-METAL = Path(__file__).resolve().parents[1] / "cpp_runtime/backends/metal"
+METAL = Path(__file__).resolve().parents[1] / "csrc/backends/metal"
 
 
 @pytest.mark.parametrize(

@@ -376,7 +376,7 @@ std::vector<torch::Tensor> nint_make_qkx3_cuda(
     const int64_t blocks =
         (groups + kWarpsPerBlock - 1) / kWarpsPerBlock;
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
-   hipLaunchKernelGGL(( nint_make_qkx3_kernel), dim3(blocks), dim3(kQkxThreads), 0, stream, 
+   hipLaunchKernelGGL(( nint_make_qkx3_kernel), dim3(blocks), dim3(kQkxThreads), 0, stream,
         x.data_ptr<float>(),
         weight.data_ptr<float>(),
         scale.data_ptr<float>(),
@@ -407,7 +407,7 @@ std::vector<torch::Tensor> nint_make_qp_cuda(
     auto levels = torch::empty(
         x.sizes(), x.options().dtype(torch::kInt32));
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
-   hipLaunchKernelGGL(( nint_make_qp_kernel), dim3(x.size(0)), dim3(kWarpSize), 0, stream, 
+   hipLaunchKernelGGL(( nint_make_qp_kernel), dim3(x.size(0)), dim3(kWarpSize), 0, stream,
         x.data_ptr<float>(),
         weight.data_ptr<float>(),
         scale.data_ptr<float>(),

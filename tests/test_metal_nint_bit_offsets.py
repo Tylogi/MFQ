@@ -17,12 +17,12 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PYTHON_NINT = _ROOT / "mfq/kernels/metal/nint.py"
-_CPP_NINT = _ROOT / "cpp_runtime/backends/metal/ops/mlx_nint.cpp"
-_CPP_GROUPED = _ROOT / "cpp_runtime/backends/metal/ops/mlx_grouped_linear.cpp"
+_CPP_NINT = _ROOT / "csrc/backends/metal/ops/mlx_nint.cpp"
+_CPP_GROUPED = _ROOT / "csrc/backends/metal/ops/mlx_grouped_linear.cpp"
 _PYTHON_MOE = _ROOT / "mfq/kernels/metal/moe.py"
-_CPP_MOE = _ROOT / "cpp_runtime/backends/metal/ops/mlx_moe.cpp"
+_CPP_MOE = _ROOT / "csrc/backends/metal/ops/mlx_moe.cpp"
 _PYTHON_VQ = _ROOT / "mfq/kernels/metal/vq.py"
-_CPP_VQ = _ROOT / "cpp_runtime/backends/metal/ops/mlx_vq.cpp"
+_CPP_VQ = _ROOT / "csrc/backends/metal/ops/mlx_vq.cpp"
 
 _PACKED_METAL_SOURCES = (
     _PYTHON_NINT,

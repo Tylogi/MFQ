@@ -467,7 +467,7 @@ function Build-NativeSidecar {
     $nativeFlags = @(Get-ReleaseNativeFlags $Context)
     $cudaFlags = ($nativeFlags | ForEach-Object { "--compiler-options=$_" }) -join ' '
     Invoke-Checked $Context.Tools.CMake @(
-        "-S", (Join-Path $Context.ProjectDirectory "cpp_runtime"),
+        "-S", (Join-Path $Context.ProjectDirectory "csrc"),
         "-B", $Context.NativeBuildDirectory,
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",

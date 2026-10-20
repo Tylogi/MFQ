@@ -1078,7 +1078,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
     auto launch_assign = [&](const torch::Tensor& current_anchor) {
         if (entries == 256) {
            hipLaunchKernelGGL(( nvq2j_assign_kernel<256, uint8_t>)
-                , dim3(blocks), dim3(kAssignThreads), 0, stream, 
+                , dim3(blocks), dim3(kAssignThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1092,7 +1092,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
                     groups_per_row);
         } else if (entries == 1024) {
            hipLaunchKernelGGL(( nvq2j_assign_kernel<1024, int32_t>)
-                , dim3(blocks), dim3(kAssignThreads), 0, stream, 
+                , dim3(blocks), dim3(kAssignThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1106,7 +1106,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
                     groups_per_row);
         } else {
            hipLaunchKernelGGL(( nvq2j_assign_kernel<4096, int32_t>)
-                , dim3(blocks), dim3(kAssignThreads), 0, stream, 
+                , dim3(blocks), dim3(kAssignThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1126,7 +1126,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
         torch::Tensor& fitted_anchor) {
         if (entries == 256) {
            hipLaunchKernelGGL(( nvq2j_refit_anchor_kernel<256, uint8_t>)
-                , dim3(rows), dim3(kRefitThreads), 0, stream, 
+                , dim3(rows), dim3(kRefitThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1141,7 +1141,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
                     groups_per_row);
         } else if (entries == 1024) {
            hipLaunchKernelGGL(( nvq2j_refit_anchor_kernel<1024, int32_t>)
-                , dim3(rows), dim3(kRefitThreads), 0, stream, 
+                , dim3(rows), dim3(kRefitThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1156,7 +1156,7 @@ static std::vector<torch::Tensor> nvq2j_assign_part(
                     groups_per_row);
         } else {
            hipLaunchKernelGGL(( nvq2j_refit_anchor_kernel<4096, int32_t>)
-                , dim3(rows), dim3(kRefitThreads), 0, stream, 
+                , dim3(rows), dim3(kRefitThreads), 0, stream,
                     value.data_ptr<float>(),
                     objective_weight.data_ptr<float>(),
                     current_anchor.data_ptr<float>(),
@@ -1264,7 +1264,7 @@ static std::vector<torch::Tensor> nvq2j_search_banks_part(
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     if (codebooks.size(1) == 1024) {
        hipLaunchKernelGGL(( nvq2j_search_bank_chunks_kernel<1024>)
-            , dim3(chunk_count), dim3(kParallelSearchThreads), 0, stream, 
+            , dim3(chunk_count), dim3(kParallelSearchThreads), 0, stream,
                 xgroup.data_ptr<float>(),
                 wgroup.data_ptr<float>(),
                 codebooks.data_ptr<int8_t>(),
@@ -1278,7 +1278,7 @@ static std::vector<torch::Tensor> nvq2j_search_banks_part(
                 chunks_per_bank);
     } else {
        hipLaunchKernelGGL(( nvq2j_search_bank_chunks_kernel<4096>)
-            , dim3(chunk_count), dim3(kParallelSearchThreads), 0, stream, 
+            , dim3(chunk_count), dim3(kParallelSearchThreads), 0, stream,
                 xgroup.data_ptr<float>(),
                 wgroup.data_ptr<float>(),
                 codebooks.data_ptr<int8_t>(),
@@ -1296,7 +1296,7 @@ static std::vector<torch::Tensor> nvq2j_search_banks_part(
         (group_banks + kSearchReduceThreads - 1)
         / kSearchReduceThreads;
    hipLaunchKernelGGL(( nvq2j_reduce_bank_chunks_kernel)
-        , dim3(reduce_blocks), dim3(kSearchReduceThreads), 0, stream, 
+        , dim3(reduce_blocks), dim3(kSearchReduceThreads), 0, stream,
             chunk_error.data_ptr<float>(),
             chunk_scale.data_ptr<float>(),
             chunk_indices.data_ptr<int32_t>(),
@@ -1331,7 +1331,7 @@ torch::Tensor nvq2j_reassign_banks_cuda(
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     if (codebooks.size(1) == 1024) {
        hipLaunchKernelGGL(( nvq2j_reassign_bank_blocks_kernel<1024>)
-            , dim3(groups * kBanks), dim3(kAssignThreads), 0, stream, 
+            , dim3(groups * kBanks), dim3(kAssignThreads), 0, stream,
                 xgroup.data_ptr<float>(),
                 wgroup.data_ptr<float>(),
                 scales.data_ptr<float>(),
@@ -1341,7 +1341,7 @@ torch::Tensor nvq2j_reassign_banks_cuda(
                 static_cast<int>(valid_last));
     } else {
        hipLaunchKernelGGL(( nvq2j_reassign_bank_blocks_kernel<4096>)
-            , dim3(groups * kBanks), dim3(kAssignThreads), 0, stream, 
+            , dim3(groups * kBanks), dim3(kAssignThreads), 0, stream,
                 xgroup.data_ptr<float>(),
                 wgroup.data_ptr<float>(),
                 scales.data_ptr<float>(),

@@ -302,7 +302,7 @@ void silu_mul(
     const int grid = static_cast<int>(std::min<std::size_t>(
         4096, (elements + block - 1) / block));
     if (gate.scalar_type == ScalarType::float32) {
-       hipLaunchKernelGGL(( silu_mul_f32_kernel), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( silu_mul_f32_kernel), dim3(grid), dim3(block), 0, stream,
             gate.data_as<float>(), up.data_as<float>(), output.data_as<float>(), elements);
     } else if (gate.scalar_type == ScalarType::float16) {
         // Half2 reduces work for large tensors, but scalar launch geometry is
@@ -317,17 +317,17 @@ void silu_mul(
             const auto pairs = elements / 2;
             const int vector_grid = static_cast<int>(std::min<std::size_t>(
                 4096, (pairs + block - 1) / block));
-           hipLaunchKernelGGL(( silu_mul_f16x2_kernel), dim3(vector_grid), dim3(block), 0, stream, 
+           hipLaunchKernelGGL(( silu_mul_f16x2_kernel), dim3(vector_grid), dim3(block), 0, stream,
                 reinterpret_cast<const half2*>(gate.data_as<half>()),
                 reinterpret_cast<const half2*>(up.data_as<half>()),
                 reinterpret_cast<half2*>(output.data_as<half>()), elements);
         } else {
-           hipLaunchKernelGGL(( silu_mul_f16_kernel), dim3(grid), dim3(block), 0, stream, 
+           hipLaunchKernelGGL(( silu_mul_f16_kernel), dim3(grid), dim3(block), 0, stream,
                 gate.data_as<half>(), up.data_as<half>(),
                 output.data_as<half>(), elements);
         }
     } else if (gate.scalar_type == ScalarType::bfloat16) {
-       hipLaunchKernelGGL(( silu_mul_bf16_kernel), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( silu_mul_bf16_kernel), dim3(grid), dim3(block), 0, stream,
             gate.data_as<__hip_bfloat16>(), up.data_as<__hip_bfloat16>(),
             output.data_as<__hip_bfloat16>(), elements);
     } else {
@@ -351,10 +351,10 @@ void gelu_mul(
     const int grid = static_cast<int>(std::min<std::size_t>(
         4096, (elements + block - 1) / block));
     if (gate.scalar_type == ScalarType::float32) {
-       hipLaunchKernelGGL(( gelu_mul_kernel<float>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( gelu_mul_kernel<float>), dim3(grid), dim3(block), 0, stream,
             gate.data_as<float>(), up.data_as<float>(), output.data_as<float>(), elements);
     } else if (gate.scalar_type == ScalarType::float16) {
-       hipLaunchKernelGGL(( gelu_mul_kernel<half>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( gelu_mul_kernel<half>), dim3(grid), dim3(block), 0, stream,
             gate.data_as<half>(), up.data_as<half>(), output.data_as<half>(), elements);
     } else {
         throw std::invalid_argument("native gelu_mul dtype must be f32 or f16");
@@ -388,7 +388,7 @@ void linear_gate_beta(
     const int grid = static_cast<int>(std::min<std::size_t>(
         4096, (elements + block - 1) / block));
     if (alpha.scalar_type == ScalarType::float32) {
-       hipLaunchKernelGGL(( linear_gate_beta_kernel<float>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( linear_gate_beta_kernel<float>), dim3(grid), dim3(block), 0, stream,
             alpha.data_as<float>(), beta.data_as<float>(),
             dt_bias.data_as<float>(), a_log.data_as<float>(),
             gate_t.data_as<float>(), beta_t.data_as<float>(),
@@ -396,7 +396,7 @@ void linear_gate_beta(
             alpha.strides[0], alpha.strides[1], alpha.strides[2],
             beta.strides[0], beta.strides[1], beta.strides[2], stable_softplus);
     } else if (alpha.scalar_type == ScalarType::float16) {
-       hipLaunchKernelGGL(( linear_gate_beta_kernel<half>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( linear_gate_beta_kernel<half>), dim3(grid), dim3(block), 0, stream,
             alpha.data_as<half>(), beta.data_as<half>(),
             dt_bias.data_as<float>(), a_log.data_as<float>(),
             gate_t.data_as<float>(), beta_t.data_as<float>(),

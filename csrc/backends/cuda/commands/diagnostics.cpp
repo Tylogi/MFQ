@@ -1,0 +1,1829 @@
+#include "native/env.h"
+
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace mfq::cuda::internal {
+inline void finish_cuda_activity_trace() noexcept {
+    if(!mfq::cuda::env_lookup("MFQ_CUDA_ACTIVITY_PREFIX"))return;
+#ifdef _WIN32
+    const auto module=GetModuleHandleW(L"cuda_activity_collector.dll");
+    const auto finish=module?reinterpret_cast<int(*)()>(GetProcAddress(module,"MFQCompleteCudaActivityTrace")):nullptr;
+    const int status=finish?finish():0;
+    (void)std::fprintf(stderr,"native_cuda_activity_export status=%d\n",status);
+#endif
+}
+}
+#include "diagnostics/generation_result.h"
+#include "include/cuda_engine.h"
+#include "kernels/sampling_ops.h"
+#include "engine/decode_graph.h"
+#include "models/common/full_block.h"
+#include "native/tensor/backend.h"
+#include "model_source.h"
+#include "ops/execution/cuda_execution.h"
+#include "storage/weights/moe/expert_cache.h"
+#include <cuda_profiler_api.h>
+#include "engine/load_options.h"
+#include "models/qwen4_exp/mtp.h"
+#include "models/glm5_next/mtp.h"
+#include "storage/weights/loaders/weight.h"
+#include "cli.h"
+namespace mfq::cuda::diagnostics {
+
+inline int generate_diagnostic_tokens(CudaLoadOptions options,
+        std::vector<int64_t> prompt, int tokens, bool profile) {
+    using Clock = std::chrono::steady_clock;
+    CudaEngineOptions engine_options;
+    static_cast<CudaLoadOptions&>(engine_options) = std::move(options);
+    const auto start = Clock::now();
+    auto engine = load_cuda_engine(std::move(engine_options));
+    const auto loaded = Clock::now();
+    MfqSamplingParams sampling;
+    sampling.max_tokens = tokens;
+    sampling.temperature = 0;
+    sampling.top_k = 1;
+    if (profile) MFQ_CUDA_CHECK(cudaProfilerStart());
+    GenerationResult result;
+    try { result = collect_engine_steps(*engine, std::move(prompt), sampling); }
+    catch (...) { if (profile) cudaProfilerStop(); throw; }
+    if (profile) MFQ_CUDA_CHECK(cudaProfilerStop());
+    const auto finished = Clock::now();
+    const auto first = result.tokens.empty() ? finished : result.first_token;
+    const auto seconds = [](auto end, auto begin) {
+        return std::chrono::duration<double>(end - begin).count();
+    };
+    const auto decode_tokens = result.tokens.empty() ? 0 : result.tokens.size() - 1;
+    const auto decode_seconds = seconds(finished, first);
+    std::cout << "generation_path=engine_step\n"
+        << "load_sec=" << seconds(loaded, start) << '\n'
+        << "prefill_sec=" << seconds(first, loaded) << '\n'
+        << "decode_tokens=" << decode_tokens << '\n'
+        << "decode_sec=" << decode_seconds << '\n';
+    if (decode_tokens && decode_seconds > 0)
+        std::cout << "decode_tok_per_s=" << decode_tokens / decode_seconds << '\n';
+    std::cout << "generated_ids=";
+    for (size_t i = 0; i < result.tokens.size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << result.tokens[i];
+    }
+    std::cout << '\n';
+    return 0;
+}
+
+} // namespace mfq::cuda::diagnostics
+
+namespace mfq::cuda::internal {
+
+inline void report_source_file_io(const mfq::ModelSource* source, const char* phase) noexcept {
+    const char* report = mfq::cuda::env_lookup("MFQ_REPORT_FILE_IO");
+    if (!source || !report || report[0] != '1') return;
+    const auto stats = source->file_read_stats();
+    try {
+        std::cout << "source_file_io phase=" << phase
+                  << " mode=" << mfq::file_read_mode_name(stats.mode)
+                  << " files=" << stats.files << " calls=" << stats.calls
+                  << " logical_bytes=" << stats.logical_bytes << " physical_bytes=" << stats.physical_bytes
+                  << " errors=" << stats.errors << " staging_bytes=" << stats.staging_bytes
+                  << " staging_peak_sum_bytes=" << stats.staging_peak_bytes
+                  << " staging_cached_bytes=" << stats.staging_cached_bytes << " staging_allocations=" << stats.staging_allocations
+                  << " read_ms=" << double(stats.read_nanoseconds) / 1e6 << std::endl;
+    } catch (const std::exception&) { } // Optional diagnostics cannot abort generation.
+}
+
+inline mfq_tensor_backend::Tensor diagnostic_decode_input(
+        const mfq_tensor_backend::Tensor& predicted,
+        const mfq_tensor_backend::Tensor& forced,int step) {
+    return forced.defined()?forced.narrow(0,step,1).view({1,1}):predicted.view({1,1});
+}
+
+template <typename Model>
+int generate_diagnostic_tokens(
+        CudaExecutionContext& execution,
+        Model& model,
+        mfq_tensor_backend::Tensor ids,
+        int gen,
+        bool profile,
+        std::chrono::steady_clock::time_point t0,
+        std::chrono::steady_clock::time_point t1,
+        const std::vector<int64_t>& decode_inputs = {},
+        const std::unordered_set<int64_t>& stop_token_ids = {},
+        bool production_prefill = false) {
+        if(!decode_inputs.empty() && (gen<=1 || decode_inputs.size()!=size_t(gen-1)))
+            throw std::invalid_argument("diagnostic decode input count differs from gen-1");
+        mfq_tensor_backend::Tensor forced_inputs;
+        if(!decode_inputs.empty())
+            forced_inputs=mfq_tensor_backend::tensor(decode_inputs).to(mfq_tensor_backend::kCUDA);
+        std::cout<<"decode_input_mode="<<(forced_inputs.defined()?"forced":"generated")<<"\n";
+        auto& profiler = execution.profiler;
+        report_source_file_io(model.source.get(), "prefill_begin");
+        profiler.reset();
+        auto next = [&] {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(production_prefill && ids.size(1)>128 && !qwen4_layer_major_prefill_eligible(model,ids.size(1)))
+                    throw std::invalid_argument("router audit requires production prefill; enable MFQ_MOE_PIPELINE and MFQ_MOE_PREFILL_LAYER");
+                if(production_prefill && qwen4_layer_major_prefill_eligible(model,ids.size(1))) {
+                    std::cout<<"diagnostic_prefill path=production_layer_major tokens="<<ids.size(1)<<std::endl;
+                    auto hidden=qwen4_layer_major_prefill_hidden(model,ids,1024,true);
+                    return model.next_token_from_hidden(std::move(hidden));
+                }
+            }
+            return model.next_token(ids);
+        }();
+        mfq_cuda_synchronize();
+        auto t2 = std::chrono::steady_clock::now();
+        report_cuda_memory(execution.config, "prefill");
+        report_source_file_io(model.source.get(), "prefill");
+        const char * empty_cache_env = mfq::cuda::env_lookup("MFQ_EMPTY_CACHE_BEFORE_GRAPH");
+        if (empty_cache_env != nullptr && std::atoi(empty_cache_env) != 0) {
+            mfq_cuda_empty_cache();
+            report_cuda_memory(execution.config, "prefill_empty_cache");
+        }
+        profiler.report("prefill");
+        profiler.reset();
+        if (gen == 0) return 0;
+        int produced = 1;
+        bool hit_eos = !stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>());
+        auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+        cudaStream_t stream = mfq_get_current_cuda_stream().stream();
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
+                                   sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
+        const char* graph_env = mfq::cuda::env_lookup("MFQ_CUDA_GRAPH");
+        const char * profile_graph_env = mfq::cuda::env_lookup("MFQ_PROFILE_CUDA_GRAPH");
+        const bool profile_cuda_graph = profile && profile_graph_env != nullptr &&
+            std::atoi(profile_graph_env) != 0;
+        bool use_cuda_graph =
+            !forced_inputs.defined() &&
+            (graph_env == nullptr || graph_env[0] != '0') &&
+            !model.metadata.flash_next &&
+            mfq_cuda_graph_capture_supported() &&
+            execution.dsv4_cpu_offload_layers.empty() &&
+            execution.dense_cpu_layer_count == 0 &&
+            !execution.stores.moe_expert_cache &&
+            model_parallel_cuda_graph_enabled(execution) &&
+            (!profile || profile_cuda_graph) && gen > 1;
+        const char * cuda_profiler_env = mfq::cuda::env_lookup("MFQ_CUDA_PROFILER_RANGE");
+        const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
+            std::atoi(cuda_profiler_env) != 0;
+        auto decode_replay_t0 = t2;
+        auto first_decode_done=t2;
+        bool measured_first_decode=false;
+        auto halfway_done=t2;
+        bool measured_halfway=false;
+        auto last_window_done=t2;
+        bool measured_last_window=false;
+        if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
+        if (use_cuda_graph && !hit_eos) {
+            auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_pos = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_len = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_step = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto graph_stream = mfq_get_stream_from_pool(false);
+            MfqCudaGuard graph_device_guard(
+                graph_stream.device_index());
+            const auto& parallel = execution.tensor_parallel.enabled()
+                ? execution.tensor_parallel
+                : execution.expert_parallel;
+            auto graph_compute_streams =
+                make_cuda_graph_compute_streams(graph_stream, parallel);
+            auto graph_stream_guards =
+                activate_cuda_graph_compute_streams(
+                    graph_compute_streams);
+            cudaStream_t graph_raw_stream = graph_stream.stream();
+
+            int64_t pos_h = model.cache_pos;
+            int64_t len_h = pos_h + 1;
+            int64_t step_h = 1;
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_input.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
+                                       sizeof(int64_t), cudaMemcpyDeviceToDevice, graph_raw_stream));
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_pos.template data_ptr<int64_t>(), &pos_h,
+                                       sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_len.template data_ptr<int64_t>(), &len_h,
+                                       sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_step.template data_ptr<int64_t>(), &step_h,
+                                       sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
+
+            MfqCudaGraph graph;
+            mfq_tensor_backend::Tensor static_next;
+            const int64_t planned_len = model.cache_pos + gen;
+            const int64_t attention_parts = decode_graph_attention_parts(
+                planned_len, FullBlock::kDecodeAttentionMaxParts);
+            {
+                DecodeGraphBranchScope branch_scope(
+                    execution.decode_graph_serial_branches);
+                prepare_decode_graph_memory(model, graph, [&]() {
+                    (void)model.next_token_static(
+                        static_input, static_pos, static_len,
+                        {planned_len, attention_parts});
+                }, cuda_graph_participant_streams(
+                    graph_compute_streams,
+                    execution.model_parallel_collectives));
+                profiler.reset();
+                profiler.graph_events = profile_cuda_graph;
+                graph.capture_begin();
+                static_next = profiler.measure("decode.model_total", [&]() {
+                    return model.next_token_static(
+                        static_input, static_pos, static_len,
+                        {planned_len, attention_parts});
+                });
+                profiler.measure("decode.commit", [&]() {
+                    decode_graph_commit_cuda(
+                        static_next, generated_cuda, static_step,
+                        static_input, static_pos, static_len);
+                    return 0;
+                });
+                graph.capture_end();
+            }
+            mfq_debug_dump_cuda_graph(graph);
+            report_cuda_memory(execution.config, "graph_captured");
+
+            decode_replay_t0 = std::chrono::steady_clock::now();
+            for (int i = 1; i < gen; ++i) {
+                graph.replay();
+                produced = i + 1;
+                if (!stop_token_ids.empty()) {
+                    MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
+                    if (stop_token_ids.contains(static_next.template item<int64_t>())) {
+                        hit_eos = true;
+                        break;
+                    }
+                }
+            }
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
+        } else if (!hit_eos) {
+            for (int i = 1; i < gen; ++i) {
+                next = profiler.measure("decode.eager_model", [&]() {
+                    return model.next_token(diagnostic_decode_input(next,forced_inputs,i-1));
+                });
+                profiler.measure("decode.eager_commit", [&]() {
+                    MFQ_CUDA_CHECK(cudaMemcpyAsync(
+                        generated_cuda.template data_ptr<int64_t>() + i,
+                        next.template data_ptr<int64_t>(), sizeof(int64_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    return 0;
+                });
+                produced = i + 1;
+                if (!stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>())) {
+                    hit_eos = true;
+                    break;
+                }
+                if(i==1 && model.metadata.flash_next && stop_token_ids.empty()) {
+                    mfq_cuda_synchronize();first_decode_done=std::chrono::steady_clock::now();
+                    measured_first_decode=true;
+                }
+                if(gen>=4 && i==gen/2 && model.metadata.flash_next && stop_token_ids.empty()) {
+                    mfq_cuda_synchronize();halfway_done=std::chrono::steady_clock::now();
+                    measured_halfway=true;
+                }
+                if(gen>256 && i==gen-1-128 && model.metadata.flash_next && stop_token_ids.empty()) {
+                    mfq_cuda_synchronize();last_window_done=std::chrono::steady_clock::now();
+                    measured_last_window=true;
+                }
+            }
+        }
+        mfq_cuda_synchronize();
+        if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStop());
+        auto t3 = std::chrono::steady_clock::now();
+        report_cuda_memory(execution.config, "decode_complete");
+        profiler.report("decode");
+        gen = produced;
+        auto generated_tensor = generated_cuda.narrow(0, 0, produced).to(mfq_tensor_backend::kCPU).contiguous();
+        auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
+        double load_s = std::chrono::duration<double>(t1 - t0).count();
+        double prefill_s = std::chrono::duration<double>(t2 - t1).count();
+        double decode_s = std::chrono::duration<double>(t3 - t2).count();
+        double decode_replay_s = std::chrono::duration<double>(t3 - decode_replay_t0).count();
+        std::cout << "load_sec=" << load_s << "\n";
+        std::cout << "prefill_sec=" << prefill_s << "\n";
+        std::cout << "finish_reason=" << (hit_eos ? "stop" : "length") << "\n";
+        std::cout << "decode_tokens=" << std::max(0, gen - 1) << "\n";
+        std::cout << "decode_setup_sec=" << (decode_s - decode_replay_s) << "\n";
+        std::cout << "decode_replay_sec=" << decode_replay_s << "\n";
+        if(measured_first_decode) {
+            const double first_sec=std::chrono::duration<double>(first_decode_done-t2).count();
+            const double after_first_sec=std::chrono::duration<double>(t3-first_decode_done).count();
+            std::cout<<"decode_first_step_sec="<<first_sec<<"\n"
+                <<"decode_after_first_tokens="<<std::max(0,gen-2)<<"\n"
+                <<"decode_after_first_sec="<<after_first_sec<<"\n";
+            if(gen>2)std::cout<<"decode_after_first_tok_per_s="<<double(gen-2)/after_first_sec<<"\n";
+        }
+        if(measured_halfway) {
+            const int head_tokens=gen/2,tail_tokens=gen-1-head_tokens;
+            const double head_sec=std::chrono::duration<double>(halfway_done-t2).count();
+            const double tail_sec=std::chrono::duration<double>(t3-halfway_done).count();
+            std::cout<<"decode_head_tokens="<<head_tokens<<"\n"
+                <<"decode_head_sec="<<head_sec<<"\n"
+                <<"decode_tail_tokens="<<tail_tokens<<"\n"
+                <<"decode_tail_sec="<<tail_sec<<"\n"
+                <<"decode_tail_tok_per_s="<<double(tail_tokens)/tail_sec<<"\n";
+        }
+        if(measured_last_window) {
+            const double seconds=std::chrono::duration<double>(t3-last_window_done).count();
+            std::cout<<"decode_last_128_tokens=128\n"
+                <<"decode_last_128_begin_cache_position="<<ids.size(1)+gen-1-128<<"\n"
+                <<"decode_last_128_sec="<<seconds<<"\n"
+                <<"decode_last_128_tok_per_s="<<128./seconds<<"\n";
+        }
+        std::cout << "decode_sec=" << decode_s << "\n";
+        if (gen > 1) std::cout << "decode_tok_per_s=" << (double)(gen - 1) / decode_s << "\n";
+        if (gen > 1) std::cout << "decode_steady_tok_per_s=" << (double)(gen - 1) / decode_replay_s << "\n";
+        std::cout << "generated_ids=";
+        for (int64_t i = 0; i < generated_tensor.numel(); ++i) {
+            if (i) std::cout << ",";
+            std::cout << generated_ptr[i];
+        }
+        std::cout << "\n";
+        report_source_file_io(model.source.get(), "decode");
+        if (execution.stores.moe_expert_cache) {
+            print_moe_expert_cache_stats(
+                execution.stores.moe_expert_cache, std::cout);
+        }
+        finish_cuda_activity_trace();
+        return 0;
+ }
+
+} // namespace mfq::cuda::internal
+#include "engine/model_registry.h"
+#include "diagnostics/backend_checks.h"
+#include "diagnostics/model_checks.h"
+#include "diagnostics/runtime_checks.h"
+#include "diagnostics/flash_next_mtp.h"
+#include "minicpmo45.h"
+#include "ops/execution/cuda_execution.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "ops/execution/execution_options.h"
+#include "kernels/deepseek_v41.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace mfq::cuda {
+
+struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
+    std::string check_linear, check_linear_cpu, check_linear_gate;
+    std::string check_tp_linear, check_ep_moe;
+    std::string check_tp_axis_arg = "output";
+    std::string check_linear_group, check_q8_embedding;
+    std::string check_gdn_input, check_gdn_output, check_gdn_state;
+    std::string check_linear_conv_input, check_linear_conv_output;
+    std::string check_mfe_tensor, check_dsv4_output_a;
+    std::string prefill_sweep_arg;
+    std::string check_moe_tokens = "1,2,4,8,16,32,64,128,256";
+    std::string block_trace_reference, block_trace_output;
+    std::string check_tokenizer_text =
+        "MFQ tokenizer check: hello, world! <think>";
+    std::string bench_qwen35_mtp;
+    std::string kl_mmq_arg = "default";
+    int bench_qwen35_mtp_reps = 3;
+    int64_t minicpmo_eval_vision_batch_size = 16;
+    int64_t block_trace_start = 0;
+    int64_t block_trace_count = 0;
+    int prefill_repeat = 0;
+    int prefill_sweep_reps = 5;
+    int check_linear_m = 1;
+    int check_linear_reps = 200;
+    int check_tp_m = 1;
+    int check_ep_moe_tokens = 1;
+    int check_ep_moe_routes = 2;
+    int check_gdn_tokens = 512;
+    int check_gdn_q_heads = 16;
+    int check_gdn_v_heads = 32;
+    int check_gdn_head_dim = 128;
+    int check_linear_conv_tokens = 512;
+    int check_linear_conv_q_heads = 16;
+    int check_linear_conv_v_heads = 32;
+    int check_linear_conv_key_dim = 128;
+    int check_linear_conv_value_dim = 128;
+    int check_linear_conv_kernel = 4;
+    int check_gemma_geglu_layer = -1;
+    int check_gemma_geglu_reps = 100;
+    int check_moe_layer = -1;
+    int check_moe_reps = 100;
+    int check_mfe_tokens = 1;
+    int check_mfe_routes = 2;
+    int check_mfe_reps = 100;
+    int check_mfe_split_width = 0;
+    int check_dsv4_output_a_batch = 1;
+    int check_dsv4_output_a_reps = 200;
+    int check_attention_decode = 0;
+    int check_attention_reps = 200;
+    int check_attention_head_dim = 256;
+    int check_attention_window = 4096;
+    int compare_mma_decode_steps = 1;
+    int compare_mma_decode_planned_len = 0;
+    bool profile = false;
+    bool ignore_eos = false;
+    bool compare_ffn_transfer_phases = false;
+    bool compare_router_lookahead = false;
+    bool compare_rotary_fusion = false;
+    bool compare_attention_grouping = false;
+    bool compare_mhc_fusion = false;
+    bool compare_mhc_shared_norm = false;
+    bool compare_mhc_dense_fusion = false;
+    bool compare_mhc_packed_groups = false;
+    bool compare_mhc_fixed_formats = false;
+    bool compare_mhc_async_normalized = false;
+    bool compare_gdn_fixed_geometry = false;
+    bool compare_gdn_inplace_state = false;
+    bool compare_qsa_fusion = false;
+    bool compare_mfe_parallel_gu = false;
+    bool compare_mfe_gpu_bundle = false;
+    bool compare_mfe_default_math = false;
+    bool compare_mfe_e8_narrow = false;
+    bool compare_mfe_shared_first = false;
+    bool compare_mfe_early_gu = false;
+    bool compare_cpu_transfer_budget = false;
+    bool compare_cpu_background_calibration = false;
+    bool compare_router_topk = false;
+    bool compare_route_poll = false;
+    bool compare_window_flush = false;
+    bool compare_early_no_cpu_ready = false;
+    bool compare_gpu_only_cpu_wait = false;
+    bool compare_fixed_gpu_timing = false;
+    bool compare_window_input_views = false;
+    bool compare_route_spin = false;
+    bool compare_moe_plan_reuse = false;
+    bool compare_shared_gate_fusion = false;
+    bool compare_graph_optimizations = false;
+    int comparison_rounds = 1;
+    bool comparison_phase_timings = false;
+    bool compare_host_pin = false;
+    bool compare_resident_overlap = false;
+    bool compare_dma_graph_batch = false;
+    bool compare_ram_field_packing = false;
+    bool compare_warp_multi_sum = false;
+    int warmup_prefill = -1;
+    std::string router_lookahead_audit;
+    std::string decode_inputs_file;
+    std::vector<int64_t> decode_inputs;
+    bool check_backend_bf16_add = false;
+    bool check_backend_argmax = false;
+    bool compare_mma_attention = false;
+    bool compare_decode_splitk = false;
+    bool compare_mma_decode = false;
+    bool compare_nvq_vec4 = false;
+    bool check_gemma4_swa = false;
+    bool check_glm_dsa = false;
+    bool check_dsv4_attention = false;
+    bool check_dsv4_hc = false;
+    bool check_deepseek_v41 = false;
+    bool check_text_session_state = false;
+    bool check_qwen35_mtp = false;
+    bool check_continuous_batching = false;
+    int check_continuous_batching_requests = 2;
+    bool check_engine_isolation = false;
+    bool check_flash_next = false;
+    bool check_qwen4_decode_hidden = false;
+    bool check_flash_next_mtp = false;
+    bool compare_dsv4_hc_ops = false;
+    bool compare_dsv4_hc_model = false;
+    bool check_attention_swa_decode = false;
+    bool check_mfe_routed_input = false;
+    bool check_mfe_benchmark_only = false;
+    bool check_runtime_assets = false;
+    bool check_mfq_container = false;
+    bool minicpmo_eval_batch = false;
+
+    int runtime_comparison_modes() const {
+        return int(compare_ffn_transfer_phases) + int(compare_router_lookahead) +
+               int(compare_rotary_fusion) + int(compare_attention_grouping) + int(compare_mhc_fusion) + int(compare_mhc_shared_norm) + int(compare_mhc_dense_fusion) + int(compare_mhc_packed_groups) + int(compare_mhc_fixed_formats) + int(compare_mhc_async_normalized) + int(compare_gdn_fixed_geometry) + int(compare_gdn_inplace_state) + int(compare_qsa_fusion) + int(compare_mfe_parallel_gu) + int(compare_mfe_gpu_bundle) + int(compare_mfe_default_math) + int(compare_mfe_e8_narrow) + int(compare_mfe_shared_first) + int(compare_mfe_early_gu) + int(compare_cpu_transfer_budget) + int(compare_cpu_background_calibration) +
+               int(compare_router_topk) + int(compare_route_poll) + int(compare_window_flush) + int(compare_early_no_cpu_ready) + int(compare_gpu_only_cpu_wait) + int(compare_fixed_gpu_timing) + int(compare_window_input_views) + int(compare_route_spin) + int(compare_moe_plan_reuse) + int(compare_shared_gate_fusion) + int(compare_graph_optimizations) + int(compare_host_pin) + int(compare_resident_overlap) + int(compare_dma_graph_batch) + int(compare_ram_field_packing) + int(compare_warp_multi_sum);
+    }
+    const char* runtime_comparison_name() const {
+        if (compare_route_poll) return "route_poll_comparison";
+        if (compare_window_flush) return "window_flush_comparison";
+        if (compare_early_no_cpu_ready) return "early_no_cpu_ready_comparison";
+        if (compare_gpu_only_cpu_wait) return "gpu_only_cpu_wait_comparison";
+        if (compare_fixed_gpu_timing) return "fixed_gpu_timing_comparison";
+        if (compare_window_input_views) return "window_input_views_comparison";
+        if (compare_route_spin) return "route_spin_comparison";
+        if (compare_moe_plan_reuse) return "moe_plan_reuse_comparison";
+        if (compare_mfe_default_math) return "mfe_default_math_comparison";
+        if (compare_mfe_e8_narrow) return "mfe_e8_narrow_comparison";
+        if (compare_shared_gate_fusion) return "shared_gate_fusion_comparison";
+        if (compare_graph_optimizations) return "graph_optimizations_comparison";
+        if (compare_host_pin) return "host_pin_comparison";
+        if (compare_resident_overlap) return "resident_overlap_comparison";
+        if (compare_dma_graph_batch) return "dma_graph_batch_comparison";
+        if (compare_ram_field_packing) return "ram_field_packing_comparison";
+        if (compare_warp_multi_sum) return "warp_multi_sum_comparison";
+        if (compare_router_topk) return "router_topk_comparison";
+        if (compare_mhc_fusion) return "mhc_fusion_comparison";
+        if (compare_mhc_shared_norm) return "mhc_shared_norm_comparison";
+        if (compare_mhc_dense_fusion) return "mhc_dense_fusion_comparison";
+        if (compare_mhc_packed_groups) return "mhc_packed_groups_comparison";
+        if (compare_mhc_fixed_formats) return "mhc_fixed_formats_comparison";
+        if (compare_mhc_async_normalized) return "mhc_async_normalized_comparison";
+        if (compare_gdn_fixed_geometry) return "gdn_fixed_geometry_comparison";
+        if (compare_gdn_inplace_state) return "gdn_inplace_state_comparison";
+        if (compare_qsa_fusion) return "qsa_fusion_comparison";
+        if (compare_mfe_parallel_gu) return "mfe_parallel_gu_comparison";
+        if (compare_mfe_gpu_bundle) return "mfe_gpu_bundle_comparison";
+        if (compare_mfe_shared_first) return "mfe_shared_first_comparison";
+        if (compare_mfe_early_gu) return "mfe_early_gate_up_comparison";
+        if (compare_cpu_background_calibration) return "cpu_background_calibration_comparison";
+        if (compare_cpu_transfer_budget) return "cpu_transfer_budget_comparison";
+        if (compare_attention_grouping) return "attention_grouping_comparison";
+        if (compare_rotary_fusion) return "rotary_fusion_comparison";
+        if (compare_router_lookahead) return "router_lookahead_comparison";
+        return "ffn_transfer_comparison";
+    }
+};
+
+} // namespace mfq::cuda
+
+using namespace mfq::cuda::internal;
+
+using namespace mfq::cuda::diagnostics;
+
+namespace {
+class ScopedDiagnosticEnvironment {
+    std::string name_;
+    std::string previous_;
+    bool present_;
+public:
+    explicit ScopedDiagnosticEnvironment(const char* name) : name_(name) {
+        const char* previous = mfq::cuda::env_lookup(name);
+        present_ = previous != nullptr;
+        if (previous) previous_ = previous;
+    }
+    void set(const char* value) {
+        mfq::cuda::env_set(name_.c_str(), value);
+    }
+    ~ScopedDiagnosticEnvironment() {
+        if (present_) mfq::cuda::env_set(name_.c_str(), previous_.c_str());
+        else mfq::cuda::env_clear(name_.c_str());
+    }
+};
+
+struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
+    explicit DiagnosticsCommand(mfq::cuda::DiagnosticsCommandOptions options)
+        : mfq::cuda::DiagnosticsCommandOptions(std::move(options)) {}
+    int run() { return with_command_errors([&]() -> int {
+        if (check_engine_isolation) {
+            mfq::cuda::CudaEngineOptions options;
+            static_cast<mfq::cuda::CudaLoadOptions&>(options) =
+                static_cast<const mfq::cuda::CudaLoadOptions&>(*this);
+            return run_cuda_engine_isolation_check(std::move(options));
+        }
+        CudaExecutionContext execution;
+        // Operator-only checks do not require loading a model.
+        if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
+        if (check_backend_argmax) return run_backend_argmax_check(248320, 2000);
+        MFQ_RUNTIME_CHECK(!comparison_phase_timings || runtime_comparison_modes(),
+            "comparison phase timings require a runtime comparison");
+        if(runtime_comparison_modes()) {
+            MFQ_RUNTIME_CHECK(mfq::cuda::runtime_options::transfer_cache() &&
+                !mfq::cuda::runtime_options::mapped_copy(),
+                "runtime comparison requires MFQ_MOE_TRANSFER_CACHE=1 and MFQ_MOE_MAPPED_COPY=0");
+            const bool free_gpu_comparison=decode_inputs.empty() &&
+                (compare_route_spin || compare_moe_plan_reuse || compare_shared_gate_fusion || compare_graph_optimizations || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion) &&
+                execution.config.moe_ram_pcie_fraction && *execution.config.moe_ram_pcie_fraction==1.0;
+            MFQ_RUNTIME_CHECK(gen>1 && (!decode_inputs.empty() || free_gpu_comparison) && !profile &&
+                runtime_comparison_modes() == 1 && router_lookahead_audit.empty() &&
+                !execution.config.moe_mapped_gather && execution.config.moe_preload_all &&
+                execution.config.moe_two_stage_ffn && moe_gpu_cache_gb>0,
+                "runtime comparison requires fixed inputs or an eligible GPU-only free-decode comparison, complete preload, two-stage FFN and profiling disabled");
+            MFQ_RUNTIME_CHECK(!compare_attention_grouping ||
+                execution.config.diagnostic_nint_group,
+                "attention-grouping comparison requires grouped NINT enabled");
+            MFQ_RUNTIME_CHECK(!compare_mhc_fusion || (execution.config.gr_fused_projections &&
+                execution.config.gr_native_projection_input),
+                "residual fusion comparison requires native packed projections");
+            MFQ_RUNTIME_CHECK(!(compare_gpu_only_cpu_wait || compare_fixed_gpu_timing || compare_graph_optimizations) || (execution.config.moe_ram_pcie_fraction &&
+                *execution.config.moe_ram_pcie_fraction==1.0),
+                "fixed GPU comparison requires MFQ_MOE_RAM_PCIE_FRACTION=1");
+            execution.config.moe_residency_adapt=false;
+            std::cout<<std::unitbuf;
+        }
+        setup_cuda_load(*this, execution);
+        if(runtime_comparison_modes()) {
+            std::cout<<runtime_comparison_name()<<"_setup\n";
+            print_moe_expert_cache_stats(execution.stores.moe_expert_cache,std::cout);
+        }
+        if (!check_linear_cpu.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-linear-cpu requires --model");
+            }
+            auto gate_mode = InputGateMode::None;
+            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
+            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
+            else if (!check_linear_gate.empty()) {
+                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
+            }
+            return run_cpu_linear_check(
+                execution, model_path, check_linear_cpu, check_linear_m,
+                gate_mode, check_linear_reps);
+        }
+        if (!check_linear.empty()) {
+            if (model_path.empty()) throw std::runtime_error("--check-linear requires --model");
+            auto gate_mode = InputGateMode::None;
+            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
+            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
+            else if (!check_linear_gate.empty()) {
+                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
+            }
+            return run_linear_check(
+                execution, model_path, check_linear, check_linear_m, gate_mode,
+                check_linear_reps);
+        }
+        if (!check_tp_linear.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error(
+                    "--check-tp-linear requires --model");
+            }
+            const TensorParallelAxis axis =
+                check_tp_axis_arg == "output"
+                ? TensorParallelAxis::Output
+                : check_tp_axis_arg == "input"
+                ? TensorParallelAxis::Input
+                : throw std::runtime_error(
+                    "--check-tp-axis must be output or input");
+            return run_tensor_parallel_linear_check(
+                execution, model_path, check_tp_linear,
+                axis, check_tp_m);
+        }
+        if (!check_ep_moe.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error(
+                    "--check-ep-moe requires --model");
+            }
+            return run_expert_parallel_moe_check(
+                execution, model_path, check_ep_moe,
+                check_ep_moe_tokens,
+                check_ep_moe_routes);
+        }
+        if (!check_linear_group.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-linear-group requires --model");
+            }
+            return run_linear_group_check(
+                execution, model_path, check_linear_group, check_linear_m,
+                check_linear_reps);
+        }
+        if (!check_q8_embedding.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-q8-embedding requires --model");
+            }
+            return run_q8_embedding_check(
+                execution, model_path, check_q8_embedding);
+        }
+        if (!check_gdn_input.empty()) {
+            if (check_gdn_output.empty() || check_gdn_state.empty()) {
+                throw std::runtime_error(
+                    "--check-gdn-input requires --check-gdn-output and --check-gdn-state");
+            }
+            return run_gdn_operator_check(
+                check_gdn_input, check_gdn_output, check_gdn_state,
+                check_gdn_tokens, check_gdn_q_heads,
+                check_gdn_v_heads, check_gdn_head_dim);
+        }
+        if (!check_linear_conv_input.empty()) {
+            if (check_linear_conv_output.empty()) {
+                throw std::runtime_error(
+                    "--check-linear-conv-input requires --check-linear-conv-output");
+            }
+            return run_linear_conv_operator_check(
+                check_linear_conv_input, check_linear_conv_output,
+                check_linear_conv_tokens, check_linear_conv_q_heads,
+                check_linear_conv_v_heads, check_linear_conv_key_dim,
+                check_linear_conv_value_dim, check_linear_conv_kernel,
+                1.0e-6);
+        }
+        if (check_gemma_geglu_layer >= 0) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-gemma-geglu-layer requires --model");
+            }
+            return run_gemma_geglu_check(
+                execution, model_path, check_gemma_geglu_layer,
+                check_gemma_geglu_reps);
+        }
+        if (check_mfq_container) {
+            if (model_path.empty()) {
+                throw std::runtime_error(
+                    "--check-mfq-container requires --model");
+            }
+            auto model_source = mfq::open_model_source(model_path);
+            const auto& mfq = *model_source;
+            std::cout << "mfq_container_check=ok"
+                      << " shards=" << mfq.source_paths().size()
+                      << " tensors=" << mfq.tensors().size()
+                      << " assets=" << mfq.assets().size()
+                      << "\n";
+            return 0;
+        }
+        if (check_runtime_assets) {
+            if (model_path.empty()) {
+                throw std::runtime_error(
+                    "--check-runtime-assets requires --model");
+            }
+            auto model_source = mfq::open_model_source(model_path);
+            const auto& mfq = *model_source;
+            const auto config = mfq::models::ModelConfig::from_json(
+                mfq::cuda::load_model_config_json(mfq, config_path));
+            if (!mfq.has_asset(mfq::kTokenizerGgufAsset)) {
+                throw std::runtime_error(
+                    "model source has no tokenizer GGUF");
+            }
+            const auto tokenizer_blob =
+                read_asset(mfq, mfq::kTokenizerGgufAsset);
+            const auto embedded =
+                probe_mfq_tokenizer(tokenizer_blob, check_tokenizer_text);
+            if (embedded.vocab_size != config.vocab_size) {
+                throw std::runtime_error(
+                    "embedded tokenizer/model vocabulary mismatch: tokenizer=" +
+                    std::to_string(embedded.vocab_size) + " model=" +
+                    std::to_string(config.vocab_size));
+            }
+            std::cout << "runtime_assets_check=ok"
+                      << " config=embedded"
+                      << " tokenizer=embedded"
+                      << " vocab_size=" << embedded.vocab_size
+                      << " chat_template="
+                      << (!embedded.chat_template.empty() ? 1 : 0)
+                      << " bos=" << embedded.bos_token
+                      << " eos=" << embedded.eos_token
+                      << " eot=" << embedded.eot_token
+                      << " pad=" << embedded.pad_token
+                      << " token_count=" << embedded.tokens.size()
+                      << "\n";
+            if (!tokenizer_model.empty()) {
+                const auto external =
+                    probe_mfq_tokenizer(tokenizer_model, check_tokenizer_text);
+                if (external.vocab_size != embedded.vocab_size ||
+                    external.bos_token != embedded.bos_token ||
+                    external.eos_token != embedded.eos_token ||
+                    external.eot_token != embedded.eot_token ||
+                    external.pad_token != embedded.pad_token ||
+                    external.chat_template != embedded.chat_template ||
+                    external.tokens != embedded.tokens) {
+                    throw std::runtime_error(
+                        "embedded tokenizer differs from external GGUF");
+                }
+                std::cout << "runtime_assets_external_match=ok\n";
+            }
+            return 0;
+        }
+        if (check_moe_layer >= 0) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-moe-layer requires --model");
+            }
+            return run_moe_check(
+                execution, model_path, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
+        }
+        if (!check_mfe_tensor.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-mfe-tensor requires --model");
+            }
+            KlMmqScope check_kl_mmq_scope(
+                parse_kl_mmq_mode(kl_mmq_arg), execution.kl_mmq);
+            const auto tensor_names =
+                parse_tensor_names(check_mfe_tensor);
+            if (execution.stores.moe_expert_cache &&
+                    tensor_names.size() != 1) {
+                throw std::runtime_error(
+                    "cached --check-mfe-tensor accepts one tensor "
+                    "per invocation");
+            }
+            for (const auto & tensor_name : tensor_names) {
+                const int result = run_mfe_tensor_check(
+                    execution, model_path, tensor_name, check_mfe_tokens,
+                    check_mfe_routes, check_mfe_reps,
+                    check_mfe_split_width, check_mfe_routed_input,
+                    check_mfe_benchmark_only);
+                if (result != 0) return result;
+            }
+            return 0;
+        }
+        if (!check_dsv4_output_a.empty()) {
+            if (model_path.empty()) {
+                throw std::runtime_error("--check-dsv4-output-a requires --model");
+            }
+            return run_dsv4_output_a_check(
+                execution, model_path, check_dsv4_output_a,
+                check_dsv4_output_a_batch, check_dsv4_output_a_reps);
+        }
+        if (check_attention_decode > 0) {
+            return run_attention_decode_check(
+                check_attention_decode, check_attention_reps,
+                check_attention_head_dim, check_attention_swa_decode,
+                check_attention_window);
+        }
+        if (check_gemma4_swa) {
+            return run_gemma4_swa_check(check_attention_reps);
+        }
+        if (check_glm_dsa) {
+            return run_glm_dsa_check(check_attention_reps);
+        }
+        if (check_dsv4_attention) {
+            return run_dsv4_attention_check(check_attention_reps);
+        }
+        if (check_dsv4_hc) {
+            return run_dsv4_hc_check(check_attention_reps);
+        }
+        if (check_deepseek_v41) {
+            return mfq::cuda::deepseek_v41_runtime::run_self_check();
+        }
+        if (check_text_session_state) {
+            return run_text_session_state_check();
+        }
+        if (minicpmo_eval_batch) {
+            if (model_path.empty()) {
+                throw std::runtime_error(
+                    "--minicpmo-eval-batch requires --model");
+            }
+            if (!ids_arg.empty() || !ids_file.empty()) {
+                throw std::runtime_error(
+                    "MiniCPM-o eval mode cannot be combined with "
+                    "composite, duplex, token, transport, KL, or prefill modes");
+            }
+            if (minicpmo_eval_vision_batch_size <= 0) {
+                throw std::runtime_error(
+                    "--minicpmo-eval-vision-batch-size must be positive");
+            }
+            return mfq::cuda::minicpmo45::run_eval_batch(
+                execution, model_path, config_path, context_size,
+                minicpmo_eval_vision_batch_size);
+        }
+        if (model_path.empty()) {
+            std::cerr << "missing model or execution mode (see --help)\n";
+            return 2;
+        }
+        if (context_size < 0) throw std::runtime_error("--ctx-size must be positive");
+        if (!bench_qwen35_mtp.empty()) {
+            MFQ_RUNTIME_CHECK(bench_qwen35_mtp == "ordinary" || bench_qwen35_mtp == "mtp",
+                "--bench-qwen35-mtp expects ordinary or mtp");
+            MFQ_RUNTIME_CHECK(!check_qwen35_mtp && ids_arg.empty() && ids_file.empty() &&
+                prefill_sweep_arg.empty(), "MTP benchmark cannot combine execution modes");
+            if (context_size == 0) context_size = 512;
+            MFQ_RUNTIME_CHECK(gen >= 2 && context_size >= static_cast<int64_t>(gen) + 17 &&
+                bench_qwen35_mtp_reps > 0 && bench_qwen35_mtp_reps <= 100,
+                "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
+            std::cout << std::unitbuf;
+        }
+        if (check_qwen35_mtp) {
+            if (context_size == 0) context_size = 512;
+            if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
+            std::cout << std::unitbuf;
+        }
+        if (check_continuous_batching) {
+            MFQ_RUNTIME_CHECK(
+                !check_qwen35_mtp &&
+                !check_flash_next && !check_flash_next_mtp &&
+                bench_qwen35_mtp.empty() && ids_arg.empty() &&
+                ids_file.empty() &&
+                prefill_sweep_arg.empty(),
+                "continuous batching check cannot combine execution modes");
+            if (context_size == 0) context_size = 512;
+            if (context_size < 32) {
+                throw std::runtime_error(
+                    "continuous batching check requires --ctx-size >= 32");
+            }
+            std::cout << std::unitbuf;
+        }
+        std::vector<int64_t> prefill_sweep_sizes;
+        if (!prefill_sweep_arg.empty()) {
+            prefill_sweep_sizes = parse_ids(prefill_sweep_arg);
+            if (std::any_of(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end(),
+                            [](int64_t value) { return value <= 0; })) {
+                throw std::runtime_error("--prefill-sweep values must be positive");
+            }
+            if (context_size == 0) {
+                context_size = *std::max_element(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end());
+            }
+        }
+        if ((!block_trace_reference.empty() || !block_trace_output.empty()) &&
+                context_size == 0) {
+            context_size = (int64_t)(
+                ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file)).size();
+        }
+        const bool model_check = check_continuous_batching || check_flash_next ||
+            check_flash_next_mtp || check_qwen35_mtp || !bench_qwen35_mtp.empty() ||
+            !prefill_sweep_sizes.empty() || compare_dsv4_hc_ops || compare_dsv4_hc_model ||
+            !block_trace_reference.empty() || !block_trace_output.empty() ||
+            compare_decode_splitk || compare_mma_decode || compare_nvq_vec4 ||
+            prefill_repeat > 0 || compare_mma_attention || runtime_comparison_modes() ||
+            !router_lookahead_audit.empty();
+        if (!model_check)
+            return generate_diagnostic_tokens(*this,
+                ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file), gen, profile);
+        execution.profiler.enabled = false;
+        mfq_tensor_backend::NoGradGuard no_grad;
+        return with_loaded_cuda_model(execution, *this,
+            check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
+            [&](auto& model, auto& runtime_components,
+                    std::chrono::steady_clock::time_point t0,
+                    std::chrono::steady_clock::time_point t1) -> int {
+        using Model = std::remove_cvref_t<decltype(model)>;
+        if (check_continuous_batching) {
+            if constexpr (Model::policy.continuous_batching) {
+                return run_cuda_continuous_batching_check(model,check_continuous_batching_requests);
+            }
+            throw std::runtime_error(
+                "continuous batching requires Qwen3.5 or Flash-Next");
+        }
+        if (check_qwen4_decode_hidden) {
+            if constexpr(Model::policy.decode_graph) {
+                const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_GENERATION_VARIANTS");
+                if(profile && variants && variants[0]=='1') {
+                    MFQ_RUNTIME_CHECK(runtime_components.mtp,"MTP variants require a loaded predictor");
+                    return run_qwen4_mtp_generation_variants(model,*runtime_components.mtp,
+                        ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file));
+                }
+            }
+            if constexpr(Model::policy.decode_graph)
+                return profile?run_qwen4_mtp_profile(model,ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file))
+                    :run_qwen4_decode_hidden_check(model);
+            throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
+        }
+        if (check_flash_next) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
+                return run_flash_next_check(model);
+            }
+            throw std::runtime_error(
+                "Flash-Next diagnostic requires a Flash-Next causal LM");
+        }
+        if (check_flash_next_mtp) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
+                using Predictor=std::conditional_t<
+                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm>,
+                    mfq::cuda::qwen4_exp::Qwen4ExpMtp,
+                    mfq::cuda::glm5_next::Glm5NextMtp>;
+                auto* predictor=dynamic_cast<Predictor*>(runtime_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "Flash-Next MTP diagnostic requires a loaded predictor component");
+                return run_flash_next_mtp_check(model,*predictor);
+            }
+            throw std::runtime_error(
+                "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
+        }
+        if (check_qwen35_mtp) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
+                auto* predictor = dynamic_cast<Qwen35Mtp*>(
+                    runtime_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "--check-qwen35-mtp requires a supported model containing MTP weights");
+                return run_qwen35_mtp_check(model, *predictor);
+            }
+            throw std::runtime_error(
+                "--check-qwen35-mtp requires Qwen35CausalLm");
+        }
+        if (!bench_qwen35_mtp.empty()) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
+                auto* predictor = dynamic_cast<Qwen35Mtp*>(
+                    runtime_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "--bench-qwen35-mtp requires a supported model containing MTP weights");
+                return run_qwen35_mtp_bench(model, *predictor,
+                    bench_qwen35_mtp == "mtp", gen,
+                    bench_qwen35_mtp_reps);
+            }
+            throw std::runtime_error(
+                "--bench-qwen35-mtp requires Qwen35CausalLm");
+        }
+        if (!prefill_sweep_sizes.empty()) {
+            execution.profiler.enabled=profile;
+            const int status = run_prefill_sweep(
+                model, prefill_sweep_sizes, prefill_sweep_reps,execution);
+            if (execution.stores.moe_expert_cache) {
+                print_moe_expert_cache_stats(
+                    execution.stores.moe_expert_cache, std::cout);
+            }
+            return status;
+        }
+        if(!router_lookahead_audit.empty()) {
+            MFQ_RUNTIME_CHECK(!compare_ffn_transfer_phases && !profile && gen>1 && !decode_inputs.empty(),
+                "router lookahead audit requires fixed single-token decode inputs and profiling disabled");
+            if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                qwen4_begin_router_lookahead_audit(model,gen-1);
+            else throw std::runtime_error("router lookahead audit requires Qwen4 Flash-Next");
+        }
+        auto ids_vec = ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file);
+        auto ids = mfq_tensor_backend::tensor(ids_vec, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
+        if (compare_dsv4_hc_ops) {
+            g_dsv4_compare_hc_ops = true;
+            g_dsv4_fused_hc = false;
+            model.reset(1);
+            (void)model.forward(ids);
+            mfq_cuda_synchronize();
+            return 0;
+        }
+        if (compare_dsv4_hc_model) {
+            return run_dsv4_hc_model_compare(model, ids);
+        }
+        if (!block_trace_reference.empty()) {
+            return run_block_trace_compare(
+                model, block_trace_reference, config_path, context_size, ids);
+        }
+        if (!block_trace_output.empty()) {
+            return run_block_trace_dump(
+                model, block_trace_output, ids,
+                block_trace_start, block_trace_count);
+        }
+        if(runtime_comparison_modes()) {
+            if constexpr (!std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                throw std::runtime_error("runtime comparison requires Qwen4 Flash-Next");
+            const char* comparison_name = runtime_comparison_name();
+            std::cout<<comparison_name<<"_model_load_sec="
+                <<std::chrono::duration<double>(t1-t0).count()<<"\n";
+            const int rounds=warmup_prefill<0?1:warmup_prefill;
+            const bool compare_dense_mhc=execution.config.gr_two_stage_dense_injection;
+            ScopedDiagnosticEnvironment topk_cache("MFQ_MOE_TOPK_CACHE");
+            ScopedDiagnosticEnvironment shared_norm("MFQ_GR_SHARE_NORM");
+            ScopedDiagnosticEnvironment dense_fusion("MFQ_GR_DENSE_FUSION");
+            ScopedDiagnosticEnvironment gr_groups("MFQ_GR_FIXED_GROUPS");
+            ScopedDiagnosticEnvironment gr_threads("MFQ_GR_UP_THREADS");
+            ScopedDiagnosticEnvironment gr_formats("MFQ_GR_FIXED_FORMATS");
+            ScopedDiagnosticEnvironment gr_async("MFQ_GR_ASYNC_NORMALIZED");
+            ScopedDiagnosticEnvironment gdn_geometry("MFQ_GDN_FIXED_GEOMETRY");
+            ScopedDiagnosticEnvironment gdn_inplace("MFQ_GDN_INPLACE_STATE");
+            ScopedDiagnosticEnvironment qsa_selection("MFQ_QSA_SELECT_FUSED");
+            ScopedDiagnosticEnvironment qsa_gate("MFQ_QSA_SPARSE_GATE_FUSED");
+            ScopedDiagnosticEnvironment qsa_reduce("MFQ_QSA_PARALLEL_REDUCE");
+            ScopedDiagnosticEnvironment qsa_query("MFQ_QSA_SPARSE_QUERY_FUSED");
+            ScopedDiagnosticEnvironment parallel_gu("MFQ_MFE_PARALLEL_GU");
+            ScopedDiagnosticEnvironment gpu_bundle("MFQ_MFE_GPU_BUNDLE");
+            ScopedDiagnosticEnvironment default_math("MFQ_MFE_DEFAULT_MATH");
+            ScopedDiagnosticEnvironment e8_narrow("MFQ_MFE_E8_NARROW");
+            ScopedDiagnosticEnvironment shared_first("MFQ_MFE_SHARED_FIRST");
+            ScopedDiagnosticEnvironment early_gu("MFQ_MFE_EARLY_GU");
+            ScopedDiagnosticEnvironment cpu_background("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
+            ScopedDiagnosticEnvironment route_poll("MFQ_MOE_ROUTE_POLL_US");
+            ScopedDiagnosticEnvironment window_flush("MFQ_MOE_SINGLE_WINDOW_FLUSH");
+            ScopedDiagnosticEnvironment early_no_cpu_ready("MFQ_MOE_EARLY_NO_CPU_READY");
+            ScopedDiagnosticEnvironment gpu_only_cpu_wait("MFQ_MOE_SKIP_GPU_ONLY_CPU_WAIT");
+            ScopedDiagnosticEnvironment fixed_gpu_timing("MFQ_MOE_SKIP_FIXED_GPU_TIMING");
+            ScopedDiagnosticEnvironment window_input_views("MFQ_MFE_WINDOW_INPUT_VIEWS");
+            ScopedDiagnosticEnvironment route_spin("MFQ_MOE_ROUTE_SPIN");
+            ScopedDiagnosticEnvironment plan_reuse("MFQ_MOE_PLAN_REUSE");
+            ScopedDiagnosticEnvironment shared_gate_fusion("MFQ_SHARED_GATE_FUSED");
+            ScopedDiagnosticEnvironment layer_timings("MFQ_TRACE_LAYER_TIMINGS");
+            ScopedDiagnosticEnvironment mhc_timings("MFQ_TRACE_MHC_TIMINGS");
+            ScopedDiagnosticEnvironment host_pin("MFQ_MOE_DECODE_HOST_PIN");
+            ScopedDiagnosticEnvironment resident_overlap("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+            ScopedDiagnosticEnvironment dma_graph_batch("MFQ_MOE_DMA_GRAPH_BATCH");
+            ScopedDiagnosticEnvironment ram_field_packing("MFQ_MOE_RAM_FIELD_PACKING");
+            ScopedDiagnosticEnvironment warp_multi_sum("MFQ_CUDA_WARP_MULTI_SUM");
+            MFQ_RUNTIME_CHECK(!(compare_mfe_e8_narrow || compare_mfe_default_math || compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_two_stage_ffn,
+                "MFE parallel Gate/Up comparison requires two-stage FFN");
+            MFQ_RUNTIME_CHECK(!compare_mhc_shared_norm || execution.config.gr_two_stage,
+                "MHC norm comparison requires fused residual projection");
+            MFQ_RUNTIME_CHECK(!compare_mhc_dense_fusion || (execution.config.gr_two_stage && execution.config.gr_two_stage_dense_injection),
+                "MHC dense fusion comparison requires fused residual BF16 injection");
+            MFQ_RUNTIME_CHECK(!(compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_graph_optimizations) || execution.config.gr_two_stage,
+                "MHC packed group comparison requires fused residual projection");
+            MFQ_RUNTIME_CHECK(!(compare_gdn_fixed_geometry || compare_gdn_inplace_state) ||
+                (execution.config.gdn_fused_core && execution.config.gdn_fused_preparation &&
+                 execution.config.gdn_fused_output && execution.config.gdn_transposed_state),
+                "GDN comparison requires the complete fused transposed core");
+            const int performance_passes=3*comparison_rounds;
+            for(int pass=0;pass<performance_passes+(comparison_phase_timings?3:0);++pass) {
+                const bool phased=pass%3==1;
+                const bool phase_timings=comparison_phase_timings && pass>=performance_passes;
+                if(comparison_phase_timings) {
+                    layer_timings.set(phase_timings?"2":"0");mhc_timings.set("0");
+                }
+                if (compare_route_poll) route_poll.set(phased ? "0" : "2000");
+                if (compare_window_flush) window_flush.set(phased ? "1" : "0");
+                if (compare_early_no_cpu_ready) early_no_cpu_ready.set(phased ? "1" : "0");
+                if (compare_gpu_only_cpu_wait) gpu_only_cpu_wait.set(phased ? "1" : "0");
+                if (compare_fixed_gpu_timing) fixed_gpu_timing.set(phased ? "1" : "0");
+                if (compare_window_input_views) window_input_views.set(phased ? "1" : "0");
+                if (compare_route_spin) route_spin.set(phased ? "1" : "0");
+                if (compare_moe_plan_reuse) plan_reuse.set(phased ? "1" : "0");
+                if (compare_mfe_default_math) default_math.set(phased ? "1" : "0");
+                if (compare_mfe_e8_narrow) e8_narrow.set(phased ? "1" : "0");
+                if (compare_shared_gate_fusion) shared_gate_fusion.set(phased ? "1" : "0");
+                if (compare_graph_optimizations) {
+                    window_flush.set(phased ? "1" : "0");
+                    early_no_cpu_ready.set(phased ? "1" : "0");
+                    gpu_only_cpu_wait.set(phased ? "1" : "0");
+                    window_input_views.set(phased ? "1" : "0");
+                    route_spin.set(phased ? "1" : "0");
+                    shared_gate_fusion.set(phased ? "1" : "0");
+                    gr_groups.set(phased ? "1" : "0");
+                    gr_threads.set(phased ? "512" : "256");
+                }
+                if (compare_host_pin) host_pin.set(phased ? "1" : "0");
+                if (compare_resident_overlap) resident_overlap.set(phased ? "1" : "0");
+                if (compare_dma_graph_batch) dma_graph_batch.set(phased ? "1" : "0");
+                if (compare_ram_field_packing) ram_field_packing.set(phased ? "1" : "0");
+                if (compare_warp_multi_sum) warp_multi_sum.set(phased ? "1" : "0");
+                if (compare_cpu_background_calibration) cpu_background.set(phased ? "1" : "0");
+                if (compare_router_topk) topk_cache.set(phased ? "1" : "0");
+                if (compare_mhc_shared_norm) shared_norm.set(phased ? "1" : "0");
+                if (compare_mhc_dense_fusion) {shared_norm.set("1");dense_fusion.set(phased ? "1" : "0");}
+                if (compare_mhc_packed_groups) {
+                    gr_groups.set(phased?"1":"0");gr_threads.set(phased?"512":"256");
+                }
+                if (compare_mhc_fixed_formats)gr_formats.set(phased?"1":"0");
+                if (compare_mhc_async_normalized)gr_async.set(phased?"1":"0");
+                if (compare_gdn_fixed_geometry)gdn_geometry.set(phased?"1":"0");
+                if (compare_gdn_inplace_state)gdn_inplace.set(phased?"1":"0");
+                if (compare_qsa_fusion) {
+                    qsa_selection.set(phased?"1":"0");qsa_gate.set(phased?"1":"0");
+                    qsa_reduce.set(phased?"1":"0");
+                    qsa_query.set(phased?"1":"0");
+                }
+                if (compare_mfe_parallel_gu) parallel_gu.set(phased ? "1" : "0");
+                if (compare_mfe_gpu_bundle) {
+                    parallel_gu.set("1");gpu_bundle.set(phased ? "1" : "0");
+                }
+                if (compare_mfe_shared_first) {
+                    parallel_gu.set("1");gpu_bundle.set("1");shared_first.set(phased ? "1" : "0");
+                }
+                if (compare_mfe_early_gu) {
+                    parallel_gu.set("1");gpu_bundle.set("1");early_gu.set(phased ? "1" : "0");
+                }
+                // reset destroys the decoder graphs before each branch is captured.
+                model.reset(1);mfq_cuda_synchronize();
+                if(compare_ffn_transfer_phases)execution.config.moe_ffn_transfer_phases=phased;
+                if(compare_mhc_fusion) {
+                    execution.config.gr_two_stage=phased;
+                    execution.config.gr_two_stage_dense_injection=phased && compare_dense_mhc;
+                }
+                if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+                    if(compare_router_lookahead)model.router_lookahead=phased;
+                    if(compare_rotary_fusion)qwen4_set_rotary_fusion(model,phased);
+                    if(compare_attention_grouping) {
+                        qwen4_set_rotary_fusion(model,true);
+                        qwen4_set_attention_grouping(model,phased);
+                    }
+                    if(compare_mhc_fusion) {
+                        qwen4_set_rotary_fusion(model,true);
+                        qwen4_set_attention_grouping(model,true);
+                    }
+                }
+                if(compare_cpu_background_calibration)
+                    prepare_moe_cpu_calibration_comparison(execution.stores.moe_expert_cache,pass>0);
+                else if(compare_cpu_transfer_budget)
+                    prepare_moe_cpu_budget_comparison(execution.stores.moe_expert_cache,pass>0,phased);
+                else prepare_moe_pipeline_comparison(execution.stores.moe_expert_cache,pass>0);
+                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1";
+                if(comparison_phase_timings)std::cout<<" mfe_phase_timings="<<phase_timings;
+                std::cout<<'\n';
+                const auto warm_start=std::chrono::steady_clock::now();
+                for(int round=0;round<rounds;++round) {
+                    model.reset(1);(void)model.next_token(ids);mfq_cuda_synchronize();
+                }
+                model.reset(1);mfq_cuda_synchronize();execution.profiler.reset();
+                std::cout<<"warmup_prefill_rounds="<<rounds<<"\n"
+                    <<"warmup_prefill_tokens="<<rounds*ids_vec.size()<<"\n"
+                    <<"warmup_prefill_sec="<<std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-warm_start).count()<<"\n";
+                const auto pass_start=std::chrono::steady_clock::now();
+                const int status=generate_diagnostic_tokens(execution,model,ids,gen,false,
+                    pass_start,pass_start,decode_inputs);
+                if(status)return status;
+                const auto records=finish_moe_pipeline_comparison(execution.stores.moe_expert_cache);
+                if(compare_moe_plan_reuse || compare_mfe_e8_narrow || compare_mfe_default_math || compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion || compare_mfe_early_gu)
+                    print_moe_expert_cache_stats(execution.stores.moe_expert_cache,std::cout);
+                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased
+                    <<" end=1 dispatch_records="<<records<<"\n";
+            }
+            return 0;
+        }
+        const int warmup_rounds = warmup_prefill < 0 ? (profile ? 1 : 0) : warmup_prefill;
+        const auto warmup_start = std::chrono::steady_clock::now();
+        for (int round = 0; round < warmup_rounds; ++round) {
+            model.reset(1);
+            (void)model.next_token(ids);
+            mfq_cuda_synchronize();
+        }
+        if (warmup_rounds) {
+            model.reset(1);
+            execution.profiler.reset();
+        }
+        std::cout << "warmup_prefill_rounds=" << warmup_rounds << "\n"
+                  << "warmup_prefill_tokens=" << warmup_rounds * ids_vec.size() << "\n"
+                  << "warmup_prefill_sec="
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - warmup_start).count()
+                  << "\n";
+        if (profile) {
+            execution.profiler.enabled = true;
+        }
+        if (compare_decode_splitk) {
+            auto run = [&](bool split) {
+                execution.config.attention_decode_split_k = split;
+                model.reset(1);
+                (void)model.hidden_forward(ids);
+                const int64_t decode_len = model.cache_pos + 1;
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+                auto decode_id = ids.index({Slice(), -1}).reshape({1, 1});
+                auto hidden = model.hidden_forward(decode_id, mfq_nullopt, seq_len);
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto logits = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
+                mfq_cuda_synchronize();
+                return logits;
+            };
+            auto ref = run(false);
+            auto test = run(true);
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
+            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
+            auto diff = (ref - test).abs();
+            std::cout << "decode_splitk_compare_kl=" << kl.template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_rel=" << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_max_abs=" << diff.max().template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_same_top="
+                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
+            return 0;
+        }
+        if (compare_mma_decode) {
+            if (compare_mma_decode_steps < 1) {
+                throw std::runtime_error("--compare-mma-decode-steps must be positive");
+            }
+            auto cuda_i64 = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
+            std::vector<mfq_tensor_backend::Tensor> reference_logits;
+            std::vector<int64_t> teacher_tokens;
+            reference_logits.reserve(compare_mma_decode_steps);
+            teacher_tokens.reserve(compare_mma_decode_steps);
+            execution.config.mma_attention_decode = false;
+            model.reset(1);
+            auto input = model.next_token(ids).reshape({1, 1});
+            const int64_t initial_teacher_token = input.template item<int64_t>();
+            for (int step = 0; step < compare_mma_decode_steps; ++step) {
+                const int64_t decode_len = model.cache_pos + 1;
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
+                auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto logits = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
+                reference_logits.push_back(logits.clone());
+                const int64_t next = logits.argmax(-1).template item<int64_t>();
+                teacher_tokens.push_back(next);
+                input = mfq_tensor_backend::tensor({next}, cuda_i64).reshape({1, 1});
+            }
+            execution.config.mma_attention_decode = true;
+            const int64_t planned_kv_length =
+                compare_mma_decode_planned_len > 0
+                ? compare_mma_decode_planned_len
+                : ids.size(1) + compare_mma_decode_steps;
+            if (planned_kv_length > model.max_position_embeddings()) {
+                throw std::runtime_error("decode comparison planned length exceeds context capacity");
+            }
+            model.reset(1);
+            (void)model.next_token(ids);
+            input = mfq_tensor_backend::tensor({initial_teacher_token}, cuda_i64).reshape({1, 1});
+            double kl_sum = 0.0;
+            double kl_max = 0.0;
+            double abs_sum = 0.0;
+            double delta_sq_sum = 0.0;
+            double reference_sq_sum = 0.0;
+            double max_abs = 0.0;
+            int same_top = 0;
+            int first_top_difference = -1;
+            int64_t values = 0;
+            for (int step = 0; step < compare_mma_decode_steps; ++step) {
+                const int64_t decode_len = model.cache_pos + 1;
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
+                auto hidden = model.hidden_forward(
+                    input, mfq_nullopt, seq_len, nullptr, mfq_nullopt,
+                    nullptr, 0, {planned_kv_length, 0});
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto test = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
+                const auto & ref = reference_logits[(size_t)step];
+                auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+                auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
+                const double kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1).template item<double>();
+                auto delta = test - ref;
+                kl_sum += kl;
+                kl_max = std::max(kl_max, kl);
+                abs_sum += delta.abs().sum().template item<double>();
+                delta_sq_sum += delta.square().sum().template item<double>();
+                reference_sq_sum += ref.square().sum().template item<double>();
+                max_abs = std::max(max_abs, delta.abs().max().template item<double>());
+                values += delta.numel();
+                const bool top_equal = test.argmax(-1).eq(ref.argmax(-1)).template item<bool>();
+                same_top += top_equal ? 1 : 0;
+                if (!top_equal && first_top_difference < 0) first_top_difference = step;
+                input = mfq_tensor_backend::tensor({teacher_tokens[(size_t)step]}, cuda_i64).reshape({1, 1});
+            }
+            mfq_cuda_synchronize();
+            std::cout << std::setprecision(10)
+                      << "mma_decode_compare_steps=" << compare_mma_decode_steps << "\n"
+                      << "mma_decode_compare_mean_kl=" << kl_sum / compare_mma_decode_steps << "\n"
+                      << "mma_decode_compare_max_kl=" << kl_max << "\n"
+                      << "mma_decode_compare_rel=" << std::sqrt(delta_sq_sum / reference_sq_sum) << "\n"
+                      << "mma_decode_compare_mean_abs=" << abs_sum / values << "\n"
+                      << "mma_decode_compare_max_abs=" << max_abs << "\n"
+                      << "mma_decode_compare_same_top=" << same_top << "\n"
+                      << "mma_decode_compare_first_top_difference=" << first_top_difference << "\n";
+            return 0;
+        }
+        if (compare_nvq_vec4) {
+            auto run = [&](bool) {
+                model.reset(1);
+                auto logits = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+                mfq_cuda_synchronize();
+                return logits;
+            };
+            auto ref = run(false);
+            auto repeat = run(false);
+            auto test = run(true);
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto repeat_logp = mfq_tensor_backend::log_softmax(repeat, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
+            auto repeat_kl = (ref_logp.exp() * (ref_logp - repeat_logp)).sum(-1);
+            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
+            auto diff = (ref - test).abs();
+            auto repeat_diff = (ref - repeat).abs();
+            std::cout << "nvq_vec4_repeat_kl=" << repeat_kl.template item<float>() << "\n";
+            std::cout << "nvq_vec4_repeat_max_abs=" << repeat_diff.max().template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_kl=" << kl.template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_rel="
+                      << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_max_abs=" << diff.max().template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_same_top="
+                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
+            return 0;
+        }
+        if (prefill_repeat > 0) {
+            const char * trace_env = mfq::cuda::env_lookup("MFQ_CHECK_PREFILL_REPEAT_TRACE");
+            const bool trace_repeat = trace_env != nullptr && std::atoi(trace_env) != 0;
+            std::vector<mfq_tensor_backend::Tensor> reference_trace;
+            std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> reference_gemma_trace;
+            for (int i = 0; i < prefill_repeat; ++i) {
+                model.reset(1);
+                auto run_t0 = std::chrono::steady_clock::now();
+                std::vector<mfq_tensor_backend::Tensor> trace;
+                std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> gemma_trace;
+                mfq_tensor_backend::Tensor logits;
+                if (trace_repeat) {
+                    model.execution->gemma_trace_layer = 0;
+                    model.execution->gemma_stage_trace = &gemma_trace;
+                    auto hidden = model.hidden_forward(
+                        ids, mfq_nullopt, mfq_nullopt, &trace);
+                    model.execution->gemma_stage_trace = nullptr;
+                    model.execution->gemma_trace_layer = -1;
+                    auto last = hidden.index({Slice(), -1, Slice()})
+                        .to(mfq_tensor_backend::kFloat16).contiguous();
+                    logits = model.lm_head.forward(execution, last);
+                } else {
+                    logits = model.last_logits(ids);
+                }
+                mfq_cuda_synchronize();
+                auto run_t1 = std::chrono::steady_clock::now();
+                std::cout << "prefill_repeat=" << (i + 1)
+                          << " sec=" << std::chrono::duration<double>(run_t1 - run_t0).count()
+                          << " top=" << logits.argmax(-1).template item<int64_t>() << "\n";
+                if (trace_repeat) {
+                    if (reference_trace.empty()) {
+                        reference_trace = std::move(trace);
+                        reference_gemma_trace = std::move(gemma_trace);
+                    } else {
+                        for (size_t stage = 0; stage < gemma_trace.size(); ++stage) {
+                            auto diff = (gemma_trace[stage].second -
+                                         reference_gemma_trace[stage].second).abs();
+                            const float max_abs = diff.max().template item<float>();
+                            if (max_abs != 0.0f) {
+                                std::cout << "prefill_repeat_first_gemma_stage="
+                                          << gemma_trace[stage].first
+                                          << " max_abs=" << max_abs
+                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
+                                break;
+                            }
+                        }
+                        for (size_t stage = 0; stage < trace.size(); ++stage) {
+                            auto diff = (trace[stage] - reference_trace[stage]).abs();
+                            const float max_abs = diff.max().template item<float>();
+                            if (max_abs != 0.0f) {
+                                std::cout << "prefill_repeat_first_difference=" << stage
+                                          << " layer=" << static_cast<int64_t>(stage) - 1
+                                          << " max_abs=" << max_abs
+                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        if (compare_mma_attention) {
+            execution.config.mma_attention = false;
+            execution.config.minicpm_bf16_flash128 = false;
+            auto ref = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+            mfq_cuda_synchronize();
+            model.reset(1);
+            execution.config.mma_attention = true;
+            execution.config.minicpm_bf16_flash128 = true;
+            auto test = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+            mfq_cuda_synchronize();
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
+            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
+            auto diff = (ref - test).abs();
+            auto same_top = ref.argmax(-1).eq(test.argmax(-1));
+            std::cout << "attention_compare_kl=" << kl.template item<float>() << "\n";
+            std::cout << "attention_compare_max_logit_abs=" << diff.max().template item<float>() << "\n";
+            std::cout << "attention_compare_mean_logit_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
+            return 0;
+        }
+        std::unordered_set<int64_t> stop_ids;
+        if (!ignore_eos && tokenizer_model.empty() && decode_inputs.empty()) {
+            stop_ids = mfq::engine::model_stop_token_ids(
+                mfq::cuda::load_model_config_json(*model.source, config_path), model.vocab_size());
+            if (stop_ids.empty()) std::cerr << "warning: no model EOS token IDs; generation is limited only by --gen\n";
+        }
+        const auto status=generate_diagnostic_tokens(
+            execution, model, ids, gen, profile, t0, t1,decode_inputs,stop_ids,!router_lookahead_audit.empty());
+        if(!status && !router_lookahead_audit.empty()) {
+            if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);
+        }
+        return status;
+            });
+    }); }
+};
+
+} // namespace
+
+namespace mfq::cuda {
+int execute_diagnostics_command(DiagnosticsCommandOptions options) {
+    return DiagnosticsCommand(std::move(options)).run();
+}
+} // namespace mfq::cuda
+
+namespace mfq::cuda::commands {
+namespace {
+
+void print_diagnostics_help() {
+    std::cout
+        << "MFQ CUDA diagnostics\n\n"
+        << "Usage:\n"
+        << "  mfq-diagnostics [--model MODEL] CHECK [OPTIONS]\n\n"
+        << "Checks and benchmarks:\n"
+        << "  --check-linear NAME             check one GPU linear\n"
+        << "  --check-linear-cpu NAME         check one CPU linear\n"
+        << "  --check-linear-group NAMES      check a tensor group\n"
+        << "  --check-q8-embedding NAME       check a Q8 embedding\n"
+        << "  --check-tp-linear NAME          check tensor-parallel linear\n"
+        << "  --check-ep-moe NAME             check expert-parallel MoE\n"
+        << "  --check-gdn-input PATH          check GDN operator fixtures\n"
+        << "  --check-linear-conv-input PATH  check linear-conv fixtures\n"
+        << "  --check-moe-layer N             check a model MoE layer\n"
+        << "  --check-mfe-tensor NAME         check an MFE tensor\n"
+        << "  --check-dsv4-output-a NAME      check DeepSeek output-A\n"
+        << "  --check-attention-decode N      check decode attention\n"
+        << "  --check-gemma4-swa              check Gemma4 SWA\n"
+        << "  --check-glm-dsa                 check GLM DSA\n"
+        << "  --check-dsv4-attention          check DeepSeek-V4 attention\n"
+        << "  --check-dsv4-hc                 check DeepSeek-V4 HC\n"
+        << "  --check-deepseek-v41            run DeepSeek-V4.1 self-check\n"
+        << "  --check-text-session-state      check session state\n"
+        << "  --check-qwen35-mtp              check Qwen3.5 MTP\n"
+        << "  --check-flash-next              check Flash-Next\n"
+        << "  --check-qwen4-decode-hidden     check decode graph raw hidden and KV transitions\n"
+        << "  --check-flash-next-mtp          check Flash-Next MTP\n"
+        << "  --check-continuous-batching     check continuous batching\n"
+        << "  --continuous-batching-check-requests N  check 2..32 concurrent requests\n"
+        << "  --check-engine-isolation        check two concurrent CUDA engines\n"
+        << "  --check-backend-bf16-add        check backend BF16 add\n"
+        << "  --check-backend-argmax          check backend argmax\n"
+        << "  --check-runtime-assets          validate embedded assets\n"
+        << "  --check-mfq-container           validate the MFQ container\n"
+        << "  --minicpmo-eval-batch           run MiniCPM-o batch evaluation\n"
+        << "  --bench-qwen35-mtp MODE         benchmark ordinary or mtp mode\n"
+        << "  --prefill-sweep LIST            benchmark prefill sizes\n"
+        << "  --prefill-repeat N              repeat prefill N times\n"
+        << "  --compare-block-trace PATH      compare a block trace\n"
+        << "  --dump-block-trace PATH         write a block trace\n"
+        << "  --compare-dsv4-hc-ops           compare DeepSeek HC operators\n"
+        << "  --compare-dsv4-hc-model         compare DeepSeek HC model\n"
+        << "  --compare-mma-attention         compare MMA attention\n"
+        << "  --compare-decode-splitk         compare decode split-K\n"
+        << "  --compare-mma-decode            compare MMA decode\n"
+        << "  --compare-nvq-vec4              compare NVQ vec4\n"
+        << "  --profile                       profile token generation\n\n"
+        << "Common options:\n"
+        << "  --model PATH                    model or split-model shard\n"
+        << "  --config PATH                   external model config\n"
+        << "  --ids LIST | --ids-file PATH    diagnostic token input\n"
+        << "  --router-lookahead-audit PREFIX record actual FFN inputs and next-router logits; diagnostic only\n"
+        << "  --compare-ffn-transfer-phases     one load, fixed primary tiers and CPU routes; baseline/phased/baseline\n"
+        << "  --compare-router-lookahead       one load, fixed primary tiers and CPU routes; baseline/prefetch/baseline\n"
+        << "  --compare-rotary-fusion          one load, fixed primary tiers and CPU routes; original/fused/original\n"
+        << "  --compare-attention-grouping     one load, fixed primary tiers and CPU routes; separate/grouped/separate\n"
+        << "  --compare-mhc-fusion             one load, fixed primary tiers and CPU routes; original/fused/original; honors MFQ_GR_TWO_STAGE_DENSE_INJECTION\n"
+        << "  --compare-mhc-shared-norm        one load, fixed primary tiers and CPU routes; fused/shared-norm/fused\n"
+        << "  --compare-mhc-dense-fusion       one load, fixed primary tiers and CPU routes; original/fused/original BF16 injection\n"
+        << "  --compare-mhc-packed-groups      one load, fixed routes; original/warp-cached metadata and 512-thread Up/original\n"
+        << "  --compare-mfe-parallel-gu        one load, fixed primary tiers and CPU routes; serial/parallel/serial Gate-Up\n"
+        << "  --compare-mfe-gpu-bundle         one load, fixed primary tiers and CPU routes; current/bundle/current FFN\n"
+        << "  --compare-mfe-shared-first       one load, fixed primary tiers and CPU routes; off/on/off shared expert CTA order\n"
+        << "  --compare-mfe-early-gate-up      one load, fixed primary tiers and CPU routes; off/on/off resident Gate-Up with cold Down\n"
+        << "  --compare-cpu-background-calibration one load; synchronous/background/synchronous, fresh CPU costs\n"
+        << "  --compare-cpu-transfer-budget    one load; original/conservative/original CPU policy; report natural route changes\n"
+        << "  --compare-router-topk            one load, fixed primary tiers and CPU routes; original/cached/original\n"
+        << "  --decode-inputs-file FILE        fixed decode input ids, raw int32, gen-1 entries\n"
+        << "  --gen N                         generated tokens\n"
+        << "  --ignore-eos                    fixed-length token diagnostics\n"
+        << "  --compare-route-poll            compare route notification polling, 2000/0/2000 us\n"
+        << "  --compare-window-flush          compare per-layer / one token / per-layer WDDM submission flush\n"
+        << "  --compare-early-no-cpu-ready     compare late / early / late GPU-only CPU completion\n"
+        << "  --compare-gpu-only-cpu-wait      compare kept / skipped / kept CPU wait with a full GPU quota\n"
+        << "  --compare-fixed-gpu-timing      compare kept / skipped / kept rate events with a full GPU quota\n"
+        << "  --compare-window-input-views    compare staged / producer / staged graph input addresses\n"
+        << "  --compare-route-spin           compare yielding / Strata pause / yielding route waits\n"
+        << "  --compare-moe-plan-reuse       one load, fixed primary tiers; allocating/reused/allocating host plans\n"
+        << "  --compare-graph-optimizations  compare graph, shared-gate and residual optimizations off / on / off\n"
+        << "  --compare-mhc-fixed-formats     compare generic / specialized / generic GR Down formats\n"
+        << "  --compare-mhc-async-normalized  compare sync / async / sync GR Float activation copies\n"
+        << "  --compare-gdn-fixed-geometry   compare generic / fixed / generic GDN geometry\n"
+        << "  --compare-gdn-inplace-state    compare copied / inplace / copied GDN state\n"
+        << "  --compare-shared-gate-fusion    compare cuBLAS / fused / cuBLAS shared scalar gates\n"
+        << "  --compare-mfe-default-math      compare complete / default-only / complete MFE arithmetic kernels\n"
+        << "  --compare-mfe-e8-narrow         compare wide / proven narrow / wide MFE E8 metadata kernels\n"
+        << "  --comparison-rounds N           repeat the off/on/off runtime comparison (1..8)\n"
+        << "  --comparison-phase-timings      append a separate off/on/off MFE timing round after performance passes\n"
+        << "  --compare-host-pin              compare decode host placement, free/pinned/free\n"
+        << "  --compare-resident-overlap      compare resident GPU work before host planning, off/on/off\n"
+        << "  --compare-dma-graph-batch       compare ordinary/batched/ordinary weight DMA submissions\n"
+        << "  --compare-ram-field-packing     compare direct/packed/direct small RAM fields, fixed decode inputs\n"
+        << "  --compare-warp-multi-sum       compare original / Strata multi-row reduction / original\n"
+        << "  --warmup-prefill N              prefill warmups, 0-100; default profile=1, otherwise=0\n"
+        << "  --ctx-size N                    context size; 0 selects a default\n"
+        << "  -t, --threads N                 positive CPU thread count\n"
+        << "  -ngl, --n-gpu-layers N          non-negative GPU layer count\n"
+        << "  --cpu-offload-layers RANGES     explicit CPU-offloaded layers\n"
+        << "  --moe-gpu-cache-gb N            bounded MoE GPU cache\n"
+        << "  --tensor-parallel DEVICES       tensor-parallel devices\n"
+        << "  --expert-parallel DEVICES       expert-parallel devices\n"
+        << "  --layer-parallel DEVICES        layer-placement devices\n"
+        << "  -h, --help                      show this help\n";
+}
+
+bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
+    return !value.check_linear.empty() || !value.check_linear_cpu.empty() ||
+        !value.check_tp_linear.empty() || !value.check_ep_moe.empty() ||
+        !value.check_linear_group.empty() || !value.check_q8_embedding.empty() ||
+        !value.check_gdn_input.empty() || !value.check_linear_conv_input.empty() ||
+        !value.check_mfe_tensor.empty() || !value.check_dsv4_output_a.empty() ||
+        value.check_moe_layer >= 0 || value.check_gemma_geglu_layer >= 0 ||
+        value.check_attention_decode > 0 || value.check_backend_bf16_add ||
+        value.check_backend_argmax || value.check_gemma4_swa || value.check_glm_dsa ||
+        value.check_dsv4_attention || value.check_dsv4_hc ||
+        value.check_deepseek_v41 || value.check_text_session_state ||
+        value.check_qwen35_mtp || value.check_continuous_batching ||
+        value.check_engine_isolation ||
+        value.check_flash_next || value.check_qwen4_decode_hidden || value.check_flash_next_mtp ||
+        value.check_runtime_assets || value.check_mfq_container ||
+        value.compare_dsv4_hc_ops || value.compare_dsv4_hc_model ||
+        value.compare_mma_attention || value.compare_decode_splitk ||
+        value.compare_mma_decode || value.compare_nvq_vec4 ||
+        !value.block_trace_reference.empty() || !value.block_trace_output.empty() ||
+        !value.bench_qwen35_mtp.empty() || !value.prefill_sweep_arg.empty() ||
+        !value.ids_arg.empty() || !value.ids_file.empty() ||
+        value.prefill_repeat > 0 || value.profile || value.minicpmo_eval_batch;
+}
+
+// Keep flag dispatch flat: MSVC limits nesting in long else-if chains.
+bool parse_diagnostic_switch(std::string_view option, DiagnosticsCommandOptions& result) {
+    static constexpr std::pair<std::string_view, bool DiagnosticsCommandOptions::*> switches[] = {
+        {"--check-qwen4-decode-hidden", &DiagnosticsCommandOptions::check_qwen4_decode_hidden},
+        {"--compare-ram-field-packing", &DiagnosticsCommandOptions::compare_ram_field_packing},
+        {"--compare-qsa-fusion", &DiagnosticsCommandOptions::compare_qsa_fusion},
+        {"--compare-moe-plan-reuse", &DiagnosticsCommandOptions::compare_moe_plan_reuse},
+        {"--compare-mfe-default-math", &DiagnosticsCommandOptions::compare_mfe_default_math},
+        {"--compare-mfe-e8-narrow", &DiagnosticsCommandOptions::compare_mfe_e8_narrow},
+        {"--minicpmo-eval-batch", &DiagnosticsCommandOptions::minicpmo_eval_batch},
+        {"--check-mfe-routed-input", &DiagnosticsCommandOptions::check_mfe_routed_input},
+        {"--check-mfe-benchmark-only", &DiagnosticsCommandOptions::check_mfe_benchmark_only},
+        {"--check-attention-swa-decode", &DiagnosticsCommandOptions::check_attention_swa_decode},
+        {"--check-gemma4-swa", &DiagnosticsCommandOptions::check_gemma4_swa},
+        {"--check-glm-dsa", &DiagnosticsCommandOptions::check_glm_dsa},
+        {"--check-dsv4-attention", &DiagnosticsCommandOptions::check_dsv4_attention},
+        {"--check-dsv4-hc", &DiagnosticsCommandOptions::check_dsv4_hc},
+        {"--check-deepseek-v41", &DiagnosticsCommandOptions::check_deepseek_v41},
+        {"--check-text-session-state", &DiagnosticsCommandOptions::check_text_session_state},
+        {"--check-qwen35-mtp", &DiagnosticsCommandOptions::check_qwen35_mtp},
+        {"--check-flash-next", &DiagnosticsCommandOptions::check_flash_next},
+        {"--check-flash-next-mtp", &DiagnosticsCommandOptions::check_flash_next_mtp},
+        {"--compare-dsv4-hc-ops", &DiagnosticsCommandOptions::compare_dsv4_hc_ops},
+        {"--compare-dsv4-hc-model", &DiagnosticsCommandOptions::compare_dsv4_hc_model},
+        {"--check-continuous-batching", &DiagnosticsCommandOptions::check_continuous_batching},
+        {"--check-engine-isolation", &DiagnosticsCommandOptions::check_engine_isolation},
+        {"--check-runtime-assets", &DiagnosticsCommandOptions::check_runtime_assets},
+        {"--check-mfq-container", &DiagnosticsCommandOptions::check_mfq_container},
+        {"--compare-ffn-transfer-phases", &DiagnosticsCommandOptions::compare_ffn_transfer_phases},
+        {"--compare-route-poll", &DiagnosticsCommandOptions::compare_route_poll},
+        {"--compare-window-flush", &DiagnosticsCommandOptions::compare_window_flush},
+        {"--compare-early-no-cpu-ready", &DiagnosticsCommandOptions::compare_early_no_cpu_ready},
+        {"--compare-gpu-only-cpu-wait", &DiagnosticsCommandOptions::compare_gpu_only_cpu_wait},
+        {"--compare-fixed-gpu-timing", &DiagnosticsCommandOptions::compare_fixed_gpu_timing},
+        {"--compare-window-input-views", &DiagnosticsCommandOptions::compare_window_input_views},
+        {"--compare-route-spin", &DiagnosticsCommandOptions::compare_route_spin},
+        {"--compare-shared-gate-fusion", &DiagnosticsCommandOptions::compare_shared_gate_fusion},
+        {"--compare-graph-optimizations", &DiagnosticsCommandOptions::compare_graph_optimizations},
+        {"--comparison-phase-timings", &DiagnosticsCommandOptions::comparison_phase_timings},
+        {"--compare-host-pin", &DiagnosticsCommandOptions::compare_host_pin},
+        {"--compare-resident-overlap", &DiagnosticsCommandOptions::compare_resident_overlap},
+        {"--compare-dma-graph-batch", &DiagnosticsCommandOptions::compare_dma_graph_batch},
+        {"--compare-warp-multi-sum", &DiagnosticsCommandOptions::compare_warp_multi_sum},
+        {"--compare-router-lookahead", &DiagnosticsCommandOptions::compare_router_lookahead},
+        {"--compare-rotary-fusion", &DiagnosticsCommandOptions::compare_rotary_fusion},
+        {"--compare-attention-grouping", &DiagnosticsCommandOptions::compare_attention_grouping},
+        {"--compare-mhc-fusion", &DiagnosticsCommandOptions::compare_mhc_fusion},
+        {"--compare-mhc-shared-norm", &DiagnosticsCommandOptions::compare_mhc_shared_norm},
+        {"--compare-mhc-dense-fusion", &DiagnosticsCommandOptions::compare_mhc_dense_fusion},
+        {"--compare-mhc-packed-groups", &DiagnosticsCommandOptions::compare_mhc_packed_groups},
+        {"--compare-mhc-fixed-formats", &DiagnosticsCommandOptions::compare_mhc_fixed_formats},
+        {"--compare-mhc-async-normalized", &DiagnosticsCommandOptions::compare_mhc_async_normalized},
+        {"--compare-gdn-fixed-geometry", &DiagnosticsCommandOptions::compare_gdn_fixed_geometry},
+        {"--compare-gdn-inplace-state", &DiagnosticsCommandOptions::compare_gdn_inplace_state},
+        {"--compare-mfe-parallel-gu", &DiagnosticsCommandOptions::compare_mfe_parallel_gu},
+        {"--compare-mfe-gpu-bundle", &DiagnosticsCommandOptions::compare_mfe_gpu_bundle},
+        {"--compare-mfe-shared-first", &DiagnosticsCommandOptions::compare_mfe_shared_first},
+        {"--compare-mfe-early-gate-up", &DiagnosticsCommandOptions::compare_mfe_early_gu},
+        {"--compare-cpu-background-calibration", &DiagnosticsCommandOptions::compare_cpu_background_calibration},
+        {"--compare-cpu-transfer-budget", &DiagnosticsCommandOptions::compare_cpu_transfer_budget},
+        {"--compare-router-topk", &DiagnosticsCommandOptions::compare_router_topk},
+        {"--profile", &DiagnosticsCommandOptions::profile},
+        {"--ignore-eos", &DiagnosticsCommandOptions::ignore_eos},
+        {"--check-backend-bf16-add", &DiagnosticsCommandOptions::check_backend_bf16_add},
+        {"--check-backend-argmax", &DiagnosticsCommandOptions::check_backend_argmax},
+        {"--compare-mma-attention", &DiagnosticsCommandOptions::compare_mma_attention},
+        {"--compare-decode-splitk", &DiagnosticsCommandOptions::compare_decode_splitk},
+        {"--compare-mma-decode", &DiagnosticsCommandOptions::compare_mma_decode},
+        {"--compare-nvq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+        {"--compare-niq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+    };
+    for (const auto& [name, field] : switches) {
+        if (option == name) {
+            result.*field = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
+    DiagnosticsCommandOptions result;
+    while (!args.empty()) {
+        const std::string_view option = args.next();
+        if (option == "--help" || option == "-h") {
+            print_diagnostics_help();
+            throw HelpRequested{};
+        }
+        if (parse_cuda_load_option(option, args, result) ||
+                parse_token_input_option(option, args, result) ||
+                parse_diagnostic_switch(option, result)) {
+            continue;
+        }
+        if (option == "--continuous-batching-check-requests") {
+            result.check_continuous_batching_requests = integer<int>(args.value(option),option);
+            continue;
+        }
+        if (option == "--minicpmo-eval-vision-batch-size") {
+            result.minicpmo_eval_vision_batch_size =
+                integer<int64_t>(args.value(option), option);
+            if (result.minicpmo_eval_vision_batch_size <= 0) {
+                usage_error("--minicpmo-eval-vision-batch-size must be positive");
+            }
+        }
+        else if (option == "--check-linear") result.check_linear = args.value(option);
+        else if (option == "--check-linear-cpu") result.check_linear_cpu = args.value(option);
+        else if (option == "--check-tp-linear") result.check_tp_linear = args.value(option);
+        else if (option == "--check-tp-axis") result.check_tp_axis_arg = args.value(option);
+        else if (option == "--check-tp-m") result.check_tp_m = integer<int>(args.value(option), option);
+        else if (option == "--check-ep-moe" || option == "--check-tp-moe") {
+            result.check_ep_moe = args.value(option);
+        }
+        else if (option == "--check-ep-moe-tokens" ||
+                option == "--check-tp-moe-tokens") {
+            result.check_ep_moe_tokens = integer<int>(args.value(option), option);
+        }
+        else if (option == "--check-ep-moe-routes" ||
+                option == "--check-tp-moe-routes") {
+            result.check_ep_moe_routes = integer<int>(args.value(option), option);
+        }
+        else if (option == "--check-linear-group") result.check_linear_group = args.value(option);
+        else if (option == "--check-q8-embedding") result.check_q8_embedding = args.value(option);
+        else if (option == "--check-gdn-input") result.check_gdn_input = args.value(option);
+        else if (option == "--check-gdn-output") result.check_gdn_output = args.value(option);
+        else if (option == "--check-gdn-state") result.check_gdn_state = args.value(option);
+        else if (option == "--check-gdn-tokens") result.check_gdn_tokens = integer<int>(args.value(option), option);
+        else if (option == "--check-gdn-q-heads") result.check_gdn_q_heads = integer<int>(args.value(option), option);
+        else if (option == "--check-gdn-v-heads") result.check_gdn_v_heads = integer<int>(args.value(option), option);
+        else if (option == "--check-gdn-head-dim") result.check_gdn_head_dim = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-input") result.check_linear_conv_input = args.value(option);
+        else if (option == "--check-linear-conv-output") result.check_linear_conv_output = args.value(option);
+        else if (option == "--check-linear-conv-tokens") result.check_linear_conv_tokens = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-q-heads") result.check_linear_conv_q_heads = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-v-heads") result.check_linear_conv_v_heads = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-key-dim") result.check_linear_conv_key_dim = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-value-dim") result.check_linear_conv_value_dim = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-conv-kernel") result.check_linear_conv_kernel = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-m") result.check_linear_m = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-reps") result.check_linear_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-linear-gate") result.check_linear_gate = args.value(option);
+        else if (option == "--check-gemma-geglu-layer") result.check_gemma_geglu_layer = integer<int>(args.value(option), option);
+        else if (option == "--check-gemma-geglu-reps") result.check_gemma_geglu_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-moe-layer") result.check_moe_layer = integer<int>(args.value(option), option);
+        else if (option == "--check-moe-tokens") {
+            result.check_moe_tokens = args.value(option);
+            validate_integer_list(result.check_moe_tokens, option);
+        }
+        else if (option == "--check-moe-reps") result.check_moe_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-mfe-tensor") result.check_mfe_tensor = args.value(option);
+        else if (option == "--check-mfe-tokens") result.check_mfe_tokens = integer<int>(args.value(option), option);
+        else if (option == "--check-mfe-routes") result.check_mfe_routes = integer<int>(args.value(option), option);
+        else if (option == "--check-mfe-reps") result.check_mfe_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-mfe-split-width") result.check_mfe_split_width = integer<int>(args.value(option), option);
+        else if (option == "--check-dsv4-output-a") result.check_dsv4_output_a = args.value(option);
+        else if (option == "--check-dsv4-output-a-batch") result.check_dsv4_output_a_batch = integer<int>(args.value(option), option);
+        else if (option == "--check-dsv4-output-a-reps") result.check_dsv4_output_a_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-attention-decode") result.check_attention_decode = integer<int>(args.value(option), option);
+        else if (option == "--check-attention-reps") result.check_attention_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-attention-head-dim") result.check_attention_head_dim = integer<int>(args.value(option), option);
+        else if (option == "--check-attention-window") result.check_attention_window = integer<int>(args.value(option), option);
+        else if (option == "--bench-qwen35-mtp") result.bench_qwen35_mtp = args.value(option);
+        else if (option == "--bench-qwen35-mtp-reps") result.bench_qwen35_mtp_reps = integer<int>(args.value(option), option);
+        else if (option == "--kl-mmq") {
+            result.kl_mmq_arg = args.value(option);
+            try { (void)parse_kl_mmq_mode(result.kl_mmq_arg); }
+            catch (const std::runtime_error& error) {
+                usage_error(error.what());
+            }
+        }
+        else if (option == "--compare-block-trace") result.block_trace_reference = args.value(option);
+        else if (option == "--dump-block-trace") result.block_trace_output = args.value(option);
+        else if (option == "--dump-block-trace-start") result.block_trace_start = integer<int64_t>(args.value(option), option);
+        else if (option == "--dump-block-trace-count") result.block_trace_count = integer<int64_t>(args.value(option), option);
+        else if (option == "--prefill-repeat") result.prefill_repeat = integer<int>(args.value(option), option);
+        else if (option == "--prefill-sweep") {
+            result.prefill_sweep_arg = args.value(option);
+            validate_integer_list(result.prefill_sweep_arg, option);
+        }
+        else if (option == "--prefill-sweep-reps") result.prefill_sweep_reps = integer<int>(args.value(option), option);
+        else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);
+        else if (option == "--router-lookahead-audit") result.router_lookahead_audit = args.value(option);
+        else if (option == "--comparison-rounds") {
+            result.comparison_rounds=integer<int>(args.value(option),option);
+            if(result.comparison_rounds<1 || result.comparison_rounds>8)
+                throw std::invalid_argument("comparison rounds must be between one and eight");
+        }
+        else if (option == "--decode-inputs-file") result.decode_inputs_file = args.value(option);
+        else if (option == "--warmup-prefill") {
+            result.warmup_prefill = integer<int>(args.value(option), option);
+            if (result.warmup_prefill < 0 || result.warmup_prefill > 100)
+                usage_error("--warmup-prefill requires a count from 0 to 100");
+        }
+        else if (option == "--compare-mma-decode-steps") result.compare_mma_decode_steps = integer<int>(args.value(option), option);
+        else if (option == "--compare-mma-decode-planned-len") result.compare_mma_decode_planned_len = integer<int>(args.value(option), option);
+        else usage_error("unknown option: " + std::string(option));
+    }
+    if (!result.decode_inputs_file.empty()) {
+        result.decode_inputs = load_ids_file(result.decode_inputs_file);
+        if (result.gen <= 1 || result.decode_inputs.size() != size_t(result.gen - 1))
+            usage_error("--decode-inputs-file requires exactly gen-1 entries and gen greater than 1");
+        if (std::any_of(result.decode_inputs.begin(),result.decode_inputs.end(),[](int64_t id){return id<0;}))
+            usage_error("--decode-inputs-file requires nonnegative token ids");
+    }
+    if (!result.ids_arg.empty() && !result.ids_file.empty()) {
+        usage_error("--ids and --ids-file are mutually exclusive");
+    }
+    if (!has_diagnostic_action(result)) {
+        usage_error("mfq-diagnostics requires a check or benchmark");
+    }
+    return result;
+}
+
+} // namespace
+
+int run_diagnostics(int argc, char** argv) {
+    try {
+        ArgCursor args(argc, argv);
+        auto options = parse_diagnostics(args);
+        return mfq::cuda::execute_diagnostics_command(std::move(options));
+    } catch (const HelpRequested&) {
+        return 0;
+    } catch (const UsageError& error) {
+        return print_usage_error(error);
+    } catch (const std::exception& error) {
+        std::cerr << "mfq-diagnostics: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+} // namespace mfq::cuda::commands

@@ -86,8 +86,8 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
     tmp_path: Path, monkeypatch
 ) -> None:
     root = tmp_path / "source"
-    (root / "cpp_runtime").mkdir(parents=True)
-    (root / "cpp_runtime" / "CMakeLists.txt").write_text("", encoding="utf-8")
+    (root / "csrc").mkdir(parents=True)
+    (root / "csrc" / "CMakeLists.txt").write_text("", encoding="utf-8")
     mlx = tmp_path / "mlx"
     monkeypatch.setattr(build, "repository_root", lambda: root)
     monkeypatch.setattr(build, "detect_backend", lambda _: "metal")
@@ -107,8 +107,13 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
 
     assert plan.backend == "metal"
     assert plan.target == "mfq-decode-metal"
+    assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
+        "mfq-decode-metal",
+    )
     assert "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON" in plan.configure_command
     assert "-DMFQ_BUILD_METAL_RUNTIME=ON" in plan.configure_command
+    assert "-DMFQ_BUILD_CUDA_RUNTIME=OFF" in plan.configure_command
+    assert "-DMFQ_BUILD_HIP_RUNTIME=OFF" in plan.configure_command
     assert "-DMFQ_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
     assert plan.build_command[-2:] == ("-j", "3")
 
@@ -117,8 +122,8 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     tmp_path: Path, monkeypatch
 ) -> None:
     root = tmp_path / "source"
-    (root / "cpp_runtime").mkdir(parents=True)
-    (root / "cpp_runtime" / "CMakeLists.txt").write_text("", encoding="utf-8")
+    (root / "csrc").mkdir(parents=True)
+    (root / "csrc" / "CMakeLists.txt").write_text("", encoding="utf-8")
     monkeypatch.setattr(build, "repository_root", lambda: root)
     monkeypatch.setattr(build, "detect_backend", lambda _: "cuda")
     monkeypatch.setattr(
@@ -136,8 +141,10 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     command = " ".join(plan.configure_command)
     assert plan.target == "mfq-runtime"
     assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
-        "mfq-runtime", "mfq-diagnostics", "mfq-eval"
+        "mfq-runtime",
     )
+    # A reused build directory cached with the backend off must not drop it.
+    assert "-DMFQ_BUILD_CUDA_RUNTIME=ON" in command
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
     assert "CMAKE_PREFIX_PATH" not in command
     assert "Python_EXECUTABLE" not in command
@@ -160,7 +167,7 @@ def test_build_plan_disables_unselected_accelerators(tmp_path, monkeypatch, back
 
 
 def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
-    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     native_start = cmake.index("add_library(mfq-cuda-runtime STATIC\n")
@@ -168,7 +175,7 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
     native_target = cmake[native_start:reference_start]
 
     assert "MFQ_NATIVE_CUDA_RUNTIME=1" in native_target
-    assert "mfq-cuda-core" in native_target
+    assert "mfq-cuda-native" in native_target
     assert "mfq-cuda-native-kernels" in native_target
     assert "TORCH_LIBRARIES" not in native_target
     assert "Python::Python" not in native_target
@@ -181,17 +188,17 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
 
 
 def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
-    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.h",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.cpp",
+        ROOT / "csrc" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
+        ROOT / "csrc" / "backends" / "cuda" / "commands" / "runtime.cpp",
+        ROOT / "csrc" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.h",
+        ROOT / "csrc" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.cpp",
         *(
-            ROOT / "mfq" / "kernels" / "cuda" / name
+            ROOT / "csrc" / "backends" / "cuda" / "kernels" / name
             for name in re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.cu)", source_block)
         ),
     ]
@@ -208,7 +215,7 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
 
 
 def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
-    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
 
@@ -226,10 +233,10 @@ def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
 
 
 def test_native_cuda_buffer_retains_its_selected_stream() -> None:
-    header = (ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_context.h").read_text(
+    header = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.h").read_text(
         encoding="utf-8"
     )
-    source = (ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu").read_text(
+    source = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.cu").read_text(
         encoding="utf-8"
     )
 
@@ -264,8 +271,8 @@ def test_double_dash_arguments_are_forwarded_without_the_separator(monkeypatch) 
 
 def test_custom_build_is_recorded_and_loaded_for_serve(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "source"
-    (root / "cpp_runtime").mkdir(parents=True)
-    (root / "cpp_runtime" / "CMakeLists.txt").write_text("", encoding="utf-8")
+    (root / "csrc").mkdir(parents=True)
+    (root / "csrc" / "CMakeLists.txt").write_text("", encoding="utf-8")
     mlx = tmp_path / "mlx"
     monkeypatch.setattr(build, "repository_root", lambda: root)
     monkeypatch.setattr(build, "detect_backend", lambda _: "metal")

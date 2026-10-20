@@ -430,11 +430,11 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_matmul_cuda(
     MfqCudaGuard guard(input.device());
     const int64_t total = input.size(0) * first.size(0);
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nepq_sparse_residual_matmul_kernel), 
+   hipLaunchKernelGGL(( nepq_sparse_residual_matmul_kernel),
         dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock),
         dim3(kWarpSize * kWarpsPerBlock),
         0,
-        stream, 
+        stream,
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
@@ -472,11 +472,11 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_dequant_cuda(
     MfqCudaGuard guard(weight.device());
     const int64_t total = first.numel();
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nepq_sparse_residual_dequant_kernel), 
+   hipLaunchKernelGGL(( nepq_sparse_residual_dequant_kernel),
         dim3((total + 255) / 256),
         dim3(256),
         0,
-        stream, 
+        stream,
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
@@ -540,11 +540,11 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_grouped_cuda(
     MfqCudaGuard guard(input.device());
     const int64_t total = route_ids.numel() * out_per_expert;
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nepq_sparse_residual_grouped_kernel), 
+   hipLaunchKernelGGL(( nepq_sparse_residual_grouped_kernel),
         dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock),
         dim3(kWarpSize * kWarpsPerBlock),
         0,
-        stream, 
+        stream,
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
@@ -606,8 +606,8 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_backward_input_cuda(
         static_cast<unsigned>(output_gradient.size(0)));
     const size_t shared_bytes =
         static_cast<size_t>(threads / kWarpSize) * block_vectors * 8 * sizeof(float);
-   hipLaunchKernelGGL(( nepq_sparse_residual_backward_input_kernel), 
-        dim3(blocks), dim3(threads), shared_bytes, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nepq_sparse_residual_backward_input_kernel),
+        dim3(blocks), dim3(threads), shared_bytes, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(), second.data_ptr<int16_t>(),
         reinterpret_cast<const __half *>(
@@ -692,8 +692,8 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_backward_transpose_cuda(
         output_gradient.size(0) * vectors * kWarpSize;
     const int blocks = static_cast<int>(
         (total_threads + threads - 1) / threads);
-   hipLaunchKernelGGL(( nepq_sparse_residual_backward_transpose_kernel), 
-        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( nepq_sparse_residual_backward_transpose_kernel),
+        dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         transpose_offsets.data_ptr<int32_t>(),
         transpose_rows.data_ptr<int32_t>(),

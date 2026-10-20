@@ -409,7 +409,7 @@ std::vector<torch::Tensor> nepq0_s_assign_cuda(
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     const int64_t assignment_blocks = rows * supers_per_row;
 
-   hipLaunchKernelGGL(( nepq0_s_assign_kernel), dim3(assignment_blocks), dim3(kThreads), 0, stream, 
+   hipLaunchKernelGGL(( nepq0_s_assign_kernel), dim3(assignment_blocks), dim3(kThreads), 0, stream,
         value.data_ptr<float>(),
         initial_anchor.data_ptr<float>(),
         scale_lut.data_ptr<float>(),
@@ -423,7 +423,7 @@ std::vector<torch::Tensor> nepq0_s_assign_cuda(
         supers_per_row);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-   hipLaunchKernelGGL(( nepq0_s_refit_anchor_kernel), dim3(rows), dim3(kThreads), 0, stream, 
+   hipLaunchKernelGGL(( nepq0_s_refit_anchor_kernel), dim3(rows), dim3(kThreads), 0, stream,
         value.data_ptr<float>(),
         initial_anchor.data_ptr<float>(),
         scale_lut.data_ptr<float>(),
@@ -438,7 +438,7 @@ std::vector<torch::Tensor> nepq0_s_assign_cuda(
         supers_per_row);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-   hipLaunchKernelGGL(( nepq0_s_assign_kernel), dim3(assignment_blocks), dim3(kThreads), 0, stream, 
+   hipLaunchKernelGGL(( nepq0_s_assign_kernel), dim3(assignment_blocks), dim3(kThreads), 0, stream,
         value.data_ptr<float>(),
         fitted_anchor.data_ptr<float>(),
         scale_lut.data_ptr<float>(),

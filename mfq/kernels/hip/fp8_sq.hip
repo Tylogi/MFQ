@@ -427,14 +427,14 @@ void launch_dequant(
     const int blocks = static_cast<int>(std::min<std::int64_t>(
         (count + 255) / 256, 65535));
     if constexpr (MXFP8) {
-       hipLaunchKernelGGL(( mxfp8_sq_dequant_kernel), dim3(blocks), dim3(256), 0, stream, 
+       hipLaunchKernelGGL(( mxfp8_sq_dequant_kernel), dim3(blocks), dim3(256), 0, stream,
             blob.data_ptr<std::uint8_t>(),
             row_q.data_ptr<std::uint8_t>(),
             row_symbol_byte_offsets.data_ptr<std::int32_t>(),
             reinterpret_cast<T*>(output.data_ptr()),
             layout);
     } else {
-       hipLaunchKernelGGL(( fp8_128_sq_dequant_kernel), dim3(blocks), dim3(256), 0, stream, 
+       hipLaunchKernelGGL(( fp8_128_sq_dequant_kernel), dim3(blocks), dim3(256), 0, stream,
             blob.data_ptr<std::uint8_t>(),
             row_q.data_ptr<std::uint8_t>(),
             row_symbol_byte_offsets.data_ptr<std::int32_t>(),
@@ -458,11 +458,11 @@ void launch_mmq(
         ((static_cast<std::int64_t>(rows) + TILE_M - 1) / TILE_M);
     const int blocks = static_cast<int>(std::min<std::int64_t>(tasks, 65535));
     if constexpr (MXFP8) {
-       hipLaunchKernelGGL(( mxfp8_sq_mmq_kernel<TILE_M>), dim3(blocks), dim3(128), 0, stream, 
+       hipLaunchKernelGGL(( mxfp8_sq_mmq_kernel<TILE_M>), dim3(blocks), dim3(128), 0, stream,
             blob, row_q, row_symbol_byte_offsets, input, output, layout, rows,
             nullptr, nullptr, 0, 0, layout.outputs, 1, false);
     } else {
-       hipLaunchKernelGGL(( fp8_128_sq_mmq_kernel<TILE_M>), dim3(blocks), dim3(128), 0, stream, 
+       hipLaunchKernelGGL(( fp8_128_sq_mmq_kernel<TILE_M>), dim3(blocks), dim3(128), 0, stream,
             blob, row_q, row_symbol_byte_offsets, input, output, layout, rows,
             nullptr, nullptr, 0, 0, layout.outputs, 1, false);
     }
@@ -518,12 +518,12 @@ void launch_routed(
         ((static_cast<std::int64_t>(out_per_expert) + 3) / 4);
     const int blocks = static_cast<int>(std::min<std::int64_t>(tasks, 65535));
     if constexpr (MXFP8) {
-       hipLaunchKernelGGL(( mxfp8_sq_mmq_kernel<1, __half, true>), dim3(blocks), dim3(128), 0, stream, 
+       hipLaunchKernelGGL(( mxfp8_sq_mmq_kernel<1, __half, true>), dim3(blocks), dim3(128), 0, stream,
             blob, row_q, row_symbol_byte_offsets, input, output, layout,
             route_count, expert_ids, expert_local, global_experts,
             local_experts, out_per_expert, routes, shared_input);
     } else {
-       hipLaunchKernelGGL(( fp8_128_sq_mmq_kernel<1, __half, true>), dim3(blocks), dim3(128), 0, stream, 
+       hipLaunchKernelGGL(( fp8_128_sq_mmq_kernel<1, __half, true>), dim3(blocks), dim3(128), 0, stream,
             blob, row_q, row_symbol_byte_offsets, input, output, layout,
             route_count, expert_ids, expert_local, global_experts,
             local_experts, out_per_expert, routes, shared_input);

@@ -1,0 +1,43 @@
+#pragma once
+
+#include "models/common/causal_model_ops.h"
+#include "models/common/block.h"
+#include "glm5_next/causal_lm.h"
+#include "glm5_next/config.h"
+#include "ops/quant/quant_linear.h"
+
+#include <memory>
+
+namespace mfq::cuda {
+
+struct Glm5Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.predictor = CudaPredictorAdapter::flash_next};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
+    template <class Backend> using CausalModel = mfq::models::glm5_next::CausalLm<Backend>;
+    mfq::models::glm5_next::Config config;
+
+    void validate_load_options() const;
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
+                                              const std::string &type);
+
+    mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
+                                               int64_t tokens) const;
+    mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
+                                                const mfq_tensor_backend::Tensor &output_norm,
+                                                int64_t batch, int64_t tokens) const;
+    mfq_tensor_backend::Tensor
+    extract_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+                       const mfq_tensor_backend::Tensor &finalized) const;
+    mfq_tensor_backend::Tensor last_logits_from_head(const QuantLinear &lm_head,
+                                                   mfq_tensor_backend::Tensor hidden) const;
+    mfq_tensor_backend::Tensor next_token_from_head(const QuantLinear &lm_head,
+                                                  mfq_tensor_backend::Tensor hidden) const;
+};
+
+extern template struct CudaSessionCodec<Glm5Model>;
+
+} // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct glm5_next::CausalLm<cuda::CudaCausalOps<cuda::Glm5Model>>;
+} // namespace mfq::models

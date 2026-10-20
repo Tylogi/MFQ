@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-METAL = Path(__file__).resolve().parents[1] / "cpp_runtime/backends/metal"
+METAL = Path(__file__).resolve().parents[1] / "csrc/backends/metal"
 
 
 def test_preparation_does_not_execute_graphs():
@@ -43,7 +43,7 @@ def test_preparation_covers_host_and_device_sampling_inputs():
 def test_load_prepares_kernels_before_service_ready():
     source = (METAL / "apps/mfq_decode_mlx.cpp").read_text()
     loaded = source.split("int run_loaded_runtime(", 1)[1].split("int run_native_runtime(", 1)[0]
-    assert loaded.index("preparation->finish();") < loaded.index("return runtime.run();")
+    assert loaded.index("preparation->finish();") < loaded.index("return transport->run(scheduler);")
     assert "preparation.collect_sampling(preparation_vocab, preparation_sampling);" in source
 
 

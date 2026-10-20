@@ -869,7 +869,7 @@ def _to_gpu_fp8_sq(tensor, device: str | torch.device) -> dict:
         "blob": _payload_tensor(tensor.payload, device),
         "row_q": torch.tensor(layout.row_q_bits, dtype=torch.uint8, device=device),
         "row_symbol_byte_offsets": torch.tensor(
-            layout.row_symbol_byte_offsets, dtype=torch.int32, device=device
+            layout.row_symbol_byte_offsets[:-1], dtype=torch.int32, device=device
         ),
         "out": int(layout.shape[0]),
         "neuron_len": int(layout.shape[1]),

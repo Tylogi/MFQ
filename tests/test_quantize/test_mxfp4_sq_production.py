@@ -212,7 +212,7 @@ def test_production_palettes_match_unified_metal_tables(
     expected: np.ndarray,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
-    source = (root / "cpp_runtime/backends/metal/ops/mlx_mxfp4_sq.h").read_text()
+    source = (root / "csrc/backends/metal/ops/mlx_mxfp4_sq.h").read_text()
     match = re.search(rf"{name}\s*\{{(.*?)\}};", source, re.S)
     assert match is not None
     actual = np.asarray([int(value) for value in re.findall(r"\d+", match.group(1))])

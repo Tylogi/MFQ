@@ -149,7 +149,7 @@ __global__ void rotary_normalized_grouped_kernel(RotaryNormalizedGroup group) {
 }
 template<class Value>
 void launch_rotary_normalized(const RotaryNormalizedProjection& p) {
-   hipLaunchKernelGGL(( rotary_normalized_cached_kernel<Value>), dim3(unsigned(p.rows)),dim3(p.threads),0,mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( rotary_normalized_cached_kernel<Value>), dim3(unsigned(p.rows)),dim3(p.threads),0,mfq_current_cuda_stream(),
         static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
         p.frequencies,p.selected_axes,static_cast<Value*>(p.output),p.heads,p.tokens,p.width,p.pairs,
         p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
@@ -333,7 +333,7 @@ mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     const auto blocks=static_cast<unsigned int>((total+127)/128);
     auto launch=[&](auto tag) {
         using Value=decltype(tag);
-       hipLaunchKernelGGL(( rotary_embedding_cached_kernel<Value>), dim3(blocks),dim3(128),0,mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( rotary_embedding_cached_kernel<Value>), dim3(blocks),dim3(128),0,mfq_current_cuda_stream(),
             reinterpret_cast<const Value*>(input.data_ptr()),positions.data_ptr<int32_t>(),frequencies.data_ptr<float>(),
             axes.data_ptr<int32_t>(),reinterpret_cast<Value*>(output.data_ptr()),rows,int(input.size(1)),int(input.size(2)),
             int(input.size(3)),int(pairs),int(position_axes),int(batches),int(maximum));
@@ -614,7 +614,7 @@ mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tenso
     MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
                 "rope: batch positions do not match x leading dimensions");
     auto out = mfq_tensor_backend::empty_like(x);
-   hipLaunchKernelGGL(( rope_kernel), dim3(MT * T), dim3(ROPE_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( rope_kernel), dim3(MT * T), dim3(ROPE_BD), 0, mfq_current_cuda_stream(),
         x.data_ptr<float>(), pos.data_ptr<float>(), out.data_ptr<float>(),
         MT * T, T, D, RD, pos_axes, pos_batches, s0, s1, s2, (float)base);
     return out;
@@ -660,7 +660,7 @@ mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_ten
     MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
                 "rope_table: batch positions do not match x leading dimensions");
     auto out = mfq_tensor_backend::empty_like(x);
-   hipLaunchKernelGGL(( rope_table_kernel), dim3(MT * T), dim3(ROPE_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( rope_table_kernel), dim3(MT * T), dim3(ROPE_BD), 0, mfq_current_cuda_stream(),
         x.data_ptr<float>(), pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
         out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, pos_batches,
         s0, s1, s2);
@@ -694,8 +694,8 @@ mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mf
                 "rope_table_bf16: invalid rotary geometry");
     const int rows = (int)(x.numel() / D);
     auto out = mfq_tensor_backend::empty_like(x);
-   hipLaunchKernelGGL(( rope_table_bf16_kernel), 
-        dim3(rows), dim3(ROPE_BD), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( rope_table_bf16_kernel),
+        dim3(rows), dim3(ROPE_BD), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __hip_bfloat16*>(
             x.data_ptr<mfq_bfloat16>()),
         pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
@@ -754,8 +754,8 @@ mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int Hk = (int)k.size(1);
-   hipLaunchKernelGGL(( minicpm_bf16_rope_cache_write_kernel), 
-        dim3(B * Hq), dim3(128), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( minicpm_bf16_rope_cache_write_kernel),
+        dim3(B * Hq), dim3(128), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __hip_bfloat16*>(q.data_ptr<mfq_bfloat16>()),
         reinterpret_cast<const __hip_bfloat16*>(k.data_ptr<mfq_bfloat16>()),
         reinterpret_cast<const __hip_bfloat16*>(v.data_ptr<mfq_bfloat16>()),

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.cli import _build_parser
+from mfq.commands import build
 from mfq.commands.serve import (
     _prepare_web_root,
     _resolve_runtime_executable,
@@ -269,6 +270,72 @@ def test_serve_rebuilds_a_missing_runtime_from_its_recorded_recipe(
         "generator": "Ninja",
         "cmake_args": ("-DMFQ_EXPERIMENTAL_KERNEL=ON",),
     }
+
+
+def _cuda_checkout(tmp_path: Path, monkeypatch) -> Path:
+    root = tmp_path / "source"
+    (root / "csrc").mkdir(parents=True)
+    (root / "csrc" / "CMakeLists.txt").write_text("", encoding="utf-8")
+    monkeypatch.setattr(build, "repository_root", lambda: root)
+    monkeypatch.setattr(build, "_cuda_compiler", lambda: Path("/opt/cuda/bin/nvcc"))
+    monkeypatch.setattr(build.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(build.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        build.shutil, "which", lambda name: f"/usr/bin/{name}" if name == "cmake" else None
+    )
+    return root
+
+
+def _captured_cmake_runs(monkeypatch, executable: Path) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def run(command, **_kwargs):
+        commands.append(list(command))
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_bytes(b"runtime")
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    return commands
+
+
+def _build_targets(command: list[str]) -> list[str]:
+    return command[command.index("--target") + 1 : command.index("-j")]
+
+
+def test_serve_compiles_only_the_cuda_runtime_for_a_fresh_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _cuda_checkout(tmp_path, monkeypatch)
+    executable = root / "build" / "csrc" / "mfq-runtime"
+    commands = _captured_cmake_runs(monkeypatch, executable)
+
+    assert _resolve_runtime_executable("cuda") == executable
+    assert _build_targets(commands[-1]) == ["mfq-runtime"]
+
+
+def test_serve_rebuilds_a_missing_cuda_runtime_with_only_the_runtime_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _cuda_checkout(tmp_path, monkeypatch)
+    build_dir = tmp_path / "custom-cuda"
+    missing = build_dir / "mfq-runtime"
+    build.record_managed_build(
+        build.create_build_plan(
+            backend="cuda",
+            build_dir=build_dir,
+            build_type="RelWithDebInfo",
+            generator="Ninja",
+            cmake_args=["-DCMAKE_CUDA_ARCHITECTURES=90"],
+        ),
+        missing,
+    )
+    commands = _captured_cmake_runs(monkeypatch, missing)
+
+    assert _resolve_runtime_executable("cuda") == missing.resolve()
+    configure, compiled = commands
+    assert "-DCMAKE_CUDA_ARCHITECTURES=90" in configure
+    assert "-G" in configure and configure[configure.index("-G") + 1] == "Ninja"
+    assert _build_targets(compiled) == ["mfq-runtime"]
 
 
 def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) -> None:
@@ -558,6 +625,48 @@ def test_serve_validates_web_ui_before_backend_build_or_model_load(
 
 def test_serve_can_disable_web_ui_build() -> None:
     assert _prepare_web_root(None, disabled=True) is None
+
+
+def test_cuda_serve_starts_without_diagnostics_or_evaluation_tools(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("mfq.commands.serve.platform.system", lambda: "Linux")
+    monkeypatch.setattr("mfq.commands.serve.platform.machine", lambda: "x86_64")
+    executable = tmp_path / "mfq-runtime"
+    executable.write_bytes(b"runtime")
+    # A sibling Metal tool or CUDA eval binary must not create a CUDA quality capability.
+    (tmp_path / "mfq-perplexity").write_bytes(b"tool")
+    (tmp_path / "mfq-eval").write_bytes(b"tool")
+    args = _build_parser().parse_args(
+        [
+            "serve",
+            "--no-web-ui",
+            "--backend",
+            "cuda",
+            "--running-executable",
+            str(executable),
+            "--data-dir",
+            str(tmp_path / ".mfq"),
+            "--work-dir",
+            str(tmp_path / "work"),
+        ]
+    )
+    captured: dict[str, set[str]] = {}
+
+    def run(server):
+        captured["kinds"] = {
+            item.kind for item in server.config.app.state.service.jobs.kinds().data
+        }
+
+    monkeypatch.setattr("mfq.server.api.listener.RuntimeServer.run", run)
+
+    assert _run(args) == 0
+    # CUDA serving works with the runtime alone: the Metal-only kernel benchmark and the
+    # Metal-only WT2 evaluation are not advertised, while container validation stays.
+    assert "model.validate" in captured["kinds"]
+    assert "benchmark.kernel" not in captured["kinds"]
+    assert "evaluate.wikitext2" not in captured["kinds"]
 
 
 def test_serve_starts_without_loading_an_initial_model(

@@ -1,6 +1,5 @@
-#include "../../mfq/kernels/cuda/packed_nvq.cuh"
-#include "../../mfq/kernels/cuda/nvq_byte_signs.cuh"
-#include "../../mfq/kernels/cuda/nvq_cooperative_reads.cuh"
+#include "../../csrc/backends/cuda/kernels/quant/packed_nvq.cuh"
+#include "../../csrc/backends/cuda/kernels/nvq/device.cuh"
 #include <algorithm>
 #include <array>
 #include <cstdio>

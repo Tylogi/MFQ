@@ -49,7 +49,7 @@ _MANIFEST_VERSION = 1
 
 def repository_root() -> Path:
     root = Path(__file__).resolve().parents[2]
-    if not (root / "cpp_runtime" / "CMakeLists.txt").is_file():
+    if not (root / "csrc" / "CMakeLists.txt").is_file():
         raise BuildError(
             "the native runtime sources are not installed; run mfq from an MFQ source checkout"
         )
@@ -139,7 +139,7 @@ def load_managed_build(backend: str) -> ManagedBuild | None:
     ):
         return None
     source_dir = Path(record["source_dir"]).expanduser().resolve()
-    if source_dir != (root / "cpp_runtime").resolve():
+    if source_dir != (root / "csrc").resolve():
         return None
     return ManagedBuild(
         backend=backend,
@@ -272,8 +272,8 @@ def create_build_plan(
     cmake = shutil.which("cmake")
     if not cmake:
         raise BuildError("cmake was not found; install CMake 3.26 or newer")
-    output = (build_dir or root / "build" / "cpp_runtime").expanduser().resolve()
-    source = root / "cpp_runtime"
+    output = (build_dir or root / "build" / "csrc").expanduser().resolve()
+    source = root / "csrc"
     target = "mfq-decode-metal" if selected == "metal" else "mfq-runtime"
     configure = [
         cmake,
@@ -299,9 +299,11 @@ def create_build_plan(
             ]
         )
     else:
+        # Explicit ON: a cache configured with the backend off would drop the runtime.
         configure.extend(
             [
                 "-DMFQ_BUILD_METAL_RUNTIME=OFF",
+                "-DMFQ_BUILD_CUDA_RUNTIME=ON",
                 "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF",
             ]
         )
@@ -338,7 +340,6 @@ def create_build_plan(
         build_type,
         "--target",
         target,
-        *([] if selected == "metal" else ["mfq-diagnostics", "mfq-eval"]),
         "-j",
         str(parallelism),
     ]

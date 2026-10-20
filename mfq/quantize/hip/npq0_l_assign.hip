@@ -378,7 +378,7 @@ std::vector<torch::Tensor> npq0_l_assign_cuda(
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
     auto launch_assign = [&](const torch::Tensor& current_anchor) {
-       hipLaunchKernelGGL(( npq0_l_assign_kernel), dim3(groups), dim3(kAssignThreads), 0, stream, 
+       hipLaunchKernelGGL(( npq0_l_assign_kernel), dim3(groups), dim3(kAssignThreads), 0, stream,
             value.data_ptr<float>(),
             objective_weight.data_ptr<float>(),
             current_anchor.data_ptr<float>(),
@@ -397,7 +397,7 @@ std::vector<torch::Tensor> npq0_l_assign_cuda(
     auto launch_refit = [&](
         const torch::Tensor& current_anchor,
         torch::Tensor& fitted_anchor) {
-       hipLaunchKernelGGL(( npq0_l_refit_anchor_kernel), dim3(rows), dim3(kRefitThreads), 0, stream, 
+       hipLaunchKernelGGL(( npq0_l_refit_anchor_kernel), dim3(rows), dim3(kRefitThreads), 0, stream,
             value.data_ptr<float>(),
             objective_weight.data_ptr<float>(),
             current_anchor.data_ptr<float>(),

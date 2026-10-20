@@ -56,13 +56,19 @@ architecture, and backend. Mismatched manifests are ignored.
 
 The manifest is always read from `<repo>/build/mfq-runtime.json`, where
 `<repo>` is the checkout supplying the running `mfq` command. A default build
-uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
+uses `<repo>/csrc` as its source and `<repo>/build/csrc` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 
 Source installations use the managed build automatically, including a custom
 `mfq build --build-dir`. Packaged distributions pass their bundled worker with
 `--running-executable`.
+
+On CUDA, every automatic build requests the `mfq-runtime` target only. A missing
+`mfq-diagnostics` or `mfq-eval` never blocks the server or normal inference: a
+`model.validate` job reports `tool_unavailable` naming the expected path and the
+`cmake --build "<build-dir>" --config <configuration> --target mfq-diagnostics`
+command that produces it. See [optional native tools](build.md#optional-native-tools).
 
 ## Application and private listeners
 

@@ -85,7 +85,7 @@ inline void launch_cast(
     constexpr int threads = 256;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (count + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( cast_kernel<Destination, Source>), dim3(blocks), dim3(threads), 0, stream, 
+   hipLaunchKernelGGL(( cast_kernel<Destination, Source>), dim3(blocks), dim3(threads), 0, stream,
         source, destination, count);
 }
 
@@ -123,7 +123,7 @@ inline void launch_split_float_reduce_to_half(
     const int64_t total = static_cast<int64_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( split_float_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream, 
+   hipLaunchKernelGGL(( split_float_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream,
         partials, destination, rows, width, splits);
 }
 
@@ -180,14 +180,14 @@ inline void launch_split_half_reduce_to_half(
         const int64_t pairs = total / 2;
         const int blocks = static_cast<int>(std::min<int64_t>(
             (pairs + threads - 1) / threads, 65535));
-       hipLaunchKernelGGL(( split_half2_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream, 
+       hipLaunchKernelGGL(( split_half2_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream,
             reinterpret_cast<const __half2 *>(partials),
             reinterpret_cast<__half2 *>(destination), pairs, splits);
         return;
     }
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( split_half_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream, 
+   hipLaunchKernelGGL(( split_half_reduce_to_half_kernel), dim3(blocks), dim3(threads), 0, stream,
         partials, destination, total, splits);
 }
 

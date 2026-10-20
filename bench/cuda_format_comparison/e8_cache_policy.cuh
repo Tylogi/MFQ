@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq/kernels/cuda/nvq_e8_dense_group.cuh"
+#include "csrc/backends/cuda/kernels/nvq/device.cuh"
 
 namespace e8_cache_policy {
 namespace pn=mfq::cuda::packed_nvq;

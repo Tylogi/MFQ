@@ -652,7 +652,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     MFQ_RUNTIME_CHECK(real(workspace) && workspace.sizes().vec()==std::vector<int64_t>({batch,value_heads,width+1}),
         "GDN decode core workspace shape/device/dtype disagrees");
     const auto launch=[&]<class Gate,class Output>() {
-       hipLaunchKernelGGL(( gdn_decode_core_kernel<Gate,Output>), dim3(unsigned(batch*value_heads*tiles)),dim3(threads),0,mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( gdn_decode_core_kernel<Gate,Output>), dim3(unsigned(batch*value_heads*tiles)),dim3(threads),0,mfq_current_cuda_stream(),
             reinterpret_cast<const __half*>(qkv.data_ptr<mfq_half>()),output_gate.data_ptr<Gate>(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
             convolution_state.data_ptr<float>(),recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
             dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<Output>(),

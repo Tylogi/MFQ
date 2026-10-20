@@ -1574,18 +1574,18 @@ void build_expert_map(
     MFQ_CUDA_CHECK(hipMemsetAsync(counts.data_ptr<int32_t>(), 0, experts * sizeof(int32_t), stream));
     const int block = 256;
     const int grid = ::min((pairs + block - 1) / block, 65535);
-   hipLaunchKernelGGL(( count_experts_kernel), dim3(grid), dim3(block), 0, stream, 
+   hipLaunchKernelGGL(( count_experts_kernel), dim3(grid), dim3(block), 0, stream,
         ids.data_ptr<int32_t>(), counts.data_ptr<int32_t>(), pairs, experts);
-   hipLaunchKernelGGL(( scan_expert_counts_kernel), dim3(1), dim3(1), 0, stream, 
+   hipLaunchKernelGGL(( scan_expert_counts_kernel), dim3(1), dim3(1), 0, stream,
         counts.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),
         secondary_bounds_ptr, tertiary_bounds_ptr, experts, tile_m,
         secondary_tile_m, tertiary_tile_m);
-   hipLaunchKernelGGL(( fill_tile_experts_kernel), dim3((experts + 255) / 256), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( fill_tile_experts_kernel), dim3((experts + 255) / 256), dim3(256), 0, stream,
         tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
         secondary_bounds_ptr, secondary_experts_ptr,
         tertiary_bounds_ptr, tertiary_experts_ptr, experts);
-   hipLaunchKernelGGL(( scatter_routes_kernel), dim3(grid), dim3(block), 0, stream, 
+   hipLaunchKernelGGL(( scatter_routes_kernel), dim3(grid), dim3(block), 0, stream,
         ids.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         ids_dst.data_ptr<int32_t>(), pairs, experts);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1602,7 +1602,7 @@ void launch_nint_quantize(
         int gs,
         hipStream_t stream) {
     const int block = gs <= 32 ? 32 : 64;
-   hipLaunchKernelGGL(( quantize_moe_input_kernel), dim3(dim3(rows, groups)), dim3(block), 0, stream, 
+   hipLaunchKernelGGL(( quantize_moe_input_kernel), dim3(dim3(rows, groups)), dim3(block), 0, stream,
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
         rows, k_real, k_pad, gs);
@@ -1758,8 +1758,8 @@ void launch_nint8_zero_grouped_matmul(
         constexpr int persistent_blocks = 4096;
         const int blocks = static_cast<int>(
             std::min<int64_t>(max_tasks, persistent_blocks));
-       hipLaunchKernelGGL(( nint8_zero_moe_grouped_tile_persistent_kernel<kRouteTile>), 
-            dim3(blocks), dim3(dim3(32, 4)), 0, stream, 
+       hipLaunchKernelGGL(( nint8_zero_moe_grouped_tile_persistent_kernel<kRouteTile>),
+            dim3(blocks), dim3(dim3(32, 4)), 0, stream,
                 q.data_ptr<uint8_t>(),
                 reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -1779,8 +1779,8 @@ void launch_nint8_zero_grouped_matmul(
         static_cast<int64_t>(row_tiles) * max_tiles;
     MFQ_RUNTIME_CHECK(
         blocks <= INT_MAX, "grouped NINT8-0 launch grid is too large");
-   hipLaunchKernelGGL(( nint8_zero_moe_grouped_tile_kernel<kRouteTile>), 
-        dim3(static_cast<int>(blocks)), dim3(dim3(32, 4)), 0, stream, 
+   hipLaunchKernelGGL(( nint8_zero_moe_grouped_tile_kernel<kRouteTile>),
+        dim3(static_cast<int>(blocks)), dim3(dim3(32, 4)), 0, stream,
             q.data_ptr<uint8_t>(),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -1805,7 +1805,7 @@ void mfq::moe_cache_scatter_cuda(
         "MoE cache descriptor offset must be non-negative");
     MFQ_RUNTIME_CHECK(transfer_count > 0,
         "MoE cache scatter requires at least one transfer");
-   hipLaunchKernelGGL(( moe_cache_scatter_kernel), dim3(transfer_count), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( moe_cache_scatter_kernel), dim3(transfer_count), dim3(256), 0, stream,
         staging, descriptor_offset, transfer_count);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -1824,7 +1824,7 @@ void mfq::moe_cache_mapped_gather_cuda(
     const dim3 grid(
         static_cast<unsigned int>(blocks_per_transfer),
         static_cast<unsigned int>(transfer_count));
-   hipLaunchKernelGGL(( moe_cache_mapped_gather_kernel), dim3(grid), dim3(256), 0, stream, 
+   hipLaunchKernelGGL(( moe_cache_mapped_gather_kernel), dim3(grid), dim3(256), 0, stream,
         descriptors, transfer_count);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -1875,7 +1875,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     if (!disable_topk_sort && rows == 1 && experts == 128 && top_k == 8 &&
             logits.scalar_type() == mfq_tensor_backend::kFloat32 && bias_ptr == nullptr &&
             !use_sigmoid && !normalize && delayed_softmax && scale == 1.0) {
-       hipLaunchKernelGGL(( moe_topk_1x128_8_kernel), dim3(1), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_1x128_8_kernel), dim3(1), dim3(32), 0, stream,
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>());
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
@@ -1883,7 +1883,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     if (!disable_topk_sort && rows == 1 && experts == 256 && top_k == 8 &&
             logits.scalar_type() == mfq_tensor_backend::kFloat32 && bias_ptr == nullptr &&
             !use_sigmoid && !use_sqrt_softplus && !normalize && delayed_softmax && scale == 1.0) {
-       hipLaunchKernelGGL(( moe_topk_1x256_8_kernel), dim3(1), dim3(256), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_1x256_8_kernel), dim3(1), dim3(256), 0, stream,
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>());
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
@@ -1891,7 +1891,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     if (!disable_topk_sort && rows == 1 && experts == 256 && top_k == 6 &&
             logits.scalar_type() == mfq_tensor_backend::kFloat32 &&
             !use_sigmoid && use_sqrt_softplus && normalize && !delayed_softmax) {
-       hipLaunchKernelGGL(( moe_topk_1x256_6_sqrtsoftplus_kernel), dim3(1), dim3(256), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_1x256_6_sqrtsoftplus_kernel), dim3(1), dim3(256), 0, stream,
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             static_cast<float>(norm_floor), static_cast<float>(scale));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1905,13 +1905,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         (cache_flag == nullptr || std::atoi(cache_flag) != 0);
     if (use_cached) {
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
-       hipLaunchKernelGGL(( moe_topk_cached_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_cached_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
-       hipLaunchKernelGGL(( moe_topk_cached_kernel<float>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_cached_kernel<float>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
@@ -1919,13 +1919,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     }
     } else {
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
-       hipLaunchKernelGGL(( moe_topk_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
-       hipLaunchKernelGGL(( moe_topk_kernel<float>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_topk_kernel<float>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
@@ -1961,11 +1961,11 @@ mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
     const int grid = (rows + 3) / 4;
     const hipStream_t stream = mfq_current_cuda_stream();
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
-       hipLaunchKernelGGL(( moe_sqrtsoftplus_weights_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_sqrtsoftplus_weights_kernel<mfq_half>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<mfq_half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, top_k, static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
-       hipLaunchKernelGGL(( moe_sqrtsoftplus_weights_kernel<float>), dim3(grid), dim3(block), 0, stream, 
+       hipLaunchKernelGGL(( moe_sqrtsoftplus_weights_kernel<float>), dim3(grid), dim3(block), 0, stream,
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, top_k, static_cast<float>(norm_floor), static_cast<float>(scale));
     }
@@ -2452,7 +2452,7 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor p
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
     const hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( moe_weighted_reduce_kernel), dim3(grid), dim3(block), 0, stream, 
+   hipLaunchKernelGGL(( moe_weighted_reduce_kernel), dim3(grid), dim3(block), 0, stream,
         reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
         weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         tokens, routes, width);
@@ -2463,7 +2463,7 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor p
 mfq_tensor_backend::Tensor moe_swiglu_sigmoid_table_cuda() {
     auto table=mfq_tensor_backend::empty({2,65536},
         mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
-   hipLaunchKernelGGL(( moe_sigmoid_table_kernel), dim3(256),dim3(256),0,mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_sigmoid_table_kernel), dim3(256),dim3(256),0,mfq_current_cuda_stream(),
         reinterpret_cast<__half*>(table.data_ptr<mfq_half>()));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return table;
@@ -2513,7 +2513,7 @@ mfq_tensor_backend::Tensor moe_swiglu_split_cuda(mfq_tensor_backend::Tensor gate
     const int64_t total = static_cast<int64_t>(rows) * width;
     constexpr int block = 256;
     const int grid = static_cast<int>((total + block - 1) / block);
-   hipLaunchKernelGGL(( moe_glu_split_kernel<false>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_glu_split_kernel<false>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
         reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), rows, width);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2535,7 +2535,7 @@ mfq_tensor_backend::Tensor moe_geglu_split_cuda(mfq_tensor_backend::Tensor gate_
     constexpr int block = 256;
     const int64_t total = rows64 * width;
     const int grid = static_cast<int>((total + block - 1) / block);
-   hipLaunchKernelGGL(( moe_glu_split_kernel<true>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_glu_split_kernel<true>), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
         reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         static_cast<int>(rows64), width);
@@ -2572,7 +2572,7 @@ mfq_tensor_backend::Tensor moe_apply_expert_scale_cuda(
     MFQ_RUNTIME_CHECK(total64 <= INT_MAX, "expert scale tensor is too large");
     constexpr int block = 256;
     const int grid = static_cast<int>((total64 + block - 1) / block);
-   hipLaunchKernelGGL(( moe_apply_expert_scale_kernel), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_apply_expert_scale_kernel), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
         weights.data_ptr<float>(), ids.data_ptr<int32_t>(), scales.data_ptr<float>(),
         static_cast<int>(total64));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2601,7 +2601,7 @@ mfq_tensor_backend::Tensor moe_add_shared_gate_cuda(
     const int64_t total = static_cast<int64_t>(rows) * width;
     constexpr int block = 256;
     const int grid = static_cast<int>((total + block - 1) / block);
-   hipLaunchKernelGGL(( moe_add_shared_gate_kernel), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_add_shared_gate_kernel), dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(routed.data_ptr<mfq_half>()),
         reinterpret_cast<const __half *>(shared.data_ptr<mfq_half>()),
         gate_logits.data_ptr<float>(),
@@ -2640,8 +2640,8 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
     constexpr int block = 256;
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
-   hipLaunchKernelGGL(( moe_weighted_reduce_shared_gate_kernel), 
-        dim3(grid), dim3(block), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( moe_weighted_reduce_shared_gate_kernel),
+        dim3(grid), dim3(block), 0, mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
         weights.data_ptr<float>(),
         reinterpret_cast<const __half *>(shared.data_ptr<mfq_half>()),

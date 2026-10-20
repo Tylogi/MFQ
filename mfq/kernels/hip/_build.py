@@ -10,10 +10,10 @@ import tempfile
 def stage_sources(repository: Path, build_directory: Path) -> Path:
     trees = (
         "mfq/kernels/hip",
-        "cpp_runtime/backends/hip/include",
-        "cpp_runtime/core/include",
-        "cpp_runtime/components/ggml/include",
-        "cpp_runtime/components/ggml/src/ggml-hip",
+        "csrc/backends/hip/include",
+        "csrc/formats",
+        "csrc/components/ggml/include",
+        "csrc/components/ggml/src/ggml-hip",
     )
     suffixes = {".h", ".cuh", ".hpp", ".cpp", ".hip"}
     files = {
@@ -24,7 +24,7 @@ def stage_sources(repository: Path, build_directory: Path) -> Path:
     }
     files.update(
         path.relative_to(repository)
-        for path in (repository / "cpp_runtime/components/ggml/src").glob("*")
+        for path in (repository / "csrc/components/ggml/src").glob("*")
         if path.is_file() and path.suffix in {".h", ".cuh", ".hpp"}
     )
     files = sorted(files)

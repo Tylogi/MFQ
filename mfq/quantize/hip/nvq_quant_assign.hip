@@ -443,14 +443,14 @@ static std::vector<torch::Tensor> nvq1_assign_cuda(
         + q_count * kThreads * (sizeof(float) + sizeof(uint16_t));
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     if (banked) {
-       hipLaunchKernelGGL(( nvq1_l_assign_kernel<16, 512, true>), dim3(groups), dim3(kThreads), shared_bytes, stream, 
+       hipLaunchKernelGGL(( nvq1_l_assign_kernel<16, 512, true>), dim3(groups), dim3(kThreads), shared_bytes, stream,
             xgroup.data_ptr<float>(), wgroup.data_ptr<float>(),
             group_anchor.data_ptr<float>(), codebook.data_ptr<int8_t>(),
             out_scale.data_ptr<uint8_t>(), out_delta.data_ptr<uint8_t>(),
             out_indices.data_ptr<int64_t>(), static_cast<int>(groups_per_row),
             static_cast<int>(valid_last), static_cast<float>(delta));
     } else if (sub_bits == 3) {
-       hipLaunchKernelGGL(( nvq1_l_assign_kernel<8>), dim3(groups), dim3(kThreads), shared_bytes, stream, 
+       hipLaunchKernelGGL(( nvq1_l_assign_kernel<8>), dim3(groups), dim3(kThreads), shared_bytes, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             group_anchor.data_ptr<float>(),
@@ -462,7 +462,7 @@ static std::vector<torch::Tensor> nvq1_assign_cuda(
             static_cast<int>(valid_last),
             static_cast<float>(delta));
     } else {
-       hipLaunchKernelGGL(( nvq1_l_assign_kernel<16>), dim3(groups), dim3(kThreads), shared_bytes, stream, 
+       hipLaunchKernelGGL(( nvq1_l_assign_kernel<16>), dim3(groups), dim3(kThreads), shared_bytes, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             group_anchor.data_ptr<float>(),
@@ -569,7 +569,7 @@ static std::vector<torch::Tensor> nvq_search_part(
         {groups, vectors_per_group}, xgroup.options().dtype(torch::kInt64));
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     if (vector_size == 8 && codebook.size(0) == 4096) {
-       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 4096>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 4096>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -580,7 +580,7 @@ static std::vector<torch::Tensor> nvq_search_part(
             static_cast<int>(search_steps),
             static_cast<float>(qmax));
     } else if (vector_size == 8 && codebook.size(0) == 1024) {
-       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 1024>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 1024>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -591,7 +591,7 @@ static std::vector<torch::Tensor> nvq_search_part(
             static_cast<int>(search_steps),
             static_cast<float>(qmax));
     } else if (vector_size == 8) {
-       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 256>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<8, 3, 256>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -602,7 +602,7 @@ static std::vector<torch::Tensor> nvq_search_part(
             static_cast<int>(search_steps),
             static_cast<float>(qmax));
     } else if (codebook.size(0) == 1024) {
-       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 1024>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 1024>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -613,7 +613,7 @@ static std::vector<torch::Tensor> nvq_search_part(
             static_cast<int>(search_steps),
             static_cast<float>(qmax));
     } else if (codebook.size(0) == 512) {
-       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 512>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 512>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -624,7 +624,7 @@ static std::vector<torch::Tensor> nvq_search_part(
             static_cast<int>(search_steps),
             static_cast<float>(qmax));
     } else {
-       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 256>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_search_kernel<4, 6, 256>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             codebook.data_ptr<int8_t>(),
@@ -661,7 +661,7 @@ static torch::Tensor nvq_reassign_part(
         {groups, vectors_per_group}, xgroup.options().dtype(torch::kInt64));
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     if (vector_size == 8 && codebook.size(0) == 4096) {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 4096>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 4096>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),
@@ -670,7 +670,7 @@ static torch::Tensor nvq_reassign_part(
             static_cast<int>(groups_per_row),
             static_cast<int>(valid_last));
     } else if (vector_size == 8 && codebook.size(0) == 1024) {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 1024>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 1024>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),
@@ -679,7 +679,7 @@ static torch::Tensor nvq_reassign_part(
             static_cast<int>(groups_per_row),
             static_cast<int>(valid_last));
     } else if (vector_size == 8) {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 256>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<8, 3, 256>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),
@@ -688,7 +688,7 @@ static torch::Tensor nvq_reassign_part(
             static_cast<int>(groups_per_row),
             static_cast<int>(valid_last));
     } else if (codebook.size(0) == 1024) {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 1024>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 1024>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),
@@ -697,7 +697,7 @@ static torch::Tensor nvq_reassign_part(
             static_cast<int>(groups_per_row),
             static_cast<int>(valid_last));
     } else if (codebook.size(0) == 512) {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 512>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 512>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),
@@ -706,7 +706,7 @@ static torch::Tensor nvq_reassign_part(
             static_cast<int>(groups_per_row),
             static_cast<int>(valid_last));
     } else {
-       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 256>), dim3(groups), dim3(kThreads), 0, stream, 
+       hipLaunchKernelGGL(( nvq_reassign_kernel<4, 6, 256>), dim3(groups), dim3(kThreads), 0, stream,
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
             scale.data_ptr<float>(),

@@ -1,10 +1,10 @@
 #include "packed_bench_utils.h"
-#include "mfq_cuda_moe_ops.h"
-#include "mfe_ffn_runtime.h"
-#include "storage/moe_quant_range_source.h"
-#include "storage/moe_cache_types_internal.h"
-#include "storage/weight_loader.h"
-#include "mfq/model_source.h"
+#include "kernels/moe/ops.h"
+#include "ops/moe/mfe_ffn_runtime.h"
+#include "storage/weights/moe/quant_range_source.h"
+#include "storage/weights/moe/cached_source_internal.h"
+#include "storage/weights/loaders/weight.h"
+#include "model_source.h"
 #include <array>
 #include <cstring>
 #include <memory>

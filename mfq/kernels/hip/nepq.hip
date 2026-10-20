@@ -124,11 +124,11 @@ mfq_tensor_backend::Tensor nepq_hadamard_input_cuda(
     MfqCudaGuard guard(input.device());
     auto output = mfq_tensor_backend::empty_like(input);
     hipStream_t stream = mfq_current_cuda_stream();
-   hipLaunchKernelGGL(( nepq_hadamard_input_kernel), 
+   hipLaunchKernelGGL(( nepq_hadamard_input_kernel),
         dim3(dim3(width / block_size, rows)),
         dim3(256),
         static_cast<size_t>(block_size) * sizeof(float),
-        stream, 
+        stream,
         reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
         signs.data_ptr<int8_t>(),
         reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
@@ -170,11 +170,11 @@ mfq_tensor_backend::Tensor nepq_hadamard_adjoint_cuda(
     if (rows == 0) {
         return output;
     }
-   hipLaunchKernelGGL(( nepq_hadamard_adjoint_kernel), 
+   hipLaunchKernelGGL(( nepq_hadamard_adjoint_kernel),
         dim3(dim3(width / block_size, rows)),
         dim3(256),
         static_cast<size_t>(block_size) * sizeof(float),
-        mfq_current_cuda_stream(), 
+        mfq_current_cuda_stream(),
         reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
         signs.data_ptr<int8_t>(),
         reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),

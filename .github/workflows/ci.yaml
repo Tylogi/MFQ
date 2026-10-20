@@ -22,19 +22,19 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Configure portable runtime tests
         run: >-
-          cmake -S cpp_runtime -B build/linux-core -DCMAKE_BUILD_TYPE=Release
+          cmake -S csrc -B build/linux-core -DCMAKE_BUILD_TYPE=Release
           -DMFQ_BUILD_CUDA_RUNTIME=OFF -DMFQ_BUILD_HIP_RUNTIME=OFF
           -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF
           -DBUILD_TESTING=ON
       - name: Build storage and cache regression tests
         run: >-
           cmake --build build/linux-core --parallel 2 --target
-          mfq-file-range-reader-test mfq-model-source-test mfq-quant-expert-range-test
+          mfq-file-range-reader-test mfq-host-memory-copy-test mfq-model-source-test mfq-quant-expert-range-test
           mfq-moe-cache-policy-test mfq-moe-cache-profile-test mfq-native-tensor-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
+          -R '^mfq-(file-range-reader|host-memory-copy|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
 
   macos-metal:
     name: macOS Metal
@@ -52,5 +52,19 @@ jobs:
 
       - name: Check text prefill chunking
         run: |
-          cmake --build build/cpp_runtime --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test
-          ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45)-test$'
+          cmake --build build/csrc --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test
+          ctest --test-dir build/csrc --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45)-test$'
+
+  cuda-source-hygiene:
+    name: CUDA source hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Keep the CUDA backend include graph a DAG
+        run: python3 tests/test_cuda_include_graph.py
+      - name: Keep MFQ_* knobs behind the env module
+        run: |
+          ! grep -rn --include='*.cpp' --include='*.cu' --include='*.cuh' --include='*.h' \
+              -E '(std::)?getenv\(|[^_a-z](setenv|unsetenv)\(|_putenv_s\(' csrc/backends/cuda \
+            | grep -v -e 'backends/cuda/native/env\.cpp:' -e 'backends/cuda/commands/runtime\.cpp:'

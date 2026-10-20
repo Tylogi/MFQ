@@ -1,3 +1,4 @@
+#include "../cuda_graph_query.h"
 #include "weights.h"
 
 static void select_reference(bool enabled) {
@@ -84,7 +85,7 @@ struct Replay {
         for(std::size_t i=0;i<calls;++i)outputs.push_back(run(banks[i%banks.size()]));
         if(std::getenv("MFQ_BENCH_GRAPH_DOT")) {
             cudaStreamCaptureStatus status;unsigned long long id;cudaGraph_t captured=nullptr;
-            fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&status,&id,&captured,nullptr,nullptr));
+            fb::check(bench_stream_captured_graph(mfq_current_cuda_stream(),&status,&id,&captured));
             if(std::getenv("MFQ_BENCH_GRAPH_DOT"))
                 fb::check(cudaGraphDebugDotPrint(captured,std::getenv("MFQ_BENCH_GRAPH_DOT"),cudaGraphDebugDotFlagsKernelNodeParams));
         }

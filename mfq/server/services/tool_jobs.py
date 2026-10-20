@@ -864,12 +864,20 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = ContainerValidationPayload.model_validate(payload)
         artifact = await self._model(request.model)
-        diagnostics = self._required_executable(
-            self.paths.diagnostics or self.paths.runtime, "MFQ diagnostics"
+        diagnostics = self.paths.diagnostics
+        # Metal serve wires diagnostics to the runtime itself; that executable needs no
+        # CUDA target hint.
+        build_target = (
+            None
+            if diagnostics is not None and diagnostics == self.paths.runtime
+            else "mfq-diagnostics"
+        )
+        required = self._required_executable(
+            diagnostics, "MFQ diagnostics", build_target=build_target
         )
         output = await self._run(
             context,
-            [str(diagnostics), "--model", str(artifact.path), "--check-mfq-container"],
+            [str(required), "--model", str(artifact.path), "--check-mfq-container"],
         )
         with suppress(ValueError, StorageError):
             await context.validate_artifact(self._artifact_uri(artifact.path))
@@ -1484,10 +1492,23 @@ class ToolJobHandlers:
         }
 
     @staticmethod
-    def _required_executable(value: Path | None, name: str) -> Path:
-        if value is None or not value.is_file():
-            raise ToolJobHandlers._failure("tool_unavailable", f"{name} executable is unavailable")
-        return value
+    def _required_executable(
+        value: Path | None,
+        name: str,
+        build_target: str | None = None,
+    ) -> Path:
+        if value is not None and value.is_file():
+            return value
+        message = f"{name} executable is unavailable"
+        if build_target is not None:
+            expected = f": {value}" if value is not None else ""
+            message += (
+                f"{expected}; build it with 'cmake --build \"<build-dir>\" "
+                f"--config <configuration> --target {build_target}', replacing the "
+                "placeholders with the CMake build directory and configuration of "
+                "your native build"
+            )
+        raise ToolJobHandlers._failure("tool_unavailable", message)
 
     @staticmethod
     def _failure(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:

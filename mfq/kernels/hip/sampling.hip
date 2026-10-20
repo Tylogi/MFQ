@@ -481,14 +481,14 @@ mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
     if ((V & 1) == 0 &&
         pair_aligned &&
         logits.scalar_type() == mfq_tensor_backend::kFloat16) {
-       hipLaunchKernelGGL(( sample_greedy_pair_kernel<half2>), dim3(B), dim3(SAMPLE_BD), 0, stream, 
+       hipLaunchKernelGGL(( sample_greedy_pair_kernel<half2>), dim3(B), dim3(SAMPLE_BD), 0, stream,
             reinterpret_cast<const half2*>(logits.data_ptr<mfq_half>()),
             out.data_ptr<int64_t>(), V);
     } else if ((V & 1) == 0 &&
                pair_aligned &&
                logits.scalar_type() == mfq_tensor_backend::kBFloat16) {
        hipLaunchKernelGGL(( sample_greedy_pair_kernel<__hip_bfloat162>)
-            , dim3(B), dim3(SAMPLE_BD), 0, stream, 
+            , dim3(B), dim3(SAMPLE_BD), 0, stream,
                 reinterpret_cast<const __hip_bfloat162*>(
                     logits.data_ptr<mfq_bfloat16>()),
                 out.data_ptr<int64_t>(), V);
@@ -496,7 +496,7 @@ mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
         MFQ_DISPATCH_FLOATING_TYPES_AND2(
             mfq_dispatch_half, mfq_dispatch_bfloat16,
             logits.scalar_type(), "sample_greedy_cuda", [&] {
-       hipLaunchKernelGGL(( sample_greedy_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( sample_greedy_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(),
             logits.data_ptr<scalar_t>(), out.data_ptr<int64_t>(), B, V);
         });
     }
@@ -522,7 +522,7 @@ mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_softmax_cuda", [&] {
-       hipLaunchKernelGGL(( sample_softmax_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( sample_softmax_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(),
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature);
     });
@@ -571,7 +571,7 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
         MFQ_DISPATCH_FLOATING_TYPES_AND2(
             mfq_dispatch_half, mfq_dispatch_bfloat16,
             logits.scalar_type(), "sample_top_k_radix_stage1", [&] {
-           hipLaunchKernelGGL(( sample_top_k_radix_stage1_kernel<scalar_t>), dim3(first_blocks), dim3(SAMPLE_BD), 0, stream, 
+           hipLaunchKernelGGL(( sample_top_k_radix_stage1_kernel<scalar_t>), dim3(first_blocks), dim3(SAMPLE_BD), 0, stream,
                 logits.data_ptr<scalar_t>(), vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(),
                 V, (int)top_k);
         });
@@ -581,11 +581,11 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
         while (count > SAMPLE_BD) {
             const int blocks = (count + SAMPLE_BD - 1) / SAMPLE_BD;
             if (input_is_a) {
-               hipLaunchKernelGGL(( sample_top_k_radix_reduce_kernel), dim3(blocks), dim3(SAMPLE_BD), 0, stream, 
+               hipLaunchKernelGGL(( sample_top_k_radix_reduce_kernel), dim3(blocks), dim3(SAMPLE_BD), 0, stream,
                     vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(),
                     vals_b.data_ptr<float>(), idxs_b.data_ptr<int>(), count, (int)top_k);
             } else {
-               hipLaunchKernelGGL(( sample_top_k_radix_reduce_kernel), dim3(blocks), dim3(SAMPLE_BD), 0, stream, 
+               hipLaunchKernelGGL(( sample_top_k_radix_reduce_kernel), dim3(blocks), dim3(SAMPLE_BD), 0, stream,
                     vals_b.data_ptr<float>(), idxs_b.data_ptr<int>(),
                     vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(), count, (int)top_k);
             }
@@ -593,11 +593,11 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
             input_is_a = !input_is_a;
         }
         if (input_is_a) {
-           hipLaunchKernelGGL(( sample_top_k_radix_finish_kernel), dim3(1), dim3(SAMPLE_BD), 0, stream, 
+           hipLaunchKernelGGL(( sample_top_k_radix_finish_kernel), dim3(1), dim3(SAMPLE_BD), 0, stream,
                 vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(), random.data_ptr<float>(),
                 out.data_ptr<int64_t>(), count, (int)top_k, (float)temperature, (float)top_p);
         } else {
-           hipLaunchKernelGGL(( sample_top_k_radix_finish_kernel), dim3(1), dim3(SAMPLE_BD), 0, stream, 
+           hipLaunchKernelGGL(( sample_top_k_radix_finish_kernel), dim3(1), dim3(SAMPLE_BD), 0, stream,
                 vals_b.data_ptr<float>(), idxs_b.data_ptr<int>(), random.data_ptr<float>(),
                 out.data_ptr<int64_t>(), count, (int)top_k, (float)temperature, (float)top_p);
         }
@@ -607,7 +607,7 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_top_k_top_p_cuda", [&] {
-       hipLaunchKernelGGL(( sample_top_k_top_p_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( sample_top_k_top_p_kernel<scalar_t>), dim3(B), dim3(SAMPLE_BD), 0, mfq_current_cuda_stream(),
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature, (int)top_k, (float)top_p);
     });
@@ -625,7 +625,7 @@ void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_
     if (n == 0) return;
     constexpr int bd = 256;
     int blocks = (int)((n + bd - 1) / bd);
-   hipLaunchKernelGGL(( sample_token_counts_add_kernel), dim3(blocks), dim3(bd), 0, mfq_current_cuda_stream(), 
+   hipLaunchKernelGGL(( sample_token_counts_add_kernel), dim3(blocks), dim3(bd), 0, mfq_current_cuda_stream(),
         counts.data_ptr<int32_t>(), tokens.data_ptr<int64_t>(), n, (int)counts.numel());
 }
 
@@ -655,7 +655,7 @@ mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_apply_penalties_cuda", [&] {
-       hipLaunchKernelGGL(( sample_apply_penalties_kernel<scalar_t>), dim3(blocks), dim3(bd), 0, mfq_current_cuda_stream(), 
+       hipLaunchKernelGGL(( sample_apply_penalties_kernel<scalar_t>), dim3(blocks), dim3(bd), 0, mfq_current_cuda_stream(),
             logits.data_ptr<scalar_t>(), counts.data_ptr<int32_t>(), vocab_size,
             (float)presence_penalty, (float)frequency_penalty, (float)repetition_penalty);
     });
