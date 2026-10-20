@@ -70,6 +70,8 @@ packaging/docker/deploy.env
 models/
 !cpp_runtime/models/
 !cpp_runtime/models/**
+!cpp_runtime/server/models/
+!cpp_runtime/server/models/**
 !cpp_runtime/backends/cuda/models/
 !cpp_runtime/backends/cuda/models/**
 !cpp_runtime/backends/hip/models/

@@ -36,6 +36,8 @@ std::filesystem::path home_directory() {
     throw std::runtime_error("cannot locate the user home directory");
 }
 
+} // namespace
+
 std::string normalize_uuid(std::string value) {
     if (value.empty()) {
         std::random_device random;
@@ -63,6 +65,8 @@ std::string normalize_uuid(std::string value) {
     }
     return value;
 }
+
+namespace {
 
 [[noreturn]] void file_error(const char* message) {
     throw std::system_error(errno, std::generic_category(), message);

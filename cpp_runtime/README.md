@@ -82,33 +82,108 @@ and `LICENSES/` directory.
 
 ## Native server bootstrap
 
+Stage 1 infrastructure is implemented and accepted on Linux: seven scenarios
+with 951 checks, plus 34 native regression tests. Windows and macOS acceptance
+remain pending. Stage 2 currently provides the local model catalog; in-process
+model loading and inference are the next step. Studio and release entry points
+still use the existing service.
+
 Build the initial server without GPU backends or the private inference transport:
+
+SQLite development headers and libraries must be installed. On Debian/Ubuntu:
+
+```sh
+sudo apt install libsqlite3-dev
+```
 
 ```sh
 cmake -S cpp_runtime -B build/native-server \
   -DMFQ_BUILD_SERVER=ON -DMFQ_BUILD_CUDA_RUNTIME=OFF \
   -DMFQ_BUILD_HIP_RUNTIME=OFF -DMFQ_BUILD_METAL_RUNTIME=OFF \
-  -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build/native-server --target mfq-server -j
-ctest --test-dir build/native-server -R '^mfq-server-test$' --output-on-failure
+  -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF -DBUILD_TESTING=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native-server --target mfq-server-test -j
+ctest --test-dir build/native-server -L native-server --output-on-failure
 build/native-server/server/mfq-server --data-dir .mfq --port 8090
 ```
 
-The native process needs no Python. The process test uses the Python standard
-library and runs when CMake finds an interpreter. Version metadata comes from
-`mfq/_version.py`, read as text at configure time.
+The server and its C++ integration test need no Python interpreter or test
+framework. CTest launches the native test executable, which starts real server
+processes and checks HTTP, lifecycle, authentication and database migrations.
+Version metadata comes from `mfq/_version.py`, read as text at configure time.
+Use `ctest --test-dir build/native-server -L stage1 --output-on-failure` for the
+infrastructure acceptance suite alone; model catalog checks have the `stage2`
+label.
 
 The initial routes are `/health` and `/health/identity`. Optional `--web-root PATH`
 serves an existing frontend build, including browser navigation fallback; unknown
-API paths remain errors. Without this flag, static serving is disabled. Only
-`127.0.0.1` and `::1` may bind until authentication is migrated. Port `0` selects
-an available port; the startup JSON line reports the actual listener port.
+API paths remain errors. Without this flag, static serving is disabled. Port `0`
+selects an available port; the startup JSON line reports the actual listener port.
+`--host` accepts numeric IPv4/IPv6 addresses and defaults to `127.0.0.1`.
+
+Authentication uses `MFQ_SERVER_API_KEY`, or a variable selected with
+`--api-key-env NAME`. A saved `auth.json` policy takes precedence over the
+environment. Non-loopback listeners require an enabled policy, which cannot be
+disabled while listening on the network. Authentication routes are:
+
+- `GET/PUT /api/v1/auth/policy`;
+- `GET/POST /api/v1/auth/keys`;
+- `POST /api/v1/auth/keys/{id}/revoke` and `/rotate`.
+
+Root credentials and administrator keys manage authentication. Issued keys use
+scopes (`inference`, `models`, `jobs`, `admin`) or roles (`viewer`, `operator`,
+`administrator`), with optional expiry. Tokens are returned only on creation or
+rotation; persistence stores SHA-256 hashes. The request gate accepts Bearer
+credentials, Anthropic `X-Api-Key`, and WebSocket `access_token` credentials
+before upgrade. Studio CORS preflights and instance checks are also enforced;
+the realtime WebSocket API itself remains pending.
 
 The data directory selects the same instance lock and workspace identity as the
-Python service. It cannot be served by both implementations at once. Existing
-databases are untouched. `--exit-on-stdin-close` exits when the parent closes its
+Python service. It cannot be served by both implementations at once.
+`--exit-on-stdin-close` exits when the parent closes its
 input pipe; `--studio-instance-id UUID` requires that lifecycle flag. SIGINT and
 SIGTERM also stop the server. Lock files remain on disk and unlock on process exit.
+Shutdown finishes active database handlers before closing SQLite and skips HTTP
+connections that are still queued. Current-version databases with missing
+authentication columns fail startup instead of advertising a healthy service.
+Version 19 databases skip schema initialization and version rewrites. This
+native rewrite retains version 19; upgrading older databases preserves existing
+user data rather than introducing a new schema version.
 
-Authentication, SQLite, management and inference APIs, and the Studio/release
-switch are pending. This target is not yet a replacement for `mfq serve`.
+SQLite uses `server.sqlite3` in the data directory, falling back to an existing
+`mfq-server.sqlite3`; `--db PATH` selects an explicit file. The shared schema is
+embedded at build time from `mfq/server/state/schema.sql`. Versions 1–18 migrate
+transactionally to version 19, preserving existing rows. Migration failures roll
+back; corrupt databases, unknown versions and nonempty databases without schema
+metadata are rejected.
+
+The local model catalog defaults to `DATA_DIR/models`. Repeated `--model-dir PATH`
+arguments select other roots; when omitted, `MFQ_SERVER_MODEL_DIRS` accepts an
+OS-separated path list. Registration persists the existing `.mfq-files.json`
+format in the first root. The catalog serves:
+
+- `GET /api/v1/models`, with `?refresh=true` to rescan;
+- `GET /api/v1/models/directories`, with `directory_id` or `path` to browse;
+- `POST /api/v1/models/directories/register`, with exactly one directory source;
+- `GET /api/v1/models/{id}/directory`.
+
+Discovery reuses the native MFQ and Safetensors readers without reading full
+weight payloads. It reports file sizes, tensor counts, dtypes, declared context
+capacity and incomplete artifacts. Model listings omit host paths; directory
+APIs require the `models` scope or an appropriate role. Directory IDs change on
+restart. Duplicate names within one format fail; MFQ takes precedence when an
+HF source and converted MFQ share a name. Failed registrations preserve the
+previous index and snapshot.
+
+Snapshots refresh synchronously after five seconds or on request. Each root
+scan is limited to 100,000 entries and 32 nested directory levels; registration
+allows at most 10,000 model paths and a 4 MiB index, enforced before saving.
+Slow volumes can delay catalog requests. The `stage2` CTest suite covers two
+scenarios with 112 checks.
+Models currently report `loadable: false` because in-process execution is still
+pending. Opening a server-side desktop file manager is also pending and is
+reported as unavailable in directory responses.
+
+Other management and inference APIs, and the Studio/release switch are pending.
+This target is not yet a replacement for `mfq serve`. Validation currently covers
+Linux; Windows and macOS remain unverified.

@@ -2,7 +2,9 @@
 
 本文记录 C++ 服务端重写的目标设计，实施顺序见 [迁移计划](backend-plan.md)。
 这是目标架构，不表示已经完整实现。当前产品仍使用 `mfq/server/` 的 Python 服务和
-`cpp_runtime/` 下的原生推理代码；`cpp_runtime/server/` 已开始提供独立原生服务基础入口。
+`cpp_runtime/` 下的原生推理代码；`cpp_runtime/server/` 已提供独立原生服务入口、
+鉴权、SQLite 基础设施和本地模型目录。阶段一基础设施已通过 Linux 验收，
+Windows/macOS 尚待验证；阶段二已实现目录部分，模型加载、同进程推理和其余业务接口尚未接入。
 目标目录统一命名为 `csrc/`，承接 `refactor/cuda` 的目录调整。
 
 ## 1. 已确认的设计

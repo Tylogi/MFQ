@@ -130,6 +130,7 @@ include = ["mfq*"]
 "mfq.quantize.hip" = ["*.hip", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",
+    "state/*.sql",
 ]
 
 [tool.uv]
