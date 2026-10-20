@@ -241,6 +241,9 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-recurrent-mixer-ops-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    if(MSVC)
+        target_compile_options(mfq-recurrent-mixer-ops-test PRIVATE /EHsc)
+    endif()
     mfq_add_cuda_test(mfq-nint-q8-test
         ${MFQ_CUDA_ROOT}/tests/mfq_nint_q8_test.cu
         mfq-cuda-native-kernels)
