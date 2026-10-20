@@ -58,6 +58,14 @@ _REGISTRY = (
         aliases=("gemma4", "gemma4_text"),
         features=ModelFeatureSet(),
     ),
+    # Nemotron-H CUDA text inference and its multi-token predictor are
+    # implemented; the RADIO vision tower has no runtime adapter yet, so no
+    # media capability is advertised for the family.
+    _CapabilityRegistration(
+        family="nemotron_h",
+        aliases=("nemotron_h", "nemotron_h_text", "nemotron_h_omni"),
+        features=ModelFeatureSet(mtp=True),
+    ),
     _CapabilityRegistration(
         family="qwen3_5",
         aliases=("qwen3_5", "qwen35"),

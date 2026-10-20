@@ -293,19 +293,18 @@ QwenBatchState Qwen35BatchStateAdapter::take(int64_t batch) {
             full->cache = KVCache();
             clear_full_attention_decode_workspaces(*full);
         } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(linear->conv_state.defined() && linear->gdn_state.defined() &&
-                                  linear->conv_state.size(0) == batch &&
-                                  linear->gdn_state.size(0) == batch &&
-                                  !linear->speculative_pending,
+            MFQ_RUNTIME_CHECK(linear->mixer.convolution.defined() &&
+                                  linear->mixer.recurrent.defined() &&
+                                  linear->mixer.convolution.size(0) == batch &&
+                                  linear->mixer.recurrent.size(0) == batch &&
+                                  !linear->mixer.speculative_pending,
                               "continuous batching recurrent state is unavailable");
             layer.kind = QwenBatchLayerState::Kind::Recurrent;
-            layer.first = linear->conv_state;
-            layer.second = linear->gdn_state;
-            linear->conv_state = Tensor();
-            linear->gdn_state = Tensor();
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
+            layer.first = linear->mixer.convolution;
+            layer.second = linear->mixer.recurrent;
+            linear->mixer.convolution = Tensor();
+            linear->mixer.recurrent = Tensor();
+            linear->mixer.clear_speculative();
         } else {
             throw std::runtime_error("continuous batching encountered an unsupported block state");
         }
@@ -342,11 +341,9 @@ void Qwen35BatchStateAdapter::restore(const QwenBatchState &state, int64_t cache
                                   saved.first.size(0) == state.batch &&
                                   saved.second.size(0) == state.batch,
                               "continuous batching recurrent state changed");
-            linear->conv_state = saved.first;
-            linear->gdn_state = saved.second;
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
+            linear->mixer.convolution = saved.first;
+            linear->mixer.recurrent = saved.second;
+            linear->mixer.clear_speculative();
         } else {
             throw std::runtime_error(
                 "continuous batching restore encountered an unsupported block");
@@ -418,8 +415,8 @@ std::vector<const void *> Qwen35BatchStateAdapter::decode_state_addresses() {
                 addresses.push_back(full->cache.v.data_ptr());
             }
         } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
-            addresses.push_back(linear->conv_state.data_ptr());
-            addresses.push_back(linear->gdn_state.data_ptr());
+            addresses.push_back(linear->mixer.convolution.data_ptr());
+            addresses.push_back(linear->mixer.recurrent.data_ptr());
         }
     }
     return addresses;
@@ -438,8 +435,8 @@ Qwen35BatchStateAdapter::capture_recurrent_slots(const std::vector<std::int32_t>
         MfqCudaGuard guard(linear->cuda_device);
         std::vector<Tensor> conv, gdn;
         for (auto slot : slots) {
-            conv.push_back(linear->conv_state.narrow(0, slot, 1));
-            gdn.push_back(linear->gdn_state.narrow(0, slot, 1));
+            conv.push_back(linear->mixer.convolution.narrow(0, slot, 1));
+            gdn.push_back(linear->mixer.recurrent.narrow(0, slot, 1));
         }
         state.layers[i].first = mfq_tensor_backend::cat(conv, 0).clone();
         state.layers[i].second = mfq_tensor_backend::cat(gdn, 0).clone();
@@ -457,9 +454,9 @@ void Qwen35BatchStateAdapter::restore_recurrent_slots(const std::vector<std::int
             continue;
         MfqCudaGuard guard(linear->cuda_device);
         for (std::size_t row = 0; row < slots.size(); ++row) {
-            linear->conv_state.narrow(0, slots[row], 1)
+            linear->mixer.convolution.narrow(0, slots[row], 1)
                 .copy_(state.layers[i].first.narrow(0, row, 1));
-            linear->gdn_state.narrow(0, slots[row], 1)
+            linear->mixer.recurrent.narrow(0, slots[row], 1)
                 .copy_(state.layers[i].second.narrow(0, row, 1));
         }
     }

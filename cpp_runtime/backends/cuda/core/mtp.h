@@ -16,7 +16,8 @@ struct MtpTarget {
     std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
         mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
         mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
-        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
+        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*,
+        mfq::cuda::NemotronHCausalLm*> model;
     const RopeCache* rope = nullptr;
     template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
     mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;

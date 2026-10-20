@@ -6,6 +6,16 @@ struct PredictorCursor {
     int64_t layer, start;
 };
 
+// A predictor state may bound its own history; the shared contract for every
+// other family is the backend's configured context capacity.
+template <class State> int64_t predictor_capacity(const State &state) {
+    if constexpr (requires { state.predictor_capacity(); }) {
+        return state.predictor_capacity();
+    } else {
+        return state.config.maximum;
+    }
+}
+
 template <class State, class Reset>
 PredictorCursor begin_predictor(State &state, int64_t batch, int64_t tokens, int64_t depth,
                                 int64_t capacity, bool cache, Reset reset) {
@@ -32,7 +42,7 @@ auto projected_predictor(State &state, int64_t batch, int64_t tokens, int64_t de
                          Hidden hidden, Fuse fuse, Layer layer, Output output,
                          SavePositions save_positions) {
     const auto cursor =
-        begin_predictor(state, batch, tokens, depth, state.config.maximum, cache, reset);
+        begin_predictor(state, batch, tokens, depth, predictor_capacity(state), cache, reset);
     auto embeds = embed();
     auto pos = positions(cursor);
     auto e = embedding(std::move(embeds), pos);

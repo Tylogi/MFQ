@@ -145,6 +145,8 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_flash_next = false;
     bool check_qwen4_decode_hidden = false;
     bool check_flash_next_mtp = false;
+    bool check_nemotron_h = false;
+    bool check_nemotron_h_mtp = false;
     bool compare_dsv4_hc_ops = false;
     bool compare_dsv4_hc_model = false;
     bool check_attention_swa_decode = false;
@@ -541,6 +543,13 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
             std::cout << std::unitbuf;
         }
+        if (check_nemotron_h_mtp) {
+            if (context_size == 0) context_size = 128;
+            if (context_size < 64)
+                throw std::runtime_error(
+                    "Nemotron-H MTP correctness gate requires --ctx-size >= 64");
+            std::cout << std::unitbuf;
+        }
         if (check_qwen35_mtp) {
             if (context_size == 0) context_size = 512;
             if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
@@ -580,7 +589,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(execution, *this,
-            check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
+            check_qwen35_mtp || check_flash_next_mtp || check_nemotron_h_mtp ||
+                !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
             [&](auto& model, auto& runtime_components,
                     auto t0, auto t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
@@ -614,6 +624,24 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             throw std::runtime_error(
                 "Flash-Next diagnostic requires a Flash-Next causal LM");
+        }
+        if (check_nemotron_h) {
+            if constexpr (std::is_same_v<Model, mfq::cuda::NemotronHCausalLm>) {
+                return run_nemotron_h_check(model);
+            }
+            throw std::runtime_error(
+                "--check-nemotron-h requires a Nemotron-H causal LM");
+        }
+        if (check_nemotron_h_mtp) {
+            if constexpr (std::is_same_v<Model, mfq::cuda::NemotronHCausalLm>) {
+                auto* predictor = dynamic_cast<mfq::cuda::nemotron_h::NemotronHMtp*>(
+                    runtime_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "--check-nemotron-h-mtp requires a model containing MTP weights");
+                return run_nemotron_h_mtp_check(model, *predictor);
+            }
+            throw std::runtime_error(
+                "--check-nemotron-h-mtp requires a Nemotron-H causal LM");
         }
         if (check_flash_next_mtp) {
             if constexpr (
@@ -1152,6 +1180,8 @@ void print_diagnostics_help() {
         << "  --check-flash-next              check Flash-Next\n"
         << "  --check-qwen4-decode-hidden     check decode graph raw hidden and KV transitions\n"
         << "  --check-flash-next-mtp          check Flash-Next MTP\n"
+        << "  --check-nemotron-h              check Nemotron-H text backbone\n"
+        << "  --check-nemotron-h-mtp          check Nemotron-H multi-token prediction\n"
         << "  --check-continuous-batching     check continuous batching\n"
         << "  --continuous-batching-check-requests N  check 2..32 concurrent requests\n"
         << "  --check-engine-isolation        check two concurrent CUDA engines\n"
@@ -1244,6 +1274,7 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.check_qwen35_mtp || value.check_continuous_batching ||
         value.check_engine_isolation ||
         value.check_flash_next || value.check_qwen4_decode_hidden || value.check_flash_next_mtp ||
+        value.check_nemotron_h || value.check_nemotron_h_mtp ||
         value.check_runtime_assets || value.check_mfq_container ||
         value.compare_dsv4_hc_ops || value.compare_dsv4_hc_model ||
         value.compare_mma_attention || value.compare_decode_splitk ||
@@ -1276,6 +1307,8 @@ bool parse_diagnostic_switch(std::string_view option, DiagnosticsCommandOptions&
         {"--check-qwen35-mtp", &DiagnosticsCommandOptions::check_qwen35_mtp},
         {"--check-flash-next", &DiagnosticsCommandOptions::check_flash_next},
         {"--check-flash-next-mtp", &DiagnosticsCommandOptions::check_flash_next_mtp},
+        {"--check-nemotron-h", &DiagnosticsCommandOptions::check_nemotron_h},
+        {"--check-nemotron-h-mtp", &DiagnosticsCommandOptions::check_nemotron_h_mtp},
         {"--compare-dsv4-hc-ops", &DiagnosticsCommandOptions::compare_dsv4_hc_ops},
         {"--compare-dsv4-hc-model", &DiagnosticsCommandOptions::compare_dsv4_hc_model},
         {"--check-continuous-batching", &DiagnosticsCommandOptions::check_continuous_batching},

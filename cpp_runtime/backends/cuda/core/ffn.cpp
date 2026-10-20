@@ -94,7 +94,11 @@ void FFN::prepare_moe_pipeline(CudaExecutionContext& execution) const {
             cpu_moe_gate || cpu_moe_up || cpu_moe_gate_up || cpu_moe_down ||
             !execution.config.moe_route_stats_path.empty())return;
     std::vector<std::shared_ptr<MfeWeight>> gate_up;
-    if(moe_split_gate_up)gate_up={std::make_shared<MfeWeight>(moe_gate),std::make_shared<MfeWeight>(moe_up)};
+    // An ungated bank publishes Up in both slots; the pipeline detects the
+    // single-image layout from the projection geometry, not the model name.
+    if(moe_ungated_experts)
+        gate_up={std::make_shared<MfeWeight>(moe_up),std::make_shared<MfeWeight>(moe_up)};
+    else if(moe_split_gate_up)gate_up={std::make_shared<MfeWeight>(moe_gate),std::make_shared<MfeWeight>(moe_up)};
     else gate_up={std::make_shared<MfeWeight>(moe_gate_up)};
     MoeFfnPrefetch prefetch;
     moe_pipeline_forward=make_moe_ffn_pipeline(gate_up,{std::make_shared<MfeWeight>(moe_down)},
@@ -449,6 +453,11 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                 execution.continuous_batch_cache_serial) {
                 return false;
             }
+            if (moe_ungated_experts) {
+                if (cpu_moe_up || cpu_moe_down)
+                    return false;
+                return prefetch_cached_moe_projection_bundle(moe_up, moe_down, route);
+            }
             if (moe_split_gate_up) {
                 if (cpu_moe_gate || cpu_moe_up)
                     return false;
@@ -502,10 +511,17 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     });
                 }
                 if (!use_pipeline) {
+                    // Dense (source-precision) banks are not MFE cohorts, so
+                    // their expert count comes from the bank itself.
+                    const auto routed_experts =
+                        moe_dense_up.defined()
+                            ? static_cast<int>(moe_dense_up.size(0))
+                            : (moe_ungated_experts
+                                   ? moe_up.n_experts
+                                   : (moe_split_gate_up ? moe_gate.n_experts
+                                                        : moe_gate_up.n_experts));
                     route = profiler.measure("moe.route_map", [&]() {
-                        return build_moe_route_plan(selected.at(0), moe_split_gate_up
-                                                                        ? moe_gate.n_experts
-                                                                        : moe_gate_up.n_experts);
+                        return build_moe_route_plan(selected.at(0), routed_experts);
                     });
                 }
                 return selected;
@@ -558,6 +574,22 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                 const bool dense_routed =
                     moe_dense_up.defined() || moe_dense_down.defined() ||
                     moe_dense_gate.defined();
+                // Only routed experts run in the latent space; the router and
+                // the shared expert keep reading the original hidden state.
+                const bool latent_routed =
+                    !dense_routed && dense_linear_defined(moe_latent_in);
+                auto routed_input = xf;
+                if (latent_routed)
+                    routed_input = profiler.measure("moe.latent_down", [&] {
+                        return moe_latent_in.forward(execution, xf);
+                    });
+                const auto finish_latent = [&](Tensor reduced) {
+                    if (latent_routed)
+                        return profiler.measure("moe.latent_up", [&] {
+                            return moe_latent_out.forward(execution, reduced);
+                        });
+                    return reduced;
+                };
                 if (dense_routed) {
                     if (moe_ungated_experts &&
                         (moe_dense_gate.defined() || moe_gate_up.n_experts > 0 ||
@@ -603,22 +635,71 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                                            down_pair, static_cast<int>(moe_dense_up.size(0)));
                     return {reduced, true};
                 }
-                if (moe_ungated_experts)
-                    throw std::runtime_error(
-                        "non-gated routed MoE requires a dense BF16/F16/F32 expert bank; "
-                        "the MFE non-gated kernel is not implemented");
-                if(use_pipeline) {
-                    auto result=moe_pipeline_forward(execution,xf,selected.at(0),selected.at(1));
-                    if(result.dim()==3)result=moe_weighted_reduce_cuda(result,selected.at(1));
-                    return {result,true};
+                if (moe_ungated_experts && !use_pipeline) {
+                    // relu-squared experts store Up and Down only: one Up matmul,
+                    // no gate projection, and the shared expert stays outside
+                    // the routed latent space.
+                    if (moe_gate.n_experts > 0 || moe_gate_up.n_experts > 0 ||
+                        moe_gate.cached_source || moe_gate_up.cached_source)
+                        throw std::runtime_error(
+                            "ungated routed MoE cannot carry a gate projection");
+                    MFQ_RUNTIME_CHECK(moe_up.n_experts > 0,
+                                      "ungated routed MoE requires an Up bank");
+                    if (!projection_bundle_prefetched) {
+                        moe_up.prefetch(route);
+                        moe_down.prefetch(route);
+                    }
+                    std::optional<MfeWeight> staged_up;
+                    const MfeWeight *active_up = &moe_up;
+                    if (cpu_moe_up) {
+                        staged_up.emplace(profiler.measure("moe.cpu_offload_up_h2d", [&]() {
+                            return stage_cpu_mixed_moe(cpu_moe_up, execution.config);
+                        }));
+                        active_up = &staged_up.value();
+                    }
+                    auto up = profiler.measure("moe.up", [&]() {
+                        return active_up->forward(execution, routed_input, route);
+                    });
+                    auto hidden = profiler.measure("moe.relu_squared", [&]() {
+                        return relu_squared_cuda(up.contiguous());
+                    });
+                    staged_up.reset();
+                    std::optional<MfeWeight> staged_down;
+                    const MfeWeight *active_down = &moe_down;
+                    if (cpu_moe_down) {
+                        staged_down.emplace(profiler.measure("moe.cpu_offload_down_h2d", [&]() {
+                            return stage_cpu_mixed_moe(cpu_moe_down, execution.config);
+                        }));
+                        active_down = &staged_down.value();
+                    }
+                    auto down_pair = profiler.measure("moe.down", [&] {
+                        return active_down->forward(execution, hidden, route);
+                    });
+                    record_moe_route_stats(execution, moe_layer, selected.at(0),
+                                           selected.at(1), down_pair, moe_up.n_experts);
+                    staged_down.reset();
+                    if (latent_routed)
+                        return {finish_latent(profiler.measure("moe.reduce", [&] {
+                                    return moe_weighted_reduce_cuda(down_pair, selected.at(1));
+                                })),
+                                true};
+                    return {down_pair, false};
                 }
-                if (expert_parallel)
-                    return {profiler.measure("moe.expert_parallel",
-                                             [&] {
-                                                 return forward_expert_parallel_moe(
-                                                     execution, xf, route, selected.at(1));
-                                             }),
-                            true};
+                if(use_pipeline) {
+                    auto result=moe_pipeline_forward(execution,routed_input,selected.at(0),
+                                                     selected.at(1));
+                    if(result.dim()==3)result=moe_weighted_reduce_cuda(result,selected.at(1));
+                    return {finish_latent(result),true};
+                }
+                if (expert_parallel) {
+                    auto result = profiler.measure("moe.expert_parallel", [&] {
+                        return forward_expert_parallel_moe(execution, routed_input, route,
+                                                           selected.at(1));
+                    });
+                    if (latent_routed && result.dim() == 3)
+                        result = moe_weighted_reduce_cuda(result, selected.at(1));
+                    return {finish_latent(result), true};
+                }
                 std::optional<MfeWeight> staged_gate_up;
                 std::optional<MfeWeight> staged_gate;
                 std::optional<MfeWeight> staged_up;

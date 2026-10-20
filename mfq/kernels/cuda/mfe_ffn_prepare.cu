@@ -63,6 +63,8 @@ __device__ void prepare_shared_gate(const MfePrepareSharedGate& gate,int token,i
 }
 __device__ int residency_kind(const MfeFfnBatch& b,int expert) {
     for(int which=0;which<3;++which) {
+        // An ungated bank has no Gate cohort; Up and Down own the residency.
+        if(which==0 && b.expert_activation==1)continue;
         const int pool=b.cohort_by_expert[which*b.experts+expert];
         if(unsigned(pool)>=unsigned(b.projection_counts[which]))return which==2?6:2;
         const auto& d=b.projections[b.projection_offsets[which]+pool];
@@ -233,7 +235,9 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
                 if constexpr(EarlyTags)if(projection==3)
                     early_tag=reinterpret_cast<const volatile MfeCachedExpert*>(cache.mapped)[expert].ready_mask;
                 unsigned missing=0;
-                if(projection<3) {
+                // A relu-squared bank has no Gate cohort: projection 0 keeps its
+                // empty primary layout and is never missing or refreshed.
+                if(projection<3 && !(projection==0 && b.expert_activation==1)) {
                     const int p=projection;
                     const int pool=cache.primary_cohorts[p*b.experts+expert];
                     mapping[p*b.experts+expert]=pool;

@@ -42,9 +42,12 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
             throw std::runtime_error(
                 "ungated routed MoE requires only Up and Down at layer " +
                 std::to_string(layer));
-        if constexpr (requires { result.moe_ungated_experts = true; })
+        if constexpr (requires { result.moe_ungated_experts = true; }) {
             result.moe_ungated_experts = true;
-        else
+            // Up lives in the split slot so prefetch/cache code sees a real
+            // single projection instead of an empty fused pair.
+            result.moe_split_gate_up = true;
+        } else
             throw std::runtime_error(
                 "this FFN type does not support ungated routed experts at layer " +
                 std::to_string(layer));
@@ -104,9 +107,12 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
     return result;
 }
 
+// Geometry and projections of one canonical attention mixer. Blocks that also
+// carry a separate FFN norm load it through their own adapter.
 template <class Block, class Loader>
-void load_full_attention(Block& block, Loader& ops, const ModelConfig& config, int layer,
-                         const std::string& prefix, double norm_offset, bool output_gate = false) {
+void load_attention_mixer(Block& block, Loader& ops, const ModelConfig& config, int layer,
+                          const std::string& prefix, double norm_offset,
+                          bool output_gate = false) {
     block.layer = layer;
     block.attention_heads = config.num_attention_heads;
     block.kv_heads = config.num_key_value_heads;
@@ -118,7 +124,6 @@ void load_full_attention(Block& block, Loader& ops, const ModelConfig& config, i
     if constexpr (requires { block.no_rope = false; })
         block.no_rope = config.positional_encoding == PositionalEncoding::none;
     block.attn_norm = ops.dense(prefix + "attention.norm.weight");
-    block.ffn_norm = ops.dense(prefix + "mlp.norm.weight");
     const auto attention = prefix + "attention.";
     ops.qkv(block, {attention + "query.weight", attention + "key.weight", attention + "value.weight"});
     block.o = ops.linear(attention + "output.weight");
@@ -126,6 +131,13 @@ void load_full_attention(Block& block, Loader& ops, const ModelConfig& config, i
         block.q_norm = ops.dense(attention + "query_norm.weight");
     if (ops.has(attention + "key_norm.weight"))
         block.k_norm = ops.dense(attention + "key_norm.weight");
+}
+
+template <class Block, class Loader>
+void load_full_attention(Block& block, Loader& ops, const ModelConfig& config, int layer,
+                         const std::string& prefix, double norm_offset, bool output_gate = false) {
+    load_attention_mixer(block, ops, config, layer, prefix, norm_offset, output_gate);
+    block.ffn_norm = ops.dense(prefix + "mlp.norm.weight");
 }
 
 } // namespace mfq::models

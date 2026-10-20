@@ -44,6 +44,9 @@ template <class Backend> struct CausalLm;
 namespace mfq::models::minicpmo45 {
 template <class Backend> struct TtsCausalLm;
 }
+namespace mfq::models::nemotron_h {
+template <class Backend> struct CausalLm;
+}
 
 namespace mfq::cuda {
 
@@ -107,6 +110,7 @@ struct Glm5Model;
 struct Qwen4Model;
 struct DeepseekV4Model;
 struct DeepseekV41Model;
+struct NemotronHModel;
 
 template <typename Model> struct CudaCausalOps;
 template <typename Model>
@@ -358,5 +362,6 @@ using Glm5CausalLm = mfq::models::glm5_next::CausalLm<CudaCausalOps<Glm5Model>>;
 using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>>;
 using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
 using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
+using NemotronHCausalLm = mfq::models::nemotron_h::CausalLm<CudaCausalOps<NemotronHModel>>;
 
 } // namespace mfq::cuda

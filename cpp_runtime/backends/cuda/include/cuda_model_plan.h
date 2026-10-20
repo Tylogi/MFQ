@@ -20,6 +20,7 @@ enum class CudaBackbone {
     qwen4_exp,
     deepseek_v4,
     deepseek_v41,
+    nemotron_h,
     unsupported,
 };
 
@@ -35,6 +36,7 @@ enum class CudaPredictorAdapter {
     qwen35,
     flash_next,
     deepseek_v41_dspark,
+    nemotron_h,
 };
 
 struct CudaModelPlan {
@@ -86,6 +88,9 @@ inline constexpr CudaBackbone cuda_backbone(
     if (implementation == "deepseek_v41") {
         return CudaBackbone::deepseek_v41;
     }
+    if (implementation == "nemotron_h") {
+        return CudaBackbone::nemotron_h;
+    }
     return CudaBackbone::unsupported;
 }
 
@@ -131,6 +136,11 @@ inline CudaModelPlan cuda_model_plan(
         predictor->implementation == "deepseek_v41_dspark" &&
         predictor->tensor_root == "predictor") {
         result.predictor = CudaPredictorAdapter::deepseek_v41_dspark;
+    }
+    if (graph.backbone == "nemotron_h" && predictor != nullptr &&
+        predictor->implementation == "nemotron_h_mtp" &&
+        predictor->tensor_root == "predictor") {
+        result.predictor = CudaPredictorAdapter::nemotron_h;
     }
     return result;
 }
