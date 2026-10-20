@@ -1,5 +1,5 @@
-#include "mfq/io/file_range_reader.h"
-#include "mfq/io/async_range_reader.h"
+#include "file_range_reader.h"
+#include "async_range_reader.h"
 
 #include <algorithm>
 #include <array>

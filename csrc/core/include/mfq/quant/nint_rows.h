@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <vector>
-#include "mfq/io/read_span.h"
+#include "read_span.h"
 
 namespace mfq {
 

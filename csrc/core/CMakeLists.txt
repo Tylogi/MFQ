@@ -24,9 +24,6 @@ set_target_properties(mfq-model-graph PROPERTIES
 )
 
 add_library(mfq-model-source STATIC
-    io/file_range_reader.cpp
-    io/async_range_reader.cpp
-    include/mfq/io/file_range_reader.h
     quant/mfe_quant_expert_store.cpp
     include/mfq/quant/mfe_expert_store.h
     quant/nint_rows.cpp
@@ -50,7 +47,7 @@ target_include_directories(mfq-model-source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
-target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
+target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-io)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)

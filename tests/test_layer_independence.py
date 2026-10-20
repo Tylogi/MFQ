@@ -3,7 +3,7 @@
 
 The rules are about responsibility, not about directory names:
 
-  1. core, scheduler, transport, engine and models never name a backend
+  1. core, scheduler, transport, engine, models and file I/O never name a backend
      (mfq::cuda, mfq::metal, mfq_tensor_backend, backends/ includes).
   2. A model family may be named in engine/model/<family>/ and in models/, where
      the family lives.  The generic request table, the Planner, both Stores, the
@@ -38,7 +38,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 CSRC = REPO / "csrc"
-SHARED = ("core", "scheduler", "transport", "engine", "models")
+SHARED = ("core", "scheduler", "transport", "engine", "models", "components/io")
 BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/")
 # Family stems anywhere in an identifier: Qwen35, qwen3_5 and is_qwen35 all hit.
 FAMILY_TOKEN = re.compile(
@@ -71,22 +71,28 @@ def check_tree(csrc):
     for path in sources(csrc):
         relative = os.path.relpath(path, csrc).replace(os.sep, "/")
         module = relative.split("/")[0]
-        if module not in SHARED:
+        if not relative.startswith(tuple(owner + "/" for owner in SHARED)):
             continue
         under_model = relative.startswith("engine/model/")
+        under_io = relative.startswith("components/io/")
         exempt = relative in FAMILY_EXCEPTIONS
         for lineno, line in code_lines(path):
             if BACKEND_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: shared layer names a backend: {line.strip()}")
             if module == "engine" and not under_model and not exempt and FAMILY_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: generic engine code names a model family: {line.strip()}")
-        if not under_model:
+        if not (under_model or under_io):
             continue
         for lineno, raw in includes(path):
             hits = resolve(raw, path, roots)
             if not hits:
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
+            if under_io:
+                if (target.startswith(("core/", "models/", "model_source/", "engine/", "formats/")) or
+                        target.startswith("backends/") and not target.startswith("backends/cpu/native/")):
+                    failures.append(f"{relative}:{lineno}: file I/O reaches a higher layer: {raw}")
+                continue
             if not target.startswith("engine/"):
                 if target.startswith("backends/"):
                     failures.append(f"{relative}:{lineno}: shared model layer includes a backend header: {raw}")
@@ -104,6 +110,21 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("file I/O may use host thread primitives", {
+        "components/io/read.cpp": '#include "mfq/host_parallel.h"\n',
+        "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",
+    }, None),
+    ("file I/O may not name a backend", {
+        "components/io/read.cpp": "void f() { mfq::cuda::run(); }\n",
+    }, "shared layer names a backend"),
+    ("file I/O may not reach a model source", {
+        "components/io/read.cpp": '#include "mfq/model_source/model_source.h"\n',
+        "core/include/mfq/model_source/model_source.h": "struct Source {};\n",
+    }, "file I/O reaches a higher layer"),
+    ("file I/O may not reach a backend tensor by a bare include", {
+        "components/io/read.cpp": '#include "tensor.h"\n',
+        "backends/cuda/tensor.h": "struct Tensor {};\n",
+    }, "file I/O reaches a higher layer"),
     ("model layer may use the state and weight interfaces", {
         "engine/model/qwen35/forward.h": '#include "pages.h"\n#include "slots.h"\n',
         "engine/state/pages.h": "struct Pages {};\n",

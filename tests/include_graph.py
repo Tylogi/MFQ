@@ -33,6 +33,8 @@ def include_roots(csrc):
                   os.path.join(csrc, "backends", backend, "include")]
     roots += [os.path.join(csrc, "backends", "cpu", layer, "include")
               for layer in ("native", "execution")]
+    roots += [os.path.join(csrc, "backends", "cpu", "ops"),
+              os.path.join(csrc, "components", "io")]
     roots += [os.path.join(csrc, "components", "tokenizer"),
               os.path.join(csrc, "components", "tokenizer", "include"),
               os.path.join(csrc, "models")]

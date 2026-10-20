@@ -1,4 +1,4 @@
-"""CPU native primitives must not pull in expert execution or the old core."""
+"""CPU primitives and file I/O must not pull in expert execution or the old core."""
 from pathlib import Path
 import re
 import sys
@@ -31,8 +31,10 @@ def _target_dependencies(graph: str, target: str) -> set[str]:
 
 
 def _check_native_targets(graph: str, cuda: bool) -> None:
-    forbidden = {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json", "mfq-cpu-execution"}
-    targets = ["mfq-host-parallel", "mfq-host-parallel-test", "mfq-cpu-topology-test"]
+    forbidden = {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json", "mfq-cpu-execution",
+                 "mfq-engine", "mfq-models"}
+    targets = ["mfq-host-parallel", "mfq-host-parallel-test", "mfq-cpu-topology-test",
+               "mfq-cpu-ops", "mfq-host-memory-copy-test", "mfq-io", "mfq-file-range-reader-test"]
     if cuda:
         targets.append("mfq-cuda-native")
     for target in targets:
@@ -57,12 +59,16 @@ def test_native_target_closure(tmp_path: Path, cuda: bool) -> None:
 
 def test_target_check_rejects_transitive_expert_dependency() -> None:
     targets = ["mfq-host-parallel", "mfq-host-parallel-test", "mfq-cpu-topology-test",
-               "mfq-cpu-execution", "mfq-cpu-expert-pool-test", "bridge"]
+               "mfq-cpu-execution", "mfq-cpu-expert-pool-test", "bridge", "mfq-cpu-ops",
+               "mfq-host-memory-copy-test", "mfq-io", "mfq-file-range-reader-test"]
     graph = "\n".join(f'"n{i}" [ label = "{name}" ];' for i, name in enumerate(targets))
     graph += '\n"n1" -> "n0";\n"n2" -> "n0";\n"n3" -> "n0";\n"n4" -> "n3";'
+    graph += '\n"n6" -> "n0";\n"n7" -> "n6";\n"n8" -> "n0";\n"n9" -> "n8";'
     _check_native_targets(graph, False)
     with pytest.raises(AssertionError, match="mfq-host-parallel reaches"):
         _check_native_targets(graph + '\n"n0" -> "n5";\n"n5" -> "n3";', False)
+    with pytest.raises(AssertionError, match="mfq-io reaches"):
+        _check_native_targets(graph + '\n"n8" -> "n5";\n"n5" -> "n3";', False)
 
 
 def _check_native_sources(csrc: Path) -> None:

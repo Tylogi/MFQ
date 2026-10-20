@@ -1,5 +1,5 @@
 #include "mfq/model_source/mfq_model_source.h"
-#include "mfq/io/async_range_reader.h"
+#include "async_range_reader.h"
 #include "mfq/mapped_read_profile.h"
 #include "mfq/mapped_prefetch_scope.h"
 #include "mfq/mapped_tensor_pages.h"

@@ -88,8 +88,9 @@ endif()
 # Common code is split by responsibility. JSON is defined first because the
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
-add_subdirectory(core)
 add_subdirectory(backends/cpu)
+add_subdirectory(components/io)
+add_subdirectory(core)
 add_subdirectory(models)
 
 add_subdirectory(components/ggml)

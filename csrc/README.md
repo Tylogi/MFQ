@@ -3,8 +3,8 @@
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
 target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`, and adds `formats/`, `model_source/` and
-`components/io/`. That end state is defined in
+`engine/model/<family>/`, and adds `formats/` and `model_source/`.
+File I/O already lives in `components/io/`. That end state is defined in
 [docs/refactor.md](../docs/refactor.md) and sequenced in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
@@ -26,7 +26,13 @@ has landed.
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
-  and `json`);
+  `json`, and `io`). `mfq-io` owns file-range and batched reads and statistics,
+  independently of model sources and Engine; its only library dependency is
+  `mfq-host-parallel`. `mfq-model-source` exposes the reader value contracts
+  through its public link to `mfq-io`;
+- `backends/cpu/` — host thread primitives, CPU expert execution and host math;
+  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`, which no longer publishes
+  the old core include directory;
 - `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests. `native/` implements
   Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains

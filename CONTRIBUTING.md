@@ -27,9 +27,13 @@ architecture-named entry point.
 - Backend-neutral value contracts, schemas, canonical names and model sources
   live in `csrc/core/` today. That aggregation is transitional, not the target:
   [refactor.md](docs/refactor.md) assigns them to `formats/`,
-  `model_source/`, `components/io/`, `backends/cpu/` and the Engine modules, and
+  `model_source/`, `backends/cpu/` and the Engine modules, and
   [plan.md](docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
   Do not add new code to `core/` that belongs in one of those owners.
+- File ranges, batched reads and I/O statistics live in `csrc/components/io/`
+  (`mfq-io`), with headers beside the implementation. It links only host
+  thread primitives and must not depend on model loading, formats, Engine
+  or device operations. Host memory copying belongs in `backends/cpu/ops/`.
 - Logical scheduling, cancellation, deadlines and output backpressure belong
   in `csrc/scheduler/`; wire protocols belong in `csrc/transport/`.
 - Cross-backend request execution, tokenization, sampling semantics, physical
@@ -167,7 +171,7 @@ weights provide them; missing weights or an explicit user override disables them
 
 Before submitting a runtime or quantization change:
 
-1. Identify the owner: core, transport, scheduler, shared Engine/model,
+1. Identify the owner: core, file I/O, transport, scheduler, shared Engine/model,
    backend operation/storage, importer, or application.
 2. Search all architectures and both backends for an equivalent implementation.
 3. Extract reusable behavior before extending it; keep model adapters thin.

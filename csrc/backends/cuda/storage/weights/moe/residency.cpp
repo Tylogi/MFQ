@@ -4,7 +4,7 @@
 #include "kernels/moe/pipeline.h"
 #include "cached_source_internal.h"
 #include "mfq/moe/cpu_expert_pool.h"
-#include "mfq/io/host_memory_copy.h"
+#include "host_memory_copy.h"
 #include "ranker.h"
 #include "native_dma_batch.h"
 #include "mfq/cpu_topology.h"
