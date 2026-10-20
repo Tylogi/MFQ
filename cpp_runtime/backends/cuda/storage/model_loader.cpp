@@ -6,6 +6,7 @@
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
 #include "models/qwen35/mtp.h"
+#include "models/nemotron_h/mtp.h"
 #include "models/deepseek_v41/dspark.h"
 
 #include "cuda_execution.h"
@@ -200,7 +201,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     }
 
-    if (model.adapter_uses_common_rope()) {
+    if (model.adapter_uses_common_rope() && !model.metadata.no_rope) {
         auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(model.max_position_embeddings(), model.rotary_dim(), model.rope_base(),
                            0, -1, device, model.metadata.rope_interleaved,execution.yarn);
@@ -256,6 +257,7 @@ MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Glm5CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV41CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::NemotronHCausalLm);
 
 #undef MFQ_INSTANTIATE_CAUSAL_LM
 
@@ -446,6 +448,47 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         mfq::cuda::deepseek_v41_runtime::load_dspark_if_present(
             *model.execution, *model.source, model.shared->config);
     result.mtp_available = static_cast<bool>(result.mtp);
+    return result;
+}
+
+template <>
+RuntimeComponents<mfq::cuda::NemotronHCausalLm> load_runtime_components(
+        mfq::cuda::NemotronHCausalLm& model,
+        bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::NemotronHCausalLm> result{model.graph, model.plan};
+    if (!load_optional_components) return result;
+    if ((result.plan.vision != mfq::cuda::CudaVisionAdapter::none &&
+         result.plan.vision != mfq::cuda::CudaVisionAdapter::radio) ||
+            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+             result.plan.predictor != mfq::cuda::CudaPredictorAdapter::nemotron_h)) {
+        throw std::runtime_error(
+            "unsupported Nemotron-H CUDA component adapter");
+    }
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::radio) {
+        const auto* component = result.graph.component("vision");
+        MFQ_RUNTIME_CHECK(component != nullptr,
+            "Nemotron-H graph declares a RADIO adapter without a vision component");
+        const auto vision = mfq::models::nemotron_h::RadioVisionConfig::from_json(
+            model.source->model_config_json());
+        result.radio_vision.emplace(
+            mfq::cuda::nemotron_h::CudaRadioPromptComponent::load(
+                *model.execution, *model.source, vision, component->input_contract,
+                component->position_policy));
+        result.vision_available = true;
+    }
+    if (result.plan.predictor ==
+            mfq::cuda::CudaPredictorAdapter::none) return result;
+    MFQ_RUNTIME_CHECK(model.supports_speculation(),
+        "invalid Nemotron-H predictor model");
+    auto predictor = mfq::cuda::nemotron_h::NemotronHMtp::load_if_present(
+        *model.execution, *model.source, model.config);
+    // The graph declares the component, so missing weights are a broken
+    // container rather than a text-only model.
+    MFQ_RUNTIME_CHECK(predictor,
+        "Nemotron-H graph declares the predictor component but the source has no MTP weights");
+    result.mtp = std::make_unique<mfq::cuda::nemotron_h::NemotronHMtp>(
+        std::move(*predictor));
+    result.mtp_available = true;
     return result;
 }
 

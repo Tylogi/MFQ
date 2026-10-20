@@ -1,10 +1,9 @@
 #include "vision.h"
-#include "core/grid_vision_component.h"
+#include "core/axial_patch_vision.h"
 #include "mfq_paged_prefix_cache.h"
 
 namespace mfq::cuda::deepseek_v41_runtime {
 namespace {
-namespace memory=mfq::cuda::grid_vision_runtime::detail;
 
 struct HostLoading {
     bool& value;bool previous;
@@ -17,54 +16,6 @@ Tensor vector_weight(CudaExecutionContext& execution,const mfq::ModelSource& sou
     auto value=load_dense_gpu(execution,source,name);
     MFQ_RUNTIME_CHECK(value.dim()==1 && value.size(0)==width,"DeepSeek-V4.1 vision vector shape mismatch: "+name);
     return value;
-}
-
-struct Affine {
-    QuantLinear linear;
-    Tensor bias;
-    static Affine load(CudaExecutionContext& execution,const mfq::ModelSource& source,
-                       const std::string& prefix,int64_t input,int64_t output) {
-        Affine result{load_quant_linear(execution,source,prefix+".weight"),{}};
-        MFQ_RUNTIME_CHECK(result.linear.neuron_len()==input && result.linear.out()==output,
-                          "DeepSeek-V4.1 vision linear shape mismatch: "+prefix);
-        if(has_tensor(source,prefix+".bias"))result.bias=vector_weight(execution,source,prefix+".bias",output);
-        return result;
-    }
-    template<class F> void visit_tensors(F visit){memory::visit_linear(linear,visit);if(bias.defined())visit(bias);}
-    Tensor operator()(CudaExecutionContext& execution,Tensor value) const {
-        auto result=linear.forward(execution,std::move(value));
-        return bias.defined()?result+bias.to(result.scalar_type()):result;
-    }
-};
-
-struct BlockWeights {
-    Tensor norm1,norm2;
-    Affine qkv,output,gate_up,down;
-    template<class F> void visit_tensors(F visit) {
-        visit(norm1);visit(norm2);qkv.visit_tensors(visit);output.visit_tensors(visit);
-        gate_up.visit_tensors(visit);down.visit_tensors(visit);
-    }
-};
-
-struct AlignerWeights {
-    Tensor norm;
-    Affine input,output;
-    template<class F> void visit_tensors(F visit){visit(norm);input.visit_tensors(visit);output.visit_tensors(visit);}
-};
-
-Tensor norm(Tensor value,const Tensor& weight) {
-    return qwen_rms_norm(value.to(mfq_tensor_backend::kFloat32),weight.to(mfq_tensor_backend::kFloat32),1e-6,false)
-        .to(value.scalar_type()).contiguous();
-}
-
-template<class Weights,class Forward> Tensor use_weights(CudaExecutionContext& execution,
-        Weights weights,std::size_t activations,Forward forward) {
-    // One vision block at a time: text-only loading owns no vision allocation,
-    // and even a large tower needs no permanent RAM or VRAM weight copy.
-    return memory::vision_workspace(execution,memory::weight_bytes(weights)+activations,[&] {
-        auto device=memory::to_cuda(weights);
-        return forward(device);
-    });
 }
 
 struct Span {int64_t begin,end,height,width,rows,columns;};
@@ -116,71 +67,16 @@ Vision Vision::load(std::shared_ptr<const mfq::ModelSource> source,const CommonC
 }
 
 mfq::StepSequence<Tensor> Vision::encode(CudaExecutionContext& execution,Tensor patches,int height,int width) const {
-    const auto& config=config_.vision;
-    const auto hidden=config.hidden,heads=config.n_heads,dim=hidden/heads;
-    const int64_t count=int64_t(height)*width;
-    const auto activations=std::size_t(count)*std::size_t(std::max(6*hidden,2*config.intermediate))*sizeof(float)+
-        (std::size_t(32)<<20);
-    Tensor value;
-    {
-        Affine patch;
-        {HostLoading loading(execution);patch=Affine::load(execution,*source_,"vision.patch_embedding",
-            3*config.patch_size*config.patch_size,hidden);}
-        value=use_weights(execution,std::move(patch),activations,[&](const auto& weight){return weight(execution,patches);});
+    const auto& v=config_.vision;
+    const mfq::models::axial_patch_vision::Config config{
+        v.hidden,v.n_layers,v.n_heads,v.intermediate,v.patch_size,
+        v.downsample_ratio,config_.hidden,v.rope_theta,1e-6};
+    auto tower=mfq::cuda::axial_patch_vision::CudaAxialPatchVisionTower::load(execution,*source_,config);
+    auto steps=tower.encode_steps(execution,std::move(patches),height,width);
+    while(auto step=steps.next()) {
+        if(step.value)co_yield std::move(*step.value);
+        else co_yield step.state;
     }
-    co_yield mfq::StepState::advanced;
-    std::vector<int32_t> positions;positions.reserve(std::size_t(count)*2);
-    for(int row=0;row<height;++row)for(int column=0;column<width;++column){positions.push_back(row);positions.push_back(column);}
-    for(int64_t i=0;i<config.n_layers;++i) {
-        BlockWeights block;
-        {
-            HostLoading loading(execution);const auto prefix="vision.block."+std::to_string(i);
-            block.norm1=vector_weight(execution,*source_,prefix+".norm1.weight",hidden);
-            block.norm2=vector_weight(execution,*source_,prefix+".norm2.weight",hidden);
-            block.qkv=Affine::load(execution,*source_,prefix+".attention.qkv",hidden,3*hidden);
-            block.output=Affine::load(execution,*source_,prefix+".attention.output",hidden,hidden);
-            block.gate_up=Affine::load(execution,*source_,prefix+".mlp.gate_up",hidden,2*config.intermediate);
-            block.down=Affine::load(execution,*source_,prefix+".mlp.down",config.intermediate,hidden);
-        }
-        value=use_weights(execution,std::move(block),activations,[&](const auto& weights) {
-            auto qkv=weights.qkv(execution,norm(value,weights.norm1));
-            const auto rope=[&](int index){return memory::apply_axial_rope(
-                qkv.narrow(-1,index*hidden,hidden).reshape({count,heads,dim}),positions,config.rope_theta);};
-            auto query=rope(0),key=rope(1),v=qkv.narrow(-1,2*hidden,hidden).reshape({count,heads,dim});
-            auto attended=memory::segmented_attention(query,key,v,{int32_t(count)}).reshape({count,hidden});
-            auto result=value+weights.output(execution,std::move(attended));
-            auto gate_up=weights.gate_up(execution,norm(result,weights.norm2));
-            return result+weights.down(execution,mfq_tensor_backend::silu(gate_up.narrow(-1,0,config.intermediate))*
-                                      gate_up.narrow(-1,config.intermediate,config.intermediate));
-        });
-        co_yield mfq::StepState::advanced;
-    }
-    {
-        const auto ratio=config.downsample_ratio;
-        std::vector<int64_t> indices;
-        const auto out_h=(height+ratio-1)/ratio,out_w=(width+ratio-1)/ratio;
-        for(int64_t row=0;row<out_h;++row)for(int64_t column=0;column<out_w;++column)
-            for(int64_t pr=0;pr<ratio;++pr)for(int64_t pc=0;pc<ratio;++pc) {
-                const auto r=row*ratio+pr,c=column*ratio+pc;
-                indices.push_back(r<height && c<width?r*width+c:count);
-            }
-        AlignerWeights weights;
-        {
-            HostLoading loading(execution);
-            weights.norm=vector_weight(execution,*source_,"vision.output_norm.weight",hidden);
-            weights.input=Affine::load(execution,*source_,"vision.aligner.input",hidden*ratio*ratio,config_.hidden);
-            weights.output=Affine::load(execution,*source_,"vision.aligner.output",config_.hidden,config_.hidden);
-        }
-        value=use_weights(execution,std::move(weights),activations,[&](const auto& device) {
-            auto padded=mfq_tensor_backend::cat({norm(value,device.norm),mfq_tensor_backend::zeros({1,hidden},value.options())},0);
-            auto index=mfq_tensor_backend::tensor(indices,mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)
-                .device(mfq_tensor_backend::kCUDA));
-            auto gathered=padded.index_select(0,index).reshape({out_h*out_w,ratio*ratio,hidden})
-                .transpose(1,2).contiguous().reshape({out_h*out_w,hidden*ratio*ratio});
-            return device.output(execution,mfq_tensor_backend::gelu(device.input(execution,std::move(gathered)),"none"));
-        });
-    }
-    co_yield std::move(value);
 }
 
 mfq::StepSequence<CudaPreparedPrompt> Vision::prepare(DeepseekV41CausalLm& language,

@@ -82,6 +82,8 @@ struct GlmDsaBlockSessionState {
 enum class HybridBlockSessionStateKind {
     FullAttention,
     Recurrent,
+    // The block keeps no cache state, so a checkpoint only records position.
+    Stateless,
 };
 
 struct HybridBlockSessionState {

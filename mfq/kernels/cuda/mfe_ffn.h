@@ -76,6 +76,10 @@ struct MfeFfnBatch {
     int tokens=0,routes=0,experts=0,input_width=0,output_width=0;
     int intermediate=0,shared_intermediate=0;
     float swiglu_limit=0;
+    // Expert activation: 0 is silu(gate)*up, 1 is relu(up)^2 with no gate.
+    // A relu-squared bank has no gate descriptor: projection_counts[0] is 0
+    // for routed experts and projection() hides the shared gate slot.
+    int expert_activation=0,shared_activation=0;
     // Immutable family metadata across resident/transfer views. Raw callers
     // default to the complete decoder; the runtime computes its actual mask.
     std::uint32_t nvq_format_mask=0x3fffeu;
@@ -99,7 +103,11 @@ struct MfeFfnBatch {
 };
 #ifdef __CUDACC__
 __device__ __forceinline__ __half mfe_ffn_swiglu(const MfeFfnBatch& b,__half gate,__half up,
-        const __half* table) {
+        const __half* table,bool shared=false) {
+    if((shared?b.shared_activation:b.expert_activation)==1) {
+        const float positive=fmaxf(__half2float(up),0.0f);
+        return __float2half_rn(positive*positive);
+    }
     if(b.swiglu_limit>0) {
         const float g=fminf(__half2float(gate),b.swiglu_limit);
         const float u=fminf(fmaxf(__half2float(up),-b.swiglu_limit),b.swiglu_limit);

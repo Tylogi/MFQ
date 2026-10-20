@@ -1,5 +1,6 @@
 #include "../runtime/execution_options.h"
 #include "moe_cached_source_internal.h"
+#include "moe_host_cache_policy.h"
 #include "moe_pinned_expert_arena.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq/host_parallel.h"
@@ -60,7 +61,7 @@ std::optional<std::size_t> MoeExpertCache::available_host_ram() const {
     if(option && option[0]=='0')return std::nullopt;
     try {
         const auto memory=MoeResidencyManager::sample_host_memory();
-        auto available=std::size_t(memory.available_bytes);
+        auto available=std::size_t(memory.available_host_bytes());
         if(config_.moe_host_physical_bytes)
             available=std::min(available,memory.resident_bytes>=config_.moe_host_physical_bytes
                 ?std::size_t(0):std::size_t(config_.moe_host_physical_bytes-memory.resident_bytes));
@@ -145,9 +146,7 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
         std::size_t fields=0;
         for(const auto& source:sources_)for(int e=0;e<source->n_experts();++e)
             fields+=source->quant_source_->expert_field_bytes(e);
-        const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()+kv_growth_reserve;
-        const auto gpu=std::min(std::size_t(budget_bytes_),device_free>reserve?device_free-reserve:0);
-        if(fields>gpu && fields-gpu>config_.moe_host_cache_bytes) {
+        if(!moe_preload_fits_host(fields,config_.moe_host_cache_bytes)) {
             config_.moe_preload_all=false;config_.moe_assert_resident=false;
         }
     }
@@ -1345,10 +1344,14 @@ void MoeExpertCache::preload_complete_residency() {
     }
     const auto cold_bytes=total_bytes-std::min<std::uint64_t>(total_bytes,allocated_bytes_);
     const auto host_budget=host_experts_->stats().budget_bytes;
+    // Preload acquires a host image for every routed expert, including those
+    // uploaded to the GPU cache, so the complete set must fit the RAM tier.
+    const auto host_required_bytes=total_bytes;
     std::cerr << "moe_residency_plan experts=" << total_experts << " runtime_bytes=" << total_bytes
         << " gpu_bytes=" << allocated_bytes_ << " cold_bytes=" << cold_bytes
+        << " host_required_bytes=" << host_required_bytes
         << " host_field_budget_bytes=" << host_budget << std::endl;
-    if(cold_bytes>host_budget) {
+    if(host_required_bytes>host_budget) {
         const auto* option=std::getenv("MFQ_MOE_SSD_EXPERTS");
         if(config_.moe_pipeline && option && option[0]=='1') {
             config_.moe_preload_all=false;config_.moe_assert_resident=false;

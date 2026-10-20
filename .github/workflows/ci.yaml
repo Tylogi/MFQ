@@ -31,10 +31,13 @@ jobs:
           cmake --build build/linux-core --parallel 2 --target
           mfq-file-range-reader-test mfq-model-source-test mfq-quant-expert-range-test
           mfq-moe-cache-policy-test mfq-moe-cache-profile-test mfq-native-tensor-test
+          mfq-moe-host-memory-test mfq-model-config-test
+          mfq-nemotron-vision-config-test mfq-nemotron-vision-geometry-test
+          mfq-deepseek-v41-vision-layout-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
+          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout)-test$'
 
   macos-metal:
     name: macOS Metal
@@ -52,5 +55,9 @@ jobs:
 
       - name: Check text prefill chunking
         run: |
-          cmake --build build/cpp_runtime --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test
-          ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45)-test$'
+          cmake --build build/cpp_runtime --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test mfq-metal-nemotron-test
+          ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45|nemotron-conv)-test$'
+      - name: Check Nemotron text, MTP and RADIO vision
+        env:
+          MFQ_METAL_NEMOTRON_TEST: build/cpp_runtime/metal/mfq-metal-nemotron-test
+        run: uv run --with pytest python -m pytest tests/test_metal_nemotron_runtime.py -q

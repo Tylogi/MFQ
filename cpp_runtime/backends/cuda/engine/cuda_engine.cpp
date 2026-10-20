@@ -435,6 +435,7 @@ struct CudaEngineState {
         if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
             if(components.deepseek_vision)return components.deepseek_vision->prepare(language,input.prompt,*input.vision);
+        if (components.radio_vision) return components.radio_vision->prepare(language, input.prompt, *input.vision);
         throw std::invalid_argument("model has no multimodal component");
     }
     auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
@@ -597,7 +598,8 @@ using State = std::variant<
     std::unique_ptr<CudaEngineState<Glm5CausalLm>>,
     std::unique_ptr<CudaEngineState<Qwen4CausalLm>>,
     std::unique_ptr<CudaEngineState<DeepseekV4CausalLm>>,
-    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>>;
+    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>,
+    std::unique_ptr<CudaEngineState<NemotronHCausalLm>>>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
@@ -644,7 +646,9 @@ struct CudaBackend {
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();
-            info.multimodal = state.components.grid_vision.has_value() || state.components.deepseek_vision.has_value() || bool(state.components.composite);
+            info.multimodal = state.components.grid_vision.has_value() ||
+                state.components.deepseek_vision.has_value() ||
+                state.components.radio_vision.has_value() || bool(state.components.composite);
             info.reload = true;
             const auto caps = cuda_runtime_capabilities(state.components.graph, state.components.plan,
                 state.components.state(), info.multimodal, bool(state.components.composite));

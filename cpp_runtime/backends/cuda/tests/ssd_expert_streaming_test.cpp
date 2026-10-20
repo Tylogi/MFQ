@@ -508,13 +508,16 @@ struct Run {
     MoeFfnForward forward;
     MoeFfnPrefetch prefetch;
     bool hybrid=false;
-    Run(const std::filesystem::path& path,bool streaming,bool automatic=false,bool combined=false,const std::string& prefix="") {
+    Run(const std::filesystem::path& path,bool streaming,bool automatic=false,bool combined=false,const std::string& prefix="",
+        std::optional<double> pcie_fraction=std::nullopt) {
         auto& c=execution.config;
         c.moe_pipeline=true;c.moe_two_stage_ffn=true;c.moe_ram_pcie=true;c.moe_direct_ram=true;
-        c.moe_ram_pcie_fraction=1.;c.moe_preload_all=!streaming || automatic;c.moe_assert_resident=!streaming || automatic;
-        if(const auto* fraction=std::getenv("MFQ_SSD_EXPERT_TEST_PCIE_FRACTION")) {
-            c.moe_ram_pcie_fraction=std::stod(fraction);hybrid=*c.moe_ram_pcie_fraction<1;
-        }
+        c.moe_preload_all=!streaming || automatic;c.moe_assert_resident=!streaming || automatic;
+        if(!pcie_fraction)
+            if(const auto* fraction=std::getenv("MFQ_SSD_EXPERT_TEST_PCIE_FRACTION"))
+                pcie_fraction=std::stod(fraction);
+        c.moe_ram_pcie_fraction=pcie_fraction.value_or(1.);
+        hybrid=*c.moe_ram_pcie_fraction<1;
         const bool mixed=path.stem()=="mixed";
         const bool phase_wide=path.stem()=="phase-wide";
         c.moe_host_cache_bytes=prefix.empty()?(streaming?(phase_wide?4<<20:mixed?512*1024:32768):(phase_wide?64:8)*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
@@ -571,6 +574,11 @@ struct Run {
         }
         check(cache->ssd_experts()==streaming,"expert tier selection changed");
     }
+    // Cache retention and transfer overlap require GPU work, independently
+    // of the CPU/GPU split selected for the surrounding arithmetic tests.
+    static Run gpu_only(const std::filesystem::path& path,bool streaming) {
+        return Run(path,streaming,false,false,"",1.);
+    }
     std::map<std::string,double> metrics()const {
         const auto values=moe_expert_memory_metrics(cache);return {values.begin(),values.end()};
     }
@@ -587,7 +595,8 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
     }
 }
 void check_standalone_prefetch(const std::filesystem::path& root) {
-    Run candidate(root/"phase-wide",true),reference(root/"phase-wide",false);
+    auto candidate=Run::gpu_only(root/"phase-wide",true);
+    auto reference=Run::gpu_only(root/"phase-wide",false);
     candidate.cache->suspend_residency(true);
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
     std::vector<tb::Tensor> expected;
@@ -676,7 +685,8 @@ void check_standalone_prefetch(const std::filesystem::path& root) {
 }
 void check_cached_gate_up_overlap(const std::filesystem::path& root) {
     if(!mfq::cuda::NativeDmaBatch::available())return;
-    Run candidate(root/"phase-wide",true),reference(root/"phase-wide",false);
+    auto candidate=Run::gpu_only(root/"phase-wide",true);
+    auto reference=Run::gpu_only(root/"phase-wide",false);
     candidate.cache->suspend_residency(true);
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
     std::vector<tb::Tensor> expected;

@@ -1,4 +1,5 @@
 add_library(mfq-models STATIC
+    common/axial_patch_vision.cpp
     common/model_config.cpp
     deepseek_v4/config.cpp
     deepseek_v41/config.cpp
@@ -7,6 +8,8 @@ add_library(mfq-models STATIC
     gemma4/config.cpp
     glm_dsa/config.cpp
     minicpmo45/config.cpp
+    nemotron_h/config.cpp
+    nemotron_h/vision.cpp
     qwen35/config.cpp
 )
 add_library(mfq::models ALIAS mfq-models)

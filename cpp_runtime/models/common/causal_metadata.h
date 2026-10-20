@@ -24,6 +24,8 @@ struct CausalLmMetadata {
     double embedding_scale = 1.0;
     bool tie_word_embeddings = false;
     bool rope_interleaved = false;
+    // NoPE models have no rotary table; adapters leave rotary_dim at zero.
+    bool no_rope = false;
     bool multi_axis_positions = false;
     bool flash_next = false;
     bool gemma4 = false;

@@ -32,7 +32,13 @@ class ImatrixTarget:
     def __post_init__(self) -> None:
         if not self.name or not self.module_name or self.width <= 0 or self.experts <= 0:
             raise ValueError(f"invalid imatrix target: {self}")
-        if self.kind not in {"linear", "expert_gate_up", "expert_down"}:
+        if self.kind not in {
+            "linear",
+            "router",
+            "expert_gate_up",
+            "expert_up",
+            "expert_down",
+        }:
             raise ValueError(f"unsupported imatrix target kind: {self.kind}")
 
 
@@ -549,6 +555,109 @@ class ActivationImatrixCollector:
         )
         self.counts[target.name][expert].add_(int(matrix.shape[0]))
 
+    def _install_ungated_expert_bank(
+        self,
+        module: nn.Module,
+        module_name: str,
+        up: ImatrixTarget,
+        down: ImatrixTarget,
+    ) -> None:
+        """Collect a routed relu-squared bank that stores only up and down."""
+
+        up_proj = getattr(module, "up_proj", None)
+        down_proj = getattr(module, "down_proj", None)
+        activation = getattr(module, "act_fn", None)
+        if (
+            not isinstance(up_proj, torch.Tensor)
+            or not isinstance(down_proj, torch.Tensor)
+            or not callable(activation)
+            or up_proj.ndim != 3
+            or down_proj.ndim != 3
+        ):
+            raise TypeError(f"unsupported non-gated routed-expert module: {module_name}")
+        if int(up_proj.shape[0]) != up.experts or int(up_proj.shape[2]) != up.width:
+            raise ValueError(
+                f"non-gated Up bank shape {tuple(up_proj.shape)} does not match "
+                f"{up.name} ({up.experts}, *, {up.width})"
+            )
+        if int(down_proj.shape[0]) != down.experts or int(down_proj.shape[2]) != down.width:
+            raise ValueError(
+                f"non-gated Down bank shape {tuple(down_proj.shape)} does not match "
+                f"{down.name} ({down.experts}, *, {down.width})"
+            )
+        if (
+            int(down_proj.shape[1]) != int(up_proj.shape[2])
+            or int(down_proj.shape[2]) != int(up_proj.shape[1])
+        ):
+            raise ValueError(
+                f"non-gated expert bank disagrees on its hidden width: "
+                f"{tuple(up_proj.shape)} vs {tuple(down_proj.shape)}"
+            )
+        if self.neural:
+            self.neuron_sums.setdefault(
+                up.name,
+                torch.zeros(
+                    (up.experts, int(up_proj.shape[1])),
+                    device=self.device,
+                    dtype=self.accumulation_dtype,
+                ),
+            )
+            self.neuron_sums.setdefault(
+                down.name,
+                torch.zeros(
+                    (down.experts, int(down_proj.shape[1])),
+                    device=self.device,
+                    dtype=self.accumulation_dtype,
+                ),
+            )
+            self._naq_categories[up.name] = "routed_ffn_up"
+
+        def expert_forward(
+            _module,
+            hidden_states: torch.Tensor,
+            selected_experts: torch.Tensor,
+            top_k_weights: torch.Tensor,
+            *,
+            _up=up,
+            _down=down,
+        ) -> torch.Tensor:
+            # Mirror NemotronHExperts: no gate, relu-squared up, then down.
+            final = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
+            with torch.no_grad():
+                active = torch.unique(selected_experts).to(torch.int64).cpu().tolist()
+            for expert in active:
+                expert = int(expert)
+                token_idx, top_k_pos = torch.where(selected_experts == expert)
+                if token_idx.numel() == 0:
+                    continue
+                current = hidden_states[token_idx]
+                valid = None
+                if self.valid_mask is not None:
+                    valid = self.valid_mask.index_select(0, token_idx)
+                measured_current = current if valid is None else current[valid]
+                if measured_current.numel():
+                    self.add_expert(_up, measured_current, expert)
+                up_value = torch.nn.functional.linear(current, _module.up_proj[expert])
+                if self.neural:
+                    measured_up = up_value if valid is None else up_value[valid]
+                    if measured_up.numel():
+                        self.add_expert_neurons(_up, measured_up, expert)
+                activated = _module.act_fn(up_value)
+                measured_activated = activated if valid is None else activated[valid]
+                if measured_activated.numel():
+                    self.add_expert(_down, measured_activated, expert)
+                output = torch.nn.functional.linear(activated, _module.down_proj[expert])
+                output = output * top_k_weights[token_idx, top_k_pos, None]
+                if self.neural:
+                    measured_output = output if valid is None else output[valid]
+                    if measured_output.numel():
+                        self.add_expert_neurons(_down, measured_output, expert)
+                final.index_add_(0, token_idx, output.to(final.dtype))
+            return final.to(hidden_states.dtype)
+
+        self.restores.append((module, module.forward))
+        module.forward = types.MethodType(expert_forward, module)
+
     def install_layer(
         self,
         layer: nn.Module,
@@ -567,7 +676,7 @@ class ActivationImatrixCollector:
                     f"layer {layer_index} lacks imatrix module {module_name!r}"
                 ) from exc
             kinds = {target.kind for target in module_targets}
-            if kinds == {"linear"}:
+            if kinds in ({"linear"}, {"router"}):
                 if len(module_targets) != 1:
                     raise TypeError(f"imatrix target is not one matrix projection: {module_name}")
                 target = module_targets[0]
@@ -576,7 +685,7 @@ class ActivationImatrixCollector:
                     self.add_linear(_target, inputs[0])
 
                 self.handles.append(module.register_forward_pre_hook(pre_hook))
-                if self.neural:
+                if self.neural and target.kind == "linear":
                     weight = getattr(module, "weight", None)
                     if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
                         raise TypeError(
@@ -595,6 +704,11 @@ class ActivationImatrixCollector:
                         self.add_neurons(_target, output)
 
                     self.handles.append(module.register_forward_hook(post_hook))
+                continue
+            if kinds == {"expert_up", "expert_down"} and len(module_targets) == 2:
+                up = next(item for item in module_targets if item.kind == "expert_up")
+                down = next(item for item in module_targets if item.kind == "expert_down")
+                self._install_ungated_expert_bank(module, module_name, up, down)
                 continue
             if kinds != {"expert_gate_up", "expert_down"} or len(module_targets) != 2:
                 raise TypeError(f"invalid routed-expert imatrix binding: {module_name}")
@@ -956,6 +1070,20 @@ def _release(device: torch.device) -> None:
 def _backend(model: Path, device: torch.device, attention: str):
     from transformers import AutoConfig
 
+    config_path = Path(model) / "config.json"
+    if config_path.is_file():
+        from mfq.architectures.hf_config import load_hf_model_config, text_section
+
+        raw = load_hf_model_config(model)
+        outer_type = str(raw.get("model_type", ""))
+        if outer_type == "nemotron_h_omni" or outer_type.removesuffix("_text") == "nemotron_h":
+            from mfq.calibration.layerwise_nemotron_h import NemotronHLayerwiseBackend
+
+            backend = NemotronHLayerwiseBackend(
+                model, device=device, attention=attention
+            )
+            return backend, str(text_section(raw).get("model_type", outer_type))
+
     outer = AutoConfig.from_pretrained(model, local_files_only=True, trust_remote_code=True)
     config = getattr(outer, "text_config", outer)
     model_type = str(getattr(config, "model_type", ""))
@@ -984,6 +1112,9 @@ def _targets(
     backend: Any,
     _model_type: str,
 ) -> tuple[dict[int, tuple[ImatrixTarget, ...]], tuple[ImatrixTarget, ...]]:
+    builder = getattr(backend, "imatrix_targets", None)
+    if callable(builder):
+        return builder()
     by_layer: dict[int, list[ImatrixTarget]] = {}
     index = backend.index
     for layer in range(backend.num_layers):

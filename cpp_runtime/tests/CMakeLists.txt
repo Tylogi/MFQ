@@ -1,6 +1,6 @@
 # Backend-independent native tests. Keep assert checks in Release too.
 if(MSVC)
-    add_compile_options(/UNDEBUG)
+    add_compile_options(/UNDEBUG $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 else()
     add_compile_options(-UNDEBUG)
 endif()
@@ -81,6 +81,19 @@ target_link_libraries(mfq-packed-nint-cpu-test PRIVATE mfq-cpu-ops)
 mfq_add_core_test(mfq-nvq-group-cpu-test nvq_group_cpu_test.cpp)
 target_link_libraries(mfq-nvq-group-cpu-test PRIVATE mfq-cpu-ops)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
+
+# RADIO cropped-position geometry: backend-neutral, no CUDA or weights needed.
+add_executable(mfq-nemotron-vision-geometry-test nemotron_vision_geometry_test.cpp)
+target_link_libraries(mfq-nemotron-vision-geometry-test PRIVATE mfq-models)
+target_compile_features(mfq-nemotron-vision-geometry-test PRIVATE cxx_std_17)
+add_test(NAME mfq-nemotron-vision-geometry-test
+    COMMAND mfq-nemotron-vision-geometry-test)
+
+add_executable(mfq-nemotron-vision-config-test nemotron_vision_config_test.cpp)
+target_link_libraries(mfq-nemotron-vision-config-test PRIVATE mfq-models)
+target_compile_features(mfq-nemotron-vision-config-test PRIVATE cxx_std_17)
+add_test(NAME mfq-nemotron-vision-config-test
+    COMMAND mfq-nemotron-vision-config-test)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
 target_link_libraries(mfq-deepseek-v41-config-test PRIVATE mfq-models)
 target_compile_features(mfq-deepseek-v41-config-test PRIVATE cxx_std_20)
@@ -105,6 +118,15 @@ target_include_directories(mfq-cuda-model-plan-test PRIVATE
 target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
+
+add_executable(mfq-moe-host-memory-test
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/moe_host_memory_test.cpp
+)
+target_include_directories(mfq-moe-host-memory-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda
+)
+target_compile_features(mfq-moe-host-memory-test PRIVATE cxx_std_20)
+add_test(NAME mfq-moe-host-memory-test COMMAND mfq-moe-host-memory-test)
 
 add_executable(mfq-inference-test inference_test.cpp)
 target_link_libraries(mfq-inference-test PRIVATE mfq-engine)
@@ -160,3 +182,7 @@ if(TARGET mfq-runtime-communication)
     target_compile_features(mfq-runtime-profile-test PRIVATE cxx_std_17)
     add_test(NAME mfq-runtime-profile-test COMMAND mfq-runtime-profile-test)
 endif()
+
+add_executable(mfq-deepseek-v41-vision-layout-test deepseek_v41_vision_layout_test.cpp)
+target_link_libraries(mfq-deepseek-v41-vision-layout-test PRIVATE mfq-models)
+add_test(NAME mfq-deepseek-v41-vision-layout-test COMMAND mfq-deepseek-v41-vision-layout-test)

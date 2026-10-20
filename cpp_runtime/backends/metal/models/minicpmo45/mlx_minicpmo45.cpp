@@ -1,4 +1,5 @@
 #include "mlx_minicpmo45.h"
+#include "mlx_pre_ln_vision.h"
 #include "mlx_multimodal.h"
 
 #include "mlx_platform.h"
@@ -2404,165 +2405,20 @@ array additive_mask(
             dtype));
 }
 
-class VisionAttention {
-public:
-    static VisionAttention load(
-        const MfqContainer& model,
-        const std::string& prefix) {
-        const auto* fuse_value = std::getenv(
-            "MFQ_METAL_VISION_FUSED_QKV");
-        const bool fuse_qkv =
-            fuse_value == nullptr || std::strcmp(fuse_value, "0") != 0;
-        if (fuse_qkv) {
-            auto weight = mlx::core::concatenate(
-                {
-                    dense(model, prefix + ".query.weight"),
-                    dense(model, prefix + ".key.weight"),
-                    dense(model, prefix + ".value.weight"),
-                },
-                0);
-            auto bias = mlx::core::concatenate(
-                {
-                    dense(model, prefix + ".query.bias"),
-                    dense(model, prefix + ".key.bias"),
-                    dense(model, prefix + ".value.bias"),
-                },
-                0);
-            return VisionAttention(
-                std::move(weight),
-                std::move(bias),
-                MiniLinear::load(model, prefix + ".output"));
-        }
-        return VisionAttention(
-            MiniLinear::load(model, prefix + ".query"),
-            MiniLinear::load(model, prefix + ".key"),
-            MiniLinear::load(model, prefix + ".value"),
-            MiniLinear::load(model, prefix + ".output"));
-    }
-
-    VisionAttention(
-        MiniLinear query,
-        MiniLinear key,
-        MiniLinear value,
-        MiniLinear output)
-        : query_(std::move(query)),
-          key_(std::move(key)),
-          value_(std::move(value)),
-          output_(std::move(output)) {}
-
-    VisionAttention(
-        array qkv_weight,
-        array qkv_bias,
-        MiniLinear output)
-        : qkv_weight_(std::move(qkv_weight)),
-          qkv_bias_(std::move(qkv_bias)),
-          output_(std::move(output)) {
-        qkv_weight_->eval();
-        qkv_bias_->eval();
-    }
-
-    array operator()(
-        const array& input,
-        const std::optional<array>& mask) const {
-        const int batch = input.shape(0);
-        const int tokens = input.shape(1);
-        const auto project = [batch, tokens](array value) {
-            return mlx::core::transpose(
-                mlx::core::reshape(
-                    value,
-                    Shape{batch, tokens, 16, 72}),
-                {0, 2, 1, 3});
-        };
-        array query = input;
-        array key = input;
-        array value = input;
-        if (qkv_weight_) {
-            auto pieces = mlx::core::split(
-                dense_linear(
-                    input,
-                    *qkv_weight_,
-                    qkv_bias_),
-                3,
-                -1);
-            query = std::move(pieces.at(0));
-            key = std::move(pieces.at(1));
-            value = std::move(pieces.at(2));
-        } else {
-            query = (*query_)(input);
-            key = (*key_)(input);
-            value = (*value_)(input);
-        }
-        auto attended = scaled_dot_product_attention(
-            project(std::move(query)),
-            project(std::move(key)),
-            project(std::move(value)),
-            false,
-            1.0f / std::sqrt(72.0f),
-            mask);
-        attended = mlx::core::reshape(
-            mlx::core::transpose(attended, {0, 2, 1, 3}),
-            Shape{batch, tokens, 1152});
-        return output_(attended);
-    }
-
-private:
-    std::optional<MiniLinear> query_;
-    std::optional<MiniLinear> key_;
-    std::optional<MiniLinear> value_;
-    std::optional<array> qkv_weight_;
-    std::optional<array> qkv_bias_;
-    MiniLinear output_;
-};
-
-class VisionLayer {
-public:
-    static VisionLayer load(
-        const MfqContainer& model,
-        int index) {
-        const auto prefix =
-            "vision.block." + std::to_string(index);
-        return VisionLayer(
-            VisionAttention::load(model, prefix + ".attention"),
-            MiniLayerNorm::load(model, prefix + ".norm1", 1e-6f),
-            MiniLayerNorm::load(model, prefix + ".norm2", 1e-6f),
-            MiniLinear::load(model, prefix + ".mlp.up"),
-            MiniLinear::load(model, prefix + ".mlp.down"));
-    }
-
-    VisionLayer(
-        VisionAttention attention,
-        MiniLayerNorm norm1,
-        MiniLayerNorm norm2,
-        MiniLinear fc1,
-        MiniLinear fc2)
-        : attention_(std::move(attention)),
-          norm1_(std::move(norm1)),
-          norm2_(std::move(norm2)),
-          fc1_(std::move(fc1)),
-          fc2_(std::move(fc2)) {}
-
-    array operator()(
-        const array& input,
-        const std::optional<array>& mask) const {
-        auto hidden = input + attention_(norm1_(input), mask);
-        return hidden + fc2_(gelu(fc1_(norm2_(hidden)), true));
-    }
-
-private:
-    VisionAttention attention_;
-    MiniLayerNorm norm1_;
-    MiniLayerNorm norm2_;
-    MiniLinear fc1_;
-    MiniLinear fc2_;
-};
-
 class VisionEncoder {
 public:
     static VisionEncoder load(const MfqContainer& model) {
-        std::vector<VisionLayer> layers;
+        // The pre-LayerNorm ViT block is shared with the RADIO tower; only the
+        // tanh GELU and per-layer tensors differ.
+        std::vector<MlxPreLnVisionBlock> layers;
         layers.reserve(27);
         for (int index = 0; index < 27; ++index) {
-            layers.push_back(VisionLayer::load(model, index));
+            layers.push_back(MlxPreLnVisionBlock::load(
+                model,
+                "vision.block." + std::to_string(index),
+                16,
+                1e-6f,
+                MlxVisionActivation::gelu_tanh));
         }
         return VisionEncoder(
             dense(model, "vision.patch_embedding.weight"),
@@ -2576,7 +2432,7 @@ public:
         array patch_weight,
         array patch_bias,
         array position_embedding,
-        std::vector<VisionLayer> layers,
+        std::vector<MlxPreLnVisionBlock> layers,
         MiniLayerNorm post_norm)
         : patch_weight_(std::move(patch_weight)),
           patch_bias_(std::move(patch_bias)),
@@ -2703,7 +2559,7 @@ public:
         const auto encode = [&](array hidden,
                                 const std::optional<array>& local_mask) {
             for (const auto& layer : layers_) {
-                hidden = layer(hidden, local_mask);
+                hidden = layer.forward(hidden, local_mask);
             }
             return post_norm_(hidden);
         };
@@ -2746,7 +2602,7 @@ private:
     array patch_weight_;
     array patch_bias_;
     array position_embedding_;
-    std::vector<VisionLayer> layers_;
+    std::vector<MlxPreLnVisionBlock> layers_;
     MiniLayerNorm post_norm_;
 };
 

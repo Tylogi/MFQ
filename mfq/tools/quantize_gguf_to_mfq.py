@@ -234,6 +234,7 @@ def _hf_output_name_map(
 
 _RECIPE_TARGETS = {
     "IQ1_M": "NVQ1-L",
+    "IQ1_S": "NVQ1-S",
     "IQ2_S": "NVQ2J-XL",
     "IQ2_XS": "NVQ2J-L",
     "IQ2_XXS": "NVQ2J",
@@ -241,6 +242,8 @@ _RECIPE_TARGETS = {
     "IQ3_XXS": "NVQ3J",
     "IQ4_NL": "NINT4",
     "IQ4_XS": "NINT4",
+    # ggml Q2_0 (id 42) is a 2-bit block type; it shares NINT2 with Q2_K.
+    "Q2_0": "NINT2",
     "Q2_K": "NINT2",
     "Q3_K": "NINT3",
     "Q4_0": "NINT4",

@@ -3,6 +3,7 @@
 
 #include "quant_linear.h"
 #include "mfe_weight.h"
+#include "models/common/gated_mlp.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +17,12 @@ struct FFN {
         important_neuron_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
     bool geglu = false;
+    // Dense FFN and shared/routed experts share the explicit activation label.
+    mfq::models::MlpActivation activation = mfq::models::MlpActivation::silu_gated;
     bool is_moe = false;
     bool moe_split_gate_up = false;
+    // Routed experts without a gate projection use the activation above.
+    bool moe_ungated_experts = false;
     MfeWeight moe_gate_up;
     MfeWeight moe_gate;
     MfeWeight moe_up;
@@ -26,6 +31,13 @@ struct FFN {
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_down;
+    // Dense (F32/F16/BF16) routed expert banks: [experts,out,in].
+    mfq_tensor_backend::Tensor moe_dense_gate;
+    mfq_tensor_backend::Tensor moe_dense_up;
+    mfq_tensor_backend::Tensor moe_dense_down;
+    // Optional latent projections around the routed branch only.
+    QuantLinear moe_latent_in;
+    QuantLinear moe_latent_out;
     mfq_tensor_backend::Tensor moe_router;
     mfq_tensor_backend::Tensor moe_shared_gate;
     mfq_tensor_backend::Tensor moe_router_bias;

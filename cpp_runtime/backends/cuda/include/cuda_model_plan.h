@@ -20,6 +20,7 @@ enum class CudaBackbone {
     qwen4_exp,
     deepseek_v4,
     deepseek_v41,
+    nemotron_h,
     unsupported,
 };
 
@@ -28,6 +29,7 @@ enum class CudaVisionAdapter {
     grid_vit,
     minicpmo45,
     deepseek_v41,
+    radio,
 };
 
 enum class CudaPredictorAdapter {
@@ -35,6 +37,7 @@ enum class CudaPredictorAdapter {
     qwen35,
     flash_next,
     deepseek_v41_dspark,
+    nemotron_h,
 };
 
 struct CudaModelPlan {
@@ -86,6 +89,9 @@ inline constexpr CudaBackbone cuda_backbone(
     if (implementation == "deepseek_v41") {
         return CudaBackbone::deepseek_v41;
     }
+    if (implementation == "nemotron_h") {
+        return CudaBackbone::nemotron_h;
+    }
     return CudaBackbone::unsupported;
 }
 
@@ -117,6 +123,15 @@ inline CudaModelPlan cuda_model_plan(
         tts->implementation == "minicpmo45_tts") {
         result.vision = CudaVisionAdapter::minicpmo45;
     }
+    // Cropped-position-embedding towers are selected by their declared data
+    // contract alone: the graph names the implementation and the patch
+    // contract, and RADIO's graph carries no multimodal position policy.
+    if (vision != nullptr && vision->tensor_root == "vision" &&
+        vision->implementation == "radio" &&
+        vision->input_contract == kMfqRadioCpeInputContract &&
+        vision->position_policy.empty()) {
+        result.vision = CudaVisionAdapter::radio;
+    }
     const auto* predictor = graph.component("predictor");
     if (graph.backbone == "qwen3_5" && predictor != nullptr &&
         predictor->implementation == "next_token_prediction" &&
@@ -132,6 +147,11 @@ inline CudaModelPlan cuda_model_plan(
         predictor->tensor_root == "predictor") {
         result.predictor = CudaPredictorAdapter::deepseek_v41_dspark;
     }
+    if (graph.backbone == "nemotron_h" && predictor != nullptr &&
+        predictor->implementation == "nemotron_h_mtp" &&
+        predictor->tensor_root == "predictor") {
+        result.predictor = CudaPredictorAdapter::nemotron_h;
+    }
     return result;
 }
 
@@ -143,7 +163,8 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
         plan.vision == CudaVisionAdapter::minicpmo45 ||
-        plan.vision == CudaVisionAdapter::deepseek_v41;
+        plan.vision == CudaVisionAdapter::deepseek_v41 ||
+        plan.vision == CudaVisionAdapter::radio;
     result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_output = plan.vision == CudaVisionAdapter::minicpmo45;

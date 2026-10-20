@@ -23,6 +23,7 @@ Model and feature support for CUDA, Metal, and ROCm (HIP).
 | MiniCPM-o 4.5 | Native C++ | Native C++ | — | Text, image, video, audio input, audio output, and duplex serving |
 | GLM5–5.3 | Native C++ | Reference | — | DSA/KDA and Flash-Next families; Metal production C++ worker integration remains open |
 | Gemma 4 | Native C++ | Reference | — | Mixed full/sliding attention and MoE; Metal production C++ worker integration remains open |
+| Nemotron-H | Native C++ (text) | — | — | Mamba-2, NoPE attention and latent relu² MoE with a dense expert bank; graph-declared MTP; RADIO vision is not implemented |
 
 The HIP column reflects MI300X validation of the early HIP backend: dense
 Qwen3.5–3.8 models (BF16 and quantized `S4` tiers) run end to end, Qwen

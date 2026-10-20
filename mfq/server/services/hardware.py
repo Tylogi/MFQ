@@ -19,6 +19,20 @@ def _unified_gpu_name(name: str) -> bool:
     return bool(re.search(r"\bGB10\b|\bMI300A\b|\bRadeon\s+(?:80[456]0S|8065S)\b", name, re.IGNORECASE))
 
 
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = (
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    )
+
+
 @dataclass(frozen=True)
 class GpuMemory:
     name: str
@@ -56,6 +70,7 @@ class HardwareIdentity:
 def memory_topology() -> dict[str, Any]:
     hardware = hardware_identity()
     host_total, host_available = host_memory_capacity()
+    commit_limit, commit_available = host_commit_capacity()
     architecture = hardware.memory_architecture
     capacities = [item.capacity_bytes for item in hardware.gpu_memory if not item.unified and not _unified_gpu_name(item.name)]
     return {
@@ -63,6 +78,8 @@ def memory_topology() -> dict[str, Any]:
         "unified_memory": architecture == "unified" if architecture != "unknown" else None,
         "host_memory_total_bytes": hardware.physical_memory_bytes or host_total,
         "host_memory_available_bytes": host_available,
+        "host_commit_limit_bytes": commit_limit,
+        "host_commit_available_bytes": commit_available,
         "device_memory_total_bytes": sum(capacities) if capacities and all(value is not None for value in capacities) else None,
         "gpu_devices": [{"id": item.device_id or str(index), "name": item.name,
             "memory_total_bytes": item.capacity_bytes, "unified_memory": item.unified or _unified_gpu_name(item.name)}
@@ -78,6 +95,20 @@ def host_memory_capacity() -> tuple[int | None, int | None]:
         return int(memory.total), int(memory.available)
     except (OSError, psutil.Error):
         return None, None
+
+
+def host_commit_capacity() -> tuple[int | None, int | None]:
+    """Return the Windows commit limit and headroom, including the page file."""
+    if platform.system() != "Windows":
+        return None, None
+    try:
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None, None
+    except (AttributeError, OSError):
+        return None, None
+    return int(status.ullTotalPageFile), int(status.ullAvailPageFile)
 
 
 def _command(argv: list[str]) -> str:

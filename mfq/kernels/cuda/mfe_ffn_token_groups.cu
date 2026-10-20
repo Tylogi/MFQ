@@ -479,7 +479,8 @@ __global__ void __launch_bounds__(256,4) shared_token_gate_up(MfeFfnBatch b,int 
     const int lane=threadIdx.x,warp=threadIdx.y,team=4;
     const int base=int(blockIdx.x)*team,first=base+warp%team,p=warp/team;
     if(base>=b.shared_intermediate)return;
-    const auto& d=b.shared[p];
+    // An ungated shared expert has no gate descriptor; both teams read Up.
+    const auto& d=b.shared[b.shared_activation==1?1:p];
     const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
     #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
@@ -498,7 +499,7 @@ __global__ void __launch_bounds__(256,4) shared_token_gate_up(MfeFfnBatch b,int 
         const int slot=slots[k];
         if(base+lane<end) {
             const auto gate=projected[lane][k],up=projected[lane+team][k];
-            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,b.sigmoid_table);
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,b.sigmoid_table,true);
             if(b.completion)__threadfence();
         }
         if(!b.completion)continue;

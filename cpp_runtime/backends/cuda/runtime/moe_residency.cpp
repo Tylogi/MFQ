@@ -63,7 +63,7 @@ MoeResidencyManager::MemorySample process_memory() {
     PROCESS_MEMORY_COUNTERS process{};MEMORYSTATUSEX system{};system.dwLength=sizeof(system);
     if(!K32GetProcessMemoryInfo(GetCurrentProcess(),&process,sizeof(process)) || !GlobalMemoryStatusEx(&system))
         throw std::runtime_error("cannot measure physical memory for expert residency transaction");
-    return {process.WorkingSetSize,system.ullAvailPhys};
+    return {process.WorkingSetSize,system.ullAvailPhys,system.ullAvailPageFile};
 #elif defined(__linux__)
     std::uint64_t virtual_pages=0,resident_pages=0;std::ifstream status("/proc/self/statm");
     struct sysinfo system{};
@@ -526,7 +526,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         // keep adaptation batches within this fixed workspace thereafter.
         const auto memory=s.memory_probe();
         auto capacity=std::min<std::uint64_t>({cache->host_experts_->stats().budget_bytes/4,
-            std::uint64_t(moe_ssd_residency_stage_limit_bytes),memory.available_bytes/8});
+            std::uint64_t(moe_ssd_residency_stage_limit_bytes),memory.available_host_bytes()/8});
         if(cache->config_.moe_host_physical_bytes)
             capacity=std::min(capacity,memory.resident_bytes>=cache->config_.moe_host_physical_bytes?std::uint64_t(0):
                 (cache->config_.moe_host_physical_bytes-memory.resident_bytes)/8);
@@ -962,7 +962,7 @@ void MoeResidencyManager::prepare() {
     }
     std::uint64_t stage_limit=std::numeric_limits<std::uint64_t>::max();
     if(cache.config_.moe_residency_warm) {
-        const auto memory=s.memory_probe();auto available=memory.available_bytes;
+        const auto memory=s.memory_probe();auto available=memory.available_host_bytes();
         if(cache.config_.moe_host_physical_bytes)
             available=std::min(available,memory.resident_bytes>=cache.config_.moe_host_physical_bytes
                 ? std::uint64_t(0):cache.config_.moe_host_physical_bytes-memory.resident_bytes);

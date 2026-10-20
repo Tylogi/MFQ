@@ -107,6 +107,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/selective_state_scan.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
 )
 
@@ -235,6 +236,14 @@ if(BUILD_TESTING)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_activation_test.cu
         mfq-cuda-native-kernels)
+    mfq_add_cuda_test(mfq-recurrent-mixer-ops-test
+        ${MFQ_CUDA_ROOT}/tests/recurrent_mixer_ops_test.cpp
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-recurrent-mixer-ops-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
+    if(MSVC)
+        target_compile_options(mfq-recurrent-mixer-ops-test PRIVATE /EHsc)
+    endif()
     mfq_add_cuda_test(mfq-nint-q8-test
         ${MFQ_CUDA_ROOT}/tests/mfq_nint_q8_test.cu
         mfq-cuda-native-kernels)
@@ -344,6 +353,7 @@ function(mfq_configure_cuda_runtime_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
+    ${MFQ_CUDA_ROOT}/core/axial_patch_vision.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/session.cpp
@@ -359,6 +369,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/nemotron_h/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
 )
@@ -618,6 +629,13 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-mxfp8-layout-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-mxfp8-layout-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-mxfp8-layout-test COMMAND mfq-mxfp8-layout-test)
+    add_executable(mfq-nope-latent-moe-test ${MFQ_CUDA_ROOT}/tests/nope_latent_moe_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-nope-latent-moe-test)
+    target_compile_definitions(mfq-nope-latent-moe-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-nope-latent-moe-test PRIVATE
+        mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
+    add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
+    set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-moe-ffn-pipeline-test ${MFQ_CUDA_ROOT}/tests/moe_ffn_pipeline_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -722,6 +740,16 @@ if(BUILD_TESTING)
     if(MSVC)
         target_compile_options(mfq-deepseek-v41-hc-bench PRIVATE /EHsc)
     endif()
+    add_executable(mfq-cuda-deepseek-v41-axial-vision-test
+        ${MFQ_CUDA_ROOT}/tests/deepseek_v41_axial_vision_gpu_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-deepseek-v41-axial-vision-test)
+    target_compile_definitions(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE mfq-cuda-runtime)
+    target_compile_features(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-deepseek-v41-axial-vision-test
+        COMMAND mfq-cuda-deepseek-v41-axial-vision-test)
+    set_tests_properties(mfq-cuda-deepseek-v41-axial-vision-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

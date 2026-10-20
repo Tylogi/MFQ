@@ -58,6 +58,14 @@ _REGISTRY = (
         aliases=("gemma4", "gemma4_text"),
         features=ModelFeatureSet(),
     ),
+    # Nemotron-H text inference, its multi-token predictor and the RADIO image
+    # tower are implemented. The released omni checkpoint declares neither a
+    # video nor an audio token id, so those modalities stay unsupported.
+    _CapabilityRegistration(
+        family="nemotron_h",
+        aliases=("nemotron_h", "nemotron_h_text", "nemotron_h_omni"),
+        features=ModelFeatureSet(text=True, image_input=True, mtp=True),
+    ),
     _CapabilityRegistration(
         family="qwen3_5",
         aliases=("qwen3_5", "qwen35"),

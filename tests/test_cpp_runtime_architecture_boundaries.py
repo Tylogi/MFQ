@@ -26,6 +26,9 @@ QWEN4_HEADER = (
 DSV = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp").read_text(
     encoding="utf-8"
 )
+NEMOTRON = (
+    MODELS / "nemotron_h" / "mlx_nemotron_h_causal_lm.cpp"
+).read_text(encoding="utf-8")
 DSV_MOE = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_moe.cpp").read_text(
     encoding="utf-8"
 )
@@ -315,10 +318,14 @@ def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
 
 
 def test_remaining_model_assembly_lives_in_shared_models() -> None:
-    for family in ("qwen35", "glm_dsa", "minicpmo45"):
+    for family in ("qwen35", "glm_dsa", "minicpmo45", "nemotron_h"):
         shared = (ROOT / "cpp_runtime/models" / family / "causal_lm.h").read_text()
         native = (CUDA_MODELS / family / "ops.cpp").read_text()
-        assert "load_block(" in shared or "load_language_block(" in shared
+        assert (
+            "load_block(" in shared
+            or "load_language_block(" in shared
+            or "load_linear_attention(" in shared
+        )
         assert f"mfq::models::{family}::load_" in native
         assert '"model.block."' not in native
         assert '"experts.gate_up.weight"' not in native
@@ -327,6 +334,28 @@ def test_remaining_model_assembly_lives_in_shared_models() -> None:
     assert "split != ops.has(up) || fused == split" in shared
     assert '"experts.gate.weight"' not in CUDA_TRANSFORMER_LOADER
     assert "load_transformer_block" not in CUDA_TRANSFORMER_LOADER
+
+
+def test_recurrent_mixers_share_one_state_container_and_graph() -> None:
+    state = (
+        ROOT / "cpp_runtime/backends/cuda/core/recurrent_mixer_state.h"
+    ).read_text()
+    assert "struct RecurrentMixerState" in state
+    for model in ("qwen35/linear_attention.h", "nemotron_h/model.h"):
+        text = (
+            ROOT / "cpp_runtime/backends/cuda/models" / model
+        ).read_text()
+        assert "RecurrentMixerState" in text
+    graph = (ROOT / "cpp_runtime/models/common/recurrent_attention.h").read_text()
+    assert "selective_state_attention" in graph
+    # The Mamba-2 recurrence stays shared: no architecture re-implements it.
+    for model in ("qwen35/causal_lm.h", "nemotron_h/causal_lm.h"):
+        text = (ROOT / "cpp_runtime/models" / model).read_text()
+        assert "selective_state_scan" not in text
+        assert "ssm_conv_silu" not in text
+    for source in (ROOT / "cpp_runtime/models/nemotron_h").glob("*.h"):
+        text = source.read_text(encoding="utf-8")
+        assert "sampler" not in text and "TextSessionState" not in text
 
 
 def test_cuda_native_tensor_ops_stay_split_by_domain() -> None:
@@ -1073,7 +1102,7 @@ def test_mtp_policy_and_lifecycle_are_runtime_owned() -> None:
 
 
 def test_every_mtp_architecture_is_a_thin_client_of_one_engine() -> None:
-    clients = (QWEN, QWEN4, DSV, DSV41)
+    clients = (QWEN, QWEN4, DSV, DSV41, NEMOTRON)
     for source in clients:
         assert source.count("run_mlx_mtp_generation(") == 1
         assert source.count("mlx_mtp_verification_ids(") == 1
@@ -1118,7 +1147,7 @@ def test_server_exposes_predictors_by_role_not_architecture_name() -> None:
     assert SERVER_COMPONENTS.count(
         'component_declared(graph, "predictor")'
     ) == 3
-    assert SERVER_COMPONENTS.count("return make_grid_vision_engine_components(") == 2
+    assert SERVER_COMPONENTS.count("return make_grid_vision_engine_components(") == 3
     assert re.search(
         r'component_with_implementation\([^;]*"predictor"',
         SERVER_COMPONENTS,
@@ -1502,7 +1531,9 @@ def test_shared_models_own_composition_loading_and_input_rules() -> None:
     assert "mfq::models::minicpmo45::multimodal_forward(" in mini
     assert "for (const auto & bound : images)" not in mini
     grid = (CUDA_MODELS.parent / "core/grid_vision_component.h").read_text()
-    for stage in ("attention", "encode", "merge", "prepare"):
+    vision_ops = (CUDA_MODELS.parent / "core/vision_ops.h").read_text()
+    assert "mfq::models::grid_vision::attention(" in vision_ops
+    for stage in ("encode", "merge", "prepare"):
         assert f"mfq::models::grid_vision::{stage}(" in grid
     assert "token_ids[index] == image_token_id_" not in grid
     for source in shared.rglob("*.h"):

@@ -151,8 +151,8 @@ def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
     ):
         assert obsolete not in CUDA_SESSION_STATE_HEADER
     assert "TextSessionStateKind::HybridAttention" in DECODE
-    assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
-    assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
+    assert "saved.convolution_state = linear->mixer.convolution.clone()" in DECODE
+    assert "saved.recurrent_state = linear->mixer.recurrent.clone()" in DECODE
     assert "std::optional<MtpSessionState> mtp" in DECODE
     assert "mtp->restore_session_state(*match->state->mtp)" in DECODE
     assert "prompt.size() - reused_tokens" in DECODE

@@ -15,6 +15,22 @@ def _json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def text_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the part of a composite config that describes the text model.
+
+    Most families nest the language model under ``text_config``, NVIDIA Omni
+    wrappers use ``llm_config``, and a plain text checkpoint is itself the
+    text section.  Importers and topology readers share this one rule instead
+    of spelling the nesting key per architecture.
+    """
+
+    for key in ("text_config", "llm_config"):
+        raw = config.get(key)
+        if isinstance(raw, Mapping):
+            return raw
+    return config
+
+
 def merge_hf_inference_config(
     config: Mapping[str, Any],
     supplemental: Mapping[str, Any],
@@ -56,4 +72,4 @@ def load_hf_model_config(root: str | Path) -> dict[str, Any]:
     return config
 
 
-__all__ = ["load_hf_model_config", "merge_hf_inference_config"]
+__all__ = ["load_hf_model_config", "merge_hf_inference_config", "text_section"]
