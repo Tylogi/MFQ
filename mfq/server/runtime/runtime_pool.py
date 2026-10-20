@@ -819,7 +819,7 @@ class RuntimePool:
                     0,
                     committed_bytes - self._committed_runtime_bytes(victim),
                 )
-            prefix_limit = self._reserve_prefix_capacity_locked(model_name, claimed_instance_ids)
+            prefix_limit = self._reserve_prefix_capacity_locked(model_name, claimed_instance_ids, request)
             request = request.model_copy(update={"prefix_cache_hot_bytes": prefix_limit, "prefix_cache_max_bytes": prefix_limit})
             port = self._reserve_free_port_locked() if self.transport == "http" else 0
             for victim in evicted:
@@ -1406,9 +1406,21 @@ class RuntimePool:
         names = {item.artifact.resource.name for item in current}
         return used + sum(self._policy_prefix_limits.get(name, 0) for name in self._loading_model_names if name not in names)
 
-    def _reserve_prefix_capacity_locked(self, model: str, excluded_ids: set[UUID]) -> int:
+    def _prefix_hot_cap(self, request: ModelLoadRequest | None) -> int:
+        if request is None:
+            return self._prefix_total_limit()
+        if not request.prefix_cache_enabled:
+            return 0
+        explicit = request.prefix_cache_hot_bytes
+        if explicit is None:
+            explicit = request.prefix_cache_max_bytes
+        return min(self._prefix_total_limit(), explicit) if explicit is not None else self._prefix_total_limit()
+
+    def _reserve_prefix_capacity_locked(self, model: str, excluded_ids: set[UUID],
+                                       request: ModelLoadRequest | None = None) -> int:
         remaining = max(0, self._prefix_total_limit() - self._prefix_reserved_capacity_locked(excluded_ids))
-        limit = min(remaining, self._policy_prefix_limits.get(model, self._prefix_total_limit()))
+        limit = min(remaining, self._policy_prefix_limits.get(model, self._prefix_total_limit()),
+                    self._prefix_hot_cap(request))
         self._policy_prefix_limits[model] = limit
         return limit
 
@@ -1523,12 +1535,16 @@ class RuntimePool:
                 remaining = max(0, self._prefix_total_limit() - fixed)
                 candidates.sort(key=lambda item: (item.id == preferred, item.last_used_at or item.started_at), reverse=True)
                 targets = {}
+                caps = {item.id: self._prefix_hot_cap(self._load_requests.get(item.artifact.resource.name))
+                        for item in candidates}
                 for item in candidates:
                     wanted = max(item.memory.prefix_cache_bytes or 0, item.prefix_pressure_bytes)
-                    targets[item.id] = min(remaining, wanted)
+                    targets[item.id] = min(remaining, wanted, caps[item.id])
                     remaining -= targets[item.id]
-                if candidates:
-                    targets[candidates[0].id] += remaining
+                for item in candidates:
+                    extra = min(remaining, caps[item.id] - targets[item.id])
+                    targets[item.id] += extra
+                    remaining -= extra
                 disk_limit = self.memory_policy.prefix_disk_limit_bytes
                 if disk_limit is None:
                     disk_limit = self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", 100 << 30)

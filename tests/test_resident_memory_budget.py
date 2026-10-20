@@ -294,6 +294,7 @@ def test_load_reservation_is_shared_and_passed_to_native(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('busy', [False, True])
 def test_moe_load_uses_remaining_shared_capacity_and_streams_excess_experts(tmp_path, busy):
+    import sys
     from unittest.mock import AsyncMock, Mock
     from tests.test_server_models import _fake_runtime, _model
 
@@ -307,7 +308,11 @@ def test_moe_load_uses_remaining_shared_capacity_and_streams_excess_experts(tmp_
         catalog.resolve = AsyncMock(return_value=incoming)
         pool = RuntimePool(catalog, executable, max_runtime_memory_bytes=12 * GIB,
             startup_timeout_seconds=5)
-        pool._launch_configuration = Mock(wraps=pool._launch_configuration)
+        configure = pool._launch_configuration
+        def launch(*args, **kwargs):
+            command, environment = configure(*args, **kwargs)
+            return [sys.executable, *command], environment
+        pool._launch_configuration = Mock(side_effect=launch)
         old = instance(tmp_path, 'old', limit=8 * GIB)
         if busy:
             old.state, old.active_requests = RuntimeInstanceState.BUSY, 1

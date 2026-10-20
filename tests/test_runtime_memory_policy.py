@@ -87,6 +87,40 @@ def test_metal_launch_passes_cache_limits_to_native_environment(tmp_path, monkey
     assert environment['MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES'] == '0'
 
 
+@pytest.mark.parametrize('settings,expected', [
+    ({'prefix_cache_hot_bytes': 0}, 0),
+    ({'prefix_cache_hot_bytes': GIB // 2}, GIB // 2),
+    ({'prefix_cache_max_bytes': 0}, 0),
+    ({'prefix_cache_hot_bytes': GIB, 'prefix_cache_max_bytes': 0}, GIB),
+    ({'prefix_cache_enabled': False}, 0),
+    ({}, 2 * GIB),
+])
+def test_load_reservation_preserves_explicit_prefix_caps(tmp_path, settings, expected):
+    pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime')
+    request = ModelLoadRequest(model='a', **settings)
+    assert pool._reserve_prefix_capacity_locked('a', set(), request) == expected
+    pool._loading_model_names.add('a')
+    assert pool._reserve_prefix_capacity_locked('b', set()) == 2 * GIB - expected
+
+
+def test_hot_rebalance_respects_disabled_and_capped_models(tmp_path):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime')
+        pool.memory_policy = RuntimeMemoryPolicy(prefix_limit_bytes=4 * GIB)
+        a = cached_instance(tmp_path, 'a', 0, 0, pressure=4 * GIB)
+        b = cached_instance(tmp_path, 'b', 0, 0, pressure=4 * GIB)
+        c = cached_instance(tmp_path, 'c', 0, 0, pressure=4 * GIB)
+        pool._instances = {item.id: item for item in (a, b, c)}
+        pool._load_requests = {'a': ModelLoadRequest(model='a', prefix_cache_hot_bytes=0),
+                               'b': ModelLoadRequest(model='b', prefix_cache_hot_bytes=GIB)}
+        await pool._rebalance_prefix_cache_budget(a.id)
+        assert a.backend.limit == 0 and b.backend.limit == GIB and c.backend.limit == 3 * GIB
+        assert a.control_leases == b.control_leases == c.control_leases == 0
+        pool._instances.clear()
+        await pool.aclose()
+    asyncio.run(run())
+
+
 def test_hot_capacity_borrows_by_demand_and_trims_lru_without_reloads(tmp_path):
     async def run():
         pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime')
