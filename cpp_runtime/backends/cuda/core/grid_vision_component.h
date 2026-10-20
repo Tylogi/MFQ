@@ -415,7 +415,7 @@ class CudaGridVisionPromptComponent {
                     .to(mfq_tensor_backend::kInt64);
             });
         co_yield CudaPreparedPrompt{token_ids, std::move(prepared.embeddings), std::move(prepared.positions),
-                mfq_tensor_backend::Tensor(), prepared.decode_delta, std::move(cache_key)};
+                prepared.decode_delta, std::move(cache_key)};
     }
 
     const std::string &input_contract() const noexcept { return input_contract_; }
