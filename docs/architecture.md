@@ -78,14 +78,15 @@ ControlResult control(ControlRequest request);
 
 ## 3. 当前模型组织与资源持有
 
-- 共享 family 定义在 `csrc/engine/model/<family>/`（`config.h/.cpp` + `causal_lm.h`）。`engine/model/common/causal_model.h` 提供 `CausalModelBase<Backend, Derived>`；`CausalLm<Backend>` 由各 family 自己的 `causal_lm.h` 定义（例如 `engine/model/qwen35/causal_lm.h`）。
+- 共享 family 定义在 `csrc/engine/model/<family>/`（`config.h/.cpp` + `causal_lm.h`），非模板实现由 `mfq-engine` 编译。`engine/model/common/` 包含视觉几何与 YaRN，`causal_model.h` 提供 `CausalModelBase<Backend, Derived>`；`CausalLm<Backend>` 由各 family 自己的 `causal_lm.h` 定义（例如 `engine/model/qwen35/causal_lm.h`）。
 - CUDA 绑定在 `csrc/backends/cuda/models/`：`common/causal_model_ops.h` 的 `CudaCausalOps<Model> : Model, CudaCausalModel`与 `attention_ops.h`；`qwen35/ops.h` 实例化 `CausalLm<CudaCausalOps<Qwen35Model>>`。另有 `ForwardOps` 与 `CudaSessionCodec`。
 - **这套共享目前只覆盖 CUDA 侧**：Metal 有自己的 family 实现（`backends/metal/models/` 下的 `mlx_*`），不实例化这些模板，也不接 `EngineInstance`。见 [bugs.md B28](bugs.md)。
-- Engine 模块目录：`csrc/engine/{include,model,src,requests,batch,state,weights,executor,text}`。`include/` 是唯一 PUBLIC include 目录，model_source、prefix/QSA 字节存储与 tokenizer 的实现依赖均为 PRIVATE；其余模块目录在 `engine/CMakeLists.txt` 里是 PRIVATE，只有 `backends/` 与 `tests/` 把它们加进 include path。
+- Engine 模块目录：`csrc/engine/{include,model,src,requests,batch,state,weights,executor,text}`。`include/` 是唯一 PUBLIC include 目录，包含请求/媒体值、SamplingParams、语法游标、资源错误与 StepSequence；model_source、prefix/QSA 字节存储与 tokenizer 的实现依赖均为 PRIVATE。实际 `backends/`、`tests/` 与 `bench/` 消费者显式添加所需私有 include path。
+- 输入与格式：`formats/` 提供持久化 schema、范围解码和只读码表；`model_source/` 负责输入读取与旧名称映射，公共接口暴露 TensorLayout。旧 dtype 在元数据和 MFE cohort 输入处规范化，VQ/SQ 算子只分派规范格式；文件 I/O 位于 `components/io/`。
 - 资源持有：`CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，由 `CudaExecutionContext` 持有（`execution/cuda_execution.h`）；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用。公共 StateStore/WeightStore 尚未拥有这些资源（[B34](bugs.md)）。
 - 连续批处理：共享 `ContinuousBatch` 在 `engine/executor/driver.h`，由 `backends/cuda/engine/batch_execution.*` 驱动；当前由 family policy 与 `batch_executor_t<Model>` 选择实现，包含 Qwen35 与单独的 Qwen4/Flash-Next batch 绑定；Qwen35 请求状态仍专用绑定，尚未收敛到目标共享 Executor（[B32](bugs.md)）。
 - host parallel、拓扑、亲和性和 host copy 位于 `backends/cpu/native/`，专家调度位于 `backends/cpu/execution/`；CUDA native 的线程原语依赖不引入 CPU 专家调度。
-- prefix 的匹配与请求计数、QSA 的 sequence/snapshot 已归 `engine/state/`；RAM/SSD 队列、文件校验与回收归 `backends/cpu/storage/`，由 State 组合持有。MoE 成本/放置与分片归 `engine/weights/`，异步观测推进归 `engine/executor/`；CPU worker 只测量并返回耗时，保留输入租约直至工作结束。`csrc/core/`、`mfq-core` 和 `mfq::core` 已删除；各真实消费者显式链接所需模块，CUDA 物理执行由独立 object target 编译。
+- prefix 的匹配与请求计数、QSA 的 sequence/snapshot 位于 `engine/state/`；RAM/SSD 队列、文件校验与回收归 `backends/cpu/storage/`，由 State 组合持有。MoE 成本/放置与分片归 `engine/weights/`，异步观测推进归 `engine/executor/`；CPU worker 只测量并返回耗时，保留输入租约直至工作结束。各消费者显式链接所需模块，CUDA 物理执行由独立 object target 编译。
 
 ## 4. CUDA 与 Metal 的实际差别
 
@@ -112,11 +113,9 @@ ControlResult control(ControlRequest request);
 - Duplex 走第二条控制路径：`ControlPending` / `ControlCompletion`（`engine/include/engine.h`）、Scheduler 侧 `pending_control` / `duplex_active`（`scheduler/src/scheduler.cpp`）、CUDA 侧 `duplex_active` / `duplex_pending` / `duplex_stop` / `duplex_sequence`（`cuda_engine.cpp`）。见 [B26](bugs.md)。
 - Metal 保留独立 generation；`mlx_mtp.cpp` 的 `GenerationPolicy<MlxDsparkDepthController>` 引用残留源码可见，接口仍需同步。见 [B18](bugs.md)。
 - Store 所有权未收口（`CudaStores`）。见 [B34](bugs.md) 与 plan §1.4 R4。
-- `csrc/engine/model/` 已收拢共享配置、旧 family 组合、视觉几何与 YaRN，原 `csrc/models/` 与 `mfq-models` 已删除；编译实现归 `mfq-engine`，模型根目录仅供实际消费者显式使用。尚无新 family forward、`Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
-- K1 底层依赖迁移已完成。schema、范围解码和码表归 `formats/`，输入与旧名称读取归 `model_source/`，视觉几何由 `mfq-engine` 编译；文件 I/O 与 host 原语已独立。`mfq-model-graph` 与 `mfq-model-source` 不再依赖 core，CUDA kernel 不再取得 core 的 include 路径或链接 `mfq-core`。
-- 旧 dtype 在 MFQ 元数据和 MFE cohort 输入解析处规范化，VQ/SQ 算子只分派规范格式；ModelSource 只暴露 TensorLayout，名称映射保留在 compat 读取实现。
-- K2 契约与模型归位已完成。请求/媒体值、唯一 SamplingParams、语法游标、资源错误与 StepSequence 已归 `engine/include/`；CUDA native 只取得公共错误声明的 include 路径，不再依赖 core。K3/K4 的职责与构建迁移已完成；core 删除不代表 R4 的 Store 所有权已完成。Metal MFE 输入解析暂与 offload 缓存同在 `mlx_moe.cpp`，其缓存拆分随 R4/后端迁移推进。见 plan §1.4 与阶段 3。
-- 已知非绿：`mfq-float-projection-test`（[B11](bugs.md)）、`mfq-cuda-include-graph-test` 重复注册（[B15](bugs.md)）、普通 MXFP8 的 16 行反向回退误差（[B35](bugs.md)）、shared-input mixed Gate 的逐字节比较（[B36](bugs.md)，K2 基线同样复现）。
+- 尚无新 family forward、`Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
+- Metal MFE 输入解析与 offload 缓存同在 `mlx_moe.cpp`，其缓存拆分随 R4/后端迁移推进。见 plan §1.4 与阶段 3。
+- 已知非绿：`mfq-float-projection-test`（[B11](bugs.md)）、`mfq-cuda-include-graph-test` 重复注册（[B15](bugs.md)）、普通 MXFP8 的 16 行反向回退误差（[B35](bugs.md)）、shared-input mixed Gate 的逐字节比较（[B36](bugs.md)，`28476704` 基线同样复现）。
 
 ## 7. 规则与目标在哪里
 

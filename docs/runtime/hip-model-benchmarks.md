@@ -26,7 +26,7 @@ prompts longer than 32 tokens (see the
 
 ```sh
 python bench/model_bench.py model-fp.mfq model-s4m.mfq \
-  --runtime build/cpp_runtime/mfq-runtime \
+  --runtime build/mfq-runtime \
   --prefill-lengths 32,512,2048,8192 --decode-tokens 256 \
   --env MFQ_DISABLE_MMA_ATTENTION=1 --output results.json
 ```
@@ -106,7 +106,7 @@ gap:
   125.3 tok/s) and +4.4% on 27B (36.4 to 38.0) before further kernel
   work; see the improvement section below.
 - **Prefill above 8 rows dequantizes whole matrices.** `nint_matmul`
-  (cpp_runtime/backends/hip/ops/nint.cpp) uses the fused workspace GEMV
+  (`csrc/backends/hip/ops/nint.cpp`) uses the fused workspace GEMV
   only for M <= 8; larger cohorts dequantize the full weight to BF16
   and call a dense GEMM. In the profiled window the dequant kernel
   alone cost 11.3 ms against 6.5 ms for the GEMM it feeds.

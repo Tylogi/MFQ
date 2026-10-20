@@ -36,7 +36,7 @@
 | B33 | 结构债务 | 待决（开关归属未定；未复现故障） | 调试开关归属未定；若改成缓存读取会破坏测试内 `setenv` A/B |
 | B34 | 结构债务 | 待处理（plan R4，随阶段 2/3） | `CudaStores` 只是字段包装，Store 所有权未收口 |
 | B35 | 真实缺陷 | 待修复 | MXFP8 反向的 FP16 GEMM 回退在 16 行输入下超过既有容差 |
-| B36 | 真实缺陷 | 待修复 | shared-input mixed Gate 与既有路径不能逐字节一致，K2 基线同样复现 |
+| B36 | 真实缺陷 | 待修复 | shared-input mixed Gate 与既有路径不能逐字节一致，`28476704` 基线同样复现 |
 
 ## 真实缺陷（待修复）
 
@@ -136,11 +136,11 @@
 
 ### B36：shared-input mixed Gate 不能通过逐字节比较
 
-- 状态：待修复；K3/K4 迁移没有改动该数值实现或容差。
+- 状态：待修复。
 - 位置：[`verify_shared_input`](../csrc/backends/cuda/tests/kernels/moe_ffn_pipeline_test.cpp) 的 mixed Gate/Up 普通与 Graph 对照，以及共享输入量化/heterogeneous decode 算子。
-- 复现：用 `PYTHONPATH=. .venv/bin/python csrc/tests/quant/make_cpu_quant_fixtures.py /tmp/mfq-k3-quant-fixtures --experts 3` 生成固定 seed `20261005` 的范围夹具，然后运行 `build/cuda/mfq-moe-ffn-pipeline-test /tmp/mfq-k3-quant-fixtures --shared-input-check`。
+- 复现：用 `PYTHONPATH=. .venv/bin/python csrc/tests/quant/make_cpu_quant_fixtures.py /tmp/mfq-quant-fixtures --experts 3` 生成固定 seed `20261005` 的范围夹具，然后运行 `build/cuda/mfq-moe-ffn-pipeline-test /tmp/mfq-quant-fixtures --shared-input-check`。
 - 现象：index 777，actual `0.000947952`，expected `0.000947475`，逐字节比较失败。不能用放宽相等判据把迁移计为数值修复。
-- 基线：从 `28476704` 导出原头文件、原 `ops/moe/moe.cpp` 与原测试函数，独立编译该数值 provider/probe，使用未改动的 native kernel 库和相同夹具；相同 index 和相同数值差异复现，exit 1。本轮定向 CPU 成本观测覆盖 4 格式、16 次 warmup 和 32 次 decode，独立于此失败通过。
+- 基线：从 `28476704` 导出原头文件、原 `ops/moe/moe.cpp` 与原测试函数，独立编译该数值 provider/probe，使用未改动的 native kernel 库和相同夹具；相同 index 和相同数值差异复现，exit 1。
 - 关闭条件：在原逐字节判据下通过普通/Graph、多格式及变化输入的比较，定位量化或累积顺序差异；与架构迁移分开验证。
 
 ## 结构债务

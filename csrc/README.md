@@ -1,9 +1,9 @@
 # MFQ C++ runtime
 
 The native runtime is organized by responsibility. Shared models are grouped
-by model family. The tree below is the **current transitional layout**; the
-core aggregation is gone; the target replaces the old model binding chain
-with complete backend operators.
+by model family. The tree below is the **current transitional layout**;
+replacing the old model binding chain with complete backend operators remains
+in the plan.
 Format schemas, range readers and frozen codebooks live in `formats/`,
 model input lives in `model_source/`, and file
 I/O lives in `components/io/`. That end state is defined in
@@ -20,29 +20,27 @@ has landed.
   frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
   dependency. Compiled NINT/NVQ/MFE range readers live beside those headers
   in `formats/quant/` and build as `mfq-quant-readers`, with file-read values
-  and host workers but no core/model dependency. Canonical dtype identifiers
+  and host workers but no model dependency. Canonical dtype identifiers
   live in `formats/dtype.h`; legacy spelling recognition stays in `formats/compat/`.
-  Model sources and backend operators consume the headers directly; CUDA
-  native kernels no longer depend on `mfq-core`. Persisted model schema and
-  validation live in `formats/model_graph/` (`mfq-model-graph`); that target
+  Model sources, backend operators and CUDA native kernels consume the headers
+  directly. Persisted model schema and validation live in `formats/model_graph/`
+  (`mfq-model-graph`); that target
   contains no vision algorithm or old model reader. Legacy dtype spellings are
   normalized at metadata/cohort input; VQ/SQ operators accept canonical IDs;
 - `engine/model/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `engine/model/common/` contains `CausalModelBase`,
   causal traversal, attention, MLP, MoE, recurrence, shared layer compositions
-  and YaRN scaling. Compiled model functions belong to `mfq-engine`; the old
-  `models/` root and `mfq-models` target are gone;
+  and YaRN scaling. Compiled model functions belong to `mfq-engine`;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral logical request lifecycle, admission,
   cancellation decisions and bounded output queues;
 - `engine/model/common/vision/` — shared grid vision configuration, geometry,
   positions and canonical tensor roles, compiled by `mfq-engine` and consumed
-  within the shared model tree without old-model dependency exceptions;
+  within the shared model tree;
 - `engine/include/` — public request/media values, the sole `SamplingParams`,
-  grammar cursor, resource errors and `StepSequence`. Native allocation errors
-  no longer require a core include path. Engine clients inherit only this public
-  directory; implementation dependencies stay private;
+  grammar cursor, resource errors and `StepSequence`. Engine clients inherit
+  only this public directory; implementation dependencies stay private;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
@@ -61,8 +59,7 @@ has landed.
   encoded-row cache shared by CUDA/HIP. `mfq-prefix-blocks` and
   `mfq-qsa-kv-store` contain no Engine policy; CPU execution measures work while
   captured inputs retain their leases;
-  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`, which no longer publishes
-  the old core include directory;
+  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`;
 - `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests. `native/` implements
   Tensor/context primitives in the `mfq-cuda-native` target. `execution/` owns

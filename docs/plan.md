@@ -24,7 +24,7 @@
 终态目录与逐文件归属以 [refactor.md](refactor.md) 为准，剩余迁移包括：
 
 - 在 `engine/model/<family>/` 用完整算子组合替换旧 Ops/继承/ForwardOps 绑定链。
-- 将状态、权重与执行规则分别落实到 `engine/state/`、`engine/weights/` 和 `engine/executor/`；后端保留物理存储与数值执行。
+- 落实 StateStore/WeightStore 的唯一所有权、事务与回收，以及 Executor 的 Preparation/InFlightBatch；后端保留物理存储与数值执行。
 - 将 CUDA `engine/` 收敛为装配入口，迁走其中的生成、事务和可复用模型行为。
 
 复用现有请求 map、`plan_batch`、页分配与 slots/ranker，不为新名称增加包装类。Transport、tokenizer、CLI 与诊断保持各自职责。
@@ -40,8 +40,6 @@
 - 例外按具体消费者列出，迁完即删除，不通过排除整个目录规避检查。
 
 ### 1.3 CMake 与规范同步
-
-公共 Engine/模型非模板实现由 `mfq-engine` 编译，模板由实际后端和测试实例化；公共库不链接设备库，也不公开全部 implementation 目录。
 
 每批迁移同步 CUDA、Metal、CPU、工具绑定、bench 与测试的实际消费者，以及 [CONTRIBUTING.md](../CONTRIBUTING.md)、[运行时说明](../csrc/README.md) 和本文。旧路径直接更新，不保留转发头或聚合库。
 

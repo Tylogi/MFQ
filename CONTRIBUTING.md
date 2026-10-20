@@ -28,10 +28,9 @@ architecture-named entry point.
   in `engine/executor/`, and logical prefix/QSA state in `engine/state/`.
   Host byte storage, disk reservations and encoded-row leases belong to
   `backends/cpu/storage/`; measured CPU work belongs to CPU execution.
-  The old core directory, target and alias have been removed. Schemas and row
-  readers belong to `formats/`, model input to `model_source/`, and vision
-  geometry to `engine/model/common/vision/`. Do not recreate a core aggregation
-  or add forwarding headers.
+  Schemas and row readers belong to `formats/`, model input to `model_source/`,
+  and vision geometry to `engine/model/common/vision/`. Do not recreate a core
+  aggregation or add forwarding headers.
 - `mfq-model-graph` parses only persisted schema. `mfq-model-source` opens inputs,
   normalizes metadata and retains bounded readers; neither may depend on core,
   Engine or model execution. Keep alias maps in `model_source/compat/`; public
@@ -56,7 +55,7 @@ architecture-named entry point.
 - Engine request/media values, sampling parameters, grammar cursor and
   `StepSequence` live in `csrc/engine/include/`. Sampling has one definition in
   `sampling_params.h`; device sampling adapters include that narrow contract.
-  Native allocators include `resource_error.h` directly without core.
+  Native allocators include `resource_error.h` directly.
 - Shared model configurations and forward definitions live in
   `csrc/engine/model/<family>/`, with shared layer compositions in
   `csrc/engine/model/common/`. Their non-template implementations compile in
