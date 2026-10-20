@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model_config.h"
+#include "gated_mlp.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,33 +24,82 @@ Ffn load_dense_ffn(Loader& ops, const ModelConfig& config, const std::string& pr
     return result;
 }
 
+// Routed banks may be gated (gate/up or fused gate_up) or ungated (up only).
+// An ungated expert's activation is relu^2, never a gate projection alias.
 template <class Ffn, class Loader>
 Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
-                    bool router_bias_required = false) {
+                    bool router_bias_required = false, bool ungated_experts = false,
+                    bool ungated_shared = false) {
     const auto gate_up = prefix + "experts.gate_up.weight", gate = prefix + "experts.gate.weight",
                up = prefix + "experts.up.weight", down = prefix + "experts.down.weight";
-    const bool fused = ops.has(gate_up), split = ops.has(gate);
-    if (split != ops.has(up) || fused == split || !ops.has(down))
-        throw std::runtime_error("routed MoE requires down and exactly one fused or split "
-                                 "Gate/Up representation at layer " + std::to_string(layer));
+    const bool has_up = ops.has(up), has_down = ops.has(down);
+    const bool has_gate = ops.has(gate), has_gate_up = ops.has(gate_up);
     Ffn result;
     result.is_moe = true;
-    result.moe_split_gate_up = split;
     result.moe_layer = layer;
-    if (split) {
-        ops.experts(result, ExpertProjection::gate, gate, layer);
+    if (ungated_experts) {
+        if (!has_up || !has_down || has_gate || has_gate_up)
+            throw std::runtime_error(
+                "ungated routed MoE requires only Up and Down at layer " +
+                std::to_string(layer));
+        if constexpr (requires { result.moe_ungated_experts = true; })
+            result.moe_ungated_experts = true;
+        else
+            throw std::runtime_error(
+                "this FFN type does not support ungated routed experts at layer " +
+                std::to_string(layer));
+        if constexpr (requires { result.activation = MlpActivation::relu_squared; })
+            result.activation = MlpActivation::relu_squared;
         ops.experts(result, ExpertProjection::up, up, layer);
     } else {
-        ops.experts(result, ExpertProjection::gate_up, gate_up, layer);
+        const bool split = has_gate, fused = has_gate_up;
+        if (split != ops.has(up) || fused == split || !ops.has(down))
+            throw std::runtime_error(
+                "routed MoE requires Down and exactly one fused or split "
+                "Gate/Up representation at layer " + std::to_string(layer));
+        result.moe_split_gate_up = split;
+        if (split) {
+            ops.experts(result, ExpertProjection::gate, gate, layer);
+            ops.experts(result, ExpertProjection::up, up, layer);
+        } else {
+            ops.experts(result, ExpertProjection::gate_up, gate_up, layer);
+        }
     }
     ops.experts(result, ExpertProjection::down, down, layer);
+    const auto latent_in = prefix + "latent.down.weight";
+    const auto latent_out = prefix + "latent.up.weight";
+    if (ops.has(latent_in) != ops.has(latent_out))
+        throw std::runtime_error(
+            "latent MoE requires both Down and Up latent projections at layer " +
+            std::to_string(layer));
+    if (ops.has(latent_in)) {
+        if constexpr (requires { result.moe_latent_in = ops.linear(latent_in); }) {
+            result.moe_latent_in = ops.linear(latent_in);
+            result.moe_latent_out = ops.linear(latent_out);
+        } else {
+            throw std::runtime_error(
+                "this FFN type does not support latent MoE projections at layer " +
+                std::to_string(layer));
+        }
+    }
     result.moe_router = ops.router_parameter(prefix + "router.weight");
     if (router_bias_required || ops.has(prefix + "router.bias"))
         result.moe_router_bias = ops.router_parameter(prefix + "router.bias");
     result.shared = std::make_unique<Ffn>();
     result.shared->down = ops.linear(prefix + "shared_expert.down.weight");
-    result.shared->gate_up = ops.gate_up(
-        {prefix + "shared_expert.gate.weight", prefix + "shared_expert.up.weight"}, result.shared->down);
+    const auto shared_gate = prefix + "shared_expert.gate.weight";
+    const auto shared_up = prefix + "shared_expert.up.weight";
+    if (ungated_shared) {
+        if (ops.has(shared_gate) || !ops.has(shared_up))
+            throw std::runtime_error(
+                "ungated shared expert requires Up without a Gate at layer " +
+                std::to_string(layer));
+        if constexpr (requires { result.shared->activation = MlpActivation::relu_squared; })
+            result.shared->activation = MlpActivation::relu_squared;
+        result.shared->gate_up = ops.gate_up({shared_up}, result.shared->down);
+    } else {
+        result.shared->gate_up = ops.gate_up({shared_gate, shared_up}, result.shared->down);
+    }
     ops.workspace(*result.shared);
     return result;
 }
@@ -65,6 +115,8 @@ void load_full_attention(Block& block, Loader& ops, const ModelConfig& config, i
     block.rms_norm_eps = config.rms_norm_eps;
     block.norm_weight_offset = norm_offset;
     block.attention_output_gate = output_gate;
+    if constexpr (requires { block.no_rope = false; })
+        block.no_rope = config.positional_encoding == PositionalEncoding::none;
     block.attn_norm = ops.dense(prefix + "attention.norm.weight");
     block.ffn_norm = ops.dense(prefix + "mlp.norm.weight");
     const auto attention = prefix + "attention.";

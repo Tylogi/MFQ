@@ -11,7 +11,6 @@
 namespace mfq { class ModelSource; }
 
 struct FullBlock;
-
 struct TransformerWeightLoader {
     CudaExecutionContext& execution;
     const mfq::ModelSource& source;
@@ -35,11 +34,12 @@ struct TransformerWeightLoader {
     static auto shape(const mfq_tensor_backend::Tensor& value) { return value.sizes().vec(); }
     static int64_t elements(const mfq_tensor_backend::Tensor& value) { return value.numel(); }
 };
-
 struct MoeWeightLoadOptions {
     int layer;
     bool cpu_offloaded = false;
     bool router_bias_required = false;
+    bool ungated_experts = false;
+    bool ungated_shared = false;
     std::size_t shared_gate_up_compatible_prefix = 2;
 };
 

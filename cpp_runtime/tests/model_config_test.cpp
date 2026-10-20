@@ -5,6 +5,7 @@
 #include "models/glm_dsa/config.h"
 #include "models/minicpmo45/config.h"
 #include "models/qwen35/config.h"
+#include "models/common/model_config.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -139,6 +140,27 @@ int main() {
             minicpm.version == "4.5" && !minicpm.attention_bias &&
                 !minicpm.use_sliding_window,
             "MiniCPM-o config was not normalized");
+
+        const auto nope = mfq::models::ModelConfig::from_json(R"({
+            "model_type":"nemotron_h","vocab_size":128,"hidden_size":64,
+            "num_hidden_layers":2,"num_attention_heads":4,
+            "num_key_value_heads":2,"max_position_embeddings":4096,
+            "head_dim":16,"positional_encoding":"none"})");
+        require(
+            nope.positional_encoding == mfq::models::PositionalEncoding::none &&
+                nope.rotary_dim == 0,
+            "NoPE model config retained a rotary dimension");
+        rejected = false;
+        try {
+            static_cast<void>(mfq::models::ModelConfig::from_json(R"({
+                "model_type":"nemotron_h","vocab_size":128,"hidden_size":64,
+                "num_hidden_layers":2,"num_attention_heads":4,
+                "num_key_value_heads":2,"max_position_embeddings":4096,
+                "head_dim":16,"positional_encoding":"absolute"})"));
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "unknown positional_encoding was accepted");
 
         auto flash = nlohmann::json::parse(R"({
             "model_type":"qwen4_exp_text","vocab_size":128,"hidden_size":32,

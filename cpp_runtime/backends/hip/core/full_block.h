@@ -21,6 +21,8 @@ struct FullBlock : Block {
     double rms_norm_eps = 1e-6;
     double norm_weight_offset = 1.0;
     bool official_bf16 = false;
+    // NoPE GQA: skip every rotary callback while keeping the KV cache normal.
+    bool no_rope = false;
     RopeCache attention_rope;
 
     mfq_tensor_backend::Tensor attn_norm;

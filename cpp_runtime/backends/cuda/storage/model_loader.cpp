@@ -200,7 +200,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     }
 
-    if (model.adapter_uses_common_rope()) {
+    if (model.adapter_uses_common_rope() && !model.metadata.no_rope) {
         auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(model.max_position_embeddings(), model.rotary_dim(), model.rope_base(),
                            0, -1, device, model.metadata.rope_interleaved,execution.yarn);

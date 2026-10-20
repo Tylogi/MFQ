@@ -7,6 +7,9 @@
 
 namespace mfq::models {
 
+// How the model positions attention queries and keys.
+enum class PositionalEncoding { rope, none };
+
 // Backend-neutral transformer geometry normalized from model_config.json.
 struct ModelConfig {
     std::string model_type;
@@ -20,6 +23,8 @@ struct ModelConfig {
     std::int64_t head_dim = 0;
     double rope_base = 1'000'000.0;
     double full_rotary_factor = 1.0;
+    // none permanently disables rotation and requires rotary_dim == 0.
+    PositionalEncoding positional_encoding = PositionalEncoding::rope;
     std::int64_t rotary_dim = 0;
     double rms_norm_eps = 1e-6;
     bool tie_word_embeddings = false;

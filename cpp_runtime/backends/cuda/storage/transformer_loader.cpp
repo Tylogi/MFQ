@@ -82,6 +82,29 @@ void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermed
 void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection projection,
                                      const std::string& name, int layer) const {
     using Role = mfq::models::ExpertProjection;
+    const auto& record = require_tensor(source, name);
+    if (record.dtype == "F32" || record.dtype == "F16" || record.dtype == "BF16") {
+        // Source-precision banks stay dense instead of entering an MFE cohort.
+        if (cpu_offloaded)
+            throw std::runtime_error(
+                "CPU-offloaded MoE cannot materialize a dense expert bank at layer " +
+                std::to_string(layer));
+        if (projection == Role::gate_up)
+            throw std::runtime_error(
+                "dense fused Gate/Up expert banks require separate Gate and Up records at layer " +
+                std::to_string(layer));
+        auto bank = load_dense_native_gpu(execution, source, name);
+        if (bank.dim() != 3)
+            throw std::runtime_error(
+                "dense routed expert tensor must be [experts,out,in]: " + name);
+        switch (projection) {
+            case Role::gate: ffn.moe_dense_gate = std::move(bank); break;
+            case Role::up: ffn.moe_dense_up = std::move(bank); break;
+            case Role::down: ffn.moe_dense_down = std::move(bank); break;
+            case Role::gate_up: break;
+        }
+        return;
+    }
     MfeWeight* weight = nullptr;
     std::shared_ptr<MixedMoeRuntime>* cpu = nullptr;
     const char* role = nullptr;
@@ -106,6 +129,7 @@ FFN load_moe_weights(CudaExecutionContext& execution, const mfq::ModelSource& so
     TransformerWeightLoader loader{execution, source};
     loader.cpu_offloaded = options.cpu_offloaded;
     loader.shared_gate_up_compatible_prefix = options.shared_gate_up_compatible_prefix;
-    return mfq::models::load_moe_weights<FFN>(loader, std::string(prefix), options.layer,
-                                             options.router_bias_required);
+    return mfq::models::load_moe_weights<FFN>(
+        loader, std::string(prefix), options.layer, options.router_bias_required,
+        options.ungated_experts, options.ungated_shared);
 }

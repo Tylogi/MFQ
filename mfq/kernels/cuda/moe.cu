@@ -13,6 +13,7 @@
 
 #include <math_constants.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -149,6 +150,26 @@ __device__ __forceinline__ float load_float<mfq_half>(const mfq_half * ptr, int 
     return __half2float(*reinterpret_cast<const __half *>(ptr + index));
 }
 
+template <>
+__device__ __forceinline__ float load_float<mfq_bfloat16>(const mfq_bfloat16 * ptr, int index) {
+    return __bfloat162float(ptr[index]);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t store_float(float value) {
+    return static_cast<scalar_t>(value);
+}
+
+template <>
+__device__ __forceinline__ mfq_half store_float<mfq_half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ mfq_bfloat16 store_float<mfq_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
 __device__ __forceinline__ float moe_sqrt_softplus(float value) {
     const float softplus = value > 20.0f ? value : log1pf(expf(value));
     return sqrtf(softplus);
@@ -200,9 +221,10 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         softmax_sum = warp_sum(softmax_sum);
     }
 
-    int selected[16];
+    // The generic fallback also serves Nemotron's top-22/512 routing.
+    int selected[32];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         selected[i] = -1;
     }
 
@@ -214,7 +236,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         for (int expert = lane; expert < experts; expert += kWarpSize) {
             bool already_selected = false;
 #pragma unroll
-            for (int previous = 0; previous < 16; ++previous) {
+            for (int previous = 0; previous < 32; ++previous) {
                 if (previous < rank && selected[previous] == expert) {
                     already_selected = true;
                 }
@@ -1386,10 +1408,11 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
     }
 }
 
+template <typename scalar_t>
 __global__ void moe_weighted_reduce_kernel(
-        const __half * __restrict__ pair_output,
+        const scalar_t * __restrict__ pair_output,
         const float * __restrict__ weights,
-        __half * __restrict__ output,
+        scalar_t * __restrict__ output,
         int tokens,
         int routes,
         int width) {
@@ -1402,9 +1425,9 @@ __global__ void moe_weighted_reduce_kernel(
         float value = 0.0f;
         for (int route = 0; route < routes; ++route) {
             const size_t pair = static_cast<size_t>(token) * routes + route;
-            value += weights[pair] * __half2float(pair_output[pair * width + column]);
+            value += weights[pair] * load_float(pair_output, static_cast<int>(pair * width + column));
         }
-        output[index] = __float2half(value);
+        output[index] = store_float<scalar_t>(value);
     }
 }
 
@@ -1861,8 +1884,8 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     const int rows = static_cast<int>(logits.size(0));
     const int experts = static_cast<int>(logits.size(1));
     MFQ_RUNTIME_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
-    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
-        "top_k must be in [1, min(16, experts)]");
+    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 32 && top_k <= experts,
+        "top_k must be in [1, min(32, experts)]");
     MFQ_RUNTIME_CHECK(!(normalize && delayed_softmax),
         "selected-weight normalization and delayed softmax are mutually exclusive");
     MFQ_RUNTIME_CHECK(!(use_sigmoid && delayed_softmax),
@@ -1989,8 +2012,8 @@ mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
     const int experts = static_cast<int>(logits.size(1));
     const int top_k = static_cast<int>(ids.size(1));
     MFQ_RUNTIME_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
-    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
-        "top_k must be in [1, min(16, experts)]");
+    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 32 && top_k <= experts,
+        "top_k must be in [1, min(32, experts)]");
 
     auto weights = mfq_tensor_backend::empty(ids.sizes(), logits.options().dtype(mfq_tensor_backend::kFloat32));
     const dim3 block(32, 4);
@@ -2512,9 +2535,11 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
 }
 
 mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights) {
+    const auto dtype = pair_output.scalar_type();
     MFQ_RUNTIME_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
-        pair_output.scalar_type() == mfq_tensor_backend::kFloat16 && pair_output.dim() == 3,
-        "pair_output must be contiguous CUDA float16 [tokens, routes, width]");
+        (dtype == mfq_tensor_backend::kFloat16 || dtype == mfq_tensor_backend::kBFloat16 ||
+         dtype == mfq_tensor_backend::kFloat32) && pair_output.dim() == 3,
+        "pair_output must be contiguous CUDA f16/bf16/f32 [tokens, routes, width]");
     MFQ_RUNTIME_CHECK(weights.is_cuda() && weights.is_contiguous() &&
         weights.scalar_type() == mfq_tensor_backend::kFloat32 && weights.dim() == 2,
         "weights must be contiguous CUDA float32 [tokens, routes]");
@@ -2529,10 +2554,19 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor p
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
     const cudaStream_t stream = mfq_current_cuda_stream();
-    moe_weighted_reduce_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
-        weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-        tokens, routes, width);
+    if (dtype == mfq_tensor_backend::kFloat16) {
+        moe_weighted_reduce_kernel<mfq_half><<<grid, block, 0, stream>>>(
+            pair_output.data_ptr<mfq_half>(), weights.data_ptr<float>(),
+            output.data_ptr<mfq_half>(), tokens, routes, width);
+    } else if (dtype == mfq_tensor_backend::kBFloat16) {
+        moe_weighted_reduce_kernel<mfq_bfloat16><<<grid, block, 0, stream>>>(
+            pair_output.data_ptr<mfq_bfloat16>(), weights.data_ptr<float>(),
+            output.data_ptr<mfq_bfloat16>(), tokens, routes, width);
+    } else {
+        moe_weighted_reduce_kernel<float><<<grid, block, 0, stream>>>(
+            pair_output.data_ptr<float>(), weights.data_ptr<float>(),
+            output.data_ptr<float>(), tokens, routes, width);
+    }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

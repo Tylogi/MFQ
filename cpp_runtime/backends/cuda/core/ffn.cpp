@@ -17,6 +17,78 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+using Tensor = mfq_tensor_backend::Tensor;
+using ActivationKind = mfq::models::MlpActivation;
+
+bool dense_linear_defined(const QuantLinear &linear) {
+    return linear.out() > 0 && linear.neuron_len() > 0;
+}
+
+} // namespace
+
+Tensor dense_routed_projection(const Tensor &bank, const Tensor &input, const Tensor &ids,
+                               std::size_t gather_budget_bytes) {
+    MFQ_RUNTIME_CHECK(bank.is_cuda() && bank.is_contiguous() && bank.dim() == 3,
+                      "dense routed expert bank must be contiguous CUDA [experts,out,in]");
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.dim() == 2, "dense routed ids must be [tokens,routes]");
+    const int64_t rows = ids.size(0), routes = ids.size(1);
+    const int64_t output = bank.size(1), width = bank.size(2);
+    MFQ_RUNTIME_CHECK(input.size(0) == rows && input.size(-1) == width,
+                      "dense routed input shape does not match the expert bank");
+    MFQ_RUNTIME_CHECK(input.dim() == 2 || (input.dim() == 3 && input.size(1) == routes),
+                      "dense routed activation shape does not match the route plan");
+    auto project = [&](const Tensor &chunk_ids, const Tensor &chunk_input) {
+        const int64_t count = chunk_ids.size(0);
+        auto selected =
+            bank.index_select(0, chunk_ids.reshape({-1}).to(mfq_tensor_backend::kInt64))
+                .reshape({count, routes, output, width});
+        auto source = chunk_input.dim() == 2
+                          ? chunk_input.unsqueeze(1).expand({count, routes, width})
+                          : chunk_input;
+        return mfq_tensor_backend::matmul(selected, source.to(bank.scalar_type()).unsqueeze(-1))
+            .squeeze(-1);
+    };
+    // Every route copies its whole expert matrix, so a long prompt would gather
+    // tokens * routes full matrices at once; bound each copy by row chunks.
+    const auto row_bytes = static_cast<std::size_t>(routes * output * width) * bank.element_size();
+    const auto rows_per_chunk = gather_budget_bytes / std::max<std::size_t>(1, row_bytes);
+    const auto chunk_rows = static_cast<int64_t>(std::max<std::size_t>(1, rows_per_chunk));
+    if (rows <= chunk_rows)
+        return project(ids, input);
+    std::vector<Tensor> parts;
+    parts.reserve(static_cast<std::size_t>((rows + chunk_rows - 1) / chunk_rows));
+    for (int64_t start = 0; start < rows; start += chunk_rows) {
+        const auto count = std::min(chunk_rows, rows - start);
+        parts.push_back(project(ids.narrow(0, start, count), input.narrow(0, start, count)));
+    }
+    return mfq_tensor_backend::cat(parts, 0);
+}
+
+namespace {
+
+Tensor dense_expert_activation(ActivationKind activation, Tensor gate, Tensor up, double limit) {
+    if (activation == ActivationKind::relu_squared) {
+        MFQ_RUNTIME_CHECK(!gate.defined(), "relu-squared experts have no gate projection");
+        return relu_squared_cuda(up.contiguous());
+    }
+    MFQ_RUNTIME_CHECK(gate.defined(), "gated experts require a gate projection");
+    if (activation == ActivationKind::gelu_gated)
+        return gelu_mul_cuda(gate.contiguous(), up.contiguous());
+    if (limit > 0.0) {
+        auto clipped_gate = mfq_tensor_backend::clamp_max(
+            gate.to(mfq_tensor_backend::kFloat32), limit);
+        auto clipped_up = mfq_tensor_backend::clamp(
+            up.to(mfq_tensor_backend::kFloat32), -limit, limit);
+        return (mfq_tensor_backend::silu(clipped_gate) * clipped_up)
+            .to(mfq_tensor_backend::kFloat16).contiguous();
+    }
+    return (up * mfq_tensor_backend::silu(gate)).contiguous();
+}
+
+} // namespace
+
 void FFN::prepare_moe_pipeline(CudaExecutionContext& execution) const {
     if(moe_pipeline_initialized || !uses_moe_expert_cache() || expert_parallel_moe_compatible() ||
             cpu_moe_gate || cpu_moe_up || cpu_moe_gate_up || cpu_moe_down ||
@@ -263,7 +335,8 @@ FFN::forward_expert_parallel_moe(CudaExecutionContext &execution, mfq_tensor_bac
 mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(CudaExecutionContext &execution,
                                                            mfq_tensor_backend::Tensor xh) const {
     auto &profiler = execution.profiler;
-    MFQ_RUNTIME_CHECK(!is_moe && !tensor_parallel_dense_compatible() && !geglu &&
+    MFQ_RUNTIME_CHECK(!is_moe && !tensor_parallel_dense_compatible() &&
+                          activation == ActivationKind::silu_gated && !geglu &&
                           swiglu_limit <= 0.0,
                       "FP32-output IN diagnostic requires a local dense SiLU FFN");
     auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
@@ -482,6 +555,58 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     .to(mfq_tensor_backend::kFloat16);
             },
             [&](const auto &selected) -> ExpertOutput {
+                const bool dense_routed =
+                    moe_dense_up.defined() || moe_dense_down.defined() ||
+                    moe_dense_gate.defined();
+                if (dense_routed) {
+                    if (moe_ungated_experts &&
+                        (moe_dense_gate.defined() || moe_gate_up.n_experts > 0 ||
+                         moe_gate.n_experts > 0 || moe_up.n_experts > 0 ||
+                         moe_gate_up.cached_source || moe_up.cached_source))
+                        throw std::runtime_error(
+                            "ungated routed MoE cannot mix a gate with a dense expert bank");
+                    MFQ_RUNTIME_CHECK(moe_dense_up.defined() && moe_dense_down.defined(),
+                                      "dense routed MoE requires Up and Down banks");
+                    auto expert_input = xf;
+                    if (dense_linear_defined(moe_latent_in))
+                        expert_input = profiler.measure("moe.latent_down", [&] {
+                            return moe_latent_in.forward(execution, xf);
+                        });
+                    auto up = profiler.measure("moe.dense_up", [&] {
+                        return dense_routed_projection(moe_dense_up, expert_input,
+                                                       selected.at(0));
+                    });
+                    Tensor gate;
+                    if (!moe_ungated_experts) {
+                        MFQ_RUNTIME_CHECK(moe_dense_gate.defined(),
+                                          "gated dense routed MoE requires a Gate bank");
+                        gate = profiler.measure("moe.dense_gate", [&] {
+                            return dense_routed_projection(moe_dense_gate, expert_input,
+                                                           selected.at(0));
+                        });
+                    }
+                    auto hidden = profiler.measure("moe.dense_activation", [&] {
+                        return dense_expert_activation(activation, std::move(gate),
+                                                       std::move(up), swiglu_limit);
+                    });
+                    auto down_pair = profiler.measure("moe.dense_down", [&] {
+                        return dense_routed_projection(moe_dense_down, hidden, selected.at(0));
+                    });
+                    auto reduced = profiler.measure("moe.dense_reduce", [&] {
+                        return moe_weighted_reduce_cuda(down_pair, selected.at(1));
+                    });
+                    if (dense_linear_defined(moe_latent_out))
+                        reduced = profiler.measure("moe.latent_up", [&] {
+                            return moe_latent_out.forward(execution, reduced);
+                        });
+                    record_moe_route_stats(execution, moe_layer, selected.at(0), selected.at(1),
+                                           down_pair, static_cast<int>(moe_dense_up.size(0)));
+                    return {reduced, true};
+                }
+                if (moe_ungated_experts)
+                    throw std::runtime_error(
+                        "non-gated routed MoE requires a dense BF16/F16/F32 expert bank; "
+                        "the MFE non-gated kernel is not implemented");
                 if(use_pipeline) {
                     auto result=moe_pipeline_forward(execution,xf,selected.at(0),selected.at(1));
                     if(result.dim()==3)result=moe_weighted_reduce_cuda(result,selected.at(1));
@@ -654,8 +779,13 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     },
                     shared_gate,
                     [&](Tensor routed, Tensor shared) {
-                        return profiler.measure(
-                            "moe.combine", [&] { return acc_cuda(routed.contiguous(), shared); });
+                        return profiler.measure("moe.combine", [&] {
+                            // Dense BF16 expert banks may return a different storage
+                            // type than the shared branch; align without changing it.
+                            if (routed.scalar_type() != shared.scalar_type())
+                                shared = shared.to(routed.scalar_type()).contiguous();
+                            return acc_cuda(routed.contiguous(), shared);
+                        });
                     },
                     [&](Tensor routed, Tensor shared, Tensor logits) {
                         return profiler.measure("moe.combine", [&] {
@@ -666,6 +796,18 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
     }
     using Tensor = mfq_tensor_backend::Tensor;
     using Activation = mfq::models::GatedActivation;
+    if (activation == ActivationKind::relu_squared) {
+        MFQ_RUNTIME_CHECK(!important_neurons && !tensor_parallel_dense_compatible(),
+                          "relu-squared FFN does not support important neurons or tensor parallelism");
+        auto parts = profiler.measure("ffn.up", [&]() { return gate_up.forward(execution, xh); });
+        MFQ_RUNTIME_CHECK(parts.size() == 1,
+                          "relu-squared FFN requires exactly one Up projection");
+        auto hidden = profiler.measure("ffn.relu_squared", [&]() {
+            return relu_squared_cuda(parts[0].contiguous());
+        });
+        return profiler.measure("ffn.down",
+                                [&]() { return down.forward(execution, hidden); });
+    }
     return mfq::models::gated_mlp(
         xh, geglu, swiglu_limit,
         [&](const Tensor &input, Activation activation, double limit) -> std::optional<Tensor> {

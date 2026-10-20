@@ -83,6 +83,20 @@ ModelConfig ModelConfig::from_json(std::string_view payload) {
     if (config.head_dim <= 0) {
         throw std::runtime_error("model config head_dim must be positive");
     }
+    auto positional_encoding = text.value(
+        "positional_encoding", std::string{});
+    if (positional_encoding.empty()) {
+        const auto rope_type = full_rope.value(
+            "rope_type", rope.value(
+                "rope_type", text.value("rope_type", std::string("default"))));
+        positional_encoding = rope_type == "none" ? "none" : "rope";
+    }
+    if (positional_encoding == "none") {
+        config.positional_encoding = PositionalEncoding::none;
+    } else if (positional_encoding != "rope") {
+        throw std::runtime_error(
+            "model config positional_encoding must be \"rope\" or \"none\"");
+    }
     config.rope_base = full_rope.value(
         "rope_theta", rope.value(
             "rope_theta", text.value("rope_theta", 1'000'000.0)));
@@ -90,8 +104,10 @@ ModelConfig ModelConfig::from_json(std::string_view payload) {
         "partial_rotary_factor", rope.value(
             "partial_rotary_factor",
             text.value("partial_rotary_factor", 1.0)));
-    config.rotary_dim = static_cast<std::int64_t>(std::llround(
-        config.full_rotary_factor * static_cast<double>(config.head_dim)));
+    config.rotary_dim = config.positional_encoding == PositionalEncoding::none
+        ? 0
+        : static_cast<std::int64_t>(std::llround(
+              config.full_rotary_factor * static_cast<double>(config.head_dim)));
     config.rms_norm_eps = text.value("rms_norm_eps", 1e-6);
     config.tie_word_embeddings = text.value(
         "tie_word_embeddings", root.value("tie_word_embeddings", false));
@@ -107,11 +123,18 @@ ModelConfig ModelConfig::from_json(std::string_view payload) {
         throw std::runtime_error(
             "model config layer_types length does not match num_hidden_layers");
     }
-    if (!std::isfinite(config.rope_base) || config.rope_base <= 0.0 ||
-            !std::isfinite(config.full_rotary_factor) ||
-            config.full_rotary_factor <= 0.0 || config.rotary_dim <= 0 ||
-            !std::isfinite(config.rms_norm_eps) || config.rms_norm_eps <= 0.0) {
-        throw std::runtime_error("invalid model RoPE or RMSNorm configuration");
+    if (config.positional_encoding == PositionalEncoding::rope) {
+        if (!std::isfinite(config.rope_base) || config.rope_base <= 0.0 ||
+                !std::isfinite(config.full_rotary_factor) ||
+                config.full_rotary_factor <= 0.0 || config.rotary_dim <= 0) {
+            throw std::runtime_error("invalid model RoPE configuration");
+        }
+    } else if (config.rotary_dim != 0) {
+        throw std::runtime_error(
+            "model config without positional encoding requires rotary_dim == 0");
+    }
+    if (!std::isfinite(config.rms_norm_eps) || config.rms_norm_eps <= 0.0) {
+        throw std::runtime_error("invalid model RMSNorm configuration");
     }
     return config;
 }

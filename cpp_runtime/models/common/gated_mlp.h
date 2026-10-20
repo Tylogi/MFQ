@@ -7,6 +7,10 @@ namespace mfq::models {
 
 enum class GatedActivation { silu, gelu };
 
+// MLP activation selected by the model config. relu_squared consumes a single
+// Up projection, so it has no gate branch and no SwiGLU clamp.
+enum class MlpActivation { silu_gated, gelu_gated, relu_squared };
+
 // Canonical gate/up -> activation product -> down graph. Native operations may
 // replace a contiguous part of this graph with an equivalent fused operation.
 template <class Tensor, class Fused, class FusedProjection, class Project, class Activate,
