@@ -7280,6 +7280,74 @@ void test_deepseek_v41_streamed_moe() {
     }
 }
 
+void test_deepseek_v41_visual_router_precision() {
+    using namespace mfq::metal;
+    constexpr int experts = 8, hidden = 96, intermediate = 64;
+    const std::string prefix = "model.block.0.mlp";
+    const auto projection = [&](int output, int input, int salt) {
+        const auto nint = make_nint_v2_tensor(4 * output, input, salt, 16);
+        const auto vq = make_jsc_nvq(4 * output, input);
+        return make_raw_nim2(experts, output, input, {
+            {{0, 2, 4, 6}, "NINTv2", nint, {}},
+            {{1, 3, 5, 7}, vq.dtype, {vq.blob, vq.dense, 4 * output, input}, vq.runtime},
+        });
+    };
+    const auto bias = [&](bool visual) {
+        std::vector<std::uint8_t> result;
+        append<std::uint32_t>(result, 1);
+        append<std::int64_t>(result, experts);
+        for (int expert = 0; expert < experts; ++expert)
+            append<float>(result, expert == 0 ? (visual ? 0.0001f : 0.1f) : expert == 1 ? 0.0f : -100.0f);
+        return result;
+    };
+    const auto records = [&](bool bf16) {
+        std::vector<std::uint8_t> router;
+        append<std::uint32_t>(router, 2);
+        append<std::int64_t>(router, experts);
+        append<std::int64_t>(router, hidden);
+        for (int expert = 0; expert < experts; ++expert) for (int col = 0; col < hidden; ++col) {
+            const float value = col == 0 && expert < 2 ? 1.0f : col == 1 && expert == 1 ? 1.0f / 1024 : 0.0f;
+            if (bf16) append<std::uint16_t>(router, static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(value) >> 16));
+            else append<float>(router, value);
+        }
+        return std::vector<MappedRecordFixture>{
+            {prefix + ".router.weight", bf16 ? "BF16" : "F32", std::move(router)},
+            {prefix + ".router.bias", "F32", bias(false)},
+            {prefix + ".router.vision_bias", "F32", bias(true)},
+            {prefix + ".shared_expert.gate.weight", "F16", make_dense_tensor("F16", intermediate, hidden, 5).blob},
+            {prefix + ".shared_expert.up.weight", "F16", make_dense_tensor("F16", intermediate, hidden, 7).blob},
+            {prefix + ".shared_expert.down.weight", "F16", make_dense_tensor("F16", hidden, intermediate, 11).blob},
+            {prefix + ".experts.gate_up.weight", "MFE", projection(2 * intermediate, hidden, 17)},
+            {prefix + ".experts.down.weight", "MFE", projection(hidden, intermediate, 13)},
+        };
+    };
+    const TemporaryMfq packed_file(records(true)), reference_file(records(false));
+    const MfqContainer packed(packed_file.path()), reference(reference_file.path());
+    DeepseekV41Config config;
+    config.hidden = hidden; config.moe_inter = intermediate;
+    config.n_experts = experts; config.top_k = 1;
+    config.norm_topk_prob = true; config.routed_scaling = 1.0; config.swiglu_limit = 10.0;
+    const auto expected = MlxDeepseekV41Moe::load(reference, config, prefix);
+    for (const bool streamed : {false, true}) {
+        auto cache = streamed ? std::make_shared<MlxMfeOffloadCache>(packed, 0) : nullptr;
+        const auto actual = MlxDeepseekV41Moe::load(packed, config, prefix, false, nullptr, cache);
+        for (int rows : {1, 2, 7}) {
+            std::vector<float> values(rows * hidden, 0.0f);
+            std::vector<std::uint8_t> mask(rows);
+            for (int row = 0; row < rows; ++row) {
+                values[row * hidden] = values[row * hidden + 1] = 1.0f;
+                mask[row] = row % 2 == 0;
+            }
+            const auto x = mlx::core::astype(mlx::core::array(values.begin(), mlx::core::Shape{1, rows, hidden}), mlx::core::float16);
+            const auto images = mlx::core::astype(mlx::core::array(mask.begin(), mlx::core::Shape{1, rows}), mlx::core::bool_);
+            const auto a = evaluated_floats(actual.forward(x, images).routed);
+            const auto b = evaluated_floats(expected.forward(x, images).routed);
+            for (std::size_t index = 0; index < a.size(); ++index)
+                require_close(a[index], b[index], 0.002f + std::abs(b[index]) * 0.002f);
+        }
+    }
+}
+
 void test_streamed_mixed_mfe_residency() {
     bool indirect_supported = false;
     if (__builtin_available(macOS 15, *)) indirect_supported =
@@ -10211,6 +10279,11 @@ int main(int argc, char** argv) {
             std::cout << "MFQ MXFP4 repeated-route tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-v41-vision-routing") {
+            test_deepseek_v41_visual_router_precision();
+            std::cout << "MFQ DeepSeek-V4.1 visual router precision tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
             test_streamed_mfe_read_validation();
             test_streamed_mfe_overlapped_read();
@@ -10219,6 +10292,7 @@ int main(int argc, char** argv) {
             test_deepseek_v41_ced_text_cache();
             test_deepseek_v41_ced_text_cache(true);
             test_deepseek_v41_streamed_moe();
+            test_deepseek_v41_visual_router_precision();
             test_streamed_mfe_partition_preparation();
             test_concatenate_resident_mfe_experts();
             test_compact_nint_mhc();

@@ -1036,6 +1036,17 @@ add_test(
     COMMAND mfq-metal-deepseek-v4-vision-test
 )
 
+add_executable(mfq-metal-deepseek-v41-vision-test
+    tests/mlx_deepseek_v41_vision_test.cpp
+)
+target_link_libraries(mfq-metal-deepseek-v41-vision-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-deepseek-v41-vision-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-deepseek-v41-vision-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-deepseek-v41-vision-test COMMAND mfq-metal-deepseek-v41-vision-test)
+add_test(NAME mfq-metal-deepseek-v41-vision-routing-test COMMAND mfq-metal-moe-test --test-v41-vision-routing)
+
 add_executable(mfq-metal-moe-ops-test
     tests/mlx_moe_ops_test.cpp
 )

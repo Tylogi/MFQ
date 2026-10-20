@@ -358,6 +358,14 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
     const bool fused_router = image_mask == std::nullopt &&
         top_k_ == 6 && normalize_ && dense_router != nullptr &&
         moe_dense_router_topk_supported(source, *dense_router);
+    const auto router_logits = [&] {
+        if (image_mask && dense_router) {
+            return mlx::core::matmul(
+                mlx::core::astype(source, mlx::core::float32),
+                mlx::core::transpose(mlx::core::astype(*dense_router, mlx::core::float32)));
+        }
+        return router_(source);
+    };
 
     std::optional<array> logits;
     array shared_hidden(0.0f);
@@ -366,9 +374,9 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         shared_hidden = shared_gate_up_batch_->swiglu(
             source, swiglu_limit_);
         if (!fused_router) {
-            logits = router_(source);
+            logits = router_logits();
         }
-    } else if (!fused_router && projection_batch_) {
+    } else if (!fused_router && !image_mask && projection_batch_) {
         auto projections = (*projection_batch_)(source);
         logits = std::move(projections.at(0));
         shared_hidden = limited_swiglu(
@@ -378,13 +386,13 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         shared_hidden = limited_swiglu(
             projections.at(0), projections.at(1), swiglu_limit_);
         if (!fused_router) {
-            logits = router_(source);
+            logits = router_logits();
         }
     } else {
         shared_hidden = limited_swiglu(
             shared_gate_(source), shared_up_(source), swiglu_limit_);
         if (!fused_router) {
-            logits = router_(source);
+            logits = router_logits();
         }
     }
 
