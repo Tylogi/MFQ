@@ -31,26 +31,42 @@ struct Predictor {
     bool legacy = false;
     bool bootstrap = false;
     bool split = false;
+    bool blockwise = false;
+    std::vector<std::pair<int64_t,int64_t>> context_appends;
     int maximum_draft_depth() const { return 3; }
     bool dspark_policy() const { return legacy; }
-    bool blockwise_drafting() const { return false; }
+    bool blockwise_drafting() const { return blockwise; }
     bool supports_session_state() const { return true; }
-    bool teacher_forced_prompt_prime() const { return true; }
+    bool teacher_forced_prompt_prime() const { return !blockwise; }
     bool target_bootstrap_decode() const { return bootstrap; }
     bool split_target_verification() const { return split; }
     bool retains_partial_target_prefix() const { return true; }
     int64_t cache_position() const { return position; }
     void trim_cache_to(int64_t value) { position = value; }
-    void append_target_context(Tensor, int64_t) { throw std::logic_error("not blockwise"); }
-    Tensor draft_block(int, Tensor, int) { throw std::logic_error("not blockwise"); }
-    Tensor draft_next(Tensor, Tensor) { throw std::logic_error("not blockwise"); }
+    void append_target_context(Tensor value, int64_t start) {
+        if(!blockwise || start<position || (start>position && value.shape.at(1)<2))
+            throw std::logic_error("invalid blockwise context append");
+        context_appends.emplace_back(start,value.shape.at(1));position=start+value.shape.at(1);
+    }
+    void seed_target_context(Tensor value,int64_t tokens) {
+        if(!blockwise || position || value.shape.at(1)>tokens)throw std::logic_error("invalid context seed");
+        position=tokens-value.shape.at(1);append_target_context(value,position);
+    }
+    Tensor draft_block(int, Tensor, int depth) {
+        if(!blockwise)throw std::logic_error("not blockwise");
+        return {{1,depth,1},true};
+    }
+    Tensor draft_next(Tensor hidden, Tensor) {
+        if(!blockwise)throw std::logic_error("not blockwise");
+        hidden.shape.back()=3;hidden.proposal=true;return hidden;
+    }
 };
 
 struct Prepared {
     std::vector<int64_t> token_ids;
     Tensor embeddings, positions;
     int decode_position_delta = 0;
-    bool transformed() const { return false; }
+    bool transformed() const { return !embeddings.shape.empty() || !positions.shape.empty() || decode_position_delta!=0; }
 };
 
 struct Sampler {
@@ -178,6 +194,29 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
+}
+
+void run_dspark_draft_cost() {
+    struct DelayedDraftOps : Ops {
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            return Ops::predictor_step(hidden,ids,positions);
+        }
+    };
+    Model model;Predictor predictor;predictor.legacy=true;
+    InferenceRequest request;
+    request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=10;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"dspark-draft-cost");
+    auto generation=speculative_sequence(DelayedDraftOps{{model,predictor}},
+        request,output,512,0,Tensor{},nullptr);
+    std::vector<int64_t> tokens;
+    while(auto step=generation.next())if(step.value)
+        if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+            tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+    if(tokens!=std::vector<int64_t>(10,0) || output.metrics.mtp.head_ms<75.0 ||
+            output.metrics.mtp.measured_depth_ms[3]<75.0)
+        throw std::runtime_error("DSpark depth selection omitted completed draft work from its cycle cost");
 }
 
 void run_chunked_prompt_history(bool streaming, int reused) {
@@ -691,6 +730,144 @@ void batch_policy_observations() {
 }
 }
 
+void run_prepared_default_positions() {
+    for(bool positioned:{false,true}) {
+        Model model;Predictor predictor;
+        InferenceRequest request;request.prompt={1,1,1};request.sampling.max_tokens=8;
+        Prepared prepared;prepared.token_ids=request.prompt;prepared.embeddings={{1,3,1}};
+        if(positioned)prepared.positions={{3}};
+        int calls=0;
+        struct ImageOps:Ops {
+            bool positioned=false;int* calls=nullptr;
+            Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+                assert(defined(positions)==positioned);++*calls;
+                return Ops::predictor_step(hidden,ids,positions);
+            }
+        };
+        ImageOps ops{{model,predictor},positioned,&calls};ops.prepared=&prepared;
+        InferenceOutput output(request,nullptr,"prepared-default-positions");
+        auto generation=speculative_sequence(std::move(ops),request,output,2,0,Tensor{},nullptr);
+        while(generation.next()){}
+        assert(output.result.completion_tokens==8 && calls>0);
+    }
+    Model model;Predictor predictor;InferenceRequest request;request.prompt={1,1,1};
+    Prepared bad;bad.token_ids=request.prompt;bad.embeddings={{1,3,1}};bad.decode_position_delta=1;
+    Ops ops{model,predictor};ops.prepared=&bad;
+    InferenceOutput output(request,nullptr,"missing-shifted-positions");
+    auto generation=speculative_sequence(ops,request,output,2,0,Tensor{},nullptr);
+    bool rejected=false;
+    try{(void)generation.next();}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected);
+}
+
+void run_restored_blockwise_context() {
+    for(int reused:{0,4})for(bool tail_only:{false,true}) {
+        Model model;model.cache_pos=reused;
+        Predictor predictor;predictor.blockwise=true;predictor.position=reused;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        struct TailOps:Ops {
+            bool tail_only=false;
+            Prefill prefill(PrefillChunk chunk) {
+                auto result=Ops::prefill(chunk);
+                if(tail_only)result.raw.shape[1]=2;
+                return result;
+            }
+        };
+        InferenceOutput output(request,nullptr,"restored-blockwise-context");
+        auto generation=speculative_sequence(TailOps{{model,predictor},tail_only},request,output,
+            16,reused,Tensor{{1,1,1}},nullptr);
+        while(generation.next()){}
+        assert(output.result.completion_tokens==1 && predictor.position==10);
+        const auto expected_start=tail_only?8:reused;
+        assert(predictor.context_appends.size()==1 && predictor.context_appends.front().first==expected_start);
+    }
+    Model model;model.cache_pos=4;Predictor predictor;predictor.blockwise=true;predictor.position=3;
+    InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+    InferenceOutput output(request,nullptr,"invalid-blockwise-context");
+    auto generation=speculative_sequence(Ops{model,predictor},request,output,16,4,Tensor{{1,1,1}},nullptr);
+    bool rejected=false;try{(void)generation.next();}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected && predictor.context_appends.empty() && model.cache_pos==4);
+}
+
+void run_blockwise_prompt_checkpoint() {
+    for(int reused:{0,4})for(int stable:{5,9})for(int chunk:{3,64})for(bool tail_only:{false,true}) {
+        if(tail_only && chunk<64)continue;
+        Model model;model.cache_pos=reused;
+        Predictor predictor;predictor.blockwise=true;predictor.position=reused;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        struct CheckpointOps:Ops {
+            bool tail_only;
+            std::vector<PrefillChunk>* chunks;
+            int* primes;
+            double blockwise_prompt_context(Tensor context,int64_t position,bool seed) {
+                ++*primes;
+                if(seed)mtp.seed_target_context(context,position);
+                else mtp.append_target_context(context,position-size(context,1));
+                return 3.0;
+            }
+            Prefill prefill(PrefillChunk chunk) {
+                chunks->push_back(chunk);
+                auto result=Ops::prefill(chunk);
+                if(tail_only)result.raw.shape[1]=std::min<int64_t>(2,chunk.count);
+                return result;
+            }
+        };
+        InferenceOutput output(request,nullptr,"blockwise-prompt-checkpoint");
+        std::vector<PrefillChunk> chunks;std::vector<int64_t> checkpoints;Tensor hidden;int primes=0;
+        auto generation=speculative_sequence(CheckpointOps{{model,predictor},tail_only,&chunks,&primes},
+            request,output,chunk,reused,Tensor{{1,1,1}},&hidden,stable);
+        while(auto step=generation.next())if(step.value)
+            if(const auto* progress=std::get_if<PrefillProgress>(&*step.value);progress && progress->session_boundary) {
+                if(output.metrics.saw_token || predictor.cache_position()!=model.cache_pos ||
+                        !Ops::defined(hidden) || Ops::size(hidden,1)!=1)
+                    throw std::runtime_error("blockwise prompt checkpoint lost its committed predictor boundary");
+                checkpoints.push_back(model.cache_pos);
+                if(primes!=int(checkpoints.size()) || progress->timing.model_ms<primes*3.0+1.0)
+                    throw std::runtime_error("blockwise predictor prompt preparation was omitted from PP timing");
+            }
+        if(checkpoints!=std::vector<int64_t>{stable,10} || output.result.completion_tokens!=1 ||
+                model.cache_pos!=10 || predictor.cache_position()!=10)
+            throw std::runtime_error("stable MTP prompt checkpoint changed the target/predictor history");
+        int64_t position=reused;
+        for(const auto& part:chunks) {
+            if(part.offset!=position || part.count<=0 || part.last!=(position+part.count==10))
+                throw std::runtime_error("MTP checkpoint duplicated prefill rows or changed the final-chunk flag");
+            position+=part.count;
+        }
+        if(position!=10)throw std::runtime_error("MTP checkpoint omitted a prompt suffix");
+    }
+}
+void run_blockwise_final_context() {
+    for(bool accepted:{false,true})for(bool eos:{false,true})for(int limit:{2,3,4,7,8}) {
+        struct BlockOps:Ops {
+            bool accepted;
+            std::vector<int32_t> greedy_tokens(Tensor logits) {
+                return std::vector<int32_t>(size(logits,0),accepted?1:0);
+            }
+        };
+        Model model;Predictor predictor;predictor.blockwise=true;
+        InferenceRequest request;request.prompt={0,0,0};request.sampling.max_tokens=limit;
+        if(eos)request.stop_token_ids={1};
+        InferenceOutput output(request,nullptr,"blockwise-final-context");
+        Tensor hidden;
+        auto generation=speculative_sequence(BlockOps{{model,predictor},accepted},request,output,
+            16,0,Tensor{},&hidden);
+        while(generation.next()){}
+        const int expected=eos && accepted?2:limit;
+        if(output.result.completion_tokens!=expected || predictor.cache_position()!=model.cache_pos ||
+                !Ops::defined(hidden))
+            throw std::runtime_error("block predictor final snapshot lost committed target context");
+        int64_t position=0;
+        for(const auto& [start,rows]:predictor.context_appends) {
+            if(start!=position || rows<=0)throw std::runtime_error("block predictor duplicated or skipped final history");
+            position+=rows;
+        }
+        if(position!=model.cache_pos)throw std::runtime_error("block predictor final history is incomplete");
+    }
+}
+
 int main() try {
     for (const bool dspark : {false, true}) {
         Model model;
@@ -712,10 +889,15 @@ int main() try {
         assert(output.result.finish_reason == "stop" && output.result.completion_tokens == 1);
         assert(model.speculative_start < 0 && model.cache_pos == 3);
     }
+    run_prepared_default_positions();
+    run_restored_blockwise_context();
+    run_blockwise_prompt_checkpoint();
+    run_blockwise_final_context();
     run(false);
     run(false,true);
     run(false,true,true);
     run(true);
+    run_dspark_draft_cost();
     for(bool streaming:{false,true})for(int reused:{0,4})run_chunked_prompt_history(streaming,reused);
     run_prompt_snapshot_boundary();
     run_bootstrap_publication();

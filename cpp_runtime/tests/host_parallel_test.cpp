@@ -26,7 +26,7 @@ void coverage(int threads, int count) {
 }
 
 void copy_checks() {
-    const std::size_t width=(2u<<20)+7;
+    const std::size_t width=(1u<<20)+7;
     std::vector<std::vector<unsigned char>> inputs(4),outputs(4);
     std::vector<mfq::HostCopy> copies;
     for(std::size_t i=0;i<inputs.size();++i) {
@@ -42,7 +42,26 @@ void copy_checks() {
                     std::equal(inputs[i].begin(),inputs[i].end(),outputs[i].begin()+1),
                     "parallel host copy changed bytes or destination guards");
     }
+    // Exercise both upload thresholds, cache-line heads/tails and unaligned
+    // sources. Guard bytes catch any stores beyond the requested range.
+    std::vector<unsigned char> input((2u<<20)+64);
+    for(std::size_t i=0;i<input.size();++i)input[i]=static_cast<unsigned char>(i*137+i/259);
+    for(const std::size_t bytes:{0u,1u,63u,64u,127u,128u,262143u,262144u,
+                                 262145u,1048579u,2097151u,2097152u})
+        for(const std::size_t dst:{0u,1u,7u,63u})for(const std::size_t src:{0u,3u,13u,63u}) {
+            std::vector<unsigned char> output(bytes+192,0x5a);
+            mfq::copy_host_range({output.data()+64+dst,input.data()+src,bytes});
+            require(std::equal(input.begin()+src,input.begin()+src+bytes,output.begin()+64+dst) &&
+                    std::all_of(output.begin(),output.begin()+64+dst,[](auto c){return c==0x5a;}) &&
+                    std::all_of(output.begin()+64+dst+bytes,output.end(),[](auto c){return c==0x5a;}),
+                    "host upload threshold or alignment changed bytes outside the destination");
+        }
     mfq::copy_host_ranges({{nullptr,nullptr,0}});
+    mfq::copy_host_range({nullptr,nullptr,0});
+    bool invalid_single=false;
+    try{mfq::copy_host_range({nullptr,input.data(),1});}
+    catch(const std::invalid_argument&){invalid_single=true;}
+    require(invalid_single,"single host copy accepted a null destination");
     unsigned char guard=0x5a;bool rejected=false;
     try{mfq::copy_host_ranges({{&guard,inputs[0].data(),1},{nullptr,inputs[1].data(),1}});}
     catch(const std::invalid_argument&){rejected=true;}

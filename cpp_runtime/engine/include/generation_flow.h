@@ -83,6 +83,8 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         plan.stable_prefix_tokens > 0 &&
         (!cache_plan.session_id.empty() || session_cache.persistent_prefix_enabled());
     const bool use_mtp = mtp && sampling.enable_mtp && sampling.max_tokens > 1;
+    if constexpr(requires { ops.set_prefix_boundary(size_t{}); })
+        ops.set_prefix_boundary(caching?std::min(plan.stable_prefix_tokens,prompt.size()-1):0);
     if (mtp) {
         mtp->last_stats = {};
         mtp->last_stats.available = true;
@@ -132,6 +134,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         ? ops.speculate(request, output, restored.tokens, restored.mtp_last_target_hidden,
                         &last_target_hidden)
         : ops.plain(request, output, restored.tokens, caching ? plan.stable_prefix_tokens : 0);
+    bool traced_decode_boundary = false;
     while (auto step = sequence.next()) {
         auto& event = step.value;
         if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
@@ -145,6 +148,11 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             snapshot();
         }
         if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr) {
+            if(!traced_decode_boundary && !delta->token_ids.empty()) {
+                if constexpr(requires { ops.trace_expert_cache("decode_begin", false); })
+                    ops.trace_expert_cache("decode_begin", false);
+                traced_decode_boundary = true;
+            }
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
             // Compatibility with speculative producers lacking an explicit
             // pre-token prompt boundary event.

@@ -45,6 +45,34 @@ std::vector<std::int64_t> host_int64_values(const mfq::cuda::Tensor& value) {
         host.data_ptr<std::int64_t>() + host.numel());
 }
 
+void check_where_broadcast() {
+    using namespace mfq::cuda;
+    for(auto dtype:{kFloat16,kFloat32}) {
+        auto options=TensorOptions{}.device(kCUDA).dtype(dtype);
+        auto mask=tensor<uint8_t>({1,0,1}).reshape({3,1}).to(kCUDA);
+        auto yes=tensor<float>({1,2}).to(kCUDA).to(dtype);
+        auto result=where(mask,yes,-yes);
+        require(result.sizes().vec()==std::vector<int64_t>{3,2} &&
+            host_values(result)==std::vector<float>{1,2,-1,-2,1,2},
+            "where ignored a token axis supplied only by its condition");
+        auto batch_mask=tensor<uint8_t>({1,0}).reshape({2,1,1}).to(kCUDA);
+        auto values=tensor<float>({3,5,7}).reshape({1,3,1}).to(kCUDA).to(dtype);
+        auto batched=where(batch_mask,values,-2.);
+        require(batched.sizes().vec()==std::vector<int64_t>{2,3,1} &&
+            host_values(batched)==std::vector<float>{3,5,7,-2,-2,-2},
+            "where lost a condition-only batch axis with scalar alternatives");
+        auto strided_mask=mask.transpose(0,1);
+        auto strided=where(strided_mask,ones({3,1},options),zeros({3,1},options));
+        require(strided.sizes().vec()==std::vector<int64_t>{3,3} &&
+            host_values(strided)==std::vector<float>{1,0,1,1,0,1,1,0,1},
+            "where changed a strided broadcast condition");
+        bool rejected=false;
+        try{(void)where(ones({3,3},options),yes,-yes);}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,"where accepted incompatible condition dimensions");
+    }
+    std::cout<<"where_broadcast FP16/FP32 condition-only axes/scalar/strided/rejection PASS\n";
+}
+
 void set_test_environment(const char* name, const char* value) {
 #ifdef _WIN32
     if (_putenv_s(name, value) != 0) {
@@ -142,6 +170,8 @@ int main(int argc,char** argv) try {
 
     using namespace mfq::cuda;
     const Device cuda_device{DeviceType::cuda, 0};
+    if(argc==2 && std::string(argv[1])=="--where-broadcast-check") {check_where_broadcast();return 0;}
+    check_where_broadcast();
     if(argc==2 && std::string(argv[1])=="--contiguous-convert-check") {
         check_contiguous_convert();return 0;
     }

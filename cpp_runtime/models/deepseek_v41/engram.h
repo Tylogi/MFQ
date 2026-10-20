@@ -11,6 +11,11 @@
 
 namespace mfq::models::deepseek_v41 {
 inline constexpr int64_t kDeadToken = -1;
+struct EngramHashSnapshot {
+    int batch = 0;
+    std::int64_t position = 0;
+    std::vector<std::int64_t> context;
+};
 struct EngramHashBatch {
     int batch = 0;
     int tokens = 0;
@@ -59,6 +64,23 @@ class EngramHashState {
         speculative_tokens_.clear();
     }
 
+    EngramHashSnapshot snapshot() const {
+        if(batch_<=0 || position_<0 || speculative_context_)
+            throw std::runtime_error("Engram session history is not committed");
+        return {batch_,position_,context_};
+    }
+
+    void restore(const EngramHashSnapshot& state) {
+        if(state.batch<=0 || state.position<0 ||
+                state.context.size()!=std::size_t(state.batch)*std::size_t(max_ngram_size_-1) ||
+                std::any_of(state.context.begin(),state.context.end(),[&](auto value) {
+                    return value<kDeadToken || value>=vocabulary_;
+                }))throw std::invalid_argument("Engram session history is incompatible");
+        auto context=state.context;
+        commit_speculative();
+        batch_=state.batch;position_=state.position;context_.swap(context);
+    }
+
     void begin_speculative() {
         if (batch_ <= 0 || position_ <= 0 || context_.empty() || speculative_context_.has_value()) {
             throw std::runtime_error("invalid DeepSeek-V4.1 Engram speculative checkpoint");
@@ -103,7 +125,8 @@ class EngramHashState {
         return next.forward(ids,batch,tokens,pos0);
     }
 
-    EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0) {
+    EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0,
+                           const std::uint8_t* image_mask = nullptr) {
         if (!ids || batch <= 0 || tokens <= 0 || pos0 < 0)
             throw std::invalid_argument("invalid Engram hash input");
         if (pos0 == 0)
@@ -118,7 +141,8 @@ class EngramHashState {
             if (token < 0 || token >= static_cast<std::int64_t>(parameters_->token_map.size())) {
                 throw std::out_of_range("DeepSeek-V4.1 Engram token ID is outside the vocabulary");
             }
-            compressed[index] = parameters_->token_map[static_cast<std::size_t>(token)];
+            compressed[index] = image_mask && image_mask[index] ? kDeadToken :
+                parameters_->token_map[static_cast<std::size_t>(token)];
         }
 
         if(speculative_context_) {

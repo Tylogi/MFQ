@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -50,6 +51,9 @@ struct MlxMfeCacheReuseStats {
     double view_seconds = 0;
     std::size_t cached_route_hits = 0;
     std::size_t cached_route_misses = 0;
+    std::size_t overlapped_read_batches = 0;
+    std::size_t overlapped_read_submissions = 0;
+    std::size_t parallel_body_read_batches = 0;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -107,7 +111,8 @@ public:
         std::span<const std::string> names,
         const std::vector<std::int32_t>& active_experts,
         std::span<const std::uint32_t> activation_counts = {},
-        bool prefill_scan = false);
+        bool prefill_scan = false,
+        const std::function<void(const std::vector<MlxMfeWeight>&)>& prefix_ready = {});
 
     std::optional<std::vector<MlxMfeWeight>> layer_mfe(
         std::span<const std::string> names,

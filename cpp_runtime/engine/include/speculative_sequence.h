@@ -15,7 +15,7 @@ namespace mfq::engine {
 template <class Ops>
 Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOutput &output,
     int64_t prefill_chunk_size, size_t reused_tokens, typename Ops::Tensor restored_last_hidden,
-    typename Ops::Tensor *session_last_hidden) {
+    typename Ops::Tensor *session_last_hidden, size_t stable_prefix_tokens = 0) {
     const auto &prompt = request.prompt;
     const auto &sampling = request.sampling;
     const auto &token_constraint = request.token_constraint;
@@ -34,15 +34,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
     require_execution(
         reused_tokens < prompt.size(), "restored MTP prefix must be shorter than the prompt");
     const bool transformed_prompt = prepared != nullptr && prepared->transformed();
+    const bool positioned_prompt = transformed_prompt && ops.defined(prepared->positions);
     require_execution(prepared == nullptr || prepared->token_ids == prompt,
         "prepared MTP prompt disagrees with rendered token IDs");
     require_execution(!transformed_prompt ||
-                          (ops.defined(prepared->embeddings) && ops.defined(prepared->positions)),
-        "prepared MTP prompt is missing embeddings or positions");
+                          (ops.defined(prepared->embeddings) &&
+                           (positioned_prompt || prepared->decode_position_delta==0)),
+        "prepared MTP prompt is missing embeddings or valid position metadata");
     require_execution(
         reused_tokens == 0 || (mtp.supports_session_state() && ops.defined(restored_last_hidden) &&
                                   model.cache_pos == static_cast<int64_t>(reused_tokens) &&
-                                  mtp.cache_position() == static_cast<int64_t>(reused_tokens) - 1),
+                                  mtp.cache_position() == static_cast<int64_t>(reused_tokens) -
+                                      (mtp.blockwise_drafting()?0:1)),
         "restored MTP session boundary is incompatible");
     mtp.last_stats = {};
     mtp.last_stats.available = true;
@@ -113,6 +116,20 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         std::vector<Tensor> raw_chunks;
         double prefill_ms = 0.0;
         double target_prefill_ms=0.0, predictor_prefill_ms=0.0, predictor_workspace_ms=0.0;
+        const auto checkpoint=mtp.blockwise_drafting() && session_last_hidden &&
+            stable_prefix_tokens>reused_tokens && stable_prefix_tokens<prompt.size()
+            ?static_cast<int64_t>(stable_prefix_tokens):int64_t(0);
+        bool prompt_context_seeded=false;
+        const auto prime_blockwise=[&](Tensor context,int64_t position,bool seed) {
+            if constexpr(requires { ops.blockwise_prompt_context(context,position,seed); }) {
+                const auto elapsed=ops.blockwise_prompt_context(context,position,seed);
+                prefill_ms+=elapsed;predictor_prefill_ms+=elapsed;
+            } else if(seed) {
+                if constexpr(requires { mtp.seed_target_context(context,position); })
+                    mtp.seed_target_context(context,position);
+                else mtp.append_target_context(context,0);
+            } else mtp.append_target_context(context,position-ops.size(context,1));
+        };
         const bool stream_prompt_history = mtp.teacher_forced_prompt_prime() && !mtp.blockwise_drafting() && [&] {
             if constexpr (requires { ops.stream_prompt_history(ops.size(input_ids, 1)); })
                 return ops.stream_prompt_history(ops.size(input_ids, 1));
@@ -134,7 +151,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 const auto chunk = next_prefill_chunk(pairs, offset, predictor_chunk);
                 auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
                 auto ids = ops.slice(input_ids, 1, ids_offset + chunk.offset, chunk.count);
-                auto positions = transformed_prompt
+                auto positions = positioned_prompt
                     ? ops.slice(prepared->positions, -1, ids_offset + chunk.offset, chunk.count) : Tensor{};
                 if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
                     const auto elapsed=ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
@@ -152,8 +169,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             offset < ops.size(input_ids, 1);) {
             if (output.result.cancelled)
                 co_return;
-            const auto chunk =
+            auto chunk =
                 next_prefill_chunk(ops.size(input_ids, 1), offset, prefill_chunk_size);
+            if(checkpoint>offset)chunk.count=std::min(chunk.count,checkpoint-offset);
+            chunk.last=chunk.offset+chunk.count==ops.size(input_ids,1);
             auto step = [&] {
                 PrefillActivity activity;
                 return ops.prefill(chunk);
@@ -172,6 +191,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             offset += chunk.count;
             prefill_ms += step.elapsed;
             target_prefill_ms += step.elapsed;
+            if(offset==checkpoint) {
+                // Keep an exact checkpoint before the final prompt token so
+                // an identical retry can reuse the prefix and recompute logits.
+                auto context=raw_chunks.size()==1?std::move(raw_chunks.front()):ops.concatenate(raw_chunks,1);
+                *session_last_hidden=ops.clone(ops.slice(context,1,ops.size(context,1)-1,1));
+                prime_blockwise(context,offset,reused_tokens==0);
+                prompt_context_seeded=true;raw_chunks.clear();
+                co_yield PrefillProgress{
+                    {static_cast<std::size_t>(offset)-reused_tokens,prefill_ms,0.0,prefill_ms},true};
+                if(output.stopped())co_return;
+                continue;
+            }
             co_yield PrefillProgress{
                 {static_cast<std::size_t>(offset) - reused_tokens, prefill_ms, 0.0, prefill_ms}};
         }
@@ -198,12 +229,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             !token_constraint || initial_constraint, "MTP token constraint clone is incomplete");
         int32_t pending = ops.sample_constrained(logits, counts, initial_constraint);
 
-        require_execution(reused_tokens == 0 || !mtp.blockwise_drafting(),
-            "blockwise MTP session restore is unsupported");
         if (mtp.blockwise_drafting()) {
-            if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
-                mtp.seed_target_context(raw, ops.size(input_ids, 1));
-            else mtp.append_target_context(raw, 0);
+            prime_blockwise(raw,ops.size(input_ids,1),!reused_tokens && !prompt_context_seeded);
         }
 
         if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {
@@ -237,7 +264,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 const auto chunk = mfq::engine::next_prefill_chunk(pairs, offset, chunk_size);
                 auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
                 auto ids = ops.slice(input_ids, 1, prime_ids_offset + chunk.offset, chunk.count);
-                auto positions = transformed_prompt
+                auto positions = positioned_prompt
                     ? ops.slice(prepared->positions, -1, prime_ids_offset + chunk.offset, chunk.count)
                     : Tensor{};
                 if constexpr (requires { ops.predictor_prefill(prime, ids, positions); }) {
@@ -282,7 +309,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         auto bootstrap = [&](Tensor token_counts,const MfqTokenConstraintPtr& cursor) {
             if(mtp.teacher_forced_prompt_prime()) {
                 (void)ops.predictor_step(initial_hidden,ops.ids_for({pending}),
-                    transformed_prompt ? ops.decode_positions(model.cache_pos,1) : Tensor{});
+                    positioned_prompt ? ops.decode_positions(model.cache_pos,1) : Tensor{});
             }
             auto next_hidden=ops.target_forward(ops.ids_for({pending}),&raw);
             committed_last_hidden=ops.slice(raw,1,ops.size(raw,1)-1,1);
@@ -356,7 +383,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             auto rows = pending_hidden.size() == 1 ? pending_hidden.front()
                 : ops.concatenate(pending_hidden, 1);
             auto ids=ops.ids_for(pending_ids);
-            auto positions=transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
+            auto positions=positioned_prompt ? ops.decode_positions(predictor_history_position + 1,
                 static_cast<int64_t>(pending_ids.size())) : Tensor{};
             if constexpr(requires {ops.predictor_history_step(rows,ids,positions);})
                 ops.predictor_history_step(std::move(rows),std::move(ids),std::move(positions));
@@ -453,7 +480,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             const auto history_rows=static_cast<int64_t>(shifted.size());
             auto head = ops.predictor_step(std::move(hidden_rows),
                 ops.ids_for(std::move(shifted)),
-                transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
+                positioned_prompt ? ops.decode_positions(predictor_history_position + 1,
                                          history_rows)
                                    : Tensor{});
             predictor_history_position += history_rows;
@@ -473,7 +500,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                         ops.prefetch_target_prefix(next_ids.back(),result.tokens);
                     auto next = ops.predictor_step(chain_hidden,
                         ops.ids_for({token}),
-                        transformed_prompt
+                        positioned_prompt
                             ? ops.decode_positions(predictor_history_position + position + 1, 1)
                             : Tensor{});
                     sample_hidden = std::move(next.sample_hidden);
@@ -527,7 +554,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 continue;
             }
             const int draft_count = static_cast<int>(draft.tokens.size());
-            if (depth_controller.dspark()) cycle_started = Clock::now();
+            // Depth selection pays for the draft prepared before verification
+            // as well. Keep that complete cycle when comparing with depth zero.
             const auto verify_started=Clock::now();
             Tensor verified_raw;
             std::vector<int64_t> verify_ids{pending};
@@ -717,7 +745,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             committed_last_hidden = ops.slice(verified_raw, 1, emitted_accepted, 1);
             mtp.last_stats.rollback_ms+=std::chrono::duration<double,std::milli>(Clock::now()-resolve_started).count();
             if (output.stopped()) {
-                if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
+                if (mtp.blockwise_drafting()) {
+                    // Block predictors retain the committed target rows rather
+                    // than shifted input/hidden pairs. EOS can truncate an
+                    // accepted draft, so use the target's actual cache boundary.
+                    const auto rows=model.cache_pos-predictor_history_position;
+                    require_execution(rows>=0 && rows<=ops.size(verified_raw,1),
+                        "block predictor final target boundary is incompatible");
+                    if(rows>0) {
+                        mtp.append_target_context(ops.slice(verified_raw,1,0,rows),predictor_history_position);
+                        predictor_history_position+=rows;
+                    }
+                } else if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
                     std::vector<int32_t> committed_ids(
                         delta.token_ids.begin(), delta.token_ids.end());
                     (void)prepare_draft(ops.slice(verified_raw, 1, 0, committed_ids.size()),

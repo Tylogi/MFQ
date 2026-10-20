@@ -27,6 +27,7 @@ enum class CudaVisionAdapter {
     none,
     grid_vit,
     minicpmo45,
+    deepseek_v41,
 };
 
 enum class CudaPredictorAdapter {
@@ -101,6 +102,10 @@ inline CudaModelPlan cuda_model_plan(
         result.vision = CudaVisionAdapter::grid_vit;
     }
     const auto* audio = graph.component("audio_input");
+    if(result.backbone==CudaBackbone::deepseek_v41 && vision && vision->tensor_root=="vision" &&
+            vision->implementation=="deepseek_v41_vision" &&
+            vision->input_contract=="deepseek_v41_vision.v1" &&
+            vision->position_policy=="deepseek_v41_positions")result.vision=CudaVisionAdapter::deepseek_v41;
     const auto* tts = graph.component("audio_output");
     // The current CUDA MiniCPM adapter is one composite implementation.  Do
     // not advertise a partially declared graph as supported until those
@@ -137,7 +142,8 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     if (!result.text) return result;
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
-        plan.vision == CudaVisionAdapter::minicpmo45;
+        plan.vision == CudaVisionAdapter::minicpmo45 ||
+        plan.vision == CudaVisionAdapter::deepseek_v41;
     result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_output = plan.vision == CudaVisionAdapter::minicpmo45;

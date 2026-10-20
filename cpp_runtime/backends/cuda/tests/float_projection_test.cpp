@@ -57,7 +57,9 @@ void mapped_embedding_latency() {
 }
 void mapped_embedding() {
     int cases=0;
-    const auto before=mfq::cuda::tensor_host_bytes.load();
+    // The general CPU tensor pool intentionally retains idle blocks. Check
+    // mapping ownership independently of that bounded reusable storage.
+    const auto before=mfq::cuda::mapped_embedding_host_bytes.load();
     for(bool device_control:{false,true})for(auto dtype:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})for(int width:{57,2560}) {
         auto host=tb::empty({257,width},tb::TensorOptions().device(tb::kCPU).dtype(dtype));
         auto* bytes=host.data_ptr<uint8_t>();
@@ -83,7 +85,7 @@ void mapped_embedding() {
             }
         }
     }
-    if(mfq::cuda::tensor_host_bytes.load()!=before)throw std::runtime_error("mapped embedding host ownership leaked");
+    if(mfq::cuda::mapped_embedding_host_bytes.load()!=before)throw std::runtime_error("mapped embedding host ownership leaked");
     std::cout<<"mapped_embedding_cases="<<cases<<" mapped/device-control, F16/BF16/F32, int32/int64 IDs, duplicate/boundary rows, changing graph and ownership exact PASS"<<std::endl;
 }
 template<class T> tb::Tensor upload(const std::vector<T>& values, tb::ScalarType dtype,
@@ -146,7 +148,7 @@ Fixture make_weight(int out, int width, int group_size, bool zero = false,bool a
 }
 
 void mapped_nint_embedding() {
-    const auto before=mfq::cuda::tensor_host_bytes.load();
+    const auto before=mfq::cuda::mapped_embedding_host_bytes.load();
     int cases=0;
     for(bool control:{false,true})for(bool zero:{false,true})for(int width:{57,2560}) {
         auto fixture=make_weight(257,width,32,zero);
@@ -179,7 +181,7 @@ void mapped_nint_embedding() {
             }
         }
     }
-    if(mfq::cuda::tensor_host_bytes.load()!=before)throw std::runtime_error("mapped NINT embedding ownership leaked");
+    if(mfq::cuda::mapped_embedding_host_bytes.load()!=before)throw std::runtime_error("mapped NINT embedding ownership leaked");
     std::cout<<"mapped_nint_embedding_cases="<<cases<<" changing graph, mixed bits, NINT8-0 and ownership exact PASS"<<std::endl;
 }
 

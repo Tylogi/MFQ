@@ -44,9 +44,12 @@ struct FFN {
     mutable std::function<mfq_tensor_backend::Tensor(CudaExecutionContext&,
         const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,
         const mfq_tensor_backend::Tensor&)> moe_pipeline_forward;
+    mutable std::function<void(const mfq_tensor_backend::Tensor&)> moe_pipeline_prefetch;
 
     bool uses_moe_expert_cache() const;
     void prepare_moe_pipeline(CudaExecutionContext& execution) const;
+    void prefetch_moe(CudaExecutionContext&,const mfq_tensor_backend::Tensor&,
+        MfqOptional<mfq_tensor_backend::Tensor> input_ids=mfq_nullopt) const;
     bool tensor_parallel_dense_compatible() const;
     mfq_tensor_backend::Tensor forward_tensor_parallel_dense(
         CudaExecutionContext& execution,
@@ -64,7 +67,8 @@ struct FFN {
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-        bool allow_important_neurons) const;
+        bool allow_important_neurons,
+        MfqOptional<mfq_tensor_backend::Tensor> router_bias=mfq_nullopt) const;
     bool can_forward_fused_residual(
         const CudaExecutionConfig& config,
         const mfq_tensor_backend::Tensor& x,
@@ -78,6 +82,9 @@ struct FFN {
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids = mfq_nullopt) const;
+    mfq_tensor_backend::Tensor forward_with_router_bias(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor input_ids,
+        const mfq_tensor_backend::Tensor& bias) const;
 };
 
 void prepare_ffn_workspaces(CudaExecutionContext& execution, FFN& ffn);

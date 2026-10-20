@@ -1,4 +1,5 @@
 #include "mlx_paged_session_codec.h"
+#include "mlx_deepseek_v41_causal_lm.h"
 
 #include <chrono>
 #include <cstring>
@@ -128,6 +129,8 @@ void run_codec_benchmark() {
 
 int main() {
     using namespace mfq::metal;
+    require(MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::available,
+        "DeepSeek-V4.1 persistent prefix codec is unavailable");
     MlxMiniCPMO45TextSessionState mini;
     mini.tokens = {1, 2, 3, 4, 5, 6, 7, 8};
     mini.cache_position = 8;

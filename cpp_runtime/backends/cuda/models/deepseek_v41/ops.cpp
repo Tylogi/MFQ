@@ -97,6 +97,14 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
             load_quant_linear(execution, model, prefix + "attention.indexer.score.weight");
     }
     result->mlp = load_moe_at(execution, model, config, prefix + "mlp.", layer, config.top_k);
+    if(has_tensor(model,prefix+"mlp.router.vision_bias")) {
+        result->vision_router_bias=load_dense_gpu(execution,model,prefix+"mlp.router.vision_bias")
+            .to(mfq_tensor_backend::kFloat32).contiguous();
+        MFQ_RUNTIME_CHECK(result->vision_router_bias.dim()==1 && result->vision_router_bias.size(0)==config.n_experts,
+                          "DeepSeek-V4.1 vision router bias shape mismatch");
+    }
+    if(shared->router_prefetch.empty())shared->router_prefetch.resize(config.n_layers,nullptr);
+    shared->router_prefetch.at(static_cast<std::size_t>(layer))=&result->mlp;
     result->rope = Dsv4RopeTable(
         config.max_position_embeddings, config.rope_theta, result->ratio,
         config.compress_rope_theta, config.rope_scaling.original_max_position_embeddings,
@@ -251,12 +259,6 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t position) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->rollback_speculative(position);
 }
-
-} // namespace mfq::cuda
-
-namespace mfq::cuda {
-
-template struct CudaSessionCodec<DeepseekV41Model>;
 
 } // namespace mfq::cuda
 

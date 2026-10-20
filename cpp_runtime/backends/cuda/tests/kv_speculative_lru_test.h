@@ -88,6 +88,23 @@ static void check_kv_speculative_lru() {
         }
     };
     int cases=0;
+    {
+        Fixture f;for(int expert:{1,2,3})f.put(expert);
+        f.loan.begin_speculative(3);f.packet({1,2,3});
+        for(int expert:{3,2,1})f.hit(expert);
+        f.loan.commit_speculative(3);f.advance();f.put(4);
+        check(!f.get(1) && f.get(2) && f.get(3),"GPU cache kept read order instead of the last accepted token");
+        for(int expert:{2,3,4})f.bytes(expert);++cases;
+    }
+    {
+        Fixture f(4);for(int expert:{1,2,3,4})f.put(expert);
+        f.loan.begin_speculative(3);f.packet({1,2,2,3,1,4});
+        for(int expert:{4,3,2,1})f.hit(expert);
+        f.loan.commit_speculative(2);f.advance();f.put(5);f.advance();f.put(6);
+        check(!f.get(1) && !f.get(4) && f.get(2) && f.get(3),
+            "rejected later rows changed accepted-token cache chronology");
+        for(int expert:{2,3,5,6})f.bytes(expert);++cases;
+    }
     // Control reproduces an accepted hot expert being displaced by rejected
     // hits; transaction-aware recency must preserve that expert instead.
     for(bool tracking:{false,true})for(int committed:{1,2,3}) {

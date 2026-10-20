@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace mfq::metal {
@@ -152,7 +153,8 @@ std::size_t cache_capacity_rows(const DeepseekV41Config& config) {
 }
 
 std::size_t io_worker_count() {
-    constexpr std::size_t fallback = 8;
+    const auto fallback = std::clamp<std::size_t>(
+        std::size_t{2} * std::thread::hardware_concurrency(), 8, 32);
     const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_IO_WORKERS");
     if (raw == nullptr || *raw == '\0') return fallback;
     char* end = nullptr;

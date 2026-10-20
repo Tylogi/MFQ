@@ -75,7 +75,30 @@ template <class Model> struct CudaMtpOps {
   bool target_maintenance = false;
   std::uint64_t target_graph_captures = 0;
   std::uint64_t target_transfer_bytes=0;
+  std::array<double,6> target_profile{};
   std::shared_ptr<MoeExpertCache> target_route_cache;
+  static bool profile_target() {
+    static const bool enabled=[] {
+      const auto* option=std::getenv("MFQ_PROFILE_MTP");
+      return option && option[0]=='1';
+    }();
+    return enabled;
+  }
+  std::array<double,6> target_costs() const {
+    std::array<double,6> result{};
+    for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+      if(name=="expert_route_wait_ms")result[0]=value;
+      else if(name=="expert_host_fetch_ms")result[1]=value;
+      else if(name=="expert_host_copy_ms")result[2]=value;
+      else if(name=="ssd_expert_read_wait_ms")result[3]=value;
+    }
+    if(model.source) {
+      const auto io=model.source->file_read_stats();
+      result[4]=double(io.read_nanoseconds)/1e6;
+      result[5]=double(io.physical_bytes)/1048576.0;
+    }
+    return result;
+  }
   CudaMtpOps(CudaMtpOps&&)=default;
   ~CudaMtpOps() {
     if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
@@ -195,17 +218,23 @@ template <class Model> struct CudaMtpOps {
   void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
       const auto* option=std::getenv("MFQ_PROFILE_MTP");
       const bool profile=option && option[0]=='1';
-      if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
+      if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0)) {
         std::cerr<<(profile?"runtime_mtp_cycle_profile cycle=":"runtime_mtp_slow_cycle cycle=")<<cycle<<" depth="<<depth<<" accepted="<<accepted
             <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
-            <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
+            <<" target_transfer_mb="<<target_transfer_bytes/1048576.0;
+        if(profile)
+          std::cerr<<" target_route_ms="<<target_profile[0]<<" target_fetch_ms="<<target_profile[1]
+              <<" target_host_copy_ms="<<target_profile[2]<<" target_ssd_wait_ms="<<target_profile[3]
+              <<" target_parallel_read_ms="<<target_profile[4]<<" target_physical_read_mb="<<target_profile[5];
+        std::cerr<<'\n';
+      }
   }
 
   CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
              int64_t compute_chunk, InferenceOutput* output)
       : model(model), mtp(mtp), prepared(prepared), target(model),
         transformed_prompt(prepared && prepared->transformed()),
-        position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
+        position_axes(transformed_prompt && prepared->positions.defined() && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
                           : 1), prefill_compute_chunk(compute_chunk), output(output) {
@@ -262,9 +291,15 @@ template <class Model> struct CudaMtpOps {
     projected_target_compact={};
     projected_target_greedy.clear();
     target_transfer_bytes = 0;
+    const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
+    const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
+    const auto finish_profile=[&] {
+      if(!profile_target())return;
+      const auto costs_after=target_costs();
+      for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]=costs_after[i]-costs_before[i];
+    };
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt) {
-        const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
         bool initialized=false;
         const auto host_ids = known_ids_device.defined() &&
             ids.data_ptr() == known_ids_device.data_ptr() && ids.sizes() == known_ids_device.sizes()
@@ -275,23 +310,45 @@ template <class Model> struct CudaMtpOps {
           target_maintenance=target_maintenance || initialized;
           projected_target_hidden = *hidden; projected_target_logits = std::move(logits);
           projected_target_compact=mfq::cuda::qwen4_decode_graph_compact_topk(model);
+          finish_profile();
           return std::move(*hidden);
         }
       }
     }
-    return model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
-                                mfq_nullopt, raw, confirmed);
+    auto hidden=model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
+                                     mfq_nullopt, raw, confirmed);
+    target_transfer_bytes=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
+    finish_profile();
+    return hidden;
   }
   Tensor target_suffix(Tensor ids, Tensor *raw) {
     projected_target_hidden = {}; projected_target_logits = {};
     projected_target_compact={};
     projected_target_greedy.clear();
-    return model.hidden_forward_speculative_suffix(ids, raw);
+    const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
+    const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
+    auto hidden=model.hidden_forward_speculative_suffix(ids, raw);
+    target_transfer_bytes+=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
+    if(profile_target()) {
+      const auto costs_after=target_costs();
+      for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]+=costs_after[i]-costs_before[i];
+    }
+    return hidden;
   }
   struct PrefillResult {
     Tensor hidden, raw;
     double elapsed;
   };
+  double blockwise_prompt_context(Tensor hidden,int64_t position,bool seed) {
+    PrefillCudaTimer timer;
+    if(seed)mtp.seed_target_context(std::move(hidden),position);
+    else {
+      const auto start=position-hidden.size(1);
+      mtp.append_target_context(std::move(hidden),start);
+    }
+    MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+    return timer.elapsed_ms();
+  }
   PrefillResult prefill(mfq::engine::PrefillChunk chunk) {
     PrefillCudaTimer timer;
     bool prefill_finished=false;
@@ -302,6 +359,7 @@ template <class Model> struct CudaMtpOps {
     };
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+    CudaImageMaskScope image_scope(model,prepared,chunk.offset,chunk.count);
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt && model.reuse_decode_graphs && model.graph_registry && chunk.count<=128) {
         // Reuse bounded routed windows for short prompts as well as continuations.
@@ -356,8 +414,8 @@ template <class Model> struct CudaMtpOps {
                   ids,
                   prepared->embeddings.narrow(1, chunk.offset, chunk.count)
                       .contiguous(),
-                  prepared->positions.narrow(-1, chunk.offset, chunk.count)
-                      .contiguous(),
+                  prepared->positions.defined()?MfqOptional<Tensor>(
+                      prepared->positions.narrow(-1,chunk.offset,chunk.count).contiguous()):mfq_nullopt,
                   mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt, &raw)
             : target_forward(ids, &raw);
     if(host_history)raw=raw.to(mfq_tensor_backend::kCPU);
@@ -762,7 +820,8 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    const CudaPreparedPrompt *prepared,
                    std::size_t reused_tokens,
                    mfq_tensor_backend::Tensor restored_last_hidden,
-                   mfq_tensor_backend::Tensor *session_last_hidden) {
+                   mfq_tensor_backend::Tensor *session_last_hidden,
+                   std::size_t stable_prefix_tokens) {
   auto logical_chunk=prefill_chunk_size;
   if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
     logical_chunk=std::min<int64_t>(logical_chunk,8192);
@@ -771,18 +830,21 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
       logical_chunk=request.prompt.size();
   }
   if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
-    if(!prepared || !prepared->transformed())logical_chunk=request.prompt.size();
+    // Retained small-M continuations must bound decoder replay as well as
+    // encoder tiles; merging the suffix would re-enter the large PP pipeline.
+    const bool retained_chunks=reused_tokens>0 && prefill_chunk_size<=8;
+    if(!retained_chunks && (!prepared || !prepared->transformed()))logical_chunk=request.prompt.size();
   }
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
       logical_chunk, reused_tokens, std::move(restored_last_hidden),
-      session_last_hidden);
+      session_last_hidden,stable_prefix_tokens);
 }
 #define MFQ_INSTANTIATE_MTP(MODEL)                                             \
   template Generation run_mtp_generation<MODEL>(                               \
       MODEL &, MtpModule &, InferenceRequest &, InferenceOutput &, int64_t,    \
       const CudaPreparedPrompt *, std::size_t, mfq_tensor_backend::Tensor,     \
-      mfq_tensor_backend::Tensor *)
+      mfq_tensor_backend::Tensor *, std::size_t)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);

@@ -105,10 +105,13 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SSD expert streaming cases=243 PASS" in result.stdout
+    assert "standalone_ssd_router_prefetch rows=1,2,4,32 graph_demand_first=1 gate_up_only=1 bounded_RAM=1 PASS" in result.stdout
     if native_dma == "1" and pcie_fraction == 1 and ram_pin_bytes == "0":
         assert "moe_ssd_gu_io_overlap scope=first_upload enabled=1" in result.stderr
         assert "moe_ssd_gu_compute_overlap scope=first_ready enabled=1" in result.stderr
         assert "moe_ssd_down_io_overlap scope=first_upload enabled=1" in result.stderr
+        if os.name == "nt" and not env.get("MFQ_MOE_POLL_TRANSFER_READY"):
+            assert "moe_ssd_gu_prepare_overlap scope=first_ready enabled=1 producer_wait=0" in result.stderr
     if os.name == "nt" and read_mode == "direct":
         assert "model_direct_staging_batch enabled=1" in result.stderr
 

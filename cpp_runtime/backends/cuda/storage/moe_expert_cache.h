@@ -3,6 +3,7 @@
 #include "moe_cache_profile.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
 #include <algorithm>
 #include <functional>
@@ -17,6 +18,7 @@ class MoeExpertCache;
 inline int moe_decode_transfer_slots(int rows, int routes) {
     return std::max(80, rows * routes);
 }
+inline constexpr std::size_t moe_ssd_residency_stage_limit_bytes=std::size_t(256)<<20;
 inline bool moe_predictor_transfer_cache_enabled() {
     const auto* option=std::getenv("MFQ_MOE_PREDICTOR_TRANSFER_CACHE");
     return !option || option[0]!='0';

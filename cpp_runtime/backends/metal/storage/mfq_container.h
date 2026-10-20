@@ -102,6 +102,10 @@ public:
         const std::string& name,
         std::uint64_t relative_offset,
         std::span<std::byte> destination) const;
+    void readv_range(
+        const std::string& name,
+        std::uint64_t relative_offset,
+        std::span<const std::span<std::byte>> destinations) const;
     std::vector<std::uint8_t> read(const std::string& name) const;
     // Read-only mmap view used by full-resident model loading. The mapping is
     // released as soon as the parser has copied the record into its final MLX

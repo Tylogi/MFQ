@@ -12,7 +12,7 @@ import pytest
 from mfq.server.runtime import host_memory
 from mfq.server.runtime.host_memory import HostMemorySnapshot
 from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
-from mfq.server.protocol.models import RuntimeInstanceState
+from mfq.server.protocol.models import RuntimeInstanceState, RuntimeMemoryPolicy
 from mfq.server.state.catalog import ModelCatalog
 from tests.test_server_models import IdleBackend, _model
 
@@ -143,6 +143,40 @@ def test_live_budget_includes_own_usage_but_not_pending_capacity(tmp_path, monke
     assert pool.memory_policy_status()['effective_total_limit_bytes'] == 96 * gib
     snapshot = replace(snapshot, free=1 * gib, external=10 * gib)
     assert pool._effective_runtime_memory_budget_locked() == 181 * gib // 2
+
+
+def test_automatic_budget_preview_ignores_only_the_manual_total_cap(tmp_path, monkeypatch):
+    gib = 1 << 30
+    snapshot = HostMemorySnapshot(128 * gib, 100 * gib, 0, 0, 0)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_snapshot", lambda: snapshot)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 0)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.metal_allocation_limit", lambda: 108 * gib)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", max_runtime_memory_bytes=120 * gib)
+    policy = RuntimeMemoryPolicy(total_limit_bytes=30 * gib, model_limit_bytes=24 * gib, prefix_limit_bytes=2 * gib)
+    pool.memory_policy = policy
+    status = pool.memory_policy_status()
+    assert status['effective_total_limit_bytes'] == 30 * gib
+    assert status['automatic_total_limit_bytes'] == 92 * gib
+    assert status['total_capacity_limit_bytes'] == 30 * gib
+    assert pool.memory_policy is policy
+    assert pool.memory_policy.total_limit_bytes == 30 * gib
+    assert status['model_limit_bytes'] == 24 * gib and status['prefix_limit_bytes'] == 2 * gib
+    snapshot = replace(snapshot, free=80 * gib)
+    assert pool.memory_policy_status()['automatic_total_limit_bytes'] == 72 * gib
+    pool.memory_policy = policy.model_copy(update={'total_limit_bytes': None})
+    status = pool.memory_policy_status()
+    assert status['automatic_total_limit_bytes'] == status['effective_total_limit_bytes'] == 72 * gib
+
+
+@pytest.mark.parametrize('backend', ['cuda', 'hip'])
+def test_automatic_budget_preview_keeps_device_capacity_on_discrete_backends(tmp_path, backend):
+    gib = 1 << 30
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend=backend, max_runtime_memory_bytes=24 * gib)
+    pool.memory_policy = RuntimeMemoryPolicy(total_limit_bytes=8 * gib)
+    status = pool.memory_policy_status()
+    assert status['automatic_total_limit_bytes'] == 24 * gib
+    assert status['effective_total_limit_bytes'] == 8 * gib
+    assert pool.memory_policy.total_limit_bytes == 8 * gib
 
 
 def test_metal_limit_only_caps_gpu_memory_not_cpu_cache(tmp_path, monkeypatch):

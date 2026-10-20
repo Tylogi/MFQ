@@ -8,6 +8,7 @@
 #include "mlx_deepseek_v41_moe.h"
 #include "mlx_deepseek_v41_vision.h"
 #include "mlx_sampling.h"
+#include "mlx_prefix_cache.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
@@ -197,7 +198,8 @@ public:
         const std::function<void(std::size_t, double)>& prefill_callback = {},
         const MfqTokenConstraintPtr& token_constraint = {},
         std::optional<std::size_t> stable_prefix_tokens = std::nullopt,
-        int prefill_chunk_size = 2048);
+        int prefill_chunk_size = 2048,
+        const MlxPrefixCacheHooks& prefix_cache = {});
 
     std::int32_t generate_multimodal(
         const std::vector<std::int64_t>& prompt,
@@ -206,7 +208,10 @@ public:
         std::int32_t max_tokens,
         const std::function<bool(std::int64_t)>& callback = {},
         const std::function<void(std::size_t, double)>& prefill_callback = {},
-        const MfqTokenConstraintPtr& token_constraint = {});
+        const MfqTokenConstraintPtr& token_constraint = {},
+        std::optional<std::size_t> stable_prefix_tokens = std::nullopt,
+        int prefill_chunk_size = 2048,
+        const MlxPrefixCacheHooks& prefix_cache = {});
 
     void reset_cache(int batch = 1);
     void clear_cache() noexcept;
@@ -234,11 +239,20 @@ public:
     }
     bool supports_text_session_state() const noexcept { return true; }
     MlxDeepseekV41TextSessionState capture_text_session_state(
-        const std::vector<std::int64_t>& tokens) const;
+        const std::vector<std::int64_t>& tokens, bool copy_arrays = true) const;
     void restore_text_session_state(
         const MlxDeepseekV41TextSessionState& state);
 
 private:
+    std::int32_t generate_impl(
+        const std::vector<std::int64_t>& prompt,
+        const MlxSamplingParams& sampling, std::int32_t max_tokens,
+        const std::function<bool(std::int64_t)>& callback,
+        const std::function<void(std::size_t, double)>& prefill_callback,
+        const MfqTokenConstraintPtr& token_constraint,
+        std::optional<std::size_t> stable_prefix_tokens,
+        int prefill_chunk_size, const MlxPrefixCacheHooks& prefix_cache,
+        const std::vector<MlxDeepseekV41ImageInput>* images = nullptr);
     mlx::core::array normalized_ids(const mlx::core::array& token_ids) const;
     mlx::core::array forward_impl(
         const mlx::core::array& token_ids,
@@ -266,7 +280,8 @@ private:
         const MlxSamplingParams& sampling,
         std::int32_t limit,
         const std::function<bool(std::int64_t)>& callback,
-        const MfqTokenConstraintPtr& token_constraint);
+        const MfqTokenConstraintPtr& token_constraint,
+        const MlxPrefixCacheHooks& prefix_cache = {});
     void materialize_states(
         const std::vector<MlxDeepseekV41LayerState>& states) const;
 

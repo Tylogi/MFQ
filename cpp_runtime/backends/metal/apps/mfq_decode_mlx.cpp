@@ -893,6 +893,20 @@ bool metal_prefix_nax_device() {
     return false;
 }
 
+std::string metal_media_cache_key(const MfqMultimodalInput& media) {
+    std::ostringstream key;
+    key << "vision-prefix-v1:" << media.processor_name << ':';
+    const auto append = [&](const auto& values) {
+        key << mfq::cache::block_hash_hex(mfq::cache::sha256(values.data(),
+            values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type))) << ':';
+    };
+    append(media.pixel_values);
+    append(media.pixel_shape);
+    append(media.vision_grid);
+    append(media.image_bounds);
+    return key.str();
+}
+
 template <typename Runtime>
 std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
     const mfq::metal::MfqContainer& container,
@@ -915,7 +929,8 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         }
         constexpr bool recurrent = std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
             std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>;
-        const auto default_block = mfq::metal::mlx_prefix_block_size(recurrent, prefill_chunk_size,
+        const auto default_block = mfq::metal::mlx_prefix_block_size(
+            recurrent || std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>, prefill_chunk_size,
             physical_memory_bytes(), metal_prefix_nax_device(), std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>);
         const auto block_size = cache_bytes_from_environment(
             "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS", default_block);
@@ -968,6 +983,7 @@ private:
     struct Entry {
         SessionState state;
         std::uint64_t last_used = 0;
+        std::string media_key;
     };
 
     struct PagedBinding {
@@ -1038,14 +1054,14 @@ public:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens,
-        bool require_mtp = false) {
+        bool require_mtp = false, std::string_view media_key = {}) {
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 return restore_paged(
                     runtime,
                     requested_session,
                     prompt,
-                    maximum_prefix_tokens, require_mtp);
+                    maximum_prefix_tokens, require_mtp, media_key);
             }
         }
         if (requested_session.empty() || max_sessions_ == 0 ||
@@ -1060,7 +1076,7 @@ public:
         for (const auto& [session_id, history] : states_) {
             for (std::size_t index = 0; index < history.size(); ++index) {
                 const auto& tokens = history[index].state.tokens;
-                if (tokens.empty() || tokens.size() >= prompt.size() ||
+                if (history[index].media_key != media_key || tokens.empty() || tokens.size() >= prompt.size() ||
                     tokens.size() > maximum_prefix_tokens ||
                     tokens.size() < selected_tokens ||
                     !std::equal(
@@ -1106,10 +1122,10 @@ public:
         }
     }
 
-    void store(const std::string& session_id, SessionState state) {
+    void store(const std::string& session_id, SessionState state, std::string_view media_key = {}) {
         if constexpr (Codec::available) {
             if (paged_cache_) {
-                store_paged(session_id, state);
+                store_paged(session_id, state, media_key);
                 return;
             }
         }
@@ -1126,13 +1142,13 @@ public:
             }
             return;
         }
-        Entry entry{std::move(state), ++clock_};
+        Entry entry{std::move(state), ++clock_, std::string(media_key)};
         const auto protected_clock = entry.last_used;
         auto& history = states_[session_id];
         auto previous = std::find_if(
             history.begin(), history.end(),
             [&](const Entry& saved) {
-                return saved.state.tokens == entry.state.tokens;
+                return saved.media_key == entry.media_key && saved.state.tokens == entry.state.tokens;
             });
         if (previous != history.end()) {
             bytes_ -= previous->state.bytes;
@@ -1396,7 +1412,7 @@ private:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens,
-        bool require_mtp) {
+        bool require_mtp, std::string_view media_key) {
         if (max_sessions_ == 0 || !runtime.supports_text_session_state() ||
             prompt.size() < 2) {
             return 0;
@@ -1406,7 +1422,7 @@ private:
         std::vector<std::int64_t> candidate(
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(limit));
-        auto match = paged_cache_->match(candidate, {}, false);
+        auto match = paged_cache_->match(candidate, media_key, false);
         if (match.matched_tokens == 0) {
             paged_cache_->record_match(0);
             return 0;
@@ -1499,7 +1515,7 @@ private:
 
     void store_paged(
         const std::string& session_id,
-        const SessionState& state) {
+        const SessionState& state, std::string_view media_key) {
         if (max_sessions_ == 0 || state.tokens.empty()) {
             return;
         }
@@ -1520,7 +1536,7 @@ private:
             : state.tokens.size() / block_size;
         if (full_blocks == 0) return;
 
-        auto existing = paged_cache_->match(state.tokens, {}, false);
+        auto existing = paged_cache_->match(state.tokens, media_key, false);
         if (existing.matched_tokens % block_size != 0 &&
             existing.matched_tokens != state.tokens.size()) {
             existing.blocks.pop_back();
@@ -1542,7 +1558,7 @@ private:
                 parent,
                 state.tokens.data() + token_offset,
                 std::min(block_size, state.tokens.size() - token_offset),
-                std::move(payload));
+                std::move(payload), media_key);
             blocks.push_back(parent);
         }
         if constexpr (requires {
@@ -1562,6 +1578,9 @@ private:
                     upgrade_mtp = state.last_hidden && (state.cache_position == 1 || !state.mtp_layers.empty()) &&
                         (final_payload.empty() || !Codec::has_mtp(final_payload.front()));
                 }
+                if constexpr (requires { state.dspark; Codec::has_mtp(final_payload.front()); })
+                    upgrade_mtp = state.dspark.has_value() &&
+                        (final_payload.empty() || !Codec::has_mtp(final_payload.front()));
                 if (!exact || upgrade_mtp) {
                     const auto index = full_blocks - 1;
                     const auto token_offset = index * block_size;
@@ -1573,7 +1592,7 @@ private:
                         checkpoint_parent,
                         state.tokens.data() + token_offset,
                         std::min(block_size, state.tokens.size() - token_offset),
-                        Codec::encode_block(state, block_size, index));
+                        Codec::encode_block(state, block_size, index), media_key);
                     if (refreshed != blocks[index]) {
                         throw std::runtime_error(
                             "paged prefix checkpoint changed block identity");
@@ -1871,7 +1890,7 @@ std::int32_t generate_with_prefill_metrics(
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& = {}) {
+    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1889,7 +1908,8 @@ std::int32_t generate_with_prefill_metrics(
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
             : std::nullopt,
-        prefill_chunk_size);
+        prefill_chunk_size,
+        prefix_cache);
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -2035,7 +2055,7 @@ public:
             [&job](MfqPrefillTiming timing) { job.prefill(timing); };
         job.mtp.available = runtime_components.mtp_available;
         try {
-            if (request.vision) {
+            if (request.vision && !std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
                 if (!runtime_components.multimodal_generate)
                     throw std::invalid_argument("model has no multimodal component");
                 runtime_components.multimodal_generate(prompt, *request.vision,
@@ -2064,6 +2084,14 @@ public:
                     sampling.mtp_max_draft_tokens;
                 parameters.seed = sampling.seed;
                 auto& loaded_runtime = runtime_holder->value();
+                std::vector<mfq::metal::MlxDeepseekV41ImageInput> images;
+                std::string media_key;
+                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                    if (request.vision) {
+                        images = mfq::metal::prepare_deepseek_v41_images(prompt, *request.vision, loaded_runtime.config());
+                        media_key = metal_media_cache_key(*request.vision);
+                    }
+                }
                 mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
                     enforce_memory_budget(bytes);
                 }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -2085,12 +2113,14 @@ public:
                      session_cache->persistent_prefix_enabled()) &&
                     loaded_runtime.supports_text_session_state();
                 if (cache_enabled) {
-                    (void)session_cache->restore_best(
+                    const auto restored = session_cache->restore_best(
                         loaded_runtime,
                         cache_plan.session_id,
                         prompt,
                         stable_prefix_tokens, parameters.enable_mtp && runtime_components.mtp_available &&
-                            sampling.max_tokens > 1);
+                            sampling.max_tokens > 1, media_key);
+                    if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>)
+                        if (request.vision && restored == 0) loaded_runtime.reset_cache(1);
                 }
                 auto effective_cache_plan = cache_plan;
                 effective_cache_plan.stable_prefix_tokens = cache_enabled
@@ -2100,7 +2130,8 @@ public:
                 auto cache_tokens = prompt;
                 std::size_t last_checkpoint = 0;
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-                    std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+                    std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
+                    std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
                     if (cache_enabled) {
                         prefix_hooks.block_size = session_cache->block_size_tokens();
                         prefix_hooks.input_tokens = stable_prefix_tokens;
@@ -2111,7 +2142,9 @@ public:
                                 session_cache->store(cache_plan.session_id,
                                     loaded_runtime.capture_text_session_state(
                                         std::vector<std::int64_t>(cache_tokens.begin(),
-                                            cache_tokens.begin() + static_cast<std::ptrdiff_t>(position)), false));
+                                            cache_tokens.begin() + static_cast<std::ptrdiff_t>(position)),
+                                        std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm> &&
+                                            !session_cache->persistent_prefix_enabled()), media_key);
                                 last_checkpoint = position;
                             } catch (const std::exception& error) {
                                 std::cerr << "server_session_cache backend=metal action=skip error="
@@ -2125,7 +2158,14 @@ public:
                     cache_tokens.push_back(token);
                     return !callback || callback(token);
                 };
-                const auto generated = generate_with_prefill_metrics(
+                const auto generated = [&] {
+                    if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                        if (request.vision) return loaded_runtime.generate_multimodal(prompt, images, parameters,
+                            sampling.max_tokens, cached_callback, [&](std::size_t tokens, double ms) {
+                                on_prefill(MfqPrefillTiming{tokens, ms, 0.0, ms});
+                            }, token_constraint, effective_cache_plan.stable_prefix_tokens, prefill_chunk_size, prefix_hooks);
+                    }
+                    return generate_with_prefill_metrics(
                     loaded_runtime,
                     prompt,
                     parameters,
@@ -2136,6 +2176,7 @@ public:
                     token_constraint,
                     prefill_chunk_size,
                     prefix_hooks);
+                }();
                 if (!prefix_hooks && cache_enabled &&
                     loaded_runtime.cache_position() ==
                         static_cast<int>(stable_prefix_tokens)) {
@@ -2472,15 +2513,18 @@ private:
         const auto target = budget - allocation;
         if (used() <= target) return;
         mfq::metal::drain_metal_work(runtime_stream);
-        mlx::core::set_cache_limit(0);
-        allocator_cache_limit = 0;
-        mlx::core::clear_cache();
+        const auto clear_allocator_excess = [&] {
+            if (mlx::core::get_cache_memory() > reserve) mlx::core::clear_cache();
+        };
+        clear_allocator_excess();
         std::size_t prefix = 0;
         for (const auto& metric : session_cache->metrics()) if (metric.first == "prefix_cache_hot_bytes") prefix = static_cast<std::size_t>(metric.second);
         const auto shortage = used() > target ? used() - target : 0;
         session_cache->trim_hot(prefix > shortage ? prefix - shortage : 0);
+        clear_allocator_excess();
         if constexpr (requires(Runtime& value) { value.trim_mtp_sessions(std::size_t{}); })
             if (used() > target) runtime_holder->value().trim_mtp_sessions(0);
+        clear_allocator_excess();
         if (used() <= target) return;
         if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
             auto& runtime = runtime_holder->value();
@@ -2492,7 +2536,7 @@ private:
                 mfq::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
                 if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
                 resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
-                mlx::core::clear_cache();
+                clear_allocator_excess();
                 release_host_allocator_cache();
                 if (runtime.reclaimable_expert_bytes() >= available) break;
             }
@@ -2736,6 +2780,9 @@ private:
                     metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
                     metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);
                     metrics.emplace_back("ssd_expert_device_route_misses", stats->device_route_misses);
+                    metrics.emplace_back("ssd_expert_overlapped_read_batches", stats->overlapped_read_batches);
+                    metrics.emplace_back("ssd_expert_overlapped_read_submissions", stats->overlapped_read_submissions);
+                    metrics.emplace_back("ssd_expert_parallel_body_read_batches", stats->parallel_body_read_batches);
                     metrics.emplace_back(
                         "ssd_expert_resident_bytes",
                         static_cast<double>(stats->resident_bytes));

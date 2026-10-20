@@ -1,5 +1,6 @@
 #include "mfq_cuda_quant_ops.h"
 #include "mx.h"
+#include "mxfp8_grouped_gemm.h"
 #include "format.h"
 #include "cpu_projection_rows.h"
 #include <cmath>
@@ -188,31 +189,29 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
     MFQ_RUNTIME_CHECK(
         outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
+    if(!grouped.is_cuda()) {
+        std::vector<mfq_tensor_backend::Tensor> outputs;
+        outputs.reserve(static_cast<size_t>(groups));
+        const auto block_rows=weight.scales.size(0)==weight.out?1:
+            weight.neuron_len/weight.scales.size(1);
+        const auto scale_rows=outputs_per_group/block_rows;
+        for(int64_t group=0;group<groups;++group) {
+            const Mxfp8Weight shard{
+                weight.values.narrow(0,group*outputs_per_group,outputs_per_group),
+                weight.scales.narrow(0,group*scale_rows,scale_rows),outputs_per_group,weight.neuron_len};
+            outputs.push_back(mxfp8_matmul(profiler,shard,grouped.select(1,group).contiguous()));
+        }
+        return mfq_tensor_backend::cat(outputs,-1).contiguous();
+    }
     if (grouped.size(0) <= 8) {
         return profiler.measure("mxfp8.groupwise_small_m", [&]() {
             return mxfp8_groupwise_small_m_cuda(
                 weight.values, weight.scales, grouped, groups);
         });
     }
-    std::vector<mfq_tensor_backend::Tensor> outputs;
-    outputs.reserve(static_cast<size_t>(groups));
-    const int64_t block_rows=weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1);
-    const int64_t scale_rows_per_group = outputs_per_group / block_rows;
-    for (int64_t group = 0; group < groups; ++group) {
-        Mxfp8Weight shard;
-        shard.out = outputs_per_group;
-        shard.neuron_len = weight.neuron_len;
-        shard.values = weight.values.narrow(
-            0, group * outputs_per_group,
-            outputs_per_group).contiguous();
-        shard.scales = weight.scales.narrow(
-            0, group * scale_rows_per_group,
-            scale_rows_per_group).contiguous();
-        outputs.push_back(mxfp8_matmul(
-            profiler, shard,
-            grouped.select(1, group).contiguous()));
-    }
-    return mfq_tensor_backend::cat(outputs, -1).contiguous();
+    return profiler.measure("mxfp8.groupwise_gemm", [&]() {
+        return mxfp8_groupwise_gemm_f16_cuda(weight.values,weight.scales,grouped,groups);
+    });
 }
 
 mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
@@ -237,25 +236,9 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
                     weight.values, weight.scales, grouped, groups);
             });
     }
-    std::vector<mfq_tensor_backend::Tensor> outputs;
-    outputs.reserve(static_cast<size_t>(groups));
-    const int64_t block_rows=weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1);
-    const int64_t scale_rows_per_group = outputs_per_group / block_rows;
-    for (int64_t group = 0; group < groups; ++group) {
-        Mxfp8Weight shard;
-        shard.out = outputs_per_group;
-        shard.neuron_len = weight.neuron_len;
-        shard.values = weight.values.narrow(
-            0, group * outputs_per_group,
-            outputs_per_group).contiguous();
-        shard.scales = weight.scales.narrow(
-            0, group * scale_rows_per_group,
-            scale_rows_per_group).contiguous();
-        outputs.push_back(mxfp8_matmul_f32(
-            profiler, shard,
-            grouped.select(1, group).contiguous()));
-    }
-    return mfq_tensor_backend::cat(outputs, -1).contiguous();
+    return profiler.measure("mxfp8.groupwise_gemm_f32", [&]() {
+        return mxfp8_groupwise_gemm_f32_cuda(weight.values,weight.scales,grouped,groups);
+    });
 }
 
 mfq_tensor_backend::Tensor mxfp4_matmul(

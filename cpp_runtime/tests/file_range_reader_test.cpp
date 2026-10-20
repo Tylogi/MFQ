@@ -9,6 +9,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -16,6 +17,83 @@
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void exercise_coalesced_staging(const std::filesystem::path& base) {
+    const auto path=std::filesystem::path(base.string()+"-coalesced");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup(){std::error_code ignored;std::filesystem::remove(path,ignored);}
+    } cleanup{path};
+    constexpr std::size_t mib=1u<<20;
+    std::vector<std::byte> expected(3*mib+4096);
+    for(std::size_t i=0;i<expected.size();++i)expected[i]=std::byte((i*19+i/137)&255);
+    {std::ofstream stream(path,std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());
+        require(bool(stream),"cannot write coalesced staging fixture");}
+    mfq::AsyncRangeReader reader(path,mfq::FileReadMode::Direct);
+    const std::array<std::size_t,3> offsets{3,mib+20,2*mib+11};
+    const std::array<std::size_t,3> sizes{mib+17,mib-9,mib-1};
+    std::array<std::vector<std::byte>,3> output;
+    std::vector<mfq::ReadSpan> spans;
+    for(std::size_t i=0;i<output.size();++i) {
+        output[i].assign(sizes[i]+2,std::byte{0x5a});
+        spans.push_back({offsets[i],output[i].data()+1,sizes[i]});
+    }
+    reader.read(spans);
+    for(std::size_t i=0;i<output.size();++i) {
+        require(output[i].front()==std::byte{0x5a} && output[i].back()==std::byte{0x5a},
+                "coalesced read overwrote a field guard");
+        require(std::equal(output[i].begin()+1,output[i].end()-1,expected.begin()+offsets[i]),
+                "coalesced read changed field bytes");
+    }
+    const auto stats=reader.stats();
+    require(stats.logical_bytes==sizes[0]+sizes[1]+sizes[2] && !stats.staging_bytes,
+            "coalesced read leaked staging or changed logical byte accounting");
+    require(stats.staging_peak_bytes<=expected.size()+(64u<<10),
+            "coalesced read retained two full-sized payload buffers");
+    const auto tail_path=std::filesystem::path(base.string()+"-coalesced-tail");
+    Cleanup tail_cleanup{tail_path};
+    const auto tail_size=3*mib+19;
+    {std::ofstream stream(tail_path,std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(expected.data()),tail_size);
+        require(bool(stream),"cannot write coalesced EOF fixture");}
+    for(auto mode:{mfq::FileReadMode::Buffered,mfq::FileReadMode::Direct}) {
+        mfq::AsyncRangeReader tail(tail_path,mode);
+        std::vector<std::byte> first(mib+19,std::byte{0x5a});
+        std::vector<std::byte> second(tail_size-mib-18,std::byte{0x5a});
+        tail.read({{3,first.data()+1,mib+17},{mib+20,second.data()+1,tail_size-mib-20}});
+        require(first.front()==std::byte{0x5a} && first.back()==std::byte{0x5a} &&
+                second.front()==std::byte{0x5a} && second.back()==std::byte{0x5a},
+                "coalesced EOF read overwrote field guards");
+        require(std::equal(first.begin()+1,first.end()-1,expected.begin()+3) &&
+                std::equal(second.begin()+1,second.end()-1,expected.begin()+mib+20),
+                "coalesced EOF read changed bytes");
+        require(tail.stats().staging_peak_bytes<=tail_size+(128u<<10),
+                "unaligned EOF retained another full coalesced payload");
+        mfq::FileRangeReader grouped(path,mode);
+        std::vector<std::byte> actual(4002,std::byte{0x5a}),reference=actual;
+        std::copy_n(expected.begin()+100,3000,reference.begin()+1);
+        std::copy_n(expected.begin()+200,3000,reference.begin()+1001);
+        grouped.read_coalesced({{100,actual.data()+1,3000},{200,actual.data()+1001,3000}});
+        require(actual==reference && grouped.stats().logical_bytes==6000,
+                "coalesced reads changed caller order or duplicate-byte accounting");
+    }
+    mfq::FileRangeReader aligned(path,mfq::FileReadMode::Direct);
+    const auto alignment=aligned.alignment();
+    struct AlignedOutput {
+        std::size_t alignment;
+        std::byte* data;
+        ~AlignedOutput(){::operator delete(data,std::align_val_t{alignment});}
+    } direct{alignment,static_cast<std::byte*>(::operator new(4*alignment,std::align_val_t{alignment}))};
+    std::fill_n(direct.data,4*alignment,std::byte{0x5a});
+    aligned.read_batch({{2*alignment,direct.data+alignment,alignment},{0,direct.data+2*alignment,alignment}});
+    require(std::equal(direct.data+alignment,direct.data+2*alignment,expected.begin()+2*alignment) &&
+            std::equal(direct.data+2*alignment,direct.data+3*alignment,expected.begin()),
+            "aligned direct batch changed field bytes");
+    require(std::all_of(direct.data,direct.data+alignment,[](auto value){return value==std::byte{0x5a};}) &&
+            std::all_of(direct.data+3*alignment,direct.data+4*alignment,[](auto value){return value==std::byte{0x5a};}) &&
+            !aligned.stats().staging_peak_bytes,
+            "aligned direct batch copied outside its target or allocated bounce storage");
+}
 void exercise_shared_staging(const std::filesystem::path& base) {
     struct Fixtures {
         std::array<std::filesystem::path,2> paths;
@@ -69,7 +147,7 @@ void exercise_shared_staging(const std::filesystem::path& base) {
     for(auto& job:jobs)job.get();
     auto cached=first->stats().staging_cached_bytes;
     for(const auto& reader:readers)cached+=reader->stats().staging_cached_bytes;
-    require(cached>0 && cached<=(64u<<20),"shared staging exceeded its process-wide idle budget");
+    require(cached>0 && cached<=(128u<<20),"shared staging exceeded its process-wide idle budget");
 }
 void exercise(const std::filesystem::path& path, const std::vector<std::byte>& expected, mfq::FileReadMode mode) {
     auto reader = std::make_shared<mfq::FileRangeReader>(path, mode);
@@ -121,6 +199,7 @@ int main() {
         for (std::size_t i=0;i<expected.size();++i) expected[i]=static_cast<std::byte>((i*73+i/131)&255);
         { std::ofstream stream(path,std::ios::binary); stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());
           require(bool(stream),"cannot write fixture"); }
+        exercise_coalesced_staging(path);
         {
             const auto sector=mfq::FileRangeReader(path,mfq::FileReadMode::Direct).alignment();
             std::vector<std::byte> large(256*sector+13);

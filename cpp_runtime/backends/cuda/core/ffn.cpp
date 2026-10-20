@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -23,11 +24,47 @@ void FFN::prepare_moe_pipeline(CudaExecutionContext& execution) const {
     std::vector<std::shared_ptr<MfeWeight>> gate_up;
     if(moe_split_gate_up)gate_up={std::make_shared<MfeWeight>(moe_gate),std::make_shared<MfeWeight>(moe_up)};
     else gate_up={std::make_shared<MfeWeight>(moe_gate_up)};
+    MoeFfnPrefetch prefetch;
     moe_pipeline_forward=make_moe_ffn_pipeline(gate_up,{std::make_shared<MfeWeight>(moe_down)},
-        {},{},{},nullptr,swiglu_limit);
+        {},{},{},&prefetch,swiglu_limit);
+    if(prefetch)moe_pipeline_prefetch=[prefetch=std::move(prefetch)](const auto& ids) {
+        auto task=prefetch(ids);
+        if(auto* window=mfq::cuda::DecodeWindow::recording())window->enroll(std::move(task));
+        else task.serve();
+    };
     moe_pipeline_initialized=true;
     if(moe_pipeline_forward)std::fprintf(stderr,"moe_generic_pipeline_dispatch layer=%d clipped_swiglu=%g\n",
         moe_layer,swiglu_limit);
+}
+
+void FFN::prefetch_moe(CudaExecutionContext& execution,const mfq_tensor_backend::Tensor& x,
+        MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
+    if(!moe_pipeline_prefetch || !moe_expert_cache_ssd_router_prefetch(execution.moe_expert_cache) ||
+            x.dim()<2 || x.numel()/x.size(-1)>32)return;
+    namespace tb=mfq_tensor_backend;
+    tb::Tensor ids;
+    // Cover each row's leading candidates without reading low-confidence
+    // tails just because the leading experts are already cached.
+    constexpr int64_t candidates_per_row=4;
+    if(moe_hash_ids.defined()) {
+        if(!input_ids.has_value() || !input_ids.value().numel())return;
+        ids=moe_hash_ids.index_select(0,input_ids.value().reshape({-1}).to(tb::kCUDA,tb::kInt64));
+        ids=ids.narrow(1,0,std::min(candidates_per_row,ids.size(1))).to(tb::kInt32).contiguous();
+    }else {
+        auto row=x.reshape({-1,x.size(-1)}).to(tb::kFloat32);
+        auto logits=tb::matmul(row,moe_router.transpose(0,1)).contiguous();
+        ids=moe_topk_cuda(logits,std::min({int64_t(moe_top_k),logits.size(-1),candidates_per_row}),moe_use_sigmoid,
+            moe_use_sqrt_softplus,moe_normalize,moe_delayed_softmax,
+            moe_router_bias.defined()?MfqOptional<tb::Tensor>(moe_router_bias):mfq_nullopt,
+            1e-20,moe_router_scale).at(0).to(tb::kInt32).contiguous();
+    }
+    // Visit each row's highest-ranked candidate before lower ranks, so one
+    // token cannot consume the entire speculative read budget for a batch.
+    static std::atomic<bool> reported{false};
+    if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+        std::fprintf(stderr,"moe_ssd_router_candidates scope=first_forecast rows=%lld candidates_per_row=%lld\n",
+            static_cast<long long>(ids.size(0)),static_cast<long long>(ids.size(1)));
+    moe_pipeline_prefetch(ids.transpose(0,1).contiguous().reshape({1,-1}));
 }
 
 bool FFN::uses_moe_expert_cache() const {
@@ -238,7 +275,8 @@ mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(CudaExecutionContext 
 mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                                              mfq_tensor_backend::Tensor x,
                                              MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-                                             bool allow_important_neurons) const {
+                                             bool allow_important_neurons,
+                                             MfqOptional<mfq_tensor_backend::Tensor> router_bias) const {
     auto &profiler = execution.profiler;
     mfq_tensor_backend::Tensor xh;
     if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
@@ -299,9 +337,13 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     MFQ_RUNTIME_CHECK(input_ids.value().numel() == rows,
                                       "continuous-batch MoE token ids do not match rows");
                     auto row_ids = input_ids.value().reshape({rows}).narrow(0, row, 1).contiguous();
-                    outputs.push_back(forward_impl(execution, row_input, row_ids, false));
+                    auto bias=router_bias;
+                    if(bias.has_value() && bias->dim()==2)bias=bias->narrow(0,row,1);
+                    outputs.push_back(forward_impl(execution, row_input, row_ids, false,bias));
                 } else {
-                    outputs.push_back(forward_impl(execution, row_input, mfq_nullopt, false));
+                    auto bias=router_bias;
+                    if(bias.has_value() && bias->dim()==2)bias=bias->narrow(0,row,1);
+                    outputs.push_back(forward_impl(execution, row_input, mfq_nullopt, false,bias));
                 }
             }
             return mfq_tensor_backend::cat(outputs, 0).reshape(xh.sizes());
@@ -380,7 +422,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         return moe_topk_cuda(
                             router_logits.contiguous(), moe_top_k, moe_use_sigmoid,
                             moe_use_sqrt_softplus, moe_normalize, moe_delayed_softmax,
-                            moe_router_bias.defined()
+                            router_bias.has_value()?router_bias:moe_router_bias.defined()
                                 ? MfqOptional<mfq_tensor_backend::Tensor>(moe_router_bias)
                                 : mfq_nullopt,
                             1e-20, moe_router_scale);
@@ -727,6 +769,16 @@ mfq_tensor_backend::Tensor FFN::forward(CudaExecutionContext &execution,
                                         mfq_tensor_backend::Tensor x,
                                         MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
     return forward_impl(execution, std::move(x), input_ids, true);
+}
+
+mfq_tensor_backend::Tensor FFN::forward_with_router_bias(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor input_ids,
+        const mfq_tensor_backend::Tensor& bias) const {
+    MFQ_RUNTIME_CHECK(is_moe && !moe_hash_ids.defined() && bias.defined() &&
+        ((bias.dim()==1 && bias.size(0)==moe_router.size(0)) ||
+         (bias.dim()==2 && bias.size(0)==x.numel()/x.size(-1) && bias.size(1)==moe_router.size(0))),
+                      "MoE router correction bias shape mismatch");
+    return forward_impl(execution,std::move(x),std::move(input_ids),true,bias);
 }
 
 void prepare_ffn_workspaces(CudaExecutionContext &execution, FFN &f) {

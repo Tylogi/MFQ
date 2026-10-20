@@ -465,18 +465,18 @@ void MlxDeepseekV41AttentionState::reset() noexcept {
 }
 
 MlxDeepseekV41AttentionState
-MlxDeepseekV41AttentionState::snapshot() const {
+MlxDeepseekV41AttentionState::snapshot(bool copy_arrays) const {
     if (speculation) {
         throw std::runtime_error(
             "cannot snapshot a speculative DeepSeek-V4.1 attention cache");
     }
-    const auto copy_optional = [](const std::optional<array>& value) {
+    const auto copy_optional = [copy_arrays](const std::optional<array>& value) {
         return value
-            ? std::optional<array>(detached_copy(*value))
+            ? std::optional<array>(copy_arrays ? detached_copy(*value) : *value)
             : std::nullopt;
     };
     MlxDeepseekV41AttentionState result;
-    result.local_kv = detached_copy(local_kv);
+    result.local_kv = copy_arrays ? detached_copy(local_kv) : local_kv;
     result.compressed_kv = copy_optional(compressed_kv);
     result.index_k = copy_optional(index_k);
     result.partial_kv = copy_optional(partial_kv);

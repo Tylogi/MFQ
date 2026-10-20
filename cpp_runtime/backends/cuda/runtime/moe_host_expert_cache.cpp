@@ -65,7 +65,9 @@ struct MoeHostExpertCache::Impl {
         Lease value;std::list<mfq::MoeCacheKey>::iterator position;bool reused=false;
         Entry *device_prev=nullptr,*device_next=nullptr;bool device_duplicate=false;
         std::uint64_t birth_epoch=0;
+        std::uint8_t reuse_credit=0;
         bool ghost_eligible=true;
+        bool unconfirmed_prediction=false;
     };
     struct Flight {
         bool ready=false;
@@ -165,25 +167,52 @@ struct MoeHostExpertCache::Impl {
         (found->second.reused?reused:lru).erase(found->second.position);
         entries.erase(found);
     }
+    bool confirm_prediction_first_use(Entry& entry) {
+        if(!entry.unconfirmed_prediction)return false;
+        entry.unconfirmed_prediction=false;
+        if(counters.reuse_priority && !counters.prediction_first_uses++)std::fprintf(stderr,
+            "moe_ram_prediction_first_use scope=first_confirmation enabled=1 reused=0\n");
+        return true;
+    }
     void touch(mfq::MoeCacheKey key,Entry& entry) {
         if(!reuse_learning || speculative_learning)return;
         entry.ghost_eligible=true;
-        if(ghosts.contains(key)){forget_ghost(key);++counters.ghost_promotions;}
+        const bool refault=ghosts.contains(key);
+        if(refault){forget_ghost(key);++counters.ghost_promotions;}
         if(entry.device_duplicate){device_duplicate(entry,false);device_duplicate(entry,true);}
+        if(!refault && confirm_prediction_first_use(entry)) {
+            // The forecast read was an admission, not a previous consumer.
+            // One accepted use earns recency; only another use earns reuse.
+            lru.splice(lru.begin(),lru,entry.position);return;
+        }
+        entry.unconfirmed_prediction=false;
         if(!counters.reuse_priority || key.source<0) {
             lru.splice(lru.begin(),lru,entry.position);return;
         }
-        reused.splice(reused.begin(),entry.reused?reused:lru,entry.position);
         if(!entry.reused) {
+            reused.splice(reused.begin(),lru,entry.position);entry.reuse_credit=0;
             entry.reused=true;counters.reuse_protected_bytes+=entry.value->bytes;++counters.reuse_promotions;
             device_duplicate(entry,false);
-        }
-        const auto limit=budget-budget/4;
+        }else entry.reuse_credit=std::min<std::uint8_t>(3,entry.reuse_credit+1);
+        // Leave a probation window for new routes without allowing one-use
+        // expert scans to consume a quarter of the byte-bounded RAM cache.
+        // Repeated demand and confirmed refaults retain most of the payloads.
+        const auto limit=budget-budget/10;
         while(counters.reuse_protected_bytes>limit && !reused.empty()) {
             auto candidate=reused.end();
             do {--candidate;}while(candidate!=reused.begin() && exchanging.contains(*candidate));
             if(exchanging.contains(*candidate))break;
             auto& old=entries.at(*candidate);
+            // Repeated consumers earn bounded second chances. A stream of
+            // lightly reused experts cannot age out a frequent route solely
+            // by touching it later. Credits decay at replacement, without
+            // timers, a history heap or additional payload storage.
+            if(old.reuse_credit) {
+                --old.reuse_credit;reused.splice(reused.begin(),reused,old.position);
+                if(!counters.reuse_clock_rotations++)std::fprintf(stderr,
+                    "moe_ram_reuse_clock scope=first_rotation enabled=1 maximum_credit=3\n");
+                continue;
+            }
             counters.reuse_protected_bytes-=old.value->bytes;old.reused=false;
             lru.splice(lru.begin(),reused,old.position);
             device_duplicate(old,device_cached.contains(*old.position));
@@ -191,10 +220,12 @@ struct MoeHostExpertCache::Impl {
     }
     void learn_device_reuse(mfq::MoeCacheKey key,Entry& entry) {
         if(!counters.reuse_priority || entry.reused || !device_hints || !device_hints->impl_->confirmed_reuse)return;
+        if(!reuse_learning || speculative_learning)return;
         // Repeated GPU hits must not leave a hot expert's revocable RAM
         // backup permanently classified as a one-use image. Warmup and
         // uncommitted speculation retain the normal learning exclusions.
         const auto before=counters.reuse_promotions;
+        entry.unconfirmed_prediction=false; // The GPU has confirmed multiple consumers.
         touch(key,entry);
         if(counters.reuse_promotions!=before && ++counters.device_reuse_promotions==1)
             std::fprintf(stderr,"moe_ram_gpu_reuse_dispatch scope=first_promotion enabled=1\n");
@@ -266,7 +297,8 @@ struct MoeHostExpertCache::Impl {
             if (!inserted)
                 throw std::logic_error("duplicate host expert publication");
             found->second.birth_epoch=speculative_learning?learning_epoch:0;
-            found->second.ghost_eligible=reuse_learning && !speculative_learning;
+            found->second.unconfirmed_prediction=value->reservation->unconsumed_prediction;
+            found->second.ghost_eligible=reuse_learning && !speculative_learning && !found->second.unconfirmed_prediction;
             device_duplicate(found->second,device_cached.contains(key));
         }
         catch (...) { lru.pop_front(); throw; }
@@ -293,7 +325,11 @@ struct MoeHostExpertCache::Impl {
 MoeHostExpertCache::MoeHostExpertCache(std::size_t bytes):impl_(std::make_unique<Impl>(bytes)) {}
 MoeHostExpertCache::~MoeHostExpertCache()=default;
 void MoeHostExpertCache::enable_reuse_priority() {
-    std::lock_guard lock(impl_->mutex);impl_->counters.reuse_priority=true;
+    std::lock_guard lock(impl_->mutex);
+    if(!impl_->counters.reuse_priority)std::fprintf(stderr,
+        "moe_ram_reuse_dispatch enabled=1 protected_budget_bytes=%zu probation_budget_bytes=%zu\n",
+        impl_->budget-impl_->budget/10,impl_->budget/10);
+    impl_->counters.reuse_priority=true;
 }
 void MoeHostExpertCache::set_reuse_learning(bool enabled) {
     std::lock_guard lock(impl_->mutex);impl_->reuse_learning=enabled;
@@ -342,6 +378,7 @@ void MoeHostExpertCache::commit_speculative_learning(const std::vector<mfq::MoeC
             state.lru.splice(state.lru.begin(),state.lru,entry.position);
             entry.birth_epoch=0;
             entry.ghost_eligible=true;
+            state.confirm_prediction_first_use(entry);
             if(entry.device_duplicate){state.device_duplicate(entry,false);state.device_duplicate(entry,true);}
         }
     }

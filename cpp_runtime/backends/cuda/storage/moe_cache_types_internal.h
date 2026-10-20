@@ -375,6 +375,7 @@ struct MoeCacheStats {
     std::array<std::uint64_t,2> pipeline_multi_route_positions{},pipeline_multi_unique_routes{};
     int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
+    int64_t pipeline_host_copy_ns=0;
     int64_t pipeline_ssd_read_ns=0,pipeline_window_ssd_read_ns=0;
     int64_t pipeline_window_serves=0,pipeline_window_route_ns=0,pipeline_window_plan_ns=0;
     int64_t pipeline_window_fetch_ns=0,pipeline_window_cpu_ns=0,pipeline_window_gpu_ns=0;
@@ -406,6 +407,7 @@ struct MoeCacheStats {
     int64_t pipeline_ssd_gu_staged_bytes=0;
     int64_t pipeline_ssd_gu_upload_batches=0;
     int64_t pipeline_ssd_down_overlap_bytes=0,pipeline_ssd_down_upload_batches=0,pipeline_ssd_down_staged_bytes=0;
+    int64_t pipeline_ssd_down_early_max_batch=0,pipeline_ssd_down_early_max_bytes=0;
     int64_t pipeline_ssd_gu_compute_serves=0,pipeline_ssd_gate_up_wait_ns=0,pipeline_ssd_down_wait_ns=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;

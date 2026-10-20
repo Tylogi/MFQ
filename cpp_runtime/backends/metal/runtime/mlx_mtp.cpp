@@ -391,7 +391,9 @@ void MlxDsparkDepthController::update_time(
 double MlxDsparkDepthController::marginal_estimate() const {
     int low = -1;
     int high = -1;
-    for (int depth = 0; depth <= maximum_depth_; ++depth) {
+    const auto measured_widths = std::count_if(cycle_ms_.begin() + 1, cycle_ms_.end(),
+        [](const auto& measured) { return measured.has_value(); });
+    for (int depth = measured_widths >= 2 ? 1 : 0; depth <= maximum_depth_; ++depth) {
         if (!cycle_ms_[static_cast<std::size_t>(depth)]) {
             continue;
         }

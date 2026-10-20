@@ -468,6 +468,26 @@ int main() {
         require(controller.depth()==3 && *controller.measured_cycle_ms(3)==35.0);
     }
     {
+        // SSD verification can cost several ordinary decode cycles. Charge
+        // exploration against the width being probed, keeping costly losing
+        // probes within their time budget while still retrying every width.
+        DsparkDepthController controller(3);
+        constexpr std::array<double,4> cost{200.0,600.0,900.0,1200.0};
+        for(int i=0;i<8;++i) {
+            const int depth=controller.depth();controller.observe(depth,0,cost[depth]);
+        }
+        require(controller.depth()==0);
+        double elapsed=0,probing=0;std::array<int,4> visits{};
+        while(elapsed<120000.0) {
+            const int depth=controller.depth();
+            elapsed+=cost[depth];if(depth)probing+=cost[depth];++visits[depth];
+            controller.observe(depth,0,cost[depth]);
+        }
+        std::cout<<"DSpark costly probe time fraction="<<probing/elapsed<<std::endl;
+        require(probing/elapsed<=0.18);
+        require(visits[1]>=4 && visits[2]>=4 && visits[3]>=4);
+    }
+    {
         const std::array<int32_t, 4> drafts{11, 12, 13, 14};
         const std::array<int32_t, 5> partial{11, 12, 99, 14, 15};
         const auto result = verify_greedy(drafts, partial);

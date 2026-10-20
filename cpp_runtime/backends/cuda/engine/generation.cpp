@@ -101,6 +101,7 @@ template <typename Model> struct CudaGenerationOps {
             prefill_finished=true;
         };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+        CudaImageMaskScope image_scope(model,prepared,chunk.offset,chunk.count);
         Tensor hidden;
         bool layer_major=false,short_windows=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
@@ -148,7 +149,8 @@ template <typename Model> struct CudaGenerationOps {
                     std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
-                prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
+                prepared->positions.defined()?MfqOptional<Tensor>(
+                    prepared->positions.narrow(-1,chunk.offset,chunk.count).contiguous()):mfq_nullopt,
                 mfq_nullopt,
                 nullptr,
                 mfq_nullopt,
@@ -370,16 +372,28 @@ template <class Model> struct CudaGenerationContext {
     std::string request_id;
 
     bool batched() const { return batching != nullptr; }
-    void trace_expert_cache(const char* boundary) {
-        // Request boundaries only: these existing counters need no events or
-        // extra per-token synchronization. Diagnostic output drains exchanges.
+    void trace_expert_cache(const char* boundary, bool drain = true) {
+        // Request/first-token boundaries only: existing counters need no
+        // events or per-token synchronization. Full summaries drain exchanges.
         static const bool enabled=[] {
             const char* value=std::getenv("MFQ_TRACE_MOE_SUMMARY");
             return value && value[0] && value[0]!='0';
         }();
         if (!enabled || batching || std::uncaught_exceptions()) return;
         std::cerr << "moe_request_cache_stats boundary=" << boundary << '\n';
-        print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+        if(drain)print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+        // The first-token snapshot must not wait for exchanges or introduce
+        // CUDA synchronization. Subtract it from the end snapshot to isolate
+        // steady decode I/O from the much larger prefill scan.
+        std::cerr << "moe_phase_metrics boundary=" << boundary;
+        for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+            if(name=="ssd_expert_read_wait_ms" || name=="expert_route_wait_ms" ||
+               name=="expert_host_fetch_ms" || name=="expert_host_copy_ms" || name=="expert_transfer_cache_prepare_ms" || name=="ssd_expert_bytes_read" ||
+               name=="ssd_expert_read_count" || name=="ram_expert_cache_hits" ||
+               name=="ram_expert_cache_misses" || name=="ram_expert_pcie_read_bytes" ||
+               name=="expert_logical_transfer_bytes")std::cerr << ' ' << name << '=' << value;
+        }
+        std::cerr << '\n';
         if(model.source) {
             const auto io=model.source->file_read_stats();
             std::cerr<<"runtime_model_io_stats boundary="<<boundary<<" calls="<<io.calls
@@ -422,7 +436,24 @@ template <class Model> struct CudaGenerationContext {
         }
 #endif
     }
+    bool short_streamed_prefill(std::size_t tokens) const {
+        // A short continuation can reuse the bounded MFE path without
+        // returning its expert images and captured graphs for a large PP arena.
+        return model.cache_pos>0 && tokens<=128 &&
+            moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
+    }
+    int64_t prefill_chunk(std::size_t tokens) const {
+        // Reuse ordinary/MTP widths before allocating wider temporary graphs
+        // whose activation storage would displace persistent expert images.
+        return short_streamed_prefill(tokens)?std::min<int64_t>(4,config.generation.prefill_chunk_size):
+            config.generation.prefill_chunk_size;
+    }
     void prepare_prefill_workspace(std::size_t tokens) {
+        if(short_streamed_prefill(tokens)) {
+            std::cerr<<"runtime_streamed_prefill retained_decode=1 tokens="<<tokens
+                <<" chunk="<<prefill_chunk(tokens)<<'\n';
+            return;
+        }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const bool streamed=tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
@@ -444,13 +475,31 @@ template <class Model> struct CudaGenerationContext {
     }
     bool prepare_snapshot() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm> || std::is_same_v<Model,DeepseekV41CausalLm>) {
             // Retire prefill buffers before copying KV/recurrent state. Evict
             // old hot entries before allocating the incoming checkpoint.
             release_moe_prefill_buffers(model.execution->moe_expert_cache);
             // A prefix stores occupied rows, not the full preallocated context
             // or graph-owned speculative checkpoints.
-            const auto incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            std::size_t incoming=0;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            else {
+                incoming=256; // Rolling Engram history and scalar metadata.
+                const auto prefix_bytes=[](const auto& tensor,int64_t rows) -> std::size_t {
+                    return tensor.defined()?std::size_t(tensor.size(0))*rows*tensor.size(2)*tensor.element_size():0;
+                };
+                for(const auto& item:model.blocks) {
+                    const auto& state=dynamic_cast<const deepseek_v41_runtime::Block&>(*item).state;
+                    incoming+=session_tensor_bytes(state.local_kv)+session_tensor_bytes(state.partial_kv)+
+                        session_tensor_bytes(state.partial_score)+prefix_bytes(state.compressed_kv,state.compressed_length)+
+                        prefix_bytes(state.index_k,state.compressed_length);
+                }
+                if(mtp) {
+                    const auto& c=model.config;
+                    incoming+=std::size_t(c.sliding_window)*sizeof(mfq_half)*
+                        (c.n_mtp_layers*c.head_dim+c.hidden*c.dspark_target_layer_ids.size());
+                }
+            }
             std::size_t hot=0,limit=0;
             for(const auto& metric:cache.metrics()) {
                 if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
@@ -460,7 +509,7 @@ template <class Model> struct CudaGenerationContext {
             if(hot>target)cache.trim_hot(target);
             // Transposing graph KV can temporarily hold a contiguous copy in
             // addition to the checkpoint. Include that peak and metadata.
-            const auto needed=incoming*2+(std::size_t(64)<<20);
+            const auto needed=incoming*(std::is_same_v<Model,Qwen4CausalLm>?2:1)+(std::size_t(64)<<20);
             reserve_workspace(needed);
             const auto available=mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
             if(available<needed) {
@@ -473,6 +522,8 @@ template <class Model> struct CudaGenerationContext {
         return true;
     }
     void invalidate_plan() { graph.invalidate(); }
+    std::size_t prefix_boundary=0;
+    void set_prefix_boundary(std::size_t tokens) { prefix_boundary=tokens; }
     bool has_hidden(const Hidden &value) const { return value.defined(); }
     void reset() {
         if (batching) return;
@@ -491,7 +542,7 @@ template <class Model> struct CudaGenerationContext {
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
         prepare_prefill_workspace(input.prompt.size()-reused);
-        auto logical_chunk=config.generation.prefill_chunk_size;
+        auto logical_chunk=prefill_chunk(input.prompt.size()-reused);
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
             // prompts advance each bounded chunk through all layers.
@@ -502,7 +553,8 @@ template <class Model> struct CudaGenerationContext {
                 logical_chunk=input.prompt.size();
         }
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
-            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
+            if(!short_streamed_prefill(input.prompt.size()-reused) &&
+                    (!prepared || !prepared->transformed()))logical_chunk=input.prompt.size();
         }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
@@ -516,11 +568,11 @@ template <class Model> struct CudaGenerationContext {
             *mtp,
             input,
             output,
-            config.generation.prefill_chunk_size,
+            prefill_chunk(input.prompt.size()-reused),
             prepared ? &*prepared : nullptr,
             reused,
             std::move(restored),
-            committed);
+            committed,prefix_boundary);
     }
 };
 

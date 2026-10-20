@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -151,6 +152,16 @@ public:
             std::max(kExplorePeriodMs, 2.0 * period);
         const auto target = explore_due ? most_stale() : best_rival();
         if (!target) return;
+        // A wide SSD verification may cost several ordinary cycles. Budget
+        // the probe's own cost rather than assuming its width is equally cheap.
+        const double target_period=std::max(period,
+            static_cast<double>(kProbeLength)*time_estimate(*target)/kProbeDuty);
+        if(milliseconds_since_probe_<target_period)return;
+        if(!probe_budget_reported_) {
+            probe_budget_reported_=true;
+            std::fprintf(stderr,"runtime_dspark_probe_budget scope=first_probe enabled=1 strategy=candidate_cost depth=%d candidate_cycle_ms=%.3f minimum_gap_ms=%.3f\n",
+                *target,time_estimate(*target),target_period);
+        }
         current_depth_ = *target;
         probe_left_ = kProbeLength;
         milliseconds_since_probe_ = 0.0;
@@ -318,6 +329,7 @@ private:
     int current_depth_ = 1;
     int cycles_ = 0;
     int probe_left_ = 0;
+    bool probe_budget_reported_ = false;
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
     std::vector<double> acceptance_;

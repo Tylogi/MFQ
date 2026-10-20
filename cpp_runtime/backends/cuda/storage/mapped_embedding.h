@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_context.h"
@@ -9,6 +10,11 @@
 // references/strata/src/core/native_head.cpp, MIT license in
 // cpp_runtime/third_party/strata.LICENSE. Preserve MFQ's native floating dtype
 // and gather kernel; only the read-only embedding table changes placement.
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+namespace mfq::cuda {
+inline std::atomic<std::uint64_t> mapped_embedding_host_bytes{0};
+}
+#endif
 inline mfq_tensor_backend::Tensor map_embedding_storage(const mfq_tensor_backend::Tensor& cpu,int device,
         bool device_read_control=false) {
     namespace tb=mfq_tensor_backend;
@@ -23,11 +29,13 @@ inline mfq_tensor_backend::Tensor map_embedding_storage(const mfq_tensor_backend
         explicit Owner(std::size_t count):host(count,true),bytes(count) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             mfq::cuda::charge_tensor_host_bytes(bytes);
+            mfq::cuda::mapped_embedding_host_bytes.fetch_add(bytes,std::memory_order_relaxed);
 #endif
         }
         ~Owner() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             mfq::cuda::tensor_host_bytes.fetch_sub(bytes);
+            mfq::cuda::mapped_embedding_host_bytes.fetch_sub(bytes,std::memory_order_relaxed);
 #endif
         }
     };
