@@ -1,7 +1,7 @@
 #include "storage/state/cache.h"
 #include "text_cache_impl.h"
 #include "settings.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include "csrc/core/mfq_paged_prefix_cache.h"
 #include "ops/execution/cuda_execution.h"
 

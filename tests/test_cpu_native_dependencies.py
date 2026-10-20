@@ -116,6 +116,19 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     assert {"mfq-formats", "mfq-io", "mfq-host-parallel"} <= readers
     assert not readers & {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json",
                           "mfq-engine", "mfq-models", "mfq-cpu-execution"}
+    graph = (tmp_path / "native-closure/targets.dot").read_text()
+    for target in ("mfq-model-graph", "mfq-model-source"):
+        deps = _target_dependencies(graph, target)
+        assert not deps & {"mfq-core", "mfq-engine", "mfq-models", "mfq-cpu-execution",
+                           "mfq-quant-readers", "mfq-cuda-native"}
+    assert "mfq-model-source" not in _target_dependencies(graph, "mfq-model-graph")
+    commands = json.loads((tmp_path / "native-closure/compile_commands.json").read_text())
+    inputs = [item for item in commands if any(target in item["command"] for target in
+              ("mfq-model-source.dir", "mfq-model-graph.dir"))]
+    assert inputs
+    assert all((CSRC / "core").as_posix() not in item["command"] for item in inputs)
+    schema = [item for item in inputs if "mfq-model-graph.dir" in item["command"]]
+    assert len(schema) == 1 and schema[0]["file"].endswith("formats/model_graph/model_graph.cpp")
     if cuda:
         commands = json.loads((tmp_path / "native-closure/compile_commands.json").read_text())
         kernels = [item["command"].replace("\\", "/") for item in commands
@@ -155,7 +168,7 @@ def test_native_source_closure() -> None:
 
 
 @pytest.mark.parametrize("target", [
-    "core/include/mfq/model_source/model_source.h",
+    "model_source/model_source.h",
     "engine/include/engine.h",
     "components/json/json.h",
     "backends/cpu/execution/include/mfq/moe/cpu_expert_pool.h",

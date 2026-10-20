@@ -1,8 +1,8 @@
 #include "cli.h"
 #include "hip_runtime_config.h"
 #include "minicpmo45.h"
-#include "storage/model_source.h"
-#include "mfq/model_source.h"
+#include "storage/source_config.h"
+#include "model_source.h"
 #include "transport.h"
 
 #include <cstddef>

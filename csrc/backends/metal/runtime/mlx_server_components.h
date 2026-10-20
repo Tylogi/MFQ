@@ -6,7 +6,7 @@
 #include "models/flash_next/mlx_qwen4_causal_lm.h"
 #include "models/qwen35/mlx_qwen35_causal_lm.h"
 
-#include "mfq_model_graph.h"
+#include "model_graph/model_graph.h"
 #include "mfq/runtime.h"
 #include "mlx_generation_job.h"
 
@@ -35,31 +35,31 @@ struct MlxEngineComponents {
 };
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
     mlx::core::Stream runtime_stream);

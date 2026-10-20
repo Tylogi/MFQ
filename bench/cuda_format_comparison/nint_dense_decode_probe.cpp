@@ -1,7 +1,7 @@
 #include "timing.h"
 #include "cuda_execution.h"
 #include "storage/weight_loader.h"
-#include "mfq/model_source.h"
+#include "model_source.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "mfq/kernels/cuda/ple_fused.h"
 #include "mfq_cuda_linear_attention_ops.h"

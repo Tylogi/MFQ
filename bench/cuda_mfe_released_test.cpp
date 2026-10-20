@@ -4,7 +4,7 @@
 #include "storage/weights/moe/quant_range_source.h"
 #include "storage/weights/moe/cached_source_internal.h"
 #include "storage/weights/loaders/weight.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include <array>
 #include <cstring>
 #include <memory>

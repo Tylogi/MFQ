@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "nint_row_pipeline.h"
 #include "mfq/quant/nint_row_cache.h"
-#include "mfq/mapped_prefetch_scope.h"
+#include "mapped_prefetch_scope.h"
 #include "kernels/quant_ops.h"
 #include "mfq/host_parallel.h"
 #include "native/context.h"

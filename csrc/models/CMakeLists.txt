@@ -11,6 +11,6 @@ add_library(mfq-models STATIC
 )
 add_library(mfq::models ALIAS mfq-models)
 target_include_directories(mfq-models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mfq-models PUBLIC mfq-core)
+target_link_libraries(mfq-models PUBLIC mfq-engine)
 target_compile_features(mfq-models PUBLIC cxx_std_20)
 set_target_properties(mfq-models PROPERTIES POSITION_INDEPENDENT_CODE ON)

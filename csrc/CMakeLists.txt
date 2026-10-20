@@ -12,6 +12,7 @@ set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 # and tests add these directories to their include path to drive the shared
 # generation loop, which tests/test_engine_include_graph.py keeps bounded.
 set(MFQ_ENGINE_PRIVATE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/model
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/requests
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/batch
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/state
@@ -90,6 +91,7 @@ add_subdirectory(components/json)
 add_subdirectory(formats)
 add_subdirectory(backends/cpu)
 add_subdirectory(components/io)
+add_subdirectory(model_source)
 add_subdirectory(core)
 add_subdirectory(models)
 

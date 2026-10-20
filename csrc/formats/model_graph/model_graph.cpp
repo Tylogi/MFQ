@@ -1,4 +1,4 @@
-#include "mfq_model_graph.h"
+#include "model_graph/model_graph.h"
 
 #include "nlohmann/json.hpp"
 
@@ -55,11 +55,11 @@ std::string optional_identity(const json& object, const char* key) {
     return required_identity(object, key);
 }
 
-MfqGraphComponent parse_component(const json& value) {
+ModelGraphComponent parse_component(const json& value) {
     if (!value.is_object()) {
         throw std::invalid_argument("model graph component must be an object");
     }
-    MfqGraphComponent result;
+    ModelGraphComponent result;
     result.kind = required_identity(value, "kind");
     result.tensor_root = required_identity(value, "tensor_root");
     result.implementation = required_identity(value, "implementation");
@@ -85,7 +85,7 @@ MfqGraphComponent parse_component(const json& value) {
 
 } // namespace
 
-MfqModelGraph MfqModelGraph::from_json(std::string_view payload) {
+ModelGraph ModelGraph::from_json(std::string_view payload) {
     json root;
     try {
         root = json::parse(payload);
@@ -97,7 +97,7 @@ MfqModelGraph MfqModelGraph::from_json(std::string_view payload) {
         throw std::invalid_argument("MFQ model graph must be an object");
     }
 
-    MfqModelGraph result;
+    ModelGraph result;
     const auto version = nonnegative_integer(root, "schema_version");
     if (version <= 0 ||
         version > std::numeric_limits<std::int32_t>::max()) {
@@ -112,7 +112,7 @@ MfqModelGraph MfqModelGraph::from_json(std::string_view payload) {
             "MFQ model graph has no canonical_naming contract");
     }
     result.tensor_namespace = required_identity(*naming, "namespace");
-    if (result.tensor_namespace != kMfqCanonicalTensorNamespace) {
+    if (result.tensor_namespace != kCanonicalTensorNamespace) {
         throw std::invalid_argument(
             "MFQ model graph uses an unsupported tensor namespace");
     }
@@ -195,7 +195,7 @@ MfqModelGraph MfqModelGraph::from_json(std::string_view payload) {
     for (const auto& root : declared_roots) {
         if (std::none_of(
                 result.components.begin(), result.components.end(),
-                [&](const MfqGraphComponent& component) {
+                [&](const ModelGraphComponent& component) {
                     return component.tensor_root == root;
                 })) {
             throw std::invalid_argument(
@@ -247,17 +247,17 @@ MfqModelGraph MfqModelGraph::from_json(std::string_view payload) {
     return result;
 }
 
-const MfqGraphComponent* MfqModelGraph::component(
+const ModelGraphComponent* ModelGraph::component(
         std::string_view kind) const noexcept {
     const auto found = std::find_if(
         components.begin(), components.end(),
-        [kind](const MfqGraphComponent& value) {
+        [kind](const ModelGraphComponent& value) {
             return value.kind == kind;
         });
     return found == components.end() ? nullptr : &*found;
 }
 
-bool MfqModelGraph::has_capability(std::string_view capability) const noexcept {
+bool ModelGraph::has_capability(std::string_view capability) const noexcept {
     return std::find(capabilities.begin(), capabilities.end(), capability) !=
         capabilities.end();
 }

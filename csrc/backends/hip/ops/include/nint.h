@@ -2,7 +2,7 @@
 #pragma once
 
 #include "../../hip/include/mfq_tensor_backend.h"
-#include "mfq/model_source.h"
+#include "model_source.h"
 #include "quant/nint_rows.h"
 
 #include <cstdint>

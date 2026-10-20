@@ -309,7 +309,7 @@ if(BUILD_TESTING)
         ${MFQ_CUDA_ROOT}/tests/kernels/flash_next_test.cpp
         mfq-cuda-native-kernels mfq-json mfq-models)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
-    mfq_add_cuda_test(mfq-nint-row-pipeline-test tests/ops/nint_row_pipeline_test.cpp mfq-model-source mfq-cuda-native-kernels)
+    mfq_add_cuda_test(mfq-nint-row-pipeline-test tests/ops/nint_row_pipeline_test.cpp mfq-model-source mfq-quant-readers mfq-cuda-native-kernels)
     target_compile_definitions(mfq-nint-row-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE
         ${MFQ_CUDA_ROOT}

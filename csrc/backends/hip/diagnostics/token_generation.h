@@ -9,7 +9,7 @@
 #include "core/full_block.h"
 #include "storage/moe_expert_cache.h"
 #include "../../hip/include/mfq_tensor_backend.h"
-#include "mfq/model_source.h"
+#include "model_source.h"
 
 #include <hip/hip_runtime_api.h>
 #include <hip/hip_runtime_api.h>

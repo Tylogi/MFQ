@@ -1,8 +1,8 @@
 #pragma once
 
-#include "grid_vision.h"
-#include "compat/mfq_legacy_tensor_names.h"
-#include "mfq_model_graph.h"
+#include "../../engine/model/common/vision/grid_vision.h"
+#include "tensor_layout.h"
+#include "model_graph/model_graph.h"
 #include "common/model_config.h"
 #include "common/moe.h"
 
@@ -16,7 +16,7 @@
 namespace mfq::models::qwen35 {
 
 struct Config : ModelConfig {
-    MfqLegacyTensorLayout legacy_tensor_layout;
+    TensorLayout legacy_tensor_layout;
     bool attention_output_gate = false;
     std::int64_t num_experts = 0;
     std::int64_t num_experts_per_tok = 0;
@@ -65,7 +65,7 @@ struct Config : ModelConfig {
         return linear_num_value_heads * linear_value_head_dim;
     }
 
-    static Config from_json(std::string_view payload, const MfqModelGraph &graph);
+    static Config from_json(std::string_view payload, const ModelGraph &graph);
 
     template <class Source> static Config from_source(const Source &source) {
         const auto graph = source.resolved_model_graph();

@@ -5,7 +5,7 @@
 #include "models/cuda_model_plan.h"
 #include "block.h"
 #include "resource_plan.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include "common/causal_model.h"
 #include "ops/quant/quant_linear.h"
 

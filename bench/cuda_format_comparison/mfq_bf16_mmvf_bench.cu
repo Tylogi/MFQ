@@ -1,7 +1,7 @@
 #include "timing.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/weights/loaders/weight.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include "kernels/bf16_mmvf.cuh"
 #include <array>
 #include <cstring>

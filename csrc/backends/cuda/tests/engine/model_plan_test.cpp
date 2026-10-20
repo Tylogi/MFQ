@@ -31,8 +31,8 @@ mfq::ModelGraph graph_with(
 
 mfq::ModelGraph grid_vision_graph(std::string backbone = "qwen3_5") {
     auto graph = graph_with(std::move(backbone), "grid_vit", "next_token_prediction");
-    graph.components.at(1).input_contract = mfq::kMfqGridVisionInputContract;
-    graph.components.at(1).position_policy = mfq::kMfqGridMropePositionPolicy;
+    graph.components.at(1).input_contract = mfq::kGridVisionInputContract;
+    graph.components.at(1).position_policy = mfq::kGridMropePositionPolicy;
     return graph;
 }
 

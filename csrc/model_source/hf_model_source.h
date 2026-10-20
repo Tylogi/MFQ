@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/model_source/hf_safetensors_source.h"
+#include "hf_safetensors_source.h"
 
 #include <filesystem>
 #include <memory>
@@ -30,7 +30,7 @@ public:
     const std::vector<TensorMetadata>& tensors() const noexcept override;
     const TensorMetadata* find_tensor(
         std::string_view name) const noexcept override;
-    const MfqLegacyTensorAliases& legacy_tensor_compatibility()
+    TensorLayout tensor_layout()
         const noexcept override;
     void read_range_into(
         std::string_view name,

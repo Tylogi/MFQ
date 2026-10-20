@@ -38,7 +38,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 CSRC = REPO / "csrc"
-SHARED = ("core", "formats", "scheduler", "transport", "engine", "models", "components/io")
+SHARED = ("core", "formats", "model_source", "scheduler", "transport", "engine", "models", "components/io")
 BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/")
 # Family stems anywhere in an identifier: Qwen35, qwen3_5 and is_qwen35 all hit.
 FAMILY_TOKEN = re.compile(
@@ -76,19 +76,27 @@ def check_tree(csrc):
         under_model = relative.startswith("engine/model/")
         under_io = relative.startswith("components/io/")
         under_formats = module == "formats"
+        under_source = module == "model_source"
         exempt = relative in FAMILY_EXCEPTIONS
         for lineno, line in code_lines(path):
             if BACKEND_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: shared layer names a backend: {line.strip()}")
             if module == "engine" and not under_model and not exempt and FAMILY_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: generic engine code names a model family: {line.strip()}")
-        if not (under_model or under_io or under_formats):
+        if not (under_model or under_io or under_formats or under_source):
             continue
         for lineno, raw in includes(path):
             hits = resolve(raw, path, roots)
             if not hits:
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
+            if under_source:
+                if (path.endswith(".h") and not relative.startswith("model_source/compat/") and
+                        target.startswith("model_source/compat/")):
+                    failures.append(f"{relative}:{lineno}: public source header exposes compatibility: {raw}")
+                if target.startswith(("core/", "engine/", "models/", "backends/")):
+                    failures.append(f"{relative}:{lineno}: model source reaches a runtime layer: {raw}")
+                continue
             if under_formats:
                 if (target.startswith(("core/", "engine/", "models/", "model_source/")) or
                         target.startswith("backends/") and not (
@@ -117,6 +125,22 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("public source headers may not expose private aliases", {
+        "model_source/source.h": '#include "compat/aliases.h"\n',
+        "model_source/compat/aliases.h": "struct Aliases {};\n",
+    }, "public source header exposes compatibility"),
+    ("model source may consume the persisted schema", {
+        "model_source/source.cpp": '#include "model_graph/model_graph.h"\n',
+        "formats/model_graph/model_graph.h": "struct Graph {};\n",
+    }, None),
+    ("model source may not reach runtime values in core", {
+        "model_source/source.cpp": '#include "mfq/runtime.h"\n',
+        "core/include/mfq/runtime.h": "struct Request {};\n",
+    }, "model source reaches a runtime layer"),
+    ("model source may not reach the old model chain", {
+        "model_source/source.cpp": '#include "common/forward.h"\n',
+        "models/common/forward.h": "struct Model {};\n",
+    }, "model source reaches a runtime layer"),
     ("format readers may use host workers", {
         "formats/quant/rows.cpp": '#include "mfq/host_parallel.h"\n',
         "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",
@@ -141,8 +165,8 @@ FIXTURES = [
         "components/io/read.cpp": "void f() { mfq::cuda::run(); }\n",
     }, "shared layer names a backend"),
     ("file I/O may not reach a model source", {
-        "components/io/read.cpp": '#include "mfq/model_source/model_source.h"\n',
-        "core/include/mfq/model_source/model_source.h": "struct Source {};\n",
+        "components/io/read.cpp": '#include "model_source.h"\n',
+        "model_source/model_source.h": "struct Source {};\n",
     }, "file I/O reaches a higher layer"),
     ("file I/O may not reach a backend tensor by a bare include", {
         "components/io/read.cpp": '#include "tensor.h"\n',

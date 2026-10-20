@@ -11,7 +11,7 @@ namespace mfq::models::qwen35 {
 
 Config Config::from_json(
         std::string_view payload,
-        const MfqModelGraph& graph) {
+        const ModelGraph& graph) {
     const auto document = nlohmann::json::parse(
         payload.begin(), payload.end(), nullptr, false);
     if (!document.is_object()) {

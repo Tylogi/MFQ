@@ -1,9 +1,9 @@
 #pragma once
 
-#include "mfq/model_graph.h"
+#include "model_graph/model_graph.h"
 #include "file_range_reader.h"
 #include "read_span.h"
-#include "compat/mfq_legacy_tensor_names.h"
+#include "tensor_layout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,11 +57,7 @@ public:
     virtual const std::vector<TensorMetadata>& tensors() const noexcept = 0;
     virtual const TensorMetadata* find_tensor(
         std::string_view name) const noexcept = 0;
-    virtual const MfqLegacyTensorAliases& legacy_tensor_compatibility()
-        const noexcept {
-        static const MfqLegacyTensorAliases compatibility;
-        return compatibility;
-    }
+    virtual TensorLayout tensor_layout() const noexcept { return {}; }
     virtual void read_range_into(
         std::string_view name,
         std::uint64_t relative_offset,

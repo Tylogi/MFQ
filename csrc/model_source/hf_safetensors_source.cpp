@@ -1,4 +1,4 @@
-#include "mfq/model_source/hf_safetensors_source.h"
+#include "hf_safetensors_source.h"
 
 #include "nlohmann/json.hpp"
 

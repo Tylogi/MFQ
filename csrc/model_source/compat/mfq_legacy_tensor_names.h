@@ -1,5 +1,7 @@
 #pragma once
 
+#include "tensor_layout.h"
+
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -7,18 +9,9 @@
 
 namespace mfq {
 
-// Numeric/layout differences that cannot be represented by a no-copy name
-// alias. New schema-v1 artifacts always use canonical semantics; these flags
-// exist only while pre-schema files remain readable.
-struct MfqLegacyTensorLayout {
-    double norm_weight_offset = 1.0;
-    bool linear_attention_a_is_log = true;
-    bool qwen_gdn_gguf_layout = false;
-};
-
 struct MfqLegacyTensorAliases {
     std::unordered_map<std::string, std::string> canonical_to_stored;
-    MfqLegacyTensorLayout layout;
+    TensorLayout layout;
 };
 
 // The sole backend-neutral C++ name compatibility boundary. Runtime loaders

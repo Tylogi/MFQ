@@ -1,4 +1,4 @@
-#include "mfq_model_graph.h"
+#include "model_graph/model_graph.h"
 #include "compat/mfq_legacy_model_graph.h"
 #include "compat/mfq_legacy_tensor_names.h"
 
@@ -27,7 +27,7 @@ void require_invalid(Callable&& callable, const char* message) {
 
 int main() {
     try {
-        const auto graph = mfq::MfqModelGraph::from_json(R"json({
+        const auto graph = mfq::ModelGraph::from_json(R"json({
           "schema_version": 1,
           "architecture": "qwen3_5",
           "canonical_naming": {"namespace": "mfq.tensor", "version": 1, "component_roots": ["model", "vision", "predictor"]},
@@ -56,7 +56,7 @@ int main() {
 
         require_invalid(
             [] {
-                (void)mfq::MfqModelGraph::from_json(R"json({
+                (void)mfq::ModelGraph::from_json(R"json({
                   "schema_version": 1,
                   "architecture": "qwen3_5",
                   "canonical_naming": {"namespace": "hf.tensor", "version": 1, "component_roots": ["model"]},
@@ -68,7 +68,7 @@ int main() {
             "foreign tensor namespace was accepted");
         require_invalid(
             [] {
-                (void)mfq::MfqModelGraph::from_json(R"json({
+                (void)mfq::ModelGraph::from_json(R"json({
                   "schema_version": 1,
                   "architecture": "qwen3_5",
                   "canonical_naming": {"namespace": "mfq.tensor", "version": 1, "component_roots": ["model"]},
@@ -80,7 +80,7 @@ int main() {
             "missing Vision component was accepted");
         require_invalid(
             [] {
-                (void)mfq::MfqModelGraph::from_json(R"json({
+                (void)mfq::ModelGraph::from_json(R"json({
                   "schema_version": 1,
                   "architecture": "qwen3_5",
                   "canonical_naming": {"namespace": "mfq.tensor", "version": 1, "component_roots": ["model"]},

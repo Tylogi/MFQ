@@ -1,8 +1,8 @@
-#include "mfq/model_source/mfq_model_source.h"
+#include "mfq_model_source.h"
 #include "async_range_reader.h"
-#include "mfq/mapped_read_profile.h"
-#include "mfq/mapped_prefetch_scope.h"
-#include "mfq/mapped_tensor_pages.h"
+#include "mapped_read_profile.h"
+#include "mapped_prefetch_scope.h"
+#include "mapped_tensor_pages.h"
 
 #include "compat/format.h"
 #include "compat/mfq_legacy_tensor_names.h"
@@ -723,9 +723,8 @@ const TensorMetadata* MfqModelSource::find_tensor(std::string_view name) const n
         : &impl_->tensors[found->second];
 }
 
-const MfqLegacyTensorAliases&
-MfqModelSource::legacy_tensor_compatibility() const noexcept {
-    return impl_->legacy_tensor_compatibility;
+TensorLayout MfqModelSource::tensor_layout() const noexcept {
+    return impl_->legacy_tensor_compatibility.layout;
 }
 
 void MfqModelSource::read_range_into(

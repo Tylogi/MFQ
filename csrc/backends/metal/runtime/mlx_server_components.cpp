@@ -45,8 +45,8 @@ MlxSamplingParams metal_sampling(const MfqSamplingParams& sampling) {
     return result;
 }
 
-const MfqGraphComponent* component_with_implementation(
-    const MfqModelGraph* graph,
+const ModelGraphComponent* component_with_implementation(
+    const ModelGraph* graph,
     std::string_view kind,
     std::string_view implementation) {
     if (graph == nullptr) return nullptr;
@@ -56,7 +56,7 @@ const MfqGraphComponent* component_with_implementation(
 }
 
 bool component_declared(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::string_view kind) {
     return graph == nullptr || graph->component(kind) != nullptr;
 }
@@ -80,7 +80,7 @@ std::vector<MlxGridShape> grid_shapes(
 
 template <class Runtime>
 static MlxEngineComponents make_grid_vision_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<Runtime>> runtime_holder,
     mlx::core::Stream runtime_stream) {
@@ -171,7 +171,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
 }
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
@@ -180,7 +180,7 @@ MlxEngineComponents make_mlx_engine_components(
 }
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime_holder,
     mlx::core::Stream runtime_stream) {
@@ -499,7 +499,7 @@ MlxEngineComponents make_mlx_engine_components(
 }
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
@@ -649,7 +649,7 @@ MlxEngineComponents make_mlx_engine_components(
 }
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
@@ -775,7 +775,7 @@ MlxEngineComponents make_mlx_engine_components(
 }
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {

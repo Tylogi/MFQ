@@ -47,7 +47,7 @@ bool starts_with(std::string_view value, std::string_view prefix) {
 
 } // namespace
 
-MfqModelGraph synthesize_legacy_model_graph(
+ModelGraph synthesize_legacy_model_graph(
     std::string_view artifact_architecture,
     std::string_view model_config_json,
     const std::function<bool(std::string_view)>& contains_tensor) {
@@ -114,12 +114,12 @@ MfqModelGraph synthesize_legacy_model_graph(
         backbone = "generic_qwen";
     }
 
-    MfqModelGraph graph;
+    ModelGraph graph;
     graph.schema_version = 1;
     graph.architecture = family;
     graph.graph_kind = "causal_lm";
     graph.backbone = backbone;
-    graph.tensor_namespace = std::string(kMfqCanonicalTensorNamespace);
+    graph.tensor_namespace = std::string(kCanonicalTensorNamespace);
     graph.tensor_naming_version = 1;
     graph.topology.text_layers = std::max<std::int64_t>(
         1, integer_value(text, "num_hidden_layers", 1));
@@ -153,8 +153,8 @@ MfqModelGraph synthesize_legacy_model_graph(
                 integer_value(vision, "num_hidden_layers", 1)));
         add_optional(
             "vision", "vision", "grid_vit",
-            std::string(kMfqGridVisionInputContract),
-            std::string(kMfqGridMropePositionPolicy));
+            std::string(kGridVisionInputContract),
+            std::string(kGridMropePositionPolicy));
     }
 
     std::int64_t predictor_layers = integer_value(

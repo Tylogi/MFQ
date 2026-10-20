@@ -1,4 +1,5 @@
 add_library(mfq-engine STATIC
+    model/common/vision/grid_vision.cpp
     weights/slots.cpp
     src/settings.cpp
     src/policy.cpp

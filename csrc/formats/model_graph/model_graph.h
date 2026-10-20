@@ -9,18 +9,18 @@
 
 namespace mfq {
 
-inline constexpr std::string_view kMfqModelGraphAsset =
+inline constexpr std::string_view kModelGraphAsset =
     "__mfq_asset__/model_graph.json";
-inline constexpr std::string_view kMfqHfSourceMapAsset =
+inline constexpr std::string_view kHfSourceMapAsset =
     "__mfq_asset__/hf/source_tensor_map.json";
-inline constexpr std::string_view kMfqCanonicalTensorNamespace =
+inline constexpr std::string_view kCanonicalTensorNamespace =
     "mfq.tensor";
-inline constexpr std::string_view kMfqGridVisionInputContract =
+inline constexpr std::string_view kGridVisionInputContract =
     "grid_vision.v1";
-inline constexpr std::string_view kMfqGridMropePositionPolicy =
+inline constexpr std::string_view kGridMropePositionPolicy =
     "grid_mrope";
 
-struct MfqGraphTopology {
+struct ModelGraphTopology {
     std::int64_t text_layers = 0;
     std::int64_t vision_layers = 0;
     std::int64_t predictor_layers = 0;
@@ -29,7 +29,7 @@ struct MfqGraphTopology {
 // A component describes one composable part of the inference graph. The
 // implementation and policies are stable semantic IDs resolved by each
 // backend's component registry; they are not source-model class names.
-struct MfqGraphComponent {
+struct ModelGraphComponent {
     std::string kind;
     std::string tensor_root;
     std::string implementation;
@@ -39,7 +39,7 @@ struct MfqGraphComponent {
     std::unordered_map<std::string, std::string> options;
 };
 
-struct MfqModelGraph {
+struct ModelGraph {
     std::int32_t schema_version = 0;
     std::string architecture;
     std::string graph_kind;
@@ -47,13 +47,13 @@ struct MfqModelGraph {
     std::string tensor_namespace;
     std::int32_t tensor_naming_version = 0;
     std::vector<std::string> component_roots;
-    MfqGraphTopology topology;
-    std::vector<MfqGraphComponent> components;
+    ModelGraphTopology topology;
+    std::vector<ModelGraphComponent> components;
     std::vector<std::string> capabilities;
 
-    static MfqModelGraph from_json(std::string_view payload);
+    static ModelGraph from_json(std::string_view payload);
 
-    const MfqGraphComponent* component(std::string_view kind) const noexcept;
+    const ModelGraphComponent* component(std::string_view kind) const noexcept;
     bool has_component(std::string_view kind) const noexcept {
         return component(kind) != nullptr;
     }

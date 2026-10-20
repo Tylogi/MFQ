@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 
 #include <filesystem>
 #include <memory>

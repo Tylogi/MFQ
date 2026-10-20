@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_model_graph.h"
+#include "model_graph/model_graph.h"
 
 namespace mfq::metal {
 
@@ -15,6 +15,6 @@ void install_legacy_tensor_compatibility(MfqContainer& model);
 // Every native loader consumes a graph. Canonical artifacts carry it; this
 // function synthesizes the one temporary graph for a pre-schema artifact so
 // legacy architecture strings never leak into backend dispatch.
-mfq::MfqModelGraph effective_model_graph(const MfqContainer& model);
+mfq::ModelGraph effective_model_graph(const MfqContainer& model);
 
 } // namespace mfq::metal

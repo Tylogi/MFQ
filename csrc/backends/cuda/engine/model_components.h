@@ -7,7 +7,7 @@
 #include "ops/execution/execution_options.h"
 #include "storage/weights/moe/expert_cache.h"
 #include <array>
-#include "csrc/core/grid_vision.h"
+#include "common/vision/grid_vision.h"
 #include "mfq/runtime.h"
 #include "kernels/attention/ops.h"
 #include "csrc/core/mfq_paged_prefix_cache.h"
@@ -402,11 +402,11 @@ class CudaGridVisionPromptComponent {
     load(CudaExecutionContext &execution, const mfq::ModelSource &model,
          const GridVisionConfig &vision, int64_t image_token_id, int64_t video_token_id,
          std::string input_contract, std::string position_policy) {
-        if (input_contract != kMfqGridVisionInputContract) {
+        if (input_contract != kGridVisionInputContract) {
             throw std::invalid_argument("unsupported grid-Vision input contract: " +
                                         input_contract);
         }
-        if (position_policy != kMfqGridMropePositionPolicy) {
+        if (position_policy != kGridMropePositionPolicy) {
             throw std::invalid_argument("unsupported grid-Vision position policy: " +
                                         position_policy);
         }

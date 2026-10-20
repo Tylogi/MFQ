@@ -3,19 +3,22 @@
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
 target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`, and adds `model_source/`.
-Pure format headers and frozen codebooks already live in `formats/`, and file
+`engine/model/<family>/`.
+Format schemas, range readers and frozen codebooks live in `formats/`,
+model input lives in `model_source/`, and file
 I/O lives in `components/io/`. That end state is defined in
 [docs/refactor.md](../docs/refactor.md) and sequenced in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — canonical model graph, request/value contracts, policies, and
-  row readers; temporary old-artifact name adapters live in
-  `core/compat/`. This is a transitional aggregation target (`mfq-core`), not a
-  target module: its responsibilities are reassigned in
-  [docs/refactor.md](../docs/refactor.md) and removed by K1–K4 in
+- `core/` — remaining request/value contracts, placement rules and state storage.
+  The transitional `mfq-core` aggregation is removed by K2–K4 in
   [docs/plan.md](../docs/plan.md);
+- `model_source/` — input discovery, metadata normalization and bounded reads,
+  built as `mfq-model-source`. Headers sit beside implementations; old graph/name
+  readers stay in `compat/`. The public source contract exposes layout facts,
+  without the private canonical-to-stored name map. Mapping hints and read
+  profiling belong here with the mapped reader;
 - `formats/` — packed quantization schemas, byte-range decoding helpers and
   frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
   dependency. Compiled NINT/NVQ/MFE range readers live beside those headers
@@ -23,7 +26,9 @@ has landed.
   and host workers but no core/model dependency. Canonical dtype identifiers
   live in `formats/dtype.h`; legacy spelling recognition stays in `formats/compat/`.
   Model sources and backend operators consume the headers directly; CUDA
-  native kernels no longer depend on `mfq-core`;
+  native kernels no longer depend on `mfq-core`. Persisted model schema and
+  validation live in `formats/model_graph/` (`mfq-model-graph`); that target
+  contains no vision algorithm or old model reader;
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
@@ -31,6 +36,9 @@ has landed.
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral logical request lifecycle, admission,
   cancellation decisions and bounded output queues;
+- `engine/model/common/vision/` — shared grid vision configuration, geometry,
+  positions and canonical tensor roles, compiled by `mfq-engine`. Two old model
+  headers still consume this implementation until their K2 migration;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
