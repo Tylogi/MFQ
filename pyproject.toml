@@ -43,13 +43,15 @@ dependencies = [
 
 [project.optional-dependencies]
 benchmark = [
-    "torch>=2.5.0",
     "pandas>=2.0.0,<3",
     "sympy>=1.13.0",
     "regex>=2024.0.0",
     "loguru>=0.7.0",
     "PyYAML>=6.0.0",
     "antlr4-python3-runtime==4.11.1",
+]
+reference = [
+    "mlx-lm==0.31.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -125,6 +127,7 @@ include = ["mfq*"]
 [tool.setuptools.package-data]
 "mfq.calibration" = ["recipes/*.json"]
 "mfq.quantize.cuda" = ["*.cu", "*.cpp", "*.h"]
+"mfq.quantize.hip" = ["*.hip", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",
 ]
@@ -132,6 +135,10 @@ include = ["mfq*"]
 [tool.uv]
 override-dependencies = ["librosa>=0.10.0"]
 conflicts = [
+    [
+        { extra = "reference" },
+        { extra = "minicpmo45" },
+    ],
     [
         { extra = "calibration" },
         { extra = "minicpmo45" },

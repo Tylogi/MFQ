@@ -293,6 +293,9 @@ int main(int argc, char** argv) try {
         check_native_resources();
         check_memory_envelope();
         if (argc == 3) check_engines(argv[1], argv[2]);
+        // CTest runs this without arguments, so the chunked-prefill engine check
+        // below is not part of the CTest result; say so in the log.
+        else std::cout << "model_branch=skipped chunked_prefill needs <model> <tokenizer-gguf>\n";
     }
     return isolated.load(std::memory_order_relaxed) &&
             first.drop_file_cache && !second.drop_file_cache &&

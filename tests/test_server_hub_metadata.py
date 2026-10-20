@@ -225,6 +225,8 @@ def test_default_source_prefers_inspected_metadata_and_keeps_source_order_on_tie
     from mfq.server.protocol.models import ModelCacheProfile
 
     catalog = HubCatalog()
+    catalog._discovered_sources.update((provider, 'Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ')
+        for provider in ('huggingface', 'modelscope'))
     spec = next(item for item in catalog._official_specs() if item.name == 'DeepSeek-V4-Flash-0731')
     repo = spec.sources[0].repo_id
     hf = HubModelInfo(provider='huggingface', repo_id=repo, revision='main',
@@ -263,3 +265,28 @@ def test_dynamic_model_identity_description_and_publication_sort(monkeypatch):
         assert 'PLE' in result.data[0].description and 'SSD' in result.data[0].description
         await catalog.aclose()
     asyncio.run(run())
+
+
+def test_discovered_models_get_capabilities_from_metadata_not_a_builtin_catalog():
+    from mfq.server.protocol.models import ModelParameterBreakdown
+
+    catalog = HubCatalog()
+    repo = 'Tylogi/New-Model-MFQ'
+    key = ('huggingface', repo)
+    catalog._discovered_sources.add(key)
+    info = HubModelInfo(provider=key[0], repo_id=repo, revision='main', files=[],
+        modalities=['text', 'image'], mtp_supported=True,
+        parameter_breakdown=ModelParameterBreakdown(total=100, dense=40, routed_experts=50, ple=10, active=45))
+    catalog._official_cache[key] = info
+    spec = catalog._official_specs()[0]
+    public = catalog._official_model(spec, system_profile())
+    assert public.modalities == ['text', 'image']
+    assert set(public.capabilities) == {'MoE', 'PLE', 'MTP', 'Vision'}
+    assert public.supports_ssd_streaming
+    catalog._official_cache[key] = info.model_copy(update={
+        'parameter_breakdown': ModelParameterBreakdown(total=100, dense=100, routed_experts=0, ple=0, active=100),
+        'modalities': ['text'], 'mtp_supported': False,
+    })
+    public = catalog._official_model(spec, system_profile())
+    assert public.modalities == ['text'] and not public.capabilities
+    assert not public.supports_ssd_streaming

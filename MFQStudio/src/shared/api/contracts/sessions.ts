@@ -148,6 +148,7 @@ export interface ResponseResource {
   performance?: ResponsePerformance | null;
   settings?: {
     sampling: SamplingParams;
+    model?: string | null;
     system_prompt?: string | null;
     include_reasoning_history: boolean;
   } | null;
@@ -177,6 +178,7 @@ export interface GenerationPresetResource {
 
 export interface StreamRequest {
   request_id: string;
+  model?: string;
   expected_revision: number;
   input: ContentPart[];
   input_role?: 'user' | 'tool';

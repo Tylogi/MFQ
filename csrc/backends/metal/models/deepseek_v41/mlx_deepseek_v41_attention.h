@@ -1,8 +1,8 @@
 #pragma once
 
 #include "deepseek_v41_model.h"
-#include "mlx_tensor.h"
-#include "mlx_resource_telemetry.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_resource_telemetry.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -102,7 +102,9 @@ public:
         const mlx::core::array& input,
         MlxDeepseekV41AttentionState& state,
         MlxDeepseekV41SharedAttentionState& shared,
-        int pos0) const;
+        int pos0,
+        bool ced_replay = false,
+        const mlx::core::array* encoder_source = nullptr) const;
 
     // The common MTP engine owns scheduling and verification. These methods
     // expose only this attention layout's compact cache transaction.

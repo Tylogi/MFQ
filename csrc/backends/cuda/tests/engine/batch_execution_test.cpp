@@ -1,7 +1,7 @@
 #include "engine/batch_execution.h"
-#include "request_executor.h"
+#include "table.h"
 #include "common/causal_metadata.h"
-#include "storage/kv/batch_paged.h"
+#include "storage/state/batch_paged.h"
 
 #include <array>
 #include <iostream>
@@ -66,8 +66,8 @@ struct DenseModel {
     int64_t vocab_size() const { return 32; }
     int64_t max_position_embeddings() const { return 256; }
     int64_t num_experts() const { return 0; }
-    bool adapter_uses_decode_sequence_length() const { return false; }
-    std::vector<const void*> adapter_batch_state_addresses(const auto&) const { return {}; }
+    bool uses_decode_sequence_length() const { return false; }
+    std::vector<const void*> batch_state_addresses(const auto&) const { return {}; }
     Tensor hidden_forward(Tensor ids, MfqOptional<Tensor> = {}, MfqOptional<Tensor> = {},
                           void* = nullptr, MfqOptional<Tensor> = {}) {
         return ids.to(kFloat32).unsqueeze(-1);
@@ -87,9 +87,11 @@ static void check_dense_execution(bool graph) {
     CudaContinuousBatchConfig config;
     config.max_sequences = 4; config.cuda_graph = graph; config.cuda_graph_minimum_tokens = 2;
     struct Ops {
+        DenseModel::BatchStorage storage;
         ContinuousBatch<CudaBatchExecution<DenseModel>> batch;
         Ops(DenseModel& model, CudaExecutionContext& context, CudaContinuousBatchConfig config)
-            : batch(2, 2, model, context, config) {}
+            : storage(model, config.max_sequences, config.paged_kv),
+              batch(2, 2, model, context, config, storage) {}
         bool can_overlap(const EngineRequest&) const { return true; }
         bool exclusive() const { return false; }
         bool mtp_available() const { return false; }

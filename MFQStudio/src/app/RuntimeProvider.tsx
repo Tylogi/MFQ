@@ -8,9 +8,9 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings } from '../shared/api/resources/runtime';
+import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings, type KvMemorySettings } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
+import { ApiError, browserServiceUrl, getApiToken, onAuthenticationRequired, onServerInstanceChanged, setApiBaseUrl, setApiToken, setApiServerInstance } from '../shared/api/client';
 import type {
   JobResource,
   RuntimeStatus,
@@ -20,7 +20,7 @@ import type {
   RealtimeCapabilities,
   VoiceOutputComponentStatus,
 } from '../shared/api/types';
-import { studioStatus, studioCredential, startLocalStudio, type StudioStatus } from '../studio';
+import { studioStatus, studioCredential, startLocalStudio, connectExistingStudio, type StudioStatus } from '../studio';
 import { isRuntimeReady, runtimeSelectionNames } from '../features/runtime/modelSelection';
 import { errorMessage } from './formatters';
 import { useJobStore } from '../stores/jobStore';
@@ -38,15 +38,17 @@ interface RuntimeContextValue {
   refreshRuntime: (quiet?: boolean) => Promise<boolean>;
   addJob: (job: JobResource) => void;
   reloadService: () => Promise<boolean>;
+  connectExistingServer: () => Promise<boolean>;
   retryJobStreams: () => void;
   connectionRevision: number;
   ready: boolean;
   loading: boolean;
+  authenticationRequired: boolean;
   connectionError: string | null;
   refreshError: string | null;
   jobStreamErrors: Record<string, string>;
   reloadingInstances: Record<string, number>;
-  reloadModelContext: (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => Promise<JobResource>;
+  reloadModelContext: (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings) => Promise<JobResource>;
 }
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -62,6 +64,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [selectedModel, setSelectedModel] = useState('');
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [authenticationRequired, setAuthenticationRequired] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [jobStreamErrors, setJobStreamErrors] = useState<Record<string, string>>({});
@@ -74,6 +77,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const initializationVersion = useRef(0);
   const selectedRef = useRef(selectedModel);
   selectedRef.current = selectedModel;
+  const transientRuntime = useRef(false);
+  transientRuntime.current = Boolean(runtime?.reloading || runtime?.runtime_state === 'loading' ||
+    instances.some((instance) => instance.state === 'loading' || instance.state === 'unloading'));
+
+  const requireAuthentication = useCallback(() => {
+    ++requestVersion.current;
+    ++jobRequestVersion.current;
+    setAuthenticationRequired(true);
+    setReady(false);
+    setLoading(false);
+    setConnectionError(null);
+    setRefreshError(null);
+    setJobStreamErrors({});
+    useJobStore.getState().clearJobStreams();
+  }, []);
+
+  useEffect(() => onAuthenticationRequired(requireAuthentication), [requireAuthentication]);
 
   const refreshRuntime = useCallback(async (quiet = true): Promise<boolean> => {
     const version = ++requestVersion.current;
@@ -118,23 +138,27 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             ? status.model
             : (names[0] ?? ''),
       );
+      setAuthenticationRequired(false);
       setRefreshError(null);
       return true;
     } catch (cause) {
-      if (mounted.current && version === requestVersion.current) setRefreshError(errorMessage(cause));
+      if (mounted.current && version === requestVersion.current) {
+        if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
+        else setRefreshError(errorMessage(cause));
+      }
       return false;
     } finally {
       if (mounted.current && version === requestVersion.current) setLoading(false);
     }
-  }, []);
+  }, [requireAuthentication]);
 
-  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => {
+  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings) => {
     const version = initializationVersion.current;
     if (reloads.current.has(instanceId)) throw new Error('Model reload is already in progress');
     reloads.current.add(instanceId);
     setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize ?? 0 }));
     try {
-      const result = await runtimeApi.configureContext(contextSize, instanceId, yarnEnabled, qsaKvOffload, kvQuantization);
+      const result = await runtimeApi.configureContext(contextSize, instanceId, yarnEnabled, qsaKvOffload, kvQuantization, kvMemory);
       if (mounted.current && version === initializationVersion.current) {
         ++jobRequestVersion.current;
         useJobStore.getState().addJob(result);
@@ -168,13 +192,20 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       let status = await studioStatus();
       if (!mounted.current || version !== initializationVersion.current) return false;
       setStudio(status);
+      if (status?.connection === 'incompatible' || status?.connection === 'confirmation_required') {
+        setConnectionError(status.connection_error ?? null);
+        setLoading(false);
+        return false;
+      }
       if (status?.config.mode === 'local' && !status.reachable) {
         await startLocalStudio();
         status = await studioStatus();
       }
-      const token = status ? await studioCredential() : getApiToken();
+      if (status && !status.reachable) throw new Error(status.connection_error || 'The server is not ready. Refresh and try again.');
+      const token = status ? await studioCredential().catch(() => '') : getApiToken();
       if (!mounted.current || version !== initializationVersion.current) return false;
       setApiBaseUrl(status?.service_url ?? browserServiceUrl());
+      setApiServerInstance(status?.server?.instance_id ?? '');
       setApiToken(token);
       setStudio(status);
       setSelectedModel('');
@@ -192,12 +223,28 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       return refreshed && mounted.current && version === initializationVersion.current;
     } catch (cause) {
       if (mounted.current && version === initializationVersion.current) {
-        setConnectionError(errorMessage(cause));
+        if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
+        else setConnectionError(errorMessage(cause));
         setLoading(false);
       }
       return false;
     }
-  }, [refreshRuntime]);
+  }, [refreshRuntime, requireAuthentication]);
+
+  const connectExistingServer = useCallback(async () => {
+    if (!studio?.server) return false;
+    setLoading(true);
+    try {
+      await connectExistingStudio(studio.server.instance_id, studio.server.workspace_id);
+      return await reloadService();
+    } catch (cause) {
+      setConnectionError(errorMessage(cause));
+      setLoading(false);
+      return false;
+    }
+  }, [studio, reloadService]);
+
+  useEffect(() => onServerInstanceChanged(() => { void reloadService(); }), [reloadService]);
 
   useEffect(() => {
     mounted.current = true;
@@ -265,12 +312,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         useJobStore.getState().setJobs(jobs);
         retryJobStreams();
         const active = useJobStore.getState().activeJobIds;
-        if (previous.slice().sort().join(',') !== active.slice().sort().join(',')) void refreshRuntime();
+        if (previous.slice().sort().join(',') !== active.slice().sort().join(',') || transientRuntime.current) await refreshRuntime();
       } catch {
         if (!disposed) retryJobStreams();
       } finally {
         running = false;
-        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length ? 1000 : 5000);
+        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length || transientRuntime.current ? 1000 : 5000);
       }
     };
     const resume = () => {
@@ -313,10 +360,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       refreshRuntime,
       addJob,
       reloadService,
+      connectExistingServer,
       retryJobStreams,
       connectionRevision,
       ready,
       loading,
+      authenticationRequired,
       connectionError,
       refreshError,
       jobStreamErrors,
@@ -336,10 +385,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       refreshRuntime,
       addJob,
       reloadService,
+      connectExistingServer,
       retryJobStreams,
       connectionRevision,
       ready,
       loading,
+      authenticationRequired,
       connectionError,
       refreshError,
       jobStreamErrors,

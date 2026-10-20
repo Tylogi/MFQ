@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_staging_allocator.h"
 
 namespace mfq::metal {
 
@@ -18,6 +18,7 @@ bool is_nint_dtype(std::string_view dtype) noexcept;
 namespace detail {
 std::string_view nint_matmul_metal_header() noexcept;
 std::string_view nint_matmul_metal_body() noexcept;
+std::string_view nint_matmul_metal_row_q_body();
 }
 
 struct NintDescriptor {
@@ -192,8 +193,11 @@ public:
     }
     int group_size() const noexcept { return group_size_; }
     int groups() const noexcept { return groups_; }
+    int up_group_size() const noexcept { return up_group_size_; }
+    int up_groups() const noexcept { return up_groups_; }
     int input_size() const noexcept { return input_size_; }
     int output_size() const noexcept { return output_size_; }
+    bool has_uniform_q_bits() const noexcept { return uniform_q_bits_; }
 
 private:
     MlxNintSwiGluPair(
@@ -203,16 +207,22 @@ private:
         mlx::core::array sub_min,
         int group_size,
         int groups,
+        int up_group_size,
+        int up_groups,
         int input_size,
-        int output_size)
+        int output_size,
+        bool uniform_q_bits)
         : q_packed_(std::move(q_packed)),
           row_metadata_(std::move(row_metadata)),
           sub_scale_(std::move(sub_scale)),
           sub_min_(std::move(sub_min)),
           group_size_(group_size),
           groups_(groups),
+          up_group_size_(up_group_size),
+          up_groups_(up_groups),
           input_size_(input_size),
-          output_size_(output_size) {}
+          output_size_(output_size),
+          uniform_q_bits_(uniform_q_bits) {}
 
     mlx::core::array q_packed_;
     mlx::core::array row_metadata_;
@@ -220,8 +230,13 @@ private:
     mlx::core::array sub_min_;
     int group_size_ = 0;
     int groups_ = 0;
+    int up_group_size_ = 0;
+    int up_groups_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;
+    bool uniform_q_bits_ = false;
 };
+
+mlx::core::array pack_nint_single_row(const MlxNintWeight& weight);
 
 } // namespace mfq::metal

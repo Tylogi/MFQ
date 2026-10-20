@@ -1,9 +1,10 @@
 #pragma once
 #include "kernels/norm_ops.h"
+#include "kernels/deepseek_v41.h"
 
-#include "storage/loaders/weight.h"
-#include "storage/mfe_expert_store.h"
-#include "csrc/models/deepseek_v41/engram.h"
+#include "storage/weights/loaders/weight.h"
+#include "storage/weights/mfe_expert_store.h"
+#include "deepseek_v41/engram.h"
 #include "ops/quant/quant_linear.h"
 #include <cstddef>
 #include <cstring>
@@ -281,192 +282,18 @@ class EngramHashState : public mfq::models::deepseek_v41::EngramHashState {
 
 class EngramTable {
   public:
-    static std::shared_ptr<EngramTable> load(const mfq::ModelSource &model, const std::string &name,
-                                             std::int64_t expected_rows, int expected_width,
-                                             std::size_t cache_capacity_rows) {
-        const auto record = require_tensor(model, name);
-        if (record.dtype != "MXFP8") {
-            throw std::runtime_error("DeepSeek-V4.1 Engram table must use native MXFP8: " + name);
-        }
-        auto header =
-            read_record_range(model, name, record.nbytes, 0, engram_detail::kMxHeaderBytes);
-        if (header.size() < engram_detail::kMxHeaderBytes ||
-            std::memcmp(header.data(), "MXT1", 4) != 0 || header[4] != 1 || header[5] != 8 ||
-            header[6] != 0 || header[7] != 0) {
-            throw std::runtime_error("invalid DeepSeek-V4.1 Engram MXFP8 header: " + name);
-        }
-        const auto rows = engram_detail::read_u64_at(header, 8);
-        const auto columns = engram_detail::read_u64_at(header, 16);
-        const auto storage_rows = engram_detail::read_u64_at(header, 24);
-        const auto storage_columns = engram_detail::read_u64_at(header, 32);
-        const auto scale_rows = engram_detail::read_u64_at(header, 40);
-        const auto scale_columns = engram_detail::read_u64_at(header, 48);
-        if (rows != static_cast<std::uint64_t>(expected_rows) ||
-            columns != static_cast<std::uint64_t>(expected_width) || storage_rows != rows ||
-            storage_columns != columns || scale_rows != rows || scale_columns != columns / 32 ||
-            columns == 0 || columns % 32) {
-            throw std::runtime_error("DeepSeek-V4.1 Engram table is not row-wise MXFP8: " + name);
-        }
-        const auto value_bytes = engram_detail::checked_product(rows, columns, "value");
-        const auto scale_bytes = engram_detail::checked_product(scale_rows, scale_columns, "scale");
-        if (value_bytes >
-                std::numeric_limits<std::uint64_t>::max() - engram_detail::kMxHeaderBytes ||
-            scale_bytes > std::numeric_limits<std::uint64_t>::max() -
-                              engram_detail::kMxHeaderBytes - value_bytes ||
-            engram_detail::kMxHeaderBytes + value_bytes + scale_bytes != record.nbytes) {
-            throw std::runtime_error("DeepSeek-V4.1 Engram MXFP8 payload size disagrees: " + name);
-        }
-        return std::shared_ptr<EngramTable>(
-            new EngramTable(model, name, record.nbytes, static_cast<std::int64_t>(rows),
-                            static_cast<int>(columns), value_bytes, cache_capacity_rows));
-    }
-
-    EngramTensor gather(const std::int64_t *rows, int batch, int tokens, int hash_columns,
-                        const mfq_tensor_backend::Device &device) const {
-        const auto expected = static_cast<std::size_t>(batch) * tokens * hash_columns;
-        if (batch <= 0 || tokens <= 0 || hash_columns <= 0 || rows == nullptr) {
-            throw std::invalid_argument("DeepSeek-V4.1 Engram lookup geometry disagrees");
-        }
-        std::vector<std::pair<std::int64_t, std::size_t>> requests;
-        requests.reserve(expected);
-        for (std::size_t index = 0; index < expected; ++index) {
-            if (rows[index] < 0 || rows[index] >= rows_) {
-                throw std::out_of_range("DeepSeek-V4.1 Engram lookup row is outside the table");
-            }
-            requests.emplace_back(rows[index], index);
-        }
-        std::sort(requests.begin(), requests.end(), [](const auto &left, const auto &right) {
-            return left.first < right.first ||
-                   (left.first == right.first && left.second < right.second);
-        });
-        std::vector<float> output(expected * static_cast<std::size_t>(width_));
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::size_t begin = 0;
-        while (begin < requests.size()) {
-            std::size_t end = begin + 1;
-            while (end < requests.size() && requests[end].first == requests[begin].first) {
-                ++end;
-            }
-            const auto &decoded = row_locked(requests[begin].first);
-            for (std::size_t request = begin; request < end; ++request) {
-                std::copy_n(decoded.data(), width_,
-                            output.data() +
-                                requests[request].second * static_cast<std::size_t>(width_));
-            }
-            begin = end;
-        }
-        return mfq_tensor_backend::from_blob(
-                   output.data(), {batch, tokens, static_cast<std::int64_t>(hash_columns) * width_},
-                   mfq_tensor_backend::TensorOptions()
-                       .device(mfq_tensor_backend::kCPU)
-                       .dtype(mfq_tensor_backend::kFloat32))
-            .clone()
-            .to(device, mfq_tensor_backend::kFloat16)
-            .contiguous();
-    }
-
+    static std::shared_ptr<EngramTable> load(const mfq::ModelSource&, const std::string&,
+        std::int64_t expected_rows, int expected_width, std::size_t cache_capacity_rows);
+    ~EngramTable();
+    void prefetch(const std::int64_t* rows, std::size_t count) const;
+    EngramTensor gather(const std::int64_t* rows, int batch, int tokens, int hash_columns,
+                        const mfq_tensor_backend::Device& device) const;
   private:
-    struct CacheEntry {
-        std::vector<float> values;
-        std::list<std::int64_t>::iterator recency;
-    };
-
-    static std::vector<std::uint8_t>
-    read_record_range(const mfq::ModelSource &source, const std::string &name, std::uint64_t nbytes,
-                      std::uint64_t relative_offset, std::uint64_t count) {
-        if (relative_offset > nbytes || count > nbytes - relative_offset ||
-            count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            throw std::out_of_range("model tensor byte range is out of bounds: " + name);
-        }
-        std::vector<std::uint8_t> result(static_cast<std::size_t>(count));
-        source.read_range_into(name, relative_offset, reinterpret_cast<std::byte *>(result.data()),
-                               result.size());
-        return result;
-    }
-
-    EngramTable(const mfq::ModelSource &source, std::string name, std::uint64_t nbytes,
-                std::int64_t rows, int width, std::uint64_t value_bytes, std::size_t capacity)
-        : source_(&source), name_(std::move(name)), nbytes_(nbytes), rows_(rows), width_(width),
-          value_bytes_(value_bytes), capacity_(capacity) {
-        for (std::size_t raw = 0; raw < e4m3_.size(); ++raw) {
-            e4m3_[raw] = engram_detail::decode_e4m3(static_cast<std::uint8_t>(raw));
-        }
-        for (std::size_t raw = 0; raw < e8m0_.size(); ++raw) {
-            e8m0_[raw] = raw == 255 ? std::numeric_limits<float>::quiet_NaN()
-                                    : std::ldexp(1.0f, static_cast<int>(raw) - 127);
-        }
-        scratch_.resize(static_cast<std::size_t>(width_));
-        row_values_.resize(static_cast<std::size_t>(width_));
-        row_scales_.resize(static_cast<std::size_t>(width_ / 32));
-    }
-
-    void read_into(std::uint64_t relative_offset, std::uint8_t *destination,
-                   std::size_t count) const {
-        if (relative_offset > nbytes_ || count > nbytes_ - relative_offset) {
-            throw std::out_of_range("DeepSeek-V4.1 Engram row range is invalid: " + name_);
-        }
-        source_->read_range_into(name_, relative_offset, reinterpret_cast<std::byte *>(destination),
-                                 count);
-    }
-
-    void decode_row(std::int64_t row, std::vector<float> &output) const {
-        read_into(engram_detail::kMxHeaderBytes + static_cast<std::uint64_t>(row) * width_,
-                  row_values_.data(), row_values_.size());
-        read_into(engram_detail::kMxHeaderBytes + value_bytes_ +
-                      static_cast<std::uint64_t>(row) * (width_ / 32),
-                  row_scales_.data(), row_scales_.size());
-        for (int group = 0; group < width_ / 32; ++group) {
-            const auto scale = e8m0_[row_scales_[group]];
-            if (!std::isfinite(scale)) {
-                throw std::runtime_error("DeepSeek-V4.1 Engram row contains an invalid E8M0 scale");
-            }
-            for (int column = 0; column < 32; ++column) {
-                const auto value =
-                    e4m3_[row_values_[static_cast<std::size_t>(group * 32 + column)]];
-                if (!std::isfinite(value)) {
-                    throw std::runtime_error("DeepSeek-V4.1 Engram row contains an E4M3 NaN");
-                }
-                output[static_cast<std::size_t>(group * 32 + column)] = value * scale;
-            }
-        }
-    }
-
-    const std::vector<float> &row_locked(std::int64_t row) const {
-        const auto found = cache_.find(row);
-        if (found != cache_.end()) {
-            recency_.splice(recency_.begin(), recency_, found->second.recency);
-            return found->second.values;
-        }
-        if (capacity_ == 0) {
-            decode_row(row, scratch_);
-            return scratch_;
-        }
-        if (cache_.size() >= capacity_) {
-            const auto victim = recency_.back();
-            recency_.pop_back();
-            cache_.erase(victim);
-        }
-        recency_.push_front(row);
-        CacheEntry entry{std::vector<float>(static_cast<std::size_t>(width_)), recency_.begin()};
-        decode_row(row, entry.values);
-        return cache_.emplace(row, std::move(entry)).first->second.values;
-    }
-
-    const mfq::ModelSource *source_ = nullptr;
-    std::string name_;
-    std::uint64_t nbytes_ = 0;
-    std::int64_t rows_ = 0;
-    int width_ = 0;
-    std::uint64_t value_bytes_ = 0;
-    std::size_t capacity_ = 0;
-    std::array<float, 256> e4m3_{};
-    std::array<float, 256> e8m0_{};
-    mutable std::mutex mutex_;
-    mutable std::list<std::int64_t> recency_;
-    mutable std::unordered_map<std::int64_t, CacheEntry> cache_;
-    mutable std::vector<float> scratch_;
-    mutable std::vector<std::uint8_t> row_values_;
-    mutable std::vector<std::uint8_t> row_scales_;
+    EngramTable(const mfq::ModelSource&, std::string, std::uint64_t nbytes,
+                std::int64_t rows, int width, std::uint64_t value_bytes, std::size_t capacity,
+                std::shared_ptr<mfq::NintRows> nint={});
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class Engram {
@@ -507,6 +334,13 @@ class Engram {
             std::move(projection), (query * key).contiguous()));
     }
 
+    int64_t layer_id() const { return config_.engram_layer_ids[hash_layer_]; }
+
+    void prefetch(const EngramHashBatch& hashes) const {
+        table_->prefetch(hashes.layer_data(hash_layer_),
+            std::size_t(hashes.batch) * hashes.tokens * hashes.columns);
+    }
+
     EngramTensor forward(CudaExecutionContext &execution, const EngramTensor &hidden,
                          const EngramHashBatch &hashes) const {
         const auto batch = hashes.batch;
@@ -517,44 +351,17 @@ class Engram {
             hashes.columns != (config_.engram_max_ngram_size - 1) * config_.engram_n_heads) {
             throw std::invalid_argument("DeepSeek-V4.1 Engram activation geometry disagrees");
         }
-        struct Projection {
-            EngramTensor key, value, source;
-        };
-        return mfq::models::deepseek_v41::engram(
-            [&] {
-                return table_->gather(hashes.layer_data(hash_layer_), batch, tokens, hashes.columns,
-                                      hidden.device());
-            },
-            [&](EngramTensor embeddings) {
-                auto key_value = projection_.forward(execution, embeddings);
-                const auto key_width = config_.hc_mult * config_.hidden;
-                auto key = key_value.narrow(-1, 0, key_width)
-                               .reshape({batch, tokens, config_.hc_mult, config_.hidden})
-                               .to(mfq_tensor_backend::kFloat32);
-                auto value = key_value.narrow(-1, key_width, config_.hidden)
-                                 .reshape({batch, tokens, 1, config_.hidden})
-                                 .to(mfq_tensor_backend::kFloat32);
-                auto source = hidden.to(mfq_tensor_backend::kFloat32);
-                return Projection{key, value, source};
-            },
-            [&](const Projection &p) {
-                const auto &key = p.key;
-                const auto &source = p.source;
-                auto inverse =
-                    mfq_tensor_backend::rsqrt(source.square().mean(-1) + config_.rms_eps) *
-                    mfq_tensor_backend::rsqrt(key.square().mean(-1) + config_.rms_eps);
-                auto score = (source * key * query_key_weight_).sum(-1) * inverse /
-                             std::sqrt(static_cast<double>(config_.hidden));
-                auto sign = (score > 0.0).to(mfq_tensor_backend::kFloat32) -
-                            (score < 0.0).to(mfq_tensor_backend::kFloat32);
-                auto gate = mfq_tensor_backend::sigmoid(sign * score.abs().clamp_min(1e-6).sqrt());
-                return gate;
-            },
-            [&](EngramTensor gate, const Projection &p) {
-                const auto &source = p.source;
-                const auto &value = p.value;
-                return (source + gate.unsqueeze(-1) * value).to(hidden.scalar_type()).contiguous();
-            });
+        auto embeddings = execution.profiler.measure("deepseek_v41.engram.rows", [&] {
+            return table_->gather(hashes.layer_data(hash_layer_), batch, tokens,
+                                  hashes.columns, hidden.device());
+        });
+        auto projected = execution.profiler.measure("deepseek_v41.engram.projection", [&] {
+            return projection_.forward(execution, embeddings);
+        });
+        return execution.profiler.measure("deepseek_v41.engram.gate_add", [&] {
+            return deepseek_v41_engram_gate_add_cuda(hidden, projected.contiguous(),
+                                                       query_key_weight_, config_.rms_eps);
+        });
     }
 
   private:
@@ -571,9 +378,9 @@ class Engram {
 };
 
 } // namespace mfq::cuda::deepseek_v41_runtime
-#include "csrc/backends/cuda/kernels/deepseek_v41.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
+#include "kernels/deepseek_v41.h"
+#include "kernels/deepseek_v4_attention.h"
+#include "kernels/deepseek_v4_hc.h"
 #include "deepseek_v41/config.h"
 #include "models/common/ffn.h"
 
@@ -581,6 +388,7 @@ class Engram {
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -603,6 +411,7 @@ struct SharedState {
     Tensor attention_meta;
     std::unique_ptr<EngramHashState> engram_hash;
     EngramHashBatch engram_hashes;
+    std::vector<Engram*> engram_prefetch;
     std::vector<Tensor> dspark_target_hiddens;
     bool capture_dspark_targets = false;
     std::int64_t compressed_length = 0;
@@ -656,9 +465,9 @@ struct SharedState {
             engram_hash->commit_speculative();
     }
 
-    void rollback_speculative() {
+    void rollback_speculative(int64_t position) {
         MFQ_RUNTIME_CHECK(engram_hash, "DeepSeek-V4.1 Engram state is unavailable");
-        engram_hash->rollback_speculative();
+        engram_hash->rollback_speculative(position);
     }
 
     void reset_session(std::int64_t current_batch) {
@@ -710,7 +519,18 @@ struct SharedState {
         MFQ_RUNTIME_CHECK(layer == next_layer && layer >= 0 && layer < layer_count &&
                               current_batch == batch && current_tokens == tokens &&
                               current_position == cache_position && previous_pre.defined(),
-                          "DeepSeek-V4.1 layer execution order changed");
+                              "DeepSeek-V4.1 layer execution order changed");
+        // Keep current/next Engram reads ahead of attention without launching
+        // every layer's SSD scan together. During CED encoder prefill, decoder
+        // tables will later consume only the bounded replay's hash rows.
+        const auto prefetch_end=current_tokens>config.sliding_window && layer<config.causal_encoder_layers
+            ?config.causal_encoder_layers:layer_count;
+        int issued=0;
+        for(const auto* memory:engram_prefetch) {
+            if(memory->layer_id()<layer || memory->layer_id()>=prefetch_end)continue;
+            memory->prefetch(engram_hashes);
+            if(++issued==2)break;
+        }
         ++next_layer;
         if (!attention_meta.defined() || attention_meta.device() != device) {
             attention_meta = mfq_tensor_backend::empty(
@@ -909,10 +729,14 @@ struct Block final : ::Block {
     Tensor speculative_slot_ids;
     Tensor speculative_partial_kv;
     Tensor speculative_partial_score;
+    Tensor speculative_projected_kv;
+    Tensor speculative_projected_score;
     std::int64_t speculative_position = -1;
     std::int64_t speculative_compressed_length = 0;
     std::int64_t speculative_partial_length = 0;
     bool speculative_pending = false;
+    std::int64_t prefilled_global_end = -1;
+    bool replay_local_window = false;
 
     bool kv_source() const noexcept { return config.is_kv_source(layer); }
 
@@ -948,8 +772,12 @@ struct Block final : ::Block {
         speculative_slot_ids = Tensor();
         speculative_partial_kv = Tensor();
         speculative_partial_score = Tensor();
+        speculative_projected_kv = Tensor();
+        speculative_projected_score = Tensor();
         speculative_position = -1;
         speculative_pending = false;
+        prefilled_global_end = -1;
+        replay_local_window = false;
         if (layer == 0)
             shared->reset_session(batch);
     }
@@ -983,21 +811,44 @@ struct Block final : ::Block {
         speculative_slot_ids = Tensor();
         speculative_partial_kv = Tensor();
         speculative_partial_score = Tensor();
+        speculative_projected_kv = Tensor();
+        speculative_projected_score = Tensor();
         speculative_position = -1;
     }
 
     void rollback_speculative(std::int64_t position) override {
-        MFQ_RUNTIME_CHECK(speculative_pending && position == speculative_position &&
+        MFQ_RUNTIME_CHECK(speculative_pending && position >= speculative_position &&
+                              position <= state.position &&
                               speculative_local_slots.defined() && speculative_slot_ids.defined(),
                           "DeepSeek-V4.1 speculative checkpoint is unavailable");
-        state.local_kv.index_copy_(1, speculative_slot_ids, speculative_local_slots);
+        const auto kept=position-speculative_position;
+        MFQ_RUNTIME_CHECK(kept<=speculative_slot_ids.numel(),"DeepSeek-V4.1 retained prefix is out of range");
+        const auto rejected=speculative_slot_ids.numel()-kept;
+        if(rejected)state.local_kv.index_copy_(1,speculative_slot_ids.narrow(0,kept,rejected),
+            speculative_local_slots.narrow(1,kept,rejected));
         if (speculative_partial_kv.defined()) {
             state.partial_kv.copy_(speculative_partial_kv);
             state.partial_score.copy_(speculative_partial_score);
         }
-        state.position = speculative_position;
+        state.position = position;
         state.compressed_length = speculative_compressed_length;
         state.partial_length = speculative_partial_length;
+        if(kept && kv_source()) {
+            const auto total=speculative_partial_length+kept;
+            state.compressed_length+=total/ratio;
+            state.partial_length=total%ratio;
+            // Complete compressed rows already contain the accepted prefix.
+            // Rebuild only its unfinished group from the saved projections;
+            // this needs no attention, projection or expert recomputation.
+            for(int64_t slot=0;slot<state.partial_length;++slot) {
+                const auto source=total-state.partial_length+slot-speculative_partial_length;
+                if(source<0)continue; // The original partial group was restored above.
+                MFQ_RUNTIME_CHECK(speculative_projected_kv.defined() && speculative_projected_score.defined(),
+                                  "DeepSeek-V4.1 retained compressor projections are unavailable");
+                state.partial_kv.narrow(1,slot,1).copy_(speculative_projected_kv.narrow(1,source,1));
+                state.partial_score.narrow(1,slot,1).copy_(speculative_projected_score.narrow(1,source,1));
+            }
+        }
         commit_speculative();
     }
 
@@ -1007,21 +858,18 @@ struct Block final : ::Block {
                        const Tensor &function, const Tensor &scale, const Tensor &base,
                        const Tensor &norm, const char *profile) const {
         return profiler.measure(profile, [&]() {
-            auto flat = residual.flatten(2).to(mfq_tensor_backend::kFloat32);
-            auto inverse = mfq_tensor_backend::rsqrt(flat.square().mean(-1, true) + config.rms_eps);
-            auto mixes = mfq_tensor_backend::matmul(flat * inverse, function.transpose(0, 1));
-            auto expansion = dsv4_hc_pre_cuda(residual, mixes.contiguous(), scale, base,
-                                              config.hc_sinkhorn_iters, config.hc_eps);
-            auto next_pre =
-                mfq_tensor_backend::sigmoid(mixes.slice(-1, 0, config.hc_mult) * scale.index({0}) +
-                                            base.slice(0, 0, config.hc_mult)) +
-                config.hc_eps;
-            auto branch = (previous_pre.to(mfq_tensor_backend::kFloat32).unsqueeze(-1) *
-                           residual.to(mfq_tensor_backend::kFloat32))
-                              .sum(2);
-            branch = weighted_rms(branch, norm, config.rms_eps);
-            return MhcResult{std::move(branch), next_pre.contiguous(), expansion.at(1),
-                             expansion.at(2)};
+            if(residual.size(0)*residual.size(1)<=8) {
+                auto partials=deepseek_v41_hc_project_cuda(residual,previous_pre,function);
+                auto result=deepseek_v41_hc_finalize_cuda(residual,previous_pre,norm,partials,scale,base,
+                    config.hc_sinkhorn_iters,config.rms_eps,config.hc_eps);
+                return MhcResult{std::move(result[0]),std::move(result[1]),std::move(result[2]),std::move(result[3])};
+            }
+            auto prepared = deepseek_v41_hc_prepare_cuda(residual, previous_pre, norm, config.rms_eps);
+            auto mixes = mfq_tensor_backend::matmul(prepared.at(0), function.transpose(0, 1));
+            auto coefficients = dsv4_hc_coefficients_cuda(mixes.contiguous(), scale, base,
+                                                          config.hc_sinkhorn_iters, config.hc_eps);
+            return MhcResult{std::move(prepared.at(1)), std::move(coefficients.at(0)),
+                             std::move(coefficients.at(1)), std::move(coefficients.at(2))};
         });
     }
 
@@ -1056,6 +904,10 @@ struct Block final : ::Block {
                 projected_score = compressor_gate.forward(execution, input)
                                       .to(mfq_tensor_backend::kFloat32)
                                       .contiguous();
+                if(speculative_pending) {
+                    speculative_projected_kv=projected_kv;
+                    speculative_projected_score=projected_score;
+                }
             },
             [&](int64_t complete, int64_t cutoff) {
                 auto kv_groups = projected_kv.narrow(1, 0, cutoff)
@@ -1088,7 +940,9 @@ struct Block final : ::Block {
 
     void publish_compressed_source(CudaExecutionContext &execution, const Tensor &input,
                                    std::int64_t position) {
-        auto latent = update_compressed_source(execution, input, position);
+        std::optional<Tensor> latent;
+        if (prefilled_global_end == position + input.size(1)) prefilled_global_end = -1;
+        else latent = update_compressed_source(execution, input, position);
         if (latent) {
             const auto count = latent->size(1);
             const auto begin = state.compressed_length;
@@ -1120,6 +974,10 @@ struct Block final : ::Block {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         const auto pool_length = shared->compressed_length;
+        Tensor candidates;
+        // Restrict scoring only when the candidate budget excludes some KV.
+        // An all-inclusive list adds scattered loads without reducing work.
+        const bool restricted = pool_length > config.candidate_topk_blocks * config.candidate_block_size;
         return mfq::models::deepseek_v41::hierarchical_index(
             ratio, index_source(), layer, config.candidate_source_layer, pool_length,
             [&] { return empty_topk(batch, tokens, input.device()); },
@@ -1142,26 +1000,30 @@ struct Block final : ::Block {
                                    .reshape({batch, tokens, config.index_n_heads})
                                    .to(mfq_tensor_backend::kFloat16)
                                    .contiguous();
-                auto scores = dsv4_indexer_scores_cuda(
-                    query, shared->index_k.narrow(1, 0, pool_length).contiguous(), weights,
-                    position, ratio);
-                return scores;
+                auto keys = shared->index_k.narrow(1, 0, pool_length).contiguous();
+                if (layer > config.candidate_source_layer && restricted) {
+                    MFQ_RUNTIME_CHECK(shared->candidate_blocks.defined(),
+                                      "DeepSeek-V4.1 hierarchical indexer has no candidates");
+                    candidates = candidate_positions(shared->candidate_blocks,
+                                                     config.candidate_block_size, pool_length);
+                    return execution.profiler.measure("deepseek_v41.indexer.candidate_scores", [&] {
+                        return dsv4_indexer_candidate_scores_cuda(query, keys, weights, candidates,
+                                                                  position, ratio);
+                    });
+                }
+                return execution.profiler.measure("deepseek_v41.indexer.full_scores", [&] {
+                    return dsv4_indexer_scores_cuda(query, keys, weights, position, ratio);
+                });
             },
             [&](Tensor scores) {
-                shared->candidate_blocks = candidate_blocks_from_scores(
+                if (restricted) shared->candidate_blocks = candidate_blocks_from_scores(
                     scores, ratio, position, config.candidate_topk_blocks,
                     config.candidate_block_size);
             },
             [&](Tensor scores) {
-                MFQ_RUNTIME_CHECK(shared->candidate_blocks.defined(),
-                                  "DeepSeek-V4.1 hierarchical indexer has no candidates");
-                auto candidates = candidate_positions(shared->candidate_blocks,
-                                                      config.candidate_block_size, pool_length);
-                auto safe = candidates.clamp(0.0, static_cast<double>(pool_length - 1));
-                auto candidate_scores = scores.gather(-1, safe);
-                candidate_scores = mfq_tensor_backend::where(
-                    candidates >= 0.0, candidate_scores, -std::numeric_limits<float>::infinity());
-                return select_topk(candidate_scores, config.index_topk, pool_length, candidates);
+                if (!restricted) return select_topk(scores, config.index_topk, pool_length);
+                MFQ_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
+                return select_topk(scores, config.index_topk, pool_length, candidates);
             },
             [&](Tensor scores) { return select_topk(scores, config.index_topk, pool_length); },
             [&](Tensor topk) { shared->topk = std::move(topk); });
@@ -1169,9 +1031,11 @@ struct Block final : ::Block {
 
     Tensor attention_forward(CudaExecutionContext &execution, const Tensor &input,
                              const Tensor &positions, std::int64_t position,
-                             const MfqOptional<Tensor> &sequence_lengths) {
+                             const MfqOptional<Tensor> &sequence_lengths,
+                             bool truncated_local = false) {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
+        const auto local_history = truncated_local ? 0 : std::min(position, config.sliding_window);
         return mfq::models::deepseek_v41::attention(
             kv_source(), ratio,
             [&] {
@@ -1215,7 +1079,7 @@ struct Block final : ::Block {
                     state.local_kv.index_copy_(1, slot, local);
                     local_for_attention = state.local_kv;
                 } else {
-                    const auto history = std::min(position, config.sliding_window);
+                    const auto history = local_history;
                     std::vector<Tensor> local_parts;
                     if (history > 0) {
                         auto slots = mfq_tensor_backend::arange(
@@ -1269,7 +1133,7 @@ struct Block final : ::Block {
                     MFQ_RUNTIME_CHECK(
                         !sequence_lengths.has_value(),
                         "DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
-                    const auto history = std::min(position, config.sliding_window);
+                    const auto history = local_history;
                     plan =
                         dsv4_build_prefill_plan_cuda(topk, position, history, pool_length,
                                                      ratio > 0 ? ratio : 1, config.sliding_window);
@@ -1291,6 +1155,17 @@ struct Block final : ::Block {
             [&](Tensor attended) { return output_projection(execution, attended); });
     }
 
+    Tensor forward_context(CudaExecutionContext& execution,Tensor hidden,
+            const ::Block::Context& context,const RopeCache& rope) override {
+        if(context.confirmed_prefix>0) {
+            // A joint pass writes pending and draft rows. Protect their whole
+            // physical window; rollback retains the confirmed prefix as well.
+            begin_speculative(hidden.size(1));
+            if(layer==0)shared->begin_speculative();
+        }
+        return ::Block::forward_context(execution,std::move(hidden),context,rope);
+    }
+
     Tensor forward(CudaExecutionContext &execution, Tensor hidden, Tensor positions,
                    std::int64_t cache_position, const MfqOptional<Tensor> &sequence_lengths,
                    const RopeCache &, const MfqOptional<Tensor> &cache_positions = mfq_nullopt,
@@ -1306,6 +1181,7 @@ struct Block final : ::Block {
                             hidden.device(), current_ids);
 
         const auto batch = hidden.size(0), tokens = hidden.size(1);
+        const bool truncated_local = std::exchange(replay_local_window, false);
         return mfq::models::deepseek_v41::decoder_layer(
             std::move(hidden), bool(engram), shared->previous_pre,
             [&](Tensor value) {
@@ -1324,8 +1200,10 @@ struct Block final : ::Block {
                                             : "deepseek_v41.mhc.mlp.collapse");
             },
             [&](Tensor value) {
-                return attention_forward(execution, value, positions, cache_position,
-                                         sequence_lengths);
+                return profiler.measure("deepseek_v41.attention", [&] {
+                    return attention_forward(execution, value, positions, cache_position,
+                                             sequence_lengths, truncated_local);
+                });
             },
             [&](Tensor value, Tensor residual, const auto &mix, int branch) {
                 return expand(profiler, value, residual, mix,
@@ -1333,8 +1211,10 @@ struct Block final : ::Block {
                                           : "deepseek_v41.mhc.mlp.expand");
             },
             [&](Tensor value) {
-                return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
-                    .reshape({batch, tokens, config.hidden});
+                return profiler.measure("deepseek_v41.mlp", [&] {
+                    return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
+                        .reshape({batch, tokens, config.hidden});
+                });
             });
     }
 };
@@ -1376,32 +1256,40 @@ inline int run_self_check() {
 namespace mfq::cuda {
 
 struct DeepseekV41Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.predictor = CudaPredictorAdapter::deepseek_v41_dspark};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
+    static constexpr bool joint_speculation_supported=true;
+    bool adapter_prefetch_token_rows(DeepseekV41CausalLm&,const mfq_tensor_backend::Tensor&);
     template <class Backend> using CausalModel = mfq::models::deepseek_v41::CausalLm<Backend>;
     mfq::models::deepseek_v41::Config config;
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
 
-    void adapter_validate_load_options() const;
-    void adapter_load_final_state(const mfq::ModelSource &source,
+    void validate_load_options() const;
+    void load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
-    void adapter_prepare_blocks(const mfq::ModelSource &source);
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    void prepare_blocks(const mfq::ModelSource &source);
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    void adapter_begin_forward(bool capture_raw_hidden);
+    void begin_forward(bool capture_raw_hidden);
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;
     mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
                                                 const mfq_tensor_backend::Tensor &output_norm,
                                                 int64_t batch, int64_t tokens) const;
     mfq_tensor_backend::Tensor
-    adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+    extract_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
                        const mfq_tensor_backend::Tensor &finalized) const;
-    void adapter_begin_speculative();
-    void adapter_commit_speculative();
-    void adapter_rollback_speculative(int64_t keep);
+    void native_begin_speculation();
+    void native_commit_speculation();
+    void native_rollback_speculation(int64_t keep);
 };
 
 extern template struct CudaSessionCodec<DeepseekV41Model>;
+
+mfq_tensor_backend::Tensor deepseek_v41_prefill_hidden(
+    DeepseekV41CausalLm& model, mfq_tensor_backend::Tensor ids, std::int64_t compute_chunk,
+    const std::function<bool()>& stopped = {}, mfq_tensor_backend::Tensor* raw_hidden = nullptr);
 
 } // namespace mfq::cuda
 

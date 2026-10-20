@@ -28,7 +28,7 @@ struct Gemma4Model : CausalResources {
     mfq::models::gemma4::Config config;
     double embed_scale = 1.0;
 
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 };
 

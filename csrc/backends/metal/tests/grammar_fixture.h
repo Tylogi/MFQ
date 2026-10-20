@@ -2,7 +2,7 @@
 
 #include "chat.h"
 #include "gguf.h"
-#include "token_constraint.h"
+#include "constraint.h"
 #include "tokenizer.h"
 
 #include <map>

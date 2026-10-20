@@ -64,6 +64,12 @@ Source installations use the managed build automatically, including a custom
 `mfq build --build-dir`. Packaged distributions pass their bundled worker with
 `--running-executable`.
 
+On CUDA, every automatic build requests the `mfq-runtime` target only. A missing
+`mfq-diagnostics` or `mfq-eval` never blocks the server or normal inference: a
+`model.validate` job reports `tool_unavailable` naming the expected path and the
+`cmake --build "<build-dir>" --config <configuration> --target mfq-diagnostics`
+command that produces it. See [optional native tools](build.md#optional-native-tools).
+
 ## Application and private listeners
 
 `--host` and `--port` control only the user-facing FastAPI/Uvicorn listener:
@@ -93,6 +99,11 @@ MFQ_SERVER_API_KEY='replace-with-a-secret' \
 `--api-key-env` changes the name of the environment variable read by the
 server; it does not accept a secret value on the command line.
 
+`--anthropic-port` opens a second public listener dedicated to the Anthropic
+Messages API (`/v1/messages`); it defaults to the saved listener port or
+`8091`. Both listeners serve the same models, and the running port/protocol
+can be changed later through `PUT /api/v1/runtime/listener`.
+
 When the selected environment variable is unset or empty, API authentication is
 disabled. When it is set, its value is the administrator credential. HTTP
 requests under `/api/` must send it as a bearer token, and realtime WebSocket
@@ -120,14 +131,18 @@ authentication is enabled.
 
 ## Web UI
 
-When Web UI assets are available, open the listener root, such as
-`http://127.0.0.1:8090/`. Asset selection follows this order:
+Web UI is enabled unless you explicitly pass `--no-web-ui`. Open the listener
+root, such as `http://127.0.0.1:8090/`. Asset selection follows this order:
 
 1. `--no-web-ui` disables the Web UI.
 2. `--web-root` uses the specified prebuilt directory.
 3. `MFQ_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
-4. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
+4. Packaged Studio servers use their bundled `web-ui` assets without Node.js/npm.
+5. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
+
+Studio starts both the API and Web UI on the same listener; it does not open a
+browser automatically. The desktop client and browsers share that server.
 
 A prebuilt directory must contain `index.html`. MFQ checks explicit and
 environment-provided directories before starting the backend or loading a
@@ -140,8 +155,9 @@ In automatic source mode, MFQ rebuilds the UI when the sources are newer than
 2. `npm run build`
 
 This needs Node.js/npm, write access to the checkout, and network access when
-npm must download packages. Without npm, the API still starts. A failed build
-or missing `dist/index.html` stops startup before model loading.
+npm must download packages. Missing assets, unavailable npm when a build is
+needed, or a failed build stop startup before model loading, with instructions
+to supply `--web-root` or explicitly select `--no-web-ui` for an API-only server.
 
 Explicit Web UI modes:
 
@@ -223,7 +239,25 @@ uv run mfq serve \
 - `--context-size 0` leaves context sizing to the native runtime.
 - `--prefill-chunk-size` is forwarded to the Metal worker; the CUDA worker does
   not receive this option.
+- `--max-requests-per-runtime N` enables continuous batching on supported
+  native paths; capacity limits and scheduling behavior are documented in
+  [Flash-Next continuous batching](../runtime/cuda-continuous-batching.md).
 - `--runtime-startup-timeout` covers native worker startup and model loading.
+
+Persistent Session KV caching is configured with `--prefix-cache-dir`,
+`--prefix-cache-disk-size`, `--prefix-cache-hot-size`, and
+`--prefix-cache-block-tokens`; `--no-prefix-cache` disables it entirely. The
+cache survives restarts in the configured directory and its entries can be
+inspected and purged through the [runtime API](../api/http.md).
+
+Resident-model admission is capped by `--max-runtime-memory`, and
+`--moe-gpu-cache-gb` bounds the resident routed-expert cache (`0` keeps
+experts fully resident; native HF Metal models otherwise choose an automatic
+budget). `--no-memory-guard` disables the automatic Metal model-residency
+budget. `--max-queued-requests-per-runtime` bounds waiting requests per
+worker, and `--runtime-idle-timeout` is the default unload delay for idle
+unpinned models; instances may override it through the runtime API.
+`--no-access-log` silences the per-request access-log line.
 
 ## Command options
 
@@ -232,7 +266,9 @@ uv run mfq serve \
 | `--model PATH` | Optional initial MFQ model file. | None |
 | `--running-executable PATH` | Prebuilt native worker used by packaged deployments. | Managed build |
 | `--host HOST` | Public API bind address. | `127.0.0.1` |
-| `--port PORT` | Public API port, from 1 to 65535. | `8090` |
+| `--port PORT` | OpenAI API bind port. | Saved listener port or `8090` |
+| `--anthropic-port PORT` | Dedicated Anthropic Messages API port. | Saved listener port or `8091` |
+| `--access-log / --no-access-log` | Emit one HTTP access-log line per request. | Enabled |
 | `--context-size N` | Native context size; `0` keeps the runtime default. | `0` |
 | `--prefill-chunk-size N` | Metal prefill chunk size. | `2048` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |
@@ -245,6 +281,16 @@ uv run mfq serve \
 | `--api-key-env NAME` | Environment variable containing the administrator API key. | `MFQ_SERVER_API_KEY` |
 | `--max-runtime-instances N` | Maximum managed native workers. | `2` |
 | `--max-requests-per-runtime N` | Concurrent requests per worker. | `1` |
+| `--max-queued-requests-per-runtime N` | Waiting requests per worker. | `max(32, 4 × concurrency)` |
+| `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
+| `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic on native HF Metal |
+| `--no-memory-guard` | Disable the automatic Metal model-residency budget. | Off |
+| `--prefix-cache-dir PATH` | Persistent Session KV cache directory. | Managed `prefix-cache` directory beside the server database |
+| `--prefix-cache-disk-size SIZE` | Maximum persistent Session KV cache size, such as `100G`. | None |
+| `--prefix-cache-hot-size SIZE` | Maximum RAM hot-cache size, such as `2G`. | None |
+| `--prefix-cache-block-tokens N` | Tokens per content-addressed Session KV block. | Runtime default |
+| `--no-prefix-cache` | Disable persistent Session KV caching. | Off |
+| `--runtime-idle-timeout SECONDS` | Default unload delay for an idle unpinned model. | Runtime default |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
 | `--backend {auto,cuda,metal}` | Select or detect the native backend. | `auto` |
 | `--transport {stdio,http}` | Python-to-native-runtime communication transport. | `stdio` |

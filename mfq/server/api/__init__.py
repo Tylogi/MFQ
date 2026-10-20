@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from mfq.server.api.auth import ApiKeyManager, required_scope
+from mfq.server.api.auth import ApiKeyManager, AuthenticationPolicy, required_scope
 from mfq.server.api.anthropic_compat import error_body as anthropic_error_body, error_type as anthropic_error_type, is_anthropic_request
 from mfq.server.api.routes.anthropic import router as anthropic_router
 from mfq.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
@@ -33,6 +32,7 @@ from mfq.server.api.routes.sessions import router as session_router
 from mfq.server.api.static import SPAStaticFiles
 from mfq.server.protocol.models import ErrorDetail, ErrorResponse
 from mfq.server.services.service import ServerService, ServiceError
+from mfq.server.instance import server_identity as make_server_identity
 
 
 def create_app(
@@ -41,6 +41,8 @@ def create_app(
     web_root: str | Path | None = None,
     api_key: str = "",
     api_keys: ApiKeyManager | None = None,
+    auth_settings_path: str | Path | None = None,
+    server_identity: dict[str, str | int] | None = None,
 ) -> FastAPI:
     """Create an executable app, or a route-only contract app when service is omitted."""
 
@@ -62,33 +64,26 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.service = service
+    app.state.server_identity = server_identity if server_identity is not None else make_server_identity()
     app.state.api_key = api_key
     app.state.api_keys = api_keys
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "tauri://localhost",
-            "http://tauri.localhost",
-            "https://tauri.localhost",
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-            "http://127.0.0.1:5174",
-            "http://localhost:5174",
-        ],
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta"],
-    )
-
+    app.state.auth_policy = AuthenticationPolicy(api_key or (api_keys.root_key if api_keys else ""),
+        enabled=api_keys is not None, path=Path(auth_settings_path) if auth_settings_path is not None else None)
     @app.middleware("http")
     async def protect_and_harden(request: Request, call_next: Any) -> Response:
-        if (api_key or api_keys is not None) and request.url.path.startswith(("/api/", "/v1")):
+        expected_instance = request.headers.get("x-mfq-instance-id")
+        if expected_instance and expected_instance != app.state.server_identity["instance_id"]:
+            detail = ErrorDetail(code="server_instance_changed", message="The server instance changed. Reconnect and confirm the new server.")
+            return JSONResponse(status_code=409, content=ErrorResponse(error=detail).model_dump(mode="json"))
+        policy = app.state.auth_policy
+        if policy.enabled and request.method != "OPTIONS" and request.url.path.startswith(("/api/", "/v1")):
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
             anthropic = is_anthropic_request(request)
             if not supplied and anthropic:
                 supplied = request.headers.get("x-api-key", "")
-            authenticated = api_keys.authenticate(supplied) if api_keys is not None else None
-            legacy = api_key and secrets.compare_digest(supplied, api_key)
+            authenticated = api_keys.authenticate(supplied, include_root=False) if api_keys is not None else None
+            legacy = policy.matches(supplied)
             scope = required_scope(request.method, request.url.path)
             if not legacy and authenticated is None:
                 detail = ErrorDetail(code="unauthorized", message="invalid API credential")
@@ -122,6 +117,21 @@ def create_app(
             "script-src 'self'; font-src 'self' data:"
         )
         return response
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:5174",
+            "http://localhost:5174",
+        ],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta", "X-MFQ-Instance-ID"],
+    )
 
     @app.exception_handler(ServiceError)
     async def handle_service_error(request: Request, error: ServiceError) -> JSONResponse:

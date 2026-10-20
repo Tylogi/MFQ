@@ -1,5 +1,5 @@
 #include "models/common/transformer_loader.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 #include "dspark.h"
@@ -21,6 +21,7 @@ FFN load_moe_at(CudaExecutionContext &execution, const mfq::ModelSource &model,
     result.moe_router_scale = config.routed_scaling;
     result.swiglu_limit = config.swiglu_limit;
     result.shared->swiglu_limit = config.swiglu_limit;
+    result.prepare_moe_pipeline(execution);
     return result;
 }
 
@@ -38,9 +39,12 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
     result->shared = shared;
     if (config.has_engram(layer)) {
         result->engram = Engram::load(execution, model, config, static_cast<int>(layer));
+        shared->engram_prefetch.push_back(result->engram.get());
     }
-    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight");
-    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight");
+    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight")
+                                 .to(mfq_tensor_backend::kFloat32).contiguous();
+    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight")
+                           .to(mfq_tensor_backend::kFloat32).contiguous();
     result->query_a_norm =
         load_dense_gpu(execution, model, prefix + "attention.query_a_norm.weight");
     result->key_value_norm =
@@ -175,27 +179,38 @@ Tensor finalize_hidden(const std::shared_ptr<SharedState> &state, const Tensor &
 
 namespace mfq::cuda {
 
-void DeepseekV41Model::adapter_validate_load_options() const {
+void DeepseekV41Model::validate_load_options() const {
     deepseek_v41_runtime::validate_load_options(*execution);
 }
 
-void DeepseekV41Model::adapter_load_final_state(const mfq::ModelSource &source,
+void DeepseekV41Model::load_final_state(const mfq::ModelSource &source,
                                                 mfq_tensor_backend::Tensor &output_norm) {
-    CausalResources::adapter_load_final_state(source, output_norm);
+    CausalResources::load_final_state(source, output_norm);
 }
 
-void DeepseekV41Model::adapter_prepare_blocks(const mfq::ModelSource &source) {
+void DeepseekV41Model::prepare_blocks(const mfq::ModelSource &source) {
     shared = deepseek_v41_runtime::load_shared_state(source, config);
 }
 
-std::unique_ptr<Block> DeepseekV41Model::adapter_load_block(const mfq::ModelSource &source,
+bool DeepseekV41Model::adapter_prefetch_token_rows(DeepseekV41CausalLm& model,
+        const mfq_tensor_backend::Tensor& ids) {
+    if(!shared || shared->batch!=1 || !shared->engram_hash || shared->engram_prefetch.empty())return false;
+    if(!ids.is_cpu() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<=0 ||
+            ids.size(1)>std::numeric_limits<int>::max() || ids.scalar_type()!=mfq_tensor_backend::kInt64 ||
+            !ids.is_contiguous())throw std::invalid_argument("Engram prefetch needs contiguous host token IDs");
+    const auto hashes=shared->engram_hash->preview(ids.data_ptr<int64_t>(),1,int(ids.size(1)),model.cache_pos);
+    for(const auto* memory:shared->engram_prefetch)memory->prefetch(hashes);
+    return true;
+}
+
+std::unique_ptr<Block> DeepseekV41Model::load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {
     MFQ_RUNTIME_CHECK(type == "deepseek_v41" && shared, "invalid DeepSeek-V4.1 block loader state");
     return deepseek_v41_runtime::load_block(*execution, source, layer, shared);
 }
 
-void DeepseekV41Model::adapter_begin_forward(bool capture_raw_hidden) {
+void DeepseekV41Model::begin_forward(bool capture_raw_hidden) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 target capture state is unavailable");
     shared->begin_forward(capture_raw_hidden, shared->config.dspark_target_layer_ids.size());
 }
@@ -218,24 +233,24 @@ DeepseekV41Model::normalize_hidden(mfq_tensor_backend::Tensor hidden,
 }
 
 mfq_tensor_backend::Tensor
-DeepseekV41Model::adapter_raw_hidden(const mfq_tensor_backend::Tensor &,
+DeepseekV41Model::extract_raw_hidden(const mfq_tensor_backend::Tensor &,
                                      const mfq_tensor_backend::Tensor &) const {
     return shared->dspark_target_hidden();
 }
 
-void DeepseekV41Model::adapter_begin_speculative() {
+void DeepseekV41Model::native_begin_speculation() {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->begin_speculative();
 }
 
-void DeepseekV41Model::adapter_commit_speculative() {
+void DeepseekV41Model::native_commit_speculation() {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
     shared->commit_speculative();
 }
 
-void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
+void DeepseekV41Model::native_rollback_speculation(int64_t position) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
-    shared->rollback_speculative();
+    shared->rollback_speculative(position);
 }
 
 } // namespace mfq::cuda
@@ -243,6 +258,12 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
 namespace mfq::cuda {
 
 template struct CudaSessionCodec<DeepseekV41Model>;
+
+CudaModelPlan DeepseekV41Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    if (declares_deepseek_v41_dspark(graph)) result.predictor = policy.predictor;
+    return result;
+}
 
 } // namespace mfq::cuda
 

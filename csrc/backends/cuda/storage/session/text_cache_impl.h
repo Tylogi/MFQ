@@ -2,7 +2,7 @@
 
 #include "text_cache.h"
 #include "state.h"
-#include "session_cache.h"
+#include "sessions.h"
 
 namespace mfq::cuda::internal {
 struct CudaSessionOps {
@@ -14,6 +14,10 @@ struct CudaSessionOps {
     static CudaPagedPayload encode(const Snapshot& state, size_t block_size, size_t index);
     static mfq::StepSequence<TextSessionState> decode_steps(const std::vector<CudaPagedPayload>& payloads, const std::vector<int64_t>& tokens, size_t block_size);
     static mfq::StepSequence<CudaPagedPayload> encode_steps(const Snapshot& state, size_t block_size, size_t index);
+    static bool paged_mtp(const Snapshot& state) { return state.kind()==TextSessionStateKind::Qwen4; }
+    static bool partial_blocks(const Snapshot& state) { return state.kind()==TextSessionStateKind::Qwen4; }
+    static size_t decodable_blocks(const std::vector<CudaPagedPayload>& payloads) { return cuda_paged_decodable_blocks(payloads); }
+    static size_t token_count(const CudaPagedPayload& payload) { return cuda_paged_payload_tokens(payload); }
     static void release_host_cache();
 };
 

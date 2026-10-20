@@ -24,13 +24,74 @@ constexpr int kMaxTopK = 1024;
 constexpr int kDirectTopK = 64;
 constexpr int kHierarchicalTopK = 128;
 constexpr int kTopKBlock = 1024;
+constexpr int kGreedyBlock = 4096;
+
+constexpr const char* kGreedyReductionHeader = R"METAL(
+inline void mfq_greedy_reduce(thread float& value, thread int& id, uint lane, uint warp,
+    threadgroup float* values, threadgroup int* ids) {
+    for (uint stride = 16u; stride; stride >>= 1u) {
+        float other = simd_shuffle_down(value, stride);
+        int index = simd_shuffle_down(id, stride);
+        if (lane + stride < 32u && (other > value || (other == value && index < id))) {
+            value = other; id = index;
+        }
+    }
+    if (lane == 0u) { values[warp] = value; ids[warp] = id; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (warp == 0u) {
+        value = lane < 8u ? values[lane] : -FLT_MAX;
+        id = lane < 8u ? ids[lane] : 0;
+        for (uint stride = 16u; stride; stride >>= 1u) {
+            float other = simd_shuffle_down(value, stride);
+            int index = simd_shuffle_down(id, stride);
+            if (lane + stride < 32u && (other > value || (other == value && index < id))) {
+                value = other; id = index;
+            }
+        }
+    }
+}
+)METAL";
+
+constexpr const char* kGreedyTilesSource = R"METAL(
+    uint tile = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_index_in_threadgroup;
+    float best = -FLT_MAX;
+    int id = 0;
+    for (uint token = tile * uint(BLOCK) + tid;
+        token < min(uint(VOCAB), (tile + 1u) * uint(BLOCK)); token += 256u) {
+        float value = float(logits[ulong(row) * uint(VOCAB) + token]);
+        value = isnan(value) ? -FLT_MAX : value;
+        if (value > best || (value == best && int(token) < id)) { best = value; id = int(token); }
+    }
+    threadgroup float values[8];
+    threadgroup int ids[8];
+    mfq_greedy_reduce(best, id, thread_index_in_simdgroup, simdgroup_index_in_threadgroup, values, ids);
+    if (tid == 0u) {
+        scores[ulong(row) * uint(TILES) + tile] = best;
+        indices[ulong(row) * uint(TILES) + tile] = id;
+    }
+)METAL";
+
+constexpr const char* kGreedyTilesFinalSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_index_in_threadgroup;
+    float best = -FLT_MAX;
+    int id = 0;
+    for (uint tile = tid; tile < uint(TILES); tile += 256u) {
+        float value = scores[ulong(row) * uint(TILES) + tile];
+        int index = indices[ulong(row) * uint(TILES) + tile];
+        if (value > best || (value == best && index < id)) { best = value; id = index; }
+    }
+    threadgroup float values[8];
+    threadgroup int ids[8];
+    mfq_greedy_reduce(best, id, thread_index_in_simdgroup, simdgroup_index_in_threadgroup, values, ids);
+    if (tid == 0u) output[row] = id;
+)METAL";
 
 constexpr const char* kGreedySource = R"METAL(
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
-    if (row >= uint(ROWS)) {
-        return;
-    }
     threadgroup float values[256];
     threadgroup int indices[256];
     float best = -FLT_MAX;
@@ -595,6 +656,26 @@ const mlx::core::fast::CustomKernelFunction& greedy_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction& greedy_tiles_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel("mfq_cpp_sample_greedy_tiles", {"logits"},
+            {"scores", "indices"}, kGreedyTilesSource, kGreedyReductionHeader, true, false, options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& greedy_tiles_final_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel("mfq_cpp_sample_greedy_tiles_final", {"scores", "indices"},
+            {"output"}, kGreedyTilesFinalSource, kGreedyReductionHeader, true, false, options);
+    }();
+    return kernel;
+}
+
 const mlx::core::fast::CustomKernelFunction& softmax_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_sample_softmax",
@@ -1031,13 +1112,24 @@ bool mlx_token_in_set(
 
 array sample_greedy(const array& logits) {
     auto view = normalize_logits(logits);
+    if (view.vocab > kGreedyBlock) {
+        const int tiles = (view.vocab - 1) / kGreedyBlock + 1;
+        auto partials = greedy_tiles_kernel()({view.values},
+            {Shape{view.rows, tiles}, Shape{view.rows, tiles}}, {mlx::core::float32, mlx::core::int32},
+            {tiles * kThreads, view.rows, 1}, {kThreads, 1, 1},
+            {{"T", view.values.dtype()}, {"VOCAB", view.vocab}, {"BLOCK", kGreedyBlock}, {"TILES", tiles}},
+            std::nullopt, false, {});
+        auto outputs = greedy_tiles_final_kernel()(partials, {Shape{view.rows}}, {mlx::core::int32},
+            {view.rows * kThreads, 1, 1}, {kThreads, 1, 1}, {{"TILES", tiles}}, std::nullopt, false, {});
+        return mlx::core::reshape(outputs.front(), std::move(view.prefix));
+    }
     auto outputs = greedy_kernel()(
         {view.values},
         {Shape{view.rows}},
         {mlx::core::int32},
         {view.rows * kThreads, 1, 1},
         {kThreads, 1, 1},
-        base_templates(view),
+        {{"T", view.values.dtype()}, {"VOCAB", view.vocab}},
         std::nullopt,
         false,
         {});

@@ -1,6 +1,6 @@
-#include "mlx_fp8_sq.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_moe.h"
+#include "ops/mlx_fp8_sq.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_moe.h"
 
 #include <array>
 #include <bit>

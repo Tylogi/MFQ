@@ -37,6 +37,9 @@ set_target_properties(mfq-ggml PROPERTIES
     C_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
+if(MSVC)
+    target_compile_options(mfq-ggml PRIVATE /utf-8)
+endif()
 
 # CUDA kernels consume a small set of implementation/MMA headers without
 # linking a GGML compute backend.

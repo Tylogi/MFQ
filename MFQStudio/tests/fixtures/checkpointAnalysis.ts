@@ -23,6 +23,10 @@ export function analysisFixture(dense = false): CheckpointAnalysis {
       shape: [128, 256], category: qsa ? 'attention' : 'gdn', projection: qsa ? 'query' : 'qkv', layer,
       parameters: 32768, stored_bytes: bpw * 4096, bpw, format: 'NINTv2' };
   });
+  if (dense) tensors.push(...Array.from({ length: 12 }, (_, layer) => ['gate', 'up', 'down'].map(projection => ({
+    name: `model.block.${layer}.mlp.${projection}.weight`, shape: [4, 8], category: 'ffn', projection, layer,
+    parameters: 32, stored_bytes: 16, bpw: 4, format: 'NINTv2',
+  }))).flat());
   return { model_id: analysisArtifacts[dense ? 1 : 0].id, name: analysisArtifacts[dense ? 1 : 0].name,
     architecture: dense ? 'qwen3_5' : 'qwen4_exp', format: 'mfq', complete: true, layer_count: 12,
     hidden_size: 2560, attention_heads: 24, kv_heads: 2, head_dim: 256, linear_key_heads: 16, linear_value_heads: 48,

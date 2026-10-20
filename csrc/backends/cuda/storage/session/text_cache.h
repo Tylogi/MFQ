@@ -1,12 +1,13 @@
 #pragma once
 
 #include "native/tensor/backend.h"
-#include "step_sequence.h"
+#include "csrc/core/step_sequence.h"
 #include <variant>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,10 +82,13 @@ public:
         const std::string& target_session);
     std::size_t close_session(const std::string& session_id);
     std::vector<std::pair<std::string, double>> metrics() const;
+    std::map<int, std::size_t> device_hot_bytes() const;
     std::size_t clear_live_sessions() noexcept;
     std::size_t clear();
     std::uint64_t trim_hot(std::uint64_t target_bytes);
     std::uint64_t set_hot_limit(std::uint64_t max_bytes);
+    std::uint64_t set_ram_limit(std::uint64_t max_bytes);
+    void reserve_ram(std::uint64_t bytes);
     std::uint64_t set_disk_limit(std::uint64_t max_bytes);
     std::uint64_t refresh_disk_index();
 

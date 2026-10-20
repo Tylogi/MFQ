@@ -1,9 +1,9 @@
 #include "qwen4_ops.h"
-#include "mlx_nint_metadata.h"
-#include "mlx_kernel_prepare.h"
+#include "ops/mlx_nint_metadata.h"
+#include "runtime/mlx_kernel_prepare.h"
 
-#include "mlx_transformer.h"
-#include "mlx_sparse_attention.h"
+#include "runtime/mlx_transformer.h"
+#include "ops/mlx_sparse_attention.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -42,7 +42,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         const std::string type = dtype_ == mlx::core::float16 ? "half"
             : dtype_ == mlx::core::bfloat16 ? "bfloat" : "float";
         const std::string name = "mfq_qsa_prefill_output_gate_" + type + "_" +
@@ -118,6 +118,9 @@ private:
 };
 
 const std::string kGatedHcWeightHeader = std::string(detail::kNintMetadataSource) + R"METAL(
+#ifndef DOWN_RPS
+#define DOWN_RPS 2
+#endif
 inline uint mfq_hc_load_u32(device const uchar* stream, uint byte) {
     const packed_uchar4 values =
         *reinterpret_cast<device const packed_uchar4*>(stream + byte);
@@ -142,20 +145,30 @@ inline uint4 mfq_hc_decode4(Stream stream, uint byte, uint shift, uint bits) {
 
 struct MfqHcCodes8 { uint4 low; uint4 high; };
 
-template <typename Stream>
+template <int GS, typename Stream>
 inline MfqHcCodes8 mfq_hc_decode8(Stream stream, uint byte, uint shift, uint bits) {
     const uint word0 = mfq_hc_load_u32(stream, byte);
-    const uint word1 = shift + 8u * bits > 32u
-        ? mfq_hc_load_u32(stream, byte + 4u) : 0u;
-    const uint word2 = shift + 8u * bits > 64u ? uint(stream[byte + 8u]) : 0u;
-    const uint packed0 = shift == 0u ? word0
-        : (word0 >> shift) | (word1 << (32u - shift));
-    const uint cursor = shift + 4u * bits;
-    const uint low = cursor >= 32u ? word1 : word0;
-    const uint high = cursor >= 32u ? word2 : word1;
-    const uint bit = cursor & 31u;
-    const uint packed1 = bit == 0u ? low
-        : (low >> bit) | (high << (32u - bit));
+    uint packed0, packed1;
+    if constexpr (GS % 4 == 0) {
+        if constexpr (GS % 8 == 0) shift = 0u;
+        const uint word1 = bits > 4u ? mfq_hc_load_u32(stream, byte + 4u) : 0u;
+        packed0 = shift == 0u ? word0 : (word0 >> 4u) | (word1 << 28u);
+        const uint cursor = 4u * bits + shift;
+        packed1 = cursor == 32u ? word1
+            : (word0 >> cursor) | (word1 << (32u - cursor));
+    } else {
+        const uint word1 = shift + 8u * bits > 32u
+            ? mfq_hc_load_u32(stream, byte + 4u) : 0u;
+        const uint word2 = shift + 8u * bits > 64u ? uint(stream[byte + 8u]) : 0u;
+        packed0 = shift == 0u ? word0
+            : (word0 >> shift) | (word1 << (32u - shift));
+        const uint cursor = shift + 4u * bits;
+        const uint low = cursor >= 32u ? word1 : word0;
+        const uint high = cursor >= 32u ? word2 : word1;
+        const uint bit = cursor & 31u;
+        packed1 = bit == 0u ? low
+            : (low >> bit) | (high << (32u - bit));
+    }
     const uint mask = (1u << bits) - 1u;
     return {
         uint4(packed0 & mask, (packed0 >> bits) & mask,
@@ -200,7 +213,7 @@ inline void mfq_hc_dot_groups(
                 + activation1.x + activation1.y + activation1.z + activation1.w;
             for (uint row = 0u; row < uint(NR); ++row) {
                 const uint bit = shifts[row] + column * bits[row];
-                const auto codes = mfq_hc_decode8(
+                const auto codes = mfq_hc_decode8<GS>(
                     weight, offsets[row] + (bit >> 3u), bit & 7u, bits[row]);
                 quantized_dots[row] += dot(activation0, float4(codes.low))
                     + dot(activation1, float4(codes.high));
@@ -637,7 +650,7 @@ constexpr const char* kGatedHcUpCollapseSource = R"METAL(
 // separate norm launch.  Four stream-slice sums are joined by the up launch.
 constexpr const char* kGatedHcNormDownSource = R"METAL(
     constexpr uint STREAMS = 4u;
-    constexpr uint ROWS_PER_SIMD = 2u;
+    constexpr uint ROWS_PER_SIMD = uint(DOWN_RPS);
     constexpr uint ROWS_PER_TG = 8u * ROWS_PER_SIMD;
     constexpr uint DOWN_GROUPS = uint(LOW_RANK) / ROWS_PER_TG;
     constexpr uint GROUPS = DOWN_GROUPS + uint(HAS_INJECTION);
@@ -695,7 +708,7 @@ constexpr const char* kGatedHcNormDownSource = R"METAL(
     if (group < DOWN_GROUPS) {
         const uint first_row =
             group * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
-        float accumulators[ROWS_PER_SIMD] = {0.0f, 0.0f};
+        float accumulators[ROWS_PER_SIMD] = {0.0f};
         if constexpr (DOWN_GS != 0) {
             mfq_hc_dot_groups<DOWN_GS, DOWN_NG, ROWS_PER_SIMD>(
                 down_weight, down_rows, down_scales, down_minima,
@@ -760,7 +773,7 @@ constexpr const char* kGatedHcNormDownSource = R"METAL(
 
 constexpr const char* kGatedHcWriteNormDownSource = R"METAL(
     constexpr uint STREAMS = 4u;
-    constexpr uint ROWS_PER_SIMD = 2u;
+    constexpr uint ROWS_PER_SIMD = uint(DOWN_RPS);
     constexpr uint ROWS_PER_TG = 8u * ROWS_PER_SIMD;
     constexpr uint DOWN_GROUPS = uint(LOW_RANK) / ROWS_PER_TG;
     constexpr uint GROUPS = DOWN_GROUPS + uint(HAS_INJECTION);
@@ -827,7 +840,7 @@ constexpr const char* kGatedHcWriteNormDownSource = R"METAL(
     if (group < DOWN_GROUPS) {
         const uint first_row =
             group * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
-        float accumulators[ROWS_PER_SIMD] = {0.0f, 0.0f};
+        float accumulators[ROWS_PER_SIMD] = {0.0f};
         if constexpr (DOWN_GS != 0) {
             mfq_hc_dot_groups<DOWN_GS, DOWN_NG, ROWS_PER_SIMD>(
                 down_weight, down_rows, down_scales, down_minima,
@@ -990,6 +1003,7 @@ struct PackedHcConfig {
     mlx::core::Dtype result_type;
     mlx::core::Dtype injection_type;
     int down_gs, down_ng, up_gs, up_ng, injection_gs, injection_ng;
+    int down_rows_per_simd;
     bool after, has_injection;
     float eps;
 };
@@ -1017,6 +1031,7 @@ std::string packed_hc_source(const PackedHcConfig& config, const std::string& ke
             {"DOWN_GS", config.down_gs}, {"DOWN_NG", config.down_ng},
             {"UP_GS", config.up_gs}, {"UP_NG", config.up_ng},
             {"INJECT_GS", config.injection_gs}, {"INJECT_NG", config.injection_ng},
+            {"DOWN_RPS", config.down_rows_per_simd},
             {"HAS_INJECTION", int(config.has_injection)}})
         source += "#define " + std::string(name) + " " + std::to_string(value) + "\n";
     source += kGatedHcWeightHeader;
@@ -1068,13 +1083,14 @@ class PackedHcPrimitive final : public mlx::core::Primitive, public MlxPreparabl
 public:
     PackedHcPrimitive(mlx::core::Stream stream, PackedHcConfig config)
         : Primitive(stream), config_(config) {
-        key_ = "mfq_packed_hc_v2";
+        key_ = "mfq_packed_hc_v3";
         for (auto dtype : {config.residual_type, config.branch_type, config.gate_type,
                 config.norm_type, config.update_type, config.output_type, config.low_type,
                 config.result_type, config.injection_type})
             key_ += "_" + mlx::core::type_to_name(dtype);
         for (int value : {config.down_gs, config.down_ng, config.up_gs, config.up_ng,
-                config.injection_gs, config.injection_ng, int(config.after), int(config.has_injection)})
+                config.injection_gs, config.injection_ng, config.down_rows_per_simd,
+                int(config.after), int(config.has_injection)})
             key_ += "_" + std::to_string(value);
     }
 
@@ -1082,7 +1098,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernels(); }
 
     std::pair<MTL::ComputePipelineState*, MTL::ComputePipelineState*> prepared_kernels() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(key_, options, [this] { return packed_hc_source(config_, key_); });
@@ -1110,7 +1126,8 @@ public:
         if (config_.after) encoder.set_output_array(outputs[2], 18);
         encoder.set_bytes(config_.eps, 19);
         encoder.set_compute_pipeline_state(kernels.first);
-        encoder.dispatch_threadgroups(MTL::Size((20 + int(config_.has_injection)) * 4, rows, 1),
+        const int down_groups = 320 / (8 * config_.down_rows_per_simd);
+        encoder.dispatch_threadgroups(MTL::Size((down_groups + int(config_.has_injection)) * 4, rows, 1),
                                       MTL::Size(256, 1, 1));
         encoder.set_input_array(normalized, 16);
         encoder.set_input_array(parts, 17);
@@ -1162,6 +1179,7 @@ MlxQwen4GatedResidualPre packed_gated_hc(
         input.dtype(), branch.dtype(), gate.dtype(), norm.dtype(), update_type, output_type,
         low_type, result_type, injection_type,
         down.group_size, down.groups, up.group_size, up.groups, injection.group_size, injection.groups,
+        input.size() / 10240 == 1 ? 1 : 2,
         after, injection_weight.has_value(), eps};
     auto branch_shape = input.shape();
     branch_shape.back() = 2560;
@@ -1243,7 +1261,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1759,7 +1777,7 @@ bool can_fuse_gated_hc_two_stage(
     if (!gated_hc_fast_path_enabled() ||
         hidden_size != 2560 || hc_count != 4 ||
         input.ndim() != 3 || input.shape(0) != 1 ||
-        input.shape(1) < 1 || input.shape(1) > 6 || input.shape(2) != 10240 ||
+        input.shape(1) < 1 || input.shape(1) > 16 || input.shape(2) != 10240 ||
         norm_weight.shape() != Shape{10240} ||
         (down_weight.output_size() != 320 || down_weight.input_size() != 10240) ||
         (up_weight.output_size() != 10240 || up_weight.input_size() != 320) ||

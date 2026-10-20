@@ -1,5 +1,7 @@
 #include "env.h"
 #include "context.h"
+#include "native/resident_allocations.h"
+#include "mfq/runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +26,29 @@
 #endif
 
 namespace mfq::cuda {
+namespace {
+__global__ void record_gpu_timestamp_kernel(uint64_t* timestamps, std::size_t index) {
+    unsigned long long nanoseconds;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(nanoseconds));
+    timestamps[index]=nanoseconds;
+}
+}
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream) {
+    record_gpu_timestamp_kernel<<<1,1,0,stream>>>(timestamps,index);
+    MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+}
+namespace { thread_local bool resident_allocations=false; }
+ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
+    :previous_(resident_allocations) {resident_allocations=enabled;}
+void ResidentAllocationScope::finish() noexcept {
+    if(active_){resident_allocations=previous_;active_=false;}
+}
+
 struct AllocationBudget {
+    std::mutex graph_memory_mutex;
+    // Retired pools remain visible until their persistent request tensors die.
+    std::unordered_map<cudaMemPool_t,bool> graph_memory_pools;
+    cudaMemPool_t resident_memory_pool=nullptr;
     std::size_t limit = 0;
     std::atomic<std::size_t> allocated{},peak{};
 #ifdef _WIN32
@@ -35,7 +59,7 @@ struct AllocationBudget {
         do {
             if(bytes>std::numeric_limits<std::size_t>::max()-before ||
                 (limit && (before>limit || bytes>limit-before)))
-                throw Error("CUDA VRAM limit exceeded: requested="+std::to_string(bytes)+
+                throw MfqResourceExhausted("CUDA VRAM limit exceeded: requested="+std::to_string(bytes)+
                     " allocated="+std::to_string(before)+" limit="+std::to_string(limit));
         } while(!allocated.compare_exchange_weak(before,before+bytes,std::memory_order_relaxed));
         auto maximum=peak.load(std::memory_order_relaxed);
@@ -66,7 +90,7 @@ std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
             candidate->limit = static_cast<std::size_t>(bytes);
         }
 #ifdef _WIN32
-        if (candidate->limit) {
+        {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
             cudaDeviceProp properties{};
             MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
@@ -82,8 +106,7 @@ std::shared_ptr<AllocationBudget> device_allocation_budget(int device) {
                     }
                 }
             }
-            if (!candidate->adapter)
-                throw Error("CUDA VRAM limit requires the matching WDDM adapter");
+            if(candidate->limit && !candidate->adapter)throw Error("CUDA VRAM limit requires the matching WDDM adapter");
         }
 #endif
         budget = std::move(candidate);
@@ -668,30 +691,201 @@ std::size_t Context::local_memory_usage() const {
     return memory_stats().allocated;
 }
 
-void Context::check_memory_limit(std::size_t additional) const {
-    if (!allocation_budget_->limit) return;
-    auto usage = local_memory_usage();
-    // Completed asynchronous frees can leave reusable pool pages charged to WDDM.
-    if (async_allocations_ && pool_ &&
-            (usage > allocation_budget_->limit || additional > allocation_budget_->limit - usage)) {
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_, 0));
-        usage = local_memory_usage();
+std::size_t Context::resident_memory_usage() const {
+    DeviceGuard guard(device_);
+    auto bytes=memory_stats().allocated;
+    const auto [used,reserved]=pool_memory_stats();
+    // Allocated bytes already include live pool and graph allocations.
+    // Add only unused pages, never device-wide usage from other processes.
+    if(reserved>used)bytes+=reserved-used;
+    return std::max(bytes,local_memory_usage());
+}
+
+std::optional<std::size_t> shared_memory_available(int device) {
+#ifdef _WIN32
+    const auto budget=device_allocation_budget(device);
+    if(budget->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(budget->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&memory)))
+            return memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
     }
-    if (usage > allocation_budget_->limit || additional > allocation_budget_->limit - usage) {
-        std::uint64_t pool_used = 0, pool_reserved = 0;
-        if (pool_) {
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
-                pool_, cudaMemPoolAttrUsedMemCurrent, &pool_used));
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
-                pool_, cudaMemPoolAttrReservedMemCurrent, &pool_reserved));
+#endif
+    return std::nullopt;
+}
+
+std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
+    DeviceGuard guard(device_);
+    std::uint64_t used=0,reserved=0;
+    const auto add=[&](cudaMemPool_t memory) {
+        if(!memory)return;
+        std::uint64_t current_used=0,current_reserved=0;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&current_used));
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrReservedMemCurrent,&current_reserved));
+        used+=current_used;reserved+=current_reserved;
+    };
+    add(pool_);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(const auto& [memory,retired]:allocation_budget_->graph_memory_pools)add(memory);
+    return {used,reserved};
+}
+
+void Context::trim_pool_pages() const {
+    if(pool_)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_,0));
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(auto entry=allocation_budget_->graph_memory_pools.begin();entry!=allocation_budget_->graph_memory_pools.end();) {
+        const auto [memory,retired]=*entry;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(memory,0));
+        std::uint64_t used=0;
+        if(retired)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&used));
+        if(retired && !used) {
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(memory));
+            entry=allocation_budget_->graph_memory_pools.erase(entry);
+        } else ++entry;
+    }
+}
+
+std::size_t Context::available_memory() const {
+    DeviceGuard guard(device_);
+    std::size_t free=0,total=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+#ifdef _WIN32
+    // CUDA may allocate beyond WDDM's current local-memory budget and let the
+    // driver page live weights through system RAM. Price revocable caches and
+    // new workspace against physical residency, before that silent slowdown.
+    if(allocation_budget_->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(allocation_budget_->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))) {
+            const auto available=memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
+            if(available<free) {
+                static std::atomic<bool> reported{false};
+                if(mfq::cuda::env_lookup("MFQ_PROFILE_SSD_EXPERTS") && !reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"cuda_residency_budget scope=first_limit cuda_free_bytes=%zu budget_bytes=%llu usage_bytes=%llu available_bytes=%zu\n",
+                        free,static_cast<unsigned long long>(memory.Budget),static_cast<unsigned long long>(memory.CurrentUsage),available);
+                free=available;
+            }
         }
-        throw Error("CUDA process VRAM limit exceeded: local_usage=" + std::to_string(usage) +
-            " requested=" + std::to_string(additional) +
-            " limit=" + std::to_string(allocation_budget_->limit) +
-            " owned=" + std::to_string(memory_stats().allocated) +
-            " pool_used=" + std::to_string(pool_used) +
-            " pool_reserved=" + std::to_string(pool_reserved));
     }
+#endif
+    const auto budget=memory_stats();
+    if(budget.limit) {
+        const auto used=resident_memory_usage();
+        free=std::min(free,used<budget.limit?budget.limit-used:0);
+    }
+    return free;
+}
+
+void Context::reclaim_idle_memory() {
+    DeviceGuard guard(device_);
+    // Phase transitions must retire frees on all compute/transfer streams.
+    // Trimming unused pages leaves live graph-pool allocations untouched.
+    MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+    trim_pool_pages();
+    if(const auto* trace=mfq::cuda::env_lookup("MFQ_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1') {
+        std::lock_guard lock(graph_pool_mutex_);
+        std::size_t cached=0,blocks=0;
+        for(const auto& [stream,pool]:graph_pools_)for(const auto& [bytes,pointers]:pool.available) {
+            cached+=bytes*pointers.size();blocks+=pointers.size();
+        }
+        std::fprintf(stderr,"graph_workspace_memory cached_bytes=%zu cached_blocks=%zu\n",cached,blocks);
+    }
+}
+
+void Context::set_memory_limit(std::size_t bytes) {
+    // Called by the engine only while no requests or expert transfers are active.
+    reclaim_idle_memory();
+    if(bytes && bytes < std::max(memory_stats().allocated,local_memory_usage()))
+        throw Error("resident memory budget is below live CUDA allocations");
+    allocation_budget_->limit=bytes;
+}
+
+void Context::check_memory_limit(std::size_t additional) const {
+    if(!allocation_budget_->limit)return;
+    auto usage=local_memory_usage();
+    // Completed asynchronous frees can leave reusable pool pages charged to
+    // WDDM. Release those pages before pricing a new allocation against the
+    // process limit; the logical allocation budget remains checked separately.
+    if(async_allocations_ && pool_ && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
+        trim_pool_pages();
+        usage=local_memory_usage();
+    }
+    if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
+        // A layer transition may still have frees pending on transfer/compute
+        // streams. Retire them before rejecting a request against physical use.
+        MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+        trim_pool_pages();
+        usage=local_memory_usage();
+    }
+    if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
+        const auto [pool_used,pool_reserved]=pool_memory_stats();
+        throw MfqResourceExhausted("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
+            " requested="+std::to_string(additional)+" limit="+std::to_string(allocation_budget_->limit)+
+            " owned="+std::to_string(memory_stats().allocated)+" pool_used="+std::to_string(pool_used)+
+            " pool_reserved="+std::to_string(pool_reserved));
+    }
+}
+
+void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                                  cudaStream_t stream) {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)throw Error("CUDA workspace loan is already active");
+    auto loan=std::make_unique<WorkspaceLoan>();
+    loan->stream=stream;loan->thread=std::this_thread::get_id();
+    for(const auto& [pointer,bytes]:regions) {
+        const auto raw=reinterpret_cast<std::uintptr_t>(pointer);
+        const auto begin=(raw+255)&~std::uintptr_t(255);
+        if(begin-raw>=bytes)continue;
+        const auto size=(bytes-(begin-raw))&~std::size_t(255);
+        if(size && !loan->free.emplace(begin,size).second)throw Error("duplicate CUDA workspace loan region");
+    }
+    for(auto it=loan->free.begin();it!=loan->free.end();++it) {
+        const auto next=std::next(it);
+        if(next==loan->free.end())break;
+        if(it->first+it->second>next->first)throw Error("overlapping CUDA workspace loan regions");
+        // Keep a gap between distinct allocations even when the allocator
+        // happened to place them adjacently. Never coalesce across their bounds.
+        if(it->first+it->second==next->first)it->second-=256;
+    }
+    workspace_loan_=std::move(loan);
+}
+void Context::suspend_workspace_loan() {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)workspace_loan_->enabled=false;
+}
+void Context::end_workspace_loan() {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_ && !workspace_loan_->live.empty()) {
+        std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+        throw Error("CUDA workspace loan still has live tensors: count="+
+            std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+    }
+    workspace_loan_.reset();
+}
+std::size_t Context::workspace_available() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id())
+        for(const auto& [p,n]:workspace_loan_->free)bytes+=n;
+    return bytes;
+}
+
+std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::vector<std::pair<void*,std::size_t>> result;
+    if(!workspace_loan_)return result;
+    auto ranges=workspace_loan_->touched;
+    std::sort(ranges.begin(),ranges.end());
+    for(const auto& [begin,size]:ranges) {
+        if(!result.empty()) {
+            auto& last=result.back();
+            const auto previous=reinterpret_cast<std::uintptr_t>(last.first);
+            if(begin<=previous+last.second) {
+                last.second=std::max(previous+last.second,begin+size)-previous;
+                continue;
+            }
+        }
+        result.emplace_back(reinterpret_cast<void*>(begin),size);
+    }
+    return result;
 }
 
 void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
@@ -702,11 +896,24 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
     bool capture_pool_miss = false,pooled_allocation=false;
+    cudaMemPool_t allocation_pool=pool_;
     {
         std::lock_guard lock(graph_pool_mutex_);
         if (auto pool = graph_pools_.find(allocation_stream);
             pool != graph_pools_.end() && (pool->second.warming || pool->second.capturing)) {
+            if(pool->second.memory)allocation_pool=pool->second.memory;
             pooled_allocation=true;
+            // Stable size classes let serial graph shapes share scratch. The
+            // same request must use the same class in warmup and capture; a
+            // free-form best-fit choice can consume a later operation's slot.
+            if(bytes>=4096) {
+                std::size_t capacity=4096;
+                while(capacity<bytes) {
+                    if(capacity>SIZE_MAX/2)throw Error("CUDA graph workspace size overflows");
+                    capacity*=2;
+                }
+                bytes=capacity;
+            }
             auto available = pool->second.available.find(bytes);
             if (available != pool->second.available.end() &&
                     !available->second.empty()) {
@@ -715,6 +922,27 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
                 return pointer;
             }
             capture_pool_miss = pool->second.capturing;
+        }
+        if(!pooled_allocation && !resident_allocations && workspace_loan_ &&
+                workspace_loan_->enabled && workspace_loan_->stream==allocation_stream &&
+                workspace_loan_->thread==std::this_thread::get_id() && bytes<=SIZE_MAX-255) {
+            auto& loan=*workspace_loan_;
+            const auto aligned=(bytes+255)&~std::size_t(255);
+            // Best fit keeps the large regions available for transfer images.
+            auto best=loan.free.end();
+            for(auto it=loan.free.begin();it!=loan.free.end();++it)
+                if(it->second>=aligned && (best==loan.free.end() || it->second<best->second))best=it;
+            if(best!=loan.free.end()) {
+                const auto base=best->first,size=best->second;
+                auto* result=reinterpret_cast<void*>(base);
+                // Record conservatively before publishing the allocation.
+                // A failed bookkeeping allocation can only cause extra restore.
+                loan.touched.emplace_back(base,aligned);
+                loan.live.emplace(result,aligned);
+                loan.free.erase(best);
+                if(size>aligned)loan.free.emplace(base+aligned,size-aligned);
+                return result;
+            }
         }
     }
     if (capture_pool_miss) {
@@ -729,20 +957,41 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             (limit && (bytes > limit || allocated > limit - bytes))) throw AllocationLimit();
     } while (!allocated_bytes_.compare_exchange_weak(allocated, allocated + bytes));
     void* pointer = nullptr;
-    bool verify_pool_reuse = false;
-    if (allocation_budget_->limit) {
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream, &capture));
-        if (capture == cudaStreamCaptureStatusNone) {
-            const auto usage = local_memory_usage();
-            if (async_allocations_ && pool_ && usage <= allocation_budget_->limit &&
-                    bytes > allocation_budget_->limit - usage) {
-                std::uint64_t used = 0, reserved = 0;
-                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
-                    pool_, cudaMemPoolAttrUsedMemCurrent, &used));
-                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
-                    pool_, cudaMemPoolAttrReservedMemCurrent, &reserved));
-                verify_pool_reuse = reserved >= used && bytes <= reserved - used;
+    const bool async=async_allocations_;
+    if(async && resident_allocations && !pooled_allocation) {
+        // Pack the many small recurrent tensors into their own pages instead
+        // of paying cudaMalloc's WDDM allocation granularity for every layer.
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        auto& memory=allocation_budget_->resident_memory_pool;
+        if(!memory) {
+            cudaMemPoolProps properties{};
+            properties.allocType=cudaMemAllocationTypePinned;
+            properties.location.type=cudaMemLocationTypeDevice;
+            properties.location.id=device_;
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            try {
+                std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+                allocation_budget_->graph_memory_pools.emplace(memory,false);
+            } catch(...) {(void)cudaMemPoolDestroy(memory);memory=nullptr;throw;}
+        }
+        allocation_pool=memory;
+    }
+    bool verify_pool_reuse=false;
+    if(allocation_budget_->limit) {
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(allocation_stream,&capture));
+        if(capture==cudaStreamCaptureStatusNone) {
+            const auto usage=local_memory_usage();
+            if(async && allocation_pool && usage<=allocation_budget_->limit &&
+                    bytes>allocation_budget_->limit-usage) {
+                std::uint64_t used=0,reserved=0;
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrUsedMemCurrent,&used));
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(allocation_pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
+                // Reusing existing pages need not increase WDDM's charge.
+                // Check the actual charge after malloc and roll back if the
+                // allocator had to grow the pool instead.
+                verify_pool_reuse=reserved>=used && bytes<=reserved-used;
             }
             if (!verify_pool_reuse &&
                     (usage > allocation_budget_->limit || bytes > allocation_budget_->limit - usage))
@@ -751,27 +1000,36 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     allocation_budget_->acquire(bytes);
     try {
-        const auto result = async_allocations_
-            ? cudaMallocFromPoolAsync(&pointer, bytes, pool_, allocation_stream)
-            : cudaMalloc(&pointer, bytes);
-        if (result == cudaErrorMemoryAllocation)
-            throw Error("CUDA allocation failed: requested=" + std::to_string(bytes) +
-                " allocated=" + std::to_string(memory_stats().allocated));
+        auto result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
+            : cudaMalloc(&pointer,bytes);
+        if(result==cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            reclaim_idle_memory();
+            result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
+                : cudaMalloc(&pointer,bytes);
+        }
+        if(result==cudaErrorMemoryAllocation)
+            throw MfqResourceExhausted("CUDA allocation failed: requested="+std::to_string(bytes)+
+                " allocated="+std::to_string(memory_stats().allocated));
         MFQ_NATIVE_CUDA_CHECK(result);
-        if (verify_pool_reuse) check_memory_limit();
-        if (pooled_allocation) {
+        if(verify_pool_reuse)check_memory_limit();
+        if(pooled_allocation) {
             std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.emplace(pointer,bytes);
             graph_pools_.at(allocation_stream).owned.insert(pointer);
         }
-    } catch (...) {
-        allocated_bytes_ -= bytes;
-        if (pointer) {
-            if (async_allocations_) (void)cudaFreeAsync(pointer, allocation_stream);
-            else (void)cudaFree(pointer);
+    } catch(...) {
+        if(pooled_allocation && pointer) {
+            std::lock_guard lock(graph_pool_mutex_);
+            graph_allocation_sizes_.erase(pointer);
+            graph_pools_.at(allocation_stream).owned.erase(pointer);
         }
-        allocation_budget_->release(bytes);
-        throw;
+        if(pointer) {if(async_allocations_)(void)cudaFreeAsync(pointer,allocation_stream);else (void)cudaFree(pointer);}
+        allocation_budget_->release(bytes);throw;
     }
+    if(const auto* trace=mfq::cuda::env_lookup("MFQ_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_allocate pointer="<<pointer<<" bytes="<<bytes
+            <<" graph="<<pooled_allocation<<" resident="<<resident_allocations<<'\n';
     return pointer;
 }
 
@@ -786,19 +1044,45 @@ void Context::release(
         stream != nullptr ? stream : stream_.get();
     try {
         std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_) {
+            auto& loan=*workspace_loan_;
+            if(auto it=loan.live.find(pointer);it!=loan.live.end()) {
+                const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
+                auto entry=loan.free.emplace(base,size).first;
+                loan.live.erase(it);
+                if(entry!=loan.free.begin()) {
+                    auto before=std::prev(entry);
+                    if(before->first+before->second==entry->first) {
+                        before->second+=entry->second;loan.free.erase(entry);entry=before;
+                    }
+                }
+                auto after=std::next(entry);
+                if(after!=loan.free.end() && entry->first+entry->second==after->first) {
+                    entry->second+=after->second;loan.free.erase(after);
+                }
+                return;
+            }
+        }
+        if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
+            bytes=capacity->second;
         if (auto pool = graph_pools_.find(allocation_stream);
             pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
             pool->second.available[bytes].push_back(pointer);
             return;
         }
+        graph_allocation_sizes_.erase(pointer);
     } catch (...) {
         // Tensor destruction is noexcept. A warm-up bookkeeping allocation
         // failure must release the CUDA allocation instead of terminating or
         // leaking it. During capture the size bucket already exists and the
         // preceding pop leaves enough vector capacity for this push.
         std::lock_guard lock(graph_pool_mutex_);
+        // A host bookkeeping failure must never cudaFree an expert-cache
+        // suballocation. Keeping the live record makes return fail safely.
+        if(workspace_loan_ && workspace_loan_->live.count(pointer))return;
         if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
             pool->second.owned.erase(pointer);
+        graph_allocation_sizes_.erase(pointer);
     }
     allocated_bytes_ -= bytes;
     on_device_noexcept(device_, [&] {
@@ -808,6 +1092,8 @@ void Context::release(
             (void)cudaFree(pointer);
         }
     });
+    if(const auto* trace=mfq::cuda::env_lookup("MFQ_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
+        std::cerr<<"cuda_large_release pointer="<<pointer<<" bytes="<<bytes<<'\n';
     allocation_budget_->release(bytes);
 }
 
@@ -819,6 +1105,44 @@ void Context::begin_graph_pool(cudaStream_t stream) {
     const auto [_, inserted] = graph_pools_.try_emplace(stream);
     if (!inserted) {
         throw Error("CUDA graph memory pool is already active on this stream");
+    }
+    if(async_allocations_) {
+        // Graph scratch has a short lifetime compared with resident model
+        // weights. Keep its backing pages separate so retiring a window can
+        // return all of them despite live allocations in the default pool.
+        DeviceGuard guard(device_);
+        cudaMemPoolProps properties{};
+        properties.allocType=cudaMemAllocationTypePinned;
+        properties.location.type=cudaMemLocationTypeDevice;
+        properties.location.id=device_;
+        cudaMemPool_t memory=nullptr;
+        try {
+            // A workspace may outlive its graph by one operation. Reap its
+            // retired pool once its async free completes; pool handles are a
+            // finite driver resource even when their pages have been trimmed.
+            {
+                std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+                for(auto entry=allocation_budget_->graph_memory_pools.begin();
+                        entry!=allocation_budget_->graph_memory_pools.end();) {
+                    std::uint64_t used=0;
+                    if(entry->second)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
+                        entry->first,cudaMemPoolAttrUsedMemCurrent,&used));
+                    if(entry->second && !used) {
+                        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(entry->first));
+                        entry=allocation_budget_->graph_memory_pools.erase(entry);
+                    } else ++entry;
+                }
+            }
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+            std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+            std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+            allocation_budget_->graph_memory_pools.emplace(memory,false);
+            graph_pools_.at(stream).memory=memory;
+        } catch(...) {
+            if(memory)(void)cudaMemPoolDestroy(memory);
+            graph_pools_.erase(stream);throw;
+        }
     }
 }
 
@@ -859,6 +1183,8 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         if (found == graph_pools_.end()) {
             return;
         }
+        for(const auto& [bytes,pointers]:found->second.available)
+            for(void* pointer:pointers)graph_allocation_sizes_.erase(pointer);
         pool = std::move(found->second);
         graph_pools_.erase(found);
     }
@@ -876,6 +1202,16 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         }
         if (async_allocations_) {
             (void)cudaStreamSynchronize(stream);
+        }
+        // Request workspaces can outlive their graph. Keep that CUDA pool
+        // registered until their asynchronous releases finish as well.
+        if(pool.memory) {
+            std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+            std::uint64_t used=0;
+            if(cudaMemPoolGetAttribute(pool.memory,cudaMemPoolAttrUsedMemCurrent,&used)==cudaSuccess && !used) {
+                allocation_budget_->graph_memory_pools.erase(pool.memory);
+                (void)cudaMemPoolDestroy(pool.memory);
+            } else allocation_budget_->graph_memory_pools.at(pool.memory)=true;
         }
     });
 }
@@ -899,7 +1235,7 @@ void Context::trim() {
     stream_.synchronize();
     if (async_allocations_) {
         DeviceGuard guard(device_);
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_, allocation_limit_.load()));
+        trim_pool_pages();
     }
     check_memory_limit();
 }
@@ -949,7 +1285,12 @@ HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
         return;
     }
     const auto flags = mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
-    MFQ_NATIVE_CUDA_CHECK(cudaHostAlloc(&data_, bytes_, flags));
+    const auto allocation=cudaHostAlloc(&data_,bytes_,flags);
+    if(allocation==cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
+        throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes_));
+    }
+    MFQ_NATIVE_CUDA_CHECK(allocation);
 }
 
 HostBuffer::~HostBuffer() noexcept {

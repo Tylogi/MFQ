@@ -1,4 +1,4 @@
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 #include "mtp.h"
@@ -9,7 +9,9 @@
 namespace mfq::cuda::qwen35 {
 struct BlockLoader : TransformerWeightLoader {
     using Ffn = FFN;
-    auto full_block() const { return std::make_unique<FullBlock>(); }
+    auto full_block() const {
+        auto block=std::make_unique<FullBlock>();block->kv_quantization=cuda_kv_quantization();return block;
+    }
     auto linear_block() const { return std::make_unique<LinearAttentionBlock>(); }
     template <class T> static std::unique_ptr<::Block> finish(std::unique_ptr<T> block) {
         return block;
@@ -305,7 +307,7 @@ void Qwen35Mtp::plan_resources(mfq::cuda::CudaResourcePlan& plan,
 
 namespace mfq::cuda {
 
-std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
+std::vector<const void*> Qwen35Model::batch_state_addresses(
         const std::vector<std::unique_ptr<Block>>& blocks) const {
     std::vector<const void*> addresses;
     for (const auto& block : blocks) {
@@ -330,23 +332,19 @@ std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
     return addresses;
 }
 
-void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
+void Qwen35Model::validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&
-        cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
+        plan_components(graph).vision != CudaVisionAdapter::grid_vit) {
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
     }
 }
 
-void Qwen35Model::adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const {
+void Qwen35Model::configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const {
     rope.configure_mrope(config.mrope_sections, config.mrope_interleaved, config.rotary_dim,
                          device);
 }
 
-bool Qwen35Model::adapter_uses_common_rope() const noexcept { return true; }
-
-bool Qwen35Model::adapter_supports_dense_cpu_offload() const noexcept { return true; }
-
-std::unique_ptr<Block> Qwen35Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> Qwen35Model::load_block(const mfq::ModelSource &source, int layer,
                                                        int, const std::string &type) {
     return qwen35::load_block(*execution, source, config, layer, type);
 }
@@ -402,17 +400,25 @@ CudaSessionCodec<Qwen35Model>::restore_steps(Model &model,
   co_yield std::monostate{};
 }
 
-mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor output) const {
+mfq_tensor_backend::Tensor Qwen35Model::post_embed(mfq_tensor_backend::Tensor output) const {
     return output.to(mfq_tensor_backend::kFloat16).contiguous();
 }
-
-bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return true; }
 
 } // namespace mfq::cuda
 
 namespace mfq::cuda {
 
 template struct FullAttentionSessionCodec<Qwen35Model>;
+
+CudaModelPlan Qwen35Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    // Only the qwen3_5 spelling has CUDA component adapters; the generic_qwen
+    // alias loads the same text model but stays text-only.
+    if (graph.backbone != "qwen3_5") return result;
+    if (declares_grid_vision(graph)) result.vision = CudaVisionAdapter::grid_vit;
+    if (declares_next_token_predictor(graph)) result.predictor = policy.predictor;
+    return result;
+}
 
 } // namespace mfq::cuda
 

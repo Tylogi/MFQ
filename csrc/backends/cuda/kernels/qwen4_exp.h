@@ -1,6 +1,7 @@
 #pragma once
+#include "mfq_cuda_kv_hot_cache.h"
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <optional>
 #include <vector>
@@ -24,19 +25,25 @@ std::vector<Tensor> gated_residual_post_norm(
     const Tensor& branch, const Tensor& residual, const Tensor& injection,
     const Tensor& norm, int64_t hc_count, double eps);
 Tensor block_scores(const Tensor&, const Tensor&);
+Tensor live_block_scores(const Tensor& query, const Tensor& pooled,
+    const Tensor& cache_positions, int64_t pool);
+std::vector<Tensor> live_index_pool(const Tensor& index, const Tensor& positions,
+    const Tensor& cache_positions, int64_t pool, int64_t maximum);
+Tensor live_topk_blocks(const Tensor& scores, const Tensor& cache_positions,
+    int64_t pool, int64_t count);
 std::vector<Tensor> ple_dilated_conv_silu(
     const Tensor&, const Tensor&, const std::optional<Tensor>& state,
     int64_t dilation);
 Tensor dense_gqa_attention(
-    const Tensor&, const Tensor&, const Tensor&, int64_t offset);
+    const Tensor&, const Tensor&, const Tensor&, int64_t offset, mfq::cuda::HotKvView hot = {});
 Tensor sparse_gqa_attention(
-    const Tensor&, const Tensor&, const Tensor&, const Tensor& indices);
+    const Tensor&, const Tensor&, const Tensor&, const Tensor& indices, mfq::cuda::HotKvView hot = {});
 Tensor sparse_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
-    const Tensor& indices, const Tensor& gate, bool half_output);
+    const Tensor& indices, const Tensor& gate, bool half_output, mfq::cuda::HotKvView hot = {});
 Tensor qsa_selected_tokens(const Tensor& blocks, const Tensor& positions,
     int64_t pool, int64_t budget);
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output);
 Tensor causal_gqa_attention_gate(const Tensor&, const Tensor&, const Tensor&,
-    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output);
+    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output, mfq::cuda::HotKvView hot = {});
 
 } // namespace mfq_qwen4_exp

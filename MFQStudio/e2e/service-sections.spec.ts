@@ -18,7 +18,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(page.locator('.server-memory-panel .model-context-settings')).toHaveCount(0);
     await expect(page.locator('.server-memory-panel')).not.toContainText(language === 'zh-CN' ? '前缀块大小' : 'Prefix block size');
     await expect(page.locator('.server-prefix-panel')).toContainText(language === 'zh-CN' ? '前缀块大小' : 'Prefix block size');
-    await expect(page.locator('.server-prefix-panel').getByRole('checkbox')).toBeDisabled();
+    await expect(page.locator('.server-prefix-panel').getByRole('checkbox')).toBeEnabled();
     await expect(page.getByRole('spinbutton', { name: language === 'zh-CN' ? 'OpenAI 端口' : 'OpenAI port', exact: true })).toBeEnabled();
     await contexts.scrollIntoViewIfNeeded();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);

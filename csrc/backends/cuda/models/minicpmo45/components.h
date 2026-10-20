@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 
 #include "minicpmo45/causal_lm.h"
 #include "common/transformer_layer.h"
@@ -848,8 +848,8 @@ struct MiniCPMO45AudioEncoder {
     }
 };
 #include <random>
-#include "generation_policy.h"
-#include "sampling.h"
+#include "policy.h"
+#include "csrc/engine/requests/sampling.h"
 #include "models/common/full_block.h"
 #include "ops.h"
 

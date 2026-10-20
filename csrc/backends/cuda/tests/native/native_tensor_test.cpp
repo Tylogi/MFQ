@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cmath>
 #include <stdexcept>
+#include <future>
+#include <vector>
 
 int main() {
     using namespace mfq::cuda;
@@ -94,4 +96,40 @@ int main() {
     assert(roundtrip.sizes() == sequence.sizes());
     assert(roundtrip.scalar_type() == sequence.scalar_type());
     assert(roundtrip.data_ptr<float>()[5] == 5.0f);
+
+    // A live narrow view must keep its block out of the idle pool, even
+    // when the original tensor is released and another worker allocates.
+    const auto fixed_host_bytes=tensor_host_bytes.load();
+    const auto options=TensorOptions{}.dtype(kUInt8);
+    constexpr std::int64_t large_bytes=(2u<<20)+17;
+    auto large=empty({large_bytes},options);
+    auto* original=large.data_ptr<std::uint8_t>();
+    original[0]=71;original[large_bytes-1]=93;
+    auto retained=large.narrow(0,0,large_bytes);
+    large={};
+    auto separate=empty({large_bytes},options);
+    assert(separate.data_ptr()!=original && retained.data_ptr<std::uint8_t>()[0]==71);
+    retained={};
+    auto reused=empty({large_bytes},options);
+    assert(reused.data_ptr()==original && reused.nbytes()==large_bytes);
+    assert(reused.data_ptr<std::uint8_t>()[large_bytes-1]==93);
+    reused={};separate={};
+
+    std::vector<std::future<void>> workers;
+    for(int worker=0;worker<8;++worker)workers.push_back(std::async(std::launch::async,[&,worker] {
+        for(int repeat=0;repeat<24;++repeat) {
+            auto value=empty({large_bytes},options);
+            auto* bytes=value.data_ptr<std::uint8_t>();
+            bytes[0]=std::uint8_t(worker);bytes[large_bytes-1]=std::uint8_t(repeat);
+            auto view=value.narrow(0,0,large_bytes);value={};
+            assert(view.data_ptr<std::uint8_t>()[0]==worker &&
+                   view.data_ptr<std::uint8_t>()[large_bytes-1]==repeat);
+        }
+    }));
+    for(auto& worker:workers)worker.get();
+    {
+        std::vector<Tensor> allocations;
+        for(int i=0;i<20;++i)allocations.push_back(empty({4u<<20},options));
+    }
+    assert(tensor_host_bytes.load()==fixed_host_bytes+(64u<<20));
 }

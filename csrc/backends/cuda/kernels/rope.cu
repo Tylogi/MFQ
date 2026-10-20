@@ -6,7 +6,7 @@
 //   out[t,j+half] = x1*cos + x0*sin
 
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <algorithm>
@@ -22,6 +22,88 @@ struct RotaryProjectionLayout {
 __device__ int64_t rotary_position(const void* positions, bool wide, int64_t index) {
     return wide ? static_cast<const int64_t*>(positions)[index]
                 : static_cast<const int32_t*>(positions)[index];
+}
+
+template<class Value>
+__global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* weight,const void* positions,
+        bool wide_positions,const int64_t* cache,const float* frequencies,const int32_t* selected_axes,Value* output,
+        int tokens,int width,int pool,int maximum,int rotary_maximum,int pairs,int axes,float eps,
+        int64_t row_stride,int64_t column_stride) {
+    const int token=blockIdx.x,column=threadIdx.x;
+    const int64_t block=cache[token]/pool,start=block*pool;
+    // A verify batch can touch one block repeatedly. Only its last query writes
+    // the pooled entry; all queries observe the same completed raw cache.
+    if(token+1<tokens && cache[token+1]/pool==block)return;
+    __shared__ float means[256],partial[256];
+    float mean=0;
+    if(column<width) {
+        float sum=0;
+        for(int i=0;i<pool;++i) {
+            const int64_t row=min(max(int64_t(0),start+i),int64_t(maximum)-1);
+            sum=__fadd_rn(sum,float(index[row*row_stride+column*column_stride]));
+        }
+        mean=float(Value(__fdiv_rn(sum,float(pool))));
+    }
+    means[column]=mean;partial[column]=__fadd_rn(0.f,__fmul_rn(mean,mean));
+    __syncthreads();
+    // Retain the normalized rotary kernel's reduction tree and intermediate
+    // FP16 rounding, including the rounding before rotate-half.
+    for(int stride=blockDim.x/2;stride>0;stride/=2) {
+        if(column<stride)partial[column]=__fadd_rn(partial[column],partial[column+stride]);
+        __syncthreads();
+    }
+    const float inverse=__fdiv_rn(1.f,__fsqrt_rn(__fadd_rn(__fdiv_rn(partial[0],float(width)),eps)));
+    const auto normalized=[&](int col){return Value(__fmul_rn(__fmul_rn(means[col],inverse),__fadd_rn(weight[col],1.f)));};
+    if(column>=width-pairs)return;
+    if(column>=pairs){output[block*width+column+pairs]=normalized(column+pairs);return;}
+    int axis=selected_axes[column];if(axis>=axes)axis=0;
+    const int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token)-cache[token]+start;
+    int position;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    position=wide_positions?__double2int_rz(double(raw)):int(raw);
+#else
+    position=int(raw);
+#endif
+    position=max(0,min(rotary_maximum-1,position));
+    const float angle=__fmul_rn(float(position),frequencies[column]);
+    const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+    const float first=float(normalized(column)),second=float(normalized(column+pairs));
+    output[block*width+column]=Value(__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine)));
+    output[block*width+column+pairs]=Value(__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine)));
+}
+
+void qsa_pool_rotary_cache_cuda(const mfq_tensor_backend::Tensor& index,const mfq_tensor_backend::Tensor& weight,
+        const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache,
+        const mfq_tensor_backend::Tensor& frequencies,const mfq_tensor_backend::Tensor& axes,
+        const mfq_tensor_backend::Tensor& output,int64_t pool,int64_t maximum,int64_t rotary_maximum,double eps) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(2)>0 && index.size(2)<=256 &&
+        (index.scalar_type()==tb::kFloat16 || index.scalar_type()==tb::kFloat32) && pool>0 && pool<=INT_MAX &&
+        maximum>0 && maximum<=index.size(1) && maximum<=INT_MAX && rotary_maximum>0 && rotary_maximum<=INT_MAX &&
+        std::isfinite(eps) && eps>=0,"invalid pooled rotary geometry");
+    MFQ_RUNTIME_CHECK(cache.device()==index.device() && cache.is_contiguous() && cache.dim()==1 &&
+        cache.numel()>0 && cache.numel()<=32 && cache.scalar_type()==tb::kInt64 &&
+        positions.device()==index.device() && positions.is_contiguous() && positions.dim()>=1 && positions.dim()<=3 &&
+        positions.size(-1)==cache.numel() && (positions.dim()<3 || positions.size(1)==1) &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64),"invalid pooled rotary positions");
+    MFQ_RUNTIME_CHECK(output.device()==index.device() && output.is_contiguous() && output.dim()==3 && output.size(0)==1 &&
+        output.size(1)>=(maximum+pool-1)/pool && output.size(2)==index.size(2) && output.scalar_type()==index.scalar_type() &&
+        weight.device()==index.device() && weight.is_contiguous() && weight.scalar_type()==tb::kFloat32 && weight.numel()==index.size(2) &&
+        frequencies.device()==index.device() && frequencies.is_contiguous() && frequencies.scalar_type()==tb::kFloat32 &&
+        frequencies.dim()==1 && frequencies.numel()>0 && frequencies.numel()<=index.size(2)/2 &&
+        axes.device()==index.device() && axes.is_contiguous() && axes.scalar_type()==tb::kInt32 && axes.sizes()==frequencies.sizes(),
+        "invalid pooled rotary storage");
+    MfqCudaGuard guard(index.device());const int width=int(index.size(2));
+    const int threads=width<=32?32:width<=64?64:width<=128?128:256;
+    const auto launch=[&](auto* source,auto* target) {
+        qsa_pool_rotary_cache_kernel<<<unsigned(cache.numel()),threads,0,mfq_current_cuda_stream()>>>(source,
+            weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==tb::kInt64,cache.data_ptr<int64_t>(),
+            frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),target,int(cache.numel()),width,int(pool),int(maximum),
+            int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),float(eps),index.stride(1),index.stride(2));
+    };
+    if(index.scalar_type()==tb::kFloat16)launch(reinterpret_cast<const __half*>(index.data_ptr()),reinterpret_cast<__half*>(output.data_ptr()));
+    else launch(index.data_ptr<float>(),output.data_ptr<float>());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<class Value>

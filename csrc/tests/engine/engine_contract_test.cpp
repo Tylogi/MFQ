@@ -3,7 +3,7 @@
 #include <type_traits>
 
 #if __has_include("inference.h") || __has_include("text_processor.h") || \
-    __has_include("request_executor.h") || __has_include("generation_step.h") || \
+    __has_include("requests.h") || __has_include("generation_step.h") || \
     __has_include("tokenizer.h")
 #error Engine implementation leaked through the public include surface
 #endif

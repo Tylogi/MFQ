@@ -1,9 +1,9 @@
 #pragma once
 
 #include "storage/session/state.h"
-#include "mtp_policy.h"
+#include "predictor.h"
 #include "native/tensor/backend.h"
-#include "models/common/causal_model_ops.h"
+#include "causal_model_ops.h"
 
 #include <cstdint>
 #include <variant>
@@ -12,11 +12,10 @@
 
 struct RopeCache;
 
+// A predictor runs against any loaded CUDA model, so it holds the model through
+// the family-independent interface rather than a list of concrete types.
 struct MtpTarget {
-    std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
-        mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
-        mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
-        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
+    mfq::cuda::CudaCausalModel* model = nullptr;
     const RopeCache* rope = nullptr;
     template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
     mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;
@@ -85,6 +84,11 @@ struct MtpModule {
     virtual void restore_session_state(const MtpSessionState&) {
         throw std::runtime_error(
             "this CUDA MTP predictor has no session state");
+    }
+    virtual void seed_target_context(mfq_tensor_backend::Tensor hidden, std::int64_t tokens) {
+        MFQ_RUNTIME_CHECK(hidden.dim() == 3 && hidden.size(1) == tokens,
+                          "this CUDA MTP predictor requires complete prompt context");
+        append_target_context(std::move(hidden), 0);
     }
     virtual void append_target_context(
         mfq_tensor_backend::Tensor,

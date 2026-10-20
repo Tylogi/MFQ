@@ -1,39 +1,33 @@
 import struct
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
-from mfq.calibration.wt2 import ReferenceWriter, write_head
+from mfq.calibration.wt2 import ReferenceWriter
 
 
 @pytest.mark.parametrize('vocab', [19, 20])
 def test_v3_binary_matches_dense_reference_and_streams_head(tmp_path, vocab):
-    torch.manual_seed(42)
-    weights = torch.randn(vocab, 8)
-    hidden = torch.randn(15, 8)
-    targets = torch.arange(15) % vocab
-    calls = []
-    def tensor(name, **kwargs):
-        calls.append((kwargs['row_start'], kwargs['row_end']))
-        return weights[kwargs['row_start']:kwargs['row_end']]
-    backend = SimpleNamespace(device=torch.device('cpu'), teacher_dtype=torch.float32,
-        index=SimpleNamespace(weight_map={'lm_head.weight': 'weights'}, tensor=tensor))
+    rng = np.random.default_rng(42)
+    weights = rng.normal(size=(vocab, 8)).astype(np.float32)
+    hidden = rng.normal(size=(15, 8)).astype(np.float32)
+    targets = np.arange(15) % vocab
     path = tmp_path / 'ref.logits'
     tokens = np.arange(64, dtype='<i4').reshape(2, 32)
+    tokens[:, 17:] = targets
     with ReferenceWriter(path, tokens, vocab) as writer:
         for chunk in range(2):
-            nll = write_head(backend, hidden, targets, writer, chunk, row_chunk=7, token_chunk=5)
+            nll = sum(writer.logits(chunk, start, hidden[start:start + 5] @ weights.T) for start in range(0, 15, 5))
         writer.commit()
-    assert max(end - start for start, end in calls) <= 7
     raw = path.read_bytes()
     assert raw[:8] == b'_logit3_'
     assert struct.unpack_from('<II', raw, 8) == (vocab, 2)
     assert struct.unpack_from('<III', raw, 16) == (32, 17, 15)
     assert np.array_equal(np.frombuffer(raw, dtype='<i4', count=64, offset=40).reshape(2, 32), tokens)
-    exact = torch.log_softmax(hidden @ weights.T, -1).numpy()
-    expected = exact[np.arange(15), targets.numpy()]
+    logits = hidden @ weights.T
+    shifted = logits - logits.max(-1, keepdims=True)
+    exact = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+    expected = exact[np.arange(15), targets]
     target_offset = 40 + 64 * 4
     actual_targets = np.frombuffer(raw, dtype='<f4', count=30, offset=target_offset).reshape(2, 15)
     np.testing.assert_allclose(actual_targets, np.stack([expected, expected]), atol=2e-6)
@@ -50,12 +44,11 @@ def test_v3_binary_matches_dense_reference_and_streams_head(tmp_path, vocab):
 
 
 def test_resident_head_produces_the_same_file(tmp_path):
-    weights, hidden = torch.randn(23, 4), torch.randn(15, 4)
-    index = SimpleNamespace(weight_map={'lm_head.weight': 'weights'}, tensor=lambda name, **kwargs: weights[kwargs['row_start']:kwargs['row_end']])
-    backend = SimpleNamespace(device=torch.device('cpu'), teacher_dtype=torch.float32, index=index)
-    for name, resident in [('streamed', None), ('resident', weights)]:
+    logits = np.random.default_rng(42).normal(size=(15, 23)).astype(np.float32)
+    for name, batch in [('streamed', 5), ('resident', 15)]:
         with ReferenceWriter(tmp_path / name, np.zeros((1, 32), dtype='<i4'), 23) as writer:
-            write_head(backend, hidden, torch.arange(15), writer, 0, row_chunk=8, resident_weight=resident)
+            for start in range(0, 15, batch):
+                writer.logits(0, start, logits[start:start + batch])
             writer.commit()
     assert (tmp_path / 'streamed').read_bytes() == (tmp_path / 'resident').read_bytes()
 

@@ -18,8 +18,8 @@ export const sessionsApi = {
 
   /** 按模型和交互模式创建会话，返回服务端分配的标识与版本。 */
   createSession(
-    model: string,
-    mode: SessionMode,
+    model?: string,
+    mode: SessionMode = 'text',
     title?: string,
     metadata?: Record<string, unknown>,
   ): Promise<Session> {

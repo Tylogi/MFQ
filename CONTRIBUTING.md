@@ -1,9 +1,16 @@
 # MFQ development rules
 
-The workspace [runtime architecture](../docs/architecture.md) defines ownership
-for CUDA and shared runtime/model code. This guide applies those rules to the
-repository. Pending migrations remain in the workspace [TODO](../docs/todo.md);
-existing backend code is not a precedent for duplicating shared behavior.
+The workspace [runtime architecture](../docs/architecture.md) describes the
+architecture as it is implemented today, including its transitional limits. The
+target refactor architecture is [refactor.md](../docs/refactor.md), the
+migration order and exit gates are [plan.md](../docs/plan.md), and known defects
+are tracked in [bugs.md](../docs/bugs.md); non-refactor follow-ups remain in the
+workspace [TODO](../docs/todo.md). Existing backend code is not a precedent for
+duplicating shared behavior.
+
+Rules below are split into what binds work **now** and what the **target**
+requires. Where the two differ, follow the current rule while migrating a
+consumer, and never add new code that the target forbids.
 
 `Runtime = Transport + Scheduler + Engine`. Runtime applications compose the
 three components. Transport converts wire messages to scheduler commands;
@@ -18,27 +25,41 @@ be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
 - Backend-neutral value contracts, schemas, canonical names and model sources
-  belong in `csrc/core/`.
+  live in `csrc/core/` today. That aggregation is transitional, not the target:
+  [refactor.md](../docs/refactor.md) assigns them to `formats/`,
+  `model_source/`, `components/io/`, `backends/cpu/` and the Engine modules, and
+  [plan.md](../docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
+  Do not add new code to `core/` that belongs in one of those owners.
 - Logical scheduling, cancellation, deadlines and output backpressure belong
   in `csrc/scheduler/`; wire protocols belong in `csrc/transport/`.
 - Cross-backend request execution, tokenization, sampling semantics, physical
   batch policy, session/cache lifecycle, metrics and MTP acceptance/commit rules
   belong in `csrc/engine/`.
-- Shared model configurations and forward definitions belong in
-  `csrc/models/<family>/`; shared layer compositions belong in
+- Shared model configurations and forward definitions live today in
+  `csrc/models/<family>/`, with shared layer compositions in
   `csrc/models/common/`. Family equations, positions and topology are defined
-  once and composed with backend operations.
+  once and composed with backend operations. The target moves each family to
+  `csrc/engine/model/<family>/` composed with complete backend operators;
+  [refactor.md](../docs/refactor.md) defines that end state and
+  [bugs.md](../docs/bugs.md) B28 tracks the current binding chain
+  (`CausalModelBase → CudaCausalOps → native model`) as debt, not as a rule to
+  reproduce.
 - Reusable mathematical operations and packed kernels belong in
   `csrc/backends/<backend>/ops/` and `csrc/backends/<backend>/kernels/`.
-  Shared CUDA kernel implementations still reside in `mfq/kernels/cuda/`
-  pending the source/package move recorded in TODO.
+  The shared CUDA `.cu/.cuh` sources already live in
+  `csrc/backends/cuda/kernels`; `mfq/kernels/cuda/` holds only the Python
+  wrappers, `mfq_cuda.cpp` and the `_ext.py` manifest, which compiles a subset
+  of those same native sources. There is no pending kernel move.
 - CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
   and physical cache storage, and `engine/` is the sole composition root for
   family selection, runtime components, batching and CUDA Graphs.
   `models/<family>/` supplies native operator/state bindings, with reusable
   bindings in `models/common/`. CUDA model code must not include CUDA `engine/`,
   and `models/common/` must not include a concrete family. These directories
-  are relative to `csrc/backends/cuda/`.
+  are relative to `csrc/backends/cuda/`. In the target, backend storage is the
+  physical implementation that a shared StateStore/WeightStore composes, and the
+  backend `engine.cpp` only assembles; see
+  [refactor.md](../docs/refactor.md) and plan §1.4 R4.
 - CLI parsing and application composition belong in backend `commands/` and
   `apps/`, compiled into the corresponding executable.
 
@@ -91,13 +112,20 @@ directory share a name prefix, the prefix becomes a subdirectory
 (`kernels/nvq/device.cuh`, not `kernels/nvq_device.cuh`).  The include rule is
 unchanged, the path is still rooted at the layer directory.
 
-`engine/internal` is PRIVATE in `engine/CMakeLists.txt`, and the backends and
-tests add that directory to their include path and include its headers bare.
-That is the only way a backend drives the shared generation loop, so it is
-allowed for `backends/` and `tests/` and for nobody else: `core/`,
-`transport/`, `scheduler/`, `models/` and `components/` must not include an
-engine internal header. `engine/` never includes a backend header. The
-engine-internal header graph is a DAG and no internal header is orphaned.
+`engine/<module>` (`requests`, `batch`, `state`, `weights`, `executor`, `text`,
+`src`) is PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add
+those directories to their include path and include their headers bare. That is
+the only way a backend drives the shared generation loop, so it is allowed for
+`backends/` and `tests/` and for nobody else: `core/`, `transport/`,
+`scheduler/`, `models/` and `components/` must not include an engine private
+header. `engine/` never includes a backend header, and inside `engine/` the
+request table, Planner, Store rules and text layer never reach the Executor
+driver. A backend's `ops/`, `kernels/` or `execution/` code never includes the
+shared Executor or Store headers; `storage/` may, because it is the physical
+StateStore and WeightStore. The engine header graph is a DAG and no private
+header is orphaned. `tests/test_engine_include_graph.py` checks all of this, and
+carries one small fixture per rule so a rule that stopped firing fails the test
+by itself.
 `tests/test_engine_include_graph.py` enforces all four.
 
 There is no `runtime/` layer and no `Runtime` type. Composition and lifetime
@@ -118,12 +146,20 @@ silent alias merely to avoid fixing an importer.
 
 ## Backend parity
 
-CUDA and Metal may use different kernels, but they share the same model graph,
-feature capability, sampling semantics, component names, and public behavior.
-Architecture support is registered from components present in the model, not
-from scattered per-model booleans. Optional Vision and MTP components default
-to enabled when both the graph and weights provide them; missing weights or an
-explicit user override disables them.
+Backends must share the **public semantics**: request lifecycle, sampling
+semantics, component names, canonical roles and the meaning of a model family's
+equations. They must not share a fake `supported = true`.
+
+Actual capability is per backend and per feature, and is stated item by item in
+the support matrix and the acceptance records
+([runtime-support.md](docs/runtime-support.md),
+[refactor-baseline.md](docs/refactor-baseline.md)), not assumed equal across
+backends. CUDA and Metal may use different kernels, physical layouts and float
+results, and one backend may lack a mechanism the other has (for example
+interleaved batching and CUDA Graphs today). Architecture support is registered
+from components present in the model, not from scattered per-model booleans.
+Optional Vision and MTP components default to enabled when both the graph and
+weights provide them; missing weights or an explicit user override disables them.
 
 ## Change checklist
 

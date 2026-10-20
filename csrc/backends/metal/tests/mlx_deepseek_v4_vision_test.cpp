@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_vision.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_vision.h"
 
 #include <cmath>
 #include <cstdint>

@@ -3,11 +3,13 @@
 #include "cuda_execution.h"
 
 #include "kernels/quant_ops.h"
+#include "kernels/mfe/ffn_token_groups.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <sstream>
 #include <filesystem>
@@ -87,6 +89,14 @@ bool enabled_unless_disabled(const char* name) {
 } // namespace
 
 namespace mfq::cuda::runtime_options {
+bool kv_vram_preallocated() {
+    const auto* value = mfq::cuda::env_lookup("MFQ_KV_VRAM_PREALLOCATED");
+    return value && value[0] == '1';
+}
+bool vision_resident() {
+    const auto* value = mfq::cuda::env_lookup("MFQ_CUDA_VISION_RESIDENT");
+    return value && value[0] == '1';
+}
 namespace {
 bool exact_one(const char* name, bool fallback = false) {
     const auto* value = mfq::cuda::env_lookup(name);
@@ -127,7 +137,11 @@ bool dma_graph_batch() { return exact_one("MFQ_MOE_DMA_GRAPH_BATCH"); }
 bool warp_multi_sum() { return exact_one("MFQ_CUDA_WARP_MULTI_SUM"); }
 float residency_heat_retention() {
     const auto* setting=mfq::cuda::env_lookup("MFQ_MOE_RESIDENCY_HEAT_RETENTION");
-    if(!setting)return 0.7f;
+    // A four-token adaptation interval needs to remember experts reused every
+    // dozen tokens. With 0.7 decay their score never reaches the admission
+    // threshold; 0.9 retains that evidence across roughly 26 tokens. Prefill
+    // still replaces the heat seed when a new request changes the working set.
+    if(!setting)return 0.9f;
     char* end=nullptr;const float value=std::strtof(setting,&end);
     if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
         throw std::invalid_argument("MFQ_MOE_RESIDENCY_HEAT_RETENTION must be between zero and one");
@@ -137,6 +151,42 @@ int residency_interval() {
     return environment_int("MFQ_MOE_RESIDENCY_INTERVAL",1,1,1024);
 }
 bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
+std::optional<bool> router_lookahead_override() {
+    const auto* value=mfq::cuda::env_lookup("MFQ_MOE_ROUTER_LOOKAHEAD");
+    return value?std::optional<bool>(std::string_view(value)=="1"):std::nullopt;
+}
+bool batch_attention_projections() {
+    const auto* value=mfq::cuda::env_lookup("MFQ_BATCH_ATTENTION_PROJECTIONS");
+    return !value || value[0]!='0';
+}
+bool gdn_independent_batch() {
+    const auto* value=mfq::cuda::env_lookup("MFQ_GDN_INDEPENDENT_BATCH");
+    return !value || value[0]!='0';
+}
+bool gdn_independent_batch_trace() { return exact_one("MFQ_TRACE_GDN_BATCH"); }
+bool batch_packed_prefill() {
+    const auto* value=mfq::cuda::env_lookup("MFQ_BATCH_PACKED_PREFILL");
+    return !value || value[0]!='0';
+}
+int batch_packed_prefill_token_budget() {
+    return environment_int("MFQ_BATCH_PACKED_PREFILL_TOKEN_BUDGET",512,16,8192);
+}
+bool nint_compressed_decode_batch() {
+    // Keep the faster GEMM dispatch while tuning the online Tensor Core path.
+    return exact_one("MFQ_NINT_COMPRESSED_DECODE_BATCH");
+}
+bool nint_compressed_large_batch(bool vocabulary) {
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_COMPRESSED_LARGE_BATCH");
+    if(!value || std::strcmp(value,"head")==0)return vocabulary;
+    return value[0]!='0';
+}
+bool nint_large_output_tiling() {
+    const auto* value=mfq::cuda::env_lookup("MFQ_NINT_LARGE_OUTPUT_TILING");
+    return !value || value[0]!='0';
+}
+int continuous_batch_kv_initial_capacity() {
+    return environment_int("MFQ_CONTINUOUS_BATCH_KV_INITIAL_CAPACITY",256,16,4096);
+}
 std::size_t workspace_reserve_bytes() {
     std::size_t reserve = std::size_t(4) * 1024 * 1024 * 1024;
     if (const auto* value = mfq::cuda::env_lookup("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
@@ -149,6 +199,15 @@ std::size_t workspace_reserve_bytes() {
         reserve = static_cast<std::size_t>(bytes);
     }
     return reserve;
+}
+std::size_t resident_budget_bytes() {
+    const auto value=environment("MFQ_SERVER_RESIDENT_BUDGET_BYTES");
+    if(!value)return 0;
+    std::size_t bytes=0;
+    const auto [end,error]=std::from_chars(value->data(),value->data()+value->size(),bytes);
+    if(error!=std::errc{} || end!=value->data()+value->size())
+        throw std::invalid_argument("MFQ_SERVER_RESIDENT_BUDGET_BYTES must be a non-negative integer");
+    return bytes;
 }
 bool phased_transfer() { return exact_one("MFQ_MOE_FFN_TRANSFER_PHASES", true); }
 bool ram_field_packing() { return exact_one("MFQ_MOE_RAM_FIELD_PACKING", true); }
@@ -800,7 +859,7 @@ CudaExecutionContext::CudaExecutionContext()
 
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
-    moe_expert_cache.reset();
+    stores.moe_expert_cache.reset();
     model_parallel_collectives.reset();
     tensor_parallel = {};
     expert_parallel = {};
@@ -1046,12 +1105,7 @@ void report_cuda_memory(
     // WDDM budget. Report those separately when diagnosing residency pressure.
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto native=context->memory_stats();
-    std::uint64_t pool_used=0,pool_reserved=0;
-    cudaMemPool_t pool=nullptr;
-    if(cudaDeviceGetDefaultMemPool(&pool,mfq_current_cuda_device())==cudaSuccess) {
-        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&pool_used));
-        MFQ_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&pool_reserved));
-    } else (void)cudaGetLastError();
+    const auto [pool_used,pool_reserved]=context->pool_memory_stats();
     std::cout<<"native_memory_stage="<<stage<<" owned_mib="<<native.allocated/mib
              <<" peak_mib="<<native.peak/mib<<" limit_mib="<<native.limit/mib
              <<" local_usage_mib="<<context->local_memory_usage()/mib
@@ -1080,3 +1134,173 @@ void report_cuda_memory(
 #endif
 #endif
 }
+
+namespace mfq::cuda::runtime_options {
+std::optional<bool> mfe_token_groups() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUPS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_token_compact_plan() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_TOKEN_COMPACT_PLAN")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_token_aligned_gu() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_TOKEN_ALIGNED_GU")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_shared_small_whole() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_SHARED_SMALL_WHOLE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_nvq_bank_map() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_NVQ_BANK_MAP")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_fused_fixed_bits() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_NINT_FUSED_FIXED_BITS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_group_quantize() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_NINT_GROUP_QUANTIZE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> ple_native_fusion() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_PLE_NATIVE_FUSION")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gdn_strided_projections() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_STRIDED_PROJECTIONS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_short_inplace() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_SHORT_INPLACE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_short_fusion() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_SHORT_FUSION")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_batch_projection() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_BATCH_PROJECTION")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_prefill_decode_reuse() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_NINT_PREFILL_DECODE_REUSE")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_prefill_append_tail() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_PREFILL_APPEND_TAIL")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gdn_prefill_layer_batch() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_PREFILL_LAYER_BATCH")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gr_prefill_layer_batch() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_PREFILL_LAYER_BATCH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_chain_ffn_post() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_CHAIN_FFN_POST")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> mtp_predictor_graph() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MTP_PREDICTOR_GRAPH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<std::int64_t> continuous_ffn_tile() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_CONTINUOUS_FFN_TILE")) return std::atoll(value);
+    return std::nullopt;
+}
+std::optional<bool> gdn_packed_qkv() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_PACKED_QKV")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<int> moe_prefill_shared_chain_streams() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_PREFILL_SHARED_CHAIN_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<int> moe_prefill_shared_streams() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_PREFILL_SHARED_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<int> gdn_prefill_projection_streams() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GDN_PREFILL_PROJECTION_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<bool> trace_gr_dispatch() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_TRACE_GR_DISPATCH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_batch_two_stage() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_BATCH_TWO_STAGE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_continuous_two_stage() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_CONTINUOUS_TWO_STAGE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<std::int64_t> gr_prefill_work_chunk() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_PREFILL_WORK_CHUNK")) return std::atoll(value);
+    return std::nullopt;
+}
+std::optional<bool> position_buffer(const char* name) {
+    if (const auto* value = mfq::cuda::env_lookup(name)) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> single_output_view() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_SINGLE_OUTPUT_VIEW")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> moe_direct_cache_dma() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_DIRECT_CACHE_DMA")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_compact_host_stage() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_COMPACT_HOST_STAGE")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_prefill_host_maps() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_PREFILL_HOST_MAPS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<char> gr_up_group_coefficients() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_UP_GROUP_COEFFICIENTS")) return value[0];
+    return std::nullopt;
+}
+std::optional<bool> gr_dense_bf16_direct() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_GR_DENSE_BF16_DIRECT")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<int> mfe_token_group_capacity() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
+        const std::string_view mode(value);
+        if (mode == "2") return 2;
+        if (mode == "4") return 4;
+        if (mode == "8") return 8;
+        if (mode == "shared4") return mfq::cuda::kMfeSharedGroupEncoding + 4;
+        if (mode == "auto") return 0;
+    }
+    return std::nullopt;
+}
+std::optional<std::int64_t> moe_ram_pin_bytes() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_RAM_PIN_GIB")) {
+        char* end=nullptr;
+        const double gib=std::strtod(value,&end);
+        if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
+            throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
+        return gib>0?std::max<std::int64_t>(1,std::int64_t(gib*(1ull<<30))):0;
+    }
+    return std::nullopt;
+}
+std::optional<std::int64_t> moe_ram_pin_reserve_bytes() {
+    if (const auto* value = mfq::cuda::env_lookup("MFQ_MOE_RAM_PIN_RESERVE_GIB")) {
+        char* end=nullptr;
+        const double gib=std::strtod(value,&end);
+        if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>=double(INT64_MAX)/(1ull<<30))
+            throw std::invalid_argument("MFQ_MOE_RAM_PIN_RESERVE_GIB must be finite and non-negative");
+        return std::int64_t(gib*(1ull<<30));
+    }
+    return std::nullopt;
+}
+} // namespace mfq::cuda::runtime_options

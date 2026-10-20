@@ -1,4 +1,4 @@
-#include "mlx_moe_ops.h"
+#include "ops/mlx_moe_ops.h"
 
 #include <algorithm>
 #include <chrono>
@@ -116,6 +116,8 @@ void test_runtime_row_kernel_reuse() {
         check("inverse permutation", inverse);
         const auto sorted_pairs = mlx::core::reshape(
             pairs, Shape{tokens * routes, width});
+        auto restored = mfq::metal::moe_restore_routed_rows(sorted_pairs,order,selected.ids);
+        check("restore routed rows", restored.inputs().front());
         check("sorted reduce", mfq::metal::moe_weighted_reduce_sorted(
             sorted_pairs, inverse, weights));
         check("sorted reduce shared gate" + gate_binding,
@@ -397,14 +399,14 @@ void test_small_m_softmax_topk() {
     for (const auto dtype : {
              mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
         for (const int experts : {32, 512, 4096}) {
-            for (int rows = 2; rows <= 6; ++rows) {
+            for (const int rows : {2, 3, 4, 5, 6, 7, 8, 12, 16}) {
                 constexpr int top_k = 10;
                 std::vector<float> logits(rows * experts);
                 for (int row = 0; row < rows; ++row) {
                     for (int expert = 0; expert < experts; ++expert) {
                         logits[row * experts + expert] = row == rows - 1
                             ? 0.0f
-                            : static_cast<float>((expert * 13 + row * 7) % 61 - 30) / 16.0f;
+                            : static_cast<float>((expert * 13 + (row % 2 ? row * 7 : 0)) % 61 - 30) / 16.0f;
                     }
                 }
                 auto source = mlx::core::astype(
@@ -421,11 +423,14 @@ void test_small_m_softmax_topk() {
                     std::vector<int> matched;
                     for (int route = 0; route < rows * top_k; ++route)
                         if (ids[route] == ids[index]) matched.push_back(route);
-                    require(groups[index * 8 + 1] == static_cast<int>(matched.size()) &&
+                    const auto position = std::find(matched.begin(), matched.end(), index) - matched.begin();
+                    const auto first = position / 6 * 6;
+                    const auto count = std::min<std::size_t>(6, matched.size() - first);
+                    require(groups[index * 8 + 1] == static_cast<int>(count) &&
                             groups[index * 8] == ids[index], "route group count or expert mismatch");
                     for (int slot = 0; slot < 6; ++slot)
                         require(groups[index * 8 + slot + 2] ==
-                            (slot < static_cast<int>(matched.size()) ? matched[slot] : -1),
+                            (slot < static_cast<int>(count) ? matched[first + slot] : -1),
                             "route group members or padding mismatch");
                 }
                 for (int row = 0; row < rows; ++row) {
@@ -1413,6 +1418,24 @@ void test_glu_and_expert_scale() {
     }
 }
 
+void test_restore_routed_rows() {
+    using namespace mlx::core;
+    for (auto dtype : {float16,bfloat16,float32}) for (int rows : {1,7,257}) for (int width : {1,13,64,511}) {
+        auto values = contiguous(astype(reshape(sin(arange(rows*width,float32)),{rows,width}),dtype));
+        std::vector<std::int32_t> order_values(rows),ids_values(rows);
+        for (int row=0;row<rows;++row) {order_values[row]=(row*13+5)%rows;ids_values[row]=row%7==0?-1:row%5;}
+        auto order = array(order_values.begin(),Shape{rows});
+        auto ids = array(ids_values.begin(),Shape{rows});
+        auto expected = where(expand_dims(ids>=array(0,int32),-1),take(values,argsort(order),0),zeros({rows,width},dtype));
+        auto actual = mfq::metal::moe_restore_routed_rows(values,order,ids);
+        auto expected_bytes = view(contiguous(expected),uint8),actual_bytes=view(contiguous(actual),uint8);
+        eval(expected_bytes,actual_bytes);
+        require(expected.shape()==actual.shape()&&expected.dtype()==actual.dtype(),"restored route shape/dtype mismatch");
+        require(std::equal(expected_bytes.data<std::uint8_t>(),expected_bytes.data<std::uint8_t>()+expected_bytes.size(),
+            actual_bytes.data<std::uint8_t>()),"restored routes are not bit-exact");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1436,6 +1459,7 @@ int main() {
         test_reduce_and_shared_gate();
         test_glu_and_expert_scale();
         test_runtime_row_kernel_reuse();
+        test_restore_routed_rows();
         std::cout
             << "MFQ C++ routed MoE Metal primitive tests passed\n";
         return 0;

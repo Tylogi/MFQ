@@ -1,4 +1,5 @@
 #include "kernels/cache/dma_copy_batch.h"
+#include "storage/weights/moe/native_dma_batch.h"
 #include "kernels/moe/pipeline.h"
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,66 @@
 namespace {
 void check(cudaError_t error) {
     if(error!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(error));
+}
+void verify_native_batches() {
+    if(!mfq::cuda::NativeDmaBatch::available()) {
+        std::cout<<"native DMA batches unavailable on this driver SKIP\n";return;
+    }
+    constexpr std::size_t total=1<<20;
+    unsigned char* host=nullptr;unsigned char* device=nullptr;void* mapped=nullptr;
+    check(cudaMallocHost(reinterpret_cast<void**>(&host),total));
+    check(cudaHostGetDevicePointer(&mapped,host,0));
+    check(cudaMalloc(reinterpret_cast<void**>(&device),total));
+    cudaStream_t stream=nullptr,consumer=nullptr;cudaEvent_t ready=nullptr;
+    check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    check(cudaStreamCreateWithFlags(&consumer,cudaStreamNonBlocking));
+    check(cudaEventCreateWithFlags(&ready,cudaEventDisableTiming));
+    for(std::size_t i=0;i<total;++i)host[i]=static_cast<unsigned char>(i*29+(i>>5)*71);
+    const auto alias=[&](const void* source,std::size_t bytes) -> CUdeviceptr {
+        const auto offset=reinterpret_cast<uintptr_t>(source)-reinterpret_cast<uintptr_t>(host);
+        return offset<=total && bytes<=total-offset?reinterpret_cast<CUdeviceptr>(mapped)+offset:0;
+    };
+    std::vector<unsigned char> expected(total),actual(total);
+    std::vector<mfq::cuda::DmaCopy> copies;
+    int cases=0;
+    for(const int count:{2,127,128,129,255,256,257,768,1025}) {
+        check(cudaMemsetAsync(device,0xa7,total,stream));
+        std::fill(expected.begin(),expected.end(),0xa7);copies.clear();
+        for(int i=0;i<count;++i) {
+            const auto source=std::size_t((i*1777+count*13)%(total-128));
+            const auto destination=std::size_t(i*256+(count&15));
+            const auto bytes=std::size_t(1+(i*71+count*19)%127);
+            copies.push_back({device+destination,host+source,bytes});
+            std::memcpy(expected.data()+destination,host+source,bytes);
+        }
+        if(!mfq::cuda::NativeDmaBatch::submit(copies,stream,1,alias))
+            throw std::runtime_error("native DMA rejected a valid multi-packet list");
+        // One phase fence must cover every packet, including a one-copy tail.
+        check(cudaEventRecord(ready,stream));check(cudaStreamWaitEvent(consumer,ready,0));
+        check(cudaMemcpyAsync(actual.data(),device,total,cudaMemcpyDeviceToHost,consumer));
+        check(cudaStreamSynchronize(consumer));
+        if(actual!=expected)throw std::runtime_error("native DMA changed payload, tail or neighboring guards");
+        ++cases;
+    }
+    // A bad owner late in the list must not submit its valid first packet.
+    copies.resize(129);check(cudaMemsetAsync(device,0xa7,total,stream));
+    std::fill(expected.begin(),expected.end(),0xa7);
+    std::size_t aliases=0;
+    if(mfq::cuda::NativeDmaBatch::submit(copies,stream,1,[&](const void* p,std::size_t n) {
+            return ++aliases==copies.size()?CUdeviceptr(0):alias(p,n);
+        }))throw std::runtime_error("native DMA accepted an invalid late alias");
+    check(cudaMemcpyAsync(actual.data(),device,total,cudaMemcpyDeviceToHost,stream));
+    check(cudaStreamSynchronize(stream));
+    if(actual!=expected)throw std::runtime_error("native DMA partially submitted before alias validation");
+    copies.back().bytes=0;bool rejected=false;
+    try {mfq::cuda::NativeDmaBatch::submit(copies,stream,1,alias);}
+    catch(const std::invalid_argument&){rejected=true;}
+    check(cudaMemcpyAsync(actual.data(),device,total,cudaMemcpyDeviceToHost,stream));
+    check(cudaStreamSynchronize(stream));
+    if(!rejected || actual!=expected)throw std::runtime_error("native DMA partially submitted an invalid late field");
+    check(cudaEventDestroy(ready));check(cudaStreamDestroy(consumer));check(cudaStreamDestroy(stream));
+    check(cudaFree(device));check(cudaFreeHost(host));
+    std::cout<<"native_dma_batch_cases="<<cases<<" 128-boundaries, one-copy tails, 1025 fields, phase fence, late invalid aliases/fields and byte guards exact PASS\n";
 }
 void verify_notification(bool cached,bool registered_source=false) {
     unsigned char* host=nullptr;unsigned char* device=nullptr;
@@ -74,9 +135,11 @@ void verify_notification(bool cached,bool registered_source=false) {
 }
 int main(int argc,char** argv) {
     try {
+        if(argc==2 && std::string(argv[1])=="--native-batches") {verify_native_batches();return 0;}
         if(argc==2 && std::string(argv[1])=="--notification-cached") {verify_notification(true);return 0;}
         if(argc==2 && std::string(argv[1])=="--notification-create") {verify_notification(false);return 0;}
         if(argc==2 && std::string(argv[1])=="--notification-registered") {verify_notification(true,true);return 0;}
+        verify_native_batches();
         constexpr std::size_t region=65536,total=2*region;
         unsigned char* host=nullptr;unsigned char* device=nullptr;
         check(cudaMallocHost(reinterpret_cast<void**>(&host),total));

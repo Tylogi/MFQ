@@ -1,10 +1,10 @@
 #pragma once
 
 #include "deepseek_v4_model.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_moe.h"
-#include "mlx_ssd_expert_cache.h"
-#include "mlx_tensor.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_moe.h"
+#include "runtime/mlx_ssd_expert_cache.h"
+#include "runtime/mlx_tensor.h"
 
 #include <array>
 #include <cstddef>

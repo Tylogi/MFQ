@@ -26,6 +26,7 @@ struct NvqWeight {
     mfq_tensor_backend::Tensor decode_records;
     // One byte-preserving group stream replaces indices/aux/states.
     bool dense_groups = false;
+    uint32_t bank_map = 0;
     int64_t format = 0;
     int64_t kernel_format = 0;
     int64_t sign_mode = 0;
@@ -165,3 +166,5 @@ bool nvq_pair_compatible(const NvqWeight& first, const NvqWeight& second);
 mfq_tensor_backend::Tensor nvq_dequant(const NvqWeight& weight);
 mfq_tensor_backend::Tensor nvq_embedding(
     const NvqWeight& weight, mfq_tensor_backend::Tensor token_ids);
+
+NvqWorkspace& resident_nvq_workspace(const NvqWeight& weight,int rows);

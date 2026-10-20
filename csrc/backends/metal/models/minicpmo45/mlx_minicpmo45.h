@@ -1,9 +1,9 @@
 #pragma once
 
 #include "mfq/token_constraint.h"
-#include "mfq_container.h"
-#include "mlx_sampling.h"
-#include "mlx_transformer.h"
+#include "storage/mfq_container.h"
+#include "runtime/mlx_sampling.h"
+#include "runtime/mlx_transformer.h"
 
 #include <cstdint>
 #include <functional>
@@ -237,6 +237,7 @@ void test_minicpmo45_qwen3_cache_equivalence();
 void test_minicpmo45_chunked_prefill_generation();
 void test_minicpmo45_qk_norm_rope();
 void test_minicpmo45_gqa_attention();
+void test_minicpmo45_gqa_reduction();
 
 } // namespace detail
 

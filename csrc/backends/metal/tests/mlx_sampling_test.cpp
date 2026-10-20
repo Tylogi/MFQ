@@ -1,4 +1,4 @@
-#include "mlx_sampling.h"
+#include "runtime/mlx_sampling.h"
 
 #include <algorithm>
 #include <chrono>
@@ -206,6 +206,37 @@ void test_greedy() {
             mlx::core::astype(input, mlx::core::float16)),
         expected,
         "greedy f16");
+}
+
+void test_greedy_large() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    for (int vocab : {4096, 4097, 65539, 248320}) {
+        std::vector<float> values(8 * vocab, -2.f);
+        std::fill(values.begin(), values.begin() + vocab, nan);
+        std::fill(values.begin() + vocab, values.begin() + 2 * vocab, -inf);
+        std::fill(values.begin() + 2 * vocab, values.begin() + 3 * vocab, -std::numeric_limits<float>::max());
+        values[3 * vocab + 2047] = values[3 * vocab + vocab - 1] = 5.f;
+        values[4 * vocab + 4095] = values[4 * vocab + vocab - 1] = 7.f;
+        values[5 * vocab + vocab - 1] = inf;
+        values[6 * vocab] = values[6 * vocab + vocab - 1] = inf;
+        for (int index = 0; index < vocab; ++index) values[7 * vocab + index] = std::sin(float(index) * .037f);
+        for (auto dtype : {mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
+            auto input = floats(values, Shape{2, 4, vocab}, dtype);
+            auto rounded = evaluated_floats(input);
+            std::vector<std::int32_t> expected;
+            for (int row = 0; row < 8; ++row) expected.push_back(cpu_greedy(rounded.data() + row * vocab, vocab));
+            auto selected = mfq::metal::sample_greedy(input);
+            require(selected.shape() == Shape{2, 4}, "tiled greedy changed the logits prefix shape");
+            require_ids(std::move(selected), expected, "tiled greedy NaN/tie/tail");
+            auto strided = mlx::core::slice(input, {0, 0, 0}, {2, 4, vocab}, {1, 1, 2});
+            rounded = evaluated_floats(mlx::core::contiguous(strided));
+            const int width = strided.shape(-1);
+            expected.clear();
+            for (int row = 0; row < 8; ++row) expected.push_back(cpu_greedy(rounded.data() + row * width, width));
+            require_ids(mfq::metal::sample_greedy(strided), expected, "tiled greedy strided input");
+        }
+    }
 }
 
 void test_softmax() {
@@ -934,6 +965,7 @@ void test_validation_and_greedy_precedence() {
 int main() {
     try {
         test_greedy();
+        test_greedy_large();
         test_softmax();
         test_direct_top_k_top_p();
         test_direct_top_k_large_vocab_and_stable_ties();

@@ -134,21 +134,20 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "glm_dsa"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
         config = Config::from_json(payload);
         config.layer_types.assign(static_cast<std::size_t>(config.num_hidden_layers), "glm_dsa");
         config.rotary_dim = config.qk_rope_head_dim;
-        this->adapter_validate_model_geometry();
+        this->validate_model_geometry();
         metadata.vocab_size = config.vocab_size;
         metadata.hidden_size = config.hidden_size;
         metadata.num_hidden_layers = config.num_hidden_layers;
         metadata.num_attention_heads = config.num_attention_heads;
         metadata.num_key_value_heads = config.num_key_value_heads;
         metadata.head_dim = config.head_dim;
-        metadata.max_position_embeddings = config.max_position_embeddings;
         metadata.rotary_dim = config.rotary_dim;
         metadata.num_experts = config.num_experts;
         metadata.rope_base = config.rope_base;
@@ -158,9 +157,6 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.decode_graph_double_warmup = true;
         metadata.model_type = config.model_type;
         metadata.layer_types = config.layer_types;
-    }
-    void adapter_set_max_position_embeddings(int64_t value) {
-        this->config.max_position_embeddings = value;
     }
 };
 

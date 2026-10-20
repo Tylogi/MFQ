@@ -2,13 +2,15 @@
 
 #include "models/common/causal_model_ops.h"
 
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "common/grid_vision_model.h"
+#include "ops/execution/execution_options.h"
+#include "storage/weights/moe/expert_cache.h"
 #include <array>
-#include "grid_vision.h"
+#include "csrc/core/grid_vision.h"
 #include "mfq/runtime.h"
 #include "kernels/attention/ops.h"
-#include "mfq_paged_prefix_cache.h"
+#include "csrc/core/mfq_paged_prefix_cache.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +23,44 @@ namespace mfq::cuda::grid_vision_runtime {
 using Tensor = mfq_tensor_backend::Tensor;
 
 namespace detail {
+
+template<class Visitor> void visit_linear(QuantLinear& w,Visitor visit) {
+    MFQ_RUNTIME_CHECK(!w.tensor_parallel(),"streamed vision weights require one CUDA device");
+    auto& n=w.nint;auto& v=w.nvq;
+    for(auto* tensor:{&w.dense,&n.q_packed,&n.row_q_bits,&n.row_q_bit_offsets,&n.q8_zero_scale,
+            &n.sub_scale,&n.sub_min,&n.neuron_scale,&n.neuron_min,&n.route_metadata,
+            &v.indices_packed,&v.aux_packed,&v.sub_scale_packed,&v.neuron_scale,&v.codebook,
+            &v.integer_codebook,&v.decode_records,&w.mxfp4.weight.values,&w.mxfp4.weight.scales,
+            &w.mxfp8.weight.values,&w.mxfp8.weight.scales,&w.mxfp4_sq.weight.blob,
+            &w.mxfp4_sq.weight.row_q,&w.mxfp4_sq.weight.row_symbol_byte_offsets,&w.mxfp4_sq.weight.row_auxiliary,
+            &w.fp8_sq.weight.blob,&w.fp8_sq.weight.row_q,&w.fp8_sq.weight.row_symbol_byte_offsets})
+        if(tensor->defined())visit(*tensor);
+    n.workspaces.clear();v.workspaces.clear();
+}
+
+template<class Weights> Weights to_cuda(Weights weights) {
+    weights.visit_tensors([](Tensor& t){t=t.to(mfq_tensor_backend::kCUDA);});
+    return weights;
+}
+template<class Weights> std::size_t weight_bytes(Weights weights) {
+    std::size_t bytes=0;
+    weights.visit_tensors([&](Tensor& t){bytes+=t.nbytes();});
+    return bytes;
+}
+
+// Finish each loan before yielding to the scheduler. Another request can then
+// decode using the restored experts, including if image preparation is cancelled.
+template<class Forward> Tensor vision_workspace(CudaExecutionContext& execution,std::size_t bytes,Forward forward) {
+    MoePrefillWorkspaceLoan loan(execution.stores.moe_expert_cache);
+    const bool borrowed=loan.begin(bytes)!=0;
+    auto result=forward();
+    if(borrowed) {
+        loan.suspend();
+        result=result.clone();
+        loan.finish();
+    }
+    return result;
+}
 
 inline Tensor required_vector(CudaExecutionContext &execution, const mfq::ModelSource &model,
                               GridVisionTensorRole role, int64_t width, size_t block = 0) {
@@ -35,6 +75,9 @@ inline Tensor required_vector(CudaExecutionContext &execution, const mfq::ModelS
 struct Affine {
     QuantLinear linear;
     Tensor bias;
+    template<class Visitor> void visit_tensors(Visitor visit) {
+        visit_linear(linear,visit);if(bias.defined())visit(bias);
+    }
 
     static Affine load(CudaExecutionContext &execution, const mfq::ModelSource &model,
                        GridVisionTensorRole weight, GridVisionTensorRole bias_role,
@@ -61,6 +104,7 @@ struct LayerNorm {
     Tensor weight;
     Tensor bias;
     double epsilon = 1e-6;
+    template<class Visitor> void visit_tensors(Visitor visit) { visit(weight);visit(bias); }
 
     static LayerNorm load(CudaExecutionContext &execution, const mfq::ModelSource &model,
                           GridVisionTensorRole weight, GridVisionTensorRole bias, int64_t width,
@@ -177,12 +221,7 @@ struct VisionAttention {
 };
 
 inline Tensor gelu_tanh(const Tensor &input) {
-    constexpr double sqrt_two_over_pi = 0.7978845608028654;
-    auto source = input.to(mfq_tensor_backend::kFloat32);
-    auto output = 0.5 * source *
-                  (1.0 + mfq_tensor_backend::tanh(sqrt_two_over_pi *
-                                                  (source + 0.044715 * source * source * source)));
-    return output.to(input.scalar_type());
+    return mfq_tensor_backend::gelu(input,"tanh");
 }
 
 struct VisionBlock {
@@ -191,6 +230,11 @@ struct VisionBlock {
     LayerNorm norm2;
     Affine mlp_up;
     Affine mlp_down;
+    template<class Visitor> void visit_tensors(Visitor visit) {
+        norm1.visit_tensors(visit);norm2.visit_tensors(visit);
+        attention.qkv.visit_tensors(visit);attention.output.visit_tensors(visit);
+        mlp_up.visit_tensors(visit);mlp_down.visit_tensors(visit);
+    }
 
     Tensor operator()(CudaExecutionContext &execution, const Tensor &input,
                       const GridVisionLayout &layout) const {
@@ -288,37 +332,55 @@ class CudaGridVisionEncoder {
                     input.size(1) != config_.patch_width())
                     throw std::runtime_error(
                         "grid-ViT pixel values must be flattened CxTxHxW patches");
-                auto weight = patch_weight_.reshape({config_.hidden_size, config_.patch_width()});
+                auto run=[&] {
+                auto weight = patch_weight_.to(mfq_tensor_backend::kCUDA).reshape({config_.hidden_size, config_.patch_width()});
                 auto output = mfq_tensor_backend::matmul(input.to(weight.scalar_type()),
                                                          weight.transpose(0, 1));
-                return output + patch_bias_.to(output.scalar_type());
+                return output + patch_bias_.to(mfq_tensor_backend::kCUDA).to(output.scalar_type());
+                };
+                return host_weights()?detail::vision_workspace(execution,patch_weight_.nbytes()+patch_bias_.nbytes()+
+                    std::size_t(count*config_.hidden_size)*16,run):run();
             },
             [&](const LearnedPositionInterpolation &interpolation) {
+                auto run=[&] {
+                auto position_weight=position_weight_.to(mfq_tensor_backend::kCUDA);
                 auto index = mfq_tensor_backend::tensor(interpolation.indices,
                                                         mfq_tensor_backend::TensorOptions()
                                                             .dtype(mfq_tensor_backend::kInt32)
                                                             .device(mfq_tensor_backend::kCPU))
-                                 .to(position_weight_.device())
+                                 .to(position_weight.device())
                                  .to(mfq_tensor_backend::kInt64);
                 auto weights = mfq_tensor_backend::tensor(interpolation.weights,
                                                           mfq_tensor_backend::TensorOptions()
                                                               .dtype(mfq_tensor_backend::kFloat32)
                                                               .device(mfq_tensor_backend::kCPU))
                                    .reshape({interpolation.patch_count, 4, 1})
-                                   .to(position_weight_.device());
+                                   .to(position_weight.device());
                 return mfq_tensor_backend::sum(
-                    position_weight_.index_select(0, index.reshape({-1}))
+                    position_weight.index_select(0, index.reshape({-1}))
                             .reshape({interpolation.patch_count, 4, config_.hidden_size}) *
                         weights,
                     1);
+                };
+                return host_weights()?detail::vision_workspace(execution,position_weight_.nbytes()+
+                    std::size_t(interpolation.patch_count*config_.hidden_size)*48,run):run();
             },
             [](Tensor hidden, Tensor learned) { return hidden + learned.to(hidden.scalar_type()); },
             [&](const auto &block, Tensor value, const GridVisionLayout &layout) {
+                // FP32 RoPE intermediates, Q/K/V copies and residual overlap;
+                // FFN input/output plus a decoded FP16 projection. GELU is fused.
+                const auto projection_scratch=std::size_t(2)*config_.hidden_size*
+                    std::max<int64_t>(3*config_.hidden_size,config_.intermediate_size);
+                if(host_weights())return detail::vision_workspace(execution,
+                    detail::weight_bytes(block)+value.nbytes()*16+projection_scratch+
+                    std::size_t(value.size(0)*config_.intermediate_size)*12+(std::size_t(16)<<20),
+                    [&] {auto resident=detail::to_cuda(block);return resident(execution,value,layout);});
                 return block(execution, std::move(value), layout);
             });
     }
 
     const GridVisionConfig &config() const noexcept { return config_; }
+    bool host_weights() const noexcept { return !patch_weight_.is_cuda(); }
 
   private:
     CudaGridVisionEncoder(GridVisionConfig config, Tensor patch_weight, Tensor patch_bias,
@@ -352,6 +414,13 @@ class CudaGridVisionPromptComponent {
             throw std::invalid_argument("invalid grid-Vision placeholder token IDs");
         }
         vision.validate();
+        struct LoadingScope {
+            bool& value;bool previous;
+            explicit LoadingScope(bool& flag,bool host):value(flag),previous(flag){value=host;}
+            ~LoadingScope(){value=previous;}
+        };
+        const bool host=!runtime_options::vision_resident() && !execution.tensor_parallel.enabled();
+        LoadingScope loading(execution.loading_cpu_layer,host);
         const int64_t unit = vision.spatial_merge_size * vision.spatial_merge_size;
         auto merger_norm = detail::LayerNorm::load(
             execution, model, GridVisionTensorRole::merger_norm_weight,
@@ -426,15 +495,24 @@ class CudaGridVisionPromptComponent {
                 if (step.value) patches = std::move(*step.value);
                 else co_yield step.state;
             }
-            merged = mfq::models::grid_vision::merge(
+            const auto merge=[&](const auto& norm,const auto& up,const auto& down) {
+            return mfq::models::grid_vision::merge(
                 patches, patches.size(0), encoder_.config(),
-                [&](Tensor value) { return merger_norm_(value); },
+                [&](Tensor value) { return norm(value); },
                 [](Tensor value, int64_t rows, int64_t width) {
                     return value.reshape({rows, width});
                 },
-                [&](Tensor value) { return merger_up_(*language.execution, std::move(value)); },
+                [&](Tensor value) { return up(*language.execution, std::move(value)); },
                 [](Tensor value) { return mfq_tensor_backend::gelu(value, "none"); },
-                [&](Tensor value) { return merger_down_(*language.execution, std::move(value)); });
+                [&](Tensor value) { return down(*language.execution, std::move(value)); });
+            };
+            if(encoder_.host_weights()) {
+                const auto bytes=detail::weight_bytes(merger_norm_)+detail::weight_bytes(merger_up_)+detail::weight_bytes(merger_down_);
+                merged=detail::vision_workspace(*language.execution,bytes+patches.nbytes()*12+(std::size_t(16)<<20),[&] {
+                    auto norm=detail::to_cuda(merger_norm_);auto up=detail::to_cuda(merger_up_);auto down=detail::to_cuda(merger_down_);
+                    return merge(norm,up,down);
+                });
+            } else merged=merge(merger_norm_,merger_up_,merger_down_);
             // ponytail: one image is the current native contract; use an LRU
             // only when alternating concurrent images becomes measurable.
             cached_vision_key_ = cache_key;
@@ -508,30 +586,32 @@ class CudaGridVisionPromptComponent {
 
 namespace mfq::cuda {
 
-template <typename Model> struct RuntimeComponents {
+// What a loaded model gained from its graph components. Family-independent: a
+// family that replaces the language model (MiniCPM-o) does so through the
+// composite, and the engine binds that once when it composes its state.
+struct RuntimeComponents {
     mfq::ModelGraph graph;
     CudaModelPlan plan;
     std::optional<grid_vision_runtime::CudaGridVisionPromptComponent> grid_vision;
     std::unique_ptr<MtpModule> mtp;
-    Model* language_override = nullptr;
     std::unique_ptr<minicpmo45::Components> composite;
     bool vision_available = false, mtp_available = false;
-    Model& language(Model& fallback) { return language_override ? *language_override : fallback; }
-    CudaComponentState state() const noexcept { return cuda_component_state(graph, plan, vision_available, mtp_available); }
 };
 
+// A family with CUDA adapters for its graph components declares an overload of
+// this for its own CausalLm; this is the text-only default for the rest.
 template <typename Model>
-RuntimeComponents<Model> load_runtime_components(Model& model, bool optional) {
-    RuntimeComponents<Model> result{model.graph, model.plan};
+RuntimeComponents load_runtime_components(Model& model, bool optional) {
+    RuntimeComponents result{model.graph, model.plan};
     if (optional && (result.plan.vision != CudaVisionAdapter::none || result.plan.predictor != CudaPredictorAdapter::none))
         throw std::runtime_error("CUDA component adapter is unsupported for this model");
     return result;
 }
 
-template<> RuntimeComponents<Qwen35CausalLm> load_runtime_components(Qwen35CausalLm&, bool);
-template<> RuntimeComponents<Qwen4CausalLm> load_runtime_components(Qwen4CausalLm&, bool);
-template<> RuntimeComponents<Glm5CausalLm> load_runtime_components(Glm5CausalLm&, bool);
-template<> RuntimeComponents<DeepseekV41CausalLm> load_runtime_components(DeepseekV41CausalLm&, bool);
-template<> RuntimeComponents<MiniCPMO45CausalLm> load_runtime_components(MiniCPMO45CausalLm&, bool);
-template<> RuntimeComponents<MiniCPMOTtsCausalLm> load_runtime_components(MiniCPMOTtsCausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(Qwen35CausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(Qwen4CausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(Glm5CausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(DeepseekV41CausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(MiniCPMO45CausalLm&, bool);
+template<> RuntimeComponents load_runtime_components(MiniCPMOTtsCausalLm&, bool);
 } // namespace mfq::cuda

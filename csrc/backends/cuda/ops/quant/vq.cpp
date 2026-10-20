@@ -1,14 +1,22 @@
+#include "native/resident_allocations.h"
 #include "ops/execution/execution_options.h"
 #include "kernels/norm_ops.h"
 #include "kernels/quant_ops.h"
 #include "vq.h"
 #include "ops/execution/cuda_execution.h"
 #include "ops/format.h"
-#include "nvq_codebooks.generated.h"
-#include "quant_dot.h"
-#include "nvq_group.h"
+#include "generated/nvq_codebooks.generated.h"
+#include "csrc/backends/cpu/ops/quant_dot.h"
+#include "csrc/backends/cpu/ops/nvq_group.h"
 #include "cpu_projection_rows.h"
-#include "nvq_dense_pack.h"
+#include "csrc/backends/cpu/ops/nvq_dense_pack.h"
+
+NvqWorkspace& resident_nvq_workspace(const NvqWeight& weight,int rows) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    mfq::cuda::ResidentAllocationScope resident;
+#endif
+    return weight.workspace(rows);
+}
 
 bool prepare_nvq_dense_groups(NvqWeight& w) {
     if(w.dense_groups)return true;
@@ -104,18 +112,11 @@ enum class NvqMatmulPath {
 };
 
 static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
-    // Small expert matrices underfill the multi-column GEMV on SM86.
-    // The vector decoder plus FP32-accumulating GEMM is faster from M=9.
+    // Short batches of small expert matrices use vector decode followed by
+    // FP32-accumulating GEMM. The decision depends on matrix geometry.
     if (M >= 9 && M <= 16 && w.out <= 4096 && w.neuron_len <= 4096 &&
             !mfq::cuda::runtime_options::nvq_dense_reference()) {
-        thread_local int cached_device = -1, major = 0, minor = 0;
-        const int device = w.indices_packed.get_device();
-        if (device != cached_device) {
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
-            cached_device = device;
-        }
-        if (major == 8 && minor == 6) return NvqMatmulPath::DequantGemm;
+        return NvqMatmulPath::DequantGemm;
     }
     const bool e8_family =
         w.format == 2 || w.format == 5 || w.format == 7 ||
@@ -475,7 +476,7 @@ mfq_tensor_backend::Tensor nvq_matmul(
     int M = (int)x.size(0);
     const NvqMatmulPath path = select_nvq_matmul_path(w, M);
     if (path == NvqMatmulPath::Gemv) {
-        NvqWorkspace & ws = w.workspace(M);
+        NvqWorkspace & ws = resident_nvq_workspace(w,M);
         return profiler.measure("nvq.gemv", [&]() {
             return nvq_gemv_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
@@ -484,7 +485,7 @@ mfq_tensor_backend::Tensor nvq_matmul(
         });
     }
     if (path == NvqMatmulPath::Mmq) {
-        NvqWorkspace & ws = w.workspace(M);
+        NvqWorkspace & ws = resident_nvq_workspace(w,M);
         return profiler.measure("nvq.mma24", [&]() {
             return nvq_mmq_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
@@ -530,7 +531,7 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
     int M = (int)x.size(0);
     const NvqMatmulPath path = select_nvq_matmul_path(w, M);
     if (path == NvqMatmulPath::Gemv) {
-        NvqWorkspace & ws = w.workspace(M);
+        NvqWorkspace & ws = resident_nvq_workspace(w,M);
         return profiler.measure("nvq.gemv_gate", [&]() {
             return nvq_gemv_gate_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
@@ -539,7 +540,7 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
         });
     }
     if (path == NvqMatmulPath::Mmq) {
-        NvqWorkspace & ws = w.workspace(M);
+        NvqWorkspace & ws = resident_nvq_workspace(w,M);
         return profiler.measure("nvq.mma24_gate", [&]() {
             return nvq_mmq_gate_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
@@ -576,7 +577,7 @@ mfq_tensor_backend::Tensor nvq_matmul_multi2(
             {nvq_matmul(profiler, first, x),
              nvq_matmul(profiler, second, x)}, -1);
     }
-    NvqWorkspace & ws = first.workspace(M);
+    NvqWorkspace & ws = resident_nvq_workspace(first,M);
     return profiler.measure("nvq.gemv_multi2", [&]() {
         return nvq_gemv_multi2_ws_cuda(
             first.indices_packed, first.aux_packed, first.sub_scale_packed,
@@ -604,7 +605,7 @@ mfq_tensor_backend::Tensor nvq_matmul_swiglu(
         auto parts = pair.split_with_sizes({gate.out, up.out}, -1);
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
-    NvqWorkspace & ws = gate.workspace(1);
+    NvqWorkspace & ws = resident_nvq_workspace(gate,1);
     return profiler.measure("nvq.gemv_swiglu", [&]() {
         return nvq_gemv_swiglu_ws_cuda(
             gate.indices_packed, gate.aux_packed, gate.sub_scale_packed,
@@ -637,8 +638,8 @@ mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
             ? acc_cuda(residual.value(), output)
             : output;
     }
-    NvqWorkspace & input_ws = gate.workspace(1);
-    NvqWorkspace & output_ws = down.workspace(1);
+    NvqWorkspace & input_ws = resident_nvq_workspace(gate,1);
+    NvqWorkspace & output_ws = resident_nvq_workspace(down,1);
     if (!input_ws.swiglu_scratch.defined() || input_ws.swiglu_scratch.numel() < gate.out) {
         input_ws.swiglu_scratch = mfq_tensor_backend::empty(
             {gate.out}, gate.indices_packed.options().dtype(

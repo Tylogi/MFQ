@@ -16,6 +16,7 @@ namespace mfq::metal {
 
 class MfqContainer;
 class MlxMfeWeight;
+struct MlxMfeCachedProjection;
 class MlxNintSwiGluPair;
 class MlxNintWeight;
 
@@ -25,6 +26,7 @@ struct MlxMfeKernelProfile {
     std::uint64_t vq_layouts = 0;
     std::shared_ptr<const std::vector<int>> nint_group_sizes;
     bool vq_execution_layout = false;
+    bool nint_q_dispatch = false;
 };
 
 struct MlxMfeProjectionInfo {
@@ -39,6 +41,15 @@ struct MlxMfeCacheReuseStats {
     std::size_t expert_hits = 0;
     std::size_t packed_hits = 0;
     std::size_t load_waits = 0;
+    std::size_t bytes_read = 0;
+    std::size_t read_calls = 0;
+    std::size_t evictions = 0;
+    double io_seconds = 0;
+    double wait_seconds = 0;
+    double prepare_seconds = 0;
+    double view_seconds = 0;
+    std::size_t cached_route_hits = 0;
+    std::size_t cached_route_misses = 0;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -73,6 +84,8 @@ public:
     void activate_record(const std::string& name);
     void prepare_projection(
         const std::string& name, bool shared_input, bool fused_swiglu = false);
+    void prepare_swiglu_pair(
+        const std::string& gate, const std::string& up, int routes);
     std::size_t backing_payload_bytes() const;
 
     MlxMfeProjectionInfo projection_info(
@@ -87,17 +100,29 @@ public:
     MlxMfeWeight grouped_mfe(
         const std::string& name,
         const std::vector<std::int32_t>& active_experts,
-        std::span<const std::uint32_t> activation_counts = {});
+        std::span<const std::uint32_t> activation_counts = {},
+        bool prefill_scan = false);
+
+    std::vector<MlxMfeWeight> grouped_mfe(
+        std::span<const std::string> names,
+        const std::vector<std::int32_t>& active_experts,
+        std::span<const std::uint32_t> activation_counts = {},
+        bool prefill_scan = false);
 
     std::optional<std::vector<MlxMfeWeight>> layer_mfe(
         std::span<const std::string> names,
         std::span<const std::int32_t> active_experts = {});
+
+    std::shared_ptr<const MlxMfeCachedProjection> cached_projection(const std::string& name);
+    bool resolve_cached_projections(std::span<const std::shared_ptr<const MlxMfeCachedProjection>> views,
+        std::span<const std::int32_t> experts);
 
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
     MlxMfeCacheReuseStats reuse_stats() const;
     std::size_t set_cache_limit(std::size_t bytes);
+    void set_prefill_priority(std::span<const std::string> names);
 
     // Atomically forget one parsed projection and all of its resident
     // experts.  Already returned routed weights retain their own Metal
@@ -140,8 +165,10 @@ class MlxMfeWeight {
 public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_blob(const mlx::core::array& blob);
     static MlxMfeWeight from_nint_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_nint_blob(const mlx::core::array& blob);
 
     // Load compatible packed projections into one final arena, without
     // separate Gate/Up arenas or model-sized staging vectors. Standalone
@@ -213,16 +240,14 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
-    // Execute independently stored Gate and Up projections without building
-    // a concatenated model-sized pool. Compatible native MXFP4 weights use a
-    // single small-M Metal dispatch; every other representation retains the
-    // exact two-projection fallback.
     mlx::core::array routed_swiglu_pair(
         const MlxMfeWeight& up,
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         float limit = 0.0f,
-        const mlx::core::array* route_groups = nullptr) const;
+        const mlx::core::array* route_groups = nullptr,
+        const mlx::core::array* gate_map = nullptr,
+        const mlx::core::array* up_map = nullptr) const;
     // One through six rows of heterogeneous MoE in two Metal launches after
     // routing. The first runs routed and shared Gate/Up; the second runs
     // routed and shared Down in parallel and combines them in-threadgroup.
@@ -236,7 +261,8 @@ public:
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_weights,
         bool shared_gate_is_logits = false,
-        const mlx::core::array* route_groups = nullptr) const;
+        const mlx::core::array* route_groups = nullptr,
+        const mlx::core::array* softmax_router_logits = nullptr) const;
     // Decode/small-M MXFP4 fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection
@@ -245,10 +271,11 @@ public:
     mlx::core::array routed_matmul_reduce(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
-        const mlx::core::array& route_weights) const;
+        const mlx::core::array& route_weights,
+        const mlx::core::array* route_groups = nullptr) const;
     // Whether this representation has a fused projection/reduction kernel.
     // Callers may otherwise fuse reduction with their following epilogue.
-    bool supports_fused_routed_reduce() const noexcept;
+    bool supports_fused_routed_reduce(const mlx::core::array* route_groups = nullptr) const noexcept;
     mlx::core::array routed_matmul_reduce_packed(
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
@@ -308,17 +335,29 @@ public:
     int neuron_len() const noexcept;
     int projections() const noexcept;
     std::size_t packed_nbytes() const noexcept;
+    static std::size_t packed_copy_count() noexcept;
+    static std::size_t indirect_dispatch_count() noexcept;
+    static std::size_t uncached_packed_bytes() noexcept;
+    static std::size_t pinned_packed_bytes() noexcept;
+    static std::size_t packed_pin_failures() noexcept;
+    static std::size_t pooled_staging_count() noexcept;
 
 private:
     struct Impl;
 
     friend class MlxMfeOffloadCache;
+    static MlxMfeWeight concatenate_expert_pages(const std::vector<MlxMfeWeight>& weights,
+        std::shared_ptr<const MlxMfeKernelProfile> profile = nullptr);
+    std::shared_ptr<void> pin_packed_storage() const noexcept;
     MlxMfeWeight with_kernel_profile(
         std::shared_ptr<const MlxMfeKernelProfile> profile) const;
+    MlxMfeWeight with_prepared_page_resources() const;
 
     static MlxMfeWeight from_projection_blobs_impl(
         std::span<const std::span<const std::uint8_t>> blobs,
-        bool nint_tensor);
+        bool nint_tensor,
+        const mlx::core::array* storage = nullptr,
+        const mlx::core::array* destination = nullptr);
 
     explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 
@@ -329,7 +368,8 @@ private:
         float swiglu_limit,
         const mlx::core::array* expert_map = nullptr,
         bool packed_expert_ids = false,
-        const mlx::core::array* route_groups = nullptr) const;
+        const mlx::core::array* route_groups = nullptr,
+        const mlx::core::array* reduce_weights = nullptr) const;
     mlx::core::array routed_bf16_reference(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -344,6 +384,27 @@ private:
 };
 
 using MlxMoeWeight = MlxMfeWeight;
+
+struct MlxMfeCachedProjection {
+    MlxMfeWeight weight;
+    mlx::core::array expert_map;
+    std::vector<std::int32_t> host_expert_map;
+    std::string name;
+    std::size_t metadata_bytes = 0;
+};
+
+struct MlxMfeCachedRoute {
+    std::shared_ptr<MlxMfeOffloadCache> cache;
+    std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections;
+    std::optional<mlx::core::array> ids;
+
+    mlx::core::array forward(const mlx::core::array& source,
+        const mlx::core::array& routes, float swiglu_limit = 0.0f,
+        const mlx::core::array* reduce_weights = nullptr);
+    std::span<const std::int32_t> host_ids();
+    bool all_resident();
+    bool resolve();
+};
 
 // Resolve canonical split Gate/Up projections into one packed dispatch.
 // Legacy fused ``gate_up.weight`` remains a read-only compatibility input.

@@ -61,7 +61,7 @@ Its scope is **routed expert tensors only**; non-routed tensors follow the norma
 quantizer/recipe policy, not the AlphaQ budget. The default 3.0 BPW is an example
 chosen by the caller, not an AlphaQ method hyperparameter.
 
-See [AlphaQ's formula, storage accounting and API](../alphaq.md) before comparing
+See [AlphaQ's formula, storage accounting and API](../quantization/alphaq.md) before comparing
 budgets or using shared-codebook candidate tables.
 
 ## Activation imatrix

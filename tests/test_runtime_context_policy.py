@@ -21,6 +21,61 @@ from mfq.server.services.model_context import declared_context_size, yarn_contex
 from mfq.server.services.service import ServerService
 from mfq.server.state.catalog import DiscoveredModel, ModelCatalog
 from mfq.server.state.storage import SCHEMA_VERSION, SessionStore
+from tests.test_server_models import _TestJobContext
+
+
+def test_global_cap_save_is_deferred_and_explicit_reload_only_shrinks_exceeded_models(tmp_path):
+    async def run():
+        pool, first, backend, service = managed_runtime(tmp_path)
+        first.context_size = 131072
+        first.artifact = DiscoveredModel(first.artifact.resource.model_copy(update={'yarn_context_capacity': 1048576, 'yarn_max_factor': 4.0}), first.artifact.path)
+        second_backend = ReloadBackend()
+        second = _Runtime(id=uuid4(), artifact=DiscoveredModel(first.artifact.resource.model_copy(update={'name': 'second'}), first.artifact.path),
+            backend=second_backend, process=None, port=0, context_size=32768, context_capacity=262144, state=RuntimeInstanceState.READY)
+        third_backend = ReloadBackend()
+        third = _Runtime(id=uuid4(), artifact=DiscoveredModel(first.artifact.resource.model_copy(update={'name': 'third'}), first.artifact.path),
+            backend=third_backend, process=None, port=0, context_size=65536, context_capacity=262144, state=RuntimeInstanceState.READY)
+        pool._instances.update({second.id: second, third.id: third})
+        await pool.configure_context_policy(RuntimeContextPolicy(max_context_size=65536,
+            model_overrides={'model': 131072}, model_yarn_enabled={'model': True},
+            model_qsa_kv_offload={'model': {'enabled': True, 'budget_bytes': 2 << 30}},
+            model_kv_quantization={'model': {'enabled': True, 'bits': 4}}))
+        saved = service.store.runtime_context_policy()
+        assert first.context_size == 131072 and backend.calls == []
+        result = await pool.configure_context(_TestJobContext(), {'apply_global_cap': True})
+        assert result['models_reloaded'] == 1 and first.context_size == 65536
+        assert backend.calls == [65536] and second_backend.calls == third_backend.calls == []
+        assert service.store.runtime_context_policy() == saved
+        assert pool._load_requests['model'].qsa_kv_offload.target_context == 65536
+        result = await pool.configure_context(_TestJobContext(), {'apply_global_cap': True})
+        assert result['models_reloaded'] == 0 and backend.calls == [65536]
+        pool._instances.clear()
+        await service.aclose()
+    asyncio.run(run())
+
+
+def test_global_cap_reload_does_nothing_in_automatic_mode(tmp_path):
+    async def run():
+        pool, instance, backend, service = managed_runtime(tmp_path)
+        result = await pool.configure_context(_TestJobContext(), {'apply_global_cap': True})
+        assert result['models_reloaded'] == 0 and backend.calls == []
+        pool._instances.clear()
+        await service.aclose()
+    asyncio.run(run())
+
+
+def test_global_cap_reload_rejects_busy_models_before_touching_any_runtime(tmp_path):
+    async def run():
+        pool, instance, backend, service = managed_runtime(tmp_path)
+        instance.context_size = 131072
+        instance.active_requests = 1
+        await pool.configure_context_policy(RuntimeContextPolicy(max_context_size=65536))
+        with pytest.raises(Exception, match='wait for model requests'):
+            await pool.configure_context(_TestJobContext(), {'apply_global_cap': True})
+        assert backend.calls == [] and instance.context_size == 131072
+        pool._instances.clear()
+        await service.aclose()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('config,tokenizer,expected', [

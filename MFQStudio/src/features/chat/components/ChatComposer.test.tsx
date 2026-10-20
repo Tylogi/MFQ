@@ -30,6 +30,18 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+it('没有可用模型时仍可编辑草稿，但不能提交', async () => {
+  const view = render(<ChatComposer {...props} ready={false} editable />);
+  await userEvent.type(screen.getByRole('textbox'), 'draft before loading');
+  expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+  await userEvent.keyboard('{Enter}');
+  expect(props.onSend).not.toHaveBeenCalled();
+  expect(screen.getByRole('textbox')).toHaveValue('draft before loading');
+  view.rerender(<ChatComposer {...props} editable />);
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+  expect(screen.getByRole('textbox')).toHaveValue('draft before loading');
+});
+
 it('每次键入只更新输入组件，草稿按会话保存并在返回时恢复', async () => {
   const user = userEvent.setup();
   let renders = 0;

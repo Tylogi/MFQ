@@ -1,9 +1,37 @@
+#include "cpu_projection_rows.h"
 #include "kernels/quant_ops.h"
 #include "mx.h"
 #include "ops/format.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
+
+CpuProjectionRows make_cpu_projection_rows(const Mxfp4Weight& w) {
+    MFQ_RUNTIME_CHECK(!w.values.is_cuda() && !w.scales.is_cuda() && w.neuron_len>0 &&
+        w.neuron_len%32==0 && w.values.numel()==w.out*(w.neuron_len/2) &&
+        w.scales.numel()==w.out*(w.neuron_len/32),"invalid CPU MXFP4 projection fields");
+    CpuProjectionRows plan;plan.width=int(w.neuron_len);plan.outputs=int(w.out);
+    const auto* values=w.values.data_ptr<uint8_t>();const auto* scales=w.scales.data_ptr<uint8_t>();
+    const int width=plan.width;
+    plan.scalar_rows=[values,scales,width](const float* input,int batch,int input_stride,
+            float* output,int output_stride,int begin,int end) {
+        static constexpr float table[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+        for(int row=begin;row<end;++row)for(int token=0;token<batch;++token) {
+            float sum=0;
+            for(int group=0;group<width/32;++group) {
+                const float scale=std::ldexp(1.0f,int(scales[std::size_t(row)*(width/32)+group])-127);
+                const auto* packed=values+std::size_t(row)*(width/2)+group*16;
+                const auto* x=input+std::size_t(token)*input_stride+group*32;
+                for(int i=0;i<16;++i) {
+                    sum+=x[2*i]*float(mfq_half(table[packed[i]&15]*scale));
+                    sum+=x[2*i+1]*float(mfq_half(table[packed[i]>>4]*scale));
+                }
+            }
+            output[std::size_t(token)*output_stride+row]=sum;
+        }
+    };
+    return plan;
+}
 
 mfq_tensor_backend::Tensor mxfp8_matmul(
         CudaProfiler& profiler,
@@ -20,7 +48,9 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
         const int64_t rows = x.size(0);
         const int64_t outputs = weight.out;
         const int64_t width = weight.neuron_len;
-        const int64_t scale_columns = width / 128;
+        const int64_t scale_columns = weight.scales.size(1);
+        const int64_t block_columns=width/scale_columns;
+        const int64_t block_rows=weight.scales.size(0)==outputs?1:block_columns;
         const auto * input = x.data_ptr<mfq_half>();
         const auto * values = weight.values.data_ptr<uint8_t>();
         const auto * scales = weight.scales.data_ptr<uint8_t>();
@@ -44,7 +74,7 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
                             static_cast<int>(exponent) - 7);
                     if ((raw & 128u) != 0u) decoded = -decoded;
                     const uint8_t raw_scale = scales[
-                        (neuron / 128) * scale_columns + column / 128];
+                        (neuron / block_rows) * scale_columns + column / block_columns];
                     const float weight_value = decoded * std::ldexp(
                         1.0f, static_cast<int>(raw_scale) - 127);
                     for (int64_t row = 0; row < rows; ++row) {
@@ -100,7 +130,9 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
     auto scales = weight.scales.to(mfq_tensor_backend::kCPU).contiguous();
     const auto * value_bytes = values.data_ptr<uint8_t>();
     const auto * scale_bytes = scales.data_ptr<uint8_t>();
-    const int64_t scale_columns = weight.neuron_len / 128;
+    const int64_t scale_columns = scales.size(1);
+    const int64_t block_columns=weight.neuron_len/scale_columns;
+    const int64_t block_rows=scales.size(0)==weight.out?1:block_columns;
     std::vector<float> dense(
         static_cast<size_t>(weight.out * weight.neuron_len));
     for (int64_t row = 0; row < weight.out; ++row) {
@@ -125,7 +157,7 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
             }
             const uint8_t raw_scale = scale_bytes[
                 static_cast<size_t>(
-                    (row / 128) * scale_columns + column / 128)];
+                    (row / block_rows) * scale_columns + column / block_columns)];
             const float scale = raw_scale == 255u
                 ? std::numeric_limits<float>::quiet_NaN()
                 : std::ldexp(1.0f, int(raw_scale) - 127);
@@ -153,7 +185,7 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
         "MXFP8 groupwise projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
     MFQ_RUNTIME_CHECK(
-        outputs_per_group % 128 == 0,
+        outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
         return profiler.measure("mxfp8.groupwise_small_m", [&]() {
@@ -163,7 +195,8 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
     }
     std::vector<mfq_tensor_backend::Tensor> outputs;
     outputs.reserve(static_cast<size_t>(groups));
-    const int64_t scale_rows_per_group = outputs_per_group / 128;
+    const int64_t block_rows=weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1);
+    const int64_t scale_rows_per_group = outputs_per_group / block_rows;
     for (int64_t group = 0; group < groups; ++group) {
         Mxfp8Weight shard;
         shard.out = outputs_per_group;
@@ -194,7 +227,7 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
         "MXFP8 groupwise FP32-output projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
     MFQ_RUNTIME_CHECK(
-        outputs_per_group % 128 == 0,
+        outputs_per_group % (weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1)) == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
         return profiler.measure(
@@ -205,7 +238,8 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
     }
     std::vector<mfq_tensor_backend::Tensor> outputs;
     outputs.reserve(static_cast<size_t>(groups));
-    const int64_t scale_rows_per_group = outputs_per_group / 128;
+    const int64_t block_rows=weight.scales.size(0)==weight.out?1:weight.neuron_len/weight.scales.size(1);
+    const int64_t scale_rows_per_group = outputs_per_group / block_rows;
     for (int64_t group = 0; group < groups; ++group) {
         Mxfp8Weight shard;
         shard.out = outputs_per_group;

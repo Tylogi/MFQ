@@ -9,11 +9,60 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(MFQ_CORE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core/include")
 
+# Shared engine module headers. They are PRIVATE to mfq-engine; backends, apps
+# and tests add these directories to their include path to drive the shared
+# generation loop, which tests/test_engine_include_graph.py keeps bounded.
+set(MFQ_ENGINE_PRIVATE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/requests
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/state
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/weights
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/executor
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/text
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/src
+)
+
 option(
     MFQ_BUILD_METAL_RUNTIME
     "Build the native MLX/Metal runtime on Apple Silicon"
     ${APPLE}
 )
+
+include(CheckLanguage)
+if(NOT DEFINED MFQ_BUILD_CUDA_RUNTIME)
+    check_language(CUDA)
+endif()
+if(NOT APPLE AND CMAKE_CUDA_COMPILER AND NOT MFQ_BUILD_HIP_RUNTIME)
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT OFF)
+endif()
+option(
+    MFQ_BUILD_CUDA_RUNTIME
+    "Build the native CUDA runtime (requires the CUDA toolkit)"
+    ${_MFQ_BUILD_CUDA_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT)
+
+if(NOT DEFINED MFQ_BUILD_HIP_RUNTIME)
+    check_language(HIP)
+endif()
+if(NOT APPLE AND CMAKE_HIP_COMPILER AND NOT MFQ_BUILD_CUDA_RUNTIME)
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT OFF)
+endif()
+option(
+    MFQ_BUILD_HIP_RUNTIME
+    "Build the native HIP runtime on AMD ROCm hosts"
+    ${_MFQ_BUILD_HIP_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_HIP_RUNTIME_DEFAULT)
+
+if(MFQ_BUILD_CUDA_RUNTIME AND MFQ_BUILD_HIP_RUNTIME)
+    message(FATAL_ERROR
+        "Select either MFQ_BUILD_CUDA_RUNTIME or MFQ_BUILD_HIP_RUNTIME; use separate build directories for both backends")
+endif()
 
 if(APPLE)
     set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT OFF)
@@ -29,6 +78,11 @@ unset(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT)
 
 if(MFQ_BUILD_METAL_RUNTIME AND NOT APPLE)
     message(FATAL_ERROR "MFQ_BUILD_METAL_RUNTIME requires macOS")
+endif()
+
+if(MFQ_BUILD_CUDA_RUNTIME AND APPLE)
+    message(FATAL_ERROR
+        "MFQ_BUILD_CUDA_RUNTIME requires the CUDA toolkit, which macOS does not provide")
 endif()
 
 # Common code is split by responsibility. JSON is defined first because the
@@ -58,8 +112,12 @@ if(MFQ_BUILD_METAL_RUNTIME)
     add_subdirectory(backends/metal metal)
 endif()
 
-if(NOT APPLE)
+if(MFQ_BUILD_CUDA_RUNTIME)
     add_subdirectory(backends/cuda cuda)
+endif()
+
+if(MFQ_BUILD_HIP_RUNTIME)
+    add_subdirectory(backends/hip hip)
 endif()
 
 if(BUILD_TESTING)

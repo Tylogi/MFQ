@@ -1,5 +1,5 @@
 /** 管理会话列表、选中会话与消息历史，所有异步回写绑定当前连接和会话。 */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
@@ -9,7 +9,7 @@ import { useDraftStore } from '../state/draftStore';
 
 /** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
-  const { ready, connectionRevision, selectedModel, setSelectedModel, models, instances } =
+  const { ready, connectionRevision, selectedModel, models, instances } =
     useRuntime();
   const sessions = useConversationStore((state) => state.sessions);
   const activeId = useConversationStore((state) => state.activeId);
@@ -50,8 +50,6 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
       .listSessions()
       .then((next) => {
         if (request !== version.current || !useConversationStore.getState().loadSessions(epoch, next)) return;
-        const selected = next[0];
-        if (selected) setSelectedModel(selected.model);
       })
       .catch((cause) => {
         if (request === version.current) setError(errorMessage(cause));
@@ -59,7 +57,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     return () => {
       ++version.current;
     };
-  }, [ready, enabled, connectionRevision, importRevision, setSelectedModel]);
+  }, [ready, enabled, connectionRevision, importRevision]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -86,50 +84,24 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     return () => controller.abort();
   }, [activeId, connectionRevision]);
 
-  useEffect(() => {
-    if (!active || generationBusy || !modelAvailable || active.model === selectedModel) return;
-    let current = true;
-    setTransitioning(true);
-    const epoch = useConversationStore.getState().epoch;
-  void sessionsApi
-      .forkSession(active.id, null, true, active.title, selectedModel)
-      .then((replacement) => {
-        if (!current || epoch !== useConversationStore.getState().epoch || useConversationStore.getState().activeId !== active.id) return;
-        setSessions((existing) => [replacement, ...existing]);
-        setActiveId(replacement.id);
-      })
-      .catch((cause) => {
-        if (current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
-      })
-      .finally(() => {
-        if (current) setTransitioning(false);
-      });
-    return () => {
-      current = false;
-      setTransitioning(false);
-    };
-  }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy]);
-
-  /** 切换会话及其绑定模型，历史请求在 effect 中按会话重建。 */
   const selectSession = useCallback(
     (id: string) => {
       const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
       if (!session || transitioning) return;
-      setSelectedModel(session.model);
       setActiveId(id);
     },
-    [transitioning, setSelectedModel, setActiveId],
+    [transitioning, setActiveId],
   );
 
   /** 创建新的空会话，版本戳防止服务切换后的返回污染当前列表。 */
   const createSession = useCallback(
     async (mode: SessionMode = 'text') => {
-      if (!selectedModel || transitioning) return;
+      if (!ready || transitioning || generationBusy) return;
       const request = version.current;
       const epoch = useConversationStore.getState().epoch;
       setTransitioning(true);
       try {
-        const created = await sessionsApi.createSession(selectedModel, mode);
+        const created = await sessionsApi.createSession(undefined, mode);
         if (request !== version.current || epoch !== useConversationStore.getState().epoch) return;
         setSessions((current) => [created, ...current]);
         setActiveId(created.id);
@@ -139,7 +111,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (request === version.current) setTransitioning(false);
       }
     },
-    [selectedModel, transitioning, setSessions, setActiveId],
+    [ready, generationBusy, transitioning, setSessions, setActiveId],
   );
 
   const removeSessions = useCallback((ids: string[]) => {
@@ -150,10 +122,9 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     for (const id of ids) useDraftStore.getState().setDraft(id, '');
     if (state.activeId && deleted.has(state.activeId)) {
       const next = remaining[0];
-      if (next) setSelectedModel(next.model);
       setActiveId(next?.id ?? null);
     }
-  }, [setSessions, setSelectedModel, setActiveId]);
+  }, [setSessions, setActiveId]);
 
   /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
   const deleteSession = useCallback(
@@ -254,8 +225,9 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     deleteSession,
     deleteAllSessions,
     renameSession,
+    historyReady: Boolean(!transitioning && active && historyLoadedId === activeId),
     conversationReady: Boolean(
-      !transitioning && active && modelAvailable && active.model === selectedModel && historyLoadedId === activeId,
+      !transitioning && active && modelAvailable && historyLoadedId === activeId,
     ),
     modelAvailable,
   };

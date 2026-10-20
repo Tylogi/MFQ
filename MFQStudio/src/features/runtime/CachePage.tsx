@@ -73,7 +73,7 @@ function ResourcePageContent() {
       if (!current()) return;
       toast.success(tr('缓存已清除', 'Cache cleared successfully'));
     } catch (cause) {
-      if (current()) toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause, tr));
     } finally {
       clearing.current = false;
       if (current()) setBusy(false);
@@ -104,7 +104,7 @@ function ResourcePageContent() {
                       '当前进程内的单条设备热前缀；切换会话或编辑 prompt 会重新 prefill',
                       'One device-hot prefix in this process; switching sessions or editing the prompt triggers a fresh prefill',
                     )
-                  : separate ? tr('显存热缓存与可跨重启复用的 SSD 前缀块，不保留 RAM 中间层', 'VRAM hot cache with persistent SSD prefix blocks; no intermediate RAM tier') : tr(
+                  : separate ? tr('显存热缓存、低优先级 RAM 前缀缓存与可选 SSD 冷层', 'VRAM hot cache, low-priority RAM prefixes and optional SSD cold tier') : tr(
                       'RAM 热缓存与可跨重启复用的 SSD 前缀块',
                       'RAM hot cache with persistent SSD prefix blocks',
                     )}
@@ -158,14 +158,20 @@ function ResourcePageContent() {
             <>
               <div className="cache-usage-bars">
                 <UsageBar
-                  label={tr('SSD 前缀缓存总占用', 'Total SSD prefix cache')}
-                  used={prefixCacheDiskBytes}
-                  total={Math.max(prefixCacheDiskBudget, prefixCacheDiskBytes)}
-                />
-                <UsageBar
                   label={separate ? tr('显存热缓存总占用', 'Total VRAM hot cache') : tr('RAM 热缓存总占用', 'Total RAM hot cache')}
                   used={prefixCacheHotBytes}
                   total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
+                />
+                {separate && <UsageBar
+                  label={tr('RAM 前缀缓存总占用', 'Total RAM prefix cache')}
+                  used={runtime?.prefix_cache_total_ram_bytes ?? runtime?.prefix_cache_ram_bytes ?? 0}
+                  total={Math.max(runtime?.prefix_cache_total_ram_bytes ?? runtime?.prefix_cache_ram_bytes ?? 0,
+                    runtime?.prefix_cache_total_ram_max_bytes ?? runtime?.prefix_cache_ram_max_bytes ?? 0)}
+                />}
+                <UsageBar
+                  label={tr('SSD 前缀缓存总占用', 'Total SSD prefix cache')}
+                  used={prefixCacheDiskBytes}
+                  total={Math.max(prefixCacheDiskBudget, prefixCacheDiskBytes)}
                 />
               </div>
               <div className="cache-stats">
@@ -213,6 +219,7 @@ function ResourcePageContent() {
                   <span>{tr('SSD 命中', 'SSD hits')}</span>
                   <strong>{formatNumber(runtime?.prefix_cache_disk_hits)}</strong>
                   <small>{formatNumber(runtime?.prefix_cache_hot_hits)} {separate ? 'VRAM' : 'RAM'} hits</small>
+                  {separate && <small>{formatNumber(runtime?.prefix_cache_ram_hits)} RAM hits</small>}
                 </div>
                 <div>
                   <span>{tr('回收', 'Evictions')}</span>

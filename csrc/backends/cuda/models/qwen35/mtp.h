@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 
 #include "models/common/mtp.h"
 #include "models/common/full_block.h"
@@ -71,6 +71,7 @@ struct Qwen35Mtp final : MtpModule {
             auto block = mfq::cuda::qwen35::load_block(execution, file, result.config, layer,
                                                        "full_attention", "predictor");
             block->cuda_device = execution.layer_placement.primary_device();
+            if (auto* full = dynamic_cast<FullBlock*>(block.get())) full->preallocate_kv();
             result.blocks.push_back(std::move(block));
         }
         return result;

@@ -1,5 +1,5 @@
-#include "mlx_mxfp4_sq.h"
-#include "mlx_grouped_linear.h"
+#include "ops/mlx_mxfp4_sq.h"
+#include "ops/mlx_grouped_linear.h"
 
 #include <algorithm>
 #include <array>

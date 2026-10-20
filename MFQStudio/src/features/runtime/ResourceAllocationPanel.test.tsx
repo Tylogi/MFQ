@@ -1,7 +1,11 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render as baseRender, screen, within } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ResourceAllocationPanel } from './ResourceAllocationPanel';
 import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
+import { TooltipProvider } from '../../shared/ui/Tooltip';
+
+function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 
 const state = vi.hoisted(() => ({ ready: true, connectionRevision: 0, refreshRuntime: vi.fn().mockResolvedValue(true),
   runtime: null as RuntimeStatus | null, instances: [] as RuntimeInstance[] }));
@@ -12,13 +16,45 @@ afterEach(() => { vi.clearAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); 
 it('uses the live shared memory budget and headroom rather than total physical memory', async () => {
   state.runtime = { runtime_memory_budget_bytes: 16 * 2 ** 30, runtime_memory_effective_budget_bytes: 8 * 2 ** 30,
     runtime_memory_committed_bytes: 5 * 2 ** 30, runtime_memory_headroom_bytes: 2 * 2 ** 30, runtime_memory_budget_mode: 'automatic' };
-  render(<ResourceAllocationPanel />);
+  const { container } = render(<ResourceAllocationPanel />);
   await act(async () => {});
-  expect(screen.getByText('8 GiB')).toBeInTheDocument();
+  expect(within(container.querySelector('.resource-budget-summary')!).getByText('8 GiB')).toBeInTheDocument();
   expect(screen.getByText('5 GiB')).toBeInTheDocument();
   expect(screen.getByText('2 GiB')).toBeInTheDocument();
   expect(screen.queryByText('16 GiB')).not.toBeInTheDocument();
   expect(screen.getByText('Automatic · current usable budget')).toBeInTheDocument();
+});
+
+it('does not subtract raw available memory again from the backend unified budget', async () => {
+  const GiB = 2 ** 30;
+  state.runtime = { memory_architecture: 'unified', host_memory_available_bytes: 3 * GiB,
+    runtime_memory_effective_budget_bytes: 5 * GiB, runtime_memory_headroom_bytes: 5 * GiB,
+    runtime_memory_committed_bytes: 0, runtime_memory_budget_mode: 'automatic' };
+  const { container } = render(<ResourceAllocationPanel />);
+  await act(async () => {});
+  expect(within(container.querySelector('.resource-budget-summary')!).getAllByText('5 GiB')).toHaveLength(2);
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('0 B / 5 GiB');
+  state.runtime = null;
+});
+
+it('keeps the summary and bars within actual free VRAM even when a manual budget has more headroom', async () => {
+  const GiB = 2 ** 30;
+  state.runtime = { memory_architecture: 'discrete', device_memory_total_bytes: 24 * GiB,
+    device_free_bytes: 2 * GiB, runtime_memory_effective_budget_bytes: 22 * GiB,
+    runtime_memory_committed_bytes: 13 * GiB, runtime_memory_headroom_bytes: 9 * GiB,
+    runtime_memory_budget_mode: 'explicit' };
+  state.instances = [{ id: 'a', model: 'Qwen3.8', state: 'ready', devices: ['cuda:0'], active_sessions: 0, queued_requests: 0,
+    memory: { resident_weight_bytes: 10 * GiB, resident_buffer_bytes: 2 * GiB, kv_bytes: GiB, context_count: 0, prefix_cache_blocks: 0,
+      ssd_experts: false, ssd_expert_bytes: 0, ssd_ple: false, ssd_ple_bytes: 0 } }];
+  const { container } = render(<ResourceAllocationPanel />);
+  await act(async () => {});
+  const summary = container.querySelector<HTMLElement>('.resource-budget-summary')!;
+  expect(within(summary).getByText('15 GiB')).toBeInTheDocument();
+  expect(within(summary).getByText('2 GiB')).toBeInTheDocument();
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('12 GiB / 15 GiB');
+  expect(container.querySelector('[data-tier="kv"] .memory-tier-heading')).toHaveTextContent('1 GiB / 3 GiB');
+  state.instances = [];
+  state.runtime = null;
 });
 
 it('refreshes every five seconds and stops on leaving the resources page', async () => {
@@ -38,11 +74,11 @@ it('leaves missing budgets unknown and reports the true per-model sizes', async 
   state.instances = [{ id: 'a', model: 'Qwen3.8', state: 'ready', devices: ['metal'], active_sessions: 2, queued_requests: 1,
     memory: { resident_weight_bytes: 2 ** 30, kv_bytes: 512, prefix_cache_bytes: 128, prefix_cache_limit_bytes: 1024,
       context_count: 2, prefix_cache_blocks: 1, ssd_experts: false, ssd_expert_bytes: 0, ssd_ple: true, ssd_ple_bytes: 2 ** 30 } }];
-  render(<ResourceAllocationPanel />);
+  const { container } = render(<ResourceAllocationPanel />);
   await act(async () => {});
   expect(screen.getByText('2 active sessions · 1 queued requests')).toBeInTheDocument();
   expect(screen.getByText(/Active KV 384 B/)).toBeInTheDocument();
-  expect(screen.getAllByText('--')).toHaveLength(3);
+  expect(within(container.querySelector('.resource-budget-summary')!).getAllByText('--')).toHaveLength(3);
   state.instances = [];
 });
 

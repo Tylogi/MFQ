@@ -44,7 +44,7 @@ function CacheInventory() {
       setInventory(value);
       setError('');
     } catch (cause) {
-      if (!signal?.aborted && current() && version === inventorySequence.current) setError(errorMessage(cause));
+      if (!signal?.aborted && current() && version === inventorySequence.current) setError(errorMessage(cause, tr));
     }
   }, [connectionScope]);
   useEffect(() => {
@@ -76,7 +76,7 @@ function CacheInventory() {
     try {
       const value = await runtimeApi.prefixCacheEntries(namespace, offset, controller.signal, nextFilters);
       if (version === sequence.current && current()) setDetail(value);
-    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause, tr)); }
     finally { if (version === sequence.current && current()) setReading(false); }
   }
   function updateFilters(next: PrefixCacheFilters) {
@@ -100,7 +100,7 @@ function CacheInventory() {
     try {
       const value = await runtimeApi.prefixCacheText(selected, block, offset);
       if (version === sequence.current && current()) setText(value);
-    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause, tr)); }
     finally { if (version === sequence.current && current()) setReading(false); }
   }
   async function clear(namespace?: string) {
@@ -110,8 +110,8 @@ function CacheInventory() {
     const message = namespace
       ? tr(`清理此缓存组（${formatBytes(group?.bytes ?? 0)}）？模型文件和聊天记录不会删除。`,
           `Clear this cache group (${formatBytes(group?.bytes ?? 0)})? Model files and chat history will be kept.`)
-      : hasSeparateVram(runtime) ? tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与显存热缓存？模型文件和聊天记录不会删除。`,
-          `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches and VRAM hot caches? Model files and chat history will be kept.`) : tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与 RAM 热缓存？模型文件和聊天记录不会删除。`,
+      : hasSeparateVram(runtime) ? tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存、RAM 前缀缓存与显存热缓存？模型文件和聊天记录不会删除。`,
+          `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches, RAM prefixes and VRAM hot caches? Model files and chat history will be kept.`) : tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与 RAM 热缓存？模型文件和聊天记录不会删除。`,
           `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches and RAM hot caches? Model files and chat history will be kept.`);
     clearing.current = true;
     setBusy(true);
@@ -129,7 +129,7 @@ function CacheInventory() {
         `Cleared ${formatNumber(result.removed_blocks)} blocks; released ${formatBytes(result.released_bytes)}`);
       if (result.failed_blocks) toast.error(`${summary} · ${tr('部分块未能删除', 'Some blocks could not be removed')}`);
       else toast.success(summary);
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
     finally { clearing.current = false; if (current()) setBusy(false); }
   }
   const reasons: Record<string, string> = {

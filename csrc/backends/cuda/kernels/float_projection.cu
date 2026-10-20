@@ -1,4 +1,6 @@
 #include "float_projection.h"
+#include "gr_prefill_blas.h"
+#include "gr_prefill_decode.cuh"
 
 #include <mma.h>
 #include "native/env.h"
@@ -72,7 +74,7 @@ __global__ void gr_prefill_tf32_kernel(const Input* input,
             wmma::load_matrix_sync(b_hi,&bh[wn][k],Pad);
             wmma::load_matrix_sync(b_lo,&bl[wn][k],Pad);
             wmma::mma_sync(low,a_hi,b_lo,low);
-            if constexpr(!std::is_same_v<Input,__half>) {
+            if constexpr(!std::is_same<Input,__half>::value) {
                 wmma::load_matrix_sync(a_lo,&al[wm][k],Pad);
                 wmma::mma_sync(low,a_lo,b_hi,low);
             }
@@ -116,7 +118,7 @@ __global__ void gr_prefill_half2_kernel(const Input* input,
                 float(input[int64_t(row0+r)*width+k0+c]):0;
             const auto top=__float2half_rn(value);
             ah[r][c]=top;
-            if constexpr(!std::is_same_v<Input,__half>)
+            if constexpr(!std::is_same<Input,__half>::value)
                 al[r][c]=__float2half_rn(__fsub_rn(value,__half2float(top))*4096.0f);
         }
         for(int i=tid;i<BN*BK;i+=256) {
@@ -154,7 +156,7 @@ __global__ void gr_prefill_half2_kernel(const Input* input,
             wmma::load_matrix_sync(b_lo,&bl[wn][k],Pad);
             wmma::mma_sync(high,a_hi,b_hi,high);
             wmma::mma_sync(low,a_hi,b_lo,low);
-            if constexpr(!std::is_same_v<Input,__half>) {
+            if constexpr(!std::is_same<Input,__half>::value) {
                 wmma::load_matrix_sync(a_lo,&al[wm][k],Pad);
                 wmma::mma_sync(low,a_lo,b_hi,low);
             }
@@ -177,64 +179,7 @@ __global__ void gr_prefill_half2_kernel(const Input* input,
 namespace {
 // Four adjacent columns share subgroup and neuron metadata. Decode directly
 // into a transient shared tile while retaining the original affine rounding.
-template<bool AlignedQ8,bool Zero>
-__device__ __forceinline__ void gr_prefill_decode_four(
-        float (&values)[4],const uint8_t* packed,const uint8_t* row_bits,
-        const int64_t* row_offsets,const uint8_t* scales,const uint8_t* minima,
-        const float* row_scales,const float* row_minima,const __half* zero_scales,
-        int neuron,int column,int width,int groups,int gs) {
-    const int bits=AlignedQ8 || Zero?8:row_bits[neuron];
-    const int64_t first_meta=int64_t(neuron)*groups+column/gs;
-    const float outer_scale=Zero?0.f:row_scales[neuron];
-    const float outer_minimum=Zero?0.f:row_minima[neuron];
-    if((gs&3)==0 && column+4<=width) {
-        const float scale=Zero?__half2float(zero_scales[first_meta]):
-            __fmul_rn(outer_scale,float(scales[first_meta]));
-        const float minimum=Zero?0.f:__fmul_rn(outer_minimum,float(minima[first_meta]));
-        uint64_t codes=0;
-        if constexpr(Zero) {
-            codes=*reinterpret_cast<const uint32_t*>(packed+first_meta*gs+column%gs);
-        } else if constexpr(AlignedQ8) {
-            codes=*reinterpret_cast<const uint32_t*>(packed+(row_offsets[neuron]>>3)+column);
-        } else {
-            const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(column)*bits;
-            const int shift=int(bit&7),bytes=(shift+bits*4+7)/8;
-            #pragma unroll
-            for(int b=0;b<5;++b)if(b<bytes)codes|=uint64_t(packed[(bit>>3)+b])<<(8*b);
-            codes>>=shift;
-        }
-        #pragma unroll
-        for(int j=0;j<4;++j) {
-            const unsigned code=unsigned(codes>>(bits*j))&((1u<<bits)-1);
-            const float q=Zero?float(static_cast<int8_t>(code)):float(code);
-            values[j]=__fsub_rn(__fmul_rn(scale,q),minimum);
-        }
-        return;
-    }
-    #pragma unroll
-    for(int j=0;j<4;++j) {
-        float value=0;
-        const int c=column+j;
-        if(c<width) {
-            const int64_t meta=int64_t(neuron)*groups+c/gs;
-            float q,scale,minimum;
-            if constexpr(Zero) {
-                q=float(static_cast<int8_t>(packed[meta*gs+c%gs]));
-                scale=__half2float(zero_scales[meta]);minimum=0;
-            } else {
-                const uint64_t bit=uint64_t(row_offsets[neuron])+uint64_t(c)*bits;
-                const int shift=int(bit&7);
-                unsigned code=packed[bit>>3];
-                if(shift+bits>8)code|=unsigned(packed[(bit>>3)+1])<<8;
-                q=float((code>>shift)&((1u<<bits)-1));
-                scale=__fmul_rn(outer_scale,float(scales[meta]));
-                minimum=__fmul_rn(outer_minimum,float(minima[meta]));
-            }
-            value=__fsub_rn(__fmul_rn(scale,q),minimum);
-        }
-        values[j]=value;
-    }
-}
+
 }
 namespace {
 bool gr_prefill_pipeline_supported(const mfq_tensor_backend::Tensor& input) {
@@ -250,7 +195,7 @@ bool gr_prefill_pipeline_supported(const mfq_tensor_backend::Tensor& input) {
     return found->second.first>=8 && found->second.second>=bytes;
 }
 template<class Input,int BM,int BN,int BK,bool Packed=false> union GrPrefillPipelineShared {
-    struct {Input a[2][BM][BK+(std::is_same_v<Input,float>?4:8)];float w[2][BN][BK+(Packed?4:1)];} tile;
+    struct {Input a[2][BM][BK+(std::is_same<Input,float>::value?4:8)];float w[2][BN][BK+(Packed?4:1)];} tile;
     float products[BM][BN];
 };
 template<class Input,class Value,bool AlignedQ8,bool Zero,bool Mix,int RN,int RM,int BK=32,int BM=256,int TileN=32,bool Packed=false>
@@ -258,8 +203,8 @@ __global__ __launch_bounds__(BM*TileN/(RN*RM),1) void gr_prefill_pipeline_kernel
         const Input* input,const uint8_t* packed,const uint8_t* row_bits,
         const int64_t* row_offsets,const uint8_t* scales,const uint8_t* minima,
         const float* row_scales,const float* row_minima,const __half* zero_scales,
-        const Value* normalized,std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,int rows,int width,int outputs,int groups,int gs) {
-    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+        const Value* normalized,std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>* output,int rows,int width,int outputs,int groups,int gs) {
+    using Output=std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
     constexpr int BN=TileN,Threads=BM*BN/(RN*RM),Columns=BN/RN,HiddenN=BN/4;
     extern __shared__ __align__(16) unsigned char bytes[];
     auto& shared=*reinterpret_cast<GrPrefillPipelineShared<Input,BM,BN,BK,Packed>*>(bytes);
@@ -373,7 +318,7 @@ template<bool Mix,class Input,class Value,bool Aligned,bool Zero>
 void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backend::Tensor& input,
         const mfq_tensor_backend::Tensor& normalized,mfq_tensor_backend::Tensor& output) {
     namespace tb=mfq_tensor_backend;
-    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    using Output=std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
     const auto rows=input.numel()/weight.neuron_len;
     const auto launch=[&](auto rn_tag,auto rm_tag,auto bm_tag,auto bn_tag,auto bk_tag,auto packed_tag) {
         constexpr int rn=decltype(rn_tag)::value,rm=decltype(rm_tag)::value;
@@ -397,7 +342,8 @@ void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backen
             output.data_ptr<Output>(),int(rows),int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
     };
     const auto* option=mfq::cuda::env_lookup(Mix?"MFQ_GR_PREFILL_FUSED_MIX":"MFQ_GR_PREFILL_MATMUL");
-    const int mode=option?std::atoi(option):(Mix?(std::is_same_v<Input,__half>?12:10):31);
+    int mode=option?std::atoi(option):(Mix?(std::is_same<Input,__half>::value?12:10):31);
+    if constexpr(!Mix)if(mode==32)mode=31;
     if constexpr(!Mix) {
         if((mode==29 || mode==31) && weight.out<=4) {
             launch(std::integral_constant<int,1>{},std::integral_constant<int,2>{},
@@ -544,6 +490,7 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,
         "GR prefill projection geometry mismatch");
     const auto rows=x.numel()/weight.neuron_len;
+    if(gr_prefill_blas_selected(weight,input))return gr_prefill_blas_fp32(weight,x);
     const auto* trace_geometry=mfq::cuda::env_lookup("MFQ_GR_PREFILL_GEOMETRY_TRACE");
     if(trace_geometry && trace_geometry[0]=='1') {
         thread_local std::map<std::array<int64_t,5>,bool> seen;
@@ -560,6 +507,7 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
     const bool requested_tf32=option && std::atoi(option)==2;
     const bool requested_half2=option && std::atoi(option)==3;
     int mode=option?std::atoi(option):31;
+    if(mode==32)mode=31;
     const bool wide_contraction=mode==24 && weight.out<weight.neuron_len && rows>=128;
     const bool transpose_weight=mode==22 || mode==23;
     const bool fewer_registers=mode==23;
@@ -654,9 +602,9 @@ __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* inpu
         const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
         const uint8_t* scales,const uint8_t* minima,const float* row_scales,
         const float* row_minima,const __half* zero_scales,const Value* normalized,
-        std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,
+        std::conditional_t<std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>* output,
         int rows,int width,int hidden,int groups,int gs) {
-    using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    using Output=std::conditional_t<std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
     constexpr int BN=HiddenN*4,RN=4,RM=RegisterM,Threads=512,Columns=BN/RN;
     static_assert(BM*BN/(RN*RM)==Threads,"GR fused tile and register geometry mismatch");
     using Shared=GrPrefillMixShared<BM,BN,BK>;
@@ -811,7 +759,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
     auto output=tb::empty(shape,input.options().dtype(dtype));
     const auto typed=[&](auto input_tag,auto value_tag,auto aligned_tag,auto zero_tag,auto swizzle_tag) {
         using Input=decltype(input_tag);using Value=decltype(value_tag);
-        using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+        using Output=std::conditional_t<std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
         constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
         {
             const auto* pipeline_option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
@@ -845,7 +793,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
         if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
         else {
             const auto* option=mfq::cuda::env_lookup("MFQ_GR_PREFILL_FUSED_MIX");
-            const int requested_mode=option?std::atoi(option):(std::is_same_v<Input,__half>?12:10);
+            const int requested_mode=option?std::atoi(option):(std::is_same<Input,__half>::value?12:10);
             const int mode=requested_mode==10 || requested_mode==12?6:requested_mode;
             if(mode==8)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,2>{});
             else if(mode==7)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,4>{});
@@ -874,7 +822,87 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
 }
 }
 
+#include "gr_prefill_blas.h"
+#include "kernel_dispatch_trace.h"
+
 namespace {
+template<class Input>
+__device__ __forceinline__ float4 gr_dense_input4(const Input* input) {
+    if constexpr(std::is_same<Input,float>::value)return *reinterpret_cast<const float4*>(input);
+    else {
+        const uint2 x=*reinterpret_cast<const uint2*>(input);
+        return make_float4(__half2float(__ushort_as_half(x.x)),__half2float(__ushort_as_half(x.x>>16)),
+            __half2float(__ushort_as_half(x.y)),__half2float(__ushort_as_half(x.y>>16)));
+    }
+}
+__device__ __forceinline__ float4 gr_dense_weight4(const uint16_t* weight) {
+    const uint2 w=*reinterpret_cast<const uint2*>(weight);
+    return make_float4(__uint_as_float(w.x<<16),__uint_as_float(w.x&0xffff0000u),
+        __uint_as_float(w.y<<16),__uint_as_float(w.y&0xffff0000u));
+}
+__device__ __forceinline__ float gr_dense_dot4(float sum,float4 w,float4 x) {
+    sum=fmaf(w.x,x.x,sum);sum=fmaf(w.y,x.y,sum);
+    sum=fmaf(w.z,x.z,sum);return fmaf(w.w,x.w,sum);
+}
+template<int Rows,class Input>
+__global__ void __launch_bounds__(128) gr_bf16_down_kernel(
+        const Input* input,const uint16_t* weight,float* output) {
+    constexpr int Width=10240,Rank=320;
+    const int row=blockIdx.x,tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+    float sums[Rows]{};
+    for(int column=tid*4;column<Width;column+=128*4) {
+        const float4 w=gr_dense_weight4(weight+size_t(row)*Width+column);
+        #pragma unroll
+        for(int m=0;m<Rows;++m)sums[m]=gr_dense_dot4(sums[m],w,
+            gr_dense_input4(input+size_t(m)*Width+column));
+    }
+    __shared__ float partial[Rows][4];
+    #pragma unroll
+    for(int m=0;m<Rows;++m) {
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1)sums[m]+=__shfl_down_sync(0xffffffffu,sums[m],offset);
+        if(lane==0)partial[m][warp]=sums[m];
+    }
+    __syncthreads();
+    if(tid<Rows) {
+        const float sum=(partial[tid][0]+partial[tid][2])+(partial[tid][1]+partial[tid][3]);
+        const float low=__fdiv_rn(sum,4.f);
+        const float gate=1.f/(1.f+expf(-low));
+        output[size_t(tid)*Rank+row]=__fmul_rn(low,gate);
+    }
+}
+template<int Rows,class Normalized>
+__global__ void __launch_bounds__(128) gr_bf16_up_mix_kernel(
+        const float* input,const Normalized* normalized,const uint16_t* weight,float* output) {
+    constexpr int Rank=320,Hidden=2560,Streams=4;
+    const int column=blockIdx.x,tid=threadIdx.x,lane=tid&31,stream=tid>>5;
+    const int row=stream*Hidden+column;
+    float sums[Rows]{};
+    for(int begin=lane*4;begin<Rank;begin+=128) {
+        const float4 w=gr_dense_weight4(weight+size_t(row)*Rank+begin);
+        #pragma unroll
+        for(int m=0;m<Rows;++m)sums[m]=gr_dense_dot4(sums[m],w,
+            gr_dense_input4(input+size_t(m)*Rank+begin));
+    }
+    __shared__ float products[Rows][Streams];
+    #pragma unroll
+    for(int m=0;m<Rows;++m) {
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1)sums[m]+=__shfl_down_sync(0xffffffffu,sums[m],offset);
+        if(lane==0) {
+            const float gate=1.f/(1.f+expf(-sums[m]));
+            products[m][stream]=__fmul_rn(gate,static_cast<float>(normalized[size_t(m)*Hidden*Streams+row]));
+        }
+    }
+    __syncthreads();
+    if(tid<Rows) {
+        float sum=0.f;
+        #pragma unroll
+        for(int s=0;s<Streams;++s)sum=__fadd_rn(sum,products[tid][s]);
+        output[size_t(tid)*Hidden+column]=sum/float(Streams);
+    }
+}
+
 template<bool AlignedQ8=false,int FixedGroup=0,class Input>
 __device__ __forceinline__ float affine_sum(
     const Input* input, const unsigned char* values,
@@ -1170,6 +1198,78 @@ mfq_tensor_backend::Tensor float_projection_impl(
 }
 } // namespace
 
+mfq_tensor_backend::Tensor try_gr_bf16_down_cuda(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& weight,int64_t streams) {
+    namespace tb=mfq_tensor_backend;
+    if(streams!=4 || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
+            input.size(-1)!=10240 || input.numel()/10240<1 || input.numel()/10240>6 ||
+            (input.scalar_type()!=tb::kFloat16 && input.scalar_type()!=tb::kFloat32) ||
+            !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
+            weight.scalar_type()!=tb::kBFloat16 || weight.sizes().vec()!=std::vector<int64_t>({320,10240}))return {};
+    const MfqCudaGuard guard(input.device());
+    const int rows=int(input.numel()/10240);
+    auto shape=input.sizes().vec();shape.back()=320;
+    auto output=tb::empty(shape,input.options().dtype(tb::kFloat32));
+    const auto launch=[&](auto capacity,auto type) {
+        using Input=decltype(type);
+        gr_bf16_down_kernel<decltype(capacity)::value,Input><<<320,128,0,mfq_current_cuda_stream()>>>(
+            input.data_ptr<Input>(),static_cast<const uint16_t*>(weight.data_ptr()),output.data_ptr<float>());
+        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+            "gr_bf16_down_silu",reinterpret_cast<const void*>(gr_bf16_down_kernel<decltype(capacity)::value,Input>),
+            "M="+std::to_string(rows)+" N=320 K=10240");
+    };
+    const auto types=[&](auto capacity) {
+        if(input.scalar_type()==tb::kFloat16)launch(capacity,__half{});else launch(capacity,float{});
+    };
+    switch(rows) {
+        case 1:types(std::integral_constant<int,1>{});break;
+        case 2:types(std::integral_constant<int,2>{});break;
+        case 3:types(std::integral_constant<int,3>{});break;
+        case 4:types(std::integral_constant<int,4>{});break;
+        case 5:types(std::integral_constant<int,5>{});break;
+        case 6:types(std::integral_constant<int,6>{});break;
+    }
+    MFQ_CUDA_CHECK(cudaGetLastError());return output;
+}
+
+mfq_tensor_backend::Tensor try_gr_bf16_up_mix_cuda(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& normalized,const mfq_tensor_backend::Tensor& weight,int64_t streams) {
+    namespace tb=mfq_tensor_backend;
+    if(streams!=4 || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
+            input.size(-1)!=320 || input.numel()/320<1 || input.numel()/320>6 ||
+            input.scalar_type()!=tb::kFloat32 || !normalized.is_cuda() || !normalized.is_contiguous() ||
+            normalized.device()!=input.device() ||
+            (normalized.scalar_type()!=tb::kFloat16 && normalized.scalar_type()!=tb::kFloat32) ||
+            !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
+            weight.scalar_type()!=tb::kBFloat16 || weight.sizes().vec()!=std::vector<int64_t>({10240,320}))return {};
+    auto expected=input.sizes().vec();expected.back()=10240;
+    if(normalized.sizes().vec()!=expected)return {};
+    const MfqCudaGuard guard(input.device());
+    const int rows=int(input.numel()/320);
+    auto shape=input.sizes().vec();shape.back()=2560;
+    auto output=tb::empty(shape,input.options());
+    const auto launch=[&](auto capacity,auto type) {
+        using Normalized=decltype(type);
+        gr_bf16_up_mix_kernel<decltype(capacity)::value,Normalized><<<2560,128,0,mfq_current_cuda_stream()>>>(
+            input.data_ptr<float>(),normalized.data_ptr<Normalized>(),static_cast<const uint16_t*>(weight.data_ptr()),output.data_ptr<float>());
+        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+            "gr_bf16_up_mix",reinterpret_cast<const void*>(gr_bf16_up_mix_kernel<decltype(capacity)::value,Normalized>),
+            "M="+std::to_string(rows)+" N=10240 K=320");
+    };
+    const auto types=[&](auto capacity) {
+        if(normalized.scalar_type()==tb::kFloat16)launch(capacity,__half{});else launch(capacity,float{});
+    };
+    switch(rows) {
+        case 1:types(std::integral_constant<int,1>{});break;
+        case 2:types(std::integral_constant<int,2>{});break;
+        case 3:types(std::integral_constant<int,3>{});break;
+        case 4:types(std::integral_constant<int,4>{});break;
+        case 5:types(std::integral_constant<int,5>{});break;
+        case 6:types(std::integral_constant<int,6>{});break;
+    }
+    MFQ_CUDA_CHECK(cudaGetLastError());return output;
+}
+
 mfq_tensor_backend::Tensor nint_float_projection_cuda(const NintWeight& weight,
         const mfq_tensor_backend::Tensor& input,bool parallel_groups,bool native_input,bool fixed_groups) {
     if(gr_prefill_selected(input))return gr_prefill_matmul(weight,input);
@@ -1206,6 +1306,9 @@ mfq_tensor_backend::Tensor nint_float_projection_mix_cuda(const NintWeight& weig
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,"packed residual mixing geometry/device disagree");
     const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/streams;
     if(gr_prefill_selected(input)) {
+        if(gr_prefill_blas_selected(weight,input) && normalized.is_contiguous() &&
+                (normalized.scalar_type()==tb::kFloat16 || normalized.scalar_type()==tb::kFloat32))
+            return gr_prefill_blas_mix(weight,input,normalized,streams);
         if(gr_prefill_mix_selected(weight,input,normalized,streams))return gr_prefill_fused_mix(weight,input,normalized);
         auto projected=gr_prefill_matmul(weight,input);
         if(input.scalar_type()==tb::kFloat16)projected=projected.to(tb::kFloat16);

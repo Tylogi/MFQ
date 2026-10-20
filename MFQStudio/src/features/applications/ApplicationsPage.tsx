@@ -64,13 +64,14 @@ export function ApplicationsPage() {
       {APPLICATIONS.map(app => {
         const snippet = applicationConfiguration(app.id, model, openAI, anthropic);
         return <section className="application-entry" key={app.id}>
-          <div className="application-entry-heading"><span className="application-mark" aria-hidden="true">{app.name[0]}</span>
+          <div className="application-entry-heading"><img className="application-mark" alt="" aria-hidden="true" src={`${import.meta.env.BASE_URL}application-icons/${app.id}.svg`} />
             <div><h2>{app.name}</h2><small>{app.protocol}</small></div>
             <button type="button" onClick={() => void openStudioExternal(app.url).catch(cause => setError(errorMessage(cause)))}>{tr('官网', 'Website')}<Icon name="link" size={14} /></button>
             <button type="button" disabled={!model || !snippet} onClick={() => void copy(app.id, snippet)}><Icon name={copied === app.id ? 'check' : 'copy'} />{copied === app.id ? tr('已复制', 'Copied') : tr('复制配置', 'Copy configuration')}</button>
           </div>
           <details><summary>{tr('配置片段', 'Configuration snippet')}<code>{app.file}</code></summary>
             {app.id === 'dsh' && <p>{tr('桌面版使用 desktop 而非 web 目录；在应用环境或凭据中设置 MFQ_API_KEY。JSON 数组可作为 YAML 配置片段。', 'Use the desktop directory instead of web for the desktop app. Set MFQ_API_KEY in the application environment or credentials. The JSON array is also a valid YAML snippet.')}</p>}
+            {app.id === 'pi' && <p>{tr('保存后在 Pi 中运行 /model，选择 MFQ 下的模型。', 'After saving, run /model in Pi and select the model under MFQ.')}</p>}
             {model && snippet ? <pre>{snippet}</pre> : <p>{tr('请先载入模型，并启用对应 API 端口。', 'Load a model and enable the required API listener first.')}</p>}
           </details>
         </section>;

@@ -66,9 +66,9 @@
 .sectioned-nav > section { display: grid; gap: 4px; }
 .sectioned-nav .sidebar-group-label {
   padding: 0 12px 6px;
-  color: var(--muted);
+  color: var(--sidebar-ink);
   font-size: 10.5px;
-  font-weight: 600;
+  font-weight: 400;
   letter-spacing: 0.065em;
   text-transform: uppercase;
 }
@@ -81,16 +81,15 @@
   border: 0;
   border-radius: 8px;
   padding: 9px 12px;
-  color: var(--ink-soft);
+  color: var(--sidebar-ink);
   background: transparent;
   font-size: 13px;
-  font-weight: 540;
+  font-weight: 400;
   text-align: left;
 }
-.sectioned-nav button:hover { color: var(--ink); background: var(--sidebar-hover); }
-.sectioned-nav button.active { color: var(--accent-ink); background: var(--accent-soft); font-weight: 650; }
-.sectioned-nav button > .ui-icon { width: 17px; height: 17px; color: var(--muted); }
-.sectioned-nav button.active .ui-icon { color: currentColor; }
+.sectioned-nav button:hover { background: var(--sidebar-hover); }
+.sectioned-nav button.active { background: var(--accent-soft); }
+.sectioned-nav button > .ui-icon { width: 17px; height: 17px; color: currentColor; }
 .sectioned-nav button > span {
   min-width: 22px;
   margin-left: auto;

@@ -1,5 +1,5 @@
-#include "mlx_mx.h"
-#include "mlx_mxfp4_sq.h"
+#include "ops/mlx_mx.h"
+#include "ops/mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <chrono>

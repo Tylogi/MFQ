@@ -25,6 +25,7 @@ struct FakeEngine final : Engine {
     std::atomic<int> released{0}, reloads{0}, control_steps{0}, control_terminals{0}, stops{0};
     bool duplex_active = false, control_pending = false, control_stop = false, initializing = false;
     int control_limit = 0;
+    std::atomic<bool> blocked{false}, resume{false};
     std::thread::id owner;
     bool fail = false, supports_duplex = false;
     MfqDuplexSessionParams last_parameters;
@@ -62,6 +63,11 @@ struct FakeEngine final : Engine {
                 result.events.push_back({id, Cancelled{}}); continue;
             }
             if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) { ++it; continue; }
+            if (work.request.diagnostic_input && work.request.diagnostic_input->tokens == std::vector<int64_t>{59} && !resume) {
+                blocked = true;
+                while (!resume) std::this_thread::sleep_for(1ms);
+            }
+            if(work.request.diagnostic_input)++advances.at(std::stoi(id));
             ++work.steps;
             if (!work.request.diagnostic_input) {
                 const auto& content = work.request.input.chat_input->messages.front().content;
@@ -75,7 +81,7 @@ struct FakeEngine final : Engine {
                     diff.tool_call_delta = work.steps == 1
                         ? ToolCall{"lookup", "{\"ok\":", "call_test"}
                         : ToolCall{"", "true}", ""};
-                    result.events.push_back({id, OutputDelta{{}, {std::move(diff)}}});
+                    result.events.push_back({id, OutputDelta{{1,2,3}, {std::move(diff)}}});
                     result.advanced.push_back(id);
                     ++it;
                     continue;
@@ -91,7 +97,6 @@ struct FakeEngine final : Engine {
             }
             const auto& tokens = work.request.diagnostic_input->tokens;
             if (tokens == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
-            ++advances.at(std::stoi(id));
             result.advanced.push_back(id);
             if (work.steps <= int(tokens.size()))
                 result.events.push_back({id, PrefillProgress{{std::size_t(work.steps), 1, 0, 1}}});
@@ -636,6 +641,31 @@ static void check_duplex_preemption() {
     assert(cancelled && engine.control_terminals == 9);
 }
 
+void test_live_request_metrics() {
+    using namespace mfq::transport;
+    RuntimeRequestMetrics store;
+    {
+        ActiveRequest first(store), second(store);
+        first.progress("one", {{"generated_tokens", 6}});
+        second.progress("two", {{"processed_tokens", 2048}});
+        auto value = store.snapshot({}, 512, false);
+        assert(value["live_requests"].size() == 2);
+        assert(value["live_requests"]["one"]["generated_tokens"] == 6);
+        first.complete("one", true, true, 10, {}, {});
+        value = store.snapshot({}, 512, false);
+        assert(value["live_requests"].size() == 1);
+        assert(value["live_requests"].contains("two"));
+    }
+    assert(store.snapshot({}, 512, false)["live_requests"].empty());
+    FakeEngine engine;
+    MfqScheduler scheduler(engine);
+    MfqRuntimeTransportConfig config;
+    CompletionStream completion(scheduler, config, store,
+        {{"input",{{"messages",json::array({{{"role","user"},{"content","hello"}}})}}},{"sampling",{{"max_new_tokens",2}}}}, "0");
+    while (completion.next()) {}
+    assert(completion.progress()["generated_tokens"] == 6);
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2) {
         const bool stdio = std::string(argv[1]) == "--stdio";
@@ -658,11 +688,30 @@ int main(int argc, char** argv) {
     check_control_protocol();
     check_input_ownership_and_budget();
     test_model_capabilities();
+    test_live_request_metrics();
     test_decode_timing();
     test_benchmark_input_contract();
     test_probability_contract();
     test_chat_input_contract();
     check_generation_protocol();
+    {
+        FakeEngine engine;
+        MfqScheduler scheduler(engine);
+        auto input = request(0, 1); input.diagnostic_input->tokens = {59};
+        auto handle = scheduler.submit(input);
+        while (!engine.blocked) std::this_thread::yield();
+        const auto started = Clock::now();
+        for (int index = 0; index < 1000; ++index) {
+            const auto snapshot = scheduler.snapshot();
+            assert(snapshot.status.healthy && snapshot.runtime == Metrics({{"test_health_only", 99}}));
+        }
+        assert(Clock::now() - started < 100ms);
+        assert(engine.advances[0] == 0);
+        engine.resume = true;
+        drain(handle);
+        scheduler.control(RuntimeMetrics{});
+        assert(scheduler.snapshot().runtime == Metrics({{"test_health_only", 99}}));
+    }
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});

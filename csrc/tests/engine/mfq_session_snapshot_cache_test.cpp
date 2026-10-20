@@ -1,4 +1,4 @@
-#include "session_snapshot_cache.h"
+#include "snapshot.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -56,6 +56,11 @@ int main() {
     require(budget.set_limit(10) == 10, "budget shrink must evict the oldest snapshot");
     require(!budget.find_best("c", {3, 9}, 2, [](const State&) { return true; }), "LRU victim must be removed");
     require(budget.find_best("d", {4, 9}, 2, [](const State&) { return true; }).has_value(), "newest snapshot must remain");
+    auto evicted=budget.find_best("d",{4,9},2,[](const State&) {return true;});
+    budget.close("d");
+    budget.record_hit(*evicted);
+    require(budget.metrics().hits==0,"evicted snapshot must not become a live cache hit");
+    budget.store("d", {{4}, "", 10}, same_snapshot);
     require(budget.set_limit(0) == 10 && !budget.enabled(), "zero allowance must empty and disable the hot tier");
     return 0;
 }

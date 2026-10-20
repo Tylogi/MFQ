@@ -2,7 +2,7 @@
 #include "timing.h"
 #include "ops/execution/cuda_execution.h"
 #include "kernels/gated_residual_fused.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "mfq/model_source/model_source.h"
 #include <array>
 #include <climits>

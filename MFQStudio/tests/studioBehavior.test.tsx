@@ -21,6 +21,7 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
 beforeEach(() => {
   vi.restoreAllMocks();
   addJob.mockReset();
+  vi.spyOn(modelsApi, 'downloadDirectory').mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
 });
 
 describe('test_assistant_markdown_recovers_fully_escaped_structural_line_breaks', () => {
@@ -108,6 +109,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
       repo_id: 'team/model',
       max_workers: 8,
       destination: `models/${provider}/team/model/model`,
+      download_directory: '/workspace/models',
       revision: 'main',
       include: [
         'model.mfq', '*.json', '*.txt', '*.model', '*.tiktoken', '*.jinja',

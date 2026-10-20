@@ -1,0 +1,144 @@
+{
+  "model": "Qwen3.8-Flash-Next",
+  "evaluation": {
+    "dataset": "WikiText-2",
+    "lower_is_better": "kld",
+    "higher_is_better": "top1_agreement_percent",
+    "weight_size_unit": "GB = 10^9 bytes",
+    "weight_size_exclusions": [
+      "vision encoder",
+      "MTP head"
+    ],
+    "mfq_gsq_protocol_from_original_figure": {
+      "samples": 580,
+      "sequence_length": 512,
+      "evaluated_positions": 147900,
+      "source": "docs/figures/qwen38-flash-next-quality.png at commit a69315fa05c687b27f69ff5a8228b8fadea1fb36",
+      "sha256": "9bf4ae74ec9f55e3494be1125a98905dc0120745a304c7da74c1e00438e9a78e",
+      "note": "The original figure attributes this protocol to MFQ · EW and GSQ-RCO only."
+    }
+  },
+  "source": {
+    "repository": "Tylogi/Qwen3.8-Flash-Next-EW-MFQ",
+    "revision": "3cdfba425c44177019d3fdac94fbfa5d17379505",
+    "url": "https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/raw/3cdfba425c44177019d3fdac94fbfa5d17379505/README.md",
+    "section": "Benchmarks",
+    "description": "Numeric table from the revision-pinned published model card. No new measurements. V4-XS is present in the published table and repository README but was absent from the original PNG."
+  },
+  "series": [
+    {
+      "id": "mfq",
+      "label": "MFQ · EW",
+      "measurements": [
+        {
+          "tier": "V1-S",
+          "weight_size_gb": 72.536,
+          "kld": 0.22157,
+          "top1_agreement_percent": 83.77
+        },
+        {
+          "tier": "V1-M",
+          "weight_size_gb": 74.529,
+          "kld": 0.19689,
+          "top1_agreement_percent": 84.72
+        },
+        {
+          "tier": "S2-L",
+          "weight_size_gb": 78.859,
+          "kld": 0.1463,
+          "top1_agreement_percent": 86.54
+        },
+        {
+          "tier": "V3-XXS",
+          "weight_size_gb": 81.952,
+          "kld": 0.12436,
+          "top1_agreement_percent": 87.62
+        },
+        {
+          "tier": "S3-L",
+          "weight_size_gb": 89.976,
+          "kld": 0.08698,
+          "top1_agreement_percent": 89.55
+        },
+        {
+          "tier": "V4-XS",
+          "weight_size_gb": 93.672,
+          "kld": 0.07524,
+          "top1_agreement_percent": 90.36
+        }
+      ]
+    },
+    {
+      "id": "unsloth-ud",
+      "label": "Unsloth UD",
+      "measurements": [
+        {
+          "tier": "IQ1_S",
+          "weight_size_gb": 72.5,
+          "kld": 0.39607,
+          "top1_agreement_percent": 77.33
+        },
+        {
+          "tier": "IQ1_M",
+          "weight_size_gb": 74.5,
+          "kld": 0.31474,
+          "top1_agreement_percent": 79.69
+        },
+        {
+          "tier": "Q2_K_XL",
+          "weight_size_gb": 78.9,
+          "kld": 0.22461,
+          "top1_agreement_percent": 82.72
+        },
+        {
+          "tier": "IQ3_XXS",
+          "weight_size_gb": 82.0,
+          "kld": 0.16512,
+          "top1_agreement_percent": 85.41
+        },
+        {
+          "tier": "Q3_K_XL",
+          "weight_size_gb": 90.0,
+          "kld": 0.1065,
+          "top1_agreement_percent": 88.31
+        },
+        {
+          "tier": "IQ4_XS",
+          "weight_size_gb": 93.7,
+          "kld": 0.08363,
+          "top1_agreement_percent": 89.55
+        }
+      ]
+    },
+    {
+      "id": "gsq-rco",
+      "label": "GSQ-RCO",
+      "measurements": [
+        {
+          "tier": "Q2_0",
+          "weight_size_gb": 66.424,
+          "kld": 0.4066,
+          "top1_agreement_percent": 77.27
+        },
+        {
+          "tier": "IQ2_XS",
+          "weight_size_gb": 68.026,
+          "kld": 0.33374,
+          "top1_agreement_percent": 79.06
+        },
+        {
+          "tier": "IQ3_XXS",
+          "weight_size_gb": 75.84,
+          "kld": 0.22134,
+          "top1_agreement_percent": 83.0
+        },
+        {
+          "tier": "IQ3_S",
+          "weight_size_gb": 83.618,
+          "kld": 0.13717,
+          "top1_agreement_percent": 86.9
+        }
+      ]
+    }
+  ]
+}

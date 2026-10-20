@@ -404,9 +404,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         arg("keys"), arg("gate_scores"), arg("ape"), arg("pool_size") = 4);
     m.def("qwen4_ple_dilated_conv_silu", &qwen::ple_dilated_conv_silu,
         arg("value"), arg("weight"), arg("state"), arg("dilation"));
-    m.def("qwen4_dense_gqa_attention", &qwen::dense_gqa_attention,
+    m.def("qwen4_dense_gqa_attention", [](const qwen::Tensor& q,const qwen::Tensor& k,const qwen::Tensor& v,int64_t offset) {
+        return qwen::dense_gqa_attention(q,k,v,offset); },
         arg("query"), arg("key"), arg("value"), arg("query_offset"));
-    m.def("qwen4_sparse_gqa_attention", &qwen::sparse_gqa_attention,
+    m.def("qwen4_sparse_gqa_attention", [](const qwen::Tensor& q,const qwen::Tensor& k,const qwen::Tensor& v,const qwen::Tensor& indices) {
+        return qwen::sparse_gqa_attention(q,k,v,indices); },
         arg("query"), arg("key"), arg("value"), arg("indices"));
     m.def("glm5_dense_mla_attention", &glm::dense_mla_attention,
         arg("query"), arg("cache"), arg("query_offset"), arg("scale") = pybind11::none());

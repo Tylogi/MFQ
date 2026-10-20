@@ -422,6 +422,9 @@ def analyze_checkpoint(artifact: DiscoveredModel) -> CheckpointAnalysis:
             average_bpw=8 * size / parameters if parameters and all(item.bpw is not None for item in items) else None,
             tensor_count=len(items), formats=sorted({cell.format for cell in cells}) if cells and category == "routed_experts" else sorted({item.format for item in items})))
     parameters, size = sum(item.parameters for item in tensors), sum(item.stored_bytes for item in tensors)
+    bpw_weights = [item for item in tensors if item.category not in {"predictor", "vision"}]
+    bpw_parameters = sum(item.parameters for item in bpw_weights)
+    bpw_size = sum(item.stored_bytes for item in bpw_weights)
     if not config:
         warnings.append("checkpoint has no model config; head counts and architecture details are unavailable")
     return CheckpointAnalysis(model_id=artifact.resource.id, name=artifact.resource.name,
@@ -432,7 +435,7 @@ def analyze_checkpoint(artifact: DiscoveredModel) -> CheckpointAnalysis:
         linear_key_heads=_integer(text, "linear_num_key_heads"), linear_value_heads=_integer(text, "linear_num_value_heads"),
         expert_count=max(_integer(text, "num_experts", "n_routed_experts") or 0, max((cell.expert + 1 for cell in experts), default=0)),
         experts_per_token=_integer(text, "num_experts_per_tok"), parameters=parameters, stored_bytes=size,
-        average_bpw=8 * size / parameters if parameters and all(item.bpw is not None for item in tensors) else None,
+        average_bpw=8 * bpw_size / bpw_parameters if bpw_parameters and all(item.bpw is not None for item in bpw_weights) else None,
         attention_distribution=dict(distribution), projections=sorted(projections, key=lambda item: (item.category, item.name)),
         layers=layers, experts=experts, tensors=tensors,
         advanced=_advanced(text, graph, tensors),

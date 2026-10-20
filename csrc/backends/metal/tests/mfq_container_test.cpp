@@ -1,10 +1,11 @@
-#include "mfq_container.h"
-#include "mfe_expert_store.h"
-#include "mlx_ssd_expert_cache.h"
+#include "storage/mfq_container.h"
+#include "storage/mfe_expert_store.h"
+#include "runtime/mlx_ssd_expert_cache.h"
 
 #include "nlohmann/json.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -979,12 +981,47 @@ void test_hf_virtual_mfe_experts(
             "expert capacity");
 }
 
+void test_concurrent_file_cache_ownership(const std::filesystem::path& root) {
+    const auto path = root / "reader-owner.mfq";
+    const auto replacement = root / "reader-replacement.mfq";
+    write_mfq(path, 2, "test", {}, {{"weight", "F16", "abcdef"}});
+    mfq::metal::MfqContainer original(path);
+    require(original.read_range("weight", 0, 6) == std::vector<std::uint8_t>({'a', 'b', 'c', 'd', 'e', 'f'}),
+        "original random-access source was not opened");
+    write_mfq(replacement, 2, "test", {}, {{"weight", "F16", "uvwxyz"}});
+    std::filesystem::rename(replacement, path);
+    mfq::metal::MfqContainer current(path);
+    const auto copy = current;
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> readers;
+    for (int worker = 0; worker < 8; ++worker) readers.emplace_back([&, worker] {
+        try {
+            for (int index = 0; index < 128; ++index) {
+                const auto& model = (index + worker) % 3 == 0 ? original : (index & 1) ? copy : current;
+                const auto expected = &model == &original ? 'b' : 'v';
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    const auto bytes = model.read_range("weight", 1, 3);
+                    if (bytes.size() != 3 || bytes.front() != expected) failed = true;
+                }
+            }
+        } catch (...) { failed = true; }
+    });
+    for (auto& reader : readers) reader.join();
+    require(!failed, "thread-local source cache crossed container ownership or changed ranges");
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        mfq::metal::MfqContainer reopened(path);
+        require(reopened.read_range("weight", 0, 6).front() == 'u',
+            "expired container retained a stale source cache");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         const TemporaryDirectory root;
         test_basic_container(root.path());
+        test_concurrent_file_cache_ownership(root.path());
         test_load_progress(root.path());
         test_malformed_tables(root.path());
         test_sharded_ranges_and_source_lifetime(

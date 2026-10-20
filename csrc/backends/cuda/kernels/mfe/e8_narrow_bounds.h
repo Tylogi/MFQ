@@ -1,5 +1,5 @@
 #pragma once
-#include "ffn.h"
+#include "kernels/mfe/ffn.h"
 #include <climits>
 
 namespace mfq::cuda {

@@ -2,7 +2,8 @@
 
 #include "mfq/token_constraint.h"
 #include "mlx_sampling.h"
-#include "mtp_depth_controller.h"
+#include "depth.h"
+#include "step_sequence.h"
 
 #include <array>
 #include <cstddef>
@@ -32,6 +33,11 @@ public:
         std::span<const std::int32_t> token_ids);
     bool empty() const noexcept { return token_ids_.empty(); }
     std::size_t size() const noexcept { return token_ids_.size(); }
+    std::size_t bytes() const noexcept {
+        std::size_t result = token_ids_.size() * sizeof(std::int32_t);
+        for (const auto& hidden : hidden_) result += hidden.nbytes();
+        return result;
+    }
     MlxMtpHistoryBatch drain();
 
 private:
@@ -141,6 +147,7 @@ struct MlxMtpTargetBatch {
     mlx::core::array logits;
     // [1, drafts + 1, ...] adapter payload used to seed the next proposal.
     mlx::core::array hidden;
+    std::optional<mlx::core::array> greedy_tokens;
 };
 
 struct MlxMtpEngineCallbacks {
@@ -172,6 +179,11 @@ struct MlxMtpEngineCallbacks {
     mfq::engine::mtp::PolicyState* policy_state = nullptr;
     std::function<MlxMtpTargetBatch(std::int32_t)> decode_target;
     std::function<void(const mlx::core::array&, int, double)> verified_round;
+    std::function<int()> draft_depth;
+    std::function<std::optional<double>(int)> batch_cycle_ms;
+    std::function<std::uint64_t()> batch_park_count;
+    std::function<void(const MlxMtpDraftContext&)> prepare_draft_history;
+    std::function<mlx::core::array()> draft_logits;
 
 };
 
@@ -190,6 +202,17 @@ struct MlxMtpEngineRequest {
     // resampled from the corresponding target row under this constraint.
     MfqTokenConstraintPtr token_constraint;
 };
+
+struct MlxMtpTargetRequest {
+    enum class Kind { target, first_draft, next_draft };
+    std::int32_t pending_token;
+    mlx::core::array draft_tokens;
+    int draft_count;
+    Kind kind = Kind::target;
+};
+using MlxMtpGeneration = mfq::StepSequence<MlxMtpTargetRequest>;
+MlxMtpGeneration mlx_mtp_generation(MlxMtpEngineRequest request,
+    MlxMtpEngineCallbacks callbacks, MlxMtpGenerationStats& stats);
 
 // Avoid allocating a vocabulary-sized count vector on the common no-penalty
 // path. The helper is shared by every generation adapter.

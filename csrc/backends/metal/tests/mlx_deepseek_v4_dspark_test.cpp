@@ -1,8 +1,8 @@
-#include "mlx_deepseek_v4_dspark.h"
-#include "mlx_deepseek_v4_attention.h"
-#include "mlx_transformer.h"
-#include "mlx_moe.h"
-#include "mlx_sampling.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_dspark.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_attention.h"
+#include "runtime/mlx_transformer.h"
+#include "ops/mlx_moe.h"
+#include "runtime/mlx_sampling.h"
 
 #include <cmath>
 #include <cstdint>

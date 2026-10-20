@@ -12,7 +12,7 @@ inline void require_model(bool condition, const char *message) {
 
 template <class Model, class Guard> void reset_model(Model &model, int64_t batch, Guard guard) {
     model.cache_pos = model.decode_position_delta = 0;
-    model.adapter_reset(batch);
+    model.reset_native(batch);
     model.speculative_start = -1;
     model.speculative_confirmed = 0;
     model.speculative_suffix_forward = false;
@@ -29,7 +29,7 @@ void begin_speculative_suffix(Model &model, int64_t tokens, Guard guard) {
                   "invalid speculative suffix");
     model.speculative_start = model.cache_pos;
     model.speculative_confirmed = 0;
-    model.adapter_begin_speculative();
+    model.native_begin_speculation();
     size_t begun = 0;
     try {
         for (auto &block : model.blocks) {
@@ -46,7 +46,7 @@ void begin_speculative_suffix(Model &model, int64_t tokens, Guard guard) {
             }
         }
         try {
-            model.adapter_rollback_speculative(model.cache_pos);
+            model.native_rollback_speculation(model.cache_pos);
         } catch (...) {
         }
         model.speculative_start = -1;
@@ -67,9 +67,9 @@ void finish_speculative(Model &model, bool commit, int64_t accepted, Guard guard
             block->rollback_speculative(keep);
     }
     if (commit)
-        model.adapter_commit_speculative();
+        model.native_commit_speculation();
     else {
-        model.adapter_rollback_speculative(keep);
+        model.native_rollback_speculation(keep);
         model.cache_pos = keep;
     }
     model.speculative_start = -1;
@@ -87,9 +87,9 @@ template <class Ops> auto causal_forward(Ops &ops) {
                       ops.size(embeddings, 1) == T &&
                       ops.size(embeddings, 2) == model.hidden_size(),
                   "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    if (model.adapter_requires_batch_reset(B))
+    if (model.requires_batch_reset(B))
         model.reset(B);
-    model.adapter_validate_forward(B, T, model.cache_pos, ops.pos_override.has_value(),
+    model.validate_forward(B, T, model.cache_pos, ops.pos_override.has_value(),
                                    ops.cache_positions_override.has_value(),
                                    ops.attention_mask.has_value());
     require_model(model.speculative_start < 0 || model.speculative_suffix_forward,
@@ -99,7 +99,7 @@ template <class Ops> auto causal_forward(Ops &ops) {
         confirmed >= 0 &&
             (confirmed == 0 || (confirmed < T && B == 1 && model.cache_pos > 0 &&
                                 (!ops.pos_override.has_value() ||
-                                 model.adapter_allows_speculative_position_override()) &&
+                                 model.allows_speculative_position_override()) &&
                                 !ops.cache_positions_override.has_value() &&
                                 !ops.attention_mask.has_value() && model.supports_speculation())),
         "unsupported speculative backbone geometry");
@@ -119,7 +119,7 @@ template <class Ops> auto causal_forward(Ops &ops) {
                   : (model.decode_position_delta == 0
                          ? ops.cache_positions
                          : ops.offset_positions(ops.cache_positions, model.decode_position_delta));
-    auto prepared = model.adapter_prepare_positions(std::move(ops.pos), B, T);
+    auto prepared = model.prepare_positions(std::move(ops.pos), B, T);
     ops.pos = std::move(prepared.positions);
     ops.full_positions = std::move(prepared.full_positions);
     const auto &positions = ops.cache_positions;
@@ -127,7 +127,7 @@ template <class Ops> auto causal_forward(Ops &ops) {
                       (ops.rank(positions) == 2 && ops.size(positions, 0) == B &&
                        ops.size(positions, 1) == T),
                   "cache_positions must have shape [tokens] or [batch,tokens]");
-    model.adapter_validate_positions(ops.pos, B, T, ops.has_mrope());
+    model.validate_positions(ops.pos, B, T, ops.has_mrope());
     if (ops.attention_mask.has_value()) {
         const auto &mask = *ops.attention_mask;
         require_model(ops.rank(mask) == 2 && ops.size(mask, 0) == B &&
@@ -135,16 +135,16 @@ template <class Ops> auto causal_forward(Ops &ops) {
                       "attention_mask must cover [batch,cached_plus_current_tokens]");
     }
     ops.effective_attention_mask =
-        model.adapter_attention_mask(ops.attention_mask, T, model.cache_pos);
+        model.attention_mask(ops.attention_mask, T, model.cache_pos);
     auto hidden = ops.prepare_hidden(B, T);
-    model.adapter_begin_forward(ops.raw_hidden != nullptr);
+    model.begin_forward(ops.raw_hidden != nullptr);
     ops.trace(hidden);
     for (auto &block : model.blocks) {
         hidden = ops.layer(block, std::move(hidden));
         ops.trace(hidden);
     }
-    model.adapter_finish_forward(ops.full_positions, B, T);
-    if (model.adapter_force_cache_advance() || !ops.pos_override.has_value() ||
+    model.finish_forward(ops.full_positions, B, T);
+    if (model.force_cache_advance() || !ops.pos_override.has_value() ||
         ops.advance_cache_with_position_ids)
         model.cache_pos += T;
     return ops.finish(std::move(hidden), B, T);

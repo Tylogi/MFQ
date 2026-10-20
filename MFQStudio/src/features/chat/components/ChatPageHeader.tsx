@@ -82,7 +82,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
         <button
           aria-label={tr('清空对话', 'Clear conversation')}
           className="chat-icon-button"
-          disabled={!conversation.conversationReady || busy || (!messages.length && !currentVoiceMessages.length)}
+          disabled={!conversation.historyReady || busy || (!messages.length && !currentVoiceMessages.length)}
           onClick={() => void clearActiveConversation()}
           title={tr('清空对话', 'Clear conversation')}
           type="button"

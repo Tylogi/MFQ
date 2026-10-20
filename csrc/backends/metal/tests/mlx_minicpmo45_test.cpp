@@ -1,4 +1,4 @@
-#include "mlx_minicpmo45.h"
+#include "models/minicpmo45/mlx_minicpmo45.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
         mfq::metal::detail::test_minicpmo45_chunked_prefill_generation();
         mfq::metal::detail::test_minicpmo45_qk_norm_rope();
         mfq::metal::detail::test_minicpmo45_gqa_attention();
+        mfq::metal::detail::test_minicpmo45_gqa_reduction();
         if (argc == 2) {
             const mfq::metal::MfqContainer model(argv[1]);
             auto runtime = mfq::metal::MlxMiniCPMO45Runtime::load(

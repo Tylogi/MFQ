@@ -17,10 +17,11 @@ import { RemoteRoutingPanel } from './RemoteRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { ContextManagementPanel } from './ContextManagementPanel';
 import { PrefixCacheSettingsPanel } from './PrefixCacheSettingsPanel';
-import { RuntimeProfilesPanel } from '../runtime/RuntimeProfilesPanel';
 import { ModelAliasMapping } from './ModelAliasMapping';
 import { InferencePolicyPanel } from './InferencePolicyPanel';
+import { ApiAuthenticationPanel } from './ApiAuthenticationPanel';
 import { toast } from '../../stores/toastStore';
+import { ServerConnectionPage } from '../../app/ServerConnectionPage';
 
 function browserConfig(): StudioConfig {
   const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
@@ -82,7 +83,7 @@ export function ConnectionsPage() {
       })
       .catch((cause) => {
         if (!disposed) {
-          toast.error(errorMessage(cause));
+          toast.error(errorMessage(cause, tr));
         }
       });
     return () => {
@@ -98,6 +99,7 @@ export function ConnectionsPage() {
     if (JSON.stringify(draft) === JSON.stringify(applied.current) && !credentialWritable && !applyState?.error) return;
     const endpoint = getApiBaseUrl();
     let credential = getApiToken();
+    let boundPort = listeningPort;
     const current = () => getApiBaseUrl() === endpoint && getApiToken() === credential;
     applying.current = true;
     setBusy(true);
@@ -106,10 +108,13 @@ export function ConnectionsPage() {
       if (draft.mode === 'local' && (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535)) {
         throw new Error(tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535'));
       }
+      if (draft.mode === 'local' && draft.local_service_port === anthropicPort && draft.local_service_port !== listeningPort) {
+        throw new Error(tr('OpenAI 和 Anthropic 不能使用同一个端口，请为它们设置不同的端口。', 'OpenAI and Anthropic cannot share a port. Choose a different port for each API.'));
+      }
       if (isStudio()) {
-        if (studio?.config.mode === 'local' && draft.mode === 'local'
+        if (studio?.connection === 'managed' && studio.config.mode === 'local' && draft.mode === 'local'
             && studio.config.local_service_port !== draft.local_service_port) {
-          await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          boundPort = (await runtimeApi.configureRuntimeListener(draft.local_service_port)).port;
           if (!current()) return;
         }
         await configureStudio(draft);
@@ -121,11 +126,13 @@ export function ConnectionsPage() {
       } else {
         let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
         if (draft.mode === 'local') {
-          if (browserConfig().mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          if (browserConfig().mode === 'local') boundPort = (await runtimeApi.configureRuntimeListener(draft.local_service_port)).port;
           if (!current()) return;
           address = `http://127.0.0.1:${draft.local_service_port}`;
         } else {
-          const parsed = new URL(address);
+          let parsed: URL;
+          try { parsed = new URL(address); }
+          catch { throw new Error(tr('请输入完整的 HTTP 或 HTTPS 服务地址，例如 http://127.0.0.1:8090。', 'Enter a full HTTP or HTTPS service URL, such as http://127.0.0.1:8090.')); }
           if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
             throw new Error(tr('请输入不含凭据的 HTTP 或 HTTPS 服务地址', 'Enter an HTTP or HTTPS service URL without credentials'));
           }
@@ -151,7 +158,9 @@ export function ConnectionsPage() {
       }
     } catch (cause) {
       if (mounted.current && current()) {
-        setApplyState({ error: true, text: errorMessage(cause) });
+        setDraft({ ...applied.current, local_service_port: boundPort ?? applied.current.local_service_port });
+        setListeningPort(boundPort);
+        setApplyState({ error: true, text: errorMessage(cause, tr) });
       }
     } finally {
       applying.current = false;
@@ -163,7 +172,13 @@ export function ConnectionsPage() {
     const port = Number(anthropicDraft);
     if (applying.current || port === anthropicPort) return;
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
       setApplyState({ error: true, text: tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535') });
+      return;
+    }
+    if (port === listeningPort) {
+      setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
+      setApplyState({ error: true, text: tr('OpenAI 和 Anthropic 不能使用同一个端口，请为它们设置不同的端口。', 'OpenAI and Anthropic cannot share a port. Choose a different port for each API.') });
       return;
     }
     const endpoint = getApiBaseUrl();
@@ -175,11 +190,13 @@ export function ConnectionsPage() {
       const listener = await runtimeApi.configureRuntimeListener(port, 'anthropic');
       if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
         setAnthropicPort(listener.anthropic_port ?? port);
+        setAnthropicDraft(String(listener.anthropic_port ?? port));
         setApplyState({ error: false, text: tr('已应用，无需重载模型', 'Applied without reloading models') });
       }
     } catch (cause) {
       if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
-        setApplyState({ error: true, text: errorMessage(cause) });
+        setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
+        setApplyState({ error: true, text: errorMessage(cause, tr) });
       }
     } finally {
       applying.current = false;
@@ -198,6 +215,7 @@ export function ConnectionsPage() {
         )}
       />
       <div className="server-page">
+        {(studio?.connection === 'confirmation_required' || studio?.connection === 'incompatible') && <ServerConnectionPage />}
         {active && (
           <div className="server-active-notice">
             <Icon name="info" size={15} />
@@ -212,6 +230,11 @@ export function ConnectionsPage() {
         <SectionLabel title={tr('API参数', 'API parameters')} />
         <TMPanel className="server-settings-panel server-api-panel">
           <div className="setting-list">
+            {studio?.reachable && <SettingRow title={tr('服务归属', 'Server ownership')}
+              detail={studio.connection === 'managed'
+                ? tr('由 App 管理；退出 App 时停止服务。', 'Managed by this app; stopped when the app quits.')
+                : tr('独立服务；退出 App 不会停止它。', 'Independent server; quitting the app leaves it running.')}
+              trailing={<span>{studio.server && `MFQ Server ${studio.server.version} · PID ${studio.server.pid}`}</span>} />}
             <SettingRow
               title={tr('模型 ID', 'Model ID')}
               detail={tr(
@@ -342,6 +365,7 @@ export function ConnectionsPage() {
               />
               </>
             )}
+            <ApiAuthenticationPanel />
           </div>
           {applyState && <p className="server-apply-state" role={applyState.error ? 'alert' : 'status'}>{applyState.text}</p>}
         </TMPanel>
@@ -354,8 +378,8 @@ export function ConnectionsPage() {
             <SettingRow
               title={tr('MFQ Studio 打开时启动服务器', 'Start server when MFQ Studio opens')}
               detail={tr(
-                '本地模式会自动恢复服务，并使用当前模型和已保存的运行配置。',
-                'Local mode restores the server automatically with the current model and saved runtime configuration.',
+                '本地模式会自动启动服务，并使用已保存的服务设置。',
+                'Local mode starts the server automatically using saved service settings.',
               )}
               trailing={
                 <input
@@ -374,7 +398,6 @@ export function ConnectionsPage() {
         </TMPanel>
       </div>
       <InferencePolicyPanel />
-      <RuntimeProfilesPanel />
       <RemoteRoutingPanel />
     </section>
   );

@@ -1,7 +1,10 @@
-#include "mlx_deepseek_v4_attention.h"
-#include "mlx_deepseek_v41_attention.h"
-#include "mlx_mx.h"
-#include "mlx_transformer.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_attention.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_attention.h"
+#include "ops/mlx_csa2.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_sparse_attention.h"
+#include "ops/mlx_mx.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -66,6 +70,7 @@ std::vector<float> evaluated_float(array value) {
             value,
             mlx::core::float32);
     }
+    value = mlx::core::contiguous(value);
     value.eval();
     return {
         value.data<float>(),
@@ -830,6 +835,100 @@ void test_v41_fused_window_kv_matches_composition() {
         "V4.1 fused window KV preparation");
 }
 
+void test_v41_ced_encoder_source_and_replay() {
+    using namespace mfq::metal;
+    DeepseekV41Config config;
+    config.vocab = 8;
+    config.hidden = 4;
+    config.n_layers = 4;
+    config.causal_encoder_layers = 2;
+    config.n_heads = 64;
+    config.n_kv_heads = 1;
+    config.head_dim = 512;
+    config.rope_head_dim = 64;
+    config.q_lora_rank = 1;
+    config.o_lora_rank = 1;
+    config.o_groups = 64;
+    config.moe_inter = 4;
+    config.n_experts = 2;
+    config.n_shared = 1;
+    config.top_k = 1;
+    config.rms_eps = 1e-6;
+    config.sliding_window = 4;
+    config.max_position_embeddings = 64;
+    config.compress_ratios = {0, 2, 1, 1};
+    config.kv_source_layers = {1, 2};
+    config.index_source_layers = {1, 2, 3};
+    config.index_n_heads = 32;
+    config.index_head_dim = 128;
+    config.index_topk = 4;
+    config.candidate_source_layer = 2;
+    config.candidate_topk_blocks = 4;
+    config.candidate_block_size = 2;
+    config.hc_mult = 4;
+    config.hc_sinkhorn_iters = 20;
+    config.validate();
+    const auto linear = [](int output, int input, float salt) {
+        std::vector<float> values(output * input);
+        for (std::size_t index = 0; index < values.size(); ++index)
+            values[index] = std::sin(index * 0.017f + salt) * 0.1f;
+        return MlxLinear(mlx::core::astype(float_array(values, {output, input}), mlx::core::float16));
+    };
+    const auto make_attention = [&]() {
+        MlxDeepseekV41AttentionComponents c{
+            linear(1, 4, 1), linear(64 * 512, 1, 2), linear(512, 4, 3),
+            linear(64, 512, 4), linear(4, 64, 5),
+            mlx::core::ones({1}), mlx::core::ones({512}), mlx::core::zeros({64}),
+            linear(512, 4, 6), std::nullopt, mlx::core::ones({512}),
+            linear(32 * 128, 1, 7), linear(128, 512, 8),
+            mlx::core::ones({128}), linear(32, 4, 9),
+        };
+        auto rope = mlx_yarn_tables(64, 64, 10000.0f);
+        return MlxDeepseekV41Attention(config, 2, 64, std::move(c), rope, rope);
+    };
+    for (const int batch : {1, 2}) for (const int prefix : {0, 3}) {
+        auto full = make_attention(), replay = make_attention();
+        auto full_state = MlxDeepseekV41AttentionState::allocate(config, 2, batch, 64);
+        auto replay_state = MlxDeepseekV41AttentionState::allocate(config, 2, batch, 64);
+        MlxDeepseekV41SharedAttentionState full_shared, replay_shared;
+        const auto input = [&](int count, int start) {
+            std::vector<float> values(batch * count * 4);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = std::sin(index * 0.13f + start) * 0.2f;
+            return mlx::core::astype(float_array(values, {batch, count, 4}), mlx::core::float16);
+        };
+        if (prefix) {
+            auto x = input(prefix, 0);
+            full.forward(x, full_state, full_shared, 0).eval();
+            replay.forward(x, replay_state, replay_shared, 0).eval();
+        }
+        const int count = 17;
+        auto source = input(count, prefix);
+        auto expected = full.forward(source, full_state, full_shared, prefix);
+        expected.eval();
+        auto actual = replay.forward(token_slice(source, count - 4, count),
+            replay_state, replay_shared, prefix + count - 4, true, &source);
+        actual.eval();
+        require(replay_state.position == prefix + count &&
+                replay_state.compressed_length == prefix + count,
+            "CED replay failed to advance the full encoder KV pool");
+        require_close(evaluated_float(*replay_state.compressed_kv),
+            evaluated_float(*full_state.compressed_kv), 0, "CED global KV");
+        require_close(evaluated_float(*replay_state.index_k),
+            evaluated_float(*full_state.index_k), 0, "CED global Indexer cache");
+        require_close(evaluated_float(token_slice(actual, 3, 4)),
+            evaluated_float(token_slice(expected, count - 1, count)), 0.002f,
+            "CED last query with complete local window");
+        auto next = input(1, prefix + count);
+        require_close(evaluated_float(replay.forward(next, replay_state, replay_shared, prefix + count)),
+            evaluated_float(full.forward(next, full_state, full_shared, prefix + count)), 0.002f,
+            "CED subsequent decode cache continuity");
+        require_invalid([&] {
+            (void)replay.forward(next, replay_state, replay_shared, replay_state.position, true);
+        }, "CED accepted an incomplete replay window");
+    }
+}
+
 void test_v41_attention_snapshot_is_detached() {
     using mfq::metal::MlxDeepseekV41AttentionState;
     MlxDeepseekV41AttentionState state;
@@ -899,6 +998,115 @@ void test_v41_attention_snapshot_is_detached() {
             && partial_storage == restored.partial_kv->buffer().ptr()
             && score_storage == restored.partial_score->buffer().ptr(),
         "DeepSeek-V4.1 logical attention reset reallocated cache storage");
+}
+
+void test_csa2_packed_execution() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    const auto values = [](Shape shape) {
+        std::size_t count = 1;
+        for (int size : shape) count *= size;
+        return contiguous(astype(reshape(sin(arange(int(count), float32) * 0.017f) * 0.2f, shape), float16));
+    };
+    for (const auto [bits, group, e4] : {
+            std::tuple{8, 32, false}, std::tuple{4, 32, false}, std::tuple{4, 16, true}}) {
+        auto input = values({2, 17, 512});
+        auto packed = mlx_csa2_pack(input, bits, group, e4);
+        auto decoded = mlx_csa2_unpack(packed, bits, group, e4);
+        auto expected = bits == 8 ? mlx_mxfp8_sim(input)
+            : e4 ? mlx_mxfp4_e4m3_scale_sim(input) : mlx_mxfp4_sim(input);
+        require_close(evaluated_float(decoded), evaluated_float(expected), 0,
+            "CSA2 packed activation round trip");
+    }
+    for (int rows : {1, 2, 6, 128, 256}) {
+        constexpr int position = 4096, window = 128, pool_size = 4096;
+        auto query = values({1, rows, 64, 512});
+        auto local = values({1, rows == 1 ? window : window + rows, 512});
+        auto pooled = values({1, pool_size, 512});
+        auto local_packed = mlx_csa2_pack(local, 8, 32);
+        auto pooled_packed = mlx_csa2_pack(pooled, 4, 16, true);
+        auto local_dense = mlx_mxfp8_sim(local);
+        auto pooled_dense = mlx_mxfp4_e4m3_scale_sim(pooled);
+        auto indices = broadcast_to(reshape(remainder(arange(512, int32) * 7,
+            array(pool_size, int32)), {1, 1, 512}), {1, rows, 512});
+        indices = where(remainder(indices, array(17, int32)) == array(0, int32),
+            array(-1, int32), indices);
+        auto sinks = zeros({64}, float32);
+        auto expected = rows == 1
+            ? mlx_sparse_circular_mla_decode_attention(transpose(query, {0, 2, 1, 3}),
+                  local_dense, pooled_dense, pool_size, indices, sinks, position + 1, 1, window)
+            : mlx_sparse_circular_mla_attention(transpose(query, {0, 2, 1, 3}),
+                  local_dense, pooled_dense, pool_size, indices, sinks, position, 1, window);
+        auto actual = mlx_csa2_attention(query, local_packed, pooled_packed,
+            pool_size, indices, sinks, position, 1, window);
+        require_close(evaluated_float(actual), evaluated_float(expected),
+            0.0002f, "CSA2 packed attention/unpacked reference M=" + std::to_string(rows));
+    }
+    for (int rows : {9, 128, 256}) for (int position : {0, 4096}) {
+        auto query = values({1, rows, 64, 512});
+        auto local = values({1, position == 0 ? rows : 128 + rows, 512});
+        auto indices = zeros({1, rows, 0}, int32);
+        auto sinks = sin(arange(64, float32));
+        auto expected = mlx_sparse_circular_mla_attention(transpose(query, {0, 2, 1, 3}),
+            mlx_mxfp8_sim(local), std::nullopt, 0, indices, sinks, position, 1, 128);
+        auto actual = mlx_csa2_attention(query, mlx_csa2_pack(local,8,32), std::nullopt,
+            0, indices, sinks, position, 1, 128);
+        require_close(evaluated_float(actual), evaluated_float(expected), 0.0002f,
+            "CSA2 local-only prefill M=" + std::to_string(rows));
+    }
+    for (int rows : {1, 2, 6}) {
+        auto query = mlx_mxfp4_sim(values({1, rows, 32, 128}));
+        auto keys = values({1, 4096, 128});
+        auto weights = reshape(sin(arange(rows * 32, float32) * 0.13f), {1, rows, 32});
+        auto actual = mlx_csa2_index_scores(query, mlx_csa2_pack(keys, 4, 32), weights, 4096, 1);
+        auto expected = rows == 1
+            ? mlx_dsa_indexer_scores_decode(query, mlx_mxfp4_sim(keys), weights, 4096, 1, 4096)
+            : mlx_dsa_indexer_scores(query, mlx_mxfp4_sim(keys), weights, 4096, 1);
+        require_close(evaluated_float(actual), evaluated_float(expected), 0.0002f,
+            "CSA2 packed Indexer/unpacked reference");
+        auto candidates = broadcast_to(reshape(arange(257, int32) * 7, {1, 1, 257}), {1, rows, 257});
+        candidates = where(remainder(candidates, array(11, int32)) == array(0, int32), array(-1, int32), candidates);
+        auto filtered = mlx_csa2_index_scores(query, mlx_csa2_pack(keys, 4, 32), weights, 4096, 1, candidates);
+        auto reference = take_along_axis(expected, maximum(candidates, array(0, int32)), -1);
+        reference = where(candidates >= array(0, int32), reference,
+            array(-std::numeric_limits<float>::infinity(), float32));
+        require_close(evaluated_float(filtered), evaluated_float(reference), 0.0002f,
+            "CSA2 candidate-only Indexer/unpacked reference");
+    }
+    for (int rows : {1, 2, 9}) for (int width : {17, 512, 1025, 4096, 4103}) {
+        const int count = std::min(width, 512);
+        for (bool explicit_ids : {false, true}) {
+            std::vector<float> scores(2 * rows * width);
+            std::vector<std::int32_t> ids(scores.size());
+            std::vector<std::int32_t> expected;
+            for (int row = 0; row < 2 * rows; ++row) {
+                std::vector<int> order(width);
+                std::iota(order.begin(), order.end(), 0);
+                const int offset = row * width;
+                for (int column = 0; column < width; ++column) {
+                    scores[offset + column] = row == 0 || column % 23 == 0
+                        ? -std::numeric_limits<float>::infinity()
+                        : float((column * 71 + row * 13) % 997);
+                    ids[offset + column] = explicit_ids ? width - column - 1 : column;
+                }
+                std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int a, int b) {
+                    return scores[offset + a] != scores[offset + b]
+                        ? scores[offset + a] > scores[offset + b] : ids[offset + a] < ids[offset + b];
+                });
+                std::vector<std::int32_t> selected;
+                for (int index = 0; index < count; ++index) {
+                    const int column = order[index];
+                    selected.push_back(std::isfinite(scores[offset + column]) ? ids[offset + column] : -1);
+                }
+                std::sort(selected.begin(), selected.end());
+                expected.insert(expected.end(), selected.begin(), selected.end());
+            }
+            auto actual = mlx_csa2_topk(array(scores.begin(), Shape{2, rows, width}), count,
+                explicit_ids ? std::optional<array>{array(ids.begin(), Shape{2, rows, width})} : std::nullopt);
+            require(evaluated_int(contiguous(actual)) == expected,
+                "CSA2 top-k CPU oracle mismatch M=" + std::to_string(rows) + " N=" + std::to_string(width));
+        }
+    }
 }
 
 void test_pool_and_ratio_schedule() {
@@ -1522,7 +1730,9 @@ int main() {
         test_image_visibility_starts_at_image_start();
         test_yarn_rope_and_rms();
         test_v41_fused_window_kv_matches_composition();
+        test_v41_ced_encoder_source_and_replay();
         test_v41_attention_snapshot_is_detached();
+        test_csa2_packed_execution();
         test_pool_and_ratio_schedule();
         test_local_attention_cpu_reference();
         test_prefill_mma_cpu_reference();

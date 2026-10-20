@@ -9,6 +9,10 @@ find_program(MFQ_PYTHON_EXECUTABLE NAMES python3 python)
 if(MFQ_PYTHON_EXECUTABLE)
     add_test(NAME mfq-engine-include-graph-test
         COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_engine_include_graph.py)
+    add_test(NAME mfq-cuda-include-graph-test
+        COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_cuda_include_graph.py)
+    add_test(NAME mfq-layer-independence-test
+        COMMAND ${MFQ_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/../tests/test_layer_independence.py)
 endif()
 
 add_executable(mfq-cuda-tensor-view-test
@@ -20,6 +24,7 @@ target_compile_features(mfq-cuda-tensor-view-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
 
 add_executable(mfq-native-tensor-test
+    ${PROJECT_SOURCE_DIR}/backends/cuda/native/env.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/native/tensor/tensor.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native/native_tensor_cpu_test_stubs.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/native/native_tensor_test.cpp
@@ -67,13 +72,27 @@ mfq_add_core_test(mfq-model-graph-test model/mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model/model_source_test.cpp)
 mfq_add_core_test(mfq-file-range-reader-test host/file_range_reader_test.cpp)
 mfq_add_core_test(mfq-moe-dispatch-plan-test moe/moe_dispatch_plan_test.cpp)
+target_include_directories(mfq-moe-dispatch-plan-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 add_executable(mfq-moe-residency-bench ${PROJECT_SOURCE_DIR}/../bench/moe_residency_bench.cpp)
-target_link_libraries(mfq-moe-residency-bench PRIVATE mfq-core)
+target_link_libraries(mfq-moe-residency-bench PRIVATE mfq-engine)
+target_include_directories(mfq-moe-residency-bench PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 target_compile_features(mfq-moe-residency-bench PRIVATE cxx_std_17)
 mfq_add_core_test(mfq-nint-rows-test quant/nint_rows_test.cpp)
 mfq_add_core_test(mfq-quant-expert-range-test moe/quant_expert_range_test.cpp)
-mfq_add_core_test(mfq-host-parallel-test host/host_parallel_test.cpp)
-mfq_add_core_test(mfq-cpu-expert-pool-test moe/cpu_expert_pool_test.cpp)
+add_executable(mfq-host-parallel-test host/host_parallel_test.cpp)
+target_link_libraries(mfq-host-parallel-test PRIVATE mfq-host-parallel)
+add_test(NAME mfq-host-parallel-test COMMAND mfq-host-parallel-test)
+add_executable(mfq-cpu-topology-test host/cpu_topology_test.cpp)
+target_link_libraries(mfq-cpu-topology-test PRIVATE mfq-host-parallel)
+add_test(NAME mfq-cpu-topology-test COMMAND mfq-cpu-topology-test)
+add_executable(mfq-cpu-expert-pool-test moe/cpu_expert_pool_test.cpp)
+target_link_libraries(mfq-cpu-expert-pool-test PRIVATE mfq-cpu-execution)
+add_test(NAME mfq-cpu-expert-pool-test COMMAND mfq-cpu-expert-pool-test)
+if(MSVC)
+    target_compile_options(mfq-host-parallel-test PRIVATE /utf-8 /EHsc)
+    target_compile_options(mfq-cpu-topology-test PRIVATE /utf-8 /EHsc)
+    target_compile_options(mfq-cpu-expert-pool-test PRIVATE /utf-8 /EHsc)
+endif()
 mfq_add_core_test(mfq-packed-nint-cpu-test quant/packed_nint_cpu_test.cpp)
 target_link_libraries(mfq-packed-nint-cpu-test PRIVATE mfq-cpu-ops)
 mfq_add_core_test(mfq-nvq-group-cpu-test quant/nvq_group_cpu_test.cpp)
@@ -88,7 +107,8 @@ target_link_libraries(mfq-sampling-test PRIVATE mfq-engine)
 target_compile_features(mfq-sampling-test PRIVATE cxx_std_17)
 add_test(NAME mfq-sampling-test COMMAND mfq-sampling-test)
 add_executable(mfq-moe-cache-policy-test moe/moe_cache_policy_test.cpp)
-target_link_libraries(mfq-moe-cache-policy-test PRIVATE mfq-core)
+target_link_libraries(mfq-moe-cache-policy-test PRIVATE mfq-engine)
+target_include_directories(mfq-moe-cache-policy-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 target_compile_features(mfq-moe-cache-policy-test PRIVATE cxx_std_17)
 add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test host/tensor_parallel_test.cpp)
@@ -130,11 +150,12 @@ foreach(target IN ITEMS
         mfq-text-emitter-test mfq-sampling-test
         mfq-inference-test mfq-request-executor-test mfq-shared-execution-test
         mfq-mtp-policy-test mfq-speculative-sequence-test)
-    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
+    target_include_directories(${target} PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 endforeach()
 
 add_executable(mfq-moe-cache-profile-test moe/moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
+target_include_directories(mfq-moe-cache-profile-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
 target_compile_features(mfq-moe-cache-profile-test PRIVATE cxx_std_17)
 if(MSVC)
     target_compile_options(mfq-moe-cache-profile-test PRIVATE /utf-8 /EHsc)
@@ -145,7 +166,7 @@ if(TARGET mfq-paged-prefix-cache)
     add_executable(mfq-paged-prefix-cache-test
         engine/mfq_paged_prefix_cache_test.cpp
     )
-    target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
+    target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
         mfq-engine
         mfq-paged-prefix-cache

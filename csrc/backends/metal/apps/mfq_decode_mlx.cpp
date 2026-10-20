@@ -1,27 +1,28 @@
-#include "mfq_container.h"
-#include "mlx_deepseek_v4_causal_lm.h"
-#include "mlx_deepseek_v41_causal_lm.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_minicpmo45.h"
-#include "mlx_moe.h"
-#include "mlx_memory_residency.h"
-#include "mlx_resident_budget.h"
-#include "mlx_qwen4_causal_lm.h"
-#include "mlx_qwen35_causal_lm.h"
-#include "mlx_stream_sync.h"
-#include "mlx_tensor.h"
-#include "qwen35_model.h"
+#include "storage/mfq_container.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_causal_lm.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "models/minicpmo45/mlx_minicpmo45.h"
+#include "ops/mlx_moe.h"
+#include "runtime/mlx_memory_residency.h"
+#include "runtime/mlx_resident_budget.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
+#include "runtime/mlx_stream_sync.h"
+#include "runtime/mlx_tensor.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include "nlohmann/json.hpp"
 
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION
 #include "mfq_paged_prefix_cache.h"
 #include "transport.h"
-#include "mlx_paged_session_codec.h"
-#include "mlx_server_components.h"
-#include "mlx_engine.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_inference_warmup.h"
+#include "runtime/mlx_paged_session_codec.h"
+#include "runtime/mlx_server_components.h"
+#include "runtime/mlx_engine.h"
+#include "runtime/mlx_qwen4_batching.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "runtime/mlx_inference_warmup.h"
 #endif
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -105,6 +107,7 @@ struct Arguments {
     bool yarn_context_extension = false;
     int prefill_chunk_size = 2048;
     bool prefill_chunk_size_explicit = false;
+    int continuous_batching = 8;
     std::optional<double> expert_cache_gb;
     std::string model_name;
     std::string api_key;
@@ -129,7 +132,11 @@ Arguments parse_arguments(int argc, char** argv) {
             }
             return argv[index];
         };
-        if (value == "--model") {
+        if (value == "--continuous-batching") {
+            const auto parsed = std::stoll(require_value("--continuous-batching"));
+            if (parsed < 0 || parsed > 256) usage_error("--continuous-batching must be in [0, 256]");
+            result.continuous_batching = static_cast<int>(parsed);
+        } else if (value == "--model") {
             result.mfq = require_value("--model");
         } else if (value == "--tensor") {
             result.tensor = require_value("--tensor");
@@ -339,6 +346,7 @@ void print_help() {
         << "  --yarn-context-extension  permit Qwen YaRN context extension on load\n"
         << "  --prefill-chunk-size N maximum prompt chunk (portable default 2048;\n"
         << "                          capable runtimes may autotune when omitted)\n"
+        << "  --continuous-batching N Flash-Next ordinary decode concurrency (default 8; 0/1 serial)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
         << "                          MFQ default: full residency; HF default: auto\n"
         << "  --model-name NAME      API model name (default model path stem)\n"
@@ -364,10 +372,15 @@ std::size_t server_cache_limit_bytes() {
     // GiB of dead activation buffers and push a fully resident model into
     // compression or swap. Keep enough scratch for reuse while scaling the
     // allowance to the host instead of assuming a 128-GiB development Mac.
-    return std::clamp(
+    static const auto limit = std::clamp(
         physical_memory_bytes() / 16,
         kMinimumServerCacheLimitBytes,
         kMaximumServerCacheLimitBytes);
+    return limit;
+}
+
+std::size_t resident_allocator_reserve_bytes(std::size_t budget) {
+    return std::min(server_cache_limit_bytes(), budget / 20);
 }
 
 std::size_t automatic_runtime_memory_budget_bytes() {
@@ -1922,18 +1935,92 @@ public:
         int chunk_size, std::size_t cache_limit,
         mfq::metal::MlxEngineComponents components,
         mfq::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
-        std::vector<std::int64_t> prepare_prompt)
+        std::vector<std::int64_t> prepare_prompt, int batch_capacity)
         : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
           runtime_stream(stream), prefill_chunk_size(chunk_size),
           allocator_cache_limit(cache_limit), runtime_components(std::move(components)),
           preparation_sampling(prepare_sampling), preparation_routes(prepare_routes),
-          preparation_vocab(prepare_vocab), warmup_prompt(std::move(prepare_prompt)) {
+          preparation_vocab(prepare_vocab), warmup_prompt(std::move(prepare_prompt)),
+          configured_batch_capacity(batch_capacity) {
         capture_weight_residency();
         resident_budget = cache_bytes_from_environment("MFQ_SERVER_RESIDENT_BUDGET_BYTES", 0);
         if (resident_budget) enforce_memory_budget(0);
         warm_runtime();
+        configure_batching();
+    }
+
+    void configure_batching() {
+        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+            if (configured_batch_capacity > 1) {
+                mfq::metal::MlxQwen4BatchOperations::Hooks hooks;
+                hooks.block_size = session_cache->block_size_tokens();
+                hooks.restore = [this](auto& request) {
+                    request.prefix = session_cache->normalize_stable_prefix_tokens(std::min(
+                        request.cache_plan.stable_prefix_tokens, request.prompt.size()));
+                    if (!request.prefix || (request.cache_plan.session_id.empty() &&
+                        !session_cache->persistent_prefix_enabled())) {
+                        request.prefix = 0;
+                        return std::size_t{0};
+                    }
+                    return session_cache->restore_best(runtime_holder->value(), request.cache_plan.session_id,
+                        request.prompt, std::min(request.prefix, request.prompt.size() - 1), request.mtp);
+                };
+                hooks.store = [this](auto& request, auto state) {
+                    session_cache->store(request.cache_plan.session_id, std::move(state));
+                };
+                batching = std::make_unique<MetalBatch>(prefill_chunk_size, prefill_chunk_size,
+                    runtime_holder->value(), std::move(hooks));
+                batching_capacity = static_cast<std::size_t>(configured_batch_capacity);
+                batch_mtp_enabled = runtime_holder->value().supports_batch_mtp();
+            }
+        }
+    }
+
+    std::size_t request_capacity() const override { return batching_capacity; }
+    bool can_batch(const mfq::engine::EngineRequest& request) const override {
+        return batching && !request.input.media &&
+            !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
+    }
+    void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
+        if (!batching || batching->empty() || eligible.empty()) return;
+        std::lock_guard lock(*runtime_mutex);
+        mlx::core::set_default_device(mlx::core::Device::gpu);
+        mlx::core::set_default_stream(runtime_stream);
+        mfq::metal::MlxResidentBudgetScope budget_scope(
+            [this](std::size_t bytes) { enforce_memory_budget(bytes); },
+            [this](std::size_t bytes) { return optional_memory_fits(bytes); });
+        batching->step(eligible);
+    }
+    mfq::engine::Generation generate_batch(const mfq::engine::RequestId& id,
+        mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output) override {
+        if (!batching) throw std::logic_error("Metal batch executor is unavailable");
+        auto generation = batching->generate(id, input, output);
+        mfq::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
+            std::lock_guard lock(*runtime_mutex);
+            mlx::core::set_default_device(mlx::core::Device::gpu);
+            mlx::core::set_default_stream(runtime_stream);
+            mfq::metal::MlxResidentBudgetScope budget_scope(
+                [this](std::size_t bytes) { enforce_memory_budget(bytes); },
+                [this](std::size_t bytes) { return optional_memory_fits(bytes); });
+            generation = {};
+        }};
+        while (true) {
+            auto step = [&] {
+                std::lock_guard lock(*runtime_mutex);
+                mlx::core::set_default_device(mlx::core::Device::gpu);
+                mlx::core::set_default_stream(runtime_stream);
+                mfq::metal::MlxResidentBudgetScope budget_scope(
+                    [this](std::size_t bytes) { enforce_memory_budget(bytes); },
+                    [this](std::size_t bytes) { return optional_memory_fits(bytes); });
+                auto step = generation.next();
+                return step;
+            }();
+            if (!step) break;
+            co_yield std::move(step);
+        }
+        cleanup.finish();
     }
 
     void generate(mfq::engine::InferenceRequest& request,
@@ -2087,6 +2174,7 @@ public:
 
     std::int64_t reload(std::int64_t requested_context) override {
         std::lock_guard<std::mutex> lock(*runtime_mutex);
+        batching.reset();
         mlx::core::set_default_device(
             mlx::core::Device::gpu);
         mlx::core::set_default_stream(runtime_stream);
@@ -2128,6 +2216,7 @@ public:
             capture_weight_residency();
             *loaded_context = requested_context;
             warm_runtime();
+            configure_batching();
             const auto seconds =
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() -
@@ -2171,6 +2260,7 @@ public:
                 capture_weight_residency();
                 *loaded_context = previous_context;
                 warm_runtime();
+                configure_batching();
             } catch (const std::exception& restore_error) {
                 throw std::runtime_error(
                     "model reload failed: " + message +
@@ -2208,20 +2298,18 @@ public:
         }
         case Kind::memory_budget: {
             const auto previous = resident_budget.load();
+            const auto previous_weights = resident_weight_budget.load();
             const auto before = mlx::core::get_active_memory();
             resident_budget = command.bytes;
-            try { enforce_memory_budget(0); }
-            catch (...) { resident_budget = previous; throw; }
-            if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
-                auto& runtime = runtime_holder->value();
-                if (command.bytes && runtime.ssd_expert_payload_bytes()) {
-                    const auto available = runtime.reclaimable_expert_bytes();
-                    const auto used = resident_memory_used();
-                    const auto fixed = used > available ? used - available : 0;
-                    const auto reserve = std::min<std::size_t>(256 << 20, command.bytes / 20);
-                    runtime.set_expert_cache_limit(command.bytes > fixed + reserve ? command.bytes - fixed - reserve : 0);
-                }
+            if (command.weight_bytes) resident_weight_budget = *command.weight_bytes;
+            try {
+                if (resident_weight_budget && resident_weight_budget < resident_dense_weight_baseline)
+                    throw mfq::metal::MlxResidentBudgetExceeded("weight budget is smaller than non-offloadable weights");
+                enforce_memory_budget(0); apply_expert_budget();
             }
+            catch (...) { resident_budget = previous; resident_weight_budget = previous_weights; throw; }
+            if (batching && (resident_budget.load() != previous || resident_weight_budget.load() != previous_weights))
+                batching->invalidate_runtime_policy();
             const auto after = mlx::core::get_active_memory();
             return {before > after ? before - after : 0, {}};
         }
@@ -2315,21 +2403,73 @@ public:
     }
 
 private:
+    void apply_expert_budget() {
+        const auto weights = resident_weight_budget.load();
+        if (weights && weights < resident_dense_weight_baseline)
+            throw mfq::metal::MlxResidentBudgetExceeded("weight budget is smaller than non-offloadable weights");
+        if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
+            auto& runtime = runtime_holder->value();
+            auto room = weights ? weights - resident_dense_weight_baseline : std::numeric_limits<std::size_t>::max();
+            const auto total = resident_budget.load();
+            if (total) {
+                const auto available = runtime.reclaimable_expert_bytes();
+                const auto used = resident_memory_used();
+                const auto cached = mlx::core::get_cache_memory();
+                const auto other = used > available ? used - available : 0;
+                const auto fixed = other - std::min(other, cached);
+                const auto reserve = std::max(resident_allocator_reserve_bytes(total), cached);
+                room = std::min(room, total > fixed + reserve ? total - fixed - reserve : 0);
+            }
+            if (room == std::numeric_limits<std::size_t>::max())
+                room = runtime.ssd_expert_payload_bytes() ? runtime.ssd_expert_payload_bytes() : runtime.resident_full_expert_bytes();
+            if (room != std::numeric_limits<std::size_t>::max()) {
+                mfq::metal::drain_metal_work(runtime_stream);
+                const auto active = mlx::core::get_active_memory();
+                const auto full = runtime.resident_full_expert_bytes();
+                runtime.set_expert_cache_limit(room);
+                if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
+                resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
+                if (mlx::core::get_active_memory() < active || runtime.resident_full_expert_bytes() != full) {
+                    mlx::core::clear_cache();
+                    release_host_allocator_cache();
+                }
+            }
+        }
+    }
     bool optional_memory_fits(std::size_t allocation) const {
         const auto budget = resident_budget.load();
         if (!budget || !runtime_holder->has_value()) return true;
         const auto used = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
-        const auto reserve = std::min<std::size_t>(std::size_t{256} << 20, budget / 20);
-        return used <= budget && reserve <= budget - used && allocation <= budget - used - reserve;
+        const auto reserve = resident_allocator_reserve_bytes(budget);
+        const auto cached = mlx::core::get_cache_memory();
+        const auto headroom = reserve > cached ? reserve - cached : 0;
+        return used <= budget && headroom <= budget - used && allocation <= budget - used - headroom;
     }
     void enforce_memory_budget(std::size_t allocation) {
         const auto budget = resident_budget.load();
+        const auto reserve = resident_allocator_reserve_bytes(budget);
+        struct RestoreAllocatorCache {
+            std::size_t& current;
+            std::size_t previous;
+            std::size_t target;
+            int exceptions = std::uncaught_exceptions();
+            ~RestoreAllocatorCache() {
+                const auto limit = std::uncaught_exceptions() > exceptions ? previous : target;
+                if (current == limit) return;
+                mlx::core::set_cache_limit(limit);
+                current = limit;
+            }
+        } restore_cache{allocator_cache_limit, allocator_cache_limit,
+            budget ? std::min(server_cache_limit_bytes(), reserve) : server_cache_limit_bytes()};
         if (!budget || !runtime_holder->has_value()) return;
-        auto used = [&] { return resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes(); };
-        const auto reserve = std::min<std::size_t>(std::size_t{256} << 20, budget / 20);
+        auto used = [&] {
+            const auto actual = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+            const auto cached = mlx::core::get_cache_memory();
+            return actual + (reserve > cached ? reserve - cached : 0);
+        };
         if (allocation > budget || reserve > budget - allocation)
-            throw std::runtime_error("resident memory budget cannot accommodate this allocation");
-        const auto target = budget - allocation - reserve;
+            throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
+        const auto target = budget - allocation;
         if (used() <= target) return;
         mfq::metal::drain_metal_work(runtime_stream);
         mlx::core::set_cache_limit(0);
@@ -2344,16 +2484,23 @@ private:
         if (used() <= target) return;
         if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
             auto& runtime = runtime_holder->value();
-            const auto available = runtime.reclaimable_expert_bytes();
-            const auto excess = used() - target;
-            runtime.set_expert_cache_limit(available > excess ? available - excess : 0);
-            weight_residency.reset();
-            resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
-            mlx::core::clear_cache();
-            release_host_allocator_cache();
+            for (auto observed = used(); observed > target; observed = used()) {
+                const auto available = runtime.reclaimable_expert_bytes();
+                if (!available) break;
+                const auto excess = observed - target;
+                const auto full = runtime.resident_full_expert_bytes();
+                mfq::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
+                if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
+                resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
+                mlx::core::clear_cache();
+                release_host_allocator_cache();
+                if (runtime.reclaimable_expert_bytes() >= available) break;
+            }
         }
-        if (used() > target) throw std::runtime_error(
-            "resident memory budget exhausted by non-offloadable weights, live KV or execution buffers");
+        if (used() > target) throw mfq::metal::MlxResidentBudgetExceeded(
+            "resident memory budget exhausted by non-offloadable weights, live KV or execution buffers"
+            "; used_bytes=" + std::to_string(used()) + "; target_bytes=" + std::to_string(target) +
+            "; allocation_bytes=" + std::to_string(allocation) + "; budget_bytes=" + std::to_string(budget));
     }
     std::size_t resident_memory_used() const {
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
@@ -2387,6 +2534,7 @@ private:
         }
         std::cerr << "Metal weight residency: bytes="
                   << (weight_residency ? weight_residency->bytes() : 0) << std::endl;
+        if (resident_weight_budget) apply_expert_budget();
         self_test_metal();
     }
 
@@ -2401,6 +2549,12 @@ private:
         }
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+            {"mfe_packed_copy_count", static_cast<double>(mfq::metal::MlxMfeWeight::packed_copy_count())},
+            {"ssd_expert_indirect_dispatch_count", static_cast<double>(mfq::metal::MlxMfeWeight::indirect_dispatch_count())},
+            {"mfe_uncached_packed_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::uncached_packed_bytes())},
+            {"ssd_expert_pinned_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::pinned_packed_bytes())},
+            {"ssd_expert_pin_failures", static_cast<double>(mfq::metal::MlxMfeWeight::packed_pin_failures())},
+            {"ssd_expert_pooled_staging_count", static_cast<double>(mfq::metal::MlxMfeWeight::pooled_staging_count())},
             {"qsa_kv_offload_supported", qsa_offload_supported},
             {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
@@ -2410,6 +2564,10 @@ private:
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
             {"resident_memory_budget_bytes", static_cast<double>(resident_budget.load())},
+            {"resident_weight_budget_bytes", static_cast<double>(resident_weight_budget.load())},
+            {"resident_weight_dynamic_budget", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
+                std::is_same_v<Runtime, mfq::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
             {"resident_memory_dynamic_budget", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
@@ -2424,6 +2582,11 @@ private:
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
         if (lock.owns_lock() && runtime_holder->has_value()) {
+            if (batching) {
+                auto batch_metrics = batching->metrics();
+                metrics.insert(metrics.end(), batch_metrics.begin(), batch_metrics.end());
+                metrics.emplace_back("continuous_batching_capacity", static_cast<double>(batching_capacity));
+            }
             metrics.emplace_back("resident_memory_used_bytes", static_cast<double>(resident_memory_used()));
             if constexpr (requires(Runtime& value) { value.mtp_session_metrics(); }) {
                 const auto adapters = runtime_holder->value().mtp_session_metrics();
@@ -2435,7 +2598,9 @@ private:
             if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
                 metrics.emplace_back("kv_cache_bytes", static_cast<double>(runtime_holder->value().kv_cache_bytes()));
             else metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
-            metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
+            if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
+                metrics.emplace_back("kv_cache_contexts", static_cast<double>(runtime_holder->value().kv_cache_contexts()));
+            else metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
             {
                 std::optional<mfq::metal::QsaKvStoreStats> offload;
                 if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
@@ -2565,6 +2730,12 @@ private:
                     metrics.emplace_back(
                         "ssd_expert_bytes_read",
                         static_cast<double>(stats->bytes_read));
+                    metrics.emplace_back("ssd_expert_read_calls", static_cast<double>(stats->read_calls));
+                    metrics.emplace_back("ssd_expert_prepare_seconds", stats->prepare_seconds);
+                    metrics.emplace_back("ssd_expert_view_seconds", stats->view_seconds);
+                    metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
+                    metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);
+                    metrics.emplace_back("ssd_expert_device_route_misses", stats->device_route_misses);
                     metrics.emplace_back(
                         "ssd_expert_resident_bytes",
                         static_cast<double>(stats->resident_bytes));
@@ -2707,8 +2878,14 @@ private:
     std::size_t resident_weight_baseline = 0;
     std::size_t resident_dense_weight_baseline = 0;
     std::atomic<std::size_t> resident_budget{0};
+    std::atomic<std::size_t> resident_weight_budget{0};
     mfq::metal::MlxEngineComponents runtime_components;
     std::unique_ptr<mfq::metal::MlxWeightResidency> weight_residency;
+    using MetalBatch = mfq::engine::ContinuousBatch<mfq::metal::MlxQwen4BatchOperations>;
+    int configured_batch_capacity;
+    std::size_t batching_capacity = 1;
+    bool batch_mtp_enabled = false;
+    std::unique_ptr<MetalBatch> batching;
 };
 
 template <typename Runtime, typename Loader>
@@ -2846,6 +3023,7 @@ int run_loaded_runtime(
     mfq::engine::EngineInfo info;
     info.max_context = transport_config.max_context;
     info.vocab_size = static_cast<std::int32_t>(vocabulary_size);
+    info.stop_token_ids = mfq::engine::model_stop_token_ids(model_config, info.vocab_size);
     info.model_type = transport_config.model_type;
     info.capabilities = *transport_config.model_capabilities;
     info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
@@ -2873,7 +3051,8 @@ int run_loaded_runtime(
         allocator_cache_limit, std::move(runtime_components), preparation_sampling,
         preparation_routes, static_cast<int>(vocabulary_size),
         text->tokenizer().tokenize("Explain how computers use memory to run language models. "
-            "Describe the roles of model weights, attention, and cached context in clear terms.", false));
+            "Describe the roles of model weights, attention, and cached context in clear terms.", false),
+        arguments.continuous_batching);
     auto inference_engine = std::make_unique<mfq::metal::MlxEngine>(
         std::move(engine_model), std::move(text), std::move(info));
     auto transport = arguments.stdio

@@ -6,6 +6,8 @@ it.each([
   ['qwen4_exp_text', 'qwen'], ['Qwen3NextForCausalLM', 'qwen'], ['qwen3_vl', 'qwen'],
   ['deepseek_v4', 'deepseek'], ['DeepseekV3ForCausalLM', 'deepseek'],
   ['glm5_next', 'zai'], ['ChatGLMForConditionalGeneration', 'zai'],
+  ['minicpmo', 'minicpm'], ['minicpmo_tts', 'minicpm'], ['MiniCPMO', 'minicpm'], ['MiniCPMVForCausalLM', 'minicpm'],
+  ['gemma4', 'gemma'], ['gemma4_text', 'gemma'], ['Gemma4ForConditionalGeneration', 'gemma'],
 ])('uses architecture %s even for a renamed checkpoint', (architecture, vendor) => {
   expect(modelVendor('renamed-checkpoint', architecture)).toBe(vendor);
 });
@@ -13,6 +15,8 @@ it.each([
 it.each([
   ['Tylogi/Qwen3.8-Flash-Next-S4-L', 'qwen'], ['Qwen', 'qwen'],
   ['community/DeepSeek-V4.1-MFQ', 'deepseek'], ['GLM-5.3', 'zai'], ['ChatGLM3-6B', 'zai'],
+  ['openbmb/MiniCPM-o-4_5', 'minicpm'], ['MiniCPMO-4.5-MFQ', 'minicpm'], ['MiniCPM-V-4.6', 'minicpm'],
+  ['MiniCPM4.1-8B', 'minicpm'], ['google/gemma-4-26b-a4b-it', 'gemma'], ['Gemma4-31B-MFQ', 'gemma'],
 ])('uses the model basename when architecture is absent: %s', (name, vendor) => {
   expect(modelVendor(name)).toBe(vendor);
 });
@@ -20,14 +24,16 @@ it.each([
 it('prefers declared architecture to model name and does not label unsupported architectures', () => {
   expect(modelVendor('DeepSeek-R1-Distill-Qwen-32B', ['Qwen2ForCausalLM'])).toBe('qwen');
   expect(modelVendor('DeepSeek-R1-Distill-Llama-70B', 'LlamaForCausalLM')).toBeNull();
-  expect(modelVendor('Qwen-custom', 'minicpm')).toBeNull();
+  expect(modelVendor('Qwen-custom', 'minicpm')).toBe('minicpm');
   expect(modelVendor('Qwen/unknown-model')).toBeNull();
   expect(modelVendor('Qwenish-model')).toBeNull();
-  expect(modelVendor('MiniCPM-o-4_5')).toBeNull();
+  expect(modelVendor('MiniCPMish-model')).toBeNull();
+  expect(modelVendor('Gemmastic-model')).toBeNull();
+  expect(modelVendor('MiniCPM-o-4_5', 'LlamaForCausalLM')).toBeNull();
   expect(modelVendor('GLM-5.3', ['', 'GlmMoeForCausalLM'])).toBe('zai');
 });
 
-it.each([['qwen3', 'Qwen'], ['deepseek4', 'DeepSeek'], ['glm5', 'Z.ai']])('renders %s as an unfilled borderless vector', (architecture, name) => {
+it.each([['qwen3', 'Qwen'], ['deepseek4', 'DeepSeek'], ['glm5', 'Z.ai'], ['minicpmo', 'MiniCPM'], ['gemma4', 'Gemma']])('renders %s as an unfilled borderless vector', (architecture, name) => {
   render(<ModelVendorMark architecture={architecture} />);
   const mark = screen.getByRole('img', { name });
   expect(mark).toHaveAttribute('fill', 'none');
@@ -46,4 +52,6 @@ it('uses the model basename when discovered architecture is unknown', () => {
   expect(modelVendor('Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ', 'unknown')).toBe('qwen');
   expect(modelVendor('DeepSeek-V4-MFQ', [' Unknown '])).toBe('deepseek');
   expect(modelVendor('Qwen-custom', ['unknown', 'LlamaForCausalLM'])).toBeNull();
+  expect(modelVendor('openbmb/MiniCPM-o-4_5', 'unknown')).toBe('minicpm');
+  expect(modelVendor('google/gemma-4-31b-it', [' Unknown '])).toBe('gemma');
 });

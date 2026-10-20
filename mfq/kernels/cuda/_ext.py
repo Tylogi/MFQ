@@ -24,6 +24,11 @@ _GGML_ROOT = Path(_REPOSITORY_ROOT) / "csrc" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
 _GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")
+# This is the closure of the functions bound by mfq_cuda.cpp, plus providers
+# called from those units.  It is deliberately not the native runtime's full
+# MFQ_CUDA_KERNEL_SOURCES list: attention_mma.cu requires ggml CUDA objects,
+# and gdn_decode_window.cu is a native-runtime-only decode path.  In contrast,
+# nvq_matmul.cu calls the provider in nvq_routed_reuse.cu, so both belong here.
 _SOURCES = [
     os.path.join(_KERNEL_DIR, "norm.cu"),
     os.path.join(_KERNEL_DIR, "acc.cu"),
@@ -32,24 +37,36 @@ _SOURCES = [
     os.path.join(_KERNEL_DIR, "attention", "gated_delta_net.cu"),
     os.path.join(_KERNEL_DIR, "attention", "ssm_conv.cu"),
     os.path.join(_KERNEL_DIR, "cache", "kv_cache.cu"),
+    os.path.join(_BACKEND_DIR, "ops", "kv_cache.cpp"),
     os.path.join(_KERNEL_DIR, "activation.cu"),
+    os.path.join(_BACKEND_DIR, "ops", "activation.cpp"),
     os.path.join(_KERNEL_DIR, "embedding.cu"),
+    os.path.join(_BACKEND_DIR, "ops", "embedding.cpp"),
     os.path.join(_KERNEL_DIR, "attention", "selected_attention.cu"),
     os.path.join(_KERNEL_DIR, "qwen4_exp.cu"),
     os.path.join(_KERNEL_DIR, "glm5_next.cu"),
     os.path.join(_KERNEL_DIR, "sampling.cu"),
     os.path.join(_KERNEL_DIR, "moe", "routing.cu"),
     os.path.join(_KERNEL_DIR, "quant", "mx_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "mx_matmul_backward.cu"),
     os.path.join(_KERNEL_DIR, "quant", "fp8_sq.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "fp8_sq_backward.cu"),
     os.path.join(_KERNEL_DIR, "quant", "mxfp4_sq.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "mxfp4_sq_backward.cu"),
     os.path.join(_KERNEL_DIR, "quant", "nint_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "nint_matmul_backward.cu"),
     os.path.join(_KERNEL_DIR, "quant", "nepq.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "nepq_backward.cu"),
     os.path.join(_KERNEL_DIR, "quant", "nepq_residual.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "nepq_residual_backward.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "matmul.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "moe.cu"),
+    os.path.join(_KERNEL_DIR, "nvq", "dequant.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "backward.cu"),
     os.path.join(_KERNEL_DIR, "nvq", "routed_reuse.cu"),
     os.path.join(_BACKEND_DIR, "native", "env.cpp"),
+    os.path.join(_KERNEL_DIR, "quant", "nint_short_decode.cu"),
+    os.path.join(_KERNEL_DIR, "quant", "nint_q8_decode.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None
@@ -88,10 +105,16 @@ def _ensure_msvc() -> None:
 
 
 def ext():
-    """Trigger the (first) build and return the cached extension module."""
-
     global _module
     if _module is None:
+        import torch
+
+        if torch.version.hip:
+            # AMD ROCm host: build the hipify-translated kernels instead.
+            from mfq.kernels.hip._ext import ext as _hip_ext
+
+            _module = _hip_ext()
+            return _module
         _ensure_msvc()
         import torch  # noqa: F401  ensure torch imported (cpp_extension depends on it)
         from torch.utils.cpp_extension import load
@@ -108,9 +131,10 @@ def ext():
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,
             ],
-            # Shared native tensor views require C++20 (span and comparisons).
-            extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
+            # CUDA 13 CCCL headers reject MSVC's traditional preprocessor.
+            extra_cflags=["/std:c++20", "/Zc:preprocessor"] if os.name == "nt" else ["-std=c++20"],
             extra_cuda_cflags=[
+                *(["-Xcompiler=/Zc:preprocessor"] if os.name == "nt" else []),
                 "-O3",
                 "--use_fast_math",
                 "--extended-lambda",

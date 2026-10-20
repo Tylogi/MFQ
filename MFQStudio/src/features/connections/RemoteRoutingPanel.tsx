@@ -24,7 +24,7 @@ export function RemoteRoutingPanel() {
       })
       .catch((cause) => {
         if (!disposed) {
-          toast.error(errorMessage(cause));
+          toast.error(errorMessage(cause, tr));
         }
       });
     return () => {
@@ -43,7 +43,7 @@ export function RemoteRoutingPanel() {
       if (!current()) return;
       setNodes(nextNodes);
     } catch (cause) {
-      if (current()) toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause, tr));
     } finally {
       if (current()) setBusy(false);
     }

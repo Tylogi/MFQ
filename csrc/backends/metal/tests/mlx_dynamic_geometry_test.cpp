@@ -1,10 +1,10 @@
-#include "mlx_deepseek_v4_hc.h"
-#include "mlx_deepseek_v41_mhc.h"
-#include "mlx_dsa.h"
-#include "mlx_mx.h"
-#include "mlx_nint8_zero.h"
-#include "mlx_sampling.h"
-#include "mlx_sparse_attention.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_hc.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_mhc.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_mx.h"
+#include "ops/mlx_nint8_zero.h"
+#include "runtime/mlx_sampling.h"
+#include "ops/mlx_sparse_attention.h"
 
 #include <cmath>
 #include <cstdint>

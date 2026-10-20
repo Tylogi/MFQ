@@ -1,10 +1,10 @@
 #pragma once
 
-#include "mlx_deepseek_v4_causal_lm.h"
-#include "mlx_deepseek_v41_causal_lm.h"
-#include "mlx_minicpmo45.h"
-#include "mlx_qwen4_causal_lm.h"
-#include "mlx_qwen35_causal_lm.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_causal_lm.h"
+#include "models/minicpmo45/mlx_minicpmo45.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
 
 #include "mfq_model_graph.h"
 #include "mfq/runtime.h"

@@ -1,6 +1,6 @@
 /** 封装 media 领域资源请求，不保存组件状态。 */
 import type { MediaResource, DocumentResource } from '../types';
-import { request, apiUrl, errorFromResponse, authorizedHeaders, getApiToken } from '../client';
+import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const mediaApi = {
   /** 计算文件摘要并上传原始媒体，返回可用于消息的媒体引用。 */
@@ -11,11 +11,10 @@ export const mediaApi = {
     ).join('');
     const response = await fetch(apiUrl('/api/v1/media'), {
       method: 'POST',
-      headers: {
+      headers: authorizedHeaders({
         'Content-Type': mimeType || file.type || 'application/octet-stream',
         'X-Content-SHA256': sha256,
-        ...(getApiToken() ? { Authorization: `Bearer ${getApiToken()}` } : {}),
-      },
+      }),
       body: file,
     });
     if (!response.ok) throw await errorFromResponse(response);

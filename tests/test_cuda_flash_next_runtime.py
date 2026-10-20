@@ -269,16 +269,198 @@ def glm_model_fixture(attention_types, sparse_ffn):
     return outer,w
 
 
+class GlmV1SReferenceWeights(dict):
+    """Decoded V1-S weights plus the execution formats that produced them."""
+
+    def __init__(self):
+        super().__init__()
+        self.nint_specs = {}
+        self.mfe_specs = {}
+
+
+def _fp16(value):
+    return np.asarray(value, dtype=np.float16)
+
+
+def _nint_activation_codes(value, groupsize):
+    """Mirror CUDA's FP16, groupwise INT8 activation quantizer."""
+
+    value = _fp16(value).astype(np.float32)
+    rows, width = value.shape
+    groups = (width + groupsize - 1) // groupsize
+    padded = np.pad(value, ((0, 0), (0, groups * groupsize - width)))
+    grouped = padded.reshape(rows, groups, groupsize)
+    scale = np.max(np.abs(grouped), axis=-1) / np.float32(127.0)
+    scale = np.where(scale > 0, scale, np.float32(1.0)).astype(np.float32)
+    rounded = np.where(
+        grouped >= 0,
+        np.floor(grouped / scale[..., None] + np.float32(0.5)),
+        np.ceil(grouped / scale[..., None] - np.float32(0.5)),
+    )
+    return np.clip(rounded, -127, 127).astype(np.int8), scale
+
+
+def glm_v1s_nint_linear_reference(value, weight, spec):
+    """Reference the CUDA NINT linear path selected by this tiny fixture."""
+
+    value = np.asarray(value)
+    shape, width = value.shape[:-1], value.shape[-1]
+    source = value.reshape(-1, width)
+    matrix = np.asarray(weight, dtype=np.float32).reshape(weight.shape[0], -1)
+    assert matrix.shape[1] == width
+    # NINT uses a decoded F16 GEMM for larger prefill matrices. The fixture's
+    # ordinary projections are decode-sized, but retaining this branch keeps
+    # the oracle faithful when its batch shape changes.
+    if source.shape[0] > 8:
+        output = _fp16(source).astype(np.float32) @ _fp16(matrix).astype(np.float32).T
+        return _fp16(output).reshape(*shape, matrix.shape[0])
+    codes, scale = _nint_activation_codes(source, spec.groupsize)
+    groups = codes.shape[1]
+    padded = np.pad(matrix, ((0, 0), (0, groups * spec.groupsize - width)))
+    packed = padded.reshape(matrix.shape[0], groups, spec.groupsize)
+    output = np.zeros((source.shape[0], matrix.shape[0]), np.float32)
+    for group in range(groups):
+        output += (codes[:, group].astype(np.float32) @ packed[:, group].T) * scale[:, group, None]
+    return _fp16(output).reshape(*shape, matrix.shape[0])
+
+
+def glm_logits_reference(hidden, weights):
+    """Run the model output head through its stored execution format."""
+
+    name = "model.output.weight"
+    spec = getattr(weights, "nint_specs", {}).get(name)
+    if spec is not None:
+        return glm_v1s_nint_linear_reference(hidden, weights[name], spec)
+    return hidden @ weights[name].T
+
+
+def glm_v1s_mfe_reference(value, weight, ids, spec):
+    """Reference an NINT MFE routed projection, including input quantization."""
+
+    value = _fp16(value)
+    ids = np.asarray(ids, dtype=np.intp)
+    if value.ndim == 2:
+        value = np.broadcast_to(value[:, None], (*value.shape[:-1], ids.shape[1], value.shape[-1]))
+    tokens, routes, width = value.shape
+    assert ids.shape == (tokens, routes)
+    # MFE switches to its tiled prefill kernel only when it has a compact
+    # route map and a sufficiently populated expert.  That kernel decodes the
+    # packed weights to FP16 and uses FP16 tensor-core operands (with FP32
+    # accumulation); it deliberately does not reuse the small-M INT8
+    # activation quantizer below.  Head-wise MLA has 14 rows in this fixture,
+    # so this branch is observable even though the model batch is one.
+    pairs = tokens * routes
+    rows_per_expert = max(1, (pairs + weight.shape[0] - 1) // weight.shape[0])
+    tiled_prefill = tokens > 8 and rows_per_expert >= 4
+    selected = np.asarray(weight, dtype=np.float32)[ids]
+    if tiled_prefill:
+        return _fp16(np.einsum(
+            "tri,troi->tro",
+            value.astype(np.float32),
+            _fp16(selected).astype(np.float32),
+            optimize=True,
+        ))
+    codes, scale = _nint_activation_codes(value.reshape(-1, width), spec.groupsize)
+    groups = codes.shape[1]
+    codes = codes.reshape(tokens, routes, groups, spec.groupsize)
+    scale = scale.reshape(tokens, routes, groups)
+    padded = np.pad(selected, ((0, 0), (0, 0), (0, 0), (0, groups * spec.groupsize - width)))
+    packed = padded.reshape(tokens, routes, selected.shape[2], groups, spec.groupsize)
+    output = np.zeros((tokens, routes, selected.shape[2]), np.float32)
+    for group in range(groups):
+        output += np.einsum(
+            "trg,trog->tro", codes[:, :, group].astype(np.float32), packed[:, :, :, group], optimize=True
+        ) * scale[:, :, group, None]
+    return _fp16(output)
+
+
+def glm_v1s_storage(weights):
+    """Pack GLM text weights using the storage families present in V1-S."""
+    from mfq.formats.mfe import MfePool, MfeTensor
+    from mfq.formats.nint import NintSpec
+    from mfq.quantize.nint_quant import dequantize, quantize
+
+    nint_suffixes = (
+        ".attention.indexer.key.weight", ".attention.indexer.query.weight",
+        ".attention.indexer.pool.gate", ".attention.key_value_a.weight",
+        ".attention.output.weight", ".attention.query_a.weight",
+        ".attention.query_b.weight", ".linear_attention.beta.weight",
+        ".linear_attention.forget_a.weight", ".linear_attention.forget_b.weight",
+        ".linear_attention.gate_a.weight", ".linear_attention.gate_b.weight",
+        ".linear_attention.key.weight", ".linear_attention.output.weight",
+        ".linear_attention.query.weight", ".linear_attention.value.weight",
+        ".mlp.down.weight", ".mlp.gate.weight", ".mlp.up.weight",
+        ".mlp.shared_expert.down.weight", ".mlp.shared_expert.gate.weight",
+        ".mlp.shared_expert.up.weight", ".mhc.pre.function",
+        "model.token_embedding.weight", "model.output.weight",
+        "predictor.fusion.weight",
+    )
+
+    def pack_mfe(name, value):
+        experts, output, width = value.shape
+        packed = quantize(value.reshape(experts * output, width), NintSpec(4, 8, 6))
+        stored = MfeTensor(value.shape, (MfePool(np.arange(experts, dtype=np.int32), packed),))
+        effective = dequantize(packed).reshape(value.shape)
+        return stored, effective
+
+    stored, effective = {}, GlmV1SReferenceWeights()
+    for name, value in weights.items():
+        if name.endswith(".experts.gate_up.weight"):
+            base = name.removesuffix("gate_up.weight")
+            gate, up = np.split(value, 2, axis=1)
+            stored[base + "gate.weight"], gate_effective = pack_mfe(base + "gate.weight", gate)
+            stored[base + "up.weight"], up_effective = pack_mfe(base + "up.weight", up)
+            effective[name] = np.concatenate((gate_effective, up_effective), axis=1)
+            effective.mfe_specs[name] = NintSpec(4, 8, 6)
+        elif ".experts." in name or ".attention.latent." in name:
+            stored[name], effective[name] = pack_mfe(name, value)
+            effective.mfe_specs[name] = NintSpec(4, 8, 6)
+        elif name.endswith(nint_suffixes):
+            packed = quantize(np.ascontiguousarray(value).reshape(value.shape[0], -1), NintSpec(8, 8, 6))
+            stored[name] = packed
+            effective[name] = dequantize(packed).reshape(value.shape)
+            effective.nint_specs[name] = packed.spec
+        else:
+            stored[name] = value
+            effective[name] = value
+    return stored, effective
+
+
 def glm_model_reference(config,w,mtp=None,return_hidden=False):
     c=config["text_config"]
+    nint_specs=getattr(w,"nint_specs",{})
+    mfe_specs=getattr(w,"mfe_specs",{})
     def sm(x,axis=-1):
         e=np.exp(x-np.max(x,axis=axis,keepdims=True));return e/e.sum(axis=axis,keepdims=True)
     def norm(x,weight):
         f=x.astype(np.float32)
         return (f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+c["rms_norm_eps"])*weight).astype(x.dtype)
     def lin(x,p):
-        weight=w[p+".weight"]
+        name=p+".weight";weight=w[name]
+        if name in nint_specs:
+            return glm_v1s_nint_linear_reference(x,weight,nint_specs[name])
         return x.astype(weight.dtype)@weight.T
+    def lookup(name,ids):
+        value=w[name][ids]
+        return _fp16(value) if name in nint_specs else value
+    def swiglu(g,u):
+        g=np.minimum(g,c["swiglu_limit"]);u=np.clip(u,-c["swiglu_limit"],c["swiglu_limit"])
+        if g.dtype==np.float16 and u.dtype==np.float16:
+            activated=_fp16(g.astype(np.float32)*_fp16(sigmoid(g.astype(np.float32))).astype(np.float32))
+            return _fp16(activated.astype(np.float32)*u.astype(np.float32))
+        return g*sigmoid(g)*u
+    def routed(x,p,ids):
+        name=p+".weight";weight=w[name]
+        if name in mfe_specs:
+            return glm_v1s_mfe_reference(x,weight,ids,mfe_specs[name])
+        source=x[:,None] if x.ndim==2 else x
+        return np.einsum("troi,tri->tro",weight[ids],source.astype(np.float32))
+    def headwise(x,p):
+        b,t,heads,width=x.shape;name=p+".weight";weight=w[name]
+        if name in mfe_specs:
+            ids=(np.arange(b*t*heads,dtype=np.int32)%heads).reshape(-1,1)
+            return glm_v1s_mfe_reference(x.reshape(-1,width),weight,ids,mfe_specs[name]).reshape(b,t,heads,-1)
+        return np.einsum("bthi,hoi->btho",x,weight)
     def hc_pre(x,p):
         f=x.astype(np.float32).reshape(*x.shape[:2],-1)
         f=f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+c["rms_norm_eps"])
@@ -294,9 +476,7 @@ def glm_model_reference(config,w,mtp=None,return_hidden=False):
     def hc_post(branch,x,post,mix):
         return post.astype(x.dtype)[...,None]*branch[...,None,:]+np.swapaxes(mix,-1,-2)@x
     def dense(x,p):
-        g=np.minimum(lin(x,p+".gate"),c["swiglu_limit"])
-        u=np.clip(lin(x,p+".up"),-c["swiglu_limit"],c["swiglu_limit"])
-        return lin(g*sigmoid(g)*u,p+".down")
+        return lin(swiglu(lin(x,p+".gate"),lin(x,p+".up")),p+".down")
     def ffn(x,p,kind):
         if kind=="dense":return dense(x,p)
         source=x.reshape(-1,c["hidden_size"]).astype(np.float16)
@@ -304,22 +484,50 @@ def glm_model_reference(config,w,mtp=None,return_hidden=False):
         ids=np.argsort(-(scores+w[p+".router.bias"]),axis=-1)[:,:c["num_experts_per_tok"]]
         weight=np.take_along_axis(scores,ids,axis=-1)
         weight=weight/np.maximum(weight.sum(axis=-1,keepdims=True),1e-20)*c["routed_scaling_factor"]
-        gu=np.einsum("troi,ti->tro",w[p+".experts.gate_up.weight"][ids],source.astype(np.float32))
-        g,u=np.split(gu,2,axis=-1);g=np.minimum(g,c["swiglu_limit"]);u=np.clip(u,-c["swiglu_limit"],c["swiglu_limit"])
-        pairs=np.einsum("troi,tri->tro",w[p+".experts.down.weight"][ids],g*sigmoid(g)*u)
-        return ((pairs*weight[...,None]).sum(axis=1)+dense(source,p+".shared_expert")).reshape(x.shape)
+        gu=routed(source,p+".experts.gate_up",ids)
+        g,u=np.split(gu,2,axis=-1)
+        pairs=routed(swiglu(g,u),p+".experts.down",ids)
+        routed_output=(pairs.astype(np.float32)*weight[...,None]).sum(axis=1)
+        if pairs.dtype==np.float16:routed_output=_fp16(routed_output)
+        return (routed_output+dense(source,p+".shared_expert")).reshape(x.shape)
     def kda(x,p):
-        inputs=[x]+[w[p+f".{n}.weight"] for n in ("query","key","value","beta","gate_a","gate_b","output")]
-        inputs += [np.concatenate([w[p+f".{n}_conv.weight"] for n in ("query","key","value")],axis=0),
-                   w[p+".forget_a.weight"],w[p+".forget_b.weight"],w[p+".dt_bias"],w[p+".a"],w[p+".output_norm.weight"]]
         a=c["linear_attn_config"]
-        return kda_reference(inputs,a["num_heads"],a["head_dim"],a["short_conv_kernel_size"])[0]
+        if not nint_specs:
+            inputs=[x]+[w[p+f".{n}.weight"] for n in ("query","key","value","beta","gate_a","gate_b","output")]
+            inputs += [np.concatenate([w[p+f".{n}_conv.weight"] for n in ("query","key","value")],axis=0),
+                       w[p+".forget_a.weight"],w[p+".forget_b.weight"],w[p+".dt_bias"],w[p+".a"],w[p+".output_norm.weight"]]
+            return kda_reference(inputs,a["num_heads"],a["head_dim"],a["short_conv_kernel_size"])[0]
+        b,t,_=x.shape;heads=a["num_heads"];width=a["head_dim"];kernel=a["short_conv_kernel_size"]
+        qkv=np.concatenate([lin(x,p+f".{name}") for name in ("query","key","value")],axis=-1).astype(np.float32)
+        joined=np.concatenate((np.zeros((b,kernel-1,heads*width*3),np.float32),qkv),axis=1)
+        convolved=np.zeros(qkv.shape,np.float32)
+        conv=np.concatenate([w[p+f".{name}_conv.weight"] for name in ("query","key","value")],axis=0)
+        for tap in range(kernel):convolved+=joined[:,tap:tap+t]*conv[:,0,tap]
+        convolved*=sigmoid(convolved)
+        q,k,v=[value.reshape(b,t,heads,width).transpose(0,2,1,3) for value in np.split(convolved,3,axis=-1)]
+        q=q/np.maximum(np.sqrt(np.sum(q*q,axis=-1,keepdims=True)),1e-6)
+        k=k/np.maximum(np.sqrt(np.sum(k*k,axis=-1,keepdims=True)),1e-6)
+        forget=-5*sigmoid(((x.astype(np.float32)@w[p+".forget_a.weight"].T)@w[p+".forget_b.weight"].T+w[p+".dt_bias"]).reshape(b,t,heads,width)
+                          *np.exp(w[p+".a"]).reshape(1,1,heads,1))
+        beta=sigmoid(lin(x,p+".beta").astype(np.float32))
+        state=np.zeros((b,heads,width,width),np.float32);outputs=[]
+        for token in range(t):
+            state*=np.exp(forget[:,token])[...,None]
+            predicted=np.sum(state*k[:,:,token,:,None],axis=-2)
+            delta=(v[:,:,token]-predicted)*beta[:,token,:,None]
+            state+=k[:,:,token,:,None]*delta[...,None,:]
+            outputs.append(np.sum(state*q[:,:,token,:,None],axis=-2)/math.sqrt(width))
+        attended=np.stack(outputs,axis=2)
+        normalized=attended/np.sqrt(np.mean(attended**2,axis=-1,keepdims=True)+1e-5)*w[p+".output_norm.weight"]
+        gate=lin(lin(x,p+".gate_a"),p+".gate_b").reshape(b,t,heads,width).transpose(0,2,1,3)
+        output=(normalized*sigmoid(gate.astype(np.float32))).transpose(0,2,1,3).reshape(b,t,heads*width).astype(x.dtype)
+        return lin(output,p+".output")
     def mla(x,p):
         b,t,_=x.shape;heads=c["num_attention_heads"];rank=c["kv_lora_rank"];index=c["index_head_dim"]
         qr=norm(lin(x,p+".query_a"),w[p+".query_a_norm.weight"])
         q=lin(qr,p+".query_b").reshape(b,t,heads,c["qk_nope_head_dim"])
         latent=norm(lin(x,p+".key_value_a"),w[p+".key_value_a_norm.weight"]).astype(np.float16).astype(np.float32)
-        absorbed=np.einsum("bthi,hoi->btho",q,w[p+".latent.query_embedding.weight"])
+        absorbed=headwise(q,p+".latent.query_embedding")
         ik=lin(x,p+".indexer.key").astype(np.float16).astype(np.float32)
         centered=ik-ik.mean(axis=-1,keepdims=True)
         ik=(centered/np.sqrt(np.mean(centered**2,axis=-1,keepdims=True)+1e-6)*w[p+".indexer.key_norm.weight"]+
@@ -347,12 +555,15 @@ def glm_model_reference(config,w,mtp=None,return_hidden=False):
                     keys=latent[bi,selected]
                     logits=absorbed[bi,token]@keys.T/math.sqrt(c["qk_nope_head_dim"])
                     attended[bi,token]=sm(logits)@keys
-        value=np.einsum("bthi,hoi->btho",attended.astype(np.float16).astype(np.float32),w[p+".latent.output_unembedding.weight"])
+        unembedding=p+".latent.output_unembedding.weight"
+        value_input=attended.astype(np.float16)
+        if unembedding not in mfe_specs:value_input=value_input.astype(np.float32)
+        value=headwise(value_input,p+".latent.output_unembedding")
         return lin(value.reshape(b,t,-1),p+".output")
     if mtp is not None:
         ids,previous,layer,positions=mtp
         positions=np.arange(ids.shape[1]) if positions is None else positions
-        embeds=w["model.token_embedding.weight"][ids]
+        embeds=lookup("model.token_embedding.weight",ids)
         embeds=np.where((positions==0)[...,None],np.zeros_like(embeds),embeds)
         x=lin(np.concatenate((norm(embeds,w["predictor.embedding_norm.weight"]),
             norm(previous,w["predictor.hidden_norm.weight"])),axis=-1),"predictor.fusion")
@@ -362,7 +573,7 @@ def glm_model_reference(config,w,mtp=None,return_hidden=False):
         branch=norm(residual,w[p+".mlp.norm.weight"]).astype(dtype)
         multi=residual+ffn(branch,p+".mlp","sparse").astype(np.float32)
         return norm(multi,w["predictor.output_norm.weight"]).astype(dtype),multi
-    hidden=w["model.token_embedding.weight"][np.arange(1,8)[None]].astype(np.float16)
+    hidden=lookup("model.token_embedding.weight",np.arange(1,8)[None]).astype(np.float16)
     x=np.broadcast_to(hidden[...,None,:],(*hidden.shape[:2],2,hidden.shape[-1])).copy()
     for i,kind in enumerate(c["layer_types"]):
         p=f"model.block.{i}"
@@ -412,9 +623,12 @@ def run_glm_fixture(path):
 @pytest.mark.parametrize("types",[("linear_attention",)*2,("deepseek_sparse_attention",)*2,
                                   ("linear_attention","deepseek_sparse_attention")])
 @pytest.mark.parametrize("sparse_ffn",[False,True])
-def test_glm_native_complete_graph(tmp_path,types,sparse_ffn):
+@pytest.mark.parametrize("storage",["dense","v1s"])
+def test_glm_native_complete_graph(tmp_path,types,sparse_ffn,storage):
     config,weights=glm_model_fixture(types,sparse_ffn)
-    expected=glm_model_reference(config,weights)
+    reference_weights=weights
+    if storage=="v1s":weights,reference_weights=glm_v1s_storage(weights)
+    expected=glm_model_reference(config,reference_weights)
     path=tmp_path/"glm-graph.mfq";write_glm_fixture(path,config,weights)
     process=run_glm_fixture(path)
     assert process.returncode==0,process.stdout+process.stderr
@@ -698,10 +912,10 @@ def test_qwen_ple_equation_eos_chunks_and_transactions(native,action,packed):
     for actual,expected in zip(got,ref):np.testing.assert_allclose(actual,expected,atol=1e-3,rtol=1e-3)
 
 
-def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
+def qwen_model_fixture(interval=2,silu_gate=False,ple=True,hidden=16):
     from mfq.architectures.flash_next import Qwen4ExpConfig
     rng=np.random.default_rng(3805);rand=lambda shape,s=.05:rng.normal(scale=s,size=shape).astype(np.float32)
-    h,streams,d,heads,kv,ih=16,2,32,2,1,8
+    h,streams,d,heads,kv,ih=hidden,2,32,2,1,8
     kinds=["full_attention" if (i+1)%interval==0 else "linear_attention" for i in range(2)]
     ple_layers=[i+1 for i,kind in enumerate(kinds) if kind=="linear_attention"] if ple else []
     c=dict(model_type="qwen4_exp_text",vocab_size=32,hidden_size=h,num_hidden_layers=2,
@@ -738,7 +952,7 @@ def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
             for key in ["query_norm","key_norm","indexer.query_norm","indexer.key_norm"]:w[a+f".{key}.weight"]=rand((d,),.02)
         if i+1 in ple_layers:
             a=p+".position_embedding"
-            for shard in range(4):w[a+f".ngram.shard.{shard}.weight"]=rand((8,4),.2)
+            for shard in range(4):w[a+f".ngram.shard.{shard}.weight"]=rand((8,h//4),.2)
             w[a+".ngram.layer_multipliers"]=np.array([-7046029254386353131,6364136223846793005,-4658895280553007687],np.int64)
             w[a+".ngram.head_offsets"]=np.array([0,8,16,24],np.int64);w[a+".ngram.head_vocab_sizes"]=np.array([5,7,5,7],np.int64)
             w[a+".key.weight"]=rand((streams*h,h));w[a+".value.weight"]=rand((h,h))
@@ -863,14 +1077,16 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent)
 
 
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
-@pytest.mark.parametrize("quantized_gr",[False,True,"shared-q8","shared-nint","shared-up"])
-def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr):
+@pytest.mark.parametrize("quantized_gr,hidden",[(False,16),(True,16),("shared-q8",16),
+    ("shared-nint",16),("shared-up",16),(False,160)])
+@pytest.mark.parametrize("ram_hot",[False,True])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr,hidden,ram_hot):
     from mfq.formats.nint import NintSpec
     from mfq.formats.mfe import MfePool,MfeTensor
     from mfq.quantize.nint_quant import quantize
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    config,weights=qwen_model_fixture(interval,True,ple)
+    config,weights=qwen_model_fixture(interval,True,ple,hidden)
     if isinstance(quantized_gr,str):
         from mfq.formats.io import BFloat16Array
         config["text_config"]["hc_lowrank"]=16
@@ -916,6 +1132,9 @@ def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interva
         "MFQ_MOE_PREFILL_GRAPH":"0",
         "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
         "MFQ_MOE_HOST_CACHE_BYTES":"1048576"}
+    if ram_hot:
+        env.update(MFQ_KV_PLACEMENT="auto",MFQ_KV_ALLOCATION="preallocated",
+            MFQ_MEMORY_ARCHITECTURE="discrete",MFQ_KV_AUTO_STREAM_MIN_CONTEXT="32",MFQ_KV_RESIDENT_CELLS="8")
     process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
         "--ctx-size","32","--moe-gpu-cache-gb","0.01","--check-qwen4-decode-hidden"],
         text=True,capture_output=True,timeout=90,env=env)
@@ -993,12 +1212,12 @@ def test_qwen_native_disabled_predictor_retains_source_config(tmp_path):
     assert result.returncode==0 and "flash_next_check " in result.stdout
 
 
-def mtp_fixture(family,layers=2):
+def mtp_fixture(family,layers=2,*,hidden=16):
     rng=np.random.default_rng(3811 if family=="qwen" else 5311)
     rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
     if family=="qwen":
-        config,w=qwen_model_fixture(2,True,True)
-        _,head=qwen_model_fixture(1,True,False)
+        config,w=qwen_model_fixture(2,True,True,hidden=hidden)
+        _,head=qwen_model_fixture(1,True,False,hidden=hidden)
         h=config["text_config"]["hidden_size"];streams=config["text_config"]["hc_count"]
         config["text_config"]["mtp_num_hidden_layers"]=layers
         w["predictor.embedding_norm.weight"]=rand((h,));w["predictor.hidden_norm.weight"]=rand((streams*h,))
@@ -1029,10 +1248,13 @@ def run_mtp_fixture(path):
 @pytest.mark.parametrize("family",["qwen","glm"])
 @pytest.mark.parametrize("layers",[1,2])
 @pytest.mark.parametrize('independent', [False, True])
-def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent):
+@pytest.mark.parametrize("storage",["dense","v1s"])
+def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers,independent,storage):
     if independent and family != 'qwen': pytest.skip('independent Qwen projections')
+    if storage=="v1s" and family!="glm":pytest.skip("V1-S GLM storage variant")
     config,w=mtp_fixture(family,layers);path=tmp_path/"predictor.mfq"
     reference_weights = w
+    if storage=="v1s":w,reference_weights=glm_v1s_storage(w)
     if independent: w = independent_qwen_attention(config, w)
     (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
     process=run_mtp_fixture(path);assert process.returncode==0,process.stdout+process.stderr
@@ -1043,22 +1265,27 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     for i,row in enumerate(raw["layers"]):
         expected=reference(config,reference_weights,mtp=(ids,previous,i,None))
         for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
-        np.testing.assert_allclose(array(row["logits"]),expected[0]@w["model.output.weight"].T,atol=2e-3,rtol=2e-3)
+        np.testing.assert_allclose(array(row["logits"]),glm_logits_reference(expected[0],reference_weights),atol=2e-3,rtol=2e-3)
         for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
         np.testing.assert_allclose(array(row["chunked"]),array(row["full"]),atol=1.5e-2,rtol=1.5e-2)
-        np.testing.assert_allclose(array(row["batch"]),np.repeat(array(row["full"]),2,axis=0),atol=2e-3,rtol=2e-3)
+        batch=np.repeat(array(row["full"]),2,axis=0)
+        if storage=="v1s":
+            # B*T=14 selects V1-S's decoded-F16 NINT prefill path, not GEMV.
+            batch_ids=np.repeat(ids,2,axis=0);batch_previous=np.repeat(previous,2,axis=0)
+            batch=reference(config,reference_weights,mtp=(batch_ids,batch_previous,i,None))[0]
+        np.testing.assert_allclose(array(row["batch"]),batch,atol=2e-3,rtol=2e-3)
         positions=np.arange(7)+3
         if family=="qwen":
             positions=np.stack((positions,positions+2,positions+4))
             axis=reference(config,reference_weights,positions=positions,mtp=(ids,previous,i,None))[0]
-        else:axis=reference(config,w,mtp=(ids,previous,i,positions))[0]
+        else:axis=reference(config,reference_weights,mtp=(ids,previous,i,positions))[0]
         np.testing.assert_allclose(array(row["axis"]),axis,atol=2e-3,rtol=2e-3)
     target=reference(config,reference_weights,return_hidden=True)
     np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
     np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
     assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0
     # The throughput controller can park after its first depth-3 probe.
-    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=1
+    assert raw["drafted"]>=3 and raw["depth_cycles"][3]>=1
 
 
 @pytest.mark.parametrize("family",["qwen","glm"])

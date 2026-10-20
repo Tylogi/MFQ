@@ -59,7 +59,7 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
                 view = store.blob_view(record)
                 try:
                     _, pools = inspect_mfe_header(view)
-                    if any(pool.dtype not in {"NINT", "NVQ", "NPQ"} for pool in pools):
+                    if any(pool.dtype not in {"NINT", "NVQ", "NPQ", "MXFP4"} for pool in pools):
                         return False
                 finally:
                     view.release()
@@ -89,11 +89,11 @@ def native_request_capacity(
 
     if requested < 1:
         raise ValueError("requested runtime concurrency must be positive")
-    # Routed expert storage does not determine whether the CUDA scheduler can
+    # Routed expert storage does not determine whether the native scheduler can
     # batch requests.  The native worker owns model/state compatibility and
     # its MoE implementation handles both resident and cached experts.
     _ = routed_expert_bytes
-    return requested if backend == "cuda" else 1
+    return requested if backend in {"cuda", "metal"} else 1
 
 
 def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:
@@ -195,8 +195,8 @@ class NativeRuntime:
             raise NativeRuntimeError("prefill chunk size must be positive")
         if self.continuous_batching < 0:
             raise NativeRuntimeError("continuous batching must be non-negative")
-        if self.continuous_batching > 0 and self.backend != "cuda":
-            raise NativeRuntimeError("continuous batching currently requires CUDA")
+        if self.continuous_batching > 0 and self.backend not in {"cuda", "metal"}:
+            raise NativeRuntimeError("continuous batching currently requires CUDA or Metal")
         if self.moe_gpu_cache_gb is not None and (
             not math.isfinite(self.moe_gpu_cache_gb) or self.moe_gpu_cache_gb < 0
         ):
@@ -247,6 +247,7 @@ class NativeRuntime:
         )
         self.process = subprocess.Popen(
             command,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             stdin=subprocess.DEVNULL,
             env=native_runtime_environment(
                 self.executable,

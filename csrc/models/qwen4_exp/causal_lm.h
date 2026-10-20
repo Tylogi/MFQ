@@ -192,7 +192,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
@@ -203,7 +203,6 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.num_attention_heads = config.heads;
         metadata.num_key_value_heads = config.kv_heads;
         metadata.head_dim = config.width;
-        metadata.max_position_embeddings = config.maximum;
         metadata.rotary_dim = config.rotary;
         metadata.num_experts = config.experts;
         metadata.hc_mult = config.streams;
@@ -215,10 +214,10 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.model_type = "qwen4_exp";
         metadata.layer_types = config.layer_types;
     }
-    Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
+    Tensor prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
         return this->repeat_hidden(std::move(hidden), this->metadata.hc_mult);
     }
-    CausalPositions<Tensor> adapter_prepare_positions(Tensor current, int64_t, int64_t) {
+    CausalPositions<Tensor> prepare_positions(Tensor current, int64_t, int64_t) {
         const auto rank = Backend::rank(current);
         if ((rank == 2 || rank == 3) && Backend::size(current, 0) == 4)
             current = this->position_axes(std::move(current), 1, 3);
@@ -227,7 +226,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
                         : current;
         return {std::move(current), std::move(full)};
     }
-    void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
+    void validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
                                     bool has_mrope) const {
         const auto rank = Backend::rank(positions);
         require_model((rank == 1 || (rank == 2 && Backend::size(positions, 0) == 3) ||
@@ -236,8 +235,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
                           Backend::size(positions, -1) == tokens,
                       "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     }
-    void adapter_set_max_position_embeddings(int64_t value) { this->config.maximum = value; }
-    void adapter_validate_forward(int64_t new_batch, int64_t tokens, int64_t cache_position, bool,
+    void validate_forward(int64_t new_batch, int64_t tokens, int64_t cache_position, bool,
                                   bool has_cache_position_override, bool has_attention_mask) const {
         require_model(tokens > 0 &&
                           cache_position + tokens <= this->metadata.max_position_embeddings &&
@@ -245,12 +243,12 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
                       "Qwen4 requires unpadded causal cache positions");
         (void)new_batch;
     }
-    bool adapter_requires_batch_reset(int64_t new_batch) const noexcept {
+    bool requires_batch_reset(int64_t new_batch) const noexcept {
         return this->batch != 0 && this->batch != new_batch;
     }
-    bool adapter_allows_speculative_position_override() const noexcept { return true; }
-    bool adapter_force_cache_advance() const noexcept { return true; }
-    bool adapter_supports_speculation() const noexcept { return true; }
+    bool allows_speculative_position_override() const noexcept { return true; }
+    bool force_cache_advance() const noexcept { return true; }
+    bool family_supports_speculation() const noexcept { return true; }
 };
 
 } // namespace mfq::models::qwen4_exp

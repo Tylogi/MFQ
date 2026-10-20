@@ -2,15 +2,16 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ModelContextSettings } from './ModelContextSettings';
 import { useJobStore } from '../../stores/jobStore';
+import { ApiError } from '../../shared/api/client';
 import type { ModelCacheProfile, RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 
-const mocks = vi.hoisted(() => ({ policy: vi.fn(), info: vi.fn(), reload: vi.fn(), warning: vi.fn(), artifacts: vi.fn(), profile: vi.fn() }));
+const mocks = vi.hoisted(() => ({ policy: vi.fn(), configurePolicy: vi.fn(), reloadGlobal: vi.fn(), addJob: vi.fn(), info: vi.fn(), reload: vi.fn(), warning: vi.fn(), artifacts: vi.fn(), profile: vi.fn() }));
 const state = vi.hoisted(() => ({ language: 'en', ready: true, connectionRevision: 0, reloadingInstances: {},
   runtime: null as RuntimeStatus | null,
   instances: [{ id: 'a', model: 'Model A', state: 'ready', context_size: 262144, context_capacity: 262144 }] as RuntimeInstance[] }));
-vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ...state, reloadModelContext: mocks.reload }) }));
+vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ...state, reloadModelContext: mocks.reload, addJob: mocks.addJob }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.language === 'en' ? en : zh }) }));
-vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { contextPolicy: mocks.policy, yarnContextInfo: mocks.info } }));
+vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { contextPolicy: mocks.policy, configureContextPolicy: mocks.configurePolicy, reloadGlobalContextCap: mocks.reloadGlobal, yarnContextInfo: mocks.info } }));
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { modelArtifacts: mocks.artifacts, modelCacheProfile: mocks.profile } }));
 vi.mock('../../stores/toastStore', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: mocks.warning } }));
 
@@ -69,6 +70,24 @@ it('defaults KV quantization to collapsed and off with TurboQuant 4 bit, then sa
 it('does not enable KV quantization on an unsupported backend', async () => {
   render(<ModelContextSettings />);
   expect(await screen.findByRole('checkbox', { name: 'Enable KV quantization' })).toBeDisabled();
+});
+
+it('defaults CUDA KV to preallocated automatic without SSD and saves placement independently of quantization', async () => {
+  state.instances[0].kv_memory_supported = true;
+  state.instances[0].kv_quantization_supported = true;
+  const { save } = await controls();
+  const placement = screen.getByRole('combobox', { name: 'KV placement' });
+  const allocation = screen.getByRole('combobox', { name: 'KV allocation' });
+  expect(placement).toHaveValue('auto');
+  expect(allocation).toHaveValue('preallocated');
+  expect(placement.querySelectorAll('option')).toHaveLength(4);
+  fireEvent.change(allocation, { target: { value: 'dynamic' } });
+  fireEvent.change(placement, { target: { value: 'auto_ssd' } });
+  expect(allocation).toHaveValue('preallocated');
+  expect(screen.getByRole('option', { name: 'Dynamic (experimental)' })).toBeDisabled();
+  fireEvent.click(save);
+  await waitFor(() => expect(mocks.reload).toHaveBeenCalledWith('a', null, false, undefined,
+    { enabled: false, bits: 4, algorithm: 'turboquant' }, { placement: 'auto_ssd', allocation: 'preallocated' }));
 });
 
 it('keeps independent KV quantization drafts while switching models', async () => {
@@ -277,4 +296,68 @@ it('keeps drafts and permits retry when submitting fails, without reporting save
   expect(input).toHaveValue(131072);
   expect(save).toBeEnabled();
   expect(screen.queryByText('Saved to this model')).not.toBeInTheDocument();
+});
+
+it('restores the saved global cap after invalid input and a rejected save', async () => {
+  mocks.policy.mockResolvedValue({ max_context_size: 32768, model_overrides: {}, model_yarn_enabled: {} });
+  mocks.configurePolicy.mockRejectedValue(new ApiError(422, { error: { code: 'invalid_request', message: 'request validation failed', retryable: false, details: {} } }));
+  await controls();
+  const input = screen.getByLabelText('Global context cap');
+  fireEvent.change(input, { target: { value: '1' } });
+  fireEvent.blur(input);
+  expect(input).toHaveValue(32768);
+  expect(screen.getByRole('alert')).toHaveTextContent('previous value was restored');
+  fireEvent.change(input, { target: { value: '65536' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save global context cap' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('Some input values are invalid');
+  expect(input).toHaveValue(32768);
+});
+
+it('restores model drafts when the backend rejects the input but keeps other models independent', async () => {
+  mocks.policy.mockResolvedValue({ max_context_size: null, model_overrides: { 'Model A': 8192 }, model_yarn_enabled: {} });
+  mocks.reload.mockRejectedValueOnce(new ApiError(400, { error: { code: 'qsa_kv_configuration_invalid', message: 'native configuration failure', retryable: false, details: {} } }));
+  const { input, save } = await controls();
+  fireEvent.change(input, { target: { value: '16384' } });
+  fireEvent.click(save);
+  expect(await screen.findByRole('alert')).toHaveTextContent('Check the budget and maximum context');
+  expect(input).toHaveValue(8192);
+});
+
+it('restores saved model settings after an asynchronous context task rejects them', async () => {
+  mocks.policy.mockResolvedValue({ max_context_size: null, model_overrides: { 'Model A': 8192 }, model_yarn_enabled: {} });
+  const { input, save } = await controls();
+  fireEvent.change(input, { target: { value: '16384' } });
+  fireEvent.click(save);
+  await waitFor(() => expect(mocks.reload).toHaveBeenCalled());
+  useJobStore.getState().updateJob('ctx', { status: 'failed', error: { code: 'qsa_kv_configuration_invalid', message: 'invalid settings', retryable: false, details: {} } });
+  await waitFor(() => expect(input).toHaveValue(8192));
+  expect(screen.getByRole('alert')).toHaveTextContent('Check the budget and maximum context');
+});
+
+it('only saves the global cap for future loads; explicit reload is separate', async () => {
+  mocks.configurePolicy.mockResolvedValue({ max_context_size: 65536, model_overrides: {}, model_yarn_enabled: {} });
+  mocks.reloadGlobal.mockResolvedValue({ id: 'global-cap', kind: 'runtime.context.configure', status: 'queued', payload: { apply_global_cap: true } });
+  await controls();
+  const reload = screen.getByRole('button', { name: 'Reload models above the global cap' });
+  expect(reload).toBeDisabled();
+  fireEvent.change(screen.getByLabelText('Global context cap'), { target: { value: '65536' } });
+  expect(reload).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Save global context cap' }));
+  await waitFor(() => expect(reload).toBeEnabled());
+  expect(mocks.reload).not.toHaveBeenCalled();
+  expect(mocks.reloadGlobal).not.toHaveBeenCalled();
+  expect(screen.getByText(/Reload immediately reloads all loaded models above/)).toBeInTheDocument();
+  fireEvent.click(reload);
+  await waitFor(() => expect(mocks.reloadGlobal).toHaveBeenCalledOnce());
+  expect(mocks.addJob).toHaveBeenCalledWith(expect.objectContaining({ id: 'global-cap' }));
+  expect(mocks.reload).not.toHaveBeenCalled();
+});
+
+it('does not reload when all loaded models are already at or below the saved cap', async () => {
+  mocks.policy.mockResolvedValue({ max_context_size: 262144, model_overrides: {}, model_yarn_enabled: {} });
+  await controls();
+  const reload = screen.getByRole('button', { name: 'Reload models above the global cap' });
+  expect(reload).toBeDisabled();
+  fireEvent.click(reload);
+  expect(mocks.reloadGlobal).not.toHaveBeenCalled();
 });

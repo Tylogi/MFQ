@@ -1,10 +1,10 @@
 #include "mlx_vq.h"
 #include "mlx_nvq_decode.h"
-#include "mlx_weight_residency.h"
+#include "runtime/mlx_weight_residency.h"
 
-#include "../../../core/compat/mfq_format_compat.h"
-#include "nvq_codebooks.generated.h"
-#include "mlx_staging_allocator.h"
+#include "compat/mfq_format_compat.h"
+#include "generated/nvq_codebooks.generated.h"
+#include "runtime/mlx_staging_allocator.h"
 #include <mlx/allocator.h>
 
 #include <algorithm>
@@ -1546,7 +1546,7 @@ void validate_canonical(const CanonicalVq& value) {
         value.scales.size() !=
             static_cast<std::size_t>(
                 value.table_banks * value.states) ||
-        value.codebooks.size() !=
+        value.codebooks.size() + value.borrowed_codebooks.size() !=
             static_cast<std::size_t>(
                 value.table_banks
                 * value.code_banks
@@ -1763,10 +1763,9 @@ CanonicalVq parse_nvq(
             "JSC banked codebook size");
         const auto* codebook =
             cursor.view(codebook_size, "NVQ-JSC codebooks");
-        result.codebooks.assign(
-            reinterpret_cast<const std::int8_t*>(codebook),
-            reinterpret_cast<const std::int8_t*>(codebook)
-                + static_cast<std::ptrdiff_t>(codebook_size));
+        const auto* codebook_data = reinterpret_cast<const std::int8_t*>(codebook);
+        if (borrow_streams) result.borrowed_codebooks = {codebook_data, codebook_size};
+        else result.codebooks.assign(codebook_data, codebook_data + codebook_size);
         result.aux_mode = kAuxSignEven;
         result.code_bank_mode = kCodeBankState;
         result.execution_layout = version == 2
@@ -1840,30 +1839,41 @@ CanonicalVq parse_nvq(
             result.indices.reserve(stream_size + 2);
             result.indices.insert(result.indices.end(), stream, stream + stream_size);
         }
+        constexpr auto parity_mask = (std::uint64_t{1} << 12)
+            | (std::uint64_t{1} << 32) | (std::uint64_t{1} << 52);
+        std::uint64_t parity_errors = 0;
         for (std::size_t record = 0; record < records; ++record) {
             std::uint64_t packed{};
             std::memcpy(
                 &packed,
                 stream + record * 8,
                 sizeof(packed));
-            const auto group = record
-                % static_cast<std::size_t>(result.groups);
-            for (int local = 0; local < 3; ++local) {
-                const auto segment = static_cast<std::uint32_t>(
-                    (packed >> (local * 20)) & 0xfffffu);
-                const auto sign = (segment >> 12) & 0xffu;
-                const auto sign7 = sign & 0x7fu;
-                if ((sign >> 7) !=
-                    (std::popcount(sign7) & 1u)) {
-                    throw std::runtime_error(
-                        "invalid NVQ-JSC group64 parity bit");
+            auto parity = packed ^ (packed >> 4);
+            parity ^= parity >> 2;
+            parity ^= parity >> 1;
+            parity_errors |= parity & parity_mask;
+        }
+        if (parity_errors != 0) {
+            throw std::runtime_error(
+                "invalid NVQ-JSC group64 parity bit");
+        }
+        const auto groups = static_cast<std::size_t>(result.groups);
+        const auto vectors = static_cast<std::size_t>(result.vectors);
+        if (groups > vectors / 3) {
+            constexpr auto record_mask = (std::uint64_t{1} << 60) - 1;
+            const auto first_group = vectors / 3;
+            const auto first_mask = record_mask & (~std::uint64_t{0} << ((vectors % 3) * 20));
+            std::uint64_t padding_errors = 0;
+            for (std::size_t row = 0; row < static_cast<std::size_t>(result.output_size); ++row) {
+                for (auto group = first_group; group < groups; ++group) {
+                    std::uint64_t packed{};
+                    std::memcpy(&packed, stream + (row * groups + group) * 8, sizeof(packed));
+                    padding_errors |= packed & (group == first_group ? first_mask : record_mask);
                 }
-                if (group * 3 + static_cast<std::size_t>(local) >=
-                        static_cast<std::size_t>(result.vectors) &&
-                    segment != 0) {
-                    throw std::runtime_error(
-                        "NVQ-JSC group64 padding must be zero");
-                }
+            }
+            if (padding_errors != 0) {
+                throw std::runtime_error(
+                    "NVQ-JSC group64 padding must be zero");
             }
         }
         result.indices.insert(result.indices.end(), 2, 0);

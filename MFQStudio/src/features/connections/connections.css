@@ -99,7 +99,7 @@
 .server-page-footer > span { color: var(--muted-light); font-size: 11px; }
 .server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .memory-budget-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 14px 0; color: var(--muted); font-size: 11px; }
-.memory-budget-available { margin-inline-start: 16px; color: var(--muted-light); font-size: 11.5px; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.memory-budget-available { margin-inline-end: 16px; color: var(--muted-light); font-size: 11.5px; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .memory-budget-actions > button { min-height: 36px; border: 1px solid var(--line); border-radius: 9px; padding: 8px 15px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 12px; font-weight: 500; }
 .memory-budget-actions > button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
 .prefix-directory-controls { flex-wrap: wrap; }

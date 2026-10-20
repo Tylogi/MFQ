@@ -1,23 +1,25 @@
-#include "mlx_moe.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_tensor.h"
-#include "mlx_moe_ops.h"
-#include "mlx_mxfp4_sq.h"
-#include "mlx_nint.h"
-#include "mlx_reference.h"
-#include "mfq_container.h"
-#include "mlx_qwen4_causal_lm.h"
-#include "qwen4_ops.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_inference_warmup.h"
-#include "mlx_resource_telemetry.h"
-#include "mlx_platform.h"
-#include "mlx_resident_budget.h"
-#include "mlx_ane_matmul.h"
-#include "mlx_paged_session_codec.h"
+#include "ops/mlx_moe.h"
+#include "ops/mlx_grouped_linear.h"
+#include "runtime/mlx_tensor.h"
+#include "ops/mlx_moe_ops.h"
+#include "ops/mlx_mxfp4_sq.h"
+#include "ops/mlx_nint.h"
+#include "runtime/mlx_reference.h"
+#include "storage/mfq_container.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_moe.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_causal_lm.h"
+#include "models/flash_next/qwen4_ops.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "runtime/mlx_inference_warmup.h"
+#include "runtime/mlx_resource_telemetry.h"
+#include "runtime/mlx_platform.h"
+#include "runtime/mlx_resident_budget.h"
+#include "runtime/mlx_ane_matmul.h"
+#include "runtime/mlx_paged_session_codec.h"
 #include "nlohmann/json.hpp"
 
-#include "nvq_codebooks.generated.h"
+#include "generated/nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>
@@ -49,6 +51,7 @@
 
 #include <mlx/mlx.h>
 #include <mlx/fast_primitives.h>
+#include <mlx/backend/metal/device.h>
 
 extern "C" __attribute__((noinline)) void mfq_kernel_prepare_phase(int phase) {
     std::cout << "kernel_prepare_phase=" << phase << std::endl;
@@ -1487,8 +1490,9 @@ TensorFixture make_nint_v2_tensor(
     int columns,
     int salt,
     int group_size = kGroupSize,
-    bool all_q_widths = false) {
-    constexpr int nominal_bits = 4;
+    bool all_q_widths = false,
+    int fixed_q = 0) {
+    const int nominal_bits = fixed_q != 0 ? fixed_q : 4;
     constexpr int nominal_sub_bits = 6;
     const int groups = (columns + group_size - 1) / group_size;
     const int values_per_row = groups * group_size;
@@ -1502,7 +1506,7 @@ TensorFixture make_nint_v2_tensor(
         static_cast<std::size_t>(rows) * groups);
     std::vector<std::uint8_t> sub_min(sub_scale.size());
     for (int row = 0; row < rows; ++row) {
-        const int q_bits = all_q_widths
+        const int q_bits = fixed_q != 0 ? fixed_q : all_q_widths
             ? 1 + (row + salt) % 8
             : 2 + (row + salt) % 5;
         const int sub_bits = 5 + (row + salt) % 4;
@@ -1584,6 +1588,19 @@ TensorFixture make_nint_v2_tensor(
         }
     }
     return {std::move(blob), std::move(dense), rows, columns};
+}
+
+std::vector<std::uint8_t> nint_expert_blob(
+    const TensorFixture& tensor, int experts, int output) {
+    if (tensor.rows != experts * output)
+        throw std::runtime_error("NINT expert fixture row mismatch");
+    std::vector<std::uint8_t> blob(tensor.blob.begin(), tensor.blob.begin() + 14);
+    append<std::uint32_t>(blob, 3);
+    append<std::int64_t>(blob, experts);
+    append<std::int64_t>(blob, output);
+    append<std::int64_t>(blob, tensor.columns);
+    blob.insert(blob.end(), tensor.blob.begin() + 34, tensor.blob.end());
+    return blob;
 }
 
 TensorFixture make_q8_tensor(
@@ -2723,12 +2740,18 @@ void test_two_stage_nint_shared_decode(
     int tokens = 1,
     bool precomputed_gate = false,
     bool packed_gate_up = false,
-    int routed_group_size = kGroupSize) {
-    constexpr int experts = 32;
+    int routed_group_size = kGroupSize,
+    bool repeated_routes = false,
+    int experts = 32,
+    bool check_folded_topk = false,
+    int fixed_q = 0,
+    int shared_up_group_size = 0,
+    bool mixed_expert_q = false,
+    bool paged = false) {
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
     const auto make_fixture = [&](int output, int input, int salt) {
-        if (!nvq3jl && routed_group_size != 48)
+        if (!nvq3jl && routed_group_size != 48 && fixed_q == 0 && !mixed_expert_q)
             return make_moe_fixture(profiles, output, input, salt, routed_group_size);
         std::vector<PoolFixture> pools;
         std::vector<float> dense(experts * output * input);
@@ -2741,7 +2764,8 @@ void test_two_stage_nint_shared_decode(
                 tensor = {std::move(vq.blob), std::move(vq.dense), output, input};
             } else {
                 profile = "NINT";
-                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true);
+                const int bits = mixed_expert_q ? std::array{4, 5, 6, 8}[expert % 4] : fixed_q;
+                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true, bits);
             }
             std::copy(tensor.dense.begin(), tensor.dense.end(),
                 dense.begin() + expert * output * input);
@@ -2758,18 +2782,30 @@ void test_two_stage_nint_shared_decode(
     const auto packed_fixture = packed_gate_up
         ? std::optional<MoeFixture>(make_fixture(intermediate * 2, hidden, 7))
         : std::nullopt;
+    const auto pages = [&](mfq::metal::MlxMfeWeight weight) {
+        if (!paged) return weight;
+        std::vector<mfq::metal::MlxMfeWeight> values;
+        for (int expert = 0; expert < experts; ++expert) {
+            const std::array id{expert};
+            values.push_back(weight.select_experts(id));
+        }
+        return mfq::metal::MlxMfeWeight::concatenate_experts(values);
+    };
     const auto gate_up = packed_fixture
-        ? mfq::metal::MlxMfeWeight::from_blob(packed_fixture->blob)
+        ? pages(mfq::metal::MlxMfeWeight::from_blob(packed_fixture->blob))
+        : paged ? mfq::metal::MlxMfeWeight::concatenate_projections({
+            pages(mfq::metal::MlxMfeWeight::from_blob(gate_fixture.blob)),
+            pages(mfq::metal::MlxMfeWeight::from_blob(up_fixture.blob))})
         : mfq::metal::MlxMfeWeight::from_projection_blobs(gate_up_blobs);
-    const auto down = mfq::metal::MlxMfeWeight::from_blob(
-        down_fixture.blob);
+    const auto down = pages(mfq::metal::MlxMfeWeight::from_blob(down_fixture.blob));
 
     const auto shared_gate_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 43, shared_group_size, true);
+        intermediate, hidden, 43, shared_group_size, true, fixed_q);
     const auto shared_up_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 47, shared_group_size, true);
+        intermediate, hidden, 47, shared_up_group_size > 0 ? shared_up_group_size : shared_group_size,
+        true, fixed_q);
     const auto shared_down_fixture = make_nint_v2_tensor(
-        hidden, intermediate, 53, shared_group_size, true);
+        hidden, intermediate, 53, shared_group_size, true, fixed_q);
     const auto shared_gate = mfq::metal::MlxNintWeight::from_blob(
         shared_gate_fixture.blob);
     const auto shared_up = mfq::metal::MlxNintWeight::from_blob(
@@ -2787,7 +2823,7 @@ void test_two_stage_nint_shared_decode(
     for (int token = 0; token < tokens; ++token) {
         for (int column = 0; column < hidden; ++column)
             input_values[token * hidden + column] = static_cast<float>(
-                (column * 7 + token * 11) % 23 - 11) / (nvq3jl || routed_group_size == 48 ? 1024.0f : 64.0f);
+                (column * 7 + token * 11) % 23 - 11) / (nvq3jl || routed_group_size != kGroupSize ? 1024.0f : 64.0f);
     }
     for (int column = 0; column < hidden; ++column) {
         shared_gate_values[column] = static_cast<float>(
@@ -2798,7 +2834,7 @@ void test_two_stage_nint_shared_decode(
     for (int token = 0; token < tokens; ++token) {
         float route_total = 0.0f;
         for (int route = 0; route < routes; ++route) {
-            ids[token * routes + route] = (token * 7 + route) % experts;
+            ids[token * routes + route] = ((repeated_routes ? token / 2 : token) * 7 + route) % experts;
             route_values[token * routes + route] = static_cast<float>(route + token + 1);
             route_total += route_values[token * routes + route];
         }
@@ -2820,9 +2856,12 @@ void test_two_stage_nint_shared_decode(
     auto gate_logits = mlx::core::matmul(
         mlx::core::astype(input, mlx::core::bfloat16),
         mlx::core::transpose(shared_gate_weight));
+    std::optional<mlx::core::array> packed_router;
     if (precomputed_gate) {
-        const auto gate_fixture = make_nint_v2_tensor(1, hidden, 67, shared_group_size, true);
-        gate_logits = mfq::metal::MlxNintWeight::from_blob(gate_fixture.blob).matmul(input);
+        const auto gate_fixture = make_nint_v2_tensor(1, hidden, 67, shared_group_size, true, fixed_q);
+        const auto router = mfq::metal::MlxNintWeight::from_blob(gate_fixture.blob);
+        gate_logits = router.matmul(input);
+        packed_router = mfq::metal::pack_nint_single_row(router);
     }
     const auto gate_input = precomputed_gate ? gate_logits : shared_gate_weight;
 
@@ -2837,6 +2876,81 @@ void test_two_stage_nint_shared_decode(
         precomputed_gate);
     require(fused.has_value(),
             "two-stage NINT/shared decode path was not selected");
+    std::optional<mlx::core::array> mixed_shared_activation;
+    if (shared_up_group_size > 0)
+        mixed_shared_activation = mlx::core::slice(fused->inputs().at(22),
+            {0, routes * intermediate}, {tokens, (routes + 1) * intermediate});
+    const auto expected_dispatch = std::string("_rowq_auto")
+        + (fixed_q != 0 || mixed_expert_q ? "1" : "0") + (fixed_q != 0 ? "s1" : "s0");
+    for (const auto* node : {&*fused, &fused->inputs().at(22)}) {
+        const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&node->primitive());
+        require(kernel != nullptr && kernel->preparation_key().find(expected_dispatch) != std::string::npos,
+            "NINT row-q dispatch did not match the actual row precision layout");
+    }
+    if (packed_router) {
+        auto packed = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+            *packed_router, input, expert_ids, route_weights);
+        require(packed.has_value(), "packed shared router disabled two-stage fusion");
+        const auto expected_values = evaluated_floats(*fused);
+        const auto packed_values = evaluated_floats(*packed);
+        float error = 0.0f, scale = 0.0f;
+        for (std::size_t index = 0; index < expected_values.size(); ++index) {
+            error = std::max(error, std::abs(expected_values[index] - packed_values[index]));
+            scale = std::max(scale, std::abs(expected_values[index]));
+        }
+        require(error == 0.0f, "packed shared router error=" + std::to_string(error) +
+            " scale=" + std::to_string(scale));
+    }
+    if (check_folded_topk) {
+        require(tokens == 1, "folded top-k fixture must have one token");
+        for (int fixture = 0; fixture < 6; ++fixture) {
+            std::vector<float> logits_values(experts);
+            for (int expert = 0; expert < experts; ++expert) {
+                float value = std::sin(float(expert * 17 + 3)) * 4.0f;
+                if (fixture == 1) value = expert % 2 ? -0.0f : 0.0f;
+                if (fixture == 2) value = float(expert % 5) / 1024.0f;
+                if (fixture == 3) value = std::numeric_limits<float>::quiet_NaN();
+                if (fixture == 4 && expert % 3 == 0)
+                    value = std::numeric_limits<float>::quiet_NaN();
+                if (fixture == 5) value = expert % 2
+                    ? std::numeric_limits<float>::infinity()
+                    : -std::numeric_limits<float>::infinity();
+                logits_values[expert] = value;
+            }
+            const auto logits = mlx::core::astype(mlx::core::array(
+                logits_values.begin(), mlx::core::Shape{1, experts}), mlx::core::float16);
+            const auto selected = mfq::metal::moe_topk(logits, routes, false, false, true);
+            auto expected = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                gate_input, input, selected.ids, selected.weights, precomputed_gate);
+            auto folded = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                gate_input, input, selected.ids, selected.weights, precomputed_gate, nullptr, &logits);
+            require(expected.has_value() && folded.has_value(), "folded routing disabled MFE");
+            if (fixture == 0) {
+                mfq::metal::MlxKernelPreparation preparation(128, 128);
+                preparation.add(*folded);
+                mlx::core::synchronize();
+                const auto active_memory = mlx::core::get_active_memory();
+                preparation.finish();
+                require(preparation.unsupported().empty(), "folded routing cannot be prepared");
+                require(mlx::core::get_active_memory() == active_memory && !folded->is_available(),
+                        "folded routing preparation executed the graph");
+            }
+            const auto routing = folded->inputs().at(27);
+            require(routing.shape() == mlx::core::Shape{2, routes} && routing.dtype() == mlx::core::float32,
+                    "folded routing was not selected");
+            const auto routing_values = evaluated_floats(routing);
+            const auto selected_ids = evaluated_floats(selected.ids);
+            const auto selected_weights = evaluated_floats(selected.weights);
+            require(std::memcmp(routing_values.data(), selected_ids.data(), routes * sizeof(float)) == 0,
+                    "folded routing changed expert IDs");
+            require(std::memcmp(routing_values.data() + routes, selected_weights.data(), routes * sizeof(float)) == 0,
+                    "folded routing changed normalized weights");
+            const auto expected_values = evaluated_floats(*expected);
+            const auto folded_values = evaluated_floats(*folded);
+            require(std::memcmp(expected_values.data(), folded_values.data(), expected_values.size() * sizeof(float)) == 0,
+                    "folded routing changed MoE output");
+        }
+    }
     if (tokens > 1) {
         std::vector<mlx::core::array> row_outputs;
         for (int row = 0; row < tokens; ++row) {
@@ -2850,21 +2964,16 @@ void test_two_stage_nint_shared_decode(
             row_outputs.push_back(*row_output);
         }
         const auto batched_values = evaluated_floats(*fused);
-        std::vector<std::int32_t> groups(ids.size() * 8, -1);
-        for (std::size_t index = 0; index < ids.size(); ++index) {
-            int matched = 0;
-            for (std::size_t route = 0; route < ids.size(); ++route)
-                if (ids[route] == ids[index]) groups[index * 8 + 2 + matched++] = int(route);
-            groups[index * 8] = ids[index];
-            groups[index * 8 + 1] = matched;
+        if (tokens <= 24) {
+            const auto route_groups = mfq::metal::moe_route_groups_host(ids, tokens, routes);
+            require(route_groups.has_value(), "two-stage route chunks were not constructed");
+            auto planned = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                gate_input, input, expert_ids, route_weights, precomputed_gate, &*route_groups);
+            require(planned.has_value(), "route groups disabled two-stage fusion");
+            const auto planned_values = evaluated_floats(*planned);
+            require(batched_values == planned_values,
+                    "route groups changed two-stage NINT/shared decode output");
         }
-        const auto route_groups = mlx::core::array(groups.begin(), mlx::core::Shape{tokens, routes, 8});
-        auto planned = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
-            gate_input, input, expert_ids, route_weights, precomputed_gate, &route_groups);
-        require(planned.has_value(), "route groups disabled two-stage fusion");
-        const auto planned_values = evaluated_floats(*planned);
-        require(batched_values == planned_values,
-                "route groups changed two-stage NINT/shared decode output");
         const auto row_values = evaluated_floats(mlx::core::concatenate(row_outputs, 0));
         require(batched_values == row_values,
                 "batched NINT/shared decode differs from identical row-wise routes");
@@ -2908,11 +3017,29 @@ void test_two_stage_nint_shared_decode(
         routed_output = dense_routed(down_fixture, routed_intermediate);
     }
     auto shared_gate_output = dense_shared_matmul(shared_gate_fixture, input);
-    auto shared_intermediate =
-        shared_gate_output * mlx::core::sigmoid(shared_gate_output) *
-        dense_shared_matmul(shared_up_fixture, input);
+    auto shared_gate_fp32 = mlx::core::astype(shared_gate_output, mlx::core::float32);
+    auto shared_intermediate = mlx::core::astype(
+        shared_gate_fp32 * mlx::core::sigmoid(shared_gate_fp32) *
+        mlx::core::astype(dense_shared_matmul(shared_up_fixture, input), mlx::core::float32),
+        mlx::core::float16);
     auto shared_output = dense_shared_matmul(
         shared_down_fixture, shared_intermediate);
+    if (shared_up_group_size > 0) {
+        auto gate_fp32 = mlx::core::astype(shared_gate_output, mlx::core::float32);
+        auto expected_shared = mlx::core::astype(gate_fp32 * mlx::core::sigmoid(gate_fp32) *
+            mlx::core::astype(dense_shared_matmul(shared_up_fixture, input), mlx::core::float32),
+            mlx::core::float16);
+        const auto actual_shared = evaluated_floats(*mixed_shared_activation);
+        const auto expected_values = evaluated_floats(expected_shared);
+        float error = 0.0f, scale = 0.0f;
+        for (std::size_t index = 0; index < actual_shared.size(); ++index) {
+            error = std::max(error, std::abs(actual_shared[index] - expected_values[index]));
+            scale = std::max(scale, std::abs(expected_values[index]));
+        }
+        require(scale > 1e-5f && error <= std::max(5e-7f, 0.005f * scale),
+            "mixed-GS shared Gate/Up differs from independent dense weights: error=" +
+            std::to_string(error) + " scale=" + std::to_string(scale));
+    }
     auto reference = mfq::metal::moe_weighted_reduce_shared_gate(
         routed_output,
         route_weights,
@@ -2949,6 +3076,105 @@ void test_two_stage_nint_shared_decode(
                 require_close(values[index], reference_values[index], 3e-2f);
         }
     }
+}
+
+void test_uniform_nint_multirow_decode() {
+    for (const int bits : {4, 5, 6, 8}) {
+        for (const int rows : {1, 3, 6}) {
+            test_two_stage_nint_shared_decode(24, 128, 64, true, rows,
+                false, false, 24, true, 32, false, bits);
+            test_two_stage_nint_shared_decode(48, 64, 128, true, rows,
+                false, true, 48, true, 32, false, bits);
+        }
+    }
+    for (const int rows : {1, 3, 6})
+        test_two_stage_nint_shared_decode(28, 128, 64, true, rows,
+            false, false, 28, true, 32, false, 8, 24, true);
+}
+
+void test_mxfp4_repeated_routes() {
+    using namespace mlx::core;
+    for (const auto [input, output] : {std::pair{96, 13}, std::pair{64, 128}}) {
+        const auto mx = make_mxfp4(2 * output, input, 3);
+        for (const auto& nvq : std::array{
+            make_nvq1_s(output, input), make_nvq1_l(output, input), make_jsc_nvq(output, input),
+            make_jsc_nvq(output, input, "NVQ2J-L", 4, 8, 10, false, 4),
+            make_jsc_nvq(output, input, "NVQ2J-XL", 5, 8, 12, true, 4),
+            make_jsc_nvq(output, input, "NVQ3J", 2, 4, 8),
+            make_jsc_nvq(output, input, "NVQ3J-512", 3, 4, 9, false, 4),
+            make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4)}) {
+        const auto weight = mfq::metal::MlxMfeWeight::from_blob(make_raw_nim2(3, output, input, {
+            {{2, 0}, "MXFP4", {mx.blob, mx.dense, 2 * output, input}, {}},
+            {{1}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime},
+        }));
+        const auto mixed_up = mfq::metal::MlxMfeWeight::from_blob(make_raw_nim2(3, output, input, {
+            {{1, 0}, "MXFP4", {mx.blob, mx.dense, 2 * output, input}, {}},
+            {{2}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime},
+        }));
+        const auto pair = mfq::metal::MlxMfeWeight::concatenate_projections({weight, weight})
+            .materialize_packed_projections();
+        for (int tokens : {1, 2, 3, 6, 8}) for (bool shared : {true, false}) {
+            std::vector<std::int32_t> ids(tokens * 4);
+            for (int token = 0; token < tokens; ++token) for (int route = 0; route < 4; ++route)
+                ids[token * 4 + route] = route == 3 ? -1 : (route + token) % 3;
+            auto routes = array(ids.begin(), Shape{tokens, 4});
+            auto groups = mfq::metal::moe_route_groups_host(ids, tokens, 4);
+            const auto* grouped = groups ? &*groups : nullptr;
+            const Shape shape = shared ? Shape{tokens, input} : Shape{tokens, 4, input};
+            int count = tokens * input * (shared ? 1 : 4);
+            auto source = contiguous(astype(reshape(sin(arange(count,float32) * 0.17f) * 0.1f,shape),float16));
+            if (!shared && tokens <= 6) {
+                auto scales = full({tokens, 4}, 0.125f, float32);
+                const auto expected = evaluated_floats(mfq::metal::moe_weighted_reduce(
+                    weight.routed_matmul(source, routes), scales));
+                const auto actual = evaluated_floats(weight.routed_matmul_reduce(source, routes, scales));
+                require(expected == actual, "mixed NVQ/MX Down fusion changed rounded values");
+                const auto grouped_expected = evaluated_floats(mfq::metal::moe_weighted_reduce(
+                    weight.routed_matmul(source, routes, grouped), scales));
+                const auto grouped_actual = evaluated_floats(weight.routed_matmul_reduce(source, routes, scales, grouped));
+                require(grouped_expected == grouped_actual, "Down fusion discarded repeated-route reuse");
+            }
+            for (bool activated : {false, true}) {
+                std::vector<array> reference;
+                for (int token = 0; token < tokens; ++token) {
+                    Shape begin(source.ndim(),0),end=source.shape();begin[0]=token;end[0]=token+1;
+                    auto x = slice(source,begin,end);
+                    auto id = slice(routes,{token,0},{token+1,4});
+                    reference.push_back(activated ? pair.routed_swiglu(x,id,0.05f) : weight.routed_matmul(x,id));
+                }
+                const auto expected = evaluated_floats(concatenate(reference,0));
+                if (activated && shared && tokens <= 6) {
+                    const auto calls = mfq::metal::MlxMfeWeight::indirect_dispatch_count();
+                    const auto actual = evaluated_floats(weight.routed_swiglu_pair(
+                        weight, source, routes, 0.05f, grouped));
+                    for (std::size_t i = 0; i < actual.size(); ++i) require_close(actual[i], expected[i], 1e-6f);
+                    if (__builtin_available(macOS 15, *)) {
+                        if (mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3))
+                            require(mfq::metal::MlxMfeWeight::indirect_dispatch_count() == calls + 1,
+                                "mixed MXFP4/NVQ Gate/Up did not use one indirect fused dispatch");
+                    }
+                    const auto mixed_expected = evaluated_floats(mfq::metal::moe_limited_swiglu_pair(
+                        weight.routed_matmul(source, routes, grouped),
+                        mixed_up.routed_matmul(source, routes, grouped), 0.05f));
+                    for (const auto* group : std::array<const array*, 2>{nullptr, grouped}) {
+                        const auto mixed_actual = evaluated_floats(weight.routed_swiglu_pair(
+                            mixed_up, source, routes, 0.05f, group));
+                        for (std::size_t i = 0; i < mixed_actual.size(); ++i)
+                            require_close(mixed_actual[i], mixed_expected[i], 1e-6f);
+                    }
+                }
+                for (const array* group : std::array<const array*,2>{nullptr, grouped}) {
+                    auto actual = activated ? pair.routed_swiglu(source,routes,0.05f,group)
+                        : weight.routed_matmul(source,routes,group);
+                    const auto values = evaluated_floats(actual);
+                    require(values.size()==expected.size(),"MXFP4 repeated route output shape");
+                    for (std::size_t i=0;i<values.size();++i)
+                        require_close(values[i],expected[i],1e-6f);
+                }
+            }
+        }
+    }
+}
 }
 
 void test_mxfp4_mfe_and_projection_offsets() {
@@ -5156,6 +5382,57 @@ void test_grouped_mmq_prefill() {
     }
 }
 
+void test_grouped_mmq_sparse_plan_bounds() {
+    for (const int experts : {1, 32, 512}) {
+        auto fixture = make_moe_fixture(std::vector<std::string>(experts, "NINTv2"), 4, 24, 0, 24);
+        const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+        for (const int count : {1, 10, 31, 32, 33, 257, 1024, 4096}) {
+            for (const bool skewed : {false, true}) {
+                std::vector<std::int32_t> ids(count);
+                std::vector<int> counts(experts, 0);
+                for (int row = 0; row < count; ++row) {
+                    ids[row] = skewed ? 0 : (row * 37 + row / 3) % experts;
+                    ++counts[ids[row]];
+                }
+                auto sorted = ids;
+                std::sort(sorted.begin(), sorted.end());
+                const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{count, 1});
+                const auto order = mlx::core::astype(mlx::core::argsort(mlx::core::reshape(
+                    routes, mlx::core::Shape{count})), mlx::core::int32);
+                for (const int rows : {32, 48, 64, 80, 96, 128}) {
+                    const auto plan = weight.build_grouped_mmq_plan(routes, order, rows);
+                    require(plan.max_blocks == std::min(count, experts + (count + rows - 1) / rows),
+                        "grouped block capacity exceeds the routed-row bound");
+                    mlx::core::eval(plan.block_meta, plan.block_count);
+                    const int actual = plan.block_count.data<std::int32_t>()[0];
+                    int expected = 0;
+                    for (const int population : counts) expected += (population + rows - 1) / rows;
+                    require(actual == expected && actual <= plan.max_blocks,
+                        "grouped block count does not cover the expert populations");
+                    require(plan.block_meta.shape() == mlx::core::Shape{plan.max_blocks, 3},
+                        "grouped block metadata has the wrong capacity");
+                    std::vector<int> covered(count, 0);
+                    const auto* metadata = plan.block_meta.data<std::int32_t>();
+                    for (int block = 0; block < actual; ++block) {
+                        const int first = metadata[block * 3];
+                        const int expert = metadata[block * 3 + 1];
+                        const int length = metadata[block * 3 + 2];
+                        require(first >= 0 && length > 0 && length <= rows && first + length <= count,
+                            "grouped block points outside the sorted routes");
+                        require(expert >= 0 && expert < experts, "grouped block has an invalid expert");
+                        for (int row = first; row < first + length; ++row) {
+                            require(sorted[row] == expert, "grouped block crosses expert boundaries");
+                            ++covered[row];
+                        }
+                    }
+                    require(std::all_of(covered.begin(), covered.end(), [](int visits) { return visits == 1; }),
+                        "grouped block plan drops or duplicates routed rows");
+                }
+            }
+        }
+    }
+}
+
 void test_portable_mmq_row_buckets() {
     constexpr int input_width = 96;
     constexpr int output_width = 68;
@@ -6255,9 +6532,518 @@ void test_concatenate_resident_mfe_experts() {
                 + " expected=" + std::to_string(expected[index]));
         }
     }
+    std::vector<mfq::metal::MlxMfeWeight> pages;
+    for (int expert = 0; expert < 75; ++expert) {
+        const std::array selected{expert % experts};
+        pages.push_back(full.select_experts(selected));
+    }
+    const auto repeated = mfq::metal::MlxMfeWeight::concatenate_experts(pages);
+    for (const int rows : {1, 2, 6, 17}) {
+        std::vector<std::int32_t> local(rows * routes), global(rows * routes);
+        for (std::size_t index = 0; index < local.size(); ++index) {
+            local[index] = static_cast<std::int32_t>((index * 37 + 74) % pages.size());
+            global[index] = local[index] % experts;
+        }
+        const auto x = mlx::core::full({rows, input}, 0.125f, mlx::core::float16);
+        require(evaluated_floats(repeated.routed_matmul(x,
+            mlx::core::array(local.begin(), mlx::core::Shape{rows, routes})))
+            == evaluated_floats(full.routed_matmul(x,
+                mlx::core::array(global.begin(), mlx::core::Shape{rows, routes}))),
+            "many-expert packed assembly changed values or tail bytes");
+    }
+}
+
+void test_streamed_mfe_partition_preparation() {
+    {
+        constexpr int input = 96, output = 13;
+        const auto mx = make_mxfp4(output, input);
+        const auto nvq = make_nvq1_s(output, input);
+        const auto gate = make_raw_nim2(2, output, input,
+            {{{0}, "MXFP4", {mx.blob, mx.dense, output, input}, {}},
+             {{1}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime}});
+        const auto up = make_raw_nim2(2, output, input,
+            {{{1}, "MXFP4", {mx.blob, mx.dense, output, input}, {}},
+             {{0}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime}});
+        const TemporaryMfq file({{"gate", "MFE", gate}, {"up", "MFE", up}});
+        const mfq::metal::MfqContainer container(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(container, 0);
+        mfq::metal::MlxKernelPreparation preparation(512, 512);
+        preparation.set_routes(3);
+        cache.prepare_swiglu_pair("gate", "up", 3);
+        const auto count = preparation.size();
+        require(count > 0, "streamed Gate/Up preparation did not collect kernels");
+        cache.prepare_swiglu_pair("gate", "up", 3);
+        require(preparation.size() == count, "streamed Gate/Up preparation did not deduplicate kernels");
+        preparation.finish();
+        require(preparation.unsupported().empty(), "streamed Gate/Up preparation has unsupported primitives");
+        require(cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+            "Gate/Up kernel preparation populated the expert cache");
+    }
+    const auto* mixed_nax = std::getenv("MFQ_METAL_MIXED_PREFILL_NAX");
+    if (mfq::metal::mlx_metal_nax_disabled() || (mixed_nax
+        ? std::string_view(mixed_nax) == "0" || std::string_view(mixed_nax) == "false"
+            || std::string_view(mixed_nax) == "off"
+        : !mfq::metal::mlx_apple_chip_starts_with("Apple M5"))) return;
+    std::array<std::size_t, 2> jobs;
+    for (int groups = 2; groups <= 3; ++groups) {
+        std::vector<PoolFixture> pools;
+        for (int group = 0; group < groups; ++group) {
+            std::vector<std::int32_t> ids;
+            for (int expert = group; expert < 12; expert += groups) ids.push_back(expert);
+            pools.push_back({ids, "NINTv2", make_nint_v2_tensor(
+                static_cast<int>(ids.size()) * 13, 96, 43, 24 + 4 * group), {}});
+        }
+        const TemporaryMfq file({{"mixed", "MFE", make_raw_nim2(12, 13, 96, pools)}});
+        const mfq::metal::MfqContainer container(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(container, 0);
+        mfq::metal::MlxKernelPreparation preparation(512, 512);
+        preparation.set_routes(3);
+        cache.prepare_projection("mixed", true);
+        jobs[groups - 2] = preparation.size();
+    }
+    require(jobs[1] == jobs[0] + 6,
+        "three-GS prefill partition preparation was deduplicated with two-GS partitions");
+}
+
+void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
+    using namespace mfq::metal;
+    constexpr int hidden = 256, intermediate = 32, experts = 8, vocab = 16;
+    DeepseekV41Config config;
+    config.vocab = vocab;
+    config.hidden = hidden;
+    config.n_layers = 4;
+    config.causal_encoder_layers = 2;
+    config.n_heads = 4;
+    config.n_kv_heads = 1;
+    config.head_dim = 512;
+    config.rope_head_dim = 64;
+    config.q_lora_rank = 16;
+    config.o_lora_rank = 16;
+    config.o_groups = 4;
+    config.moe_inter = intermediate;
+    config.n_experts = experts;
+    config.n_shared = 1;
+    config.top_k = 2;
+    config.swiglu_limit = 10;
+    config.rms_eps = 1e-6;
+    config.sliding_window = 4;
+    config.max_position_embeddings = 64;
+    config.compress_ratios = {0, 2, 1, 1, 0, 0, 0};
+    config.kv_source_layers = {1, 2};
+    config.index_source_layers = {1, 2, 3};
+    config.index_n_heads = 2;
+    config.index_head_dim = 128;
+    config.index_topk = 4;
+    config.candidate_source_layer = 2;
+    config.candidate_topk_blocks = 4;
+    config.candidate_block_size = 2;
+    config.hc_mult = 4;
+    config.hc_sinkhorn_iters = 20;
+    config.engram_layer_ids = {1};
+    config.engram_num_embeddings = {37};
+    config.engram_max_ngram_size = 2;
+    config.engram_vocab_size = vocab;
+    config.engram_n_heads = 1;
+    config.engram_head_dim = 32;
+    config.engram_compressed_vocab_size = vocab;
+    config.n_mtp_layers = 3;
+    config.dspark_block_size = 5;
+    config.dspark_noise_token_id = 7;
+    config.dspark_target_layer_ids = {1, 2, 3};
+    config.dspark_markov_rank = 16;
+    config.dspark_n_experts = experts;
+    config.dspark_top_k = 3;
+    config.validate();
+    std::vector<MappedRecordFixture> records;
+    const auto dense = [&](const std::string& name, std::vector<int> shape,
+        bool fp32 = false, std::optional<float> constant = std::nullopt) {
+        std::vector<std::uint8_t> blob;
+        append<std::uint32_t>(blob, shape.size());
+        std::size_t count = 1;
+        for (const int dimension : shape) { append<std::int64_t>(blob, dimension); count *= dimension; }
+        for (std::size_t index = 0; index < count; ++index) {
+            const float value = constant.value_or(std::sin(index * 0.13f + name.size()) * 0.002f);
+            if (fp32) append<float>(blob, value);
+            else append<mlx::core::float16_t>(blob, mlx::core::float16_t(value));
+        }
+        records.push_back({name, fp32 ? "F32" : "F16", std::move(blob)});
+    };
+    dense("model.token_embedding.weight", {vocab, hidden});
+    dense("model.output.weight", {vocab, hidden});
+    const auto projection = [&](int output, int input) {
+        return make_raw_nim2(experts, output, input, {
+            {{0, 1, 2, 3, 4, 5, 6, 7}, "NINTv2",
+                make_nint_v2_tensor(experts * output, input, 13, 16), {}},
+        });
+    };
+    for (int layer = 0; layer < 7; ++layer) {
+        const auto root = layer < 4 ? "model.block." + std::to_string(layer)
+            : "predictor.stage." + std::to_string(layer - 4);
+        const auto attention = root + ".attention";
+        dense(attention + ".query_a.weight", {16, hidden});
+        dense(attention + ".query_b.weight", {4 * 512, 16});
+        dense(attention + ".key_value.weight", {512, hidden});
+        dense(attention + ".output_a.weight", {4 * 16, 512});
+        dense(attention + ".output_b.weight", {hidden, 4 * 16});
+        dense(attention + ".query_a_norm.weight", {16}, true, 1);
+        dense(attention + ".key_value_norm.weight", {512}, true, 1);
+        dense(attention + ".sink", {4}, true, 0);
+        if (config.is_kv_source(layer)) {
+            dense(attention + ".compressor.key_value.weight", {512, hidden});
+            dense(attention + ".compressor.norm.weight", {512}, true, 1);
+            if (config.compress_ratios[layer] > 1)
+                dense(attention + ".compressor.gate.weight", {512, hidden});
+            dense(attention + ".indexer.key.weight", {128, 512});
+            dense(attention + ".indexer.key_norm.weight", {128}, true, 1);
+        }
+        if (config.is_index_source(layer)) {
+            dense(attention + ".indexer.query.weight", {2 * 128, 16});
+            dense(attention + ".indexer.score.weight", {2, hidden});
+        }
+        for (const std::string branch : {"attention", "mlp"}) {
+            const auto prefix = root + "." + branch;
+            dense(prefix + ".norm.weight", {hidden}, true, 1);
+            dense(prefix + ".mhc.pre.function", {24, 4 * hidden}, true);
+            dense(prefix + ".mhc.pre.base", {24}, true, 0);
+            dense(prefix + ".mhc.pre.scale", {3}, true, 1);
+        }
+        const auto mlp = root + ".mlp";
+        dense(mlp + ".router.weight", {experts, hidden});
+        dense(mlp + ".router.bias", {experts}, true, 0);
+        dense(mlp + ".shared_expert.gate.weight", {intermediate, hidden});
+        dense(mlp + ".shared_expert.up.weight", {intermediate, hidden});
+        dense(mlp + ".shared_expert.down.weight", {hidden, intermediate});
+        records.push_back({mlp + ".experts.gate.weight", "MFE", projection(intermediate, hidden)});
+        records.push_back({mlp + ".experts.up.weight", "MFE", projection(intermediate, hidden)});
+        records.push_back({mlp + ".experts.down.weight", "MFE", projection(hidden, intermediate)});
+    }
+    dense("predictor.stage.0.main_projection.weight", {hidden, 3 * hidden});
+    dense("predictor.stage.0.main_norm.weight", {hidden}, true, 1);
+    dense("predictor.stage.2.output_norm.weight", {hidden}, true, 1);
+    dense("predictor.stage.2.markov.embedding.weight", {vocab, 16}, false,
+        reject_drafts ? std::optional<float>{1} : std::nullopt);
+    dense("predictor.stage.2.markov.output.weight", {vocab, 16}, false,
+        reject_drafts ? std::optional<float>{0} : std::nullopt);
+    if (reject_drafts) {
+        for (int column = 0; column < 16; ++column) {
+            records.back().payload.at(20 + column * 2) = 0;
+            records.back().payload.at(21 + column * 2) = 0x3c;
+        }
+    }
+    dense("predictor.stage.2.confidence.projection.weight", {1, hidden + 16}, true);
+    const std::string engram = "model.block.1.associative_memory";
+    dense(engram + ".query.weight", {4, hidden}, true);
+    dense(engram + ".key.weight", {4, hidden}, true);
+    dense(engram + ".projection.weight", {5 * hidden, 32});
+    records.push_back({engram + ".embedding.weight", "NINT",
+        make_nint_v2_tensor(37, 32, 19, 16).blob});
+    std::vector<std::uint8_t> hash;
+    for (const char c : std::string("MFQENGR1")) hash.push_back(c);
+    for (const auto value : {vocab, vocab, 1, 2, 1}) append<std::uint32_t>(hash, value);
+    append<std::int32_t>(hash, 0);
+    append<std::int32_t>(hash, 1);
+    for (const auto value : {37, 37, 0, 3, 5}) append<std::int64_t>(hash, value);
+    for (int token = 0; token < vocab; ++token) append<std::int32_t>(hash, token);
+    records.push_back({"__mfq_asset__/deepseek-v41-engram-v1.bin", "BLOB", std::move(hash)});
+    const TemporaryMfq file(records);
+    const MfqContainer model(file.path());
+    for (const int mode : {-1, 0, 1}) {
+        auto cache = mode < 0 ? nullptr : std::make_shared<MlxMfeOffloadCache>(model,
+            mode == 0 ? std::size_t{0} : std::size_t{1} << 20);
+        auto rope = mlx_yarn_tables(64, 64, 10000.0f);
+        std::vector<MlxDeepseekV41Layer> layers;
+        for (int layer = 0; layer < 4; ++layer)
+            layers.push_back(MlxDeepseekV41Layer::load(model, config, layer, 64, rope, rope, nullptr, cache));
+        auto embedding = MlxEmbedding::load(model, "model.token_embedding.weight");
+        auto head = MlxLinear::load(model, "model.output.weight");
+        auto dspark = MlxDeepseekV41DSpark::load_if_present(model, config, embedding, head, 64,
+            nullptr, cache, 4);
+        require(dspark.has_value(), "V4.1 fixture has no DSpark stages");
+        MlxDeepseekV41CausalLm runtime(config, std::move(embedding),
+            std::move(layers), mlx::core::ones({hidden}), std::move(head),
+            MlxDeepseekV41EngramHashState::load(model, config), 64, nullptr, cache,
+            std::nullopt, std::move(dspark), std::make_shared<MfqContainer>(model));
+        const std::vector<std::int64_t> prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 2};
+        const auto ids = mlx::core::array(prompt.begin(), mlx::core::Shape{1, 17}, mlx::core::int32);
+        {
+            const std::vector<std::int64_t> chunked_prompt(prompt.begin(), prompt.begin() + 16);
+            const auto chunked_ids = mlx::core::array(chunked_prompt.begin(), mlx::core::Shape{1, 16}, mlx::core::int32);
+            const auto full = runtime.prefill(chunked_ids, 8, true);
+            const auto reference = evaluated_floats(mlx::core::slice(full, {0, 15, 0}, {1, 16, vocab}));
+            const auto reference_state = runtime.capture_text_session_state(chunked_prompt);
+            const auto next = mlx::core::array({3}, mlx::core::Shape{1, 1}, mlx::core::int32);
+            const auto reference_next = evaluated_floats(runtime.decode(next));
+            const auto actual = evaluated_floats(runtime.prefill(chunked_ids, 8));
+            const auto state = runtime.capture_text_session_state(chunked_prompt);
+            for (std::size_t index = 0; index < actual.size(); ++index)
+                require_close(actual[index], reference[index], 0.002f + std::abs(reference[index]) * 0.002f);
+            for (const auto& layer : state.layers)
+                require(layer.attention.position == 16,
+                    "V4.1 deferred Decoder left an incomplete layer position");
+            const auto prefix = [](const auto& value) {
+                auto end = value.shape();
+                end[1] = 16;
+                return evaluated_floats(mlx::core::slice(value, mlx::core::Shape(value.ndim(), 0), end));
+            };
+            require(state.engram_hash.position == 16
+                    && state.layers[2].attention.compressed_length == 16
+                    && prefix(*state.layers[2].attention.compressed_kv)
+                        == prefix(*reference_state.layers[2].attention.compressed_kv)
+                    && prefix(*state.layers[2].attention.index_k)
+                        == prefix(*reference_state.layers[2].attention.index_k),
+                "V4.1 deferred Decoder lost Encoder KV, Indexer or Engram history");
+            const auto actual_next = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < actual_next.size(); ++index)
+                require_close(actual_next[index], reference_next[index],
+                    0.002f + std::abs(reference_next[index]) * 0.002f);
+            MlxSamplingParams sampling;
+            sampling.temperature = 0;
+            sampling.mtp_max_draft_tokens = 5;
+            sampling.enable_mtp = false;
+            std::vector<std::int64_t> ordinary, speculative;
+            require(runtime.generate(chunked_prompt, sampling, 8,
+                [&](auto token) { ordinary.push_back(token); return true; }, {}, {}, std::nullopt, 8) == 8,
+                "V4.1 deferred Decoder ordinary generation did not complete");
+            sampling.enable_mtp = true;
+            require(runtime.generate(chunked_prompt, sampling, 8,
+                [&](auto token) { speculative.push_back(token); return true; }, {}, {}, std::nullopt, 8) == 8
+                    && speculative == ordinary,
+                "V4.1 deferred Decoder changed DSpark generation");
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                speculative.clear();
+                require(runtime.generate(chunked_prompt, sampling, 8,
+                    [&](auto token) { speculative.push_back(token); return true; }, {}, {}, chunked_prompt.size(), 8) == 8
+                        && speculative == ordinary,
+                    "V4.1 deferred Decoder changed persistent-prefix DSpark generation");
+            }
+        }
+        const auto logits = evaluated_floats(runtime.prefill(ids, 8));
+        require(logits.size() == vocab && std::all_of(logits.begin(), logits.end(),
+            [](float value) { return std::isfinite(value); }), "V4.1 CED prefill returned invalid logits");
+        auto saved = runtime.capture_text_session_state(prompt);
+        require(saved.engram_hash.position == 17, "V4.1 CED truncated Engram history");
+        for (const auto& layer : saved.layers)
+            require(layer.attention.position == 17, "V4.1 CED left a decoder cache at the tail length");
+        const auto next = mlx::core::array({3}, mlx::core::Shape{1, 1}, mlx::core::int32);
+        const auto expected = evaluated_floats(runtime.decode(next));
+        runtime.restore_text_session_state(saved);
+        require(evaluated_floats(runtime.decode(next)) == expected,
+            "V4.1 CED prefix restore changed subsequent decode");
+        if (mode == 1) {
+            auto history = prompt;
+            history.push_back(3);
+            for (int repeat = 0; repeat < 24; ++repeat) {
+                runtime.restore_text_session_state(saved);
+                const auto actual = evaluated_floats(runtime.decode(next));
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    require_close(actual[index], expected[index], 0.002f + std::abs(expected[index]) * 0.002f);
+                require(runtime.cache_position() == 18,
+                    "V4.1 cached-route batching advanced the context twice");
+                const auto state = runtime.capture_text_session_state(history);
+                for (const auto& layer : state.layers)
+                    require(layer.attention.position == 18 && !layer.attention.speculation,
+                        "V4.1 cached-route batching left a pending cache transaction");
+            }
+            require(cache->reuse_stats().cached_route_hits > 0,
+                "V4.1 replay did not exercise cached expert routing");
+            const std::string missing_name = "model.block.3.mlp.experts.gate.weight";
+            require(bool(cache->cached_projection(missing_name)),
+                "V4.1 forced-miss fixture has no cached suffix projection");
+            if (auto view = cache->cached_projection(missing_name)) {
+                std::vector<std::string> preferred;
+                for (int layer = 0; layer < 4; ++layer)
+                    for (const std::string projection : {"gate", "up", "down"}) {
+                        const auto name = "model.block." + std::to_string(layer)
+                            + ".mlp.experts." + projection + ".weight";
+                        if (name != missing_name) preferred.push_back(name);
+                    }
+                cache->set_prefill_priority(preferred);
+                const auto limit = cache->cache_limit_bytes();
+                while (std::count_if(view->host_expert_map.begin(), view->host_expert_map.end(),
+                        [](auto expert) { return expert >= 0; }) > 1) {
+                    cache->set_cache_limit(cache->resident_packed_bytes() - 1);
+                    cache->set_cache_limit(limit);
+                    view = cache->cached_projection(missing_name);
+                    require(bool(view), "V4.1 forced miss removed the entire cached projection");
+                }
+                cache->set_prefill_priority({});
+                const auto before = cache->reuse_stats();
+                runtime.restore_text_session_state(saved);
+                const auto actual = evaluated_floats(runtime.decode(next));
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    require_close(actual[index], expected[index], 0.002f + std::abs(expected[index]) * 0.002f);
+                const auto after = cache->reuse_stats();
+                require(after.cached_route_hits > before.cached_route_hits
+                        && after.cached_route_misses > before.cached_route_misses,
+                    "V4.1 partial cached-route replay did not preserve its valid prefix");
+                const auto state = runtime.capture_text_session_state(history);
+                for (const auto& layer : state.layers)
+                    require(layer.attention.position == 18 && !layer.attention.speculation,
+                        "V4.1 partial cached-route replay left an invalid KV transaction");
+            }
+        }
+        if (mode < 0) {
+            const auto limit = runtime.resident_full_expert_bytes() / 2;
+            require(limit > 0 && runtime.ssd_expert_payload_bytes() == 0,
+                "V4.1 full-resident accounting reported SSD weights");
+            runtime.set_expert_cache_limit(limit);
+            require(runtime.resident_full_expert_bytes() + runtime.dynamic_weight_bytes() <= limit &&
+                    runtime.ssd_expert_payload_bytes() > 0 && runtime.cache_position() == 18,
+                "V4.1 dynamic offload exceeded its budget or reset the context");
+            runtime.restore_text_session_state(saved);
+            const auto paged = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < paged.size(); ++index)
+                require_close(paged[index], expected[index], 0.002f + std::abs(expected[index]) * 0.002f);
+        }
+        const auto ceiling = runtime.resident_full_expert_bytes() + runtime.expert_cache_limit_bytes();
+        const auto resident = runtime.reclaimable_expert_bytes();
+        if (resident > 0) {
+            mlx_trim_expert_residency(runtime, resident / 2);
+            require(runtime.reclaimable_expert_bytes() <= resident / 2 &&
+                    runtime.resident_full_expert_bytes() + runtime.expert_cache_limit_bytes() == ceiling,
+                "V4.1 temporary reclamation changed the configured expert ceiling");
+            runtime.restore_text_session_state(saved);
+            const auto restored = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < restored.size(); ++index)
+                require_close(restored[index], expected[index], 0.002f + std::abs(expected[index]) * 0.002f);
+            require(runtime.reclaimable_expert_bytes() > 0,
+                "V4.1 expert cache could not refill after temporary reclamation");
+        }
+        runtime.set_expert_cache_limit(0);
+        require(runtime.cache_position() == 18 && runtime.reclaimable_expert_bytes() == 0,
+            "V4.1 budget resize discarded KV or retained zero-budget expert pages");
+        auto all = runtime.prefill(ids, 8, true);
+        require(all.shape() == mlx::core::Shape{1, 17, vocab}, "V4.1 CED truncated full-logit evaluation");
+        all.eval();
+        MlxSamplingParams sampling;
+        sampling.temperature = 0;
+        sampling.mtp_max_draft_tokens = 5;
+        sampling.enable_mtp = false;
+        std::vector<std::int64_t> ordinary;
+        require(runtime.generate(prompt, sampling, 8,
+            [&](std::int64_t token) { ordinary.push_back(token); return true; }, {}, {}, prompt.size(), 8) == 8,
+            "V4.1 ordinary decode did not finish the fixture");
+        sampling.enable_mtp = true;
+        std::vector<std::int64_t> generated;
+        const auto count = runtime.generate(prompt, sampling, 8,
+            [&](std::int64_t token) { generated.push_back(token); return true; }, {}, {}, prompt.size(), 8);
+        require(count == 8 && generated.size() == 8 && runtime.last_mtp_stats().used &&
+                runtime.last_mtp_stats().drafted_tokens > 0,
+            "V4.1 CED failed to initialize or verify DSpark drafts");
+        auto prefix = runtime.capture_text_session_state(prompt);
+        require(prefix.dspark && prefix.dspark->position() == 17,
+            "V4.1 CED did not preserve DSpark prefix position");
+        require(generated == ordinary, "V4.1 DSpark changed greedy target tokens");
+        require(reject_drafts
+                ? runtime.last_mtp_stats().accepted_tokens < runtime.last_mtp_stats().drafted_tokens
+                : runtime.last_mtp_stats().accepted_tokens > 0,
+            "V4.1 DSpark fixture did not exercise its acceptance/rollback branch");
+    }
+}
+
+void test_deepseek_v41_streamed_moe() {
+    using namespace mfq::metal;
+    constexpr int experts = 8, hidden = 96, intermediate = 64;
+    const auto projection = [&](int output, int input, int salt) {
+        const auto nint = make_nint_v2_tensor(4 * output, input, salt, 16);
+        const auto vq = make_jsc_nvq(4 * output, input);
+        return make_raw_nim2(experts, output, input, {
+            {{0, 2, 4, 6}, "NINTv2", nint, {}},
+            {{1, 3, 5, 7}, vq.dtype, {vq.blob, vq.dense, 4 * output, input}, vq.runtime},
+        });
+    };
+    std::vector<std::uint8_t> bias;
+    append<std::uint32_t>(bias, 1);
+    append<std::int64_t>(bias, experts);
+    for (int index = 0; index < experts; ++index) append<float>(bias, index * 0.01f);
+    for (const bool split : {false, true}) {
+        const std::string prefix = "model.block.0.mlp";
+        std::vector<MappedRecordFixture> records{
+            {prefix + ".router.weight", "F16", make_dense_tensor("F16", experts, hidden, 3).blob},
+            {prefix + ".router.bias", "F32", bias},
+            {prefix + ".shared_expert.gate.weight", "F16",
+                make_dense_tensor("F16", intermediate, hidden, 5).blob},
+            {prefix + ".shared_expert.up.weight", "F16",
+                make_dense_tensor("F16", intermediate, hidden, 7).blob},
+            {prefix + ".shared_expert.down.weight", "F16",
+                make_dense_tensor("F16", hidden, intermediate, 11).blob},
+            {prefix + ".experts.down.weight", "MFE", projection(hidden, intermediate, 13)},
+        };
+        records.push_back({prefix + (split ? ".experts.gate.weight" : ".experts.gate_up.weight"),
+            "MFE", projection(split ? intermediate : 2 * intermediate, hidden, 17)});
+        if (split) records.push_back({prefix + ".experts.up.weight", "MFE",
+            projection(intermediate, hidden, 19)});
+        const TemporaryMfq file(records);
+        const MfqContainer model(file.path());
+        for (const int top_k : {3, 6}) {
+            DeepseekV41Config config;
+            config.hidden = hidden;
+            config.moe_inter = intermediate;
+            config.n_experts = experts;
+            config.top_k = top_k;
+            config.norm_topk_prob = true;
+            config.routed_scaling = 1.5;
+            config.swiglu_limit = 10.0;
+            const auto resident = MlxDeepseekV41Moe::load(model, config, prefix);
+            auto converted = MlxDeepseekV41Moe::load(model, config, prefix);
+            require(converted.resident_routed_bytes() > 0,
+                "V4.1 resident expert accounting is empty");
+            auto resized = std::make_shared<MlxMfeOffloadCache>(model, 1u << 20);
+            converted.validate_offload(resized);
+            converted.use_offload(resized);
+            require(converted.resident_routed_bytes() == 0,
+                "V4.1 dynamic offload retained full expert weights");
+            for (const std::size_t budget : {std::size_t{0}, std::size_t{1} << 20}) {
+                auto cache = std::make_shared<MlxMfeOffloadCache>(model, budget);
+                const auto streamed = MlxDeepseekV41Moe::load(model, config, prefix, false, nullptr, cache);
+                for (const int rows : {1, 2, 3, 4, 5, 6, 7, 32, 64, 128}) {
+                    std::vector<float> input(rows * hidden);
+                    for (int row = 0; row < rows; ++row)
+                        for (int column = 0; column < hidden; ++column)
+                            input[row * hidden + column] = std::sin(column * 0.17f) * 0.01f;
+                    const auto x = mlx::core::astype(mlx::core::array(input.begin(),
+                        mlx::core::Shape{1, rows, hidden}), mlx::core::float16);
+                    const auto expected = resident.forward(x);
+                    const auto actual = streamed.forward(x);
+                    const auto a = evaluated_floats(actual.routed), b = evaluated_floats(expected.routed);
+                    for (std::size_t index = 0; index < a.size(); ++index)
+                        require_close(a[index], b[index], 0.002f + std::abs(b[index]) * 0.002f);
+                    require(evaluated_floats(actual.shared) == evaluated_floats(expected.shared),
+                        "V4.1 streaming changed shared-expert output");
+                    require(cache->resident_packed_bytes() <= budget,
+                        "V4.1 streaming exceeded the expert-cache budget");
+                    if (budget == 0) {
+                        resized->set_cache_limit(rows % 2 ? 0 : 1u << 20);
+                        const auto dynamic = evaluated_floats(converted.forward(x).routed);
+                        for (std::size_t index = 0; index < dynamic.size(); ++index)
+                            require_close(dynamic[index], b[index], 0.002f + std::abs(b[index]) * 0.002f);
+                        require(resized->resident_packed_bytes() <= resized->cache_limit_bytes(),
+                            "V4.1 dynamic resize exceeded its new cache limit");
+                    }
+                }
+                if (budget != 0) {
+                    const auto x = mlx::core::full({1, 1, hidden}, 0.01f, mlx::core::float16);
+                    const auto expected = evaluated_floats(resident.forward(x).routed);
+                    for (int step = 0; step < 24; ++step) {
+                        const auto actual = evaluated_floats(streamed.forward(x).routed);
+                        for (std::size_t index = 0; index < actual.size(); ++index)
+                            require_close(actual[index], expected[index], 0.002f + std::abs(expected[index]) * 0.002f);
+                    }
+                    if (__builtin_available(macOS 15, *)) {
+                        if (mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3))
+                            require(cache->reuse_stats().cached_route_hits > 0,
+                                "V4.1 did not use the shared cached-route path");
+                    }
+                }
+            }
+        }
+    }
 }
 
 void test_streamed_mixed_mfe_residency() {
+    bool indirect_supported = false;
+    if (__builtin_available(macOS 15, *)) indirect_supported =
+        mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3);
     constexpr int experts = 12;
     constexpr int output = 13;
     constexpr int input = 96;
@@ -6300,6 +7086,11 @@ void test_streamed_mixed_mfe_residency() {
     const TemporaryMfq file({
         {"mixed", "MFE", blob},
         {"alternate", "MFE", alternate_blob},
+        {"twin", "MFE", blob},
+        {"pair_up", "MFE", make_raw_nim2(experts, output, input, {
+            {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, "NINTv2",
+                make_nint_v2_tensor(experts * output, input, 71, 28), {}},
+        })},
     });
     const mfq::metal::MfqContainer model(file.path());
     mfq::metal::MlxMfeOffloadCache residency(
@@ -6328,6 +7119,259 @@ void test_streamed_mixed_mfe_residency() {
         "discarding an MFE record retained SSD backing telemetry");
 
     const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
+    {
+        mfq::metal::MlxMfeOffloadCache streamed(model, 1u << 24);
+        std::vector<std::int32_t> active(experts);
+        std::iota(active.begin(), active.end(), 0);
+        const auto paged = streamed.grouped_mfe("mixed", active);
+        for (const auto& weight : {full, paged}) {
+            require(weight.supports_fused_routed_reduce(),
+                "mixed-format Down did not expose fused weighted reduction");
+            for (const int rows : {1, 2, 3, 6}) {
+                std::vector<std::int32_t> selected(rows * 6);
+                for (std::size_t i = 0; i < selected.size(); ++i)
+                    selected[i] = i % 9 == 0 ? -1 : (i * 5 + i / 6) % experts;
+                const auto ids = mlx::core::array(selected.begin(), mlx::core::Shape{rows, 6});
+                for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {
+                    auto x = mlx::core::astype(mlx::core::reshape(
+                        mlx::core::sin(mlx::core::arange(rows * 6 * input, mlx::core::float32) * 0.03f),
+                        {rows, 6, input}), dtype);
+                    auto scales = mlx::core::full({rows, 6}, 0.125f, mlx::core::float32);
+                    auto expected = evaluated_floats(mfq::metal::moe_weighted_reduce(
+                        weight.routed_matmul(x, ids), scales));
+                    auto actual = evaluated_floats(weight.routed_matmul_reduce(x, ids, scales));
+                    require(actual.size() == expected.size(), "mixed Down reduction shape changed");
+                    for (std::size_t i = 0; i < actual.size(); ++i)
+                        require_close(expected[i], actual[i], dtype == mlx::core::float16 ? 0.001f : 0.00001f);
+                }
+            }
+        }
+    }
+    {
+        mfq::metal::MlxMfeOffloadCache priority(model, 1u << 24);
+        const std::vector<std::int32_t> active{4, 1};
+        (void)priority.grouped_mfe("mixed", active);
+        const auto encoder_bytes = priority.resident_packed_bytes();
+        for (int round = 0; round < 4; ++round)
+            (void)priority.grouped_mfe("twin", active);
+        priority.set_prefill_priority(std::array{std::string("mixed")});
+        priority.set_cache_limit(encoder_bytes);
+        const auto loads = priority.reuse_stats().expert_loads;
+        (void)priority.grouped_mfe("mixed", active, {}, true);
+        require(priority.reuse_stats().expert_loads == loads,
+            "prefill priority evicted Encoder pages before hotter Decoder pages");
+        priority.set_prefill_priority({});
+        priority.set_cache_limit(0);
+        require(priority.resident_packed_bytes() == 0,
+            "prefill priority prevented zero-budget eviction");
+        priority.set_prefill_priority(std::array{std::string("mixed")});
+        priority.clear();
+        priority.set_cache_limit(encoder_bytes);
+        (void)priority.grouped_mfe("mixed", active, {}, true);
+        priority.discard_record("mixed");
+        priority.set_prefill_priority({});
+        require(priority.resident_packed_bytes() == 0,
+            "discarding prioritized pages retained resident bytes");
+    }
+    if (indirect_supported) {
+        mfq::metal::MlxMfeOffloadCache hot(model, 1u << 24);
+        const std::vector<std::int32_t> active{4, 1, 7};
+        (void)hot.grouped_mfe("mixed", active);
+        const auto reads = hot.reuse_stats().bytes_read;
+        std::size_t reserved = 0;
+        mfq::metal::MlxResidentBudgetScope scope([&](std::size_t bytes) {
+            reserved += bytes;
+            hot.clear();
+        });
+        const auto paged = hot.grouped_mfe("mixed", active);
+        require(reserved == std::size_t{3} * getpagesize() + active.size() * (33 * 4 + 21 * 8),
+            "indirect cache hits reserved another full packed weight copy");
+        require(hot.reuse_stats().bytes_read == reads && hot.resident_packed_bytes() == 0,
+            "a budget trim discarded selected hot pages or readmitted invalidated pages");
+        const auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+        require(evaluated_floats(paged.routed_matmul(x, mlx::core::array({0, 1, 2}, {1, 3})))
+                == evaluated_floats(full.routed_matmul(x, mlx::core::array(active.begin(), {1, 3}))),
+            "budget-protected expert pages changed projection values");
+    }
+    for (const std::vector<std::int32_t> active : {
+            std::vector<std::int32_t>{4, 1, 3, 0, 7, 5}, {3, 0}, {0, 3}}) {
+        mfq::metal::MlxMfeOffloadCache scan(model, 0);
+        const auto canonical = full.select_experts(active).with_automatic_mxfp4_nax_prefill(false);
+        const auto paged = scan.grouped_mfe("mixed", active, {}, true);
+        if (indirect_supported && active.size() == 2)
+            require(!paged.supports_mxfp4_blocks(),
+                "indirect MXFP4 subset advertised contiguous expert slots");
+        for (const int rows : {33, 385}) {
+            const int count = rows * routes;
+            std::vector<std::int32_t> values(count);
+            for (int i = 0; i < count; ++i) values[i] = (i * 5 + i / routes) % active.size();
+            const auto ids = mlx::core::array(values.begin(), mlx::core::Shape{rows, routes});
+            const auto order = mlx::core::astype(mlx::core::argsort(mlx::core::reshape(ids,
+                mlx::core::Shape{count})), mlx::core::int32);
+            const auto x = mlx::core::full({rows, input}, 0.125f, mlx::core::float16);
+            const auto plan = canonical.build_grouped_mmq_plan(ids, order, 32);
+            const auto expected = evaluated_floats(canonical.routed_matmul_sorted(
+                x, ids, order, false, false, 0.0f, &plan));
+            const auto copies = mfq::metal::MlxMfeWeight::packed_copy_count();
+            const auto actual = evaluated_floats(paged.routed_matmul_sorted(
+                x, ids, order, false, false, 0.0f, &plan));
+            require(actual == expected, "indirect mixed prefill changed grouped matrix values");
+            bool indirect_supported = false;
+            if (__builtin_available(macOS 15, *)) indirect_supported =
+                mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3);
+            require(!indirect_supported || mfq::metal::MlxMfeWeight::packed_copy_count() == copies,
+                "indirect mixed prefill unnecessarily copied packed expert pages");
+        }
+    }
+    {
+        mfq::metal::MlxMfeOffloadCache individual(model, 0), coalesced(model, 0);
+        std::vector<std::int32_t> active(experts);
+        std::iota(active.begin(), active.end(), 0);
+        const auto serial = individual.grouped_mfe("mixed", active);
+        const auto batched = coalesced.grouped_mfe("mixed", active, {}, true);
+        const auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+        const auto ids = mlx::core::array(active.begin(), mlx::core::Shape{1, experts});
+        require(evaluated_floats(serial.routed_matmul(x, ids)) == evaluated_floats(batched.routed_matmul(x, ids)),
+            "coalescing adjacent expert reads changed packed values");
+        require(coalesced.reuse_stats().read_calls < individual.reuse_stats().read_calls
+                && coalesced.reuse_stats().bytes_read <= individual.reuse_stats().bytes_read,
+            "coalesced prefill reads did not reduce system calls or read unrequested gaps");
+    }
+    {
+        mfq::metal::MlxMfeOffloadCache paired(model, 0);
+        std::vector<std::int32_t> active(experts);
+        std::iota(active.begin(), active.end(), 0);
+        const auto weights = paired.grouped_mfe(std::array{std::string("mixed"), std::string("pair_up")}, active);
+        paired.clear();
+        {
+            const auto gate = weights[0].select_experts(std::array<std::int32_t, 4>{3, 1, 7, 2});
+            const auto up = weights[1].select_experts(std::array<std::int32_t, 3>{0, 4, 11});
+            const auto gate_map = mlx::core::array({0, 1, 3, -1, 2, 0}, mlx::core::int32);
+            const auto up_map = mlx::core::array({2, -1, 1, 0, 2, 1}, mlx::core::int32);
+            const auto ids = mlx::core::reshape(mlx::core::arange(6, mlx::core::int32), {1, 6});
+            const auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+            for (const auto limit : {0.0f, 0.5f}) {
+                auto gate_value = gate.routed_matmul_mapped(x, ids, gate_map);
+                auto up_value = up.routed_matmul_mapped(x, ids, up_map);
+                const auto expected = evaluated_floats(limit > 0
+                    ? mfq::metal::moe_limited_swiglu_pair(gate_value, up_value, limit)
+                    : mfq::metal::moe_swiglu_pair(gate_value, up_value));
+                const auto calls = mfq::metal::MlxMfeWeight::indirect_dispatch_count();
+                const auto actual = evaluated_floats(gate.routed_swiglu_pair(
+                    up, x, ids, limit, nullptr, &gate_map, &up_map));
+                require(actual == expected, "independent Gate/Up page tables changed clipped SwiGLU values");
+                require(!indirect_supported || mfq::metal::MlxMfeWeight::indirect_dispatch_count() == calls + 1,
+                    "independently mapped Gate/Up did not use one fused dispatch");
+            }
+        }
+        for (const int rows : {1, 2, 3, 4, 5, 6}) for (const float limit : {0.0f, 0.5f}) {
+            std::vector<float> values(rows * input);
+            for (std::size_t index = 0; index < values.size(); ++index) values[index] = float(int(index % 23) - 11) / 128;
+            std::vector<std::int32_t> routes(rows * experts);
+            for (std::size_t index = 0; index < routes.size(); ++index) routes[index] = (index * 5 + index / experts) % experts;
+            const auto x = mlx::core::astype(mlx::core::array(values.begin(), mlx::core::Shape{rows, input}), mlx::core::float16);
+            const auto ids = mlx::core::array(routes.begin(), mlx::core::Shape{rows, experts});
+            const auto groups = rows > 1 ? mfq::metal::moe_route_groups_host(routes, rows, experts) : std::nullopt;
+            const auto* grouped = groups ? &*groups : nullptr;
+            for (const bool reverse : {false, true}) {
+                const auto& gate = weights[reverse ? 1 : 0];
+                const auto& up = weights[reverse ? 0 : 1];
+                const auto expected = evaluated_floats(mfq::metal::moe_limited_swiglu_split(
+                    mlx::core::concatenate({gate.routed_matmul(x, ids, grouped), up.routed_matmul(x, ids, grouped)}, -1), limit));
+                const auto copies = mfq::metal::MlxMfeWeight::packed_copy_count();
+                auto result = gate.routed_swiglu_pair(up, x, ids, limit, grouped);
+                require(evaluated_floats(result) == expected, "indirect Gate/Up changed projection or activation values");
+                require(!indirect_supported || mfq::metal::MlxMfeWeight::packed_copy_count() == copies,
+                    "indirect Gate/Up unnecessarily copied expert weights");
+            }
+        }
+    }
+    for (const auto budget : {std::size_t{0}, std::size_t{1}, std::size_t{1u << 24}}) {
+        mfq::metal::MlxMfeOffloadCache combined(model, budget), serial(model, budget);
+        const auto x = mlx::core::full({2, input}, 0.125f, mlx::core::float16);
+        const auto check = [&](const std::vector<std::string>& names,
+            const std::vector<std::int32_t>& active, bool scan = false) {
+            auto weights = combined.grouped_mfe(names, active, {}, scan);
+            std::vector<std::int32_t> ids(2 * active.size());
+            for (std::size_t index = 0; index < ids.size(); ++index) ids[index] = index % active.size();
+            const auto routes = mlx::core::array(ids.begin(),
+                mlx::core::Shape{2, static_cast<int>(active.size())});
+            std::vector<std::vector<float>> expected;
+            for (const auto& name : names)
+                expected.push_back(evaluated_floats(serial.grouped_mfe(name, active).routed_matmul(x, routes)));
+            require(weights.size() == names.size(), "combined MFE projection count mismatch");
+            for (std::size_t index = 0; index < names.size(); ++index)
+                require(evaluated_floats(weights[index].routed_matmul(x, routes)) == expected[index],
+                    "combined MFE preparation changed projection order or expert bytes");
+            combined.clear();
+            for (std::size_t index = 0; index < names.size(); ++index)
+                require(evaluated_floats(weights[index].routed_matmul(x, routes)) == expected[index],
+                    "combined MFE preparation lost retained expert storage");
+        };
+        check({"mixed", "alternate"}, {3, 1, 0, 2});
+        check({"alternate", "mixed"}, {2, 0, 1, 3});
+        check({"mixed", "twin"}, {11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0});
+        const auto pooled = mfq::metal::MlxMfeWeight::pooled_staging_count();
+        check({"mixed", "alternate"}, {3, 1, 0, 2}, true);
+        check({"mixed", "twin"}, {11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}, true);
+        if (budget <= 1) require(mfq::metal::MlxMfeWeight::pooled_staging_count() >= pooled + 4,
+            "prefill misses did not use bounded shared staging arenas");
+        require(combined.resident_packed_bytes() <= budget, "combined MFE preparation exceeded cache budget");
+        for (const std::vector<std::string> names : {std::vector<std::string>{}, {"mixed", "mixed"}, {"mixed", "zzmissing"}}) {
+            bool rejected = false;
+            try { (void)combined.grouped_mfe(names, {1, 2}); }
+            catch (const std::exception&) { rejected = true; }
+            require(rejected, "combined MFE preparation accepted invalid projection names");
+            check({"mixed", "alternate"}, {1, 2});
+        }
+        combined.clear();
+        int reservations = 0;
+        bool denied = false;
+        {
+            mfq::metal::MlxResidentBudgetScope scope([&](std::size_t) {
+                if (++reservations == 2) throw std::runtime_error("denied second projection staging");
+            });
+            try { (void)combined.grouped_mfe(std::array{std::string("mixed"), std::string("alternate")}, {1, 2}); }
+            catch (const std::runtime_error&) { denied = true; }
+        }
+        require(denied && reservations == 2, "combined MFE preparation ignored the staging budget");
+        check({"mixed", "alternate"}, {1, 2});
+        combined.clear();
+        std::vector<std::pair<std::size_t, std::size_t>> staging;
+        {
+            mfq::metal::MlxResidentBudgetScope scope([&](std::size_t bytes) {
+                staging.emplace_back(bytes, mfq::metal::MlxResidentBudgetScope::temporary_bytes());
+            });
+            auto weights = combined.grouped_mfe(std::array{std::string("mixed"), std::string("alternate")}, {1, 2});
+            require(weights.size() == 2, "packed staging lost a projection");
+            require(staging.size() == 2 && staging[0].first > 0 && staging[0].second == 0
+                    && staging[1].second == staging[0].first,
+                "parallel projections did not share their outstanding staging reservation");
+            require(mfq::metal::MlxResidentBudgetScope::temporary_bytes() == 0,
+                "completed expert staging retained a budget reservation");
+        }
+    }
+    {
+        mfq::metal::MlxMfeOffloadCache combined(model, 1u << 24);
+        const auto previous_stream = mlx::core::default_stream(mlx::core::Device::gpu);
+        const auto stream = mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu);
+        mlx::core::set_default_stream(stream);
+        std::barrier start(2);
+        std::array<std::exception_ptr, 2> errors;
+        const auto run = [&](int index) {
+            mlx::core::set_default_stream(stream);
+            start.arrive_and_wait();
+            try { (void)combined.grouped_mfe(index ? std::vector<std::string>{"mixed", "alternate"}
+                : std::vector<std::string>{"alternate", "mixed"}, {3, 1, 0, 2}); }
+            catch (...) { errors[index] = std::current_exception(); }
+        };
+        std::thread first([&] { run(0); }), second([&] { run(1); });
+        first.join(); second.join();
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+        require(combined.reuse_stats().expert_loads == 8,
+            "reversed concurrent MFE projection batches duplicated loads");
+        mlx::core::set_default_stream(previous_stream);
+    }
     for (const auto budget : {std::size_t{0}, std::size_t{1u << 24}}) {
         mfq::metal::MlxMfeOffloadCache changing(model, budget);
         mfq::metal::MlxKernelPreparation preparation(128, 128);
@@ -6347,7 +7391,7 @@ void test_streamed_mixed_mfe_residency() {
                     const auto ids_array = mlx::core::array(ids.begin(), mlx::core::Shape{rows, routes});
                     outputs.push_back(weight.routed_matmul(x, ids_array));
                     preparation.add(outputs.back());
-                    if (rows > 1 && rows <= 6) {
+                    if (rows > 1 && rows <= 24) {
                         const auto groups = mfq::metal::moe_route_groups_host(ids, rows, routes);
                         outputs.push_back(weight.routed_matmul(x, ids_array, &*groups));
                         preparation.add(outputs.back());
@@ -6365,17 +7409,26 @@ void test_streamed_mixed_mfe_residency() {
         });
         preparation.finish();
     }
-    for (const int rows : {2, 3, 4, 5, 6}) {
-        const std::vector<float> source(rows * input, 0.125f);
-        const auto x = mlx::core::astype(mlx::core::array(source.begin(), mlx::core::Shape{rows, input}),
-            mlx::core::float16);
-        for (const auto expert : {7, 8, 9}) {
-            const std::vector<std::int32_t> ids(rows * routes, expert);
-            const auto id_array = mlx::core::array(ids.begin(), mlx::core::Shape{rows, routes});
-            const auto groups = mfq::metal::moe_route_groups_host(ids, rows, routes);
-            require(evaluated_floats(full.routed_matmul(x, id_array))
-                == evaluated_floats(full.routed_matmul(x, id_array, &*groups)),
-                "MTP route chunks changed repeated NVQ expert results");
+    const auto repeat_pair = mfq::metal::MlxMfeWeight::from_projection_blobs(
+        std::array<std::span<const std::uint8_t>, 2>{blob, blob});
+    for (const int rows : {2, 3, 4, 5, 6, 8, 12, 17, 24}) {
+        std::vector<float> source(rows * input);
+        for (std::size_t index = 0; index < source.size(); ++index)
+            source[index] = float(int((index * 17 + 5) % 31) - 15) / 128.0f;
+        const auto input_values = mlx::core::array(source.begin(), mlx::core::Shape{rows, input});
+        for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
+            const auto x = mlx::core::astype(input_values, dtype);
+            for (const auto expert : {1, 2, 4, 7, 8, 9}) {
+                const std::vector<std::int32_t> ids(rows * routes, expert);
+                const auto id_array = mlx::core::array(ids.begin(), mlx::core::Shape{rows, routes});
+                const auto groups = mfq::metal::moe_route_groups_host(ids, rows, routes);
+                require(evaluated_floats(full.routed_matmul(x, id_array))
+                    == evaluated_floats(full.routed_matmul(x, id_array, &*groups)),
+                    "MTP route chunks changed repeated expert results");
+                require(evaluated_floats(repeat_pair.routed_swiglu(x, id_array))
+                    == evaluated_floats(repeat_pair.routed_swiglu(x, id_array, 0.0f, &*groups)),
+                    "MTP route chunks changed repeated fused expert results");
+            }
         }
     }
     {
@@ -6383,6 +7436,10 @@ void test_streamed_mixed_mfe_residency() {
         mfq::metal::MlxMfeOffloadCache bulk(model, 2 * (blob.size() + alternate_blob.size()));
         auto layer = bulk.layer_mfe(names);
         require(layer && layer->size() == names.size(), "bulk MFE layer was not loaded");
+        const auto reads = bulk.reuse_stats();
+        require(reads.bytes_read == blob.size() + alternate_blob.size()
+            && reads.read_calls == names.size() && reads.io_seconds > 0,
+            "bulk expert telemetry lost actual file ranges");
         require(bulk.cached_expert_count() == 0 && bulk.resident_packed_bytes() == 0,
             "bulk prefill polluted the decode expert cache");
         std::vector<float> source(input, 0.125f);
@@ -6409,6 +7466,16 @@ void test_streamed_mixed_mfe_residency() {
         bulk.set_cache_limit(1);
         require(!bulk.layer_mfe(names), "bulk MFE ignored insufficient staging capacity");
         bulk.set_cache_limit(2 * (blob.size() + alternate_blob.size()));
+        {
+            const auto packed_staging = 2 * (blob.size() + alternate_blob.size());
+            bool reserved = false;
+            mfq::metal::MlxResidentBudgetScope packed_only([&](std::size_t bytes) {
+                require(bytes == packed_staging, "native bulk MFE reserved a nonexistent F16 expert bank");
+                reserved = true;
+            }, [&](std::size_t bytes) { return bytes <= packed_staging; });
+            require(bulk.layer_mfe(names).has_value() && reserved,
+                "native bulk MFE was refused despite enough packed-weight staging capacity");
+        }
         mfq::metal::MlxResidentBudgetScope deny([](std::size_t) {
             throw std::runtime_error("denied bulk staging should not reserve memory");
         }, [](std::size_t) { return false; });
@@ -6482,8 +7549,12 @@ void test_streamed_mixed_mfe_residency() {
     exercise({7, 0, 6, 4});
     const auto reuse_after = residency.reuse_stats();
     require(reuse_after.expert_loads == reuse_before.expert_loads
-        && reuse_after.packed_hits == reuse_before.packed_hits + 2,
+        && reuse_after.packed_hits == reuse_before.packed_hits + (indirect_supported ? 0 : 2),
         "changing active expert subsets rebuilt packed weights or reread SSD pages");
+    require(reuse_before.bytes_read > 0 && reuse_before.read_calls > 0
+        && reuse_after.bytes_read == reuse_before.bytes_read
+        && reuse_after.read_calls == reuse_before.read_calls,
+        "packed cache hits reported missing or duplicate file reads");
     {
         mfq::metal::MlxMfeOffloadCache concurrent(model, 1u << 24);
         std::vector<std::int32_t> forward(experts);
@@ -6508,7 +7579,8 @@ void test_streamed_mixed_mfe_residency() {
         second.join();
         for (const auto& error : errors) if (error) std::rethrow_exception(error);
         const auto stats = concurrent.reuse_stats();
-        require(stats.expert_loads == experts && stats.packed_hits == 1,
+        require(stats.expert_loads == experts
+                && stats.packed_hits == std::size_t(!indirect_supported || stats.load_waits != 0),
             "concurrent requests duplicated expert reads or packed assembly");
         require(concurrent.resident_packed_bytes() <= concurrent.cache_limit_bytes(),
             "concurrent prepared weights exceeded the expert budget");
@@ -6550,8 +7622,10 @@ void test_streamed_mixed_mfe_residency() {
         auto retained = bounded.grouped_mfe("mixed", {1, 2, 3});
         const auto bytes = bounded.resident_packed_bytes();
         const auto count = bounded.cached_expert_count();
-        require(bounded.set_cache_limit(bytes - 1) > 0 && bounded.cached_expert_count() == count,
-            "shrinking a prepared cache evicted expert pages before packed copies");
+        require(bounded.set_cache_limit(bytes - 1) > 0
+                && (indirect_supported ? bounded.cached_expert_count() < count
+                    : bounded.cached_expert_count() == count),
+            "shrinking the expert cache did not release its actual cached storage");
         bounded.set_cache_limit(1u << 24);
         {
             mfq::metal::MlxResidentBudgetScope scope([&](std::size_t) { bounded.clear(); });
@@ -6577,7 +7651,7 @@ void test_streamed_mixed_mfe_residency() {
             const auto run = [&](int index) {
                 mlx::core::set_default_stream(stream);
                 start.arrive_and_wait();
-                try { (void)transient.grouped_mfe("mixed", ids); }
+                try { (void)transient.grouped_mfe("mixed", ids, {}, true); }
                 catch (...) { errors[index] = std::current_exception(); }
             };
             std::thread first([&] { run(0); });
@@ -6598,6 +7672,49 @@ void test_streamed_mixed_mfe_residency() {
         mlx::core::set_default_stream(previous_stream);
     }
     {
+        const auto packed = make_mxfp4(4 * 128, 1024);
+        const auto pin_blob = make_raw_nim2(4, 128, 1024, {
+            {{0, 1, 2, 3}, "MXFP4", {packed.blob, packed.dense, 4 * 128, 1024}, {}},
+        });
+        const TemporaryMfq pin_file({{"pin", "MFE", pin_blob}});
+        const mfq::metal::MfqContainer pin_model(pin_file.path());
+        const auto before = mfq::metal::MlxMfeWeight::pinned_packed_bytes();
+        const auto failures = mfq::metal::MlxMfeWeight::packed_pin_failures();
+        mfq::metal::MlxMfeOffloadCache cache(pin_model, 8u << 20);
+        auto retained = cache.grouped_mfe("pin", {0}, {}, true);
+        const auto wait_for = [](const auto& ready) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!ready() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        wait_for([&] { return mfq::metal::MlxMfeWeight::pinned_packed_bytes() > before
+            || mfq::metal::MlxMfeWeight::packed_pin_failures() > failures; });
+        require(mfq::metal::MlxMfeWeight::pinned_packed_bytes() > before
+                || mfq::metal::MlxMfeWeight::packed_pin_failures() > failures,
+            "admitted prefill expert neither pinned its storage nor reported an OS refusal");
+        const auto x = mlx::core::full({1, 1024}, 0.125f, mlx::core::float16);
+        const auto ids = mlx::core::reshape(mlx::core::array({0}, mlx::core::int32), {1, 1});
+        const auto expected = evaluated_floats(retained.routed_matmul(x, ids));
+        cache.clear();
+        wait_for([&] { return mfq::metal::MlxMfeWeight::pinned_packed_bytes() == before; });
+        require(mfq::metal::MlxMfeWeight::pinned_packed_bytes() == before,
+            "clearing expert residency retained locked pages");
+        require(evaluated_floats(retained.routed_matmul(x, ids)) == expected,
+            "unpinning an evicted expert changed retained GPU storage");
+        for (int iteration = 0; iteration < 16; ++iteration) {
+            for (int access = 0; access < 3; ++access)
+                (void)cache.grouped_mfe("pin", {0, 1, 2, 3});
+            cache.set_cache_limit(1);
+            require(cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+                "pending page locks prevented expert budget eviction");
+            cache.set_cache_limit(8u << 20);
+        }
+        cache.discard_record("pin");
+        wait_for([&] { return mfq::metal::MlxMfeWeight::pinned_packed_bytes() == before; });
+        require(mfq::metal::MlxMfeWeight::pinned_packed_bytes() == before,
+            "cancelled page locks retained evicted expert storage");
+    }
+    {
         const auto mx_heat = make_mxfp4(4 * output, input);
         const auto heat_blob = make_raw_nim2(4, output, input, {
             {{0, 1, 2, 3}, "MXFP4", {mx_heat.blob, mx_heat.dense, 4 * output, input}, {}},
@@ -6615,9 +7732,59 @@ void test_streamed_mixed_mfe_residency() {
         (void)heat.grouped_mfe("heat", {0});
         require(heat.reuse_stats().expert_loads == before.expert_loads,
             "repeated-token expert heat was lost under cache pressure");
+        const auto scan = heat.grouped_mfe("heat", {0, 1, 2, 3}, {}, true);
+        const auto scanned = heat.reuse_stats();
+        (void)heat.grouped_mfe("heat", {0});
+        require(heat.reuse_stats().expert_loads == scanned.expert_loads,
+            "prefill scan evicted a hot decode expert");
+        const auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+        const auto ids = mlx::core::array({0, 1, 2, 3}, mlx::core::Shape{1, 4});
+        const auto copied = scan.routed_matmul(x, ids);
+        bool packed_copy = false;
+        std::function<void(const mlx::core::array&)> inspect_copy = [&](const auto& node) {
+            if (!node.has_primitive()) return;
+            if (std::string_view(node.primitive().name()) == "PackedCopyPrimitive") { packed_copy = true; return; }
+            for (const auto& input : node.inputs()) inspect_copy(input);
+        };
+        inspect_copy(copied);
+        require(packed_copy, "expert stream assembly did not dispatch the packed copy kernel");
+        require(evaluated_floats(copied) ==
+            evaluated_floats(mfq::metal::MlxMfeWeight::from_blob(heat_blob).routed_matmul(x, ids)),
+            "scan cache eviction released active expert storage");
+        const auto reads = heat.reuse_stats();
+        require(reads.bytes_read == reads.expert_loads * output * (input / 2 + input / 32)
+            && reads.read_calls == 2 * reads.expert_loads && reads.evictions > 0
+            && reads.io_seconds > 0 && reads.prepare_seconds > 0 && reads.view_seconds > 0,
+            "expert load telemetry lost payload bytes, file reads, timings or evictions");
         require(heat.resident_packed_bytes() <= heat.cache_limit_bytes(),
             "weighted expert heat exceeded the cache budget");
     }
+    mlx::core::synchronize();
+    const auto uncached_before = mfq::metal::MlxMfeWeight::uncached_packed_bytes();
+    {
+        constexpr int count = 65, rows = 257, columns = 64;
+        std::vector<std::int32_t> experts(count);
+        std::iota(experts.begin(), experts.end(), 0);
+        const auto mx = make_mxfp4(count * rows, columns);
+        const auto wire = make_raw_nim2(count, rows, columns, {
+            {experts, "MXFP4", {mx.blob, mx.dense, count * rows, columns}, {}},
+        });
+        const TemporaryMfq source({{"copy", "MFE", wire}});
+        const mfq::metal::MfqContainer container(source.path());
+        mfq::metal::MlxMfeOffloadCache transient(container, 0);
+        const auto paged = transient.grouped_mfe("copy", experts);
+        transient.clear();
+        const auto x = mlx::core::full({1, columns}, 0.125f, mlx::core::float16);
+        const auto ids = mlx::core::array(experts.begin(), mlx::core::Shape{1, count});
+        require(evaluated_floats(paged.routed_matmul(x, ids)) ==
+            evaluated_floats(mfq::metal::MlxMfeWeight::from_blob(wire).routed_matmul(x, ids)),
+            "multi-batch packed copy changed unaligned stream tails or source ownership");
+        require(mfq::metal::MlxMfeWeight::uncached_packed_bytes() > uncached_before,
+            "large packed output did not account its uncached allocation");
+    }
+    mlx::core::synchronize();
+    require(mfq::metal::MlxMfeWeight::uncached_packed_bytes() == uncached_before,
+        "uncached packed output was not released after its GPU owners completed");
     require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == blob.size(),
         "MFE cache hits duplicated SSD backing telemetry");
     const auto before = residency.resident_packed_bytes();
@@ -6641,7 +7808,8 @@ void test_streamed_mixed_mfe_residency() {
         "mixed streamed MFE record discard mismatch");
 }
 
-void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt = false) {
+void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt = false, bool nint_predictor = false,
+    bool gdn_block = false, bool qsa_group = false) {
     constexpr int hidden = 96, intermediate = 48, experts = 4;
     std::string config = R"JSON({"model_type":"qwen4_exp_text","vocab_size":32,"hidden_size":96,
         "num_hidden_layers":1,"max_position_embeddings":128,"num_attention_heads":6,
@@ -6654,6 +7822,21 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
         "ple_conv_kernel_size":4,"ple_embed_dim":96,"ple_layer_ids":[],"ngram_size":3,
         "ngram_vocab_size_base":100,"heads_per_ngram":4,"split_ngram_parts":2,
         "mtp_num_hidden_layers":0,"eos_token_id":31,"tie_word_embeddings":false})JSON";
+    if (gdn_block) {
+        auto parsed = nlohmann::json::parse(config);
+        parsed["num_hidden_layers"] = 3;
+        parsed["full_attention_interval"] = 4;
+        parsed["layer_types"] = {"linear_attention", "linear_attention", "linear_attention"};
+        if (qsa_group) {
+            parsed["full_attention_interval"] = 2;
+            parsed["layer_types"][1] = "full_attention";
+        }
+        parsed["linear_num_key_heads"] = 1;
+        parsed["linear_num_value_heads"] = 1;
+        parsed["linear_key_head_dim"] = 128;
+        parsed["linear_value_head_dim"] = 128;
+        config = parsed.dump();
+    }
     if (mtp) {
         const std::string field = "\"mtp_num_hidden_layers\":0";
         config.replace(config.find(field), field.size(), "\"mtp_num_hidden_layers\":1");
@@ -6695,7 +7878,15 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
     dense(mlp + ".router.weight", {experts, hidden});
     dense(mlp + ".shared_expert.gate.weight", {intermediate, hidden});
     dense(mlp + ".shared_expert.up.weight", {intermediate, hidden});
-    dense(mlp + ".shared_expert.down.weight", {hidden, intermediate});
+    if (nint_predictor) {
+        auto tensor = make_nint_v2_tensor(hidden, intermediate, 23, 24);
+        for (int row = 0; row < hidden; ++row) {
+            const std::uint16_t scale = 0x1400, minimum = 0x1000;
+            std::memcpy(tensor.blob.data() + 42 + row * 2, &scale, 2);
+            std::memcpy(tensor.blob.data() + 42 + hidden * 2 + row * 2, &minimum, 2);
+        }
+        records.push_back({mlp + ".shared_expert.down.weight", "NINT", std::move(tensor.blob)});
+    } else dense(mlp + ".shared_expert.down.weight", {hidden, intermediate});
     dense(mlp + ".shared_expert.router.weight", {1, hidden});
     for (const auto& projection : {std::string("gate"), std::string("up"), std::string("down")}) {
         const int rows = projection == "down" ? hidden : intermediate;
@@ -6710,12 +7901,57 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
             make_raw_nim2(experts, rows, columns, {{{0, 1, 2, 3}, "NINTv2",
                 tensor, {}}})});
     }
+    if (gdn_block) {
+        const auto attention_records = records;
+        std::erase_if(records, [](const auto& record) {
+            return record.name.starts_with("model.block.0.attention.") &&
+                !record.name.starts_with("model.block.0.attention.mhc.");
+        });
+        const auto first = records;
+        for (int layer = 1; layer < 3; ++layer) for (const auto& record : first)
+            if (record.name.starts_with("model.block.0."))
+                records.push_back({"model.block." + std::to_string(layer) + "." + record.name.substr(14),
+                    record.dtype, record.payload});
+        for (int layer = 0; layer < 3; ++layer) {
+            if (qsa_group && layer == 1) {
+                for (const auto& record : attention_records)
+                    if (record.name.starts_with("model.block.0.attention.") &&
+                        !record.name.starts_with("model.block.0.attention.mhc."))
+                        records.push_back({"model.block.1." + record.name.substr(14),
+                            record.dtype, record.payload});
+                continue;
+            }
+            const auto root = "model.block." + std::to_string(layer) + ".linear_attention";
+            dense(root + ".qkv.weight", {384, hidden});
+            dense(root + ".gate.weight", {128, hidden});
+            dense(root + ".alpha.weight", {1, hidden});
+            dense(root + ".beta.weight", {1, hidden});
+            dense(root + ".conv.weight", {384, 1, 4});
+            dense(root + ".dt_bias", {1});
+            dense(root + ".a", {1});
+            dense(root + ".norm.weight", {128}, true);
+            dense(root + ".output.weight", {hidden, 128});
+        }
+    }
     if (mtp) {
         const auto target = records;
         const std::string root = "model.block.0.";
         for (const auto& record : target) if (record.name.starts_with(root)) {
             const auto name = "predictor.block.0." + record.name.substr(root.size());
-            if (ttt && record.dtype == "MFE") {
+            if (nint_predictor && record.dtype == "MFE") {
+                if (name.ends_with(".up.weight")) continue;
+                const bool down = name.ends_with(".down.weight");
+                const int output = down ? hidden : 2 * intermediate;
+                auto tensor = make_nint_v2_tensor(experts * output,
+                    down ? intermediate : hidden, 17, 48, true, 8);
+                for (int row = 0; row < experts * output; ++row) {
+                    const std::uint16_t scale = 0x1400, minimum = 0x1000;
+                    std::memcpy(tensor.blob.data() + 42 + row * 2, &scale, 2);
+                    std::memcpy(tensor.blob.data() + 42 + experts * output * 2 + row * 2, &minimum, 2);
+                }
+                records.push_back({down ? name : "predictor.block.0.mlp.experts.gate_up.weight",
+                    "NINT", nint_expert_blob(tensor, experts, output)});
+            } else if (ttt && record.dtype == "MFE") {
                 const bool down = name.ends_with("down.weight");
                 dense(name, {experts, down ? hidden : intermediate, down ? intermediate : hidden});
             } else records.push_back({name, record.dtype, record.payload});
@@ -6882,7 +8118,8 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
         sampling.top_k = 16;
         mfq::metal::warm_mlx_inference({1, 2, 3}, 128, 64, sampling, mtp,
             [&](const auto& tokens, const auto& parameters, int count) {
-                paged.generate(tokens, parameters, count);
+                require(paged.generate(tokens, parameters, count) == count,
+                    "model warmup stopped before covering its requested steps");
             }, [&] {
                 paged.reset_generation_state();
             });
@@ -6920,18 +8157,24 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
     }
     const auto kv = paged.kv_cache_bytes();
     require(kv > 0 && paged.reclaimable_expert_bytes() > 0, "Qwen4 full-resident fixture has no weights or KV");
-    std::size_t layer_payload = 0;
-    for (const auto& record : records)
-        if (record.name.starts_with("model.block.0.mlp.experts.")) layer_payload += record.payload.size();
+    std::size_t layer_payload = 0, predictor_payload = 0;
+    for (const auto& record : records) {
+        if (record.name.starts_with("model.block.") && record.name.find(".mlp.experts.") != std::string::npos)
+            layer_payload += record.payload.size();
+        if (record.name.starts_with("predictor.block.0.mlp.experts.")) predictor_payload += record.payload.size();
+    }
     require(paged.ssd_expert_payload_bytes() == 0 &&
             mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == 0,
         "full-resident Qwen4 model reported SSD expert backing");
     if (mtp) {
         const auto full = paged.resident_full_expert_bytes();
         const auto before = mlx::core::get_active_memory();
-        paged.set_expert_cache_limit(full * 3 / 4);
-        require(paged.resident_full_expert_bytes() > 0 && paged.resident_full_expert_bytes() < full,
-            "Qwen4 partial shrink discarded all full-resident expert layers");
+        const auto budget = full * 3 / 4;
+        paged.set_expert_cache_limit(budget);
+        const auto remaining = paged.resident_full_expert_bytes();
+        require(remaining > 0 && remaining < full
+                && remaining + paged.expert_cache_limit_bytes() == budget,
+            "Qwen4 partial shrink did not share the budget with retained expert banks");
         require(paged.reclaimable_expert_bytes() <= full * 3 / 4
                 && mlx::core::get_active_memory() < before,
             "Qwen4 partial shrink did not release actual expert buffers");
@@ -6939,15 +8182,23 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
             "Qwen4 partial expert shrink discarded the live context");
         require(paged.ssd_expert_payload_bytes() == layer_payload &&
                 mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload,
-            "Qwen4 partial offload reported fully resident layers as SSD backing");
+            "Qwen4 partial shrink reported unspilled expert banks as SSD backing");
+        const auto input = mlx::core::array({4}, mlx::core::Shape{1, 1});
+        const auto expected = evaluated_floats(reference.forward(input));
+        const auto actual = evaluated_floats(paged.forward(input));
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            require_close(actual[index], expected[index], 1e-3f);
+        reference.clear_cache();
+        paged.clear_cache();
+        mlx::core::eval(reference.forward(prompt), paged.forward(prompt));
     }
     const auto active = mlx::core::get_active_memory();
     paged.set_expert_cache_limit(0);
     require(mlx::core::get_active_memory() < active, "Qwen4 expert offload did not release actual buffers");
     require(paged.cache_position() == 3 && paged.kv_cache_bytes() == kv,
         "Qwen4 expert offload discarded the live context");
-    require(paged.ssd_expert_payload_bytes() == layer_payload * (mtp ? 2 : 1) &&
-            mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload * (mtp ? 2 : 1),
+    require(paged.ssd_expert_payload_bytes() == layer_payload + predictor_payload &&
+            mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload + predictor_payload,
         "Qwen4 full offload did not report its active SSD backing records");
     for (const int token : {4, 5, 6}) {
         const auto input = mlx::core::array({token}, mlx::core::Shape{1, 1});
@@ -6963,6 +8214,32 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
     for (std::size_t index = 0; index < actual.size(); ++index) require_close(actual[index], expected[index], 1e-3f);
     require(paged.reclaimable_expert_bytes() > 0 && paged.cache_position() == 7,
         "Qwen4 cache could not regrow without reloading the model");
+    if (gdn_block) {
+        const auto before = paged.ssd_expert_cache_stats()->device_route_hits;
+        for (int step = 0; step < 24; ++step) {
+            const auto ids = mlx::core::array({1 + step % 7}, mlx::core::Shape{1, 1});
+            const auto oracle = evaluated_floats(reference.forward(ids));
+            const auto result = evaluated_floats(paged.forward(ids));
+            for (std::size_t index = 0; index < result.size(); ++index)
+                require_close(result[index], oracle[index], 1e-3f);
+        }
+        require(paged.ssd_expert_cache_stats()->device_route_hits > before + 12,
+            "GDN block did not use cached device routes");
+        paged.set_expert_cache_limit(0);
+        const auto ids = mlx::core::array({9}, mlx::core::Shape{1, 1});
+        const auto oracle = evaluated_floats(reference.forward(ids));
+        const auto result = evaluated_floats(paged.forward(ids));
+        for (std::size_t index = 0; index < result.size(); ++index)
+            require_close(result[index], oracle[index], 1e-3f);
+        require(paged.cache_position() == 32, "GDN route grouping advanced state twice");
+        if (qsa_group) {
+            const auto checkpoint = paged.capture_text_session_state(std::vector<std::int64_t>(32, 1));
+            require(checkpoint.layers[1].position == 32 && checkpoint.layers[1].kv &&
+                    checkpoint.layers[1].kv->position == 32 && checkpoint.layers[1].pooled_keys &&
+                    checkpoint.layers[1].pooled_keys->shape(1) == 16,
+                "QSA route grouping advanced KV or pooled index keys twice");
+        }
+    }
     if (mtp) {
         mfq::metal::MlxSamplingParams sampling;
         paged.generate({1, 2, 3}, sampling, 8);
@@ -6972,6 +8249,49 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
         paged.set_expert_cache_limit(0);
         require(paged.kv_cache_bytes() == bytes && paged.cache_position() == position,
             "Qwen4 expert shrink discarded target or MTP KV");
+    }
+    for (const int rows : {32, 65, 127}) {
+        paged.set_expert_cache_limit(0);
+        std::vector<std::int64_t> ids(rows);
+        for (int index = 0; index < rows; ++index) ids[index] = 1 + index % 7;
+        const auto input = mlx::core::array(ids.begin(), mlx::core::Shape{1, rows});
+        const auto expected = evaluated_floats(reference.forward(input, false));
+        const auto actual = evaluated_floats(paged.forward(input, false));
+        require(actual.size() == expected.size(), "SSD sorted prefill changed the logit shape");
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            require_close(actual[index], expected[index], 1e-3f);
+        require(paged.reclaimable_expert_bytes() == 0, "sorted SSD prefill ignored a zero expert budget");
+    }
+    if (!prepare && !nint_predictor) {
+        std::vector<std::shared_ptr<mfq::metal::MlxQwen4RequestCache>> reference_caches, paged_caches;
+        for (int index = 0; index < 3; ++index) {
+            reference_caches.push_back(reference.make_request_cache());
+            paged_caches.push_back(paged.make_request_cache());
+            (void)evaluated_floats(reference.prefill_request(*reference_caches.back(), {1 + index, 2 + index}));
+            (void)evaluated_floats(paged.prefill_request(*paged_caches.back(), {1 + index, 2 + index}));
+        }
+        paged.set_expert_cache_limit(0);
+        paged.set_expert_cache_limit(1u << 20);
+        const auto before = paged.ssd_expert_cache_stats()->loads;
+        const std::vector<std::vector<std::int64_t>> windows{{4, 5, 6}, {7, 8, 9}, {10, 11, 12}};
+        const auto expected = evaluated_floats(reference.verify_requests(reference_caches, windows).first);
+        const auto actual = evaluated_floats(paged.verify_requests(paged_caches, windows).first);
+        require(actual.size() == expected.size(), "batched SSD verification changed logit shape");
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            require_close(actual[index], expected[index], 1e-3f);
+        require(paged.ssd_expert_cache_stats()->loads > before && paged.reclaimable_expert_bytes() > 0,
+            "batched SSD verification incorrectly used prefill-only whole-layer reads");
+    }
+    if (nint_predictor) {
+        auto cold = mfq::metal::MlxQwen4CausalLm::load(container, 128, 1);
+        reference.clear_cache();
+        const auto expected = evaluated_floats(reference.forward(prompt));
+        const auto actual = evaluated_floats(cold.forward(prompt));
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            require_close(actual[index], expected[index], 1e-3f);
+        mfq::metal::MlxSamplingParams sampling;
+        cold.generate({1, 2, 3}, sampling, 8);
+        require(cold.last_mtp_stats().used, "SSD-loaded 3D NINT predictor did not execute MTP");
     }
 }
 
@@ -7000,9 +8320,12 @@ void test_materialized_mfe_projections() {
         std::unordered_set<const void*> allocations;
         std::size_t bytes = 0;
         std::function<void(const mlx::core::array&)> visit = [&](const auto& node) {
-            if (const auto data = node.data_shared_ptr(); data && data->buffer.ptr()
-                && allocations.insert(data->buffer.ptr()).second) {
-                bytes += node.buffer_size();
+            if (const auto data = node.data_shared_ptr(); data) {
+                const auto buffer = [&] {
+                    if constexpr (requires { data->buffer(); }) return data->buffer().ptr();
+                    else return data->buffer.ptr();
+                }();
+                if (buffer && allocations.insert(buffer).second) bytes += node.buffer_size();
             }
             if (node.has_primitive())
                 for (const auto& input : node.inputs()) visit(input);
@@ -7460,15 +8783,31 @@ void test_streamed_nint_selector_boundaries() {
         std::filesystem::resize_file(file.path(), model.record("broken").offset);
         mfq::metal::MlxMfeOffloadCache bulk(model, 6 * blob.size());
         for (const auto& bad : {std::string("broken"), std::string("nonfinite")}) {
-            const std::array names{std::string("valid"), bad};
-            bool failed = false;
-            try { (void)bulk.layer_mfe(names); }
-            catch (const std::exception&) { failed = true; }
-            require(failed && bulk.cached_expert_count() == 0 && bulk.backing_payload_bytes() == 0,
-                "failed bulk MFE staging committed partial state");
+            for (const std::vector<std::string> names : {
+                    std::vector<std::string>{bad, "valid"}, {"valid", bad},
+                    {"valid", bad, "valid"}}) {
+                bool failed = false;
+                try { (void)bulk.layer_mfe(names); }
+                catch (const std::exception&) { failed = true; }
+                require(failed && bulk.cached_expert_count() == 0 && bulk.backing_payload_bytes() == 0,
+                    "failed bulk MFE staging committed partial state");
+            }
         }
         const std::array valid_names{std::string("valid")};
         require(bulk.layer_mfe(valid_names).has_value(), "bulk MFE workers did not recover after an error");
+        for (const auto& bad : {std::string("broken"), std::string("nonfinite")}) {
+            for (const std::vector<std::string> names : {std::vector<std::string>{bad, "valid"}, {"valid", bad}}) {
+                cache.clear();
+                bool failed = false;
+                try { (void)cache.grouped_mfe(names, pool_ids); }
+                catch (const std::exception&) { failed = true; }
+                require(failed && cache.cached_expert_count() == 0,
+                    "failed combined MFE preparation committed partial cache pages");
+                require(cache.grouped_mfe("valid", pool_ids).experts() == experts,
+                    "combined MFE preparation did not recover after worker failure");
+            }
+        }
+        cache.clear();
         bool rejected = false;
         try { (void)cache.grouped_mfe("broken", pool_ids); }
         catch (const std::exception&) { rejected = true; }
@@ -7506,6 +8845,287 @@ void test_streamed_nint_selector_boundaries() {
             }
             require(cache.resident_packed_bytes() <= cache.cache_limit_bytes(),
                 "streamed NINT selector test exceeded cache budget");
+        }
+    }
+}
+
+void test_streamed_cached_projection() {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    constexpr int experts = 5, output = 7, input = 37;
+    const auto tensor = make_nint_v2_tensor(experts * output, input, 53, 23, true);
+    const auto blob = nint_expert_blob(tensor, experts, output);
+    const TemporaryMfq file({{"gate", "NINT", blob}, {"up", "NINT", blob}});
+    const MfqContainer model(file.path());
+    const auto full = MlxMfeWeight::from_nint_blob(blob);
+    const std::array<std::string, 2> names{"gate", "up"};
+    MlxMfeOffloadCache cache(model, std::size_t{8} << 20, experts);
+    require(!cache.cached_projection("gate"), "cold cache exposed a device projection");
+    for (int step = 0; step < 9; ++step) (void)cache.grouped_mfe(names, {0, 2, 4});
+    std::array<std::shared_ptr<const MlxMfeCachedProjection>, 2> views{
+        cache.cached_projection("gate"), cache.cached_projection("up")};
+    require(views[0] && views[1], "hot projections did not expose device pages");
+    require(cache.cached_projection("gate") == views[0], "hot device projection was rebuilt");
+    require(views[0]->host_expert_map[1] == -1 && views[0]->host_expert_map[3] == -1,
+        "device projection marked an absent expert as resident");
+    for (const int tokens : {1, 2, 3, 6}) {
+        auto x = full_like(ones({tokens, input}, float16), .125f);
+        std::vector<std::int32_t> ids(tokens * 2);
+        for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = std::array{0, 2, 4}[i % 3];
+        const auto routes = array(ids.begin(), Shape{tokens, 2}, int32);
+        const auto expected = evaluated_floats(full.routed_matmul(x, routes));
+        const auto before = cache.reuse_stats();
+        for (const auto& view : views) {
+            require(evaluated_floats(view->weight.routed_matmul(x, take(view->expert_map, routes))) == expected,
+                "cached device projection changed output bits");
+        }
+        require(cache.resolve_cached_projections(views, ids), "resident routes were reported as a miss");
+        require(cache.reuse_stats().cached_route_hits == before.cached_route_hits + 1,
+            "device route hit accounting is inconsistent");
+    }
+    const auto before = cache.reuse_stats();
+    const std::array<std::int32_t, 2> missing{1, 0};
+    require(!cache.resolve_cached_projections(views, missing), "missing device expert was accepted");
+    require(cache.reuse_stats().expert_hits == before.expert_hits,
+        "failed device trial promoted partial hits before replay");
+    require(!cache.cached_projection("gate"), "device miss did not reset confidence");
+    const auto x = full_like(ones({1, input}, float16), .125f);
+    const auto ids = array({0, 4}, Shape{1, 2}, int32);
+    const auto expected = evaluated_floats(full.routed_matmul(x, ids));
+    auto deferred = views[0]->weight.routed_matmul(x, take(views[0]->expert_map, ids));
+    views = {};
+    cache.set_cache_limit(0);
+    require(cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+        "device projection prevented budget eviction");
+    require(evaluated_floats(deferred) == expected, "budget eviction invalidated a lazy device projection");
+    auto retained = [&] {
+        MlxMfeOffloadCache temporary(model, std::size_t{8} << 20, experts);
+        for (int step = 0; step < 9; ++step) (void)temporary.grouped_mfe("gate", {0, 2, 4});
+        auto view = temporary.cached_projection("gate");
+        require(bool(view), "temporary hot projection was unavailable");
+        return view->weight.routed_matmul(x, take(view->expert_map, ids));
+    }();
+    require(evaluated_floats(retained) == expected, "cache destruction invalidated prepared GPU resources");
+}
+
+void test_streamed_nint_expert_tensor() {
+    constexpr int experts = 19, output = 5, input = 37;
+    {
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        std::vector<std::pair<mfq::metal::MlxGroupedMmqPlan, int>> plans;
+        for (const int routes : {128, 65536}) {
+            std::size_t kernels = 0;
+            const std::vector<int> counts = routes == 128
+                ? std::vector<int>{1, 19, 21, 27, 127, 128, 129, 512, 1024}
+                : std::vector<int>{128, 129, 255, 512};
+            for (const int count : counts) {
+                const auto tensor = make_nint_v2_tensor(count * output, input, 53, 23, true, 4);
+                const auto weight = mfq::metal::MlxMfeWeight::from_nint_blob(nint_expert_blob(tensor, count, output));
+                preparation.collect([&] {
+                    const auto ids = mlx::core::zeros({routes / 4, 4}, mlx::core::int32);
+                    const auto order = mlx::core::arange(routes, mlx::core::int32);
+                    auto plan = weight.build_grouped_mmq_plan(ids, order, 32);
+                    preparation.add(plan.block_meta);
+                    plans.emplace_back(std::move(plan), routes / 32);
+                });
+                require(kernels == 0 || preparation.size() == kernels,
+                    "grouped block planning compiled another kernel for a different active expert count: experts="
+                        + std::to_string(count) + " routes=" + std::to_string(routes)
+                        + " before=" + std::to_string(kernels) + " after=" + std::to_string(preparation.size()));
+                kernels = preparation.size();
+            }
+        }
+        require(preparation.size() == 2, "grouped block preparation did not retain exactly its two scheduling policies");
+        preparation.finish();
+        for (const auto& [plan, blocks] : plans) {
+            mlx::core::eval({plan.block_meta, plan.block_count});
+            require(plan.block_count.item<std::int32_t>() == blocks,
+                "runtime expert count changed the grouped block count");
+            auto metadata = plan.block_meta;
+            metadata.eval();
+            const auto* rows = metadata.data<std::int32_t>();
+            for (int block = 0; block < blocks; ++block)
+                require(rows[block * 3] == block * 32 && rows[block * 3 + 1] == 0 && rows[block * 3 + 2] == 32,
+                    "runtime expert count changed grouped row coverage or expert IDs");
+        }
+    }
+    bool indirect_supported = false;
+    if (__builtin_available(macOS 15, *)) indirect_supported =
+        mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3);
+    for (const int group_size : {23, 48, 64}) for (const int q : {0, 4, 5, 6, 8}) {
+        const auto tensor = make_nint_v2_tensor(experts * output, input, 53, group_size, true, q);
+        const auto blob = nint_expert_blob(tensor, experts, output);
+        auto invalid = blob;
+        const std::int64_t wrong_output = output + 1;
+        std::memcpy(invalid.data() + 26, &wrong_output, sizeof(wrong_output));
+        const TemporaryMfq file({{"valid", "NINT", blob}, {"invalid", "NINT", invalid},
+            {"truncated", "NINT", {blob.begin(), blob.begin() + 49}}});
+        const mfq::metal::MfqContainer model(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(model, 1, experts);
+        for (const auto* name : {"invalid", "truncated"}) {
+            bool failed = false;
+            try { (void)cache.can_group_mfe(name); }
+            catch (const std::exception&) { failed = true; }
+            require(failed && cache.cached_expert_count() == 0,
+                "invalid NINT expert geometry entered the SSD cache");
+        }
+        require(cache.can_group_mfe("valid"), "3D NINT expert bank was not pageable");
+        const auto full = mfq::metal::MlxMfeWeight::from_nint_blob(blob);
+        for (const int tokens : {1, 2, 6, 32}) {
+            const std::vector<std::int32_t> active{18, 0, 7, 11};
+            const auto paged = cache.grouped_mfe("valid", {18, 0, 7, 11, 18});
+            std::vector<float> source(tokens * input);
+            for (std::size_t i = 0; i < source.size(); ++i) source[i] = float(int(i % 37) - 18) / 256;
+            auto x = mlx::core::astype(mlx::core::array(source.begin(), mlx::core::Shape{tokens, input}), mlx::core::float16);
+            std::vector<std::int32_t> global(tokens * active.size()), local(global.size());
+            for (int token = 0; token < tokens; ++token) for (int route = 0; route < int(active.size()); ++route) {
+                global[token * active.size() + route] = active[route];
+                local[token * active.size() + route] = route;
+            }
+            const auto expected = evaluated_floats(full.routed_matmul(x,
+                mlx::core::array(global.begin(), mlx::core::Shape{tokens, int(active.size())})));
+            const auto indirect_before = mfq::metal::MlxMfeWeight::indirect_dispatch_count();
+            const auto copies_before = mfq::metal::MlxMfeWeight::packed_copy_count();
+            const auto actual = evaluated_floats(paged.routed_matmul(x,
+                mlx::core::array(local.begin(), mlx::core::Shape{tokens, int(active.size())})));
+            require(actual == expected, "SSD 3D NINT changed routed projection values");
+            require(!indirect_supported || mfq::metal::MlxMfeWeight::packed_copy_count() == copies_before,
+                "SSD NINT unnecessarily copied expert pages for a larger token batch");
+            require(mfq::metal::MlxMfeWeight::indirect_dispatch_count() - indirect_before
+                    == std::size_t(indirect_supported && tokens <= 24),
+                "SSD NINT did not use the expected indirect or large-M fallback path");
+            require(paged.experts() == int(active.size()) && cache.resident_packed_bytes() <= 1,
+                "SSD 3D NINT duplicate routing or cache budget mismatch");
+        }
+        const std::array active{18, 0, 7, 11};
+        auto x = mlx::core::full({2, input}, 0.125f, mlx::core::float16);
+        const auto global = mlx::core::array(active.begin(), mlx::core::Shape{2, 2});
+        const auto local = mlx::core::array({0, 1, 2, 3}, mlx::core::Shape{2, 2});
+        const auto expected = evaluated_floats(full.routed_matmul(x, global));
+        auto deferred = cache.grouped_mfe("valid", {18, 0, 7, 11}).routed_matmul(x, local);
+        cache.clear();
+        require(evaluated_floats(deferred) == expected,
+            "indirect GPU inputs lost expert pages after weight destruction and cache clear");
+        mfq::metal::MlxMfeOffloadCache bulk(model, 4 * blob.size(), experts);
+        const std::array names{std::string("valid")};
+        require(bulk.layer_mfe(names).has_value(), "3D NINT full-layer prefetch failed");
+    }
+    const auto tensor = make_nint_v2_tensor(33 * 257, 1024, 17, 48, true, 8);
+    const auto blob = nint_expert_blob(tensor, 33, 257);
+    require(blob.size() > (std::size_t{8} << 20), "NINT fixture misses the wire-buffer path");
+    const TemporaryMfq file({{"large", "NINT", blob}});
+    const mfq::metal::MfqContainer model(file.path());
+    mfq::metal::MlxMfeOffloadCache bulk(model, 4 * blob.size(), 33);
+    const std::array names{std::string("large")};
+    auto layer = bulk.layer_mfe(names);
+    require(layer.has_value(), "large NINT full-layer prefetch failed");
+    bulk.clear();
+    const auto full = mfq::metal::MlxMfeWeight::from_nint_blob(blob);
+    auto x = mlx::core::astype(mlx::core::ones({3, 1024}), mlx::core::float16);
+    const auto ids = mlx::core::array({32, 0, 16, 7, 32, 0}, mlx::core::Shape{3, 2});
+    require(evaluated_floats((*layer)[0].routed_matmul(x, ids)) == evaluated_floats(full.routed_matmul(x, ids)),
+        "NINT full-layer wire storage changed values or lost ownership");
+}
+
+void test_mfe_wire_buffer_materialization() {
+    constexpr int experts = 65;
+    constexpr int output = 257;
+    constexpr int input = 1024;
+    const std::array columns{0, 511, 1023};
+    const auto first = make_mxfp4(32 * output, input, 3);
+    const auto second = make_mxfp4(33 * output, input, 11);
+    std::vector<std::int32_t> first_ids(32), second_ids(33);
+    for (int local = 0; local < 32; ++local) first_ids[local] = 31 - local;
+    for (int local = 0; local < 33; ++local) second_ids[local] = 64 - local;
+    const auto blob = make_raw_nim2(experts, output, input, {
+        {first_ids, "MXFP4", {first.blob, first.dense, 32 * output, input}, {}},
+        {second_ids, "MXFP4", {second.blob, second.dense, 33 * output, input}, {}},
+    });
+    require(std::size_t(experts) * output * input / 2 > (std::size_t{8} << 20),
+        "MFE fixture does not cover the GPU stream materialization path");
+    const TemporaryMfq file({{"large", "MFE", blob}});
+    const mfq::metal::MfqContainer model(file.path());
+    mfq::metal::MlxMfeOffloadCache cache(model, 2 * blob.size());
+    const std::array names{std::string("large")};
+    auto layer = cache.layer_mfe(names);
+    require(layer && layer->size() == 1, "large MFE layer was not loaded");
+    cache.clear();
+    std::vector<float> source(columns.size() * input, 0.0f);
+    std::vector<std::int32_t> ids(columns.size() * experts);
+    for (std::size_t token = 0; token < columns.size(); ++token) {
+        source[token * input + columns[token]] = 1.0f;
+        std::iota(ids.begin() + token * experts, ids.begin() + (token + 1) * experts, 0);
+    }
+    const auto actual = evaluated_floats((*layer)[0].routed_matmul(
+        mlx::core::array(source.begin(), mlx::core::Shape{3, input}),
+        mlx::core::array(ids.begin(), mlx::core::Shape{3, experts})));
+    require(actual.size() == columns.size() * experts * output,
+        "GPU MFE materialization output shape mismatch");
+    for (std::size_t token = 0; token < columns.size(); ++token) {
+        for (int expert = 0; expert < experts; ++expert) {
+            const auto& fixture = expert < 32 ? first : second;
+            const int local = expert < 32 ? 31 - expert : 64 - expert;
+            for (int row = 0; row < output; ++row) {
+                const auto expected = fixture.dense[
+                    std::size_t(local * output + row) * input + columns[token]];
+                require(actual[(token * experts + expert) * output + row] == expected,
+                    "GPU MFE copy boundary or source ownership mismatch");
+            }
+        }
+    }
+}
+
+void test_streamed_vq_wire_views() {
+    constexpr int experts = 3;
+    for (const auto [output, input] : {std::pair{33, 40}, std::pair{33, 96}, std::pair{640, 2560}})
+        for (int variant = 0; variant < 6; ++variant) {
+        const auto fixture = variant == 0 ? make_jsc_nvq(experts * output, input)
+            : variant == 1 ? make_jsc_nvq(experts * output, input, "NVQ2J-L", 4, 8, 10, false, 4)
+            : variant == 2 ? make_jsc_nvq(experts * output, input, "NVQ2J-XL", 5, 8, 12, true, 4)
+            : variant == 3 ? make_jsc_nvq(experts * output, input, "NVQ3J", 2, 4, 8)
+            : variant == 4 ? make_jsc_nvq(experts * output, input, "NVQ3J-512", 3, 4, 9, false, 4)
+            : make_jsc_nvq(experts * output, input, "NVQ3J-L", 6, 4, 10, false, 4);
+        const auto blob = make_raw_nim2(experts, output, input, {
+            {{2, 0, 1}, fixture.dtype, {fixture.blob, fixture.dense, experts * output, input}, {}},
+        });
+        const TemporaryMfq file({{"wire", "MFE", blob}});
+        const mfq::metal::MfqContainer model(file.path());
+        for (const auto active : {std::vector<std::int32_t>{1, 2}, std::vector<std::int32_t>{1, 2, 0}}) {
+            mfq::metal::MlxMfeOffloadCache cache(model, 0);
+            const auto copied = cache.grouped_mfe("wire", active);
+            auto borrowed = [&] {
+                mfq::metal::MlxMfeOffloadCache transient(model, 0);
+                auto result = transient.grouped_mfe("wire", active, {}, true);
+                transient.clear();
+                require(transient.cached_expert_count() == 0 && transient.resident_packed_bytes() == 0,
+                    "wire-backed prefill retained expert cache storage");
+                return result;
+            }();
+            for (const int tokens : {1, 2, 3, 6, 33}) {
+                std::vector<float> values(tokens * input);
+                for (std::size_t i = 0; i < values.size(); ++i) values[i] = float(int(i % 29) - 14) / 256.0f;
+                std::vector<std::int32_t> routes(tokens * 2);
+                for (std::size_t i = 0; i < routes.size(); ++i) routes[i] = i % active.size();
+                const auto x = mlx::core::astype(mlx::core::array(values.begin(), mlx::core::Shape{tokens, input}),
+                    mlx::core::float16);
+                const auto ids = mlx::core::array(routes.begin(), mlx::core::Shape{tokens, 2});
+                require(evaluated_floats(borrowed.routed_matmul(x, ids)) ==
+                    evaluated_floats(copied.routed_matmul(x, ids)),
+                    "wire-backed VQ stream changed packed computation or lost ownership");
+                if (tokens == 1 || tokens == 33) {
+                    auto pending = [&] {
+                        mfq::metal::MlxMfeOffloadCache transient(model, 0);
+                        auto weight = transient.grouped_mfe("wire", active, {}, true);
+                        auto output = weight.routed_matmul(x, ids);
+                        mlx::core::async_eval({output});
+                        transient.clear();
+                        return output;
+                    }();
+                    mlx::core::clear_cache();
+                    require(evaluated_floats(pending) == evaluated_floats(copied.routed_matmul(x, ids)),
+                        "async VQ projection lost its released weight owners");
+                }
+            }
         }
     }
 }
@@ -7651,6 +9271,8 @@ void test_streamed_nvq1_residency() {
         require(cache.resident_packed_bytes() == 0, "NVQ1 cache clear retained bytes");
         check(retained, {2, 0});
         check(cache.grouped_mfe("valid", {0, 2, 1}), {0, 2, 1});
+        check(cache.grouped_mfe("valid", {2, 0}, {}, true), {2, 0});
+        check(cache.grouped_mfe("valid", pool_ids, {}, true), pool_ids);
     }
 }
 
@@ -8043,6 +9665,27 @@ void test_kernel_preparation() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--test-packed-shared-router") {
+        try {
+            mlx::core::set_default_device(mlx::core::Device::gpu);
+            for (int groups : {7, 24, 28, 48})
+                for (int tokens : {1, 2, 3, 4, 5, 6, 8, 24})
+                    for (int bits : {4, 8}) {
+                        try {
+                            test_two_stage_nint_shared_decode(groups, 65, 41, false,
+                                tokens, true, false, 24, false, 32, false, bits);
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("GS=" + std::to_string(groups) +
+                                " M=" + std::to_string(tokens) + " q=" + std::to_string(bits) + ": " + error.what());
+                        }
+                    }
+            std::cout << "MFQ packed shared router tests passed\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--probe-mtp-cache") {
         try {
             using namespace mlx::core;
@@ -8190,6 +9833,29 @@ int main(int argc, char** argv) {
         } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     }
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--test-folded-topk") {
+            for (const int tokens : {1, 2, 6}) {
+                test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true, 28, true, 32, false, 0, 0, false, true);
+                test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, false, 28, true, 32, false, 0, 0, false, true);
+            }
+            for (const int experts : {32, 64, 128, 512, 4096})
+                test_two_stage_nint_shared_decode(24, 32, 24, false, 1, false, false, kGroupSize, false, experts, true);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, 1, true, false, kGroupSize, false, 32, true);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, 1, true, true, kGroupSize, false, 32, true);
+            test_two_stage_nint_shared_decode(28, 260, 72, true, 2, true, false, 28, true);
+            test_two_stage_nint_shared_decode(28, 264, 76, true, 2, true, false, 28, true);
+            for (const int q : {4, 5, 6, 8}) {
+                test_two_stage_nint_shared_decode(28, 260, 72, true, 1, true, false, 28, false, 32, true, q);
+                test_two_stage_nint_shared_decode(28, 264, 76, true, 2, true, false, 28, true, 32, false, q);
+            }
+            std::cout << "MFQ folded top-k decode tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-block-plan") {
+            test_grouped_mmq_sparse_plan_bounds();
+            std::cout << "MFQ grouped block plan bounds passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-portable-prefill") {
             test_portable_mmq_row_buckets();
             test_grouped_split_nint_swiglu_prefill();
@@ -8264,13 +9930,66 @@ int main(int argc, char** argv) {
             std::cout << "MFQ direct MFE projection family tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-route-groups") {
+            test_mxfp4_repeated_routes();
+            test_uniform_nint_multirow_decode();
+            for (const auto [gate_gs, up_gs] : {std::pair{24, 28}, {28, 24}, {7, 24}, {48, 28}}) {
+                for (const int tokens : {1, 2, 6}) {
+                    test_two_stage_nint_shared_decode(gate_gs, 65, 41, false, tokens,
+                        false, false, 24, false, 32, tokens == 1, 0, up_gs);
+                    test_two_stage_nint_shared_decode(gate_gs, 256, 68, true, tokens,
+                        false, false, 24, false, 32, tokens == 1, 0, up_gs);
+                    test_two_stage_nint_shared_decode(gate_gs, 65, 41, false, tokens,
+                        false, false, 24, false, 32, tokens == 1, 8, up_gs, true, true);
+                    test_two_stage_nint_shared_decode(gate_gs, 256, 68, true, tokens,
+                        false, false, 24, false, 32, tokens == 1, 8, up_gs, true, true);
+                }
+                test_two_stage_nint_shared_decode(gate_gs, 256, 68, true, 1,
+                    false, false, 24, false, 32, true, 8, up_gs);
+            }
+            for (const int group_size : {12, 24, 28, 48})
+                for (const int tokens : {2, 6})
+                    test_two_stage_nint_shared_decode(24, 65, 41, false,
+                        tokens, true, false, group_size, true);
+            for (const int tokens : {2, 3, 5, 6, 8, 12, 17, 24}) {
+                test_two_stage_nint_shared_decode(23, 65, 41, false, tokens);
+                test_two_stage_nint_shared_decode(24, 65, 41, false, tokens, false, false, 23);
+                test_two_stage_nint_shared_decode(28, 68, 256, false, tokens, true, false, 28);
+                test_two_stage_nint_shared_decode(48, 256, 64, false, tokens, false, false, 48);
+                test_two_stage_nint_shared_decode(28, 256, 68, true, tokens, true);
+                test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true);
+                test_two_stage_nint_shared_decode(48, 256, 64, false, tokens, true, true, 48);
+                test_two_stage_nint_shared_decode(24, 65, 41, false, tokens, false, false, 23, true);
+                test_two_stage_nint_shared_decode(28, 256, 68, true, tokens, true, false, 28, true);
+                test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true, 28, true);
+            }
+            std::cout << "MFQ batched route-group tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-mxfp4-reuse") {
+            test_mxfp4_repeated_routes();
+            std::cout << "MFQ MXFP4 repeated-route tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
+            test_deepseek_v41_ced_text_cache();
+            test_deepseek_v41_ced_text_cache(true);
+            test_deepseek_v41_streamed_moe();
+            test_streamed_mfe_partition_preparation();
+            test_concatenate_resident_mfe_experts();
             test_compact_nint_mhc();
             test_qwen4_online_expert_offload(false);
             test_qwen4_online_expert_offload(true);
+            test_qwen4_online_expert_offload(true, false, false, true);
+            test_qwen4_online_expert_offload(false, false, false, false, true);
+            test_qwen4_online_expert_offload(false, false, false, false, true, true);
             test_streamed_mixed_mfe_residency();
+            test_streamed_vq_wire_views();
             test_streamed_nvq1_residency();
             test_streamed_nint_selector_boundaries();
+            test_streamed_cached_projection();
+            test_streamed_nint_expert_tensor();
+            test_mfe_wire_buffer_materialization();
             test_vq_anchor_conversion();
             test_materialized_mfe_projections();
             test_direct_mfe_projection_tails();
@@ -8299,10 +10018,12 @@ int main(int argc, char** argv) {
                 "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe|--test-direct-mfe]");
         }
         test_vq_small_m_route_order();
+        test_grouped_mmq_sparse_plan_bounds();
         test_generic_vq_wide_small_m();
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_two_stage_nint_shared_decode();
+        test_uniform_nint_multirow_decode();
         test_two_stage_nint_shared_decode(28, 65, 41);
         test_two_stage_nint_shared_decode(23, 65, 41);
         test_two_stage_nint_shared_decode(28, 256, 68, true);
@@ -8322,7 +10043,14 @@ int main(int argc, char** argv) {
             test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true);
             test_two_stage_nint_shared_decode(48, 256, 64, false, tokens, true, true, 48);
         }
+        for (int tokens : {8, 12, 24}) {
+            test_two_stage_nint_shared_decode(23, 65, 41, false, tokens);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, tokens, true);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true);
+            test_two_stage_nint_shared_decode(48, 256, 64, false, tokens, true, true, 48);
+        }
         test_mxfp4_mfe_and_projection_offsets();
+        test_mxfp4_repeated_routes();
         test_mxfp4_multi_pool_native_slots();
         test_mxfp4_pair_blocks_matches_native_projections();
         test_mxfp4_sq_mfe_reuses_linear_kernel();
@@ -8389,11 +10117,16 @@ int main(int argc, char** argv) {
         test_multiple_nint_pools_share_cpp_dispatch(513);
         test_grouped_mxfp4_vq_mmq_prefill();
         test_grouped_mxfp4_vq_mmq_prefill(129, 224);
+        test_streamed_mfe_partition_preparation();
         test_concatenate_resident_mfe_experts();
         test_compact_nint_mhc();
         test_streamed_mixed_mfe_residency();
+        test_streamed_vq_wire_views();
         test_streamed_nvq1_residency();
         test_streamed_nint_selector_boundaries();
+        test_streamed_cached_projection();
+        test_streamed_nint_expert_tensor();
+        test_mfe_wire_buffer_materialization();
         test_materialized_mfe_projections();
         test_direct_mfe_projection_tails();
         test_banked_vq_input_views();

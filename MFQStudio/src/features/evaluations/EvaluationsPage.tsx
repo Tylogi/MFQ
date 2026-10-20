@@ -66,7 +66,7 @@ export function EvaluationsPage() {
       const [nextJobs, nextEvaluations, nextDatasets, nextTools] = await Promise.all([jobsApi.jobs(100), evaluationsApi.evaluations(), evaluationsApi.datasets(), evaluationsApi.tools()]);
       if (!current()) return;
       setJobs(nextJobs.filter(evaluationJob)); setEvaluations(nextEvaluations); setDatasets(nextDatasets); setTools(nextTools);
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
   }
   useEffect(() => {
     let active = true;
@@ -76,7 +76,7 @@ export function EvaluationsPage() {
         setDatasets(nextDatasets); setEvaluations(nextEvaluations); setModels(nextModels.filter((item) => item.complete && !item.error && item.format === 'mfq'));
         setTools(nextTools); setJobs(nextJobs.filter(evaluationJob));
         setOfficialCatalog(nextCatalog);
-      }).catch((cause) => { if (active) toast.error(errorMessage(cause)); });
+      }).catch((cause) => { if (active) toast.error(errorMessage(cause, tr)); });
     return () => { active = false; };
   }, []);
   const hasActiveJobs = jobs.some(activeJob);
@@ -91,7 +91,7 @@ export function EvaluationsPage() {
         setJobs(nextJobs.filter(evaluationJob)); setEvaluations(nextEvaluations);
         setDatasets(nextDatasets);
         setTools(nextTools);
-      } catch (cause) { if (active) toast.error(errorMessage(cause)); }
+      } catch (cause) { if (active) toast.error(errorMessage(cause, tr)); }
       if (active) timer = setTimeout(() => void poll(), 1000);
     }
     timer = setTimeout(() => void poll(), 1000);
@@ -106,7 +106,7 @@ export function EvaluationsPage() {
       addJob(job); setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
       if (kind !== 'dataset.download') setView('results');
       toast.success(kind === 'dataset.download' ? tr('官方集合下载已提交', 'Official collection download submitted') : tr('评测任务已提交', 'Evaluation job submitted'));
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
     finally { if (current()) setBusy(false); }
   }
   async function cancel(id: string) {
@@ -114,7 +114,7 @@ export function EvaluationsPage() {
     try {
       const next = await jobsApi.cancelJob(id);
       if (current()) setJobs((jobs) => jobs.map((item) => item.id === next.id ? next : item));
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
   }
   async function compare() {
     if (busy) return;
@@ -123,7 +123,7 @@ export function EvaluationsPage() {
     try {
       const next = await evaluationsApi.compareEvaluations(selected);
       if (current()) setComparison(next);
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
     finally { if (current()) setBusy(false); }
   }
   const selectedResults = evaluations.filter((item) => selected.includes(item.id));

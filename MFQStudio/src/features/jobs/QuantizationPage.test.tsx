@@ -59,6 +59,18 @@ it('registers an AlphaQ recipe task with selected candidates and shared service 
   expect(screen.getByRole('progressbar')).toHaveAttribute('value', '0');
 });
 
+it('restores both default directories and shows a readable error when saving fails', async () => {
+  vi.mocked(quantizationApi.configure).mockRejectedValue(new ApiError(422, { error: { code: 'not_a_directory', message: 'not a directory: /some/file', retryable: false, details: {} } }));
+  render(<QuantizationPage />);
+  await screen.findByText('3 / 3');
+  fireEvent.click(screen.getByText('Default directories'));
+  fireEvent.change(screen.getByLabelText('Default export directory'), { target: { value: '/some/file' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save default directories' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('This location is a file, not a folder');
+  expect(screen.getByLabelText('Default import directory')).toHaveValue('/models');
+  expect(screen.getByLabelText('Default export directory')).toHaveValue('/outputs');
+});
+
 it('explains automatic chat templates, defaults on, and submits the user opt-out', async () => {
   vi.mocked(quantizationApi.source).mockResolvedValue({ path: '/models/full', architecture: 'qwen3_5', tensors: 12, parameters: 1000, format: 'hf', full_precision: true, imatrix_supported: true });
   vi.mocked(jobsApi.createJob).mockResolvedValue({ id: 'matrix1', kind: 'quantization.imatrix', status: 'queued', progress: 0, payload: {}, cancel_requested: false, created_at: '', updated_at: '' });

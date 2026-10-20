@@ -1,8 +1,8 @@
-#include "mlx_qsa_kv_offload.h"
-#include "mlx_sparse_attention.h"
-#include "qwen4_ops.h"
-#include "mlx_qwen4_causal_lm.h"
-#include "mlx_paged_session_codec.h"
+#include "runtime/mlx_qsa_kv_offload.h"
+#include "ops/mlx_sparse_attention.h"
+#include "models/flash_next/qwen4_ops.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "runtime/mlx_paged_session_codec.h"
 
 #include <algorithm>
 #include <cmath>

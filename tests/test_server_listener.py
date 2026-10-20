@@ -1,13 +1,149 @@
 import asyncio
+import os
 import socket
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 import uvicorn
 
 from mfq.server.api import create_app
 from mfq.server.api.auth import required_scope
 from mfq.server.api.listener import RuntimeServer, saved_service_port
+from mfq.server.state.storage import SessionStore
+
+
+def test_app_pipe_eof_gracefully_closes_both_api_listeners() -> None:
+    async def run():
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0,
+            log_level="error"), anthropic_port=0, parent_input=reader)
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            assert server.started
+            ports = [server.config.port, server.anthropic_port]
+            async with httpx.AsyncClient(trust_env=False) as client:
+                for port in ports:
+                    assert (await client.get(f"http://127.0.0.1:{port}/health")).status_code == 200
+            writer.write(b"owner still alive")
+            await asyncio.sleep(.05)
+            assert not task.done()
+            writer.close()
+            await asyncio.wait_for(task, 5)
+            service.aclose.assert_awaited_once()
+            for port in ports:
+                with socket.socket() as probe:
+                    probe.settimeout(.2)
+                    assert probe.connect_ex(("127.0.0.1", port)) != 0
+        finally:
+            writer.close()
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+            reader.close()
+    asyncio.run(run())
+
+
+def test_cli_server_without_app_pipe_keeps_running() -> None:
+    async def run():
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0, log_level="error"))
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            assert server.started
+            assert server.parent_input is None
+            await asyncio.sleep(.1)
+            assert not task.done()
+            service.aclose.assert_not_awaited()
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+        service.aclose.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_app_already_closed_during_server_startup() -> None:
+    async def run():
+        import io
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0,
+            log_level="error"), anthropic_port=0, parent_input=io.BytesIO())
+        await asyncio.wait_for(server.serve(), 5)
+        assert server.should_exit
+        service.aclose.assert_awaited_once()
+        for listener in server.servers:
+            assert not listener.is_serving()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+def test_occupied_listener_never_recovers_another_servers_running_jobs(tmp_path: Path, protocol: str) -> None:
+    async def run():
+        store = SessionStore(tmp_path / "server.sqlite3")
+        job = store.create_job("model.load", {"model": "fixture-model"})
+        store.claim_job(job.id)
+        store.update_job_progress(job.id, .2)
+        service = SimpleNamespace(
+            start=AsyncMock(side_effect=lambda: store.recover_interrupted_jobs()),
+            aclose=AsyncMock(),
+        )
+        with socket.socket() as occupied, socket.socket() as available:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            occupied_port = occupied.getsockname()[1]
+            available.bind(("127.0.0.1", 0))
+            available_port = available.getsockname()[1]
+            available.close()
+            primary = occupied_port if protocol == "openai" else available_port
+            secondary = available_port if protocol == "openai" else occupied_port
+            server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=primary,
+                log_level="error"), anthropic_port=secondary)
+            with pytest.raises(SystemExit):
+                await server.serve()
+            service.start.assert_not_awaited()
+            service.aclose.assert_not_awaited()
+            current = store.get_job(job.id)
+            assert current.status.value == "running"
+            assert current.progress == .2
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", available_port))
+    asyncio.run(run())
+
+
+def test_listener_startup_failure_releases_both_reserved_ports():
+    async def run():
+        service = SimpleNamespace(start=AsyncMock(side_effect=RuntimeError("fixture startup failure")), aclose=AsyncMock())
+        config = uvicorn.Config(create_app(service), host="127.0.0.1", port=0, log_level="error")
+        server = RuntimeServer(config, anthropic_port=0)
+        reserved = []
+        bind = uvicorn.Config.bind_socket
+
+        def track(config):
+            sock = bind(config)
+            reserved.append(sock.getsockname()[1])
+            return sock
+
+        from unittest.mock import patch
+        with patch.object(uvicorn.Config, "bind_socket", track), pytest.raises(SystemExit):
+            await server.serve()
+        service.aclose.assert_awaited_once()
+        assert len(reserved) == 2
+        for port in reserved:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", port))
+    asyncio.run(run())
 
 
 def test_listener_changes_port_without_restarting_service(tmp_path: Path) -> None:
@@ -53,6 +189,9 @@ def test_listener_changes_port_without_restarting_service(tmp_path: Path) -> Non
                 async with httpx.AsyncClient(trust_env=False) as client:
                     failed = await client.put(f"http://127.0.0.1:{new_port}/api/v1/runtime/listener", json={"port": unavailable})
                     assert failed.status_code == 409
+                    assert failed.json()["error"]["code"] == "listener_port_in_use"
+                    assert failed.json()["error"]["details"]["port"] == unavailable
+                    assert "Errno" not in failed.json()["error"]["message"]
                     assert (await client.get(f"http://127.0.0.1:{new_port}/state")).json() == state
             assert server.config.port == new_port
             assert saved_service_port(tmp_path / "listener.json") == new_port
@@ -130,6 +269,7 @@ def test_independent_listeners_keep_live_requests_and_shared_service(tmp_path: P
                 collision = await client.put(f"http://127.0.0.1:{oai}/api/v1/runtime/listener",
                                              json={"port": oai, "protocol": "anthropic"})
                 assert collision.status_code == 409
+                assert collision.json()["error"]["code"] == "listener_port_conflict"
                 assert server.anthropic_port == new_port
                 assert saved_service_port(tmp_path / "listener.json", "anthropic") == new_port
                 assert saved_service_port(tmp_path / "listener.json") == oai

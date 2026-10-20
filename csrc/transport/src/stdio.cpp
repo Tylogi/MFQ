@@ -47,7 +47,7 @@ public:
     int run(const MfqScheduler& scheduler) override {
         if (stdio_protocol_fd < 0) throw std::runtime_error("prepare_mfq_stdio_transport must be called before model loading");
         RuntimeProtocol protocol(scheduler, config);
-        struct Task { std::thread thread; std::shared_ptr<std::atomic<bool>> done; };
+        struct Task { std::thread thread; std::shared_ptr<std::atomic<bool>> done,submitted; std::string id; };
         std::vector<Task> tasks;
         const auto send = [](json frame) { frame["v"] = 1; return write_stdio_protocol(frame); };
         const auto send_result = [&](const std::string& id, json data) {
@@ -73,16 +73,17 @@ public:
                 } else ++item;
             }
         };
-        const auto launch = [&](const std::string& id, auto work) {
+        const auto launch = [&](const std::string& id, auto work, std::shared_ptr<std::atomic<bool>> submitted = {}) {
             auto done = std::make_shared<std::atomic<bool>>(false);
-            tasks.push_back({std::thread([&, id, done, work = std::move(work)] {
+            tasks.push_back({std::thread([&, id, done, submitted, work = std::move(work)] {
                 try { work(); }
                 catch (const ApiError& error) { send_error(id, error.status, error.type, error.what()); }
                 catch (const mfq::engine::InferenceInputError& error) { input_error(id, error); }
                 catch (const json::exception& error) { send_error(id, 400, "invalid_request_error", error.what()); }
                 catch (const std::exception& error) { send_error(id, 500, "server_error", error.what()); }
+                if(submitted) {submitted->store(true,std::memory_order_release);submitted->notify_all();}
                 done->store(true, std::memory_order_release);
-            }), done});
+            }), done, submitted, id});
         };
         send({{"type", "ready"}});
         std::string line;
@@ -104,7 +105,11 @@ public:
                 const auto params = request.value("params", json::object());
                 if (!params.is_object()) throw ApiError(400, "backend_protocol_error", "stdio params must be an object");
                 if (op == "shutdown") { if (!id.empty()) send_result(id, {{"status", "ok"}}); break; }
-                if (op == "request.cancel") { const auto result = protocol.call(op, params); if (!id.empty()) send_result(id, result); continue; }
+                if (op == "request.cancel") {
+                    const auto target=params.value("target_id",std::string{});
+                    for(const auto& task:tasks)if(task.id==target && task.submitted)
+                        task.submitted->wait(false,std::memory_order_acquire);
+                    const auto result = protocol.call(op, params); if (!id.empty()) send_result(id, result); continue; }
                 if (id.empty()) throw ApiError(400, "backend_protocol_error", "stdio operation requires an id");
                 if (op == "realtime.open") {
                     protocol.open_realtime(id, params.value("mode", std::string("audio")));
@@ -126,12 +131,14 @@ public:
                     continue;
                 }
                 if (op != "generate") { send_result(id, protocol.call(op, params)); continue; }
-                auto completion = std::make_shared<CompletionStream>(scheduler, config, protocol.request_metrics(), params, id);
-                launch(id, [&, id, completion] {
+                auto submitted=std::make_shared<std::atomic<bool>>(false);
+                launch(id, [&, id, params, submitted] {
+                    auto completion = std::make_shared<CompletionStream>(scheduler, config, protocol.request_metrics(), params, id);
+                    submitted->store(true,std::memory_order_release);submitted->notify_all();
                     while (auto frames = completion->next()) for (auto& frame : *frames)
                         if (!send_event(id, std::move(frame))) { completion->cancel(); return; }
                     send_done(id);
-                });
+                },submitted);
             } catch (const ApiError& error) { send_error(id, error.status, error.type, error.what()); }
             catch (const mfq::engine::InferenceInputError& error) { input_error(id, error); }
             catch (const json::exception& error) { send_error(id, 400, "backend_protocol_error", error.what()); }

@@ -16,7 +16,7 @@ export function RuntimeHero() {
   const jobs = useJobStore((state) => state.jobs);
   const { tr } = useSettings();
   const navigate = useNavigate();
-  const openStudioPage = () => navigate(STUDIO_PATHS.models);
+  const openStudioPage = (localCheckpoints = false) => navigate(`${STUDIO_PATHS.models}${localCheckpoints ? '#local-checkpoints' : ''}`);
   const openChatPage = () => navigate(STUDIO_PATHS.chat);
   const runtimeModelName = runtime?.model || 'Empty';
   const modelHero = useMemo(() => {
@@ -69,7 +69,7 @@ export function RuntimeHero() {
         state: 'failed' as const,
       };
     }
-    if (latestLifecycleJob?.kind === 'model.load' && latestLifecycleJob.status === 'failed') {
+    if (latestLifecycleJob?.kind === 'model.load' && ['failed', 'interrupted'].includes(latestLifecycleJob.status)) {
       const failedJobModel =
         typeof latestLifecycleJob.payload.model === 'string'
           ? latestLifecycleJob.payload.model
@@ -77,6 +77,7 @@ export function RuntimeHero() {
       return {
         name: failedJobModel || runtimeModelName,
         state: 'failed' as const,
+        interrupted: latestLifecycleJob.status === 'interrupted',
       };
     }
     return { name: runtimeModelName, state: 'idle' as const };
@@ -87,7 +88,8 @@ export function RuntimeHero() {
       : modelHero.state === 'ready'
         ? tr('运行中', 'Running')
         : modelHero.state === 'failed'
-          ? tr('加载失败', 'Failed')
+          ? 'interrupted' in modelHero && modelHero.interrupted
+            ? tr('加载中断', 'Interrupted') : tr('加载失败', 'Failed')
           : tr('空闲', 'Idle');
   return (
     <TMPanel className="runtime-hero">
@@ -111,9 +113,9 @@ export function RuntimeHero() {
       <div className="runtime-hero-actions">
         <ModelVendorMark name={modelHero.name} size={34}
           architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
-        <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
+        <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage(modelHero.state === 'idle')} type="button">
           <Icon name="folder" size={15} />
-          {tr('模型', 'Models')}
+          {modelHero.state === 'idle' ? tr('加载', 'Load') : tr('模型', 'Models')}
         </button>
         <button className={modelHero.state === 'ready' ? 'primary runtime-hero-chat' : undefined} onClick={openChatPage} type="button">
           <Icon name="chat" size={15} />

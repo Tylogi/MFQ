@@ -1,6 +1,6 @@
 #include "kernels/moe/ops.h"
 #include "kernels/norm_ops.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
 #include "common/transformer_layer.h"
@@ -290,7 +290,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 namespace mfq::cuda {
 
-std::unique_ptr<Block> Gemma4Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+std::unique_ptr<Block> Gemma4Model::load_block(const mfq::ModelSource &source, int layer,
                                                        int, const std::string &type) {
     return gemma4::load_block(*execution, source, config, layer, type);
 }

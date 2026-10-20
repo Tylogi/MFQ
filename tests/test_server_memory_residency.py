@@ -65,6 +65,44 @@ def test_balanced_reclaimable_memory_counts_file_cache_once():
     assert host_memory.automatic_memory_reserve(32 << 30) == 3 << 30
 
 
+def test_balanced_reclaimable_excludes_own_cpu_and_overlapping_file_pages():
+    gib = 1 << 30
+    snapshot = HostMemorySnapshot(128 * gib, 2 * gib, 20 * gib, 4 * gib, 0, external=10 * gib)
+    assert snapshot.reclaimable(active_ratio=0.25, own_cpu_bytes=6 * gib) == 14 * gib
+    assert snapshot.reclaimable(active_ratio=0.25, own_cpu_bytes=40 * gib) == 12 * gib
+    assert snapshot.reclaimable(active_ratio=0.25, own_cpu_bytes=-1) == snapshot.reclaimable(active_ratio=0.25)
+
+
+@pytest.mark.parametrize("free_first", [False, True])
+def test_release_credit_matches_both_telemetry_orders_once(monkeypatch, free_first):
+    now = 100.0
+    monkeypatch.setattr(host_memory.time, "monotonic", lambda: now)
+    credit = host_memory.MemoryReleaseCredit()
+    assert credit.update(10, 2) == 0
+    now += 0.1
+    assert credit.update(10 if free_first else 6, 6 if free_first else 2) == (0 if free_first else 4)
+    now += 0.1
+    assert credit.update(6, 6) == 0
+    assert credit.update(6, 6) == 0
+
+
+def test_release_credit_is_spent_by_new_allocations_and_expires(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(host_memory.time, "monotonic", lambda: now)
+    credit = host_memory.MemoryReleaseCredit()
+    assert credit.update(10, 2) == 0
+    now += 0.1
+    assert credit.update(6, 2) == 4
+    now += 0.1
+    assert credit.update(8, 2) == 2
+    now += 0.1
+    assert credit.update(8, 3) == 1
+    now += 2.1
+    assert credit.update(8, 3) == 0
+    now -= 1.0
+    assert credit.update(1, 3) == 0
+
+
 def test_kernel_process_footprint_is_used_instead_of_rss(monkeypatch):
     def query(pid, flavor, pointer):
         assert pid == 123 and flavor == 0
@@ -94,29 +132,55 @@ def test_live_budget_includes_own_usage_but_not_pending_capacity(tmp_path, monke
     gib = 1 << 30
     snapshot = HostMemorySnapshot(128 * gib, 5 * gib, 30 * gib, 10 * gib, 80 * gib, external=12 * gib)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_snapshot", lambda: snapshot)
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 80 * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda pid: 80 * gib if pid == 123 else 0)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.metal_allocation_limit", lambda: 108 * gib)
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", max_runtime_memory_bytes=120 * gib)
     memory = RuntimePool._memory_resources({"metal_wired_bytes": 80 * gib})
     item = SimpleNamespace(state=RuntimeInstanceState.READY, process=SimpleNamespace(pid=123), memory=memory)
     pool._instances[uuid4()] = item
     pool._load_bytes['not_yet_allocated'] = 80 * gib
-    assert pool._effective_runtime_memory_budget_locked() == 89 * gib
-    assert pool.memory_policy_status()['effective_total_limit_bytes'] == 89 * gib
+    assert pool._effective_runtime_memory_budget_locked() == 96 * gib
+    assert pool.memory_policy_status()['effective_total_limit_bytes'] == 96 * gib
     snapshot = replace(snapshot, free=1 * gib, external=10 * gib)
-    assert pool._effective_runtime_memory_budget_locked() == 83 * gib
+    assert pool._effective_runtime_memory_budget_locked() == 181 * gib // 2
 
 
 def test_metal_limit_only_caps_gpu_memory_not_cpu_cache(tmp_path, monkeypatch):
     gib = 1 << 30
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_snapshot",
         lambda: HostMemorySnapshot(128 * gib, 40 * gib, 0, 0, 80 * gib))
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 86 * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda pid: 86 * gib if pid == 123 else 0)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.metal_allocation_limit", lambda: 80 * gib)
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", max_runtime_memory_bytes=120 * gib)
     memory = RuntimePool._memory_resources({"metal_wired_bytes": 80 * gib})
     pool._instances[uuid4()] = SimpleNamespace(state=RuntimeInstanceState.READY, process=SimpleNamespace(pid=123), memory=memory)
     assert pool._effective_runtime_memory_budget_locked() == 86 * gib
+
+
+@pytest.mark.parametrize("total, free, active, expected", [(8, 2, 4, 0), (16, 3, 8, 2), (32, 8, 12, 8)])
+def test_fresh_install_balanced_budget_on_small_macs(tmp_path, monkeypatch, total, free, active, expected):
+    gib = 1 << 30
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.total_physical_memory", lambda: total * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 0)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.metal_allocation_limit", lambda: total * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_snapshot",
+        lambda: HostMemorySnapshot(total * gib, free * gib, active * gib, 0, 0))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="metal")
+    assert pool.automatic_memory_budget
+    assert pool._effective_runtime_memory_budget_locked() == max(1, expected * gib)
+
+
+def test_balanced_budget_excludes_server_and_all_runtime_cpu_pages(tmp_path, monkeypatch):
+    gib = 1 << 30
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 2 * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.metal_allocation_limit", lambda: 108 * gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_snapshot",
+        lambda: HostMemorySnapshot(128 * gib, 4 * gib, 20 * gib, 8 * gib, 80 * gib, external=12 * gib))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", max_runtime_memory_bytes=120 * gib)
+    pool._resident_process_usage_locked = lambda: (20 * gib, 4 * gib)
+    assert pool._effective_runtime_memory_budget_locked() == 61 * gib // 2
+    pool.memory_policy.total_limit_bytes = 24 * gib
+    assert pool._effective_runtime_memory_budget_locked() == 24 * gib
 
 
 @pytest.mark.parametrize("counter", ["compression_bytes", "swapout_bytes"])

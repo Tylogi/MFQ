@@ -16,6 +16,7 @@ export function useVoiceConversation(
   activeId: string | null,
   connectionRevision: number,
   setError: (message: string) => void,
+  selectedModel?: string,
 ) {
   const { settings } = useSettings();
   const [voiceMessages, setVoiceMessages] = useState<VoiceMessage[]>(loadVoiceHistory);
@@ -42,7 +43,7 @@ export function useVoiceConversation(
     resetVoiceLevel();
     void voiceRef.current?.stop();
     setLiveVoice(null);
-  }, [activeId, connectionRevision]);
+  }, [activeId, connectionRevision, selectedModel]);
   useEffect(() => {
     const controller = new RealtimeAudioController(
       {

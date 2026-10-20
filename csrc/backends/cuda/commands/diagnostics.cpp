@@ -28,12 +28,12 @@ inline void finish_cuda_activity_trace() noexcept {
 #include "native/tensor/backend.h"
 #include "mfq/model_source/model_source.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 #include <cuda_profiler_api.h>
 #include "engine/load_options.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "cli.h"
 namespace mfq::cuda::diagnostics {
 
@@ -92,6 +92,7 @@ inline void report_source_file_io(const mfq::ModelSource* source, const char* ph
                   << " logical_bytes=" << stats.logical_bytes << " physical_bytes=" << stats.physical_bytes
                   << " errors=" << stats.errors << " staging_bytes=" << stats.staging_bytes
                   << " staging_peak_sum_bytes=" << stats.staging_peak_bytes
+                  << " staging_cached_bytes=" << stats.staging_cached_bytes << " staging_allocations=" << stats.staging_allocations
                   << " read_ms=" << double(stats.read_nanoseconds) / 1e6 << std::endl;
     } catch (const std::exception&) { } // Optional diagnostics cannot abort generation.
 }
@@ -111,7 +112,9 @@ int generate_diagnostic_tokens(
         bool profile,
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1,
-        const std::vector<int64_t>& decode_inputs = {}) {
+        const std::vector<int64_t>& decode_inputs = {},
+        const std::unordered_set<int64_t>& stop_token_ids = {},
+        bool production_prefill = false) {
         if(!decode_inputs.empty() && (gen<=1 || decode_inputs.size()!=size_t(gen-1)))
             throw std::invalid_argument("diagnostic decode input count differs from gen-1");
         mfq_tensor_backend::Tensor forced_inputs;
@@ -121,7 +124,18 @@ int generate_diagnostic_tokens(
         auto& profiler = execution.profiler;
         report_source_file_io(model.source.get(), "prefill_begin");
         profiler.reset();
-        auto next = model.next_token(ids);
+        auto next = [&] {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(production_prefill && ids.size(1)>128 && !qwen4_layer_major_prefill_eligible(model,ids.size(1)))
+                    throw std::invalid_argument("router audit requires production prefill; enable MFQ_MOE_PIPELINE and MFQ_MOE_PREFILL_LAYER");
+                if(production_prefill && qwen4_layer_major_prefill_eligible(model,ids.size(1))) {
+                    std::cout<<"diagnostic_prefill path=production_layer_major tokens="<<ids.size(1)<<std::endl;
+                    auto hidden=qwen4_layer_major_prefill_hidden(model,ids,1024,true);
+                    return model.next_token_from_hidden(std::move(hidden));
+                }
+            }
+            return model.next_token(ids);
+        }();
         mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "prefill");
@@ -134,6 +148,8 @@ int generate_diagnostic_tokens(
         profiler.report("prefill");
         profiler.reset();
         if (gen == 0) return 0;
+        int produced = 1;
+        bool hit_eos = !stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>());
         auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         cudaStream_t stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
@@ -149,7 +165,7 @@ int generate_diagnostic_tokens(
             mfq_cuda_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&
-            !execution.moe_expert_cache &&
+            !execution.stores.moe_expert_cache &&
             model_parallel_cuda_graph_enabled(execution) &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = mfq::cuda::env_lookup("MFQ_CUDA_PROFILER_RANGE");
@@ -163,7 +179,7 @@ int generate_diagnostic_tokens(
         auto last_window_done=t2;
         bool measured_last_window=false;
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
-        if (use_cuda_graph) {
+        if (use_cuda_graph && !hit_eos) {
             auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_pos = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_len = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
@@ -231,9 +247,17 @@ int generate_diagnostic_tokens(
             decode_replay_t0 = std::chrono::steady_clock::now();
             for (int i = 1; i < gen; ++i) {
                 graph.replay();
+                produced = i + 1;
+                if (!stop_token_ids.empty()) {
+                    MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
+                    if (stop_token_ids.contains(static_next.template item<int64_t>())) {
+                        hit_eos = true;
+                        break;
+                    }
+                }
             }
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
-        } else {
+        } else if (!hit_eos) {
             for (int i = 1; i < gen; ++i) {
                 next = profiler.measure("decode.eager_model", [&]() {
                     return model.next_token(diagnostic_decode_input(next,forced_inputs,i-1));
@@ -245,15 +269,20 @@ int generate_diagnostic_tokens(
                         cudaMemcpyDeviceToDevice, stream));
                     return 0;
                 });
-                if(i==1 && model.metadata.flash_next) {
+                produced = i + 1;
+                if (!stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>())) {
+                    hit_eos = true;
+                    break;
+                }
+                if(i==1 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();first_decode_done=std::chrono::steady_clock::now();
                     measured_first_decode=true;
                 }
-                if(gen>=4 && i==gen/2 && model.metadata.flash_next) {
+                if(gen>=4 && i==gen/2 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();halfway_done=std::chrono::steady_clock::now();
                     measured_halfway=true;
                 }
-                if(gen>256 && i==gen-1-128 && model.metadata.flash_next) {
+                if(gen>256 && i==gen-1-128 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();last_window_done=std::chrono::steady_clock::now();
                     measured_last_window=true;
                 }
@@ -264,7 +293,8 @@ int generate_diagnostic_tokens(
         auto t3 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "decode_complete");
         profiler.report("decode");
-        auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
+        gen = produced;
+        auto generated_tensor = generated_cuda.narrow(0, 0, produced).to(mfq_tensor_backend::kCPU).contiguous();
         auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
         double load_s = std::chrono::duration<double>(t1 - t0).count();
         double prefill_s = std::chrono::duration<double>(t2 - t1).count();
@@ -272,6 +302,7 @@ int generate_diagnostic_tokens(
         double decode_replay_s = std::chrono::duration<double>(t3 - decode_replay_t0).count();
         std::cout << "load_sec=" << load_s << "\n";
         std::cout << "prefill_sec=" << prefill_s << "\n";
+        std::cout << "finish_reason=" << (hit_eos ? "stop" : "length") << "\n";
         std::cout << "decode_tokens=" << std::max(0, gen - 1) << "\n";
         std::cout << "decode_setup_sec=" << (decode_s - decode_replay_s) << "\n";
         std::cout << "decode_replay_sec=" << decode_replay_s << "\n";
@@ -310,9 +341,9 @@ int generate_diagnostic_tokens(
         }
         std::cout << "\n";
         report_source_file_io(model.source.get(), "decode");
-        if (execution.moe_expert_cache) {
+        if (execution.stores.moe_expert_cache) {
             print_moe_expert_cache_stats(
-                execution.moe_expert_cache, std::cout);
+                execution.stores.moe_expert_cache, std::cout);
         }
         finish_cuda_activity_trace();
         return 0;
@@ -326,9 +357,9 @@ int generate_diagnostic_tokens(
 #include "diagnostics/flash_next_mtp.h"
 #include "minicpmo45.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/expert_cache.h"
 #include "ops/execution/execution_options.h"
-#include "csrc/backends/cuda/kernels/deepseek_v41.h"
+#include "kernels/deepseek_v41.h"
 
 #include <algorithm>
 #include <chrono>
@@ -398,6 +429,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     int compare_mma_decode_steps = 1;
     int compare_mma_decode_planned_len = 0;
     bool profile = false;
+    bool ignore_eos = false;
     bool compare_ffn_transfer_phases = false;
     bool compare_router_lookahead = false;
     bool compare_rotary_fusion = false;
@@ -455,6 +487,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_text_session_state = false;
     bool check_qwen35_mtp = false;
     bool check_continuous_batching = false;
+    int check_continuous_batching_requests = 2;
     bool check_engine_isolation = false;
     bool check_flash_next = false;
     bool check_qwen4_decode_hidden = false;
@@ -583,7 +616,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         setup_cuda_load(*this, execution);
         if(runtime_comparison_modes()) {
             std::cout<<runtime_comparison_name()<<"_setup\n";
-            print_moe_expert_cache_stats(execution.moe_expert_cache,std::cout);
+            print_moe_expert_cache_stats(execution.stores.moe_expert_cache,std::cout);
         }
         if (!check_linear_cpu.empty()) {
             if (model_path.empty()) {
@@ -763,7 +796,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 parse_kl_mmq_mode(kl_mmq_arg), execution.kl_mmq);
             const auto tensor_names =
                 parse_tensor_names(check_mfe_tensor);
-            if (execution.moe_expert_cache &&
+            if (execution.stores.moe_expert_cache &&
                     tensor_names.size() != 1) {
                 throw std::runtime_error(
                     "cached --check-mfe-tensor accepts one tensor "
@@ -900,14 +933,14 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     std::chrono::steady_clock::time_point t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
-                return run_cuda_continuous_batching_check(model);
+            if constexpr (Model::policy.continuous_batching) {
+                return run_cuda_continuous_batching_check(model,check_continuous_batching_requests);
             }
             throw std::runtime_error(
-                "continuous batching requires Qwen35CausalLm");
+                "continuous batching requires Qwen3.5 or Flash-Next");
         }
         if (check_qwen4_decode_hidden) {
-            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+            if constexpr(Model::policy.decode_graph) {
                 const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_GENERATION_VARIANTS");
                 if(profile && variants && variants[0]=='1') {
                     MFQ_RUNTIME_CHECK(runtime_components.mtp,"MTP variants require a loaded predictor");
@@ -915,24 +948,20 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                         ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file));
                 }
             }
-            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+            if constexpr(Model::policy.decode_graph)
                 return profile?run_qwen4_mtp_profile(model,ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file))
                     :run_qwen4_decode_hidden_check(model);
             throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
         }
         if (check_flash_next) {
-            if constexpr (
-                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
                 return run_flash_next_check(model);
             }
             throw std::runtime_error(
                 "Flash-Next diagnostic requires a Flash-Next causal LM");
         }
         if (check_flash_next_mtp) {
-            if constexpr (
-                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::flash_next) {
                 using Predictor=std::conditional_t<
                     std::is_same_v<Model, mfq::cuda::Qwen4CausalLm>,
                     mfq::cuda::qwen4_exp::Qwen4ExpMtp,
@@ -946,7 +975,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
         }
         if (check_qwen35_mtp) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,
@@ -957,7 +986,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "--check-qwen35-mtp requires Qwen35CausalLm");
         }
         if (!bench_qwen35_mtp.empty()) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
+            if constexpr (Model::policy.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,
@@ -973,9 +1002,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             execution.profiler.enabled=profile;
             const int status = run_prefill_sweep(
                 model, prefill_sweep_sizes, prefill_sweep_reps,execution);
-            if (execution.moe_expert_cache) {
+            if (execution.stores.moe_expert_cache) {
                 print_moe_expert_cache_stats(
-                    execution.moe_expert_cache, std::cout);
+                    execution.stores.moe_expert_cache, std::cout);
             }
             return status;
         }
@@ -1143,10 +1172,10 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     }
                 }
                 if(compare_cpu_background_calibration)
-                    prepare_moe_cpu_calibration_comparison(execution.moe_expert_cache,pass>0);
+                    prepare_moe_cpu_calibration_comparison(execution.stores.moe_expert_cache,pass>0);
                 else if(compare_cpu_transfer_budget)
-                    prepare_moe_cpu_budget_comparison(execution.moe_expert_cache,pass>0,phased);
-                else prepare_moe_pipeline_comparison(execution.moe_expert_cache,pass>0);
+                    prepare_moe_cpu_budget_comparison(execution.stores.moe_expert_cache,pass>0,phased);
+                else prepare_moe_pipeline_comparison(execution.stores.moe_expert_cache,pass>0);
                 std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1";
                 if(comparison_phase_timings)std::cout<<" mfe_phase_timings="<<phase_timings;
                 std::cout<<'\n';
@@ -1163,9 +1192,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 const int status=generate_diagnostic_tokens(execution,model,ids,gen,false,
                     pass_start,pass_start,decode_inputs);
                 if(status)return status;
-                const auto records=finish_moe_pipeline_comparison(execution.moe_expert_cache);
+                const auto records=finish_moe_pipeline_comparison(execution.stores.moe_expert_cache);
                 if(compare_moe_plan_reuse || compare_mfe_e8_narrow || compare_mfe_default_math || compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion || compare_mfe_early_gu)
-                    print_moe_expert_cache_stats(execution.moe_expert_cache,std::cout);
+                    print_moe_expert_cache_stats(execution.stores.moe_expert_cache,std::cout);
                 std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased
                     <<" end=1 dispatch_records="<<records<<"\n";
             }
@@ -1410,11 +1439,17 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
+        std::unordered_set<int64_t> stop_ids;
+        if (!ignore_eos && tokenizer_model.empty() && decode_inputs.empty()) {
+            stop_ids = mfq::engine::model_stop_token_ids(
+                mfq::cuda::load_model_config_json(*model.source, config_path), model.vocab_size());
+            if (stop_ids.empty()) std::cerr << "warning: no model EOS token IDs; generation is limited only by --gen\n";
+        }
         const auto status=generate_diagnostic_tokens(
-            execution, model, ids, gen, profile, t0, t1, decode_inputs);
-        if (!status && !router_lookahead_audit.empty()) {
-            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen4CausalLm>)
-                qwen4_finish_router_lookahead_audit(model, router_lookahead_audit);
+            execution, model, ids, gen, profile, t0, t1,decode_inputs,stop_ids,!router_lookahead_audit.empty());
+        if(!status && !router_lookahead_audit.empty()) {
+            if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);
         }
         return status;
             });
@@ -1461,6 +1496,7 @@ void print_diagnostics_help() {
         << "  --check-qwen4-decode-hidden     check decode graph raw hidden and KV transitions\n"
         << "  --check-flash-next-mtp          check Flash-Next MTP\n"
         << "  --check-continuous-batching     check continuous batching\n"
+        << "  --continuous-batching-check-requests N  check 2..32 concurrent requests\n"
         << "  --check-engine-isolation        check two concurrent CUDA engines\n"
         << "  --check-backend-bf16-add        check backend BF16 add\n"
         << "  --check-backend-argmax          check backend argmax\n"
@@ -1501,6 +1537,7 @@ void print_diagnostics_help() {
         << "  --compare-router-topk            one load, fixed primary tiers and CPU routes; original/cached/original\n"
         << "  --decode-inputs-file FILE        fixed decode input ids, raw int32, gen-1 entries\n"
         << "  --gen N                         generated tokens\n"
+        << "  --ignore-eos                    fixed-length token diagnostics\n"
         << "  --compare-route-poll            compare route notification polling, 2000/0/2000 us\n"
         << "  --compare-window-flush          compare per-layer / one token / per-layer WDDM submission flush\n"
         << "  --compare-early-no-cpu-ready     compare late / early / late GPU-only CPU completion\n"
@@ -1560,26 +1597,104 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.prefill_repeat > 0 || value.profile || value.minicpmo_eval_batch;
 }
 
+// Keep flag dispatch flat: MSVC limits nesting in long else-if chains.
+bool parse_diagnostic_switch(std::string_view option, DiagnosticsCommandOptions& result) {
+    static constexpr std::pair<std::string_view, bool DiagnosticsCommandOptions::*> switches[] = {
+        {"--check-qwen4-decode-hidden", &DiagnosticsCommandOptions::check_qwen4_decode_hidden},
+        {"--compare-ram-field-packing", &DiagnosticsCommandOptions::compare_ram_field_packing},
+        {"--compare-qsa-fusion", &DiagnosticsCommandOptions::compare_qsa_fusion},
+        {"--compare-moe-plan-reuse", &DiagnosticsCommandOptions::compare_moe_plan_reuse},
+        {"--compare-mfe-default-math", &DiagnosticsCommandOptions::compare_mfe_default_math},
+        {"--compare-mfe-e8-narrow", &DiagnosticsCommandOptions::compare_mfe_e8_narrow},
+        {"--minicpmo-eval-batch", &DiagnosticsCommandOptions::minicpmo_eval_batch},
+        {"--check-mfe-routed-input", &DiagnosticsCommandOptions::check_mfe_routed_input},
+        {"--check-mfe-benchmark-only", &DiagnosticsCommandOptions::check_mfe_benchmark_only},
+        {"--check-attention-swa-decode", &DiagnosticsCommandOptions::check_attention_swa_decode},
+        {"--check-gemma4-swa", &DiagnosticsCommandOptions::check_gemma4_swa},
+        {"--check-glm-dsa", &DiagnosticsCommandOptions::check_glm_dsa},
+        {"--check-dsv4-attention", &DiagnosticsCommandOptions::check_dsv4_attention},
+        {"--check-dsv4-hc", &DiagnosticsCommandOptions::check_dsv4_hc},
+        {"--check-deepseek-v41", &DiagnosticsCommandOptions::check_deepseek_v41},
+        {"--check-text-session-state", &DiagnosticsCommandOptions::check_text_session_state},
+        {"--check-qwen35-mtp", &DiagnosticsCommandOptions::check_qwen35_mtp},
+        {"--check-flash-next", &DiagnosticsCommandOptions::check_flash_next},
+        {"--check-flash-next-mtp", &DiagnosticsCommandOptions::check_flash_next_mtp},
+        {"--compare-dsv4-hc-ops", &DiagnosticsCommandOptions::compare_dsv4_hc_ops},
+        {"--compare-dsv4-hc-model", &DiagnosticsCommandOptions::compare_dsv4_hc_model},
+        {"--check-continuous-batching", &DiagnosticsCommandOptions::check_continuous_batching},
+        {"--check-engine-isolation", &DiagnosticsCommandOptions::check_engine_isolation},
+        {"--check-runtime-assets", &DiagnosticsCommandOptions::check_runtime_assets},
+        {"--check-mfq-container", &DiagnosticsCommandOptions::check_mfq_container},
+        {"--compare-ffn-transfer-phases", &DiagnosticsCommandOptions::compare_ffn_transfer_phases},
+        {"--compare-route-poll", &DiagnosticsCommandOptions::compare_route_poll},
+        {"--compare-window-flush", &DiagnosticsCommandOptions::compare_window_flush},
+        {"--compare-early-no-cpu-ready", &DiagnosticsCommandOptions::compare_early_no_cpu_ready},
+        {"--compare-gpu-only-cpu-wait", &DiagnosticsCommandOptions::compare_gpu_only_cpu_wait},
+        {"--compare-fixed-gpu-timing", &DiagnosticsCommandOptions::compare_fixed_gpu_timing},
+        {"--compare-window-input-views", &DiagnosticsCommandOptions::compare_window_input_views},
+        {"--compare-route-spin", &DiagnosticsCommandOptions::compare_route_spin},
+        {"--compare-shared-gate-fusion", &DiagnosticsCommandOptions::compare_shared_gate_fusion},
+        {"--compare-graph-optimizations", &DiagnosticsCommandOptions::compare_graph_optimizations},
+        {"--comparison-phase-timings", &DiagnosticsCommandOptions::comparison_phase_timings},
+        {"--compare-host-pin", &DiagnosticsCommandOptions::compare_host_pin},
+        {"--compare-resident-overlap", &DiagnosticsCommandOptions::compare_resident_overlap},
+        {"--compare-dma-graph-batch", &DiagnosticsCommandOptions::compare_dma_graph_batch},
+        {"--compare-warp-multi-sum", &DiagnosticsCommandOptions::compare_warp_multi_sum},
+        {"--compare-router-lookahead", &DiagnosticsCommandOptions::compare_router_lookahead},
+        {"--compare-rotary-fusion", &DiagnosticsCommandOptions::compare_rotary_fusion},
+        {"--compare-attention-grouping", &DiagnosticsCommandOptions::compare_attention_grouping},
+        {"--compare-mhc-fusion", &DiagnosticsCommandOptions::compare_mhc_fusion},
+        {"--compare-mhc-shared-norm", &DiagnosticsCommandOptions::compare_mhc_shared_norm},
+        {"--compare-mhc-dense-fusion", &DiagnosticsCommandOptions::compare_mhc_dense_fusion},
+        {"--compare-mhc-packed-groups", &DiagnosticsCommandOptions::compare_mhc_packed_groups},
+        {"--compare-mhc-fixed-formats", &DiagnosticsCommandOptions::compare_mhc_fixed_formats},
+        {"--compare-mhc-async-normalized", &DiagnosticsCommandOptions::compare_mhc_async_normalized},
+        {"--compare-gdn-fixed-geometry", &DiagnosticsCommandOptions::compare_gdn_fixed_geometry},
+        {"--compare-gdn-inplace-state", &DiagnosticsCommandOptions::compare_gdn_inplace_state},
+        {"--compare-mfe-parallel-gu", &DiagnosticsCommandOptions::compare_mfe_parallel_gu},
+        {"--compare-mfe-gpu-bundle", &DiagnosticsCommandOptions::compare_mfe_gpu_bundle},
+        {"--compare-mfe-shared-first", &DiagnosticsCommandOptions::compare_mfe_shared_first},
+        {"--compare-mfe-early-gate-up", &DiagnosticsCommandOptions::compare_mfe_early_gu},
+        {"--compare-cpu-background-calibration", &DiagnosticsCommandOptions::compare_cpu_background_calibration},
+        {"--compare-cpu-transfer-budget", &DiagnosticsCommandOptions::compare_cpu_transfer_budget},
+        {"--compare-router-topk", &DiagnosticsCommandOptions::compare_router_topk},
+        {"--profile", &DiagnosticsCommandOptions::profile},
+        {"--ignore-eos", &DiagnosticsCommandOptions::ignore_eos},
+        {"--check-backend-bf16-add", &DiagnosticsCommandOptions::check_backend_bf16_add},
+        {"--check-backend-argmax", &DiagnosticsCommandOptions::check_backend_argmax},
+        {"--compare-mma-attention", &DiagnosticsCommandOptions::compare_mma_attention},
+        {"--compare-decode-splitk", &DiagnosticsCommandOptions::compare_decode_splitk},
+        {"--compare-mma-decode", &DiagnosticsCommandOptions::compare_mma_decode},
+        {"--compare-nvq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+        {"--compare-niq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+    };
+    for (const auto& [name, field] : switches) {
+        if (option == name) {
+            result.*field = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
     while (!args.empty()) {
         const std::string_view option = args.next();
-        if(option == "--check-qwen4-decode-hidden") {result.check_qwen4_decode_hidden=true;continue;}
-        if(option == "--compare-ram-field-packing") {result.compare_ram_field_packing=true;continue;}
-        if(option == "--compare-qsa-fusion") {result.compare_qsa_fusion=true;continue;}
-        if(option == "--compare-moe-plan-reuse") {result.compare_moe_plan_reuse=true;continue;}
-        if(option == "--compare-mfe-default-math") {result.compare_mfe_default_math=true;continue;}
-        if(option == "--compare-mfe-e8-narrow") {result.compare_mfe_e8_narrow=true;continue;}
         if (option == "--help" || option == "-h") {
             print_diagnostics_help();
             throw HelpRequested{};
         }
         if (parse_cuda_load_option(option, args, result) ||
-                parse_token_input_option(option, args, result)) {
+                parse_token_input_option(option, args, result) ||
+                parse_diagnostic_switch(option, result)) {
             continue;
         }
-        if (option == "--minicpmo-eval-batch") result.minicpmo_eval_batch = true;
-        else if (option == "--minicpmo-eval-vision-batch-size") {
+        if (option == "--continuous-batching-check-requests") {
+            result.check_continuous_batching_requests = integer<int>(args.value(option),option);
+            continue;
+        }
+        if (option == "--minicpmo-eval-vision-batch-size") {
             result.minicpmo_eval_vision_batch_size =
                 integer<int64_t>(args.value(option), option);
             if (result.minicpmo_eval_vision_batch_size <= 0) {
@@ -1635,8 +1750,6 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-mfe-routes") result.check_mfe_routes = integer<int>(args.value(option), option);
         else if (option == "--check-mfe-reps") result.check_mfe_reps = integer<int>(args.value(option), option);
         else if (option == "--check-mfe-split-width") result.check_mfe_split_width = integer<int>(args.value(option), option);
-        else if (option == "--check-mfe-routed-input") result.check_mfe_routed_input = true;
-        else if (option == "--check-mfe-benchmark-only") result.check_mfe_benchmark_only = true;
         else if (option == "--check-dsv4-output-a") result.check_dsv4_output_a = args.value(option);
         else if (option == "--check-dsv4-output-a-batch") result.check_dsv4_output_a_batch = integer<int>(args.value(option), option);
         else if (option == "--check-dsv4-output-a-reps") result.check_dsv4_output_a_reps = integer<int>(args.value(option), option);
@@ -1644,20 +1757,8 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-attention-reps") result.check_attention_reps = integer<int>(args.value(option), option);
         else if (option == "--check-attention-head-dim") result.check_attention_head_dim = integer<int>(args.value(option), option);
         else if (option == "--check-attention-window") result.check_attention_window = integer<int>(args.value(option), option);
-        else if (option == "--check-attention-swa-decode") result.check_attention_swa_decode = true;
-        else if (option == "--check-gemma4-swa") result.check_gemma4_swa = true;
-        else if (option == "--check-glm-dsa") result.check_glm_dsa = true;
-        else if (option == "--check-dsv4-attention") result.check_dsv4_attention = true;
-        else if (option == "--check-dsv4-hc") result.check_dsv4_hc = true;
-        else if (option == "--check-deepseek-v41") result.check_deepseek_v41 = true;
-        else if (option == "--check-text-session-state") result.check_text_session_state = true;
-        else if (option == "--check-qwen35-mtp") result.check_qwen35_mtp = true;
-        else if (option == "--check-flash-next") result.check_flash_next = true;
-        else if (option == "--check-flash-next-mtp") result.check_flash_next_mtp = true;
         else if (option == "--bench-qwen35-mtp") result.bench_qwen35_mtp = args.value(option);
         else if (option == "--bench-qwen35-mtp-reps") result.bench_qwen35_mtp_reps = integer<int>(args.value(option), option);
-        else if (option == "--compare-dsv4-hc-ops") result.compare_dsv4_hc_ops = true;
-        else if (option == "--compare-dsv4-hc-model") result.compare_dsv4_hc_model = true;
         else if (option == "--kl-mmq") {
             result.kl_mmq_arg = args.value(option);
             try { (void)parse_kl_mmq_mode(result.kl_mmq_arg); }
@@ -1675,65 +1776,21 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
             validate_integer_list(result.prefill_sweep_arg, option);
         }
         else if (option == "--prefill-sweep-reps") result.prefill_sweep_reps = integer<int>(args.value(option), option);
-        else if (option == "--check-continuous-batching") result.check_continuous_batching = true;
-        else if (option == "--check-engine-isolation") result.check_engine_isolation = true;
-        else if (option == "--check-runtime-assets") result.check_runtime_assets = true;
-        else if (option == "--check-mfq-container") result.check_mfq_container = true;
         else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);
         else if (option == "--router-lookahead-audit") result.router_lookahead_audit = args.value(option);
-        else if (option == "--compare-ffn-transfer-phases") result.compare_ffn_transfer_phases = true;
-        else if (option == "--compare-route-poll") result.compare_route_poll = true;
-        else if (option == "--compare-window-flush") result.compare_window_flush = true;
-        else if (option == "--compare-early-no-cpu-ready") result.compare_early_no_cpu_ready = true;
-        else if (option == "--compare-gpu-only-cpu-wait") result.compare_gpu_only_cpu_wait = true;
-        else if (option == "--compare-fixed-gpu-timing") result.compare_fixed_gpu_timing = true;
-        else if (option == "--compare-window-input-views") result.compare_window_input_views = true;
-        else if (option == "--compare-route-spin") result.compare_route_spin = true;
-        else if (option == "--compare-shared-gate-fusion") result.compare_shared_gate_fusion = true;
-        else if (option == "--compare-graph-optimizations") result.compare_graph_optimizations = true;
-        else if (option == "--comparison-phase-timings") result.comparison_phase_timings = true;
         else if (option == "--comparison-rounds") {
             result.comparison_rounds=integer<int>(args.value(option),option);
             if(result.comparison_rounds<1 || result.comparison_rounds>8)
                 throw std::invalid_argument("comparison rounds must be between one and eight");
         }
-        else if (option == "--compare-host-pin") result.compare_host_pin = true;
-        else if (option == "--compare-resident-overlap") result.compare_resident_overlap = true;
-        else if (option == "--compare-dma-graph-batch") result.compare_dma_graph_batch = true;
-        else if (option == "--compare-warp-multi-sum") result.compare_warp_multi_sum = true;
-        else if (option == "--compare-router-lookahead") result.compare_router_lookahead = true;
-        else if (option == "--compare-rotary-fusion") result.compare_rotary_fusion = true;
-        else if (option == "--compare-attention-grouping") result.compare_attention_grouping = true;
-        else if (option == "--compare-mhc-fusion") result.compare_mhc_fusion = true;
-        else if (option == "--compare-mhc-shared-norm") result.compare_mhc_shared_norm = true;
-        else if (option == "--compare-mhc-dense-fusion") result.compare_mhc_dense_fusion = true;
-        else if (option == "--compare-mhc-packed-groups") result.compare_mhc_packed_groups = true;
-        else if (option == "--compare-mhc-fixed-formats") result.compare_mhc_fixed_formats = true;
-        else if (option == "--compare-mhc-async-normalized") result.compare_mhc_async_normalized = true;
-        else if (option == "--compare-gdn-fixed-geometry") result.compare_gdn_fixed_geometry = true;
-        else if (option == "--compare-gdn-inplace-state") result.compare_gdn_inplace_state = true;
-        else if (option == "--compare-mfe-parallel-gu") result.compare_mfe_parallel_gu = true;
-        else if (option == "--compare-mfe-gpu-bundle") result.compare_mfe_gpu_bundle = true;
-        else if (option == "--compare-mfe-shared-first") result.compare_mfe_shared_first = true;
-        else if (option == "--compare-mfe-early-gate-up") result.compare_mfe_early_gu = true;
-        else if (option == "--compare-cpu-background-calibration") result.compare_cpu_background_calibration = true;
-        else if (option == "--compare-cpu-transfer-budget") result.compare_cpu_transfer_budget = true;
-        else if (option == "--compare-router-topk") result.compare_router_topk = true;
         else if (option == "--decode-inputs-file") result.decode_inputs_file = args.value(option);
-        else if (option == "--profile") result.profile = true;
         else if (option == "--warmup-prefill") {
             result.warmup_prefill = integer<int>(args.value(option), option);
             if (result.warmup_prefill < 0 || result.warmup_prefill > 100)
                 usage_error("--warmup-prefill requires a count from 0 to 100");
         }
-        else if (option == "--check-backend-bf16-add") result.check_backend_bf16_add = true;
-        else if (option == "--check-backend-argmax") result.check_backend_argmax = true;
-        else if (option == "--compare-mma-attention") result.compare_mma_attention = true;
-        else if (option == "--compare-decode-splitk") result.compare_decode_splitk = true;
-        else if (option == "--compare-mma-decode") result.compare_mma_decode = true;
         else if (option == "--compare-mma-decode-steps") result.compare_mma_decode_steps = integer<int>(args.value(option), option);
         else if (option == "--compare-mma-decode-planned-len") result.compare_mma_decode_planned_len = integer<int>(args.value(option), option);
-        else if (option == "--compare-nvq-vec4" || option == "--compare-niq-vec4") result.compare_nvq_vec4 = true;
         else usage_error("unknown option: " + std::string(option));
     }
     if (!result.decode_inputs_file.empty()) {

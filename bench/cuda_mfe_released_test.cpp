@@ -1,9 +1,9 @@
 #include "packed_bench_utils.h"
 #include "kernels/moe/ops.h"
 #include "ops/moe/mfe_ffn_runtime.h"
-#include "storage/moe/quant_range_source.h"
-#include "storage/moe/cached_source_internal.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/moe/quant_range_source.h"
+#include "storage/weights/moe/cached_source_internal.h"
+#include "storage/weights/loaders/weight.h"
 #include "mfq/model_source/model_source.h"
 #include <array>
 #include <cstring>

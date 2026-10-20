@@ -1,8 +1,8 @@
 #pragma once
 
-#include "hf_safetensors_store.h"
-#include "mlx_moe.h"
-#include "mlx_mx.h"
+#include "storage/hf_safetensors_store.h"
+#include "ops/mlx_moe.h"
+#include "ops/mlx_mx.h"
 
 #include <cstddef>
 #include <cstdint>

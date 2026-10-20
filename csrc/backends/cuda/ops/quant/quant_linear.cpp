@@ -1,3 +1,4 @@
+#include "native/weight_memory.h"
 #include "kernels/activation_ops.h"
 #include "kernels/quant_ops.h"
 #include "quant_linear.h"
@@ -29,7 +30,9 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     int64_t out = 0;
     int64_t q_bit_base = 0;
     bool aligned_q8 = !a.q8_zero;
+    int uniform_qbits=a.uniform_qbits;
     for (const auto & w : ws) {
+        if(w.uniform_qbits!=uniform_qbits)uniform_qbits=0;
         if (w.ng != a.ng || w.gs != a.gs ||
             w.neuron_len != a.neuron_len || w.q8_zero != a.q8_zero) {
             throw std::runtime_error("cannot group NINT tensors with different input layout");
@@ -60,6 +63,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.neuron_len = a.neuron_len;
     g.q8_zero = a.q8_zero;
     g.aligned_q8 = aligned_q8;
+    g.uniform_qbits=uniform_qbits;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
@@ -775,6 +779,7 @@ QuantLinearGroup make_quant_group(
         CudaExecutionContext& execution,
         std::vector<QuantLinear> layers,
         bool preserve_projection_boundaries) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.decode_branch_parallel = !preserve_projection_boundaries;
@@ -830,17 +835,14 @@ DenseLinearGroup make_dense_group(const std::vector<mfq_tensor_backend::Tensor> 
 }
 
 mfq_tensor_backend::Tensor dequant_nint_dense_f32(const NintWeight & w) {
-    mfq_tensor_backend::Tensor dense;
     if (w.q8_zero) {
-        dense = nint8_zero_dequant_cuda(
-            w.q_packed, w.q8_zero_scale, w.neuron_len);
-    } else {
-        dense = nint_decode_cuda(
-            w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
-            w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            w.neuron_len, w.gs);
+        return nint8_zero_dequant_f32_cuda(
+            w.q_packed, w.q8_zero_scale, w.neuron_len).contiguous();
     }
-    return dense.to(mfq_tensor_backend::kFloat32).contiguous();
+    return nint_decode_f32_cuda(
+        w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+        w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+        w.neuron_len, w.gs).contiguous();
 }
 
 static mfq_tensor_backend::Tensor dequant_mxfp4_sq_cpu(

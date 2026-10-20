@@ -72,6 +72,8 @@ struct Mxfp8Cpu {
     int64_t neuron_len = 0;
     std::vector<uint8_t> values;
     std::vector<uint8_t> scales;
+    int block_rows = 128;
+    int block_columns = 128;
 };
 
 struct Mxfp4Cpu {

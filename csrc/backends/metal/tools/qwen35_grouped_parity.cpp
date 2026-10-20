@@ -1,10 +1,10 @@
 // Parity check: grouped multi-row projections vs independent per-tensor
 // GEMVs on tensors loaded from a real MFQ container. Exercises the exact
 // QKV groups the Qwen3.5 runtime builds for prefill/verify rows.
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_tensor.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "runtime/mlx_tensor.h"
 
 #include <algorithm>
 #include <cmath>

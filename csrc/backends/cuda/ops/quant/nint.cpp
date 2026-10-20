@@ -1,10 +1,14 @@
+#include "kernels/quant/nint_route_hint.h"
+#include "native/resident_allocations.h"
+#include "ops/decode_window.h"
+#include "ops/execution/execution_options.h"
 #include "kernels/activation_ops.h"
 #include "kernels/quant_ops.h"
 #include "nint.h"
 #include "nint_prefill_cache.h"
 #include "ops/execution/cuda_execution.h"
 #include "ops/format.h"
-#include "packed_nint.h"
+#include "csrc/backends/cpu/ops/packed_nint.h"
 #include "cpu_projection_rows.h"
 
 #include <cstring>
@@ -27,6 +31,13 @@ struct NintPrefillDecodeCacheState {
 };
 namespace {
 thread_local NintPrefillDecodeCacheState* nint_prefill_decode_cache=nullptr;
+Workspace& resident_nint_workspace(const NintWeight& weight,int rows) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    mfq::cuda::ResidentAllocationScope resident;
+#endif
+    return weight.workspace(rows);
+}
+
 NintPrefillDecodeCacheState::Key nint_prefill_decode_key(const NintWeight& w) {
     return {reinterpret_cast<uintptr_t>(w.q_packed.data_ptr()),
         reinterpret_cast<uintptr_t>(w.row_q_bits.data_ptr()),
@@ -436,26 +447,60 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     });
     return result;
 }
+bool nint_packed_decode_rows(const NintWeight& w,int64_t rows) {
+    // Batched decode projects directly from packed weights. Preserve
+    // prefill's GEMM path and its layer decode cache.
+    return !w.q8_zero && (rows <= 8 || (rows <= 32 && w.gs>=4 && w.gs<=64 &&
+        !nint_prefill_decode_cache && mfq::cuda::DecodeWindow::recording() &&
+        (mfq::cuda::runtime_options::nint_compressed_decode_batch() ||
+         (rows>16 && mfq::cuda::runtime_options::nint_compressed_large_batch(w.out>=65536)))));
+}
+
 mfq_tensor_backend::Tensor nint_matmul(
         CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous();
+    const bool packed_rows=nint_packed_decode_rows(w,x.size(0));
+    if (!packed_rows && !w.q8_zero && w.out>=65536 && x.size(0)>8 && x.size(0)<=32 &&
+        !nint_prefill_decode_cache && mfq::cuda::runtime_options::nint_large_output_tiling()) {
+        // Large vocabulary heads otherwise materialize over a GiB of FP16
+        // weights. Reuse compressed GEMV across up to eight activation rows.
+        x=x.to(mfq_tensor_backend::kFloat16);
+        return profiler.measure("nint.matmul.tiled_output",[&] {
+            std::vector<mfq_tensor_backend::Tensor> output;
+            for(int64_t row=0;row<x.size(0);row+=8)
+                output.push_back(nint_matmul(profiler,w,x.narrow(0,row,std::min<int64_t>(8,x.size(0)-row))));
+            return mfq_tensor_backend::cat(output,0);
+        });
+    }
     if (x.size(0) > 8 || (x.scalar_type() != mfq_tensor_backend::kFloat16 &&
             x.scalar_type() != mfq_tensor_backend::kFloat32))
         x = x.to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (!w.q8_zero) {
+        if(packed_rows && M>8) {
+            return profiler.measure("nint.matmul.online_f16",[&] {
+                return nint_matmul_online_f16_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,w.gs);
+            });
+        }
         if (M <= 8) {
-            Workspace & ws = w.workspace(M);
+            Workspace & ws = resident_nint_workspace(w,M);
             return profiler.measure("nint.matmul", [&]() {
                 if (w.aligned_q8) {
                     return nint_matmul_q8_ws_cuda(
                         w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                         w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                         x, w.gs, ws.qx, ws.xscale);
+                }
+                if((w.uniform_qbits==5 && w.gs==28) || (w.uniform_qbits==6 && (w.gs==24 || w.gs==28))) {
+                    return nint_matmul_fixed_bits_ws_cuda(
+                        w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                        w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+                        x,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
                 }
                 return nint_matmul_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
@@ -483,7 +528,7 @@ mfq_tensor_backend::Tensor nint_matmul(
         });
     }
     if (M <= 8) {
-        Workspace & ws = w.workspace(M);
+        Workspace & ws = resident_nint_workspace(w,M);
         return profiler.measure("nint8_zero.gemv", [&]() {
             return nint8_zero_gemv_ws_cuda(
                 w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
@@ -608,13 +653,21 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     if (!w.q8_zero && x.size(0) <= 8) {
-        Workspace & ws = w.workspace(static_cast<int>(x.size(0)));
+        Workspace & ws = resident_nint_workspace(w,static_cast<int>(x.size(0)));
         return profiler.measure("nint.matmul.input_mul", [&]() {
             if (w.aligned_q8) {
                 return nint_matmul_input_mul_q8_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                     x, gate, mode, w.gs, ws.qx, ws.xscale);
+            }
+            const auto fixed_setting=mfq::cuda::runtime_options::nint_fused_fixed_bits();
+            if((!fixed_setting || *fixed_setting) &&
+                    ((w.uniform_qbits==5 && w.gs==28) || (w.uniform_qbits==6 && (w.gs==24 || w.gs==28)))) {
+                return nint_matmul_input_mul_fixed_bits_ws_cuda(
+                    w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+                    x,gate,mode,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
             }
             return nint_matmul_input_mul_ws_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,

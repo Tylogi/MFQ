@@ -1,8 +1,10 @@
+#include "native/env.h"
 #include "load_options.h"
 #include "cuda_runtime_config.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
-#include "moe/moe_cache_profile.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "profile.h"
+#include "profile_path.h"
 #include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>
@@ -242,6 +244,7 @@ void setup_cuda_load(
         throw std::runtime_error("--threads must be positive");
     }
     if (options.cpu_threads) mfq_set_num_threads(*options.cpu_threads);
+    execution.yarn_context_extension=options.yarn_context_extension;
     configure_model_parallel(
         execution, options.tensor_parallel, options.expert_parallel,
         options.parallel_test_duplicates);
@@ -293,7 +296,10 @@ void setup_cuda_load(
             "--moe-gpu-cache-gb cannot be combined with "
             "tensor/expert parallelism");
     }
-    if (!options.moe_cache_profile_path.empty() &&
+    const auto* auto_profile=mfq::cuda::env_lookup("MFQ_MOE_AUTO_CACHE_PROFILE");
+    const auto profile_path=mfq::resolve_moe_cache_profile_path(options.moe_cache_profile_path,
+        options.moe_gpu_cache_gb>0.0?options.model_path:std::string{},!auto_profile || auto_profile[0]!='0');
+    if (!profile_path.empty() &&
             options.moe_gpu_cache_gb <= 0.0) {
         throw std::runtime_error(
             "--moe-cache-profile requires --moe-gpu-cache-gb");
@@ -309,14 +315,13 @@ void setup_cuda_load(
             throw std::runtime_error(
                 "--moe-gpu-cache-gb is outside the supported range");
         }
-        execution.moe_expert_cache =
+        execution.stores.moe_expert_cache =
             make_moe_expert_cache(
                 static_cast<int64_t>(bytes), execution.config);
-        if (!options.moe_cache_profile_path.empty()) {
-            set_moe_expert_cache_profile(
-                *execution.moe_expert_cache,
-                mfq::load_moe_cache_profile(
-                    options.moe_cache_profile_path));
+        if (!profile_path.empty()) {
+            set_moe_expert_cache_profile(*execution.stores.moe_expert_cache,mfq::engine::load_moe_cache_profile(profile_path));
+            std::cerr<<"moe_cache_profile source="<<(options.moe_cache_profile_path.empty()?"sidecar":"explicit")
+                <<" path="<<profile_path<<std::endl;
         }
         execution.drop_file_cache = true;
     }

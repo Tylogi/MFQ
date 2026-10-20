@@ -1,8 +1,14 @@
+@import '../../shared/styles/numeric-values.css';
+
 /* 官方与社区模型浏览、设备建议和精度版本选择。 */
+.lab-view:has(> .model-download-page) > .screen-header { margin-bottom: 16px; }
 .model-browser { display: grid; min-width: 0; gap: 18px; }
-.model-browser-header { display: flex; align-items: end; justify-content: space-between; gap: 18px; }
+.model-download-page :is(input[type="number"], .download-concurrency select, .detected-memory-pool small, .model-metadata-grid dd, .model-variant small, .repository-line > span, .repository-file-list small, .download-queue-heading > span, .download-item-body > small, .download-item-files summary, .download-item-progress > span, .kv-cache-planner summary small, .kv-cache-chart text, .kv-cache-tooltip span, .kv-cache-ruler button, .kv-cache-breakdown tr:not(.kv-cache-group-row) td, .kv-cache-breakdown-heading > span) { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; }
+.model-browser-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px 18px; }
 .model-browser-header h2 { margin: 0; color: var(--ink); font-size: 18px; letter-spacing: -0.02em; }
-.model-browser-header p { margin: 5px 0 0; color: var(--muted); font-size: 12.5px; }
+.model-browser-header > h2, .model-browser-header > .download-concurrency { align-self: center; }
+.model-browser-description { display: grid; min-width: 0; gap: 8px; }
+.model-browser-header p { margin: 0; color: var(--muted); font-size: 12.5px; }
 .model-browser-tabs { display: flex; gap: 3px; border: 1px solid var(--panel-line); border-radius: 9px; padding: 3px; background: var(--panel-control); }
 .model-browser-tabs button { min-height: 34px; border: 0; border-radius: 6px; padding: 7px 12px; color: var(--muted); background: transparent; font-size: 12.5px; }
 .model-browser-tabs button[aria-selected="true"] { color: var(--ink); background: var(--surface-raised); box-shadow: 0 1px 4px rgb(0 0 0 / 8%); font-weight: 700; }
@@ -21,8 +27,8 @@
 .hardware-backend-badge .ui-icon { overflow: visible; stroke-width: .75; stroke-linejoin: miter; stroke-linecap: butt; }
 .detected-configuration > button, .community-model-search button, .model-variant button { align-self: stretch; border: 0; padding: 0 14px; color: var(--on-accent); background: var(--accent); font-size: 12px; font-weight: 700; }
 .detected-configuration > button { color: var(--ink-soft); background: var(--surface-raised); font-weight: 550; }
-.model-variant button { color: #fff; background: #4b4b4b; }
-.model-variant button:hover:not(:disabled) { background: #3d3d3d; }
+.model-variant button { color: var(--accent-ink); background: var(--accent-soft); }
+.model-variant button:hover:not(:disabled) { background: var(--accent-border); }
 .detected-configuration > button:hover:not(:disabled) { color: var(--accent-ink); background: var(--surface-hover); }
 .detected-configuration > button:disabled, .community-model-search button:disabled, .model-variant button:disabled { opacity: 0.48; }
 .model-browser-layout { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(380px, 1.2fr); gap: 20px; align-items: start; }
@@ -44,7 +50,7 @@
 .configuration-details span { color: var(--muted); font-size: 10.5px; }
 .configuration-details strong { overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
 .configuration-details p { grid-column: 1 / -1; margin: 0; padding: 7px 9px; color: var(--ink-soft); background: var(--surface-raised); font-size: 11px; line-height: 1.4; }
-.configuration-details.recommended p { color: var(--success, #26834a); }
+.configuration-details.recommended p { color: var(--accent); }
 .configuration-details.caution p { color: var(--warning, #a96600); }
 .configuration-details.not-recommended p { color: var(--danger); }
 .model-detail-panel { display: grid; min-width: 0; gap: 18px; border: 1px solid var(--panel-line); border-radius: 12px; padding: 20px; background: var(--surface-raised); }
@@ -125,6 +131,7 @@
 .repository-line { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
 .repository-line button { overflow: hidden; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .repository-line span { flex: none; color: var(--muted); font-size: 11px; }
+.model-detail-panel > .model-weight-pressure-note { margin: -8px 0 0; color: var(--muted-light); font-size: 10.5px; line-height: 1.6; }
 .model-variant-list { display: grid; gap: 0; overflow: hidden; border: 1px solid var(--panel-line); border-radius: 10px; }
 .model-variant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, 0.35fr) auto; align-items: center; gap: 10px; overflow: hidden; background: var(--panel-control); }
 .model-variant + .model-variant { border-top: 1px solid var(--panel-line); }
@@ -135,6 +142,7 @@
 .variant-memory-tiers { display: grid; min-width: 0; gap: 8px; }
 .variant-memory-caption { display: block; overflow: hidden; margin-bottom: 4px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .variant-memory-pressure > strong { min-width: 39px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
+.model-download-page .variant-memory-pressure > strong { font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .variant-memory-track { overflow: hidden; height: 6px; border-radius: 99px; background: var(--panel-line); }
 .variant-memory-track span { display: block; height: 100%; border-radius: inherit; background: var(--muted); transition: width 180ms ease; }
 .community-model-search { display: grid; grid-template-columns: auto minmax(220px, 1fr) auto; gap: 6px; }
@@ -206,7 +214,8 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
 }
 
 @media (max-width: 680px) {
-  .model-browser-header { align-items: stretch; flex-direction: column; }
+  .model-browser-header { display: flex; align-items: stretch; flex-direction: column; }
+  .model-browser-header > h2, .model-browser-header > .download-concurrency { align-self: auto; }
   .model-browser-tabs button { flex: 1; }
   .community-model-search { grid-template-columns: 1fr; }
   .model-variant { grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; }
@@ -219,8 +228,23 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .download-item-heading > .model-identity-trailing { align-self: stretch; justify-content: space-between; margin-left: 0; }
   .download-queue-item > button { margin-left: 42px; }
 }
-.model-browser-actions { display: grid; justify-items: end; gap: 9px; }
-.download-concurrency { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 11px; }
+.download-directory-row { display: flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: 12px 24px; }
+.download-directory-control { display: flex; flex: 1 1 250px; min-width: 0; align-items: center; gap: 10px; color: var(--muted); font-size: 11px; }
+.download-storage { display: grid; flex: 0 1 230px; min-width: 0; gap: 5px; }
+.download-storage-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10.5px; }
+.download-storage-summary > span:last-child { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.download-prefix-reclaim { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; cursor: pointer; }
+.download-prefix-reclaim input { appearance: none; -webkit-appearance: none; width: 13px; height: 13px; margin: 0; flex: 0 0 13px; border: 1px solid var(--muted); border-radius: 3px; background: var(--surface); display: grid; place-content: center; }
+.download-prefix-reclaim input:checked { background: var(--accent); border-color: var(--accent); }
+.download-prefix-reclaim input:checked::after { content: ''; width: 6px; height: 3px; border: solid white; border-width: 0 0 1.5px 1.5px; transform: translateY(-1px) rotate(-45deg); }
+.download-prefix-reclaim input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.download-prefix-reclaim input:disabled { cursor: wait; }
+.download-prefix-reclaim input { transition: none; }
+.download-directory-control > span { flex-shrink: 0; }
+.download-directory-control > code { min-width: 0; max-width: 520px; overflow: hidden; color: var(--ink-soft); font-family: inherit; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.download-directory-control > button { display: inline-flex; flex-shrink: 0; align-items: center; gap: 5px; min-height: 28px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-control); color: var(--ink-soft); font-size: 11px; }
+.download-directory-control > button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
+.download-concurrency { display: flex; justify-self: end; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 11px; }
 .download-concurrency select { border: 1px solid var(--line); border-radius: 7px; padding: 3px 7px; background: var(--panel-control); color: var(--ink-soft); font-size: 11px; }
 .repository-files { margin-top: 20px; color: var(--ink-soft); font-size: 12px; }
 .repository-files summary { cursor: pointer; padding: 12px 0; }

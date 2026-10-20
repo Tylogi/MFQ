@@ -1,4 +1,4 @@
-#include "mlx_qwen35_linear_attention.h"
+#include "models/qwen35/mlx_qwen35_linear_attention.h"
 
 #include <cmath>
 #include <iostream>

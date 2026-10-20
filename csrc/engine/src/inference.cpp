@@ -1,6 +1,7 @@
 #include "inference.h"
 
-#include "text_emitter.h"
+#include "emitter.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -23,6 +24,30 @@ OutputDiff public_diff(common_chat_msg_diff value) {
 }
 
 } // namespace
+
+std::unordered_set<std::int64_t> model_stop_token_ids(std::string_view config, std::int64_t vocabulary) {
+    std::unordered_set<std::int64_t> result;
+    if (vocabulary <= 0) return result;
+    const auto root = nlohmann::json::parse(config.begin(), config.end(), nullptr, false);
+    if (!root.is_object()) return result;
+    const auto* text = &root;
+    if (root.contains("text_config") && root["text_config"].is_object()) text = &root["text_config"];
+    auto found = text->find("eos_token_id");
+    if (found == text->end() || found->is_null()) {
+        text = &root;
+        found = text->find("eos_token_id");
+    }
+    if (found == text->end()) return result;
+    const auto add = [&](const auto& value) {
+        if (!value.is_number_integer()) return;
+        if (value.is_number_unsigned() && value.template get<std::uint64_t>() >= std::uint64_t(vocabulary)) return;
+        const auto id = value.template get<std::int64_t>();
+        if (id >= 0 && id < vocabulary) result.insert(id);
+    };
+    if (found->is_array()) for (const auto& value : *found) add(value);
+    else add(*found);
+    return result;
+}
 
 void InferenceMetrics::mark_prefill(const MfqPrefillTiming& timing) {
     prefill_tokens = timing.prompt_tokens;
@@ -95,12 +120,12 @@ TokenOutput InferenceOutput::append(const std::vector<std::int64_t>& tokens) {
         metrics.mark_token();
         ++result.completion_tokens;
         output.token_ids.push_back(token);
-        if (!tokenizer_) continue;
-        if (tokenizer_->is_eog(token)) {
+        if (tokenizer_ ? tokenizer_->is_eog(token) : request_.stop_token_ids.contains(token)) {
             stopped_ = true;
             result.finish_reason = "stop";
             break;
         }
+        if (!tokenizer_) continue;
         emitter_.append(tokenizer_->piece(token, request_.preserved_tokens.count(token)));
         parse(emitter_.take(), true, output);
         if (emitter_.stopped()) {

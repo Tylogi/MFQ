@@ -6,8 +6,9 @@
   background: var(--canvas);
   color-scheme: light;
   accent-color: var(--accent);
-  font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont,
-    "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+  --text-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-family: var(--text-font);
   font-size: 14px;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -36,6 +37,7 @@
   --panel-control: rgb(32 34 35 / 3.5%);
   --panel-line: rgb(32 34 35 / 8%);
   --sidebar: #eef0f3;
+  --sidebar-ink: #333333;
   --sidebar-surface: rgb(255 255 255 / 58%);
   --sidebar-hover: rgb(32 34 35 / 7%);
   --sidebar-line: rgb(32 34 35 / 10%);
@@ -79,6 +81,7 @@
   --panel-control: rgb(240 243 243 / 3.5%);
   --panel-line: rgb(240 243 243 / 8%);
   --sidebar: #1c1d21;
+  --sidebar-ink: #dedede;
   --sidebar-surface: rgb(240 243 243 / 5%);
   --sidebar-hover: rgb(240 243 243 / 8%);
   --sidebar-line: rgb(240 243 243 / 10%);
@@ -123,6 +126,7 @@
     --panel-control: rgb(240 243 243 / 3.5%);
     --panel-line: rgb(240 243 243 / 8%);
     --sidebar: #1c1d21;
+    --sidebar-ink: #dedede;
     --sidebar-surface: rgb(240 243 243 / 5%);
     --sidebar-hover: rgb(240 243 243 / 8%);
     --sidebar-line: rgb(240 243 243 / 10%);

@@ -1,8 +1,8 @@
-#include "mfe_expert_store.h"
-#include "mlx_ssd_expert_arena.h"
-#include "mlx_ssd_expert_cache.h"
-#include "mlx_moe_ops.h"
-#include "mfq_container.h"
+#include "storage/mfe_expert_store.h"
+#include "runtime/mlx_ssd_expert_arena.h"
+#include "runtime/mlx_ssd_expert_cache.h"
+#include "ops/mlx_moe_ops.h"
+#include "storage/mfq_container.h"
 
 #include <algorithm>
 #include <chrono>

@@ -7,12 +7,15 @@ stay a DAG in the documented order:
 
     native -> kernels -> ops -> storage -> models -> engine
 
-Run: python3 cuda/tests/cuda_include_graph.py [--verbose]
+Run: python3 cuda/tests/test_cuda_include_graph.py [--verbose]
 """
 import os
 import re
 import sys
 import collections
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from include_graph import include_roots
 
 BACKEND_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "csrc", "backends/cuda"))
@@ -42,17 +45,11 @@ def dir_of(path):
 REPO_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", "..", ".."))
 CSRC_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", ".."))
 
-# Every directory the CUDA targets put on the include path.  Kept here so a
-# first-party include that no longer resolves is reported instead of skipped.
-INCLUDE_ROOTS = [
-    REPO_ROOT,
-    CSRC_ROOT,
-    BACKEND_ROOT,
-    os.path.join(CSRC_ROOT, "core"),
-    os.path.join(CSRC_ROOT, "core", "include"),
-    os.path.join(CSRC_ROOT, "models"),
-    os.path.join(CSRC_ROOT, "engine", "internal"),
-]
+# Every directory the CUDA targets put on the include path, from the one place
+# that knows them.  A first-party include that no longer resolves is then
+# reported instead of skipped.
+INCLUDE_ROOTS = [REPO_ROOT, BACKEND_ROOT, os.path.join(CSRC_ROOT, "core")] + \
+    include_roots(CSRC_ROOT)
 
 # Basenames of every header under the backend root.  An include of one of these
 # that does not resolve is a broken path, not a system header.

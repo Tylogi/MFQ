@@ -1,8 +1,8 @@
 #pragma once
 
 #include "deepseek_v41_model.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
 
 #include <string>
 
@@ -23,6 +23,11 @@ mlx::core::array deepseek_v41_hc_collapse_norm(
     const mlx::core::array& pre,
     const mlx::core::array& norm,
     float norm_eps = 1e-6f);
+
+mlx::core::array deepseek_v41_hc_projection(
+    const mlx::core::array& residual,
+    const mlx::core::array& weight,
+    float eps = 1e-20f);
 
 MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
     const mlx::core::array& normalized_mixes,

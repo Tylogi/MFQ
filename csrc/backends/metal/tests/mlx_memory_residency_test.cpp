@@ -1,4 +1,4 @@
-#include "mlx_memory_residency.h"
+#include "runtime/mlx_memory_residency.h"
 
 #include <mlx/allocator.h>
 #include <mlx/mlx.h>

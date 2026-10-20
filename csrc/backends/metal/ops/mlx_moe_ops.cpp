@@ -189,7 +189,10 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
 #if MFQ_TOPK_ROUTE_GROUPS
     uint row = simdgroup_index_in_threadgroup;
     bool active = row < uint(logits_shape[0]);
-    threadgroup int selected_routes[6u * uint(TOP_K)];
+#ifndef MFQ_TOPK_MAX_ROWS
+#define MFQ_TOPK_MAX_ROWS 6
+#endif
+    threadgroup int selected_routes[uint(MFQ_TOPK_MAX_ROWS) * uint(TOP_K)];
 #else
     uint row = threadgroup_position_in_grid.y;
     constexpr bool active = true;
@@ -257,12 +260,29 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
         int expert = selected_routes[index];
         device int* group = groups + index * 8u;
         for (uint slot = 0u; slot < 6u; ++slot) group[slot + 2u] = -1;
+#if MFQ_TOPK_MAX_ROWS > 6
+        uint preceding = 0u;
+        for (uint route = 0u; route < index; ++route)
+            preceding += uint(selected_routes[route] == expert);
+        uint first = (preceding / 6u) * 6u;
+#endif
         uint matches = 0u;
         for (uint route = 0u; route < route_count; ++route) {
-            if (selected_routes[route] == expert) group[2u + matches++] = int(route);
+            if (selected_routes[route] != expert) continue;
+#if MFQ_TOPK_MAX_ROWS > 6
+            if (matches >= first && matches < first + 6u)
+                group[2u + matches - first] = int(route);
+#else
+            group[2u + matches] = int(route);
+#endif
+            ++matches;
         }
         group[0] = expert;
+#if MFQ_TOPK_MAX_ROWS > 6
+        group[1] = int(min(matches - first, 6u));
+#else
         group[1] = int(matches);
+#endif
     }
 #endif
 )METAL";
@@ -647,6 +667,36 @@ constexpr const char* kInversePermutationSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kRestoreRoutedRowsHeader = R"METAL(
+inline uint4 mfq_moe_load16(device const uchar* value) {
+    return *reinterpret_cast<device const uint4*>(value);
+}
+inline uint4 mfq_moe_load16(constant const uchar* value) {
+    return *reinterpret_cast<constant const uint4*>(value);
+}
+)METAL";
+
+constexpr const char* kRestoreRoutedRowsSource = R"METAL(
+    const uint width = uint(values_shape[1]);
+    const uint chunks = (width + 15u) / 16u;
+    const uint index = thread_position_in_grid.x;
+    const uint row = index / chunks;
+    if (row >= uint(values_shape[0])) return;
+    const uint column = (index - row * chunks) * 16u;
+    const int original = order[row];
+    if (original < 0 || original >= values_shape[0]) return;
+    const bool valid = ids[original] >= 0;
+    const ulong source = ulong(row) * width + column;
+    const ulong destination = ulong(original) * width + column;
+    if (width % 16u == 0u) {
+        const uint4 value = valid ? mfq_moe_load16(values + source) : uint4(0);
+        *reinterpret_cast<device uint4*>(output + destination) = value;
+    } else {
+        for (uint item = 0u; item < 16u && column + item < width; ++item)
+            output[destination + item] = valid ? values[source + item] : uchar(0);
+    }
+)METAL";
+
 constexpr const char* kGluSplitSource = R"METAL(
     const uint ROWS = uint(gate_up_shape[0]);
     uint index = thread_position_in_grid.x;
@@ -757,7 +807,8 @@ mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    std::string source) {
+    std::string source,
+    std::string header = {}) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
@@ -765,7 +816,7 @@ mlx::core::fast::CustomKernelFunction make_kernel(
         std::move(inputs),
         std::move(outputs),
         std::move(source),
-        "",
+        std::move(header),
         true,
         false,
         options);
@@ -812,6 +863,21 @@ softmax_top_k_group_kernel(mlx::core::Dtype dtype) {
     static const auto fp32_kernel = make_kernel(
         "mfq_cpp_moe_softmax_topk_groups_f32", {"logits"}, {"ids", "weights", "groups"},
         std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\nusing T = float;\n") + kSoftmaxTopKRowSource);
+    if (dtype == mlx::core::float16) return fp16_kernel;
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp32_kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+softmax_top_k_large_group_kernel(mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups16_f16", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\n#define MFQ_TOPK_MAX_ROWS 16\nusing T = half;\n") + kSoftmaxTopKRowSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups16_bf16", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\n#define MFQ_TOPK_MAX_ROWS 16\nusing T = bfloat;\n") + kSoftmaxTopKRowSource);
+    static const auto fp32_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups16_f32", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\n#define MFQ_TOPK_MAX_ROWS 16\nusing T = float;\n") + kSoftmaxTopKRowSource);
     if (dtype == mlx::core::float16) return fp16_kernel;
     return dtype == mlx::core::bfloat16 ? bf16_kernel : fp32_kernel;
 }
@@ -979,6 +1045,13 @@ inverse_permutation_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction& restore_routed_rows_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_restore_routed_rows",
+        {"values", "order", "ids"}, {"output"}, kRestoreRoutedRowsSource, kRestoreRoutedRowsHeader);
+    return kernel;
+}
+
 const mlx::core::fast::CustomKernelFunction& glu_split_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_moe_glu_split",
@@ -1139,7 +1212,7 @@ std::optional<array> moe_route_groups_host(
     if (tokens < 1 || routes < 1 || routes > kMaximumRoutes
         || ids.size() != static_cast<std::size_t>(tokens) * routes)
         throw std::invalid_argument("host MoE routes have invalid geometry");
-    if (tokens == 1 || tokens > 6) return std::nullopt;
+    if (tokens == 1 || tokens > 24) return std::nullopt;
     std::vector<std::int32_t> groups(ids.size() * 8, -1);
     std::vector<std::int32_t> matches;
     for (std::size_t index = 0; index < ids.size(); ++index) {
@@ -1220,7 +1293,7 @@ MlxMoeTopKResult moe_topk(
                ? 2
                : (delayed_softmax ? 3 : 0));
 
-    if (rows <= 6 && mode == 0 && normalize &&
+    if (rows <= 16 && mode == 0 && normalize &&
         norm_floor == 1e-20f && scale == 1.0f &&
         !bias.has_value() && !available.has_value() &&
         experts >= 32 && experts <= 4096 && experts % 32 == 0) {
@@ -1232,14 +1305,16 @@ MlxMoeTopKResult moe_topk(
             shapes.emplace_back(Shape{rows, top_k, 8});
             dtypes.push_back(mlx::core::int32);
         }
-        const auto& kernel = grouped ? softmax_top_k_group_kernel(values.dtype())
+        const auto& kernel = rows > 6 ? softmax_top_k_large_group_kernel(values.dtype())
+            : grouped ? softmax_top_k_group_kernel(values.dtype())
             : softmax_top_k_row_kernel(values.dtype());
+        const int grouped_threads = rows > 6 ? 512 : 192;
         auto outputs = kernel(
             {std::move(values)},
             shapes,
             dtypes,
-            grouped ? std::tuple{192, 1, 1} : std::tuple{32, rows, 1},
-            grouped ? std::tuple{192, 1, 1} : std::tuple{32, 1, 1},
+            grouped ? std::tuple{grouped_threads, 1, 1} : std::tuple{32, rows, 1},
+            grouped ? std::tuple{grouped_threads, 1, 1} : std::tuple{32, 1, 1},
             {
                 {"EXPERTS", experts},
                 {"TOP_K", top_k},
@@ -1878,6 +1953,23 @@ array moe_inverse_permutation(const array& order) {
         false,
         {});
     return std::move(outputs.front());
+}
+
+array moe_restore_routed_rows(
+    const array& sorted_output, const array& route_order, const array& expert_ids) {
+    if (sorted_output.ndim() != 2 || route_order.ndim() != 1 ||
+        route_order.size() != static_cast<std::size_t>(sorted_output.shape(0)) ||
+        expert_ids.size() != route_order.size())
+        throw std::invalid_argument("MoE sorted output and route metadata do not match");
+    if (sorted_output.size() == 0) return sorted_output;
+    auto values = mlx::core::view(mlx::core::contiguous(sorted_output), mlx::core::uint8);
+    const int chunks = (values.shape(1) + 15) / 16;
+    const int size = checked_int(std::size_t(values.shape(0)) * chunks, "restore grid");
+    auto result = restore_routed_rows_kernel()(
+        {values, int32_contiguous(route_order), int32_contiguous(expert_ids)},
+        {values.shape()}, {mlx::core::uint8}, {size,1,1}, {std::min(kThreads,size),1,1},
+        {}, std::nullopt, false, {}).front();
+    return mlx::core::view(std::move(result),sorted_output.dtype());
 }
 
 array moe_swiglu_split(const array& gate_up) {

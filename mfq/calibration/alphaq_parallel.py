@@ -86,12 +86,13 @@ def _run_job(job):
     kind, item, scheme = job
     state, started = _worker, time.monotonic()
     device = state['backend'].device
-    if kind == 'statistics':
+    if kind in ('statistics', 'statistics-energy'):
         # Each bank is independently durable even if its parent exits before
         # merging statistics.json. Workers never overwrite that shared file.
         key = hashlib.sha256(item.name.encode()).hexdigest()
         directory = state['cache']/'statistics-parts'/key
-        value = collect_statistics(state['root'], (item,), directory, device)[0]
+        value = collect_statistics(state['root'], (item,), directory, device,
+                                   column_energy=kind == 'statistics-energy')[0]
     elif kind == 'fit':
         if state['imatrix'] is None:
             if file_sha256(state['imatrix_path']) != state['imatrix_sha']:
@@ -141,7 +142,7 @@ class DeviceWorkers:
             self.executors = [ProcessPoolExecutor(max_workers=1, mp_context=context,
                 initializer=_initialize, initargs=(*self.arguments, device, *self.tail))
                 for device in self.devices]
-        jobs = [(kind, item, None) for item in tasks] if kind == 'statistics' else [
+        jobs = [(kind, item, None) for item in tasks] if kind in ('statistics', 'statistics-energy') else [
             (kind, item, scheme) for item, scheme in tasks]
         # Start larger tensors first; each available device then takes the next
         # whole bank. The count derives from work, not an inherited batch cap.

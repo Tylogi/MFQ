@@ -1,7 +1,7 @@
 #include "mlx_qwen35_linear_attention.h"
 
-#include "mlx_detached_copy.h"
-#include "mlx_eval_timing.h"
+#include "runtime/mlx_detached_copy.h"
+#include "runtime/mlx_eval_timing.h"
 
 #include <cmath>
 #include <limits>

@@ -49,7 +49,10 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
                          int64_t context_size = 0) {
         require_model(Derived::accepts_backbone(graph.backbone),
                       "model backbone does not match the requested causal model");
-        model().adapter_load_config(payload, graph, source);
+        model().load_config(payload, graph, source);
+        // Every family config spells this field the same way, so the shared copy
+        // is seeded here rather than in each load_config().
+        this->metadata.max_position_embeddings = model().config.max_position_embeddings;
         require_model(num_hidden_layers() == graph.topology.text_layers,
                       "model graph/config text-layer topology mismatch");
         if (context_size > 0) {
@@ -79,30 +82,34 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         }
     }
 
-    CausalPositions<Tensor> adapter_prepare_positions(Tensor positions, int64_t, int64_t) const {
+    CausalPositions<Tensor> prepare_positions(Tensor positions, int64_t, int64_t) const {
         return {positions, positions};
     }
-    std::optional<Tensor> adapter_attention_mask(std::optional<Tensor> mask, int64_t,
+    std::optional<Tensor> attention_mask(std::optional<Tensor> mask, int64_t,
                                                  int64_t) const {
         return mask;
     }
-    void adapter_validate_forward(int64_t, int64_t, int64_t, bool, bool, bool) const {}
-    bool adapter_allows_speculative_position_override() const noexcept { return false; }
-    void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
+    void validate_forward(int64_t, int64_t, int64_t, bool, bool, bool) const {}
+    bool allows_speculative_position_override() const noexcept { return false; }
+    void validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
                                     bool) const {
         require_model((Backend::rank(positions) == 1 && Backend::size(positions, 0) == tokens) ||
                           (Backend::rank(positions) == 2 && Backend::size(positions, 0) == batch &&
                            Backend::size(positions, 1) == tokens),
                       "position_ids must have shape [tokens] or [batch,tokens]");
     }
-    bool adapter_pass_cache_positions(bool has_mrope, bool has_override) const noexcept {
+    bool passes_cache_positions(bool has_mrope, bool has_override) const noexcept {
         return has_mrope || has_override;
     }
-    bool adapter_pass_attention_mask() const noexcept { return false; }
-    bool adapter_force_cache_advance() const noexcept { return false; }
-    bool adapter_uses_decode_sequence_length() const noexcept { return true; }
-    bool adapter_supports_speculation() const noexcept { return false; }
-    bool adapter_supports_suffix_speculation() const noexcept { return false; }
+    bool passes_attention_mask() const noexcept { return false; }
+    bool force_cache_advance() const noexcept { return false; }
+    bool uses_decode_sequence_length() const noexcept { return true; }
+    bool family_supports_speculation() const noexcept {
+        if constexpr(requires {Backend::joint_speculation_supported;})
+            return Backend::joint_speculation_supported;
+        return false;
+    }
+    bool family_supports_suffix_speculation() const noexcept { return false; }
 
     int64_t vocab_size() const noexcept { return this->metadata.vocab_size; }
 
@@ -125,7 +132,9 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     double rope_base() const noexcept { return this->metadata.rope_base; }
 
     void set_max_position_embeddings(int64_t value) noexcept {
-        model().adapter_set_max_position_embeddings(value);
+        // config drives weight loading and per-family geometry, metadata drives
+        // execution; both must see an override, so the base writes both.
+        model().config.max_position_embeddings = value;
         this->metadata.max_position_embeddings = value;
     }
 
@@ -193,15 +202,12 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         auto ops = this->forward_ops(model(), std::move(input));
         return causal_forward(ops);
     }
-    Tensor finalize_hidden(Tensor hidden, int64_t batch, int64_t tokens) {
-        return model().adapter_finalize_hidden(std::move(hidden), this->output_norm, batch, tokens);
-    }
     Tensor apply_final_logit_softcap(Tensor logits) const {
         const auto cap = final_logit_softcapping();
         return cap > 0.0 ? this->softcap(std::move(logits), cap) : std::move(logits);
     }
     Tensor logits_from_hidden(Tensor hidden) {
-        return apply_final_logit_softcap(model().adapter_logits(this->lm_head, std::move(hidden)));
+        return apply_final_logit_softcap(model().logits_from_head(this->lm_head, std::move(hidden)));
     }
     Tensor forward(Tensor ids) {
         if(auto graph=backend_graph_logits(static_cast<Backend&>(*this),model(),ids,0,0))return *graph;
@@ -217,7 +223,7 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         const auto lengths = decode_lengths(ids);
         auto hidden = hidden_forward(std::move(ids), {}, lengths);
         return apply_final_logit_softcap(
-            model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden))));
+            model().last_logits_from_head(this->lm_head, this->last_hidden(std::move(hidden))));
     }
     Tensor next_token(Tensor ids) {
         if(auto graph=backend_graph_logits(static_cast<Backend&>(*this),model(),ids,2,0))return *graph;
@@ -225,7 +231,7 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         return next_token_from_hidden(hidden_forward(std::move(ids), {}, lengths));
     }
     Tensor next_token_from_hidden(Tensor hidden) {
-        return model().adapter_next_token(this->lm_head, this->last_hidden(std::move(hidden)));
+        return model().next_token_from_head(this->lm_head, this->last_hidden(std::move(hidden)));
     }
     Tensor hidden_forward_static(Tensor ids, Tensor positions, Tensor lengths,
                                  ForwardPlan plan = {}) {
@@ -237,17 +243,17 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         auto hidden =
             hidden_forward_static(std::move(ids), std::move(positions), std::move(lengths), plan);
         return apply_final_logit_softcap(
-            model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden))));
+            model().last_logits_from_head(this->lm_head, this->last_hidden(std::move(hidden))));
     }
     Tensor next_token_static(Tensor ids, Tensor positions, Tensor lengths, ForwardPlan plan = {}) {
         return next_token_from_hidden(
             hidden_forward_static(std::move(ids), std::move(positions), std::move(lengths), plan));
     }
     bool supports_speculation() const {
-        return model().adapter_supports_speculation() && speculative_blocks();
+        return model().family_supports_speculation() && speculative_blocks();
     }
     bool supports_suffix_speculation() const {
-        return model().adapter_supports_suffix_speculation() && speculative_blocks();
+        return model().family_supports_suffix_speculation() && speculative_blocks();
     }
     void begin_speculative_suffix(int64_t draft_tokens) {
         models::begin_speculative_suffix(
@@ -327,7 +333,7 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
                       "token IDs must have shape [tokens] or [batch,tokens]");
         const auto tokens = this->size(ids, rank - 1);
         const auto batch = rank == 1 ? 1 : this->size(ids, 0);
-        if (model().adapter_uses_decode_sequence_length() && cache_pos > 0 && tokens == 1)
+        if (model().uses_decode_sequence_length() && cache_pos > 0 && tokens == 1)
             return this->sequence_lengths(batch, cache_pos + 1);
         return {};
     }

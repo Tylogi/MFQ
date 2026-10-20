@@ -5,10 +5,10 @@
 #include "kernels/sampling_ops.h"
 #include "ops/execution/cuda_execution.h"
 #include "models/common/full_block.h"
-#include "storage/kv/batch_paged.h"
-#include "continuous_batch.h"
+#include "storage/state/batch_paged.h"
+#include "driver.h"
 #include "decode_graph.h"
-#include "generation_step.h"
+#include "step.h"
 #include "ops/execution/cuda_sampling.h"
 #include <map>
 #include <span>
@@ -80,6 +80,15 @@ BatchTokens sample_cuda_batch(mfq_tensor_backend::Tensor logits,
     mfq_tensor_backend::Tensor greedy_tokens, std::span<const BatchSamplingRow>,
     bool greedy, int64_t& readbacks);
 
+// The Engine composition root owns the physical batch state, so it needs the
+// storage type of a model that batches; a model that never batches has none.
+template <class Model, class = void> struct NoBatchStorage { using type = std::monostate; };
+template <class Model>
+struct NoBatchStorage<Model, std::void_t<typename Model::BatchStorage>> {
+    using type = typename Model::BatchStorage;
+};
+template <class Model> using batch_storage_t = typename NoBatchStorage<Model>::type;
+
 template <class Model> struct CudaBatchRequest : mfq::engine::BatchRequest {
     using BatchRequest::BatchRequest;
     std::optional<Sampler> sampler;
@@ -88,15 +97,16 @@ template <class Model> struct CudaBatchRequest : mfq::engine::BatchRequest {
     typename Model::BatchRequestState cache;
 };
 
-// Reusable CUDA numerical quanta. The model and its native state are bound at
-// Engine composition; neither the shared batch policy nor this module selects
-// a family. Other native executions can implement the quantum contract directly.
+// Reusable CUDA numerical quanta. The model and the physical batch state are
+// bound here at Engine composition; the Store owns that state and this module
+// borrows it. Neither the shared batch policy nor this module selects a family.
 template <class Model> class CudaBatchExecution {
   public:
     using Tensor = mfq_tensor_backend::Tensor;
     using Request = CudaBatchRequest<Model>;
     using Sample = mfq::engine::BatchSample;
-    CudaBatchExecution(Model&, CudaExecutionContext&, CudaContinuousBatchConfig);
+    CudaBatchExecution(Model&, CudaExecutionContext&, CudaContinuousBatchConfig,
+                       typename Model::BatchStorage&);
     CudaBatchExecution(const CudaBatchExecution&) = delete;
     CudaBatchExecution& operator=(const CudaBatchExecution&) = delete;
     mfq::engine::Metrics metrics() const;
@@ -111,7 +121,7 @@ template <class Model> class CudaBatchExecution {
     void invalidate_decode_graph();
 
     Model& model_;
-    typename Model::BatchStorage native_;
+    typename Model::BatchStorage& native_;
     CudaExecutionContext& execution_;
     const CudaContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
@@ -129,12 +139,12 @@ namespace mfq::cuda {
 
 template <class Model>
 CudaBatchExecution<Model>::CudaBatchExecution(
-        Model& model, CudaExecutionContext& execution, CudaContinuousBatchConfig config)
-    : model_(model), native_(model, config.max_sequences, config.paged_kv),
-      execution_(execution), config_(std::move(config)),
+        Model& model, CudaExecutionContext& execution, CudaContinuousBatchConfig config,
+        typename Model::BatchStorage& storage)
+    : model_(model), native_(storage), execution_(execution), config_(std::move(config)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(model.num_experts() > 0),
-      cached_moe_enabled_(moe_enabled_ && bool(execution.moe_expert_cache)),
+      cached_moe_enabled_(moe_enabled_ && bool(execution.stores.moe_expert_cache)),
       metadata_(max_sequences_) {}
 
 template <class Model>
@@ -200,7 +210,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::PrefillWork<Request> work) {
     }
     auto timer = std::make_unique<internal::PrefillCudaTimer>();
     MfqOptional<Tensor> length = mfq_nullopt;
-    if (model_.adapter_uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
+    if (model_.uses_decode_sequence_length() && chunk.offset > 0 && chunk.count == 1)
         length = mfq_tensor_backend::full({1}, chunk.offset + 1, request->prefill_ids.options());
     auto hidden = model_.hidden_forward(
         request->prefill_ids.narrow(1, chunk.offset, chunk.count).contiguous(), mfq_nullopt, length);
@@ -274,7 +284,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::DecodeWork<Request> work) {
     BatchDecodeGraph* decode_graph = nullptr;
     bool graph_cache_hit = false;
     if (batch_greedy && config_.greedy && batch_cuda_graph_enabled(execution_, config_, cached_moe_enabled_)) {
-        const auto addresses = model_.adapter_batch_state_addresses(model_.blocks);
+        const auto addresses = model_.batch_state_addresses(model_.blocks);
         const auto found = std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
             return graph->matches(batch, planned_len, addresses);
         });
@@ -321,7 +331,7 @@ CudaBatchExecution<Model>::execute(mfq::engine::DecodeWork<Request> work) {
                     decode_graph->graph->capture_begin();
                     decode_graph->static_next = invoke();
                     decode_graph->graph->capture_end();
-                    decode_graph->set_key(batch, planned_len, model_.adapter_batch_state_addresses(model_.blocks));
+                    decode_graph->set_key(batch, planned_len, model_.batch_state_addresses(model_.blocks));
                     ++cuda_graph_captures_;
                     ++graph_bucket_counts_[{batch, planned_len}].first;
                 } catch (...) { decode_graph->invalidate(); throw; }
@@ -377,3 +387,9 @@ void CudaBatchExecution<Model>::recover(std::span<const std::shared_ptr<Request>
     invalidate_decode_graph();
 }
 } // namespace mfq::cuda
+
+namespace mfq::cuda {
+template<class Model,class=void>struct BatchExecutor {using type=CudaBatchExecution<Model>;};
+template<class Model>struct BatchExecutor<Model,std::void_t<typename Model::BatchExecution>> {using type=typename Model::BatchExecution;};
+template<class Model>using batch_executor_t=typename BatchExecutor<Model>::type;
+}

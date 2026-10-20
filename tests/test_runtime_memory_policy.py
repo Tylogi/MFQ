@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,29 @@ from mfq.server.state.storage import SessionStore
 from tests.test_server_models import _TestJobContext
 
 GIB = 1 << 30
+
+@pytest.mark.parametrize('limit', [None, 64 * GIB])
+def test_identical_policy_is_noop_even_with_busy_loaded_models(tmp_path, limit):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime')
+        pool.memory_policy = RuntimeMemoryPolicy(prefix_disk_limit_bytes=limit)
+        item = cached_instance(tmp_path, 'busy', GIB, 2 * GIB, active=1)
+        item.prefix_dynamic_budget = False
+        pool._instances[item.id] = item
+        pool._retire_instance = AsyncMock()
+        pool._rebalance_prefix_cache_budget = AsyncMock()
+        pool._rebalance_resident_budget = AsyncMock()
+        pool._maintain_prefix_disk_budget = AsyncMock()
+        result = await pool.configure_memory_policy(_TestJobContext(), pool.memory_policy.model_dump())
+        assert result['models_replanned'] == 0 and pool._memory_configuration_job is None
+        pool._retire_instance.assert_not_awaited()
+        pool._rebalance_prefix_cache_budget.assert_not_awaited()
+        pool._rebalance_resident_budget.assert_not_awaited()
+        pool._maintain_prefix_disk_budget.assert_not_awaited()
+        assert item.backend.calls == []
+        pool._instances.clear()
+        await pool.aclose()
+    asyncio.run(run())
 
 class CacheBackend:
     def __init__(self, hot, limit, pressure=0):
@@ -227,7 +251,7 @@ def test_impossible_dense_budget_is_rejected_before_unloading(tmp_path):
     with pytest.raises(JobExecutionError):
         pool._plan_memory_policy(RuntimeMemoryPolicy(prefix_limit_bytes=128 * GIB), [])
 
-def test_policy_reloads_dense_before_experts_preserving_each_context_and_pin(tmp_path, monkeypatch):
+def test_unsupported_weight_budget_never_reloads_models(tmp_path, monkeypatch):
     async def run():
         pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=112 * GIB)
         pool.store = SessionStore(tmp_path / 'settings.sqlite3')
@@ -247,15 +271,13 @@ def test_policy_reloads_dense_before_experts_preserving_each_context_and_pin(tmp
         monkeypatch.setattr(pool, 'load', load)
         context = _TestJobContext()
         context.job_id, context.cancel_requested = uuid4(), False
-        result = await pool.configure_memory_policy(context, {'model_limit_bytes': 64 * GIB, 'prefix_limit_bytes': 8 * GIB})
-        assert [item['model'] for item in loaded] == ['dense', 'moe']
-        assert [item['context_size'] for item in loaded] == [8192, 32768]
-        assert loaded[0]['idle_ttl_seconds'] == 300 and loaded[1]['pin'] is True
-        assert result['models_replanned'] == 2 and pool._memory_configuration_job is None
-        assert pool.store.runtime_memory_policy()['model_limit_bytes'] == 64 * GIB
+        with pytest.raises(JobExecutionError, match='online model weight budgets'):
+            await pool.configure_memory_policy(context, {'model_limit_bytes': 64 * GIB, 'prefix_limit_bytes': 8 * GIB})
+        assert loaded == [] and list(pool._instances.values()) == instances
+        assert pool._memory_configuration_job is None and pool.store.runtime_memory_policy() == {}
     asyncio.run(run())
 
-def test_failed_replan_restores_previous_policy_and_models(tmp_path, monkeypatch):
+def test_failed_directory_replan_restores_previous_policy_and_models(tmp_path, monkeypatch):
     async def run():
         pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=112 * GIB)
         dense = artifact(tmp_path, 'dense', 20)
@@ -272,7 +294,7 @@ def test_failed_replan_restores_previous_policy_and_models(tmp_path, monkeypatch
         monkeypatch.setattr(pool, 'load', load)
         context = _TestJobContext()
         context.job_id, context.cancel_requested = uuid4(), False
-        with pytest.raises(RuntimeError): await pool.configure_memory_policy(context, {'model_limit_bytes': 64 * GIB})
+        with pytest.raises(RuntimeError): await pool.configure_memory_policy(context, {'model_limit_bytes': 64 * GIB, 'prefix_directory': str(tmp_path / 'new-cache')})
         assert pool.memory_policy.model_limit_bytes is None and pool._memory_configuration_job is None
         assert restored[0]['context_size'] == 16384
     asyncio.run(run())

@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import packageInfo from '../package.json' with { type: 'json' };
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {
@@ -14,7 +15,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     await page.goto('/applications');
     if (testInfo.project.name === 'mobile') await page.getByRole('button', { name: en ? 'Open sidebar' : '打开侧栏', exact: true }).click();
     const card = page.getByRole('button', { name: en ? 'Open version manager' : '打开版本管理' });
-    await expect(card).toContainText('v0.3.2');
+    await expect(card).toContainText(`v${packageInfo.version}`);
     await expect(card).not.toContainText('Studio Test Model');
     await expect(card.locator('img, svg')).toHaveCount(0);
     await card.click();

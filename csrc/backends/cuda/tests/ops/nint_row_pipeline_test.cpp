@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "storage/nint_row_pipeline.h"
+#include "storage/weights/nint_row_pipeline.h"
 #include "ops/decode_window.h"
 #include "ops/quant/nint.h"
 #include "kernels/moe/pipeline.h"
@@ -10,6 +10,57 @@
 #include <iostream>
 #include <cstdlib>
 namespace tb=mfq_tensor_backend;
+void early_prefix_rows() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::atomic<int> submissions{0};
+    std::vector<std::shared_ptr<mfq::NintRows>> tables;
+    for(int shard=0;shard<4;++shard)tables.push_back(std::make_shared<mfq::NintRows>(fixture->blob.size(),
+        [fixture](std::size_t off,uint8_t* dst,std::size_t n){std::memcpy(dst,fixture->blob.data()+off,n);},true,
+        [fixture,&submissions](const std::vector<mfq::ReadSpan>& spans) {
+            ++submissions;
+            for(const auto& span:spans)std::memcpy(span.destination,fixture->blob.data()+span.offset,span.size);
+        }));
+    const tb::Device device{tb::kCUDA,0};
+    for(bool matches:{true,false}) {
+        NintRowPipeline pipeline(tables);
+        const std::vector<int64_t> prefix={1,529+2,529*2+3,529*3+4};
+        auto ids=prefix;
+        ids.insert(ids.end(),{5,529+2,529*2+6,529*3+4});
+        if(!matches)ids[0]=7;
+        const auto before=submissions.load();
+        pipeline.issue(prefix,{1,1,4},true);
+        auto actual=pipeline.collect(ids,{1,2,4},device).cpu().contiguous();
+        // Four shards for the hint; only shards zero and two have new rows.
+        if(submissions.load()-before!=6)
+            throw std::runtime_error("PLE prefix was reread or extension missed new rows");
+        auto expected=nint_sharded_embedding_lookup(tables,ids,{1,2,4},device).cpu().contiguous();
+        if(actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("PLE early prefix changed extended-window output");
+        auto stage=pipeline.make_stage({1,2,4},device);
+        pipeline.upload(*stage,ids,{1,2,4});stage->decode();
+        auto staged=stage->output().cpu().contiguous();
+        if(std::memcmp(staged.data_ptr(),expected.data_ptr(),staged.numel()*staged.element_size()))
+            throw std::runtime_error("PLE early prefix changed graph-stage payload");
+    }
+    {
+        NintRowPipeline pipeline(tables);
+        const std::vector<int64_t> ids={1,531,1061,1591,5,531,1064,1591,1,537,1061,1599};
+        const auto before=submissions.load();
+        pipeline.issue(std::vector<int64_t>(ids.begin(),ids.begin()+4),{1,1,4},true);
+        pipeline.issue(std::vector<int64_t>(ids.begin(),ids.begin()+8),{1,2,4},true);
+        auto actual=pipeline.collect(ids,{1,3,4},device).cpu().contiguous();
+        if(submissions.load()-before!=8)
+            throw std::runtime_error("PLE successive draft prefixes duplicated a row read");
+        auto expected=nint_sharded_embedding_lookup(tables,ids,{1,3,4},device).cpu().contiguous();
+        if(actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("PLE successive draft prefixes changed output");
+    }
+    // Abandoned hints finish safely without any subsequent target upload.
+    {NintRowPipeline pipeline(tables);pipeline.issue({9,530,1061,1591},{1,1,4},true);}
+    std::cout<<"MFQ PLE early-prefix extension/chain/mismatch/abandon PASS cases=4\n";
+}
 void large_window() {
     auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
     auto table=std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size());
@@ -49,11 +100,28 @@ void large_window() {
 }
 int main(int argc,char** argv)try {
     const bool mapped_rows=argc==2 && std::string(argv[1])=="--mapped-rows";
-    if(mapped_rows) {
-        mfq::cuda::env_set("MFQ_PLE_MAPPED_ROWS","1");
+    const bool device_rows=argc==2 && std::string(argv[1])=="--device-rows";
+    if(mapped_rows || device_rows) {
+        mfq::cuda::env_set("MFQ_PLE_MAPPED_ROWS",mapped_rows?"1":"0");
     }
-    const auto stream=mfq_current_cuda_stream();
-    auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);
+    // Hold the context before borrowing its raw stream. current_stream()'s
+    // temporary owner otherwise destroys a freshly created context here;
+    // the usual driver often reuses the handle, hiding the stale stream.
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    early_prefix_rows();
+    if(!mfq::cuda::env_lookup("MFQ_PLE_MAPPED_ROWS")) {
+        auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+        auto table=std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size());
+        NintRowPipeline pipeline({table});const tb::Device device{tb::kCUDA,0};
+        if(!pipeline.make_stage({1,1,4},device)->mapped_rows() ||
+           !pipeline.make_stage({1,6,4},device)->mapped_rows() ||
+           !pipeline.make_stage({24},device)->mapped_rows() ||
+           pipeline.make_stage({1536},device)->mapped_rows() ||
+           pipeline.make_stage({1,32,4},device)->mapped_rows() ||
+           pipeline.make_stage({1,6,256},device)->mapped_rows())
+            throw std::runtime_error("PLE automatic packet policy changed");
+    }
     if(argc==2 && std::string(argv[1])=="--large-window") {
         large_window();context->end_graph_pool(stream);return 0;
     }
@@ -165,9 +233,11 @@ int main(int argc,char** argv)try {
             throw std::runtime_error("PLE recovery retained incomplete row data");
         ++recoveries;
     }
-    large_window();
+    // The 12K-node submission stress is checked separately without kernel
+    // instrumentation; retain all row correctness/recovery cases in memcheck.
+    if(!mfq::cuda::env_lookup("MFQ_PLE_TEST_SKIP_LARGE_WINDOW"))large_window();
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     std::cout<<"MFQ PLE native row gather/cache/issue/collect PASS cases="<<cases
         <<" asynchronous graph cases="<<graph_cases<<" changed_rows="<<changed_rows
-        <<" cancel_guards="<<cancel_guards<<" recoveries="<<recoveries<<" mapped_rows="<<mapped_rows<<'\n';
+        <<" cancel_guards="<<cancel_guards<<" recoveries="<<recoveries<<" mapped_rows="<<mapped_rows<<std::endl;
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

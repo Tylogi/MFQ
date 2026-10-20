@@ -10,11 +10,13 @@ import type {
   JobResource,
   ModelConfigurationStatus,
   ModelParameterBreakdown,
+  ModelAttentionProfile,
   OfficialModelInfo,
   OfficialModelList,
   OfficialModelSource,
 } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
+import { errorMessage } from '../../app/formatters';
 import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
@@ -25,6 +27,12 @@ import { RepositoryFiles } from './RepositoryFiles';
 import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemory } from './KvCachePlanner';
 
 type Translate = (chinese: string, english: string) => string;
+function attentionLabel(profile: ModelAttentionProfile | null | undefined, tr: Translate): string {
+  if (!profile) return '--';
+  return [profile.sparse ? tr('稀疏', 'Sparse') : tr('稠密', 'Dense'),
+    ...(profile.compressed ? [tr('压缩', 'Compressed')] : []),
+    profile.hybrid ? tr('混合', 'Hybrid') : tr('非混合', 'Non-hybrid')].join('·');
+}
 export type ModelBrowserTab = 'official' | 'community' | 'downloads';
 export type DownloadOrigin = { x: number; y: number };
 
@@ -35,6 +43,8 @@ interface ModelBrowserProps {
   tab: ModelBrowserTab;
   onTabChange(tab: ModelBrowserTab): void;
   downloadQueue?: ReactNode;
+  downloadDirectory?: string;
+  downloadDirectoryControl?: ReactNode;
   tr: Translate;
 }
 
@@ -189,17 +199,20 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
 function ConfigurationDetails({ status, planned = false, rows, tr }: { status: ModelConfigurationStatus; planned?: boolean; rows?: PressureRow[]; tr: Translate }) {
   if (rows && rows.some(row => row.kind !== 'shared')) {
     return <div className="configuration-details">{rows.map(row => <div key={row.kind}>
-      <span>{row.kind === 'vram' ? tr('最低档预计显存常驻 / 显存容量', 'Smallest tier VRAM residency / capacity')
+      <span>{row.kind === 'combined' ? tr('最低档预计常驻 / 显存 + 内存容量', 'Smallest tier residency / VRAM + RAM capacity')
+        : row.kind === 'vram' ? tr('最低档预计显存常驻 / 显存容量', 'Smallest tier VRAM residency / capacity')
         : tr('最低档预计 RAM 常驻 / RAM 容量', 'Smallest tier RAM residency / capacity')}</span>
       <strong>{formatBytes(row.required)} / {formatBytes(row.available)}</strong>
-    </div>)}<p>{rows.length > 1
+    </div>)}<p>{rows.some(row => row.kind === 'combined')
+      ? tr('常驻权重和已应用的 KV 按显存 + 内存合计容量计算，已扣除 SSD PLE。', 'Resident weights and applied KV use the combined VRAM + RAM capacity, excluding SSD PLE.')
+      : rows.length > 1
       ? tr('显存按稠密权重和已应用的 KV 计算；RAM 按路由专家和 Embedding 计算。SSD PLE 单独计算。', 'VRAM includes dense weights and applied KV; RAM includes routed experts and embedding. SSD PLE is separate.')
       : tr('显存按整模权重和已应用的 KV 计算，已扣除 SSD PLE。', 'VRAM includes model weights and applied KV, excluding SSD PLE.')}</p></div>;
   }
   return (
     <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
-        <span>{planned ? tr('最低档权重 + KV/递推状态', 'Smallest tier weights + KV/recurrent state') : tr("最低档预计权重常驻", "Smallest tier estimated resident weights")}</span>
+        <span>{planned ? tr('最低档权重 + KV/递推状态', 'Smallest tier weights + KV/recurrent state') : tr("最低档权重", "Smallest tier weights")}</span>
         <strong>{formatBytes(status.required_memory_bytes)}</strong>
       </div>
       <div>
@@ -238,12 +251,12 @@ function VariantList({
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
-              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.estimated_resident_weight_bytes != null ? tr("预计权重常驻", "est. resident weights") : variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes))}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · ${tr("常驻", "resident")} ${formatBytes(Math.max(0, variant.byte_size - (variant.ssd_ple_bytes ?? 0)))} · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
               {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
             <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
                 ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes)}
-              roles={variant.estimated_weight_bytes_by_role} system={system} cacheBytes={cacheBytes} moe={moe}
+              roles={variant.estimated_weight_bytes_by_role} system={system} cacheBytes={cacheBytes} moe={moe} combineMoe showDetails={false}
               available={variant.configuration.available_memory_bytes}
               label={tr("预计占当前推理预算", "Estimated share of runtime budget")}
               tr={tr} />
@@ -260,11 +273,13 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, tr }: ModelBrowserProps) {
+export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
   const [officialSourceInfo, setOfficialSourceInfo] = useState<HubModelInfo | null>(null);
+  const [automaticSource, setAutomaticSource] = useState<OfficialModelSource | null>(null);
+  const [sourceProbing, setSourceProbing] = useState(false);
   const [provider, setProvider] = useState<HubModelSummary["provider"]>("huggingface");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<HubModelSummary[]>([]);
@@ -280,6 +295,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const catalogController = useRef<AbortController | null>(null);
   const communityRequest = useRef(0);
+  const sourceProbeRequest = useRef(0);
 
   const selectedOfficial = useMemo(
     () => official?.data.find((item) => item.id === officialSelection) ?? official?.data[0] ?? null,
@@ -287,7 +303,29 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   );
   const selectedSource = selectedOfficial?.sources.find((source) =>
     source.provider === officialSource?.provider && source.repo_id === officialSource.repo_id)
+    ?? selectedOfficial?.sources.find((source) => source.provider === automaticSource?.provider && source.repo_id === automaticSource.repo_id)
     ?? selectedOfficial?.selected_source ?? null;
+  const sourceProbeKey = selectedOfficial?.sources.filter(source => source.available)
+    .map(source => `${source.provider}:${source.repo_id}:${source.revision ?? ''}`).join('|') ?? '';
+
+  useEffect(() => {
+    const request = ++sourceProbeRequest.current;
+    const controller = new AbortController();
+    const sources = selectedOfficial?.sources.filter(source => source.available) ?? [];
+    if (officialSource || sources.length < 2) { setSourceProbing(false); return; }
+    setSourceProbing(true);
+    void modelsApi.probeDownloadSources(sources.map(({ provider, repo_id, revision }) => ({ provider, repo_id, revision })), controller.signal)
+      .then(async result => {
+        if (request !== sourceProbeRequest.current) return;
+        const fastest = result.data.filter(item => item.bytes_per_second > 0)
+          .sort((a, b) => b.bytes_per_second - a.bytes_per_second)[0];
+        const source = sources.find(item => item.provider === fastest?.provider && item.repo_id === fastest.repo_id);
+        if (source) await chooseOfficialSource(source, true);
+      }).catch(() => {}).finally(() => {
+        if (request === sourceProbeRequest.current) setSourceProbing(false);
+      });
+    return () => { controller.abort(); sourceProbeRequest.current += 1; };
+  }, [selectedOfficial?.id, sourceProbeKey, officialSource === null]);
   const sourceInfoMatches = !!officialSourceInfo && officialSourceInfo.provider === selectedSource?.provider
     && officialSourceInfo?.repo_id === selectedSource?.repo_id
     && (!selectedSource?.revision || officialSourceInfo?.revision === selectedSource.revision);
@@ -311,7 +349,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
-    jobKinds.some((item) => item.kind === `download.${targetProvider}`);
+    (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
 
   async function loadOfficial(refresh = false) {
     const request = ++catalogRequest.current;
@@ -356,13 +394,19 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     officialRequest.current += 1;
     setOfficialSelection(item.id);
     setOfficialSource(null);
+    setAutomaticSource(null);
     setOfficialSourceInfo(null);
     setOfficialLoading(false);
   }
 
-  async function chooseOfficialSource(source: OfficialModelSource) {
+  async function chooseOfficialSource(source: OfficialModelSource, automatic = false) {
     const request = ++officialRequest.current;
-    setOfficialSource(source);
+    if (automatic) setAutomaticSource(source);
+    else {
+      sourceProbeRequest.current += 1;
+      setSourceProbing(false);
+      setOfficialSource(source);
+    }
     setOfficialSourceInfo(null);
     if (!source.available) {
       setOfficialLoading(false);
@@ -378,7 +422,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       if (request === officialRequest.current) setOfficialSourceInfo(info);
     } catch (cause) {
       if (request === officialRequest.current) {
-        setOfficialSource(null);
+        if (automatic) setAutomaticSource(null); else setOfficialSource(null);
         onError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
@@ -438,6 +482,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       const created = await jobsApi.createJob(`download.${source.provider}`, {
         repo_id: source.repo_id,
         destination: `models/${source.provider}/${repositoryPath}/${variantPath}`,
+        ...(downloadDirectory ? { download_directory: downloadDirectory } : {}),
         revision: source.revision,
         include: downloadPatterns(variant),
         expected_bytes: variant.byte_size || null,
@@ -445,7 +490,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       });
       onJobCreated(created, origin);
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
+      onError(errorMessage(cause, tr));
     } finally {
       setDownloading(null);
     }
@@ -455,21 +500,20 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   return (
     <section className="model-browser">
       <header className="model-browser-header">
-        <div>
-          <h2>{tr("模型浏览器", "Model browser")}</h2>
+        <h2>{tr("模型浏览器", "Model browser")}</h2>
+        <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
+          <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
+            {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
+          </select>
+        </label>
+        <div className="model-browser-description">
           <p>{tr("查找官方优化模型或浏览社区仓库。", "Find optimized official models or browse community repositories.")}</p>
+          {downloadDirectoryControl}
         </div>
-        <div className="model-browser-actions">
-          <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
-            <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
-              {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
-            </select>
-          </label>
         <div className="model-browser-tabs" role="tablist">
           <button aria-selected={tab === "official"} onClick={() => onTabChange("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
           <button aria-selected={tab === "community"} onClick={() => onTabChange("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
           <button aria-selected={tab === "downloads"} onClick={() => onTabChange("downloads")} role="tab" type="button">{tr("下载队列", "Download queue")}</button>
-        </div>
         </div>
       </header>
 
@@ -504,15 +548,21 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("激活参数", "Active parameters")}</dt><dd title={tr("主干每 token 的逻辑激活参数，不含词嵌入、输出词表、视觉编码器与 PLE 查表。", "Logical backbone parameters active per token; excludes vocabulary embeddings/output, vision encoder and PLE lookups.")}>{parameters?.active != null ? formatParameters(parameters.active) : selectedOfficial.active_parameter_label || "—"}</dd></div>
                   <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(selectedMetadata?.modalities?.length ? selectedMetadata.modalities : selectedOfficial.modalities, tr)}</dd></div>
                   <MtpSupport supported={mtpSupported} tr={tr} />
-                  <div><dt>{tr("许可", "License")}</dt><dd>{selectedOfficial.license || tr("查看模型卡", "See model card")}</dd></div>
+                  <div><dt>{tr("注意力类型", "Attention type")}</dt><dd>{attentionLabel(selectedMetadata?.attention_profile, tr)}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(selectedOfficial.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(selectedOfficial.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
                 </dl>
                 <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
-                <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
+                <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => {
+                  if (event.target.value === 'auto') { setOfficialSource(null); return; }
+                  const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source);
+                }} value={officialSource ? String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id))) : 'auto'}>
+                  <option value="auto">{sourceProbing ? tr('自动 · 正在测速…', 'Auto · testing speed…') : `${tr('自动', 'Auto')} · ${selectedSource.provider === 'huggingface' ? 'Hugging Face' : 'ModelScope'}`}</option>
+                  {selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
+                <p className="model-weight-pressure-note">{tr('下方压力条与百分比表示常驻权重对当前剩余显存、内存或统一内存推理预算的压力，不是磁盘占用。', 'The bars and percentages below show resident-weight pressure on the currently available VRAM, RAM or unified-memory inference budget, not disk usage.')}<br />{tr('基于不同模型架构的推理特性，在非统一内存设备上，MoE 模型的推理预算统计内存 + 显存，Dense 模型的推理预算仅统计显存。', 'Because inference characteristics vary by architecture, on devices without unified memory, MoE inference budgets include RAM + VRAM, while Dense inference budgets include only VRAM.')}</p>
+                <VariantList disabled={officialLoading || sourceProbing || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(officialSourceInfo!, {
@@ -546,7 +596,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr('激活参数', 'Active parameters')}</dt><dd>{communityModel.parameter_breakdown?.active != null ? formatParameters(communityModel.parameter_breakdown.active) : '—'}</dd></div>
                   <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(communityModel.modalities.length ? communityModel.modalities : ['text'], tr)}</dd></div>
                   <MtpSupport supported={communityModel.mtp_supported} tr={tr} />
-                  <div><dt>{tr("许可", "License")}</dt><dd>{communityModel.license || tr("未声明", "Not declared")}</dd></div>
+                  <div><dt>{tr("注意力类型", "Attention type")}</dt><dd>{attentionLabel(communityModel.attention_profile, tr)}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(communityModel.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(communityModel.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(communityModel.published_at || communityModel.updated_at)}</dd></div>

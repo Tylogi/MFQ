@@ -1,9 +1,9 @@
-#include "mfq_container.h"
-#include "mlx_deepseek_v4_causal_lm.h"
-#include "mlx_qwen35_causal_lm.h"
-#include "mlx_qwen4_causal_lm.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "qwen35_model.h"
+#include "storage/mfq_container.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include "transport.h"
 #include "nlohmann/json.hpp"
@@ -791,7 +791,7 @@ ReferenceContract load_reference_contract(
         contract.score_count < 1 ||
         !((contract.attention == "native_model_default" &&
            contract.kv_cache_dtype == "native_model_default") ||
-          (contract.attention == "hf_sdpa" &&
+          ((contract.attention == "hf_sdpa" || contract.attention == "native_sdpa") &&
            contract.kv_cache_dtype == "none")) ||
         contract.scored_tokens !=
             static_cast<std::uint64_t>(contract.chunks) *

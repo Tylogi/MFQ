@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ModelAliasMapping } from '../src/features/connections/ModelAliasMapping';
-import { PrefixCacheDirectory } from '../src/features/connections/PrefixCacheDirectory';
+import { PrefixCacheControls } from '../src/features/connections/PrefixCacheControls';
 import { MemoryBudgetControls } from '../src/features/connections/MemoryBudgetControls';
 import { RepositoryFiles } from '../src/features/models/RepositoryFiles';
 import { runtimeApi } from '../src/shared/api/resources/runtime';
@@ -46,7 +46,7 @@ it('edits aliases without changing names and displays the selected alias', async
 });
 
 it('always displays the actual managed directory and allows a manual location without resetting budgets', async () => {
-  render(<PrefixCacheDirectory />);
+  render(<PrefixCacheControls budget={100 * 2 ** 30} />);
   await screen.findByText('/data/mfq/prefix-cache');
   fireEvent.change(screen.getByRole('combobox', { name: 'Prefix cache directory mode' }), { target: { value: 'manual' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Prefix cache directory' }), { target: { value: '/cache/prefix' } });
@@ -83,8 +83,9 @@ it('downloads a shard folder as one request and allows multiple file selections'
 it('does not fetch an old cache-directory job from a different server', async () => {
   let resolve!: (value: { operation_id: string }) => void;
   vi.mocked(runtimeApi.configureMemoryPolicy).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
-  render(<PrefixCacheDirectory />);
+  render(<PrefixCacheControls budget={100 * 2 ** 30} />);
   await screen.findByText('/data/mfq/prefix-cache');
+  fireEvent.change(screen.getByLabelText('SSD budget mode'), { target: { value: 'manual' } });
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
   await waitFor(() => expect(runtimeApi.configureMemoryPolicy).toHaveBeenCalledOnce());
   setApiBaseUrl('https://second.invalid');
@@ -97,8 +98,9 @@ it('does not fetch an old cache-directory job from a different server', async ()
 it('does not add an old cache-directory job after navigating away', async () => {
   let resolve!: (value: Awaited<ReturnType<typeof jobsApi.getJob>>) => void;
   vi.mocked(jobsApi.getJob).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
-  const view = render(<PrefixCacheDirectory />);
+  const view = render(<PrefixCacheControls budget={100 * 2 ** 30} />);
   await screen.findByText('/data/mfq/prefix-cache');
+  fireEvent.change(screen.getByLabelText('SSD budget mode'), { target: { value: 'manual' } });
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
   await waitFor(() => expect(jobsApi.getJob).toHaveBeenCalledOnce());
   view.unmount();
@@ -124,13 +126,14 @@ it.each(['aliases', 'directory'])('does not show a stale %s error after leaving 
   let reject!: (cause: Error) => void;
   if (kind === 'aliases') vi.mocked(runtimeApi.configureModelAliases).mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
   else vi.mocked(runtimeApi.configureMemoryPolicy).mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
-  const view = render(kind === 'aliases' ? <ModelAliasMapping models={['first']} selectedModel="first" /> : <PrefixCacheDirectory />);
+  const view = render(kind === 'aliases' ? <ModelAliasMapping models={['first']} selectedModel="first" /> : <PrefixCacheControls budget={100 * 2 ** 30} />);
   if (kind === 'aliases') {
     await screen.findByText('fast');
     fireEvent.click(screen.getByRole('button', { name: 'Alias mapping' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
   } else {
     await screen.findByText('/data/mfq/prefix-cache');
+    fireEvent.change(screen.getByLabelText('SSD budget mode'), { target: { value: 'manual' } });
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
   }
   view.unmount();

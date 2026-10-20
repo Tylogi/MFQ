@@ -1,6 +1,6 @@
-#include "mlx_nint8_zero.h"
-#include "mlx_transformer.h"
-#include "mlx_tensor.h"
+#include "ops/mlx_nint8_zero.h"
+#include "runtime/mlx_transformer.h"
+#include "runtime/mlx_tensor.h"
 
 #include <cmath>
 #include <cstdint>

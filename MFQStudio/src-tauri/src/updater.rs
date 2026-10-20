@@ -22,8 +22,6 @@ const CACHE_SECONDS: u64 = 6 * 60 * 60;
 const PREFERENCES_FILE: &str = "update-preferences.json";
 const RELEASES_FILE: &str = "releases.json";
 const INSTALL_METADATA_FILE: &str = "release.json";
-const STUDIO_CONFIG_FILE: &str = "studio.json";
-const SERVER_PID_FILE: &str = "mfq-server.pid";
 const HELPER_ARGUMENT: &str = "--mfq-update-helper";
 #[cfg(target_os = "macos")]
 const BUNDLE_IDENTIFIER: &str = "com.tylogi.mfq-studio";
@@ -147,11 +145,6 @@ struct InstalledMetadata {
     installed_at_epoch_seconds: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct StudioConnectionConfig {
-    local_service_port: u16,
-}
-
 fn now_epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -165,6 +158,8 @@ fn update_root(app: &AppHandle) -> Result<PathBuf, String> {
         .app_local_data_dir()
         .map_err(|error| error.to_string())?
         .join("updates");
+    #[cfg(target_os = "windows")]
+    let root = if standalone_launcher().is_some() { root.join("standalone") } else { root };
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     Ok(root)
 }
@@ -231,6 +226,19 @@ fn compare_versions(left: &str, right: &str) -> Ordering {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn standalone_launcher() -> Option<PathBuf> {
+    std::env::var_os("MFQ_STUDIO_LAUNCHER").map(PathBuf::from).filter(|path|
+        path.is_absolute() && path.extension().is_some_and(|value| value.eq_ignore_ascii_case("exe")))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_asset_name(name: &str, standalone: bool) -> bool {
+    let name = name.to_ascii_lowercase();
+    if standalone { name.ends_with("_x64-portable.zip") }
+    else { name.ends_with("_x64-setup.exe") }
+}
+
 fn asset_for_platform(release: &GitHubRelease) -> Option<&GitHubAsset> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return release.assets.iter().find(|asset| {
@@ -239,8 +247,7 @@ fn asset_for_platform(release: &GitHubRelease) -> Option<&GitHubAsset> {
     });
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     return release.assets.iter().find(|asset| {
-        let name = asset.name.to_ascii_lowercase();
-        name.ends_with(".exe") && name.contains("x64")
+        windows_asset_name(&asset.name, standalone_launcher().is_some())
     });
     #[allow(unreachable_code)]
     None
@@ -445,9 +452,10 @@ fn cached_installable(directory: &Path) -> Option<PathBuf> {
             .flatten()
             .map(|item| item.path())
             .find(|path| {
-                path.extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
+                path.is_file() && path.file_name().and_then(|value| value.to_str())
+                    .is_some_and(|name| if standalone_launcher().is_some() {
+                        name.eq_ignore_ascii_case("MFQ Studio.exe")
+                    } else { windows_asset_name(name, false) })
             });
     }
     #[allow(unreachable_code)]
@@ -612,117 +620,6 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<bool, String> {
         digest.update(&buffer[..count]);
     }
     Ok(format!("{:x}", digest.finalize()) == expected)
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn local_server_is_mfq(port: u16) -> bool {
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-    else {
-        return false;
-    };
-    let Ok(response) = client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-    else {
-        return false;
-    };
-    response
-        .json::<serde_json::Value>()
-        .ok()
-        .and_then(|value| {
-            value
-                .get("service")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some("mfq-server")
-}
-
-#[cfg(target_os = "macos")]
-fn managed_server_process_matches(pid: u32, data_dir: &Path) -> bool {
-    let Ok(output) = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    command.contains("serve")
-        && (command.contains("mfq") || command.contains("python"))
-        && command.contains(&data_dir.to_string_lossy().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn process_is_running(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(target_os = "windows")]
-fn process_is_running(pid: u32) -> bool {
-    Command::new("tasklist.exe")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn stop_managed_server(data_dir: &Path) -> Result<(), String> {
-    let Some(config) = read_json::<StudioConnectionConfig>(&data_dir.join(STUDIO_CONFIG_FILE))
-    else {
-        return Ok(());
-    };
-    if !local_server_is_mfq(config.local_service_port) {
-        return Ok(());
-    }
-    let pid_path = data_dir.join(SERVER_PID_FILE);
-    let Some(pid) = fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-    else {
-        return Err("the local MFQ Server is running but its managed PID is unavailable".into());
-    };
-    #[cfg(target_os = "macos")]
-    {
-        if !managed_server_process_matches(pid, data_dir) {
-            return Err("the saved MFQ Server PID does not match the managed local process".into());
-        }
-        command_success("/bin/kill", &["-TERM", &pid.to_string()])?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let status = Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string()])
-            .status()
-            .map_err(|error| format!("could not stop the managed MFQ Server: {error}"))?;
-        if !status.success() {
-            return Err(format!("taskkill exited with {status}"));
-        }
-    }
-    for _ in 0..120 {
-        if !process_is_running(pid) {
-            let _ = fs::remove_file(pid_path);
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    Err(
-        "the managed MFQ Server did not stop within 30 seconds; finish active requests and retry"
-            .into(),
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1159,8 +1056,12 @@ pub async fn studio_update_download(
                 .join("versions")
                 .join(safe_version_directory(&release.version)?);
             fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-            let destination = directory.join(&release.asset.as_ref().unwrap().name);
-            fs::copy(&asset, destination).map_err(|error| error.to_string())?;
+            if standalone_launcher().is_some() {
+                extract_standalone_zip(&asset, &directory)?;
+            } else {
+                let destination = directory.join(&release.asset.as_ref().unwrap().name);
+                fs::copy(&asset, destination).map_err(|error| error.to_string())?;
+            }
             write_json(
                 &directory.join(INSTALL_METADATA_FILE),
                 &InstalledMetadata {
@@ -1191,11 +1092,10 @@ pub async fn studio_update_install(
 ) -> Result<(), String> {
     let _guard = state.lock.lock().await;
     let root = update_root(&app)?;
-    let data_dir = root
-        .parent()
-        .ok_or_else(|| "update directory has no application data parent".to_string())?
-        .to_path_buf();
     let version = safe_version_directory(&version)?;
+    let studio = app.state::<crate::StudioState>();
+    let _server_guard = studio.start_lock.lock().await;
+    let server_app = app.clone();
     #[cfg(target_os = "macos")]
     {
         tokio::task::spawn_blocking(move || {
@@ -1204,7 +1104,7 @@ pub async fn studio_update_install(
             let target = current_bundle()?;
             ensure_bundle_parent_writable(&target)?;
             snapshot_current_bundle(&root, &target)?;
-            stop_managed_server(&data_dir)?;
+            server_app.state::<crate::StudioState>().stop_owned_server()?;
             launch_update_helper(&root, &source, &target)
         })
         .await
@@ -1217,7 +1117,14 @@ pub async fn studio_update_install(
         tokio::task::spawn_blocking(move || {
             let installer = cached_installable(&root.join("versions").join(version))
                 .ok_or_else(|| "selected version has not been downloaded".to_string())?;
-            stop_managed_server(&data_dir)?;
+            server_app.state::<crate::StudioState>().stop_owned_server()?;
+            if let Some(launcher) = standalone_launcher() {
+                replace_standalone(&installer, &launcher)?;
+                return Command::new(launcher)
+                    .arg(format!("/WAITPID={}", std::process::id()))
+                    .spawn().map(|_| ())
+                    .map_err(|error| format!("could not start the updated application: {error}"));
+            }
             Command::new(installer)
                 .spawn()
                 .map(|_| ())
@@ -1230,6 +1137,41 @@ pub async fn studio_update_install(
     }
     #[allow(unreachable_code)]
     Err("application updates are not available on this platform".into())
+}
+
+#[cfg(target_os = "windows")]
+fn extract_standalone_zip(source: &Path, directory: &Path) -> Result<PathBuf, String> {
+    let source = File::open(source).map_err(|error| error.to_string())?;
+    let mut archive = zip::ZipArchive::new(source).map_err(|error| error.to_string())?;
+    if archive.len() != 1 { return Err("standalone ZIP must contain exactly one executable".into()); }
+    let mut entry = archive.by_index(0).map_err(|error| error.to_string())?;
+    if entry.name() != "MFQ Studio.exe" || entry.is_dir() || entry.size() == 0 || entry.size() > 2 * 1024 * 1024 * 1024 {
+        return Err("standalone ZIP does not contain a valid MFQ Studio.exe".into());
+    }
+    let destination = directory.join("MFQ Studio.exe");
+    let temporary = directory.join("MFQ Studio.exe.partial");
+    let result = (|| -> Result<(), String> {
+        let mut output = File::create(&temporary).map_err(|error| error.to_string())?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        drop(output);
+        let mut signature = [0; 2];
+        File::open(&temporary).and_then(|mut file| file.read_exact(&mut signature)).map_err(|error| error.to_string())?;
+        if &signature != b"MZ" { return Err("standalone ZIP contains an invalid executable".into()); }
+        fs::rename(&temporary, &destination).map_err(|error| error.to_string())
+    })();
+    if result.is_err() { let _ = fs::remove_file(temporary); }
+    result?;
+    Ok(destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_standalone(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target.parent().ok_or("standalone executable has no parent directory")?;
+    let temporary = parent.join(format!(".mfq-update-{}.exe", std::process::id()));
+    let result = fs::copy(source, &temporary).and_then(|_| fs::rename(&temporary, target));
+    if result.is_err() { let _ = fs::remove_file(temporary); }
+    result.map_err(|error| format!("could not replace the standalone application: {error}"))
 }
 
 #[tauri::command]
@@ -1262,6 +1204,74 @@ pub async fn studio_update_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_updates_keep_installed_and_standalone_packages_separate() {
+        let installer = "MFQ.Studio_0.4.0_x64-setup.exe";
+        let standalone = "MFQ.Studio_0.4.0_x64-portable.zip";
+        assert!(windows_asset_name(installer, false));
+        assert!(!windows_asset_name(installer, true));
+        assert!(windows_asset_name(standalone, true));
+        assert!(!windows_asset_name(standalone, false));
+        assert!(!windows_asset_name("MFQ.Studio_0.4.0_x64.exe", true));
+        assert!(!windows_asset_name("MFQ.Studio_0.4.0_arm64.exe", true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn standalone_zip_update_extracts_the_app_and_rejects_extra_or_unsafe_entries() {
+        let directory = TestDirectory::new();
+        let archive = directory.0.join("update.zip");
+        let make_zip = |entries: &[(&str, &[u8])]| {
+            let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+            for (name, contents) in entries {
+                writer.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                writer.write_all(contents).unwrap();
+            }
+            writer.finish().unwrap();
+        };
+        make_zip(&[("MFQ Studio.exe", b"MZtest")]);
+        let executable = extract_standalone_zip(&archive, &directory.0).unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), b"MZtest");
+        for entries in [vec![("../MFQ Studio.exe", &b"MZbad"[..])],
+            vec![("MFQ Studio.exe", &b"bad"[..])],
+            vec![("MFQ Studio.exe", &b"MZbad"[..]), ("extra.dll", &b"extra"[..])]] {
+            make_zip(&entries);
+            assert!(extract_standalone_zip(&archive, &directory.0).is_err());
+            assert_eq!(fs::read(&executable).unwrap(), b"MZtest");
+            assert!(!directory.0.join("MFQ Studio.exe.partial").exists());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the built release ZIP and its executable SHA-256"]
+    fn release_zip_can_stage_and_replace_the_standalone_executable() {
+        let source = PathBuf::from(std::env::var_os("MFQ_TEST_UPDATE_ZIP").expect("release ZIP"));
+        let expected = std::env::var("MFQ_TEST_UPDATE_SHA256").expect("executable SHA-256");
+        let directory = TestDirectory::new();
+        let executable = extract_standalone_zip(&source, &directory.0).unwrap();
+        assert!(verify_sha256(&executable, &expected).unwrap());
+        let original = directory.0.join("Original.exe");
+        fs::write(&original, b"old package").unwrap();
+        replace_standalone(&executable, &original).unwrap();
+        assert!(verify_sha256(&original, &expected).unwrap());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn standalone_update_replaces_the_original_file_and_preserves_it_on_copy_failure() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("download.exe");
+        let target = directory.0.join("MFQ Studio.exe");
+        fs::write(&source, b"new package").unwrap();
+        fs::write(&target, b"old package").unwrap();
+        replace_standalone(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert!(replace_standalone(&directory.0.join("missing.exe"), &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert!(!directory.0.join(format!(".mfq-update-{}.exe", std::process::id())).exists());
+    }
 
     struct TestDirectory(PathBuf);
 

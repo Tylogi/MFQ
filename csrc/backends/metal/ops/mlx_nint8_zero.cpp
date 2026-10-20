@@ -1,6 +1,6 @@
 #include "mlx_nint8_zero.h"
 
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
 

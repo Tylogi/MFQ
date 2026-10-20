@@ -6,7 +6,6 @@ import hashlib
 import re
 from dataclasses import asdict, replace
 from contextlib import ExitStack
-from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -19,27 +18,10 @@ from mfq.calibration.alphaq_output import AlphaQOutput, file_sha256, model_files
 from mfq.calibration.alphaq_source import _atomic_json, _progress
 from mfq.calibration.artifact import CalibrationScheme, save_scheme, load_scheme
 from mfq.quantize.imatrix import load_importance_matrix
+from mfq.calibration.ud_recipes import automatic_recipe, registered_model
 
 
-_UD_CAPS = dict(IQ1_S=72546461344, IQ1_M=74538755776, Q2_K_XL=78869128864,
-    IQ3_XXS=81961823936, Q3_K_XL=89986353824, IQ4_XS=93682584224,
-    Q4_K_XL=111334654784, Q5_K_XL=158286406650, Q6_K_XL=169165382688)
-_UD_PARAMETERS = 176943899520
-
-
-def automatic_recipe(config, target_bpw):
-    """Use the evaluated model's pinned UD nonexpert policy at the nearest tier."""
-    text = config.get('text_config', config)
-    expected = dict(model_type='qwen4_exp_text', hidden_size=2560, num_hidden_layers=48,
-                    num_experts=512, num_experts_per_tok=10, vocab_size=248320)
-    if any(text.get(k) != v for k, v in expected.items()):
-        return None
-    target = Decimal(str(target_bpw))*_UD_PARAMETERS/8
-    tier = min(_UD_CAPS, key=lambda x: abs(Decimal(_UD_CAPS[x])-target))
-    return Path(__file__).with_name('recipes')/(tier+'.json')
-
-
-def recipe_types(path):
+def recipe_types(path, *, text_layers=None):
     from mfq.tools import quantize_hf_to_mfq as q
     # Experts have their own complete candidate set, including formats absent
     # from the source GGUF. Ignore their recipe types before the strict loader.
@@ -50,17 +32,24 @@ def recipe_types(path):
         values = doc['tensor_types']
     else:
         values = q._load_gguf_recipe(path)
-    return {name: ('Q8_0' if name.endswith('_exps.weight') else dtype)
+    return {name: ('Q8_0' if name.endswith('_exps.weight') and
+                   (text_layers is None or int(name.split('.')[1]) < text_layers) else dtype)
             for name, dtype in values.items()}
 
 
-def planned(root, recipe, scheme, overrides, ple):
+def planned(root, recipe, scheme, overrides, ple, *, vision='exclude', mtp='exclude',
+            inventory=None, config=None):
     from mfq.tools import quantize_hf_to_mfq as q
-    plans = q._plan(root, True, recipe, 'F32', scheme, quantize_ple=True, exclude_mtp=True)
+    plans = q._plan(root, vision == 'exclude', recipe, 'F32', scheme,
+        quantize_ple=True, quantize_mtp=mtp == 'quantize', exclude_mtp=mtp == 'exclude',
+        source_inventory=inventory, source_config=config)
+    if vision == 'NINT8':
+        overrides = {**{p.name: 'NINT8' for p in plans
+                        if p.name.startswith('vision.') and len(p.shape) == 2}, **overrides}
     return q._normalize_hf_expert_storage(q._apply_tensor_precision_overrides(plans, overrides))
 
 
-def routing(scope, imatrix, config, mode, cache_path, root):
+def routing(scope, imatrix, config, mode, cache_path, root, *, absolute=False):
     from mfq.tools import quantize_hf_to_mfq as q
     topk = config.get('text_config', config).get('num_experts_per_tok')
     if type(topk) is not int or topk <= 0:
@@ -92,7 +81,7 @@ def routing(scope, imatrix, config, mode, cache_path, root):
             layer = int(item.name.split('.')[2]); name = scope.imatrix_entries[item.name]
             entries[name] = replace(entries[name], counts=np.asarray(layers[layer]['counts']))
         imatrix = replace(imatrix, entries=entries)
-    return imatrix_router_multipliers(scope, imatrix, router, topk)
+    return imatrix_router_multipliers(scope, imatrix, router, topk, normalize=not absolute)
 
 
 def allocation_signature(key, cache, budget):
@@ -144,27 +133,55 @@ def _quantize(args, resources):
     cache = Path(args.alphaq_cache).resolve() if args.alphaq_cache else output.parent/(output.name+'.alphaq')
     cache.mkdir(parents=True, exist_ok=True)
     config = q.load_hf_model_config(root)
-    recipe_path = Path(args.recipe).resolve() if args.recipe else automatic_recipe(config, args.target_bpw)
+    recipe_path = (Path(args.recipe).resolve() if args.recipe else
+                   automatic_recipe(config, args.target_bpw, tier=args.ud_tier or None))
+    ceiling = None
+    if args.ud_tier:
+        doc = json.loads(recipe_path.read_text())
+        model = registered_model(config)
+        if model is None or args.ud_tier not in model['caps']:
+            raise ValueError('--ud-tier requires a registered model configuration and tier')
+        ceiling = doc.get('ud_file_bytes', model['caps'][args.ud_tier])
+    target_bpw = args.target_bpw or '1'  # Exact UD byte ceiling overrides BPW below.
     mode = args.alphaq_dense
     if mode == 'auto':
         mode = 'recipe' if recipe_path is not None else 'joint'
     if mode == 'recipe' and recipe_path is None:
         raise ValueError('recipe dense mode requires --recipe for this model')
+    if args.alphaq_allocator == 'natscale':
+        if mode != 'recipe':
+            raise ValueError('NatScale requires recipe dense mode; joint whole-model units are not implemented')
+        if args.alphaq_router != 'imatrix' or args.alphaq_router_cache:
+            raise ValueError('NatScale uses validated imatrix exposure; router overrides are not supported')
+        if not np.isfinite(args.natscale_tau) or args.natscale_tau <= 0:
+            raise ValueError('NatScale tau must be finite and positive')
+        if args.natscale_sample_layers < 1 or args.natscale_sample_experts < 1:
+            raise ValueError('NatScale sample sizes must be positive integers')
+        if args.natscale_sensitivity not in ('uniform', 'imatrix-energy') and not args.natscale_sensitivity.startswith('gradient:'):
+            raise ValueError('NatScale sensitivity must be uniform, imatrix-energy or gradient:PATH')
     recipe = recipe_types(recipe_path) if recipe_path is not None else None
     imatrix = load_importance_matrix(Path(args.imatrix).resolve())
     imatrix_sha = file_sha256(imatrix.path)
     empty = CalibrationScheme(None, 'AlphaQ', 0, {}, {}, {})
-    plans = planned(root, recipe, empty, {}, args.ple_dtype)
+    inventory = q._hf_source_inventory(root)
+    options = dict(vision='exclude' if args.text_only else args.alphaq_vision,
+                   mtp='exclude' if args.exclude_mtp else args.alphaq_mtp,
+                   inventory=inventory, config=config)
+    def plan(scheme, overrides, types=recipe):
+        return planned(root, types, scheme, overrides, args.ple_dtype, **options)
+    plans = plan(empty, {})
     if recipe is not None:
-        complete = planned(root, None, empty, {}, args.ple_dtype)
+        complete = plan(empty, {}, None)
         if {p.name: p.shape for p in plans} != {p.name: p.shape for p in complete}:
             raise ValueError('recipe changes the complete text model tensor scope')
-    scope = model_scope(plans, imatrix)
+    scope = model_scope(plans, imatrix, exclude_scaled_dense=mode == 'joint')
     overrides = {}
+    if options['vision'] == 'NINT8':
+        overrides.update({p.name: 'NINT8' for p in plans if p.name.startswith('vision.') and len(p.shape) == 2})
     # The selected recipe fallback intentionally preserves the complete UD
     # nonexpert policy. Joint allocation preserves missing-imatrix matrices.
     if mode == 'joint':
-        overrides.update({p.name: p.source_dtype for p in scope.native_dense})
+        overrides.update({p.name: 'BF16' if p.source_quantization else p.source_dtype for p in scope.native_dense})
     for item in scope.ple:
         if len(item.shape) != 2:
             continue
@@ -175,8 +192,11 @@ def _quantize(args, resources):
             # norms retain the chosen recipe's precision.
             if 'ngram' in item.name:
                 overrides[item.name] = args.ple_dtype
-    plans = planned(root, recipe, empty, overrides, args.ple_dtype)
-    scope = model_scope(plans, imatrix)
+    plans = plan(empty, overrides)
+    scope = model_scope(plans, imatrix, exclude_scaled_dense=mode == 'joint')
+    from mfq.formats.nint import NintSpec
+    auxiliary = {component: sum(q._plan_blob_nbytes(p, NintSpec()) for p in plans
+                     if p.name.startswith(component+'.')) for component in ('vision', 'predictor')}
     profiles = tuple(args.alphaq_profiles.split(',')) if args.alphaq_profiles else ALPHAQ_PROFILES
     if not profiles or len(set(profiles)) != len(profiles) or set(profiles)-set(ALPHAQ_PROFILES):
         raise ValueError('AlphaQ profiles must be distinct canonical NVQ/NINT profiles')
@@ -185,10 +205,32 @@ def _quantize(args, resources):
         router_cache_sha256=file_sha256(Path(args.alphaq_router_cache)) if args.alphaq_router_cache else None,
         recipe_sha256=file_sha256(recipe_path) if recipe_path else None,
         recipe=recipe_path.stem if recipe_path else None, target_bpw=str(args.target_bpw),
+        ud_tier=args.ud_tier or None, vision=options['vision'], mtp=options['mtp'],
+        vision_bytes=auxiliary['vision'], mtp_bytes=auxiliary['predictor'],
+        mtp_imatrix='unweighted: predictor entries are absent from the supplied imatrix',
+        joint_scaled_dense='excluded from allocation; decoded BF16 fixed payload',
+        unweighted_tensors=[p.name for p in plans if not imatrix.find(q._hf_imatrix_names(p))],
         model_weight_count=scope.model_weight_count, profiles=list(profiles), ple=args.ple_dtype,
         scope='text main model, excludes MTP; integer constants count as bytes only',
         quality_status='allocation surrogate; this output requires full-model evaluation')
-    if not args.recipe and recipe_path is not None and scope.model_weight_count != _UD_PARAMETERS:
+    if (args.alphaq_allocator == 'alphaq' and not args.ud_tier and not any(auxiliary.values())
+            and not any(p.source_quantization for p in scope.native_dense)):
+        # Preserve the existing AlphaQ text-only header and budget arithmetic
+        # when none of the new policies apply (including Qwen target-BPW runs).
+        for name in ('ud_tier', 'vision', 'mtp', 'vision_bytes', 'mtp_bytes',
+                     'mtp_imatrix', 'joint_scaled_dense', 'unweighted_tensors'):
+            policy.pop(name)
+    if args.alphaq_allocator == 'natscale':
+        error_path = Path(args.natscale_error_cache) if args.natscale_error_cache else cache/'natscale-errors.json'
+        policy.update(method='NatScale', distortion='separate-error surrogate',
+            allocator='natscale', natscale=dict(tau=args.natscale_tau,
+            sensitivity=args.natscale_sensitivity, error=args.natscale_error,
+            sample_layers=args.natscale_sample_layers, sample_experts=args.natscale_sample_experts,
+            error_cache_sha256=file_sha256(error_path)
+                if args.natscale_error == 'measured' and error_path.exists() else None,
+            gradient_sha256=file_sha256(Path(args.natscale_sensitivity[9:]))
+                if args.natscale_sensitivity.startswith('gradient:') else None))
+    if not args.recipe and recipe_path is not None and scope.model_weight_count != registered_model(config)['parameters']:
         raise ValueError('automatic UD recipe parameter count differs; specify an explicit recipe')
     allocation_key = hashlib.sha256(json.dumps(dict(policy=policy, imatrix=imatrix_sha,
         source=source_identity(root)), sort_keys=True).encode()).hexdigest()
@@ -200,11 +242,15 @@ def _quantize(args, resources):
     header, assets = runtime_metadata(root, plans, imatrix=imatrix, imatrix_sha256=imatrix_sha,
         policy=policy, tokenizer=Path(args.tokenizer).resolve() if args.tokenizer else None,
         sampling_profile=args.sampling_profile or None)
-    budget = full_file_budget(scope, header, assets, target_bpw=args.target_bpw,
+    auxiliary_bytes = sum(auxiliary.values())
+    budget = full_file_budget(scope, header, assets, target_bpw=target_bpw,
+        maximum_file_bytes=ceiling, excluded_payload_bytes=auxiliary_bytes,
         joint_dense=mode == 'joint', preserve_missing_imatrix=mode == 'joint')
     _progress(stage='alphaq_file_budget', maximum_file_bytes=budget.maximum_file_bytes,
         fixed_file_bytes=budget.fixed_file_bytes, parameters=scope.model_weight_count,
-        dense_mode=mode, expert_banks=len(scope.experts), dense_matrices=len(scope.dense))
+        dense_mode=mode, expert_banks=len(scope.experts), dense_matrices=len(scope.dense),
+        variable_expert_budget=budget.maximum_file_bytes-budget.fixed_file_bytes,
+        vision_bytes=auxiliary['vision'], mtp_bytes=auxiliary['predictor'])
     if args.dry_run:
         return
     backend = resolve_quant_backend(args.backend, args.device)
@@ -212,18 +258,35 @@ def _quantize(args, resources):
     devices = execution_devices(getattr(args, 'devices', ''), backend, args.device)
     workers = resources.enter_context(DeviceWorkers(root, cache, imatrix.path, imatrix_sha,
         backend, devices, row_chunk=args.row_chunk, artifact_root=allocation_root)) if devices else None
-    multipliers, exposure = routing(scope, imatrix, config, args.alphaq_router, args.alphaq_router_cache, root)
+    multipliers, exposure = routing(scope, imatrix, config, args.alphaq_router, args.alphaq_router_cache, root,
+                                    absolute=args.alphaq_allocator == 'natscale')
+    errors = None
+    if args.alphaq_allocator == 'natscale' and args.natscale_error == 'measured':
+        from mfq.calibration.natscale_errors import load_errors
+        error_path = Path(args.natscale_error_cache) if args.natscale_error_cache else cache/'natscale-errors.json'
+        errors = load_errors(error_path, root, scope.experts, imatrix_sha, profiles,
+                             args.natscale_sample_layers, args.natscale_sample_experts)
     allocated_dense = scope.dense if mode == 'joint' else ()
     statistics = collect_statistics(root, (*scope.experts, *allocated_dense), cache, backend.device,
-                                    mapper=workers.map if workers else None)
+                                    mapper=workers.map if workers else None,
+                                    column_energy=args.alphaq_allocator == 'natscale')
     experts, dense = statistics[:len(scope.experts)], statistics[len(scope.experts):]
     signature = allocation_signature(allocation_key, cache, budget)
     previous = saved_allocation(allocation_root, signature)
     if previous is None:
-        allocated = allocate_joint(experts, alphaq_builtin_candidates(experts, profiles),
-            dense, dense_choices(dense, {p.name: p.source_dtype for p in allocated_dense}, profiles),
-            model_weight_count=scope.model_weight_count, maximum_file_bytes=budget.maximum_file_bytes,
-            fixed_file_bytes=budget.fixed_file_bytes, expert_exposure=exposure, router_multipliers=multipliers)
+        if args.alphaq_allocator == 'natscale':
+            from mfq.calibration.natscale import allocate_natscale, projection_energies
+            frequencies = multipliers
+            allocated = allocate_natscale(experts, alphaq_builtin_candidates(experts, profiles),
+                energies=projection_energies(experts, scope, imatrix), exposures=frequencies,
+                model_weight_count=scope.model_weight_count, maximum_file_bytes=budget.maximum_file_bytes,
+                fixed_file_bytes=budget.fixed_file_bytes, tau=args.natscale_tau,
+                sensitivity=args.natscale_sensitivity, errors=errors, source=source_identity(root))
+        else:
+            allocated = allocate_joint(experts, alphaq_builtin_candidates(experts, profiles),
+                dense, dense_choices(dense, {p.name: p.source_dtype for p in allocated_dense}, profiles),
+                model_weight_count=scope.model_weight_count, maximum_file_bytes=budget.maximum_file_bytes,
+                fixed_file_bytes=budget.fixed_file_bytes, expert_exposure=exposure, router_multipliers=multipliers)
         overrides.update(budget.native_overrides); overrides.update(allocated.native_overrides)
         raw_path = allocation_root/'untrained-scheme.json'
         if raw_path.exists():
@@ -232,6 +295,8 @@ def _quantize(args, resources):
         else:
             save_scheme(raw_path, allocated.scheme)
         _atomic_json(allocation_root/'allocation.json', {**allocated.report, 'policy': policy})
+        if args.alphaq_allocator == 'natscale':
+            _progress(stage='natscale_allocation', **allocated.report)
         _atomic_json(allocation_root/'native-overrides.json', overrides)
         _atomic_json(allocation_root/'allocation-checkpoint.json', dict(complete=True,
             signature=signature, files={name:file_sha256(allocation_root/name) for name in
@@ -242,7 +307,7 @@ def _quantize(args, resources):
         _progress(stage='alphaq_allocation_reused', directory=str(allocation_root))
     encoded = None
     if workers is not None and not (cache/'encoded-candidates.json').exists():
-        pending_plans = planned(root, recipe, untrained, overrides, args.ple_dtype)
+        pending_plans = plan(untrained, overrides)
         scheme, encoded = train_and_fit(workers, root, pending_plans, untrained, imatrix,
             imatrix_sha, cache, backend, row_chunk=args.row_chunk, artifact_root=allocation_root)
     else:
@@ -259,8 +324,9 @@ def _quantize(args, resources):
     low.recipe_gguf = str(normalized_recipe) if recipe is not None else ''
     low.calibration_scheme = str(scheme_path)
     low.tensor_precision_overrides = str(override_path) if overrides else ''
-    low.text_only = True; low.exclude_mtp = True; low.quantize_ple = True; low.dense_dtype = 'f32'
-    final_plans = planned(root, recipe, scheme, overrides, args.ple_dtype)
+    low.text_only = options['vision'] == 'exclude'; low.exclude_mtp = options['mtp'] == 'exclude'
+    low.quantize_mtp = options['mtp'] == 'quantize'; low.quantize_ple = True; low.dense_dtype = 'f32'
+    final_plans = plan(scheme, overrides)
     if (cache/'encoded-candidates.json').exists():
         from mfq.calibration.alphaq_payloads import PayloadCache
         encoded = PayloadCache(cache/'encoded-candidates.json', root, imatrix_sha)
@@ -269,8 +335,19 @@ def _quantize(args, resources):
         encoded = FittedPayloadCache(root, cache, imatrix, imatrix_sha, backend,
             row_chunk=args.row_chunk, artifact_root=scheme_path.parent)
     low._alphaq_output = AlphaQOutput(root, tuple(final_plans), model_files(root), header, assets,
-                                     budget.maximum_file_bytes, encoded)
+                                     budget.maximum_file_bytes, encoded, ('vision', 'predictor'))
     q.convert(low)
+    from mfq.formats.io import open_mmap
+    with open_mmap(output) as store:
+        actual_auxiliary = {c: sum(r.nbytes for r in store.records.values()
+                                   if r.name.startswith(c+'.')) for c in ('vision', 'predictor')}
+    export = dict(output=str(output), file_bytes=output.stat().st_size,
+        maximum_file_bytes=budget.maximum_file_bytes, vision_bytes=actual_auxiliary['vision'],
+        mtp_bytes=actual_auxiliary['predictor'],
+        main_text_file_bytes=output.stat().st_size-sum(actual_auxiliary.values()),
+        model_weight_count=scope.model_weight_count)
+    _atomic_json(allocation_root/'export-report.json', export)
     _progress(stage='alphaq_complete', file_bytes=output.stat().st_size,
         maximum_file_bytes=budget.maximum_file_bytes,
-        actual_bpw=output.stat().st_size*8/scope.model_weight_count, output=str(output))
+        vision_bytes=actual_auxiliary['vision'], mtp_bytes=actual_auxiliary['predictor'],
+        actual_bpw=export['main_text_file_bytes']*8/scope.model_weight_count, output=str(output))

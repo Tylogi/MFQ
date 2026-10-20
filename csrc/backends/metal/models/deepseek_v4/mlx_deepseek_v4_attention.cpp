@@ -1,9 +1,9 @@
 #include "mlx_deepseek_v4_attention.h"
-#include "mlx_eval_timing.h"
+#include "runtime/mlx_eval_timing.h"
 
-#include "mlx_detached_copy.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_detached_copy.h"
+#include "ops/mlx_grouped_linear.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <cmath>

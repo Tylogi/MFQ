@@ -24,6 +24,7 @@ enum mfq_gguf_key {
     MFQ_GGUF_KEY_TOKENIZER_MERGES,
     MFQ_GGUF_KEY_TOKENIZER_BOS_ID,
     MFQ_GGUF_KEY_TOKENIZER_EOS_ID,
+    MFQ_GGUF_KEY_TOKENIZER_EOG_IDS,
     MFQ_GGUF_KEY_TOKENIZER_EOT_ID,
     MFQ_GGUF_KEY_TOKENIZER_EOM_ID,
     MFQ_GGUF_KEY_TOKENIZER_UNK_ID,
@@ -70,6 +71,7 @@ struct mfq_gguf_keys {
             case MFQ_GGUF_KEY_TOKENIZER_MERGES: return "tokenizer.ggml.merges";
             case MFQ_GGUF_KEY_TOKENIZER_BOS_ID: return "tokenizer.ggml.bos_token_id";
             case MFQ_GGUF_KEY_TOKENIZER_EOS_ID: return "tokenizer.ggml.eos_token_id";
+            case MFQ_GGUF_KEY_TOKENIZER_EOG_IDS: return "tokenizer.ggml.eog_token_ids";
             case MFQ_GGUF_KEY_TOKENIZER_EOT_ID: return "tokenizer.ggml.eot_token_id";
             case MFQ_GGUF_KEY_TOKENIZER_EOM_ID: return "tokenizer.ggml.eom_token_id";
             case MFQ_GGUF_KEY_TOKENIZER_UNK_ID: return "tokenizer.ggml.unknown_token_id";

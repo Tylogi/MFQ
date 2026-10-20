@@ -1,5 +1,5 @@
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -8,40 +8,9 @@
 #include <limits>
 #include <type_traits>
 
-#include "packed_backward.cuh"
+#include "mx_matmul_impl.cuh"
 
 namespace {
-
-__device__ __forceinline__ float decode_e8m0(std::uint8_t raw) {
-    if (raw == 255u) {
-        return __int_as_float(0x7fffffff);
-    }
-    // E8M0 stores the unbiased power-of-two exponent with the same bias
-    // as FP32.  Constructing the FP32 exponent is exact and avoids an
-    // expensive per-block ldexpf call.  raw=0 denotes 2^-127, the largest
-    // FP32 subnormal power of two.
-    return raw == 0u
-        ? __int_as_float(0x00400000)
-        : __int_as_float(unsigned(raw) << 23u);
-}
-
-__device__ __forceinline__ float decode_e4m3fn(std::uint8_t raw) {
-    const unsigned exponent = (unsigned(raw) >> 3u) & 15u;
-    const unsigned mantissa = unsigned(raw) & 7u;
-    if (exponent == 15u && mantissa == 7u) {
-        return __int_as_float(0x7fffffff);
-    }
-    // Normal E4M3FN numbers map exactly to FP32 by rebiasing the exponent
-    // and shifting the three mantissa bits.  Subnormals are integer
-    // multiples of 2^-9.  This removes one transcendental instruction per
-    // weight while preserving every represented value exactly.
-    const float magnitude = exponent == 0u
-        ? float(mantissa) * 0.001953125f
-        : __int_as_float(
-            ((exponent + 120u) << 23u) |
-            (mantissa << 20u));
-    return (raw & 128u) == 0u ? magnitude : -magnitude;
-}
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -65,7 +34,8 @@ __global__ void mxfp8_small_m_kernel(
         int outputs,
         int width,
         int groups,
-        int outputs_per_group) {
+        int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
     extern __shared__ float shared_activation[];
     constexpr int kWarps = 8;
     const int lane = int(threadIdx.x) & 31;
@@ -101,20 +71,21 @@ __global__ void mxfp8_small_m_kernel(
         }
     }
 
-    const int scale_columns = width / 128;
-    for (int block_column = 0; block_column < width; block_column += 128) {
+    const int scale_columns = width >> scale_column_shift;
+    const int block_columns=1<<scale_column_shift;
+    for (int block_column = 0; block_column < width; block_column += block_columns) {
         float scale[OUTPUTS_PER_WARP];
 #pragma unroll
         for (int output = 0; output < OUTPUTS_PER_WARP; ++output) {
             const int global_output = first_output + output;
             scale[output] = global_output < outputs
                 ? decode_e8m0(scales[
-                    (global_output / 128) * scale_columns +
-                    block_column / 128])
+                    (global_output >> scale_row_shift) * scale_columns +
+                    (block_column >> scale_column_shift)])
                 : 0.0f;
         }
 #pragma unroll
-        for (int local_column = lane; local_column < 128;
+        for (int local_column = lane; local_column < block_columns;
              local_column += 32) {
             const int column = block_column + local_column;
             float activation[TILE_M];
@@ -168,6 +139,14 @@ __global__ void mxfp8_small_m_kernel(
     }
 }
 
+int mxfp8_column_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return values.size(1)/scales.size(1)==128?7:5;
+}
+
+int mxfp8_row_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return scales.size(0)==values.size(0)?0:mxfp8_column_shift(values,scales);
+}
+
 template <int TILE_M, typename Output>
 void launch_mxfp8_small_m(
         const mfq_tensor_backend::Tensor & values,
@@ -195,7 +174,7 @@ void launch_mxfp8_small_m(
                 reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
                 reinterpret_cast<Output *>(y.data_ptr()), \
                 int(x.size(0)), outputs, int(values.size(1)), \
-                groups, outputs_per_group); \
+                groups, outputs_per_group,mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales)); \
     } while (false)
 #define MFQ_LAUNCH_MXFP8_OPW(OPW) \
     do { \
@@ -222,7 +201,7 @@ __global__ void mxfp8_dequant_kernel(
         const std::uint8_t * __restrict__ scales,
         __half * __restrict__ dense,
         int outputs,
-        int width) {
+        int width,int scale_row_shift,int scale_column_shift) {
     const std::size_t index =
         std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t count = std::size_t(outputs) * width;
@@ -231,9 +210,9 @@ __global__ void mxfp8_dequant_kernel(
     }
     const int output = int(index / width);
     const int column = int(index - std::size_t(output) * width);
-    const int scale_columns = width / 128;
+    const int scale_columns = width >> scale_column_shift;
     const float scale = decode_e8m0(
-        scales[(output / 128) * scale_columns + column / 128]);
+        scales[(output >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
     dense[index] = __float2half_rn(decode_e4m3fn(values[index]) * scale);
 }
 
@@ -244,7 +223,7 @@ __global__ void mxfp8_embedding_kernel(
         __half * __restrict__ output,
         int count,
         int vocab,
-        int width) {
+        int width,int scale_row_shift,int scale_column_shift) {
     const int64_t total = static_cast<int64_t>(count) * width;
     for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x +
              threadIdx.x;
@@ -255,97 +234,79 @@ __global__ void mxfp8_embedding_kernel(
         const int64_t token = ids[token_index];
         float value = 0.0f;
         if (token >= 0 && token < vocab) {
-            const int scale_columns = width / 128;
+            const int scale_columns = width >> scale_column_shift;
             const float scale = decode_e8m0(scales[
-                (token / 128) * scale_columns + column / 128]);
+                (token >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
             value = decode_e4m3fn(values[token * width + column]) * scale;
         }
         output[linear] = __float2half_rn(value);
     }
 }
 
+struct alignas(16) PackedPrefillStorage {
+    static constexpr int k=64,stride=k+8;
+    __align__(16) __half activation[16*stride];
+    __align__(16) unsigned char weights[64*stride*sizeof(__half)];
+    __device__ __forceinline__ __half* decoded() {return reinterpret_cast<__half*>(weights);}
+    __device__ __forceinline__ float* result() {return reinterpret_cast<float*>(weights);}
+    template<class Accumulator>
+    __device__ __forceinline__ void accumulate(Accumulator& acc,int warp) {
+        using namespace nvcuda;
+        __syncthreads();
+        #pragma unroll
+        for(int sub=0;sub<k;sub+=16) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af,activation+sub,stride);
+            wmma::load_matrix_sync(bf,decoded()+warp*16*stride+sub,stride);
+            wmma::mma_sync(acc,af,bf,acc);
+        }
+        __syncthreads();
+    }
+};
+
 template <typename Output>
-__global__ void __launch_bounds__(256) mxfp8_matmul_kernel(
-        const std::uint8_t * __restrict__ values,
-        const std::uint8_t * __restrict__ scales,
-        const __half * __restrict__ input,
-        Output * __restrict__ output,
-        int rows,
-        int outputs,
-        int width,
-        int row_tiles,
-        int output_tiles) {
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int warp = int(threadIdx.y);
-    const int lane = int(threadIdx.x);
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    for (int64_t task = blockIdx.x; task < tasks; task += gridDim.x) {
-        const int output_tile = static_cast<int>(task % output_tiles);
-        const int row_tile = static_cast<int>(task / output_tiles);
-        const int neuron = output_tile * kOutputsPerTile + warp;
-        if (neuron >= outputs) continue;
-        const int first_row = row_tile * kRowsPerTile;
-        float accumulators[kRowsPerTile];
-#pragma unroll
-        for (int item = 0; item < kRowsPerTile; ++item) {
-            accumulators[item] = 0.0f;
+__global__ void __launch_bounds__(128) mxfp8_matmul_kernel(
+        const std::uint8_t* __restrict__ values,const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ input,Output* __restrict__ output,
+        int rows,int outputs,int width,int scale_row_shift,int scale_column_shift) {
+    using namespace nvcuda;
+    __shared__ PackedPrefillStorage tile;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile.activation;auto* b=tile.decoded();auto* c=tile.result();
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int first_row=blockIdx.y*16,first_output=blockIdx.x*64;
+    const int scale_columns=width>>scale_column_shift;
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;
+    wmma::fill_fragment(acc,0.0f);
+    for(int k=0;k<width;k+=tile_k) {
+        for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+            const int row=first_row+i/tile_k,column=k+i%tile_k;
+            a[(i/tile_k)*stride+i%tile_k]=row<rows && column<width?
+                input[std::size_t(row)*width+column]:__float2half_rn(0);
         }
-        const int scale_columns = width / 128;
-        for (int column = lane; column < width; column += 32) {
-            const float weight = decode_e4m3fn(values[
-                static_cast<int64_t>(neuron) * width + column]) *
-                decode_e8m0(scales[
-                    static_cast<int64_t>(neuron / 128) * scale_columns +
-                    column / 128]);
-#pragma unroll
-            for (int item = 0; item < kRowsPerTile; ++item) {
-                const int row = first_row + item;
-                if (row < rows) {
-                    accumulators[item] = fmaf(
-                        __half2float(input[
-                            static_cast<int64_t>(row) * width + column]),
-                        weight,
-                        accumulators[item]);
-                }
+        for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+            const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+            float lo=0,hi=0;
+            if(neuron<outputs && column<width) {
+                const auto offset=std::size_t(neuron)*width+column;
+                const float scale=decode_e8m0(scales[std::size_t(neuron>>scale_row_shift)*scale_columns+(column>>scale_column_shift)]);
+                lo=decode_e4m3fn(values[offset])*scale;
+                hi=decode_e4m3fn(values[offset+1])*scale;
             }
+            reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
         }
-#pragma unroll
-        for (int item = 0; item < kRowsPerTile; ++item) {
-            const float value = warp_sum(accumulators[item]);
-            const int row = first_row + item;
-            if (lane == 0 && row < rows) {
-                if constexpr (std::is_same_v<Output, float>) {
-                    output[static_cast<int64_t>(row) * outputs + neuron] = value;
-                } else {
-                    output[static_cast<int64_t>(row) * outputs + neuron] =
-                        __float2half_rn(value);
-                }
-            }
+        tile.accumulate(acc,warp);
+    }
+    wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
+    __syncwarp();
+    for(int i=lane;i<16*16;i+=32) {
+        const int row=first_row+i/16,neuron=first_output+warp*16+i%16;
+        if(row<rows && neuron<outputs) {
+            if constexpr(std::is_same_v<Output,float>)output[std::size_t(row)*outputs+neuron]=c[warp*16*16+i];
+            else output[std::size_t(row)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
         }
     }
-}
-
-void validate_mxfp8(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales) {
-    MFQ_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
-                "MXFP8 values and scales must be CUDA tensors");
-    MFQ_RUNTIME_CHECK(values.scalar_type() == mfq_tensor_backend::kUInt8 &&
-                    scales.scalar_type() == mfq_tensor_backend::kUInt8,
-                "MXFP8 values and scales must be uint8");
-    MFQ_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
-                "MXFP8 values and scales must be contiguous");
-    MFQ_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2,
-                "MXFP8 values and scales must be rank-2");
-    MFQ_RUNTIME_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
-                    values.size(0) <= std::numeric_limits<int>::max() &&
-                    values.size(1) <= std::numeric_limits<int>::max() &&
-                    values.size(1) % 128 == 0,
-                "MXFP8 input width must be divisible by 128");
-    MFQ_RUNTIME_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
-                    scales.size(1) == values.size(1) / 128,
-                "MXFP8 scale geometry mismatch");
 }
 
 } // namespace
@@ -364,7 +325,7 @@ mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
-            int(values.size(0)), int(values.size(1)));
+            int(values.size(0)), int(values.size(1)),mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
 }
@@ -395,7 +356,7 @@ mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-                count, vocab, width);
+                count, vocab, width,mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
@@ -447,21 +408,11 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
     auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
-    const int output_tiles =
-        (outputs + kOutputsPerTile - 1) / kOutputsPerTile;
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
-    const dim3 threads(32, kOutputsPerTile);
-    mxfp8_matmul_kernel<__half><<<
-        blocks, threads, 0, mfq_current_cuda_stream()>>>(
-            values.data_ptr<std::uint8_t>(),
-            scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-            rows, outputs, width, row_tiles, output_tiles);
+    mxfp8_matmul_kernel<__half><<<dim3((outputs+63)/64,(rows+15)/16),128,0,mfq_current_cuda_stream()>>>(
+        values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+        reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+        reinterpret_cast<__half*>(result.data_ptr<mfq_half>()),rows,outputs,width,
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
@@ -511,20 +462,10 @@ mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
     const int N = int(values.size(0));
     auto y = mfq_tensor_backend::empty(
         {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int row_tiles = (M + kRowsPerTile - 1) / kRowsPerTile;
-    const int output_tiles = (N + kOutputsPerTile - 1) / kOutputsPerTile;
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
-    const dim3 threads(32, kOutputsPerTile);
-    mxfp8_matmul_kernel<float><<<
-        blocks, threads, 0, mfq_current_cuda_stream()>>>(
-            values.data_ptr<std::uint8_t>(),
-            scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-            y.data_ptr<float>(), M, N, int(x.size(1)),
-            row_tiles, output_tiles);
+    mxfp8_matmul_kernel<float><<<dim3((N+63)/64,(M+15)/16),128,0,mfq_current_cuda_stream()>>>(
+        values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),y.data_ptr<float>(),M,N,int(x.size(1)),
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -605,14 +546,6 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_f32_cuda(
 }
 
 namespace {
-
-__device__ __forceinline__ float decode_mxfp4_e2m1(std::uint8_t code) {
-    constexpr float magnitude[8] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    };
-    const float value = magnitude[code & 7u];
-    return (code & 8u) == 0u ? value : -value;
-}
 
 __global__ void mxfp4_dequant_kernel(
         const std::uint8_t * __restrict__ values,
@@ -723,26 +656,6 @@ __global__ void __launch_bounds__(256) mxfp4_matmul_f16_kernel(
     }
 }
 
-void validate_mxfp4_dense(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales) {
-    MFQ_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
-                "MXFP4 values and scales must be CUDA tensors");
-    MFQ_RUNTIME_CHECK(values.scalar_type() == mfq_tensor_backend::kUInt8 &&
-                    scales.scalar_type() == mfq_tensor_backend::kUInt8,
-                "MXFP4 values and scales must be uint8");
-    MFQ_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
-                "MXFP4 values and scales must be contiguous");
-    MFQ_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2 &&
-                    values.size(0) > 0 && values.size(1) > 0 &&
-                    values.size(0) <= std::numeric_limits<int>::max() &&
-                    values.size(1) <= std::numeric_limits<int>::max() / 2 &&
-                    values.size(1) % 16 == 0 &&
-                    scales.size(0) == values.size(0) &&
-                    scales.size(1) == values.size(1) / 16,
-                "MXFP4 weight geometry mismatch");
-}
-
 template <bool COMPACT_ROUTE>
 __global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
         const std::uint8_t * __restrict__ values,
@@ -846,6 +759,72 @@ __global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
             output[static_cast<int64_t>(pair) * out_per_expert + local_row] =
                 __float2half_rn(value);
         }
+    }
+}
+
+__global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
+        const std::uint8_t* __restrict__ values,
+        const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ input,
+        const std::int32_t* __restrict__ expert_local,
+        const std::int32_t* __restrict__ ids_dst,
+        const std::int32_t* __restrict__ expert_bounds,
+        const std::int32_t* __restrict__ tile_bounds,
+        const std::int32_t* __restrict__ tile_experts,
+        __half* __restrict__ output,
+        int routes,int global_experts,int pool_experts,
+        int outputs,int width,int max_tiles,int output_tiles,bool routed_input) {
+    using namespace nvcuda;
+    __shared__ PackedPrefillStorage tile_storage;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile_storage.activation;auto* b=tile_storage.decoded();auto* c=tile_storage.result();
+    __shared__ int pair_ids[16];
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int64_t tasks=int64_t(max_tiles)*output_tiles;
+    for(int64_t task=blockIdx.x;task<tasks;task+=gridDim.x) {
+        const int tile=int(task/output_tiles);
+        if(tile>=tile_bounds[global_experts])continue;
+        const int expert=tile_experts[tile],local=expert_local[expert];
+        if(static_cast<unsigned>(local)>=static_cast<unsigned>(pool_experts))continue;
+        const int local_tile=tile-tile_bounds[expert];
+        if(local_tile&1)continue;
+        const int first=expert_bounds[expert]+local_tile*8;
+        const int last=min(first+16,expert_bounds[expert+1]);
+        const int first_output=int(task%output_tiles)*64;
+        if(threadIdx.x<16)pair_ids[threadIdx.x]=first+threadIdx.x<last?
+            ids_dst[first+threadIdx.x]:-1;
+        __syncthreads();
+        wmma::fragment<wmma::accumulator,16,16,16,float> acc;
+        wmma::fill_fragment(acc,0.0f);
+        for(int k=0;k<width;k+=tile_k) {
+            for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+                const int pair=pair_ids[i/tile_k],column=k+i%tile_k;
+                const int source_row=routed_input?pair:pair/routes;
+                a[(i/tile_k)*stride+i%tile_k]=pair>=0 && column<width?
+                    input[int64_t(source_row)*width+column]:__float2half_rn(0);
+            }
+            for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+                const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+                float lo=0,hi=0;
+                if(neuron<outputs && column<width) {
+                    const int64_t packed_row=int64_t(local)*outputs+neuron;
+                    const auto packed=values[packed_row*(width/2)+column/2];
+                    const float scale=decode_e8m0(scales[packed_row*(width/32)+column/32]);
+                    lo=decode_mxfp4_e2m1(packed&15u)*scale;
+                    hi=decode_mxfp4_e2m1(packed>>4u)*scale;
+                }
+                reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
+            }
+            tile_storage.accumulate(acc,warp);
+        }
+        wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
+        __syncwarp();
+        for(int i=lane;i<16*16;i+=32) {
+            const int pair=pair_ids[i/16],neuron=first_output+warp*16+i%16;
+            if(pair>=0 && neuron<outputs)
+                output[int64_t(pair)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
+        }
+        __syncthreads();
     }
 }
 
@@ -1016,6 +995,26 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
                         tile_bounds.numel() >= global_experts + 1,
                     "MXFP4 compact route map is invalid");
         const int max_tiles = (pairs + 7) / 8 + static_cast<int>(global_experts);
+        if(pairs>=8*global_experts) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mxfp4_moe_prefill_dispatch path=packed_tensor_core tokens=%d routes=%d experts=%lld pool=%lld width=%lld outputs=%lld\n",
+                tokens,routes,static_cast<long long>(global_experts),static_cast<long long>(pool_experts),
+                static_cast<long long>(neuron_len),static_cast<long long>(out_per_expert));
+            const int output_tiles=(static_cast<int>(out_per_expert)+63)/64;
+            const int blocks=static_cast<int>(std::min<int64_t>(int64_t(max_tiles)*output_tiles,4096));
+            mxfp4_moe_grouped_tensor_kernel<<<blocks,128,0,stream>>>(
+                values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+                expert_local.data_ptr<std::int32_t>(),ids_dst.data_ptr<std::int32_t>(),
+                expert_bounds.data_ptr<std::int32_t>(),tile_bounds.data_ptr<std::int32_t>(),
+                tile_experts.data_ptr<std::int32_t>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                routes,static_cast<int>(global_experts),static_cast<int>(pool_experts),
+                static_cast<int>(out_per_expert),static_cast<int>(neuron_len),max_tiles,
+                output_tiles,input.dim()==3);
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+            return output;
+        }
         const int blocks = static_cast<int>(std::min<int64_t>(
             static_cast<int64_t>(max_tiles) * row_tiles, 4096));
         mxfp4_moe_grouped_f16_kernel<true><<<blocks, threads, 0, stream>>>(
@@ -1043,586 +1042,4 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
-}
-
-namespace {
-
-template <int Rows, int Columns>
-__global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
-        const uint8_t * __restrict__ values,
-        const uint8_t * __restrict__ scales,
-        const __half * __restrict__ output_gradient,
-        __half * __restrict__ input_gradient,
-        int rows,
-        int outputs,
-        int width) {
-    using namespace nvcuda;
-    constexpr int kWarps = 8;
-    __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
-    __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
-    __shared__ __align__(16) float result_tile[kWarps][16 * 16];
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int column0 = static_cast<int>(blockIdx.x) * Columns;
-    const int scale_columns = width >> 7;
-    for (int index = lane; index < 16 * 16; index += 32) {
-        gradient_tile[warp][index] = __float2half_rn(0.0f);
-        if constexpr (Columns < 16) {
-            weight_tile[warp][index] = __float2half_rn(0.0f);
-        }
-    }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
-    for (int output_group = warp * 128;
-         output_group < outputs;
-         output_group += kWarps * 128) {
-        for (int output0 = output_group;
-             output0 < min(output_group + 128, outputs);
-             output0 += 16) {
-            for (int index = lane; index < Rows * 16; index += 32) {
-                const int row = index >> 4;
-                const int output = output0 + (index & 15);
-                gradient_tile[warp][index] = row < rows && output < outputs
-                    ? output_gradient[
-                        static_cast<int64_t>(row) * outputs + output]
-                    : __float2half_rn(0.0f);
-            }
-            float scale = lane == 0
-                ? decode_e8m0(scales[
-                    static_cast<int64_t>(output0 >> 7) * scale_columns +
-                    (column0 >> 7)])
-                : 0.0f;
-            scale = __shfl_sync(0xffffffffu, scale, 0);
-            for (int index = lane; index < 16 * Columns; index += 32) {
-                const int output = output0 + index / Columns;
-                const int local_column = index % Columns;
-                const int column = column0 + local_column;
-                weight_tile[warp][
-                    (index / Columns) * 16 + local_column] = output < outputs
-                    ? __float2half_rn(
-                        decode_e4m3fn(values[
-                            static_cast<int64_t>(output) * width + column]) *
-                        scale)
-                    : __float2half_rn(0.0f);
-            }
-            __syncwarp();
-            wmma::fragment<
-                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
-                    gradient_fragment;
-            wmma::fragment<
-                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
-                    weight_fragment;
-            wmma::load_matrix_sync(
-                gradient_fragment, gradient_tile[warp], 16);
-            wmma::load_matrix_sync(
-                weight_fragment, weight_tile[warp], 16);
-            wmma::mma_sync(
-                accumulator, gradient_fragment, weight_fragment, accumulator);
-            __syncwarp();
-        }
-    }
-    wmma::store_matrix_sync(
-        result_tile[warp], accumulator, 16, wmma::mem_row_major);
-    __syncthreads();
-    const int index = static_cast<int>(threadIdx.x);
-    if (index < rows * Columns) {
-        const int row = index / Columns;
-        const int local_column = index % Columns;
-        const int column = column0 + local_column;
-        float value = 0.0f;
-#pragma unroll
-        for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
-            value += result_tile[source_warp][row * 16 + local_column];
-        }
-        input_gradient[static_cast<int64_t>(row) * width + column] =
-            __float2half_rn(value);
-    }
-}
-
-template <int Rows, int Columns>
-void launch_mxfp8_backward_mma(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales,
-        const mfq_tensor_backend::Tensor & output_gradient,
-        mfq_tensor_backend::Tensor & result,
-        int rows,
-        int outputs,
-        int width,
-        cudaStream_t stream) {
-    const int blocks = (width + Columns - 1) / Columns;
-    mxfp8_backward_mma_kernel<Rows, Columns><<<
-        blocks, 256, 0, stream>>>(
-        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
-        reinterpret_cast<const __half *>(
-            output_gradient.data_ptr<mfq_half>()),
-        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-        rows, outputs, width);
-}
-
-template <int Rows>
-__global__ void __launch_bounds__(32) mxfp4_backward_vec4_partial_kernel(
-        const uint8_t * __restrict__ values,
-        const uint8_t * __restrict__ scales,
-        const __half * __restrict__ output_gradient,
-        float * __restrict__ partials,
-        int rows,
-        int outputs,
-        int width) {
-    constexpr int kOutputTile = 32;
-    const int column0 =
-        (static_cast<int>(blockIdx.x) * 32 + threadIdx.x) * 4;
-    if (column0 >= width) {
-        return;
-    }
-    float accumulators[Rows][4] = {};
-    const int output_group = static_cast<int>(blockIdx.y);
-    const int output0 = output_group * kOutputTile;
-    const int output_end = min(output0 + kOutputTile, outputs);
-    const int value_columns = width >> 1;
-    const int scale_columns = width >> 5;
-    for (int output = output0; output < output_end; ++output) {
-        const uint16_t packed = *reinterpret_cast<const uint16_t *>(
-            values + static_cast<int64_t>(output) * value_columns +
-            (column0 >> 1));
-        const float scale = decode_e8m0(scales[
-            static_cast<int64_t>(output) * scale_columns +
-            (column0 >> 5)]);
-        float decoded[4];
-#pragma unroll
-        for (int component = 0; component < 4; ++component) {
-            decoded[component] = decode_mxfp4_e2m1(static_cast<uint8_t>(
-                (packed >> (4 * component)) & 15u)) * scale;
-        }
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            if (row < rows) {
-                const float gradient = __half2float(output_gradient[
-                    static_cast<int64_t>(row) * outputs + output]);
-#pragma unroll
-                for (int component = 0; component < 4; ++component) {
-                    accumulators[row][component] = fmaf(
-                        gradient, decoded[component],
-                        accumulators[row][component]);
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        if (row < rows) {
-#pragma unroll
-            for (int component = 0; component < 4; ++component) {
-                const int column = column0 + component;
-                if (column < width) {
-                    partials[(static_cast<int64_t>(output_group) * rows + row) *
-                        width + column] = accumulators[row][component];
-                }
-            }
-        }
-    }
-}
-
-template <int Rows>
-void launch_mxfp4_backward_vec4_small_m(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales,
-        const mfq_tensor_backend::Tensor & output_gradient,
-        mfq_tensor_backend::Tensor & result,
-        int rows,
-        int outputs,
-        int width,
-        cudaStream_t stream) {
-    constexpr int kOutputTile = 32;
-    const int output_groups = (outputs + kOutputTile - 1) / kOutputTile;
-    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
-        {output_groups, rows, width},
-        values.options().dtype(mfq_tensor_backend::kFloat32));
-    const dim3 partial_grid(
-        static_cast<unsigned>((width + 127) / 128),
-        static_cast<unsigned>(output_groups));
-    mxfp4_backward_vec4_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
-        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
-        reinterpret_cast<const __half *>(
-            output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(), rows, outputs, width);
-    mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
-        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-        rows, width, output_groups, stream);
-}
-
-template <int Rows>
-__global__ void __launch_bounds__(32) mxfp8_backward_scalar_partial_kernel(
-        const uint8_t * __restrict__ values,
-        const uint8_t * __restrict__ scales,
-        const __half * __restrict__ output_gradient,
-        float * __restrict__ partials,
-        int rows,
-        int outputs,
-        int width) {
-    const int column = static_cast<int>(blockIdx.x) * 32 + threadIdx.x;
-    if (column >= width) {
-        return;
-    }
-    float accumulators[Rows];
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        accumulators[row] = 0.0f;
-    }
-    const int output_group = static_cast<int>(blockIdx.y);
-    const int output0 = output_group * 128;
-    const int output_end = min(output0 + 128, outputs);
-    const int scale_columns = width >> 7;
-    const float scale = decode_e8m0(scales[
-        static_cast<int64_t>(output_group) * scale_columns +
-        (column >> 7)]);
-    const uint8_t * weight = output0 < outputs
-        ? values + static_cast<int64_t>(output0) * width + column
-        : values;
-    for (int output = output0; output < output_end; ++output) {
-        const float decoded = decode_e4m3fn(*weight) * scale;
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            if (row < rows) {
-                accumulators[row] = fmaf(
-                    __half2float(output_gradient[
-                        static_cast<int64_t>(row) * outputs + output]),
-                    decoded,
-                    accumulators[row]);
-            }
-        }
-        weight += width;
-    }
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        if (row < rows) {
-            partials[(static_cast<int64_t>(output_group) * rows + row) *
-                width + column] = accumulators[row];
-        }
-    }
-}
-
-template <int Rows, int Warps>
-__global__ void __launch_bounds__(Warps * 32)
-mxfp8_backward_block_reduce_kernel(
-        const uint8_t * __restrict__ values,
-        const uint8_t * __restrict__ scales,
-        const __half * __restrict__ output_gradient,
-        __half * __restrict__ input_gradient,
-        int rows,
-        int outputs,
-        int width) {
-    __shared__ float warp_results[Rows][Warps][32];
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int column = static_cast<int>(blockIdx.x) * 32 + lane;
-    const bool valid = column < width;
-    const int output0 = warp * 128;
-    const int output_end = min(output0 + 128, outputs);
-    const int scale_columns = width >> 7;
-    const float scale = valid && output0 < outputs
-        ? decode_e8m0(scales[
-            static_cast<int64_t>(warp) * scale_columns + (column >> 7)])
-        : 0.0f;
-    const uint8_t * weight = values +
-        static_cast<int64_t>(output0) * width + column;
-    float accumulators[Rows] = {};
-    if (valid) {
-        for (int output = output0; output < output_end; ++output) {
-            const float decoded = decode_e4m3fn(*weight) * scale;
-#pragma unroll
-            for (int row = 0; row < Rows; ++row) {
-                if (row < rows) {
-                    accumulators[row] = fmaf(
-                        __half2float(output_gradient[
-                            static_cast<int64_t>(row) * outputs + output]),
-                        decoded,
-                        accumulators[row]);
-                }
-            }
-            weight += width;
-        }
-    }
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        warp_results[row][warp][lane] = accumulators[row];
-    }
-    __syncthreads();
-    const int result_index = static_cast<int>(threadIdx.x);
-    if (result_index < rows * 32) {
-        const int row = result_index >> 5;
-        const int result_lane = result_index & 31;
-        const int result_column = static_cast<int>(blockIdx.x) * 32 + result_lane;
-        if (result_column < width) {
-            float value = 0.0f;
-#pragma unroll
-            for (int source_warp = 0; source_warp < Warps; ++source_warp) {
-                value += warp_results[row][source_warp][result_lane];
-            }
-            input_gradient[static_cast<int64_t>(row) * width + result_column] =
-                __float2half_rn(value);
-        }
-    }
-}
-
-template <int Rows>
-void launch_mxfp8_backward_block_reduce(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales,
-        const mfq_tensor_backend::Tensor & output_gradient,
-        mfq_tensor_backend::Tensor & result,
-        int rows,
-        int outputs,
-        int width,
-        cudaStream_t stream) {
-    const int output_groups = (outputs + 127) / 128;
-    const int blocks = (width + 31) / 32;
-#define MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(WARPS) \
-    mxfp8_backward_block_reduce_kernel<Rows, WARPS><<< \
-        blocks, (WARPS) * 32, 0, stream>>>( \
-            values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), \
-            reinterpret_cast<const __half *>( \
-                output_gradient.data_ptr<mfq_half>()), \
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()), \
-            rows, outputs, width)
-    if (output_groups <= 1) {
-        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(1);
-    } else if (output_groups <= 2) {
-        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(2);
-    } else if (output_groups <= 4) {
-        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(4);
-    } else {
-        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(8);
-    }
-#undef MFQ_LAUNCH_MXFP8_BLOCK_REDUCE
-}
-
-template <int Rows>
-void launch_mxfp8_backward_scalar_small_m(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales,
-        const mfq_tensor_backend::Tensor & output_gradient,
-        mfq_tensor_backend::Tensor & result,
-        int rows,
-        int outputs,
-        int width,
-        cudaStream_t stream) {
-    const int output_groups = (outputs + 127) / 128;
-    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
-        {output_groups, rows, width},
-        values.options().dtype(mfq_tensor_backend::kFloat32));
-    const dim3 partial_grid(
-        static_cast<unsigned>((width + 31) / 32),
-        static_cast<unsigned>(output_groups));
-    mxfp8_backward_scalar_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
-        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
-        reinterpret_cast<const __half *>(
-            output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(),
-        rows, outputs, width);
-    mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
-        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-        rows, width, output_groups, stream);
-}
-
-template <int Rows>
-__global__ void __launch_bounds__(32) mxfp8_backward_vec4_partial_kernel(
-        const uint8_t * __restrict__ values,
-        const uint8_t * __restrict__ scales,
-        const __half * __restrict__ output_gradient,
-        float * __restrict__ partials,
-        int rows,
-        int outputs,
-        int width) {
-    const int lane = static_cast<int>(threadIdx.x);
-    const int column0 = (static_cast<int>(blockIdx.x) * 32 + lane) * 4;
-    float accumulators[Rows][4];
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-#pragma unroll
-        for (int component = 0; component < 4; ++component) {
-            accumulators[row][component] = 0.0f;
-        }
-    }
-    const int output_group = static_cast<int>(blockIdx.y);
-    const int output0 = output_group * 32;
-    const int output_end = min(output0 + 32, outputs);
-    const int scale_columns = width >> 7;
-    float scale = lane == 0 ? decode_e8m0(scales[
-        static_cast<int64_t>(output0 >> 7) * scale_columns +
-        (column0 >> 7)]) : 0.0f;
-    scale = __shfl_sync(0xffffffffu, scale, 0);
-    const uint8_t * weight = values +
-        static_cast<int64_t>(output0) * width + column0;
-    for (int output = output0; output < output_end; ++output) {
-        const uint32_t packed = *reinterpret_cast<const uint32_t *>(weight);
-        float decoded[4];
-#pragma unroll
-        for (int component = 0; component < 4; ++component) {
-            decoded[component] = decode_e4m3fn(static_cast<uint8_t>(
-                packed >> (8 * component))) * scale;
-        }
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            float gradient = lane == 0 && row < rows
-                ? __half2float(output_gradient[
-                    static_cast<int64_t>(row) * outputs + output])
-                : 0.0f;
-            gradient = __shfl_sync(0xffffffffu, gradient, 0);
-#pragma unroll
-            for (int component = 0; component < 4; ++component) {
-                accumulators[row][component] = fmaf(
-                    gradient, decoded[component],
-                    accumulators[row][component]);
-            }
-        }
-        weight += width;
-    }
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        if (row < rows) {
-#pragma unroll
-            for (int component = 0; component < 4; ++component) {
-                partials[(static_cast<int64_t>(output_group) * rows + row) *
-                    width + column0 + component] = accumulators[row][component];
-            }
-        }
-    }
-}
-
-template <int Rows>
-void launch_mxfp8_backward_vec4_small_m(
-        const mfq_tensor_backend::Tensor & values,
-        const mfq_tensor_backend::Tensor & scales,
-        const mfq_tensor_backend::Tensor & output_gradient,
-        mfq_tensor_backend::Tensor & result,
-        int rows,
-        int outputs,
-        int width,
-        cudaStream_t stream) {
-    const int output_groups = (outputs + 31) / 32;
-    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
-        {output_groups, rows, width},
-        values.options().dtype(mfq_tensor_backend::kFloat32));
-    const dim3 partial_grid(
-        static_cast<unsigned>((width + 127) / 128),
-        static_cast<unsigned>(output_groups));
-    mxfp8_backward_vec4_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
-        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
-        reinterpret_cast<const __half *>(
-            output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(),
-        rows, outputs, width);
-    mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
-        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-        rows, width, output_groups, stream);
-}
-
-}  // namespace
-
-mfq_tensor_backend::Tensor mx_backward_input_cuda(
-        mfq_tensor_backend::Tensor values,
-        mfq_tensor_backend::Tensor scales,
-        mfq_tensor_backend::Tensor output_gradient,
-        bool mxfp4) {
-    if (mxfp4) {
-        validate_mxfp4_dense(values, scales);
-    } else {
-        validate_mxfp8(values, scales);
-    }
-    MFQ_RUNTIME_CHECK(
-        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
-        output_gradient.dim() == 2 && output_gradient.size(1) == values.size(0),
-        "MX backward output gradient geometry mismatch");
-    MFQ_RUNTIME_CHECK(
-        values.device() == scales.device() &&
-        values.device() == output_gradient.device(),
-        "MX backward tensors must share one CUDA device");
-    const auto dtype = output_gradient.scalar_type();
-    MFQ_RUNTIME_CHECK(
-        dtype == mfq_tensor_backend::kFloat16 ||
-        dtype == mfq_tensor_backend::kFloat32 ||
-        dtype == mfq_tensor_backend::kBFloat16,
-        "MX backward output gradient must be fp16, bf16, or fp32");
-    const int rows = static_cast<int>(output_gradient.size(0));
-    const int outputs = static_cast<int>(values.size(0));
-    const int width = static_cast<int>(mxfp4 ? values.size(1) * 2 : values.size(1));
-    auto result = mfq_tensor_backend::empty({rows, width}, output_gradient.options());
-    const int64_t total = static_cast<int64_t>(rows) * width;
-    if (total == 0) {
-        return result;
-    }
-    MfqCudaGuard guard(output_gradient.device());
-    constexpr int threads = 256;
-    const int blocks = static_cast<int>(std::min<int64_t>(
-        (total + threads - 1) / threads, 65535));
-    const cudaStream_t stream = mfq_current_cuda_stream();
-    if (mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
-        if (rows == 1) {
-            launch_mxfp4_backward_vec4_small_m<1>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (rows <= 2) {
-            launch_mxfp4_backward_vec4_small_m<2>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (rows <= 4) {
-            launch_mxfp4_backward_vec4_small_m<4>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else {
-            launch_mxfp4_backward_vec4_small_m<8>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        }
-        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-        return result;
-    }
-    if (!mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
-        const int output_groups = (outputs + 127) / 128;
-        if (rows == 1 && output_groups <= 8) {
-            launch_mxfp8_backward_block_reduce<1>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (rows == 1) {
-            launch_mxfp8_backward_scalar_small_m<1>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (rows <= 2) {
-            launch_mxfp8_backward_scalar_small_m<2>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (rows <= 4) {
-            launch_mxfp8_backward_vec4_small_m<4>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        // Wide down projections amortize the per-column WMMA reduction;
-        // square and output-wide projections keep the vector path.
-        } else if (static_cast<int64_t>(width) >=
-                2 * static_cast<int64_t>(outputs)) {
-            launch_mxfp8_backward_mma<8, 16>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else if (2 * static_cast<int64_t>(width) >=
-                static_cast<int64_t>(outputs)) {
-            launch_mxfp8_backward_mma<8, 8>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        } else {
-            launch_mxfp8_backward_vec4_small_m<8>(
-                values, scales, output_gradient, result,
-                rows, outputs, width, stream);
-        }
-        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-        return result;
-    }
-    auto weight = mxfp4
-        ? mxfp4_dequant_cuda(values, scales)
-        : mxfp8_dequant_cuda(values, scales);
-    mfq_packed_backward::launch_dense_half_weight(
-        output_gradient, weight, result, rows, outputs, width, stream);
-    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-    return result;
 }

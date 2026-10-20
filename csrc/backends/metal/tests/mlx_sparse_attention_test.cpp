@@ -1,4 +1,4 @@
-#include "mlx_sparse_attention.h"
+#include "ops/mlx_sparse_attention.h"
 
 #include <mlx/mlx.h>
 
@@ -199,9 +199,9 @@ void test_block_gqa_matches_expanded_reference(
 void test_block_gqa_decode(int block_size) {
     using namespace mlx::core;
     for (const auto dtype : {float16, bfloat16}) {
-        for (const int keys : {1, 2, 3, 4, 16, 17, 18, 19, 2048, 2051, 4096}) {
+        for (const int keys : {1, 2, 3, 4, 16, 17, 18, 19, 1024, 1025, 1027, 2048, 2051, 4096}) {
             for (const bool invalid_blocks : {false, true}) {
-                const int count = keys < 2048 ? 3 : 512;
+                const int count = keys < 1024 ? 3 : 512;
                 auto query = astype(patterned_half(
                     24 * 256, Shape{1, 24, 1, 256}, 37, 1.0f / 511.0f), dtype);
                 auto key = astype(patterned_half(
@@ -248,10 +248,10 @@ void test_block_gqa_small_m(int block_size, int inner_stride) {
     for (const auto dtype : {float16, bfloat16}) {
         for (const int batch : {1, 2}) {
             for (int rows = 1; rows <= 6; ++rows) {
-                for (const int keys : {3, 4, 17, 18, 19, 2048, 2051, 4096}) {
+                for (const int keys : {3, 4, 17, 18, 19, 1024, 1025, 2048, 2051, 4096}) {
                     if (rows > keys) continue;
                     for (const int offset : {0, keys - rows}) {
-                        const int count = keys < 2048 ? 3 : 512;
+                        const int count = keys < 1024 ? 3 : 512;
                         auto query = astype(patterned_half(
                             batch * 24 * rows * 256, Shape{batch, 24, rows, 256},
                             37, 1.0f / 511.0f), dtype);

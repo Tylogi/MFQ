@@ -7,6 +7,7 @@ import {
 } from '../features/settings/UpdateManager';
 import { useUiStore } from '../stores/uiStore';
 import { Icon } from './display';
+import mfqMark from '../assets/mfq-mark.svg';
 import { formatNumber } from './formatters';
 import { studioBuild } from '../features/settings/releases';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
@@ -62,7 +63,7 @@ export function StudioSidebar() {
         active: view === 'dashboard' && dashboardPage === 'models', current: true },
       { label: ['服务', 'Service'], icon: 'server-rack', path: '/runtime',
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
-      { label: ['资源', 'Resources'], icon: 'memory', path: dashboard('cache'),
+      { label: ['资源', 'Resources'], icon: 'droplet', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
     ] },
     { label: ['交互', 'Playground'], items: [
@@ -76,8 +77,6 @@ export function StudioSidebar() {
         active: view === 'lab' && labPage === 'models' },
       { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化', 'Quantization'], icon: 'tools', path: lab('quantization'),
-        active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: ['系统', 'System'], items: [
       { label: ['日志', 'Logs'], icon: 'scroll', path: dashboard('logs'),
@@ -96,7 +95,7 @@ export function StudioSidebar() {
     <>
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} id="studio-sidebar">
         <div className="brand">
-          <img src="/mfq-mark.svg" alt="" />
+          <img src={mfqMark} alt="" />
           <div><strong>MFQ</strong><span>Studio</span></div>
         </div>
         <div className="sidebar-scroll">

@@ -122,7 +122,8 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
     library = _nvml_fixture("NVIDIA GPU", [])
     del library.nvmlDeviceGetMaxClockInfo, library.nvmlDeviceGetMemoryBusWidth
     monkeypatch.setattr(ctypes, "CDLL", lambda path: library)
-    assert hardware._nvidia_memory() == (hardware.GpuMemory("NVIDIA GPU", 32 << 30), hardware.GpuMemory("NVIDIA GPU", 24 << 30))
+    assert hardware._nvidia_memory() == (hardware.GpuMemory("NVIDIA GPU", 32 << 30, device_id="0", available_bytes=0),
+        hardware.GpuMemory("NVIDIA GPU", 24 << 30, device_id="1", available_bytes=0))
 
 
 @pytest.mark.parametrize("gpus,architecture,capacity,hot", [
@@ -133,6 +134,7 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
     ((), "unknown", None, None),
 ])
 def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, gpus, architecture, capacity, hot):
+    monkeypatch.setattr(hardware, "host_memory_capacity", lambda: (128 << 30, 37 << 30))
     monkeypatch.setattr(hardware, "hardware_identity", lambda: hardware.HardwareIdentity(
         "CPU", 16, tuple(gpu.name for gpu in gpus), physical_memory_bytes=128 << 30, gpu_memory=gpus))
     value = hardware.memory_topology()
@@ -141,6 +143,7 @@ def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, g
     assert value["prefix_cache_hot_tier"] == hot
     assert value["prefix_cache_cold_tier"] == "ssd"
     assert value["host_memory_total_bytes"] == 128 << 30
+    assert value["host_memory_available_bytes"] == 37 << 30
 
 
 def test_gb10_keeps_unified_topology_when_capacity_queries_are_unavailable(monkeypatch):

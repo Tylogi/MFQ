@@ -89,15 +89,12 @@ std::vector<uint8_t> unpack_bits(const std::vector<uint8_t> & blob, size_t & off
         return out;
     }
     size_t nbytes = (count * (size_t)bits + 7) / 8;
+    const uint32_t mask=(1u<<bits)-1;
     for (size_t i = 0; i < count; ++i) {
-        uint32_t v = 0;
-        size_t bit0 = i * (size_t)bits;
-        for (int j = 0; j < bits; ++j) {
-            size_t bit = bit0 + (size_t)j;
-            uint8_t by = blob[off + bit / 8];
-            v |= ((by >> (bit & 7)) & 1u) << j;
-        }
-        out[i] = (uint8_t)v;
+        const size_t bit=i*static_cast<size_t>(bits),byte=bit/8;
+        uint32_t word=blob[off+byte];
+        if(byte+1<nbytes)word|=uint32_t(blob[off+byte+1])<<8;
+        out[i]=static_cast<uint8_t>((word>>(bit&7))&mask);
     }
     off += nbytes;
     return out;

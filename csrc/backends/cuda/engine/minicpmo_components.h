@@ -1,6 +1,6 @@
 #pragma once
 
-#include "inference.h"
+#include "csrc/engine/requests/inference.h"
 #include "models/minicpmo45/ops.h"
 
 #include <memory>
@@ -12,7 +12,9 @@ class Components {
     explicit Components(MiniCPMO45CausalLm language);
     ~Components();
 
-    MiniCPMO45CausalLm& language() noexcept;
+    // The composite replaces the loaded language model; the engine binds this
+    // through the family-independent interface when it composes its state.
+    CudaCausalModel& language() noexcept;
     mfq::StepSequence<CudaPreparedPrompt> prepare(
         const std::vector<int64_t>& prompt, const MfqMultimodalInput& media);
     mfq::StepSequence<std::monostate> start(MfqDuplexSessionParams parameters);

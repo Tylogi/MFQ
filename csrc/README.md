@@ -1,11 +1,20 @@
 # MFQ C++ runtime
 
 The native runtime is organized by responsibility. Shared models are grouped
-by model family:
+by model family. The tree below is the **current transitional layout**; the
+target layout removes the `core/` aggregation, moves each family to
+`engine/model/<family>/`, and adds `formats/`, `model_source/` and
+`components/io/`. That end state is defined in
+[docs/refactor.md](../../docs/refactor.md) and sequenced in
+[docs/plan.md](../../docs/plan.md); nothing here claims the new execution chain
+has landed.
 
 - `core/` — canonical model graph, request/value contracts, policies, and
   generated tables; temporary old-artifact name adapters live in
-  `core/compat/`;
+  `core/compat/`. This is a transitional aggregation target (`mfq-core`), not a
+  target module: its responsibilities are reassigned in
+  [docs/refactor.md](../../docs/refactor.md) and removed by K1–K4 in
+  [docs/plan.md](../../docs/plan.md);
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
@@ -41,8 +50,10 @@ polymorphic boundary. Python owns runtime process lifecycle and the public
 server API.
 
 The mandatory ownership and canonicalization rules are defined in the
-workspace [runtime architecture](../../docs/architecture.md) and repository
-[development rules](../CONTRIBUTING.md). In particular, reusable
+workspace [runtime architecture](../../docs/architecture.md) (current state) and
+repository [development rules](../CONTRIBUTING.md); the target architecture is
+[docs/refactor.md](../../docs/refactor.md) and known defects are
+[docs/bugs.md](../../docs/bugs.md). In particular, reusable
 state machines, cache lifecycle, sampling, dispatch, metrics, multimodal
 pipelines, and MTP orchestration must never live in a model-architecture
 directory.
@@ -95,7 +106,7 @@ with complete prefill/decode quanta and ordered token results. This includes
 sampling state, metadata, Graph planning/storage and execution metrics. Family
 native state stays in `models/<family>/`; scoped Qwen35 bindings own KV/recurrent
 packing and global cache-position restoration, not a shared StateAdapter protocol.
-Paged allocation, chunks and page tables live in `storage/kv/batch_paged.h`,
+Paged allocation, chunks and page tables live in `storage/state/batch_paged.h`,
 which accepts native geometry rather than a model. Model Ops associate native
 request/storage types; only Engine composition enables supported batch execution.
 Production batching is currently bound only to Qwen35. A synthetic dense CUDA
@@ -108,7 +119,8 @@ CUDA load settings stay in `engine/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model
 users include their actual family headers directly; there is no include-only
 model registry or CUDA MXFP4 blob forwarding header.
-Metal integration and duplex control remain pending;
+Metal integration and duplex control remain pending
+([docs/bugs.md](../../docs/bugs.md) B26 and B28);
 multi-device and non-Qwen3.5 real-weight validation are also incomplete.
 Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.
@@ -116,11 +128,19 @@ Qwen3.8-Flash-Next uses `qwen4_exp`.
 `CMakeLists.txt` is the single entry point. CUDA executables are `mfq-runtime`,
 `mfq-diagnostics` and `mfq-eval`; Metal executables are `mfq-decode-metal` and
 `mfq-perplexity`. CLI implementations compile into their executables, not the
-CUDA backend library. `mfq-cuda-runtime` exports the Engine construction API
+CUDA backend library. `mfq build` requests only the current backend's inference
+target (`mfq-runtime` on CUDA); the CUDA tools above are built explicitly with
+`--target`, see [optional native tools](../docs/cli/build.md#optional-native-tools). `mfq-cuda-runtime` exports the Engine construction API
 and has no transport dependency. With `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`,
 the backend, prefix cache, tokenizer, diagnostics and evaluation still build;
-communication modules and `mfq-runtime` are omitted. The optional serving
-application `mfq-runtime-torch` requires communication to be enabled.
+communication modules and `mfq-runtime` are omitted. `MFQ_BUILD_CUDA_RUNTIME`
+defaults to ON on non-Apple platforms and to OFF on Apple platforms (ON with
+Apple is a configure error). Setting it to OFF omits the CUDA backend entirely:
+the CUDA language, toolkit lookup, device tests and CUDA executables are not
+configured, so the common engine and its CPU tests still configure, build and run
+without invoking a CUDA compiler or linking a CUDA library. The
+optional serving application `mfq-runtime-torch` requires communication to be
+enabled.
 
 The established Metal build output directory remains unchanged. Integrated upstream-derived
 code retains its original licensing as documented in the repository `NOTICE`

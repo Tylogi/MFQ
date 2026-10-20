@@ -21,6 +21,8 @@ public:
 private:
     friend class GraphRegistry;
     CapturedGraph(void* stream, const std::function<void()>& body);
+    explicit CapturedGraph(void* stream);
+    void finish();
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -35,6 +37,8 @@ public:
     std::size_t size() const { return graphs_.size(); }
     std::size_t captures() const { return captures_; }
     void clear() { graphs_.clear(); }
+    void begin(std::uint64_t identity, int tokens);
+    void end(std::uint64_t identity, int tokens);
 private:
     void* stream_;
     std::map<std::pair<std::uint64_t, int>, CapturedGraph> graphs_;

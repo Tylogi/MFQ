@@ -1,7 +1,7 @@
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_tensor.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "runtime/mlx_tensor.h"
 
 #include <algorithm>
 #include <chrono>

@@ -1,7 +1,7 @@
 #include "mlx_deepseek_v41_vision.h"
 
-#include "mlx_multimodal.h"
-#include "mlx_tensor.h"
+#include "runtime/mlx_multimodal.h"
+#include "runtime/mlx_tensor.h"
 
 #include <algorithm>
 #include <stdexcept>

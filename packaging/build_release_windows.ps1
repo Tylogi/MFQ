@@ -1,4 +1,4 @@
-# Build the Windows x64 MFQ Studio serve-only NSIS installer and CUDA sidecar.
+# Build the Windows x64 MFQ Studio installer, single-file app, and CUDA sidecar.
 #
 # The release Python environment is isolated from development environments. It
 # contains only the base dependencies needed by `mfq serve`; training,
@@ -13,7 +13,9 @@ param(
     [string] $ReleaseVenv = $env:MFQ_RELEASE_VENV,
     [string] $OutputDirectory = $env:MFQ_RELEASE_OUTPUT_DIR,
     [string] $CudaArchitectures = $env:MFQ_RELEASE_CUDA_ARCHITECTURES,
-    [int] $Jobs = 0
+    [int] $Jobs = 0,
+    [switch] $PortableOnly,
+    [switch] $Clean
 )
 
 Set-StrictMode -Version Latest
@@ -222,10 +224,10 @@ function Get-ReleaseJobs {
 function New-BuildContext {
     param(
         [Parameter(Mandatory)][string] $Venv,
-        [Parameter(Mandatory)][string] $Output
+        [Parameter(Mandatory)][string] $Output,
+        [string] $ScriptDirectory = $PSScriptRoot
     )
 
-    $scriptDirectory = $PSScriptRoot
     $projectDirectory = [System.IO.Path]::GetFullPath((Join-Path $scriptDirectory ".."))
     $resourceDirectory = Join-Path $scriptDirectory "Resources"
     $sidecarDirectory = Join-Path $scriptDirectory "sidecars"
@@ -234,6 +236,7 @@ function New-BuildContext {
 
     return @{
         ScriptDirectory = $scriptDirectory
+        PathChecker = Join-Path $scriptDirectory "check_release_paths.py"
         ProjectDirectory = $projectDirectory
         StudioDirectory = Join-Path $projectDirectory "MFQStudio"
         PyInstallerBuildDirectory = Join-Path $scriptDirectory "build\pyinstaller"
@@ -277,7 +280,95 @@ function Initialize-BuildEnvironment {
     $Context.Tools.Npm = Require-Command "npm.cmd"
     $null = Require-Command "cl"
     $null = Require-Command "nvcc"
-    $null = Require-Command "makensis"
+    # Tauri downloads its pinned NSIS toolset when no local installation exists.
+    Initialize-ReleasePathMapping $Context
+}
+
+function Get-ReleasePathMappings {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $mappings = @(
+        [pscustomobject]@{ Source = $Context.ProjectDirectory; Destination = "/mfq-src" }
+        [pscustomobject]@{ Source = $env:USERPROFILE; Destination = "/mfq-build/home" }
+    )
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        $mappings += [pscustomobject]@{
+            Source = Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
+            Destination = "/mfq-build/target"
+        }
+    }
+    if (-not ('MfqRelease.BuildPaths' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+namespace MfqRelease {
+    public static class BuildPaths {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        public static extern uint GetShortPathName(string path, StringBuilder output, uint size);
+    }
+}
+'@
+    }
+    foreach ($mapping in $mappings) {
+        $mapping
+        # Native dependency generators can use Windows 8.3 path aliases.
+        $shortPath = [System.Text.StringBuilder]::new(32768)
+        $length = [MfqRelease.BuildPaths]::GetShortPathName($mapping.Source, $shortPath, $shortPath.Capacity)
+        if ($length -gt 0 -and $length -lt $shortPath.Capacity -and $shortPath.ToString() -ne $mapping.Source) {
+            [pscustomobject]@{ Source = $shortPath.ToString(); Destination = $mapping.Destination }
+        }
+    }
+}
+
+function Get-ReleaseNativeFlags {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    "/experimental:deterministic"
+    foreach ($mapping in @(Get-ReleasePathMappings $Context)) {
+        foreach ($source in @($mapping.Source, $mapping.Source.Replace('\', '/')) | Select-Object -Unique) {
+            '"/pathmap:' + $source + '=' + $mapping.Destination + '"'
+        }
+    }
+}
+
+function Initialize-ReleasePathMapping {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    # Cargo's encoded form keeps a path containing spaces in a single argument.
+    $separator = [char]31
+    $rustArguments = @()
+    if ($env:CARGO_ENCODED_RUSTFLAGS) {
+        $rustArguments = @($env:CARGO_ENCODED_RUSTFLAGS.Split($separator))
+    } elseif ($env:RUSTFLAGS) {
+        $rustArguments = @($env:RUSTFLAGS -split '\s+' | Where-Object { $_ })
+    }
+    foreach ($mapping in @(Get-ReleasePathMappings $Context)) {
+        foreach ($source in @($mapping.Source, $mapping.Source.Replace('\', '/')) | Select-Object -Unique) {
+            $rustArguments += "--remap-path-prefix=$source=$($mapping.Destination)"
+        }
+    }
+    $rustArguments += @("-C", "link-arg=/PDBALTPATH:mfq-studio.pdb")
+    $env:CARGO_ENCODED_RUSTFLAGS = $rustArguments -join $separator
+    # Native dependencies built by Rust also expand __FILE__.
+    $nativeFlags = @(Get-ReleaseNativeFlags $Context) -join ' '
+    $env:CFLAGS = "$env:CFLAGS $nativeFlags".Trim()
+    $env:CXXFLAGS = "$env:CXXFLAGS $nativeFlags".Trim()
+    $env:CC_SHELL_ESCAPED_FLAGS = "1"
+}
+
+function Assert-ReleasePaths {
+    param(
+        [Parameter(Mandatory)][hashtable] $Context,
+        [Parameter(Mandatory)][string[]] $Paths,
+        [switch] $PythonArchive
+    )
+
+    $arguments = @($Context.PathChecker) + $Paths
+    foreach ($mapping in @(Get-ReleasePathMappings $Context)) {
+        $arguments += @("--private-prefix", $mapping.Source)
+    }
+    if ($PythonArchive) { $arguments += @("--python-cli", $Context.CliArtifact) }
+    Invoke-Checked $Context.Python $arguments
 }
 
 function Initialize-ReleaseDirectories {
@@ -292,6 +383,11 @@ function Initialize-ReleaseDirectories {
         $Context.OutputDirectory
     )
     New-Item -ItemType Directory -Force -Path $directories | Out-Null
+    $temporaryDirectory = Join-Path $Context.ScriptDirectory "build\tmp"
+    New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
+    $env:TEMP = $temporaryDirectory
+    $env:TMP = $temporaryDirectory
+    $env:PYINSTALLER_CONFIG_DIR = Join-Path $Context.ScriptDirectory "build\pyinstaller-cache"
 }
 
 function Stage-LicenseNotices {
@@ -310,19 +406,41 @@ function Stage-LicenseNotices {
         }
 }
 
+function Assert-ReleaseEnvironmentAvailable {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $python = Join-Path $Context.VenvDirectory "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        return
+    }
+    $handle = $null
+    try {
+        $handle = [System.IO.File]::Open(
+            $python, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    }
+    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+        Fail "release Python environment is in use or not writable; choose an unused -ReleaseVenv: $($Context.VenvDirectory)"
+    }
+    finally {
+        if ($null -ne $handle) { $handle.Dispose() }
+    }
+}
+
 function Initialize-PythonEnvironment {
     param(
         [Parameter(Mandatory)][hashtable] $Context,
         [Parameter(Mandatory)][string] $Version
     )
 
+    Assert-ReleaseEnvironmentAvailable $Context
     Invoke-Checked $Context.Tools.Uv @("venv", "--clear", "--python", $Version, $Context.VenvDirectory)
     $env:VIRTUAL_ENV = $Context.VenvDirectory
     Add-ToPath (Join-Path $Context.VenvDirectory "Scripts")
 
     $syncArguments = @(
         "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
-        "--group", "release"
+        "--group", "release", "--extra", "benchmark"
     )
     Invoke-Checked $Context.Tools.Uv $syncArguments
 
@@ -346,11 +464,16 @@ function Build-NativeSidecar {
     # mfq-runtime uses the native tensor backend and must remain independent of
     # Python and LibTorch. Explicitly disable the optional A/B reference target
     # so a reused CMake cache cannot pull those dependencies back into a release.
+    $nativeFlags = @(Get-ReleaseNativeFlags $Context)
+    $cudaFlags = ($nativeFlags | ForEach-Object { "--compiler-options=$_" }) -join ' '
     Invoke-Checked $Context.Tools.CMake @(
         "-S", (Join-Path $Context.ProjectDirectory "csrc"),
         "-B", $Context.NativeBuildDirectory,
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_C_FLAGS=$env:CFLAGS",
+        "-DCMAKE_CXX_FLAGS=$env:CXXFLAGS",
+        "-DCMAKE_CUDA_FLAGS=$env:CUDAFLAGS $cudaFlags",
         "-DCMAKE_CUDA_COMPILER=$([System.IO.Path]::Combine($Context.CudaRoot, 'bin', 'nvcc.exe'))",
         "-DCMAKE_CUDA_ARCHITECTURES=$Architectures",
         "-DMFQ_CUDA_ARCHITECTURES=$Architectures",
@@ -415,11 +538,12 @@ function Build-PythonCli {
     )
     foreach ($package in @(
             "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
-            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets", "pyarrow")) {
+            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets", "pyarrow",
+            "pandas", "sympy", "regex", "loguru", "antlr4", "yaml", "tokenizers")) {
         $arguments += @("--collect-all", $package)
     }
     foreach ($module in @(
-            "torch", "transformers", "tokenizers", "safetensors",
+            "torch", "transformers", "safetensors",
             "scipy", "tiktoken",
             "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",
@@ -461,6 +585,12 @@ function Remove-PyInstallerCache {
 function Build-NsisInstaller {
     param([Parameter(Mandatory)][hashtable] $Context)
 
+    $cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $Context.StudioDirectory "src-tauri\target"
+    } else {
+        Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
+    }
+    $releaseDirectory = Join-Path $cargoTargetDirectory "$($Context.TargetTriple)\release"
     Push-Location $Context.StudioDirectory
     try {
         Invoke-Checked $Context.Tools.Npm @("ci")
@@ -470,6 +600,17 @@ function Build-NsisInstaller {
             "run", "tauri", "--", "build",
             "--config", "src-tauri/tauri.release-windows.conf.json",
             "--target", $Context.TargetTriple,
+            "--no-bundle"
+        )
+        Assert-ReleasePaths $Context @(
+            (Join-Path $releaseDirectory "mfq-studio.exe"),
+            $Context.SidecarDirectory, $Context.ResourceDirectory,
+            $Context.WindowsRuntimeDirectory, (Join-Path $Context.StudioDirectory "dist")
+        ) -PythonArchive
+        Invoke-Checked $Context.Tools.Npm @(
+            "run", "tauri", "--", "bundle",
+            "--config", "src-tauri/tauri.release-windows.conf.json",
+            "--target", $Context.TargetTriple,
             "--bundles", "nsis"
         )
     }
@@ -477,8 +618,8 @@ function Build-NsisInstaller {
         Pop-Location
     }
 
-    $nsisDirectory = Join-Path $Context.StudioDirectory `
-        "src-tauri\target\$($Context.TargetTriple)\release\bundle\nsis"
+    $nsisDirectory = Join-Path $cargoTargetDirectory `
+        "$($Context.TargetTriple)\release\bundle\nsis"
     $installer = Get-ChildItem -LiteralPath $nsisDirectory -File -Filter "*.exe" `
         -ErrorAction SilentlyContinue |
         Sort-Object -Property LastWriteTimeUtc -Descending |
@@ -488,23 +629,55 @@ function Build-NsisInstaller {
     }
 
     $releaseInstaller = Join-Path $Context.OutputDirectory $installer.Name
+    Assert-ReleasePaths $Context @($installer.FullName)
     Copy-Item -LiteralPath $installer.FullName -Destination $releaseInstaller -Force
     Write-Host "copied $releaseInstaller"
+}
+
+function Build-PortableArchive {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $Context.StudioDirectory "src-tauri\target"
+    } else {
+        Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
+    }
+    $executable = Join-Path $cargoTargetDirectory "$($Context.TargetTriple)\release\mfq-studio.exe"
+    $makensis = Join-Path $cargoTargetDirectory ".tauri\NSIS\makensis.exe"
+    if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+        $makensis = Require-Command "makensis"
+    }
+    Assert-ReleasePaths $Context @(
+        $executable, $Context.SidecarDirectory, $Context.ResourceDirectory,
+        $Context.WindowsRuntimeDirectory, (Join-Path $Context.StudioDirectory "dist")
+    ) -PythonArchive
+    Invoke-Checked $Context.Python @(
+        (Join-Path $Context.ScriptDirectory "build_portable_windows.py"),
+        "--studio-executable", $executable,
+        "--output-directory", $Context.OutputDirectory,
+        "--makensis", $makensis
+    )
 }
 
 if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOperatingSystem) {
     Fail "this release target must be built on 64-bit Windows"
 }
 
-foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
-    $path = Join-Path $PSScriptRoot $name
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Recurse -Force
+if ($Clean -and $PortableOnly) {
+    Fail "-PortableOnly reuses the existing build and cannot be combined with -Clean"
+}
+
+if ($Clean) {
+    foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
+        $path = Join-Path $PSScriptRoot $name
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force
+        }
     }
 }
 
 $PythonVersion = if ([string]::IsNullOrWhiteSpace($PythonVersion)) { "3.12" } else { $PythonVersion }
-$CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "86" } else { $CudaArchitectures }
+$CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "80-real;86-real;89" } else { $CudaArchitectures }
 $Jobs = Get-ReleaseJobs $Jobs
 
 $venvDirectory = if ([string]::IsNullOrWhiteSpace($ReleaseVenv)) {
@@ -519,6 +692,11 @@ $releaseOutputDirectory = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 }
 
 $context = New-BuildContext $venvDirectory $releaseOutputDirectory
+if ($PortableOnly) {
+    $context.Python = Join-Path $context.VenvDirectory "Scripts\python.exe"
+    Build-PortableArchive $context
+    exit 0
+}
 Initialize-BuildEnvironment $context
 Initialize-ReleaseDirectories $context
 Stage-LicenseNotices $context
@@ -531,6 +709,7 @@ try {
     Build-PythonCli $context
     Remove-PyInstallerCache $context
     Build-NsisInstaller $context
+    Build-PortableArchive $context
 }
 finally {
     Pop-Location

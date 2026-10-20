@@ -7,9 +7,9 @@
 #include "mlx_deepseek_v41_mhc.h"
 #include "mlx_deepseek_v41_moe.h"
 #include "mlx_deepseek_v41_vision.h"
-#include "mlx_sampling.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_sampling.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
 
 #include "mfq/token_constraint.h"
 
@@ -69,7 +69,19 @@ public:
         MlxDeepseekV41LayerState& state,
         MlxDeepseekV41SharedAttentionState& shared_attention,
         int pos0,
-        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) const;
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
+        bool ced_replay = false,
+        MlxMfeCachedRoute* deferred_route = nullptr) const;
+
+    void append_ced_encoder_context(
+        const mlx::core::array& hidden,
+        const mlx::core::array& previous_pre,
+        MlxDeepseekV41LayerState& state,
+        int pos0) const;
+
+    std::optional<MlxMfeCachedRoute> cached_route() const {
+        return engram_ ? std::nullopt : moe_.cached_route();
+    }
 
     std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const {
@@ -96,9 +108,18 @@ public:
     int index() const noexcept { return index_; }
     bool has_engram() const noexcept { return engram_ != nullptr; }
     void prefetch_engram(DeepseekV41EngramHashBatch& hashes) const;
-    std::optional<MlxMxfp8RowStoreStats> engram_ssd_stats() const;
+    std::optional<MlxQuantizedRowStoreStats> engram_ssd_stats() const;
     int recommended_prefill_chunk_size() const noexcept {
         return moe_.recommended_prefill_chunk_size();
+    }
+    std::size_t resident_routed_bytes() const noexcept {
+        return moe_.resident_routed_bytes();
+    }
+    void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const {
+        moe_.validate_offload(cache);
+    }
+    void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) {
+        moe_.use_offload(cache);
     }
 
 private:
@@ -141,7 +162,8 @@ public:
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
         std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
         std::optional<MlxDeepseekV41Vision> vision = std::nullopt,
-        std::optional<MlxDeepseekV41DSpark> dspark = std::nullopt);
+        std::optional<MlxDeepseekV41DSpark> dspark = std::nullopt,
+        std::shared_ptr<MfqContainer> source = nullptr);
 
     // Accept [tokens] or [batch,tokens]. use_cache=false resets the native
     // cache first and, like the other MFQ runtimes, leaves it ready to decode.
@@ -198,8 +220,13 @@ public:
     bool supports_mtp() const noexcept { return dspark_.has_value(); }
     int preferred_prefill_chunk_size(int portable_default) const noexcept;
     std::size_t expert_cache_limit_bytes() const noexcept;
+    std::size_t set_expert_cache_limit(std::size_t bytes);
+    std::size_t reclaimable_expert_bytes() const noexcept;
+    std::size_t resident_full_expert_bytes() const noexcept;
+    std::size_t dynamic_weight_bytes() const noexcept;
+    std::size_t ssd_expert_payload_bytes() const noexcept;
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
-    std::optional<MlxMxfp8RowStoreStats> engram_ssd_stats() const;
+    std::optional<MlxQuantizedRowStoreStats> engram_ssd_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
@@ -220,7 +247,11 @@ private:
         const std::optional<mlx::core::array>& input_embeddings = std::nullopt,
         mlx::core::array* dspark_hidden = nullptr,
         bool update_dspark = true,
-        bool skip_lm_head = false);
+        bool skip_lm_head = false,
+        bool ced_prefill = false,
+        bool defer_ced_decoder = false);
+    bool supports_ced_prefill() const noexcept;
+    void update_expert_prefill_priority();
     void begin_speculative_target(
         const mlx::core::array& token_ids,
         int confirmed_tokens);
@@ -247,6 +278,7 @@ private:
     MlxDeepseekV41EngramHashState engram_hash_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
+    std::shared_ptr<MfqContainer> source_;
     std::optional<MlxDeepseekV41Vision> vision_;
     std::optional<MlxDeepseekV41DSpark> dspark_;
     std::optional<MlxDeepseekV41DSparkState> dspark_state_;
@@ -261,6 +293,7 @@ private:
     std::optional<mlx::core::array> speculative_token_ids_;
     int speculative_cache_start_ = -1;
     bool mtp_context_requested_ = false;
+    bool ced_prefill_active_ = false;
     MlxMtpGenerationStats last_mtp_stats_;
 };
 

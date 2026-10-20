@@ -1,6 +1,6 @@
 #include "mlx_tensor.h"
 #include "mlx_kernel_prepare.h"
-#include "mlx_moe_ops.h"
+#include "ops/mlx_moe_ops.h"
 #include "mlx_reference.h"
 #include "mlx_transformer.h"
 #include "mlx_weight_residency.h"
@@ -521,7 +521,8 @@ MlxLinear MlxLinear::load(
         if (mlx_predequantize_fp16_enabled()) {
             result.materialize_fp16();
         }
-        if (auto* preparation = MlxKernelPreparation::current(); preparation && result.packed()) {
+        if (auto* preparation = MlxKernelPreparation::current();
+            preparation && !preparation->model_paths() && result.packed()) {
             preparation->collect([&] {
                 for (const auto rows : preparation->row_buckets()) {
                     for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {
@@ -1081,7 +1082,7 @@ struct MlxProjectionBatch::Impl {
 MlxProjectionBatch::MlxProjectionBatch(
     std::vector<const MlxLinear*> linears)
     : impl_(std::make_shared<Impl>(std::move(linears))) {
-    if (auto* preparation = MlxKernelPreparation::current()) {
+    if (auto* preparation = MlxKernelPreparation::current(); preparation && !preparation->model_paths()) {
         preparation->collect([&] {
             for (const auto rows : preparation->row_buckets()) {
                 for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {

@@ -49,6 +49,24 @@ function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '
 describe('StudioShell 持久运行时告警', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it('shows explicit connection confirmation instead of a perpetual loading page for CLI servers', () => {
+    const connect = vi.fn();
+    renderShell({ ready: false, studio: { config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null, connection: 'confirmation_required' },
+      connectExistingServer: connect }, '/');
+    expect(screen.getByRole('heading', { name: '检测到独立运行的服务' })).toBeInTheDocument();
+    expect(screen.queryByText('Overview content')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '连接已有服务' }));
+    expect(connect).toHaveBeenCalledOnce();
+  });
+
+  it('explains an incompatible backend without offering to attach or killing it', () => {
+    renderShell({ ready: false, studio: { config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null, connection: 'incompatible' } }, '/');
+    expect(screen.getByRole('heading', { name: '已有服务与当前 App 不兼容' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '连接已有服务' })).not.toBeInTheDocument();
+  });
+
   it('resets server-owned forms on connection change but preserves them during ordinary refreshes', () => {
     const mounted = vi.fn();
     const disposed = vi.fn();

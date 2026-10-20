@@ -1,14 +1,6 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
 find_package(Threads REQUIRED)
-add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h
-    moe/cpu_expert_pool.cpp include/mfq/moe/cpu_expert_pool.h)
-target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
-target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
-set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
-add_library(mfq::host-parallel ALIAS mfq-host-parallel)
-
 add_library(mfq-model-graph STATIC
     grid_vision.cpp
     grid_vision.h
@@ -62,14 +54,12 @@ target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)
+if(MSVC)
+    target_compile_options(mfq-model-source PRIVATE /EHsc)
+endif()
 set_target_properties(mfq-model-source PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
-
-add_library(mfq-cache-policy STATIC moe/moe_cache_policy.cpp)
-target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_features(mfq-cache-policy PUBLIC cxx_std_17)
-set_target_properties(mfq-cache-policy PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-core INTERFACE)
 add_library(mfq-qsa-kv-store STATIC qsa_kv_store.cpp include/mfq/qsa_kv_store.h)
@@ -88,7 +78,6 @@ target_include_directories(mfq-core INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
 )
 target_link_libraries(mfq-core INTERFACE
-    mfq-cache-policy
     mfq-host-parallel
     mfq-model-graph
     mfq-model-source
@@ -103,6 +92,7 @@ add_library(mfq-paged-prefix-cache STATIC
     mfq_paged_prefix_cache.h
 )
 target_include_directories(mfq-paged-prefix-cache PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(mfq-paged-prefix-cache PUBLIC Threads::Threads)

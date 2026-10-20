@@ -4,7 +4,7 @@
 #include "ops/execution/cuda_execution.h"
 #include "ops/execution/cuda_sampling.h"
 #include "native/tensor/backend.h"
-#include "tensor_parallel.h"
+#include "csrc/core/tensor_parallel.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,11 +28,12 @@ struct Components::State {
 Components::Components(mfq::cuda::MiniCPMO45CausalLm language)
     : state_(std::make_unique<State>(std::move(language))) {}
 
-Components::~Components() = default;
-
-mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
+mfq::cuda::CudaCausalModel& Components::language() noexcept {
     return state_->runtime.language;
 }
+
+Components::~Components() = default;
+
 
 mfq::StepSequence<CudaPreparedPrompt> Components::prepare(
         const std::vector<int64_t>& prompt, const MfqMultimodalInput& vision) {

@@ -1,10 +1,14 @@
 #include "deepseek_v41/config.h"
+#include "deepseek_v41/causal_lm.h"
+#include "deepseek_v41/engram.h"
 
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -108,10 +112,80 @@ void require_rejected(Mutator mutate, const char* message) {
     throw std::runtime_error(message);
 }
 
+void check_retained_engram_history() {
+    using mfq::models::deepseek_v41::EngramHashState;
+    const auto make=[] {return EngramHashState(8,3,2,0,{1},{36},{5,7,11,13},
+        {0,5,12,23},{3,5,7},{0,1,2,3,4,5,6,7});};
+    const auto tokens=[](int batch,int count,int offset) {
+        std::vector<int64_t> result(batch*count);
+        for(int b=0;b<batch;++b)for(int i=0;i<count;++i)result[b*count+i]=(b*3+offset+i)%8;
+        return result;
+    };
+    for(int batch:{1,2})for(int kept=0;kept<=5;++kept) {
+        auto reference=make(),candidate=make();
+        auto prompt=tokens(batch,3,0);
+        const auto prompt_preview=candidate.preview(prompt.data(),batch,3,0);
+        reference.forward(prompt.data(),batch,3,0);
+        require(candidate.forward(prompt.data(),batch,3,0).values==prompt_preview.values,
+                "Engram preview disagreed with fresh prompt hashes");
+        candidate.begin_speculative();
+        auto first=tokens(batch,2,3),second=tokens(batch,3,5);
+        const auto first_preview=candidate.preview(first.data(),batch,2,3);
+        require(candidate.forward(first.data(),batch,2,3).values==first_preview.values,
+                "Engram preview changed a speculative token's hashes");
+        const auto second_preview=candidate.preview(second.data(),batch,3,5);
+        require(candidate.forward(second.data(),batch,3,5).values==second_preview.values,
+                "Engram preview changed multi-forward speculative history");
+        if(kept) {auto accepted=tokens(batch,kept,3);reference.forward(accepted.data(),batch,kept,3);}
+        candidate.rollback_speculative(3+kept);
+        auto next=tokens(batch,2,7);
+        auto alternative=tokens(batch,3,2);
+        candidate.preview(alternative.data(),batch,3,3+kept);
+        const auto preview=candidate.preview(next.data(),batch,2,3+kept);
+        require(candidate.forward(next.data(),batch,2,3+kept).values==preview.values && preview.values==
+                    reference.forward(next.data(),batch,2,3+kept).values,
+                "partial Engram rollback changed batched/multi-forward ngram history");
+    }
+}
+
+void check_dspark_requested_head() {
+    for(int width:{1,2,5})for(int stages:{1,3}) {
+        auto run=[&](int requested) {
+            return mfq::models::deepseek_v41::dspark_draft(width,requested,stages,
+                [](int64_t count) {
+                    std::vector<int> rows(count);
+                    for(int i=0;i<count;++i)rows[i]=i+1;
+                    return rows;
+                },
+                [](const auto& rows){return rows;},
+                [](const auto&){return 1;},
+                [&](std::size_t stage,auto rows,int& pre,int64_t output_rows) {
+                    require(rows.size()==std::size_t(width),"DSpark stage lost physical block rows");
+                    int total=0;for(auto value:rows)total+=value;
+                    for(auto& value:rows)value+=total+int(stage)+pre;
+                    ++pre;rows.resize(output_rows);return rows;
+                },
+                [](auto rows,int pre){for(auto& value:rows)value*=pre;return rows;},
+                [&](auto rows) {
+                    require(rows.size()==std::size_t(requested),"DSpark projected unused vocabulary rows");
+                    for(auto& value:rows)value=value*17+3;
+                    return rows;
+                },
+                [](auto rows,int64_t count){rows.resize(count);return rows;});
+        };
+        const auto full=run(width);
+        for(int requested=1;requested<=width;++requested) {
+            const auto prefix=run(requested);
+            require(std::equal(prefix.begin(),prefix.end(),full.begin()),
+                    "DSpark head pruning changed requested logits");
+        }
+    }
+}
 } // namespace
 
 int main() {
     try {
+        check_retained_engram_history();
         const auto config = Config::from_json(valid_config);
         require(config.causal_encoder_layers == 2, "CED split changed");
         require(config.compress_ratios.size() == 7, "compression schedule changed");
@@ -148,7 +222,8 @@ int main() {
             },
             "unsupported source encoding was accepted");
 
-        std::cout << "DeepSeek-V4.1 common config tests passed\n";
+        check_dspark_requested_head();
+        std::cout << "DeepSeek-V4.1 common config and requested DSpark head tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "DeepSeek-V4.1 common config test failed: "

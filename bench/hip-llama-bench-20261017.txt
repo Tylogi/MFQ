@@ -1,0 +1,72 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 0.8B F16                |   1.44 GiB |   772.85 M | ROCm       |  99 |            pp32 |     1508.65 ± 599.22 |
+| qwen35 0.8B F16                |   1.44 GiB |   772.85 M | ROCm       |  99 |          pp2048 |   19731.67 ± 1014.17 |
+| qwen35 0.8B F16                |   1.44 GiB |   772.85 M | ROCm       |  99 |           tg256 |        406.76 ± 0.89 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 0.8B Q4_K - Medium      | 506.34 MiB |   772.85 M | ROCm       |  99 |            pp32 |    3115.12 ± 1846.87 |
+| qwen35 0.8B Q4_K - Medium      | 506.34 MiB |   772.85 M | ROCm       |  99 |          pp2048 |   27771.68 ± 2478.74 |
+| qwen35 0.8B Q4_K - Medium      | 506.34 MiB |   772.85 M | ROCm       |  99 |           tg256 |        414.38 ± 1.69 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 2B F16                  |   3.62 GiB |     1.94 B | ROCm       |  99 |            pp32 |     1163.18 ± 389.89 |
+| qwen35 2B F16                  |   3.62 GiB |     1.94 B | ROCm       |  99 |          pp2048 |    15495.26 ± 627.30 |
+| qwen35 2B F16                  |   3.62 GiB |     1.94 B | ROCm       |  99 |           tg256 |        290.73 ± 0.61 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 2B Q4_K - Medium        |   1.21 GiB |     1.94 B | ROCm       |  99 |            pp32 |    2758.51 ± 1534.21 |
+| qwen35 2B Q4_K - Medium        |   1.21 GiB |     1.94 B | ROCm       |  99 |          pp2048 |   20635.68 ± 1332.64 |
+| qwen35 2B Q4_K - Medium        |   1.21 GiB |     1.94 B | ROCm       |  99 |           tg256 |        375.61 ± 1.48 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 4B F16                  |   8.06 GiB |     4.33 B | ROCm       |  99 |            pp32 |      635.59 ± 171.68 |
+| qwen35 4B F16                  |   8.06 GiB |     4.33 B | ROCm       |  99 |          pp2048 |     8427.35 ± 275.47 |
+| qwen35 4B F16                  |   8.06 GiB |     4.33 B | ROCm       |  99 |           tg256 |        180.33 ± 0.15 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 4B Q4_K - Medium        |   2.58 GiB |     4.33 B | ROCm       |  99 |            pp32 |    1890.76 ± 1036.92 |
+| qwen35 4B Q4_K - Medium        |   2.58 GiB |     4.33 B | ROCm       |  99 |          pp2048 |    11761.60 ± 744.24 |
+| qwen35 4B Q4_K - Medium        |   2.58 GiB |     4.33 B | ROCm       |  99 |           tg256 |        242.64 ± 0.74 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 9B F16                  |  17.13 GiB |     9.20 B | ROCm       |  99 |            pp32 |      490.26 ± 102.34 |
+| qwen35 9B F16                  |  17.13 GiB |     9.20 B | ROCm       |  99 |          pp2048 |     6582.10 ± 169.61 |
+| qwen35 9B F16                  |  17.13 GiB |     9.20 B | ROCm       |  99 |           tg256 |        122.89 ± 0.12 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 9B Q4_K - Medium        |   5.37 GiB |     9.20 B | ROCm       |  99 |            pp32 |     1681.05 ± 882.54 |
+| qwen35 9B Q4_K - Medium        |   5.37 GiB |     9.20 B | ROCm       |  99 |          pp2048 |     8234.55 ± 426.04 |
+| qwen35 9B Q4_K - Medium        |   5.37 GiB |     9.20 B | ROCm       |  99 |           tg256 |        193.83 ± 0.52 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |            pp32 |       195.46 ± 40.20 |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |          pp2048 |      2522.62 ± 80.59 |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |           tg256 |         40.71 ± 0.01 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |            pp32 |      706.45 ± 382.38 |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |          pp2048 |     2762.59 ± 129.45 |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |           tg256 |         77.08 ± 0.08 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |            pp32 |       195.85 ± 39.32 |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |          pp2048 |      2518.91 ± 81.46 |
+| qwen35 27B F16                 |  50.89 GiB |    27.32 B | ROCm       |  99 |           tg256 |         40.59 ± 0.01 |
+build: f74e2fa (1)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 196288 MiB):
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |            pp32 |      709.31 ± 383.84 |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |          pp2048 |     2761.03 ± 135.16 |
+| qwen35 27B Q4_K - Medium       |  15.65 GiB |    27.32 B | ROCm       |  99 |           tg256 |         76.86 ± 0.13 |
+build: f74e2fa (1)

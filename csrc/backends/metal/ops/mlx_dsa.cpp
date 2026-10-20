@@ -93,6 +93,8 @@ public:
                 ? "mfq_dsa_cache_write_f16"
                 : cache.dtype() == mlx::core::bfloat16
                 ? "mfq_dsa_cache_write_bf16"
+                : cache.dtype() == mlx::core::uint8
+                ? "mfq_dsa_cache_write_u8"
                 : "mfq_dsa_cache_write_f32";
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(
@@ -137,6 +139,9 @@ kernel decltype(mfq_dsa_cache_write<bfloat>)
 template [[host_name("mfq_dsa_cache_write_f32")]]
 kernel decltype(mfq_dsa_cache_write<float>)
     mfq_dsa_cache_write<float>;
+template [[host_name("mfq_dsa_cache_write_u8")]]
+kernel decltype(mfq_dsa_cache_write<uchar>)
+    mfq_dsa_cache_write<uchar>;
 )MFQ_METAL");
             });
         auto* kernel = device.get_kernel(
@@ -186,7 +191,7 @@ constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
 
-#include "../kernels/mfq_sparse_attention_kernels.inc"
+#include "kernels/mfq_sparse_attention_kernels.inc"
 
 Kernel make_kernel(
     const char* name,
@@ -461,9 +466,10 @@ array mlx_cache_write_inplace(
         !cache.flags().row_contiguous ||
         (cache.dtype() != mlx::core::float16 &&
          cache.dtype() != mlx::core::bfloat16 &&
+         cache.dtype() != mlx::core::uint8 &&
          cache.dtype() != mlx::core::float32)) {
         throw std::invalid_argument(
-            "DSA fixed cache must be row-contiguous f16/bf16/f32 [B,C,D]");
+            "DSA fixed cache must be row-contiguous f16/bf16/f32/u8 [B,C,D]");
     }
     auto update_values = typed_contiguous(
         values,

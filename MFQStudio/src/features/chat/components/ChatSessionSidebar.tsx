@@ -2,7 +2,6 @@ import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { useConversationSelector } from '../state/conversationStore';
 import type { ChatPageState } from '../hooks/useChatPageState';
-import { ModelVendorMark } from '../../../app/ModelVendorMark';
 import { useEffect, useRef, useState } from 'react';
 import { CaretRightIcon, XIcon } from '@phosphor-icons/react';
 
@@ -47,7 +46,7 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
         <button
           aria-label={tr('新建会话', 'New chat')}
           className="chat-icon-button"
-          disabled={busy || conversation.transitioning || !conversation.modelAvailable}
+          disabled={blocked}
           onClick={() => void createSession()}
           title={tr('新建会话', 'New chat')}
           type="button"
@@ -78,8 +77,6 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
                 type="button"
               >
                 <strong>{session.title || tr('未命名会话', 'Untitled chat')}</strong>
-                <small>{session.model}</small>
-                <ModelVendorMark name={session.model} size={18} />
               </button>
               <button aria-label={tr(`重命名对话：${session.title || '未命名会话'}`, `Rename chat: ${session.title || 'Untitled chat'}`)}
                 className="chat-session-action-button" disabled={blocked}

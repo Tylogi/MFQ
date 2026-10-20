@@ -69,6 +69,8 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     });
     expect(selection.background).toBe(expected);
     expect(contrast(selection.foreground, selection.background)).toBeGreaterThanOrEqual(4.5);
+    await expect(page.getByRole('switch', { name: 'Vision input', exact: true })).toHaveCount(0);
+    await page.goto('/runtime');
     const vision = page.getByRole('switch', { name: 'Vision input', exact: true });
     await expect(vision).toBeChecked();
     await expect(vision).toHaveCSS('background-color', expected);
@@ -129,12 +131,14 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     expect(await canvas.evaluate((element: HTMLCanvasElement) => {
       const pixels = element.getContext('2d')!.getImageData(0, 0, element.width, element.height).data;
       for (let i = 0; i < pixels.length; i += 4) {
-        if (pixels[i] < pixels[i + 1] || pixels[i + 1] < pixels[i + 2]) return false;
+        if (pixels[i] !== pixels[i + 1] || pixels[i + 1] !== pixels[i + 2]) return false;
       }
       return true;
     })).toBe(true);
     await expect(page.locator('.attention-qsa').first()).toHaveCSS('background-color', expected);
-    await expect(page.locator('.budget-series-moe .budget-line')).toHaveCSS('stroke', expected);
+    await expect(page.locator('.budget-series-ffn .budget-line')).toHaveCSS('stroke', dark ? 'rgb(223, 138, 135)' : 'rgb(189, 85, 85)');
+    await expect(page.locator('.budget-series-attention .budget-line')).toHaveCSS('stroke', dark ? 'rgb(120, 171, 223)' : 'rgb(57, 121, 186)');
+    await expect(page.locator('.budget-series-total .budget-line')).toHaveCSS('stroke', dark ? 'rgb(185, 155, 224)' : 'rgb(134, 96, 176)');
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath(`analysis-${mode}.png`), fullPage: true, animations: 'disabled' });
     expect(errors).toEqual([]);

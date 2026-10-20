@@ -7,12 +7,14 @@ import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
+import { ModelDeleteDialog } from './ModelDeleteDialog';
+import { availableLoadMemory } from './loadMemoryEstimate';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
-    setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles } = catalog;
+    setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
   const [status, setStatus] = useState('all');
   const [architecture, setArchitecture] = useState('all');
   const [format, setFormat] = useState('all');
@@ -25,8 +27,9 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
     .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
-  const available = runtime?.runtime_memory_headroom_bytes;
   const separate = hasSeparateVram(runtime);
+  const available = separate ? runtime?.runtime_memory_headroom_bytes : availableResidentMemory(runtime);
+  const loadMemory = availableLoadMemory(runtime, catalog.loadDeviceIds);
   const system = separate ? { physical_memory_bytes: runtime?.host_memory_total_bytes, memory_pools: [
     { kind: 'vram' as const, capacity_bytes: runtime?.device_memory_total_bytes },
     { kind: 'ram' as const, capacity_bytes: runtime?.host_memory_total_bytes },
@@ -63,6 +66,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
               const loaded = Boolean(instance) || item.name === runtime?.model;
+              const streamsExperts = !loaded && item.loadable && (item.estimated_weight_bytes_by_role?.experts ?? 0) > 0
+                && loadMemory != null && item.estimated_resident_weight_bytes != null && item.estimated_resident_weight_bytes > loadMemory;
               return (
                 <div className="model-row" key={item.id}>
                   <span className={loaded ? 'model-state active'
@@ -79,11 +84,11 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div className="local-checkpoint-memory">
                     {!separate && <small>{tr('剩余可用内存', 'Remaining available memory')} {gib(available)}</small>}
                     <ModelPressureBars weights={item.estimated_resident_weight_bytes} roles={item.estimated_weight_bytes_by_role}
-                      system={system} available={available}
+                      system={system} available={available} combineMoe showDetails={false}
                       label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
                       tr={tr} />
                   </div>
-                  <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} /><button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>{instance ? (
+                  <div className="model-row-controls"><div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} /><button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
@@ -97,10 +102,18 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                           ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid')}
                     </em>
                   ) : (
-                    <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
+                    <button disabled={busy} aria-describedby={streamsExperts ? `expert-streaming-${item.id}` : undefined}
+                      onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}</div>
+                  )}<button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
+                    disabled={busy || loaded} title={loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
+                    onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button></div>
+                    {streamsExperts && <small className="model-streaming-notice" id={`expert-streaming-${item.id}`}>
+                      {tr('剩余内存不足，超出部分专家会被放入 SSD 进行流式加载推理。',
+                        'Insufficient remaining memory. Experts that do not fit will be streamed from SSD during inference.')}
+                    </small>}
+                  </div>
                 </div>
               );
             })}
@@ -120,6 +133,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
           }
         />
       )}
+      <ModelDeleteDialog catalog={catalog} />
     </>
   );
 }

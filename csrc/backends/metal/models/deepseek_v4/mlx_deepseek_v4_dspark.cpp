@@ -1,13 +1,13 @@
 #include "mlx_deepseek_v4_dspark.h"
 
-#include "mlx_detached_copy.h"
+#include "runtime/mlx_detached_copy.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_hc.h"
-#include "mlx_dsa.h"
-#include "mlx_eval_timing.h"
-#include "mlx_sampling.h"
-#include "mlx_sparse_attention.h"
-#include "mlx_transformer.h"
+#include "ops/mlx_dsa.h"
+#include "runtime/mlx_eval_timing.h"
+#include "runtime/mlx_sampling.h"
+#include "ops/mlx_sparse_attention.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <cmath>

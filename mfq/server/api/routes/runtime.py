@@ -170,15 +170,26 @@ async def runtime_listener(request: Request) -> dict[str, Any]:
 
 @router.put("/api/v1/runtime/listener", responses=ERROR_RESPONSES, tags=["runtime"])
 async def configure_runtime_listener(request: Request, body: RuntimeListenerRequest) -> dict[str, Any]:
+    import errno
+    import logging
     from mfq.server.services.service import ServiceError
 
     listener = getattr(request.app.state, "listener", None)
     if listener is None:
         raise ServiceError(409, "listener_not_managed", "server listener is managed externally")
+    status = listener.listener_status()
+    other_port = status.get("port" if body.protocol == "anthropic" else "anthropic_port")
+    if body.port == other_port:
+        raise ServiceError(409, "listener_port_conflict", "OpenAI and Anthropic must use different ports", details={"port": body.port})
     try:
         return await listener.change_port(body.port, body.protocol)
     except OSError as error:
-        raise ServiceError(409, "listener_change_failed", str(error)) from error
+        if error.errno == errno.EADDRINUSE:
+            raise ServiceError(409, "listener_port_in_use", "the requested port is already in use", details={"port": body.port}) from error
+        if error.errno in {errno.EACCES, errno.EPERM}:
+            raise ServiceError(409, "listener_permission_denied", "permission denied for the requested port", details={"port": body.port}) from error
+        logging.getLogger(__name__).warning("Could not update service listener", exc_info=True)
+        raise ServiceError(409, "listener_change_failed", "could not save the port change; the previous port remains active") from error
     except RuntimeError as error:
         raise ServiceError(409, "listener_not_ready", str(error)) from error
 
@@ -306,6 +317,12 @@ async def runtime_status(
     service: ServiceDependency, instance_id: UUID | None = None
 ) -> dict[str, Any]:
     return await service.runtime_status(instance_id)
+
+
+@router.get("/api/v1/runtime/serving", responses=ERROR_RESPONSES, tags=["runtime"])
+async def serving_statistics(service: ServiceDependency,
+    scope: Literal["session", "alltime"] = "session", model: str | None = None) -> dict[str, Any]:
+    return await service.serving_statistics(scope, model)
 
 
 @router.get(

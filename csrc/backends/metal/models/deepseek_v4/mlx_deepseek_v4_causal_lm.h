@@ -7,9 +7,9 @@
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_deepseek_v4_moe.h"
 #include "mlx_deepseek_v4_vision.h"
-#include "mlx_mtp.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,7 +1,7 @@
 #include "mlx_deepseek_v41_moe.h"
 
-#include "mlx_eval_timing.h"
-#include "mlx_moe_ops.h"
+#include "runtime/mlx_eval_timing.h"
+#include "ops/mlx_moe_ops.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -87,7 +87,9 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         (!mfe_offload_cache->can_group_mfe(gate_up_name)
          || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
          || !mfe_offload_cache->can_group_mfe(down_name))) {
-        mfe_offload_cache.reset();
+        throw std::runtime_error(
+            "DeepSeek-V4.1 expert projection cannot be offloaded; "
+            "refusing to bypass the configured cache budget: " + prefix);
     }
     std::optional<MlxMoeWeight> gate_up;
     std::optional<MlxRoutedLinear> gate;
@@ -253,6 +255,8 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         mfe_offload_cache_->activate_record(streamed_gate_up_name_);
         if (streamed_up_name_) mfe_offload_cache_->activate_record(*streamed_up_name_);
         mfe_offload_cache_->activate_record(streamed_down_name_);
+        if (streamed_up_name_) mfe_offload_cache_->prepare_swiglu_pair(
+            streamed_gate_up_name_, *streamed_up_name_, top_k_);
     }
     if (vision_bias_.has_value()) {
         *vision_bias_ = mlx::core::reshape(
@@ -266,6 +270,38 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         std::vector<const MlxLinear*>{
             &shared_gate_, &shared_up_,
         });
+}
+
+std::size_t MlxDeepseekV41Moe::resident_routed_bytes() const noexcept {
+    std::size_t bytes = routed_gate_up_ ? routed_gate_up_->packed_nbytes() : 0;
+    for (const auto* projection : {&routed_gate_, &routed_up_, &routed_down_}) {
+        if (*projection) bytes += (*projection)->weight().packed_nbytes();
+    }
+    return bytes;
+}
+
+void MlxDeepseekV41Moe::validate_offload(
+    const std::shared_ptr<MlxMfeOffloadCache>& cache) const {
+    for (const auto& name : {streamed_gate_up_name_,
+             streamed_up_name_.value_or(streamed_gate_up_name_),
+             streamed_down_name_}) {
+        if (!cache->can_group_mfe(name)) {
+            throw std::runtime_error("expert projection cannot be offloaded: " + name);
+        }
+    }
+}
+
+void MlxDeepseekV41Moe::use_offload(
+    const std::shared_ptr<MlxMfeOffloadCache>& cache) {
+    cache->activate_record(streamed_gate_up_name_);
+    if (streamed_up_name_) cache->activate_record(*streamed_up_name_);
+    cache->activate_record(streamed_down_name_);
+    routed_gate_up_.reset();
+    routed_gate_.reset();
+    routed_up_.reset();
+    routed_down_.reset();
+    ssd_expert_cache_.reset();
+    mfe_offload_cache_ = cache;
 }
 
 int MlxDeepseekV41Moe::recommended_prefill_chunk_size() const noexcept {
@@ -283,6 +319,20 @@ int MlxDeepseekV41Moe::recommended_prefill_chunk_size() const noexcept {
     return gate_up > 0 && down > 0 ? std::min(gate_up, down) : 0;
 }
 
+std::optional<MlxMfeCachedRoute> MlxDeepseekV41Moe::cached_route() const {
+    if (!mfe_offload_cache_) return std::nullopt;
+    MlxMfeCachedRoute route{mfe_offload_cache_, {}, std::nullopt};
+    std::vector<std::string> names{streamed_gate_up_name_};
+    if (streamed_up_name_) names.push_back(*streamed_up_name_);
+    names.push_back(streamed_down_name_);
+    for (const auto& name : names) {
+        auto projection = mfe_offload_cache_->cached_projection(name);
+        if (!projection) return std::nullopt;
+        route.projections.push_back(std::move(projection));
+    }
+    return route;
+}
+
 std::optional<MlxSsdPrefetchedExpertLayer>
 MlxDeepseekV41Moe::prefetch_routed(std::size_t rows) const {
     constexpr std::size_t kFullLayerPrefetchRows = 512;
@@ -296,7 +346,8 @@ MlxDeepseekV41Moe::prefetch_routed(std::size_t rows) const {
 MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
     const array& input,
     const std::optional<array>& image_mask,
-    MlxSsdPrefetchedExpertLayer* prefetched) const {
+    MlxSsdPrefetchedExpertLayer* prefetched,
+    MlxMfeCachedRoute* deferred_route) const {
     if (input.ndim() < 2 || input.shape(-1) != hidden_) {
         throw std::invalid_argument("DeepSeek-V4.1 MoE input shape mismatch");
     }
@@ -381,6 +432,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         routes.weights = mlx::core::where(mask, visual.weights, routes.weights);
     }
 
+    auto shared = shared_down_(shared_hidden);
     array routed(0.0f);
     const bool route_transaction = ssd_expert_cache_ &&
         ssd_expert_cache_->route_transaction_active();
@@ -421,9 +473,25 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             prepared.expert_ids(),
             routes.weights);
     } else if (mfe_offload_cache_) {
+        if (deferred_route) {
+            auto output = deferred_route->forward(source, routes.ids, swiglu_limit_, &routes.weights);
+            return {mlx::core::reshape(std::move(output), input.shape()),
+                mlx::core::reshape(std::move(shared), input.shape())};
+        }
+        if (rows == 1 && !image_mask && !detail::component_profile_active()) {
+            if (auto cached = cached_route()) {
+                auto output = cached->forward(source, routes.ids, swiglu_limit_, &routes.weights);
+                mlx::core::async_eval({output});
+                if (cached->resolve()) {
+                    return {mlx::core::reshape(std::move(output), input.shape()),
+                        mlx::core::reshape(std::move(shared), input.shape())};
+                }
+            }
+        }
         auto global_ids = mlx::core::contiguous(
             mlx::core::astype(routes.ids, mlx::core::int32));
         detail::eval_with_timing(global_ids);
+        if (rows <= 6) mlx::core::async_eval({shared});
         const auto* ids = global_ids.data<std::int32_t>();
         std::vector<std::int32_t> active;
         active.reserve(global_ids.size());
@@ -431,10 +499,10 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             static_cast<std::size_t>(experts_), 0);
         for (std::size_t index = 0; index < global_ids.size(); ++index) {
             const auto expert = ids[index];
-            if (expert < 0) {
+            if (expert == -1) {
                 continue;
             }
-            if (expert >= experts_) {
+            if (expert < -1 || expert >= experts_) {
                 throw std::runtime_error(
                     "DeepSeek-V4.1 routed expert ID is out of range");
             }
@@ -453,31 +521,84 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             global_to_local[static_cast<std::size_t>(active[local]) + 1] =
                 static_cast<std::int32_t>(local);
         }
-        auto local_ids = mlx::core::take(
-            array(
-                global_to_local.begin(),
-                Shape{static_cast<int>(global_to_local.size())}),
-            global_ids + array(1, mlx::core::int32));
+        std::vector<std::int32_t> local_routes(global_ids.size(), -1);
+        for (std::size_t index = 0; index < global_ids.size(); ++index)
+            local_routes[index] = global_to_local[static_cast<std::size_t>(ids[index] + 1)];
+        auto local_ids = array(local_routes.begin(), global_ids.shape(), mlx::core::int32);
+        const auto groups = rows <= 6
+            ? moe_route_groups_host(local_routes, rows, global_ids.shape(1)) : std::nullopt;
+        const auto* route_groups = groups ? &*groups : nullptr;
         std::vector<std::uint32_t> activation_counts;
         for (const auto expert : active) activation_counts.push_back(seen[expert]);
-        auto gate = mfe_offload_cache_->grouped_mfe(
-            streamed_gate_up_name_, active, activation_counts);
+        std::vector<std::string> names{streamed_gate_up_name_};
+        if (streamed_up_name_) names.push_back(*streamed_up_name_);
+        names.push_back(streamed_down_name_);
+        const bool prefill_scan = rows > 6;
+        auto weights = prefill_scan ? mfe_offload_cache_->layer_mfe(names, active)
+            : std::nullopt;
+        const bool layer_ready = weights.has_value();
+        if (weights) {
+            local_ids = global_ids;
+        } else {
+            const auto projections = std::span<const std::string>(names);
+            weights = mfe_offload_cache_->grouped_mfe(projections.first(projections.size() - 1),
+                active, activation_counts, prefill_scan);
+        }
+        const auto& gate = weights->front();
+        const int route_count = static_cast<int>(local_ids.size());
+        std::optional<array> sorted_routes;
+        std::optional<MlxGroupedMmqPlan> gate_plan;
+        if (prefill_scan && rows >= 32 && gate.supports_grouped_mmq() &&
+            (!streamed_up_name_ || weights->at(1).supports_grouped_mmq())) {
+            sorted_routes = mlx::core::contiguous(mlx::core::astype(
+                mlx::core::argsort(mlx::core::reshape(local_ids, Shape{route_count})), mlx::core::int32));
+            gate_plan = gate.build_grouped_mmq_plan(local_ids, *sorted_routes,
+                gate.recommended_grouped_mmq_block_rows(route_count, !streamed_up_name_));
+        }
         array routed_hidden = [&]() {
+            if (sorted_routes) {
+                auto projected = gate.routed_matmul_sorted(source, local_ids, *sorted_routes,
+                    false, !streamed_up_name_, swiglu_limit_, &*gate_plan);
+                if (!streamed_up_name_) return projected;
+                const auto& up = weights->at(1);
+                const int block_rows = up.recommended_grouped_mmq_block_rows(route_count, false);
+                const auto plan = block_rows == gate_plan->block_rows ? *gate_plan
+                    : up.build_grouped_mmq_plan(local_ids, *sorted_routes, block_rows);
+                auto up_projected = up.routed_matmul_sorted(
+                    source, local_ids, *sorted_routes, false, false, 0.0f, &plan);
+                return swiglu_limit_ > 0.0f
+                    ? moe_limited_swiglu_pair(std::move(projected), std::move(up_projected), swiglu_limit_)
+                    : moe_swiglu_pair(std::move(projected), std::move(up_projected));
+            }
             if (streamed_up_name_) {
-                auto up = mfe_offload_cache_->grouped_mfe(
-                    *streamed_up_name_, active, activation_counts);
                 return gate.routed_swiglu_pair(
-                    up, source, local_ids, swiglu_limit_);
+                    weights->at(1), source, local_ids, swiglu_limit_, route_groups);
             }
             return gate.routed_swiglu(
-                source, local_ids, swiglu_limit_);
+                source, local_ids, swiglu_limit_, route_groups);
         }();
-        auto down = mfe_offload_cache_->grouped_mfe(
-            streamed_down_name_, active, activation_counts);
-        routed = down.routed_matmul_reduce(
-            routed_hidden,
-            local_ids,
-            routes.weights);
+        if (!layer_ready) {
+            if (!prefill_scan || sorted_routes) mlx::core::async_eval({routed_hidden});
+            weights->clear();
+            weights->push_back(mfe_offload_cache_->grouped_mfe(
+                streamed_down_name_, active, activation_counts, prefill_scan));
+        }
+        const auto& down = weights->back();
+        if (sorted_routes && down.supports_grouped_mmq()) {
+            const int block_rows = down.recommended_grouped_mmq_block_rows(route_count, false);
+            const auto plan = block_rows == gate_plan->block_rows ? *gate_plan
+                : down.build_grouped_mmq_plan(local_ids, *sorted_routes, block_rows);
+            auto sorted_output = down.routed_matmul_sorted(routed_hidden, local_ids,
+                *sorted_routes, true, false, 0.0f, &plan);
+            routed = moe_weighted_reduce(mlx::core::reshape(
+                moe_restore_routed_rows(sorted_output, *sorted_routes, local_ids),
+                Shape{rows, top_k_, hidden_}), routes.weights);
+        } else {
+            if (sorted_routes) routed_hidden = mlx::core::reshape(
+                moe_restore_routed_rows(routed_hidden, *sorted_routes, local_ids),
+                Shape{rows, top_k_, intermediate_});
+            routed = down.routed_matmul_reduce(routed_hidden, local_ids, routes.weights, route_groups);
+        }
     } else {
         auto routed_hidden = routed_gate_up_
             ? routed_gate_up_->routed_swiglu(
@@ -492,7 +613,6 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             routes.ids,
             routes.weights);
     }
-    auto shared = shared_down_(shared_hidden);
     return {
         mlx::core::reshape(std::move(routed), input.shape()),
         mlx::core::reshape(std::move(shared), input.shape()),

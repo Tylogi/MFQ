@@ -27,7 +27,7 @@ class SqWireTest(unittest.TestCase):
         self.assertIn("-std=c++20", kwargs["extra_cuda_cflags"])
 
     def test_frozen_palette_parity(self):
-        source = (ROOT / "csrc/backends/cuda/kernels/quant/mxfp4_sq.cu").read_text()
+        source = (ROOT / "csrc/backends/cuda/kernels/quant/mxfp4_sq_impl.cuh").read_text()
         for bits in (1, 2, 3):
             match = re.search(rf"kSq{bits}Palette\[\d+\]\s*=\s*\{{(.*?)\}};", source, re.S)
             self.assertIsNotNone(match)

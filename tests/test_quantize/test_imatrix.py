@@ -161,6 +161,45 @@ def test_expert_imatrix_selects_weights_by_flattened_row(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize("original_shape", ((4, 3, 2), (4, 2, 3)))
+def test_single_count_3d_imatrix_selects_matrix_major_input_vectors(
+    tmp_path: Path, original_shape: tuple[int, int, int]
+):
+    matrices, rows_per_matrix, width = original_shape
+    values = np.arange(1, matrices * width + 1, dtype=np.float32).reshape(1, -1)
+    matrix = ImportanceMatrix(
+        path=tmp_path / "unused.gguf",
+        entries={
+            "blk.0.attn_k_b.weight": ImportanceEntry(
+                values=values,
+                counts=np.asarray([17], dtype=np.int64),
+            )
+        },
+        datasets=(),
+        chunk_count=0,
+        chunk_size=0,
+        legacy=False,
+    )
+    storage_shape = (matrices * rows_per_matrix, width)
+    selected_rows = np.asarray(
+        [0, rows_per_matrix - 1, rows_per_matrix, (matrices - 1) * rows_per_matrix,
+         matrices * rows_per_matrix - 1],
+        dtype=np.int64,
+    )
+    expected = values[0].reshape(matrices, width)[selected_rows // rows_per_matrix]
+
+    name, input_vectors = matrix.input_for_rows(
+        ("blk.0.attn_k_b.weight",), original_shape, storage_shape, selected_rows
+    )
+    weighted_name, weighted = matrix.for_rows(
+        ("blk.0.attn_k_b.weight",), original_shape, storage_shape, selected_rows
+    )
+
+    assert name == weighted_name == "blk.0.attn_k_b.weight"
+    np.testing.assert_array_equal(input_vectors, expected)
+    np.testing.assert_array_equal(weighted, expected)
+
+
 def test_legacy_dense_imatrix_selects_one_importance_vector_per_weight_row(tmp_path: Path):
     values = np.arange(1, 13, dtype=np.float32).reshape(4, 3)
     matrix = ImportanceMatrix(

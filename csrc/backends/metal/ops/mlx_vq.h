@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_staging_allocator.h"
 
 namespace mfq::metal {
 
@@ -63,6 +63,7 @@ struct ParsedVqStorage {
     std::span<const std::uint8_t> borrowed_indices;
     std::span<const std::uint8_t> borrowed_state;
     std::span<const std::uint8_t> borrowed_auxiliary;
+    std::span<const std::int8_t> borrowed_codebooks;
 };
 
 ParsedVqStorage parse_vq_blob(std::string_view dtype,

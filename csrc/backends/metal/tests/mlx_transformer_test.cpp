@@ -1,5 +1,5 @@
-#include "mlx_transformer.h"
-#include "mlx_resident_budget.h"
+#include "runtime/mlx_transformer.h"
+#include "runtime/mlx_resident_budget.h"
 
 #include <algorithm>
 #include <cmath>

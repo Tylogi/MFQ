@@ -4,8 +4,11 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
+from contextlib import suppress
+from copy import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import uvicorn
 
@@ -21,12 +24,29 @@ def saved_service_port(path: Path, protocol: str = "openai") -> int:
 
 
 class RuntimeServer(uvicorn.Server):
-    def __init__(self, config: uvicorn.Config, settings_path: Path | None = None, *, anthropic_port: int | None = None) -> None:
+    def __init__(self, config: uvicorn.Config, settings_path: Path | None = None, *, anthropic_port: int | None = None,
+        parent_input: BinaryIO | None = None) -> None:
         super().__init__(config)
         self.settings_path = settings_path
         self.anthropic_port = anthropic_port
+        self.parent_input = parent_input
         self._listen_lock = asyncio.Lock()
         config.app.state.listener = self
+
+    def _watch_parent_input(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        def wait_for_parent() -> None:
+            try:
+                while self.parent_input.read(4096):
+                    pass
+            except (OSError, ValueError):
+                pass
+            finally:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(setattr, self, "should_exit", True)
+
+        threading.Thread(target=wait_for_parent, name="mfq-studio-lifetime", daemon=True).start()
 
     def listener_status(self) -> dict[str, Any]:
         return {"host": self.config.host, "port": self.config.port, "anthropic_port": self.anthropic_port, "configurable": self.started}
@@ -41,23 +61,35 @@ class RuntimeServer(uvicorn.Server):
         )
 
     async def startup(self, sockets=None) -> None:
-        await super().startup(sockets)
-        self.started = False
+        owned_sockets = []
+        listeners = list(sockets) if sockets is not None else []
+        try:
+            if sockets is None:
+                listener = self.config.bind_socket()
+                owned_sockets.append(listener)
+                listener.listen(self.config.backlog)
+                listeners.append(listener)
+            if self.anthropic_port is not None:
+                config = copy(self.config)
+                config.port = self.anthropic_port
+                config.fd = config.uds = None
+                listener = config.bind_socket()
+                owned_sockets.append(listener)
+                listener.listen(config.backlog)
+                listeners.append(listener)
+            await super().startup(listeners)
+            if self.should_exit:
+                raise SystemExit(3)
+        except BaseException:
+            for listener in owned_sockets:
+                listener.close()
+            raise
         if self.config.port == 0 and self.servers[0].sockets:
             self.config.port = self.servers[0].sockets[0].getsockname()[1]
-        try:
-            if self.anthropic_port is not None:
-                listener = await self._new_listener(self.anthropic_port)
-                self.servers.append(listener)
-                await listener.start_serving()
-                self.anthropic_port = listener.sockets[0].getsockname()[1]
-        except BaseException:
-            for listener in self.servers:
-                listener.close()
-                await listener.wait_closed()
-            await self.lifespan.shutdown()
-            raise
-        self.started = True
+        if self.anthropic_port is not None and self.servers[-1].sockets:
+            self.anthropic_port = self.servers[-1].sockets[0].getsockname()[1]
+        if self.parent_input is not None:
+            self._watch_parent_input()
 
     def _save_port(self, port: int, anthropic_port: int | None) -> None:
         if self.settings_path is None:

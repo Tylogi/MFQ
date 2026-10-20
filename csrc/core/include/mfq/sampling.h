@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 
 #include <cstddef>
 #include <cstdint>

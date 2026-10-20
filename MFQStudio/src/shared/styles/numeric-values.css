@@ -1,0 +1,11 @@
+@font-face {
+  font-family: "MFQ Small Numerals";
+  src: local("SFMono-Regular"), local(".SFNSMono-Regular"), local("Menlo-Regular"), local("Menlo"), local("Consolas"), local("DejaVu Sans Mono"), local("Liberation Mono");
+  font-weight: 100 500;
+  font-display: swap;
+  unicode-range: U+0030-0039, U+FF10-FF19;
+}
+
+.service-view, .model-download-page {
+  --small-numerals-font: "MFQ Small Numerals", var(--text-font);
+}

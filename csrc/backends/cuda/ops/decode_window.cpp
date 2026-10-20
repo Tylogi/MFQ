@@ -1,8 +1,9 @@
 #include "native/env.h"
-#include "ops/decode_window.h"
+#include "decode_window.h"
 #include "ops/execution/execution_options.h"
 #include "native/context.h"
-#include "mfq/moe/cpu_expert_pool.h"
+#include "mfq/runtime.h"
+#include "mfq/cpu_topology.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -89,18 +90,36 @@ void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout
 namespace { thread_local DecodeWindow* active=nullptr; }
 struct DecodeWindow::LayerPoint {
     int layer;
+    int tile;
     std::string phase;
     cudaEvent_t event=nullptr;
     uint64_t samples=0;
     int64_t total_ns=0,min_ns=0,max_ns=0;
-    LayerPoint(int l,const char* p):layer(l),phase(p) {MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&event));}
+    LayerPoint(int l,int t,const char* p,bool clock):layer(l),tile(t),phase(p) {
+        if(!clock)MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&event));
+    }
     ~LayerPoint(){if(event)cudaEventDestroy(event);}
 };
 DecodeWindow* DecodeWindow::recording() noexcept { return active; }
 
 bool decode_window_recording() noexcept { return DecodeWindow::recording() != nullptr; }
-DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile):stream_(stream),graphs_(stream),layer_profile_(layer_profile) {}
+struct DecodeWindow::ProfileClock {
+    static constexpr std::size_t capacity=32768;
+    uint64_t* device=nullptr;
+    std::vector<uint64_t> host=std::vector<uint64_t>(capacity);
+    ProfileClock(){MFQ_NATIVE_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device),capacity*sizeof(uint64_t)));}
+    ~ProfileClock(){if(device)(void)cudaFree(device);}
+};
+DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile,bool independent_sequences)
+    :stream_(stream),graphs_(stream),layer_profile_(layer_profile),independent_sequences_(independent_sequences) {
+    // External CUDA timing events split Windows graph submissions. Device
+    // timestamps preserve the graph's submission and use the same clock as
+    // Strata's verifier profiler. This storage exists only when tracing.
+    const auto* option=mfq::cuda::env_lookup("MFQ_TRACE_LAYER_TIMINGS_CLOCK");
+    if(layer_profile_ && (!option || option[0]!='0'))profile_clock_=std::make_unique<ProfileClock>();
+}
 void DecodeWindow::mark(int layer,const char* phase) {
+    profile_layer_=layer;
     if(!layer_profile_)return;
     // Scope 2 keeps the MFE phase boundaries. Timing every small operation
     // measurably perturbs Windows graph replay; ordinary execution adds none.
@@ -119,11 +138,18 @@ void DecodeWindow::mark(int layer,const char* phase) {
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;})))return;
     }
     if(active!=this)throw std::logic_error("MFQ layer timing outside window recording");
-    const auto key=std::make_pair(layer,std::string(phase));
+    const auto key=std::make_tuple(layer,profile_tile_,std::string(phase));
     auto found=layer_point_index_.find(key);
     if(found==layer_point_index_.end()) {
-        auto point=std::make_unique<LayerPoint>(layer,phase);
+        if(profile_clock_ && layer_points_.size()>=ProfileClock::capacity)
+            throw std::runtime_error("GPU stage profile exceeds timestamp capacity");
+        auto point=std::make_unique<LayerPoint>(layer,profile_tile_,phase,bool(profile_clock_));
         found=layer_point_index_.emplace(key,point.get()).first;layer_points_.push_back(std::move(point));
+    }
+    if(profile_clock_) {
+        const auto index=std::find_if(layer_points_.begin(),layer_points_.end(),
+            [&](const auto& point){return point.get()==found->second;})-layer_points_.begin();
+        record_gpu_timestamp(profile_clock_->device,index,stream_);return;
     }
     cudaStreamCaptureStatus capture;
     MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream_,&capture));
@@ -131,10 +157,34 @@ void DecodeWindow::mark(int layer,const char* phase) {
         capture==cudaStreamCaptureStatusActive ? cudaEventRecordExternal : cudaEventRecordDefault));
 }
 void DecodeWindow::observe_layers() {
+    if(profile_clock_ && !layer_points_.empty()) {
+        MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(profile_clock_->host.data(),profile_clock_->device,
+            layer_points_.size()*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream_));
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        // A bad diagnostic sample must not cancel an otherwise completed
+        // decode, or partly increment the phase totals for this replay.
+        for(std::size_t i=1;i<layer_points_.size();++i) {
+            const auto before=profile_clock_->host[i-1],after=profile_clock_->host[i];
+            if(!before || after<before) {
+                ++dropped_profiles_;
+                std::cerr<<"native_layer_gpu_invalid role="<<profile_role_<<" rows="<<profile_rows_
+                    <<" index="<<i<<" from_layer="<<layer_points_[i-1]->layer<<" layer="<<layer_points_[i]->layer
+                    <<" from="<<layer_points_[i-1]->phase<<" to="<<layer_points_[i]->phase
+                    <<" before="<<before<<" after="<<after<<std::endl;
+                return;
+            }
+        }
+    }
     for(std::size_t i=1;i<layer_points_.size();++i) {
         auto& current=*layer_points_[i];float ms=0;
-        MFQ_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&ms,layer_points_[i-1]->event,current.event));
-        const auto ns=static_cast<int64_t>(ms*1e6);
+        int64_t ns;
+        if(profile_clock_) {
+            const auto before=profile_clock_->host[i-1],after=profile_clock_->host[i];
+            ns=static_cast<int64_t>(after-before);
+        } else {
+            MFQ_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&ms,layer_points_[i-1]->event,current.event));
+            ns=static_cast<int64_t>(ms*1e6);
+        }
         current.total_ns+=ns;current.min_ns=current.samples ? std::min(current.min_ns,ns) : ns;
         current.max_ns=std::max(current.max_ns,ns);++current.samples;
     }
@@ -144,7 +194,7 @@ std::vector<DecodeWindow::GpuPhase> DecodeWindow::gpu_phases() const {
     for(std::size_t i=1;i<layer_points_.size();++i) {
         const auto& previous=*layer_points_[i-1];const auto& current=*layer_points_[i];
         phases.push_back({previous.layer,current.layer,previous.phase,current.phase,
-            current.samples,current.total_ns,current.min_ns,current.max_ns});
+            current.samples,current.total_ns,current.min_ns,current.max_ns,previous.tile,current.tile});
     }
     return phases;
 }
@@ -159,17 +209,32 @@ DecodeWindow::~DecodeWindow() {
         std::cerr<<"native_cuda_window tasks="<<tasks_.size()<<" replays="<<replays_
             <<" capture_ns="<<capture_ns_<<" replay_ns="<<replay_ns_
             <<" reset_ns="<<reset_ns_<<" launch_ns="<<launch_ns_<<" serve_ns="<<serve_ns_
-            <<" wait_ns="<<wait_ns_<<" finish_ns="<<finish_ns_<<" profile_ns="<<profile_ns_<<std::endl;
+            <<" wait_ns="<<wait_ns_<<" finish_ns="<<finish_ns_<<" profile_ns="<<profile_ns_
+            <<" role="<<profile_role_<<" rows="<<profile_rows_
+            <<" clock="<<(profile_clock_?1:0)<<" profile_dropped="<<dropped_profiles_<<std::endl;
     for(const auto& phase:gpu_phases())if(phase.samples)
         std::cerr<<"native_layer_gpu from_layer="<<phase.from_layer<<" layer="<<phase.layer
             <<" from="<<phase.from<<" to="<<phase.to<<" samples="<<phase.samples
-            <<" total_ns="<<phase.total_ns<<" min_ns="<<phase.min_ns<<" max_ns="<<phase.max_ns<<std::endl;
+            <<" total_ns="<<phase.total_ns<<" min_ns="<<phase.min_ns<<" max_ns="<<phase.max_ns
+            <<" from_tile="<<phase.from_tile<<" tile="<<phase.tile
+            <<" kind="<<(profile_kinds_.count(phase.layer)?profile_kinds_.at(phase.layer):"unknown")<<std::endl;
 }
 void DecodeWindow::enroll(Task task) {
     if(active!=this)throw std::logic_error("MFQ task outside window capture");
     if(std::any_of(tasks_.begin(),tasks_.end(),[&](const auto& t){return t.identity==task.identity;}))
         throw std::logic_error("one MFQ operator cell was recorded twice in a window");
     tasks_.push_back(std::move(task));
+}
+std::size_t DecodeWindow::nodes() const {
+    std::size_t result=0;
+    for(std::size_t i=0;i<segments();++i)if(const auto* graph=graphs_.find(i,1))result+=graph->nodes();
+    return result;
+}
+void DecodeWindow::host_barrier(std::function<void()> serve) {
+    if(active!=this)throw std::logic_error("host I/O barrier outside window capture");
+    if(recording_segments_)graphs_.end(barriers_.size(),1);
+    barriers_.push_back({tasks_.size(),std::move(serve)});
+    if(recording_segments_)graphs_.begin(barriers_.size(),1);
 }
 void DecodeWindow::capture(const std::function<void()>& body,const std::function<void()>& restore,
         const std::function<void()>& release_output) {
@@ -200,26 +265,56 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         checkpoint("prepare");
         body();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
         release_warm_outputs();
-        tasks_.clear();
+        tasks_.clear();barriers_.clear();
         checkpoint("warmup");
-        {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-            GraphWarmupScope warmup(default_context(device),stream_);body();}
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
-        release_warm_outputs();
-        const auto warm_tasks=tasks_.size();tasks_.clear();
+        // Some first-use operator outputs remain cached after the first pass.
+        // Warm their steady allocation lifetimes before forbidding new storage
+        // in capture, including a previously unused output projection.
+        for(int pass=0;pass<2;++pass) {
+            {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
+                GraphWarmupScope warmup(default_context(device),stream_);body();}
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
+            release_warm_outputs();
+            if(!pass){tasks_.clear();barriers_.clear();}
+        }
+        const auto warm_tasks=tasks_.size(),warm_barriers=barriers_.size();tasks_.clear();barriers_.clear();
         checkpoint("record");
-        std::string error;
-        if(!graphs_.record(0,1,body,error))throw std::runtime_error(error);
-        if(tasks_.size()!=warm_tasks)throw std::logic_error("MFQ window task order changed during capture");
+        try {
+            recording_segments_=true;graphs_.begin(0,1);body();graphs_.end(barriers_.size(),1);
+            recording_segments_=false;
+        } catch(const std::exception& failure) {
+            recording_segments_=false;graphs_.clear();
+            const std::string error=failure.what();
+            // Preserve quota errors so admission can discard this request
+            // without marking the entire backend unhealthy.
+            if(error.starts_with("CUDA process VRAM limit exceeded:") ||
+                    error.starts_with("CUDA VRAM limit exceeded:") ||
+                    error.starts_with("CUDA allocation failed:") ||
+                    error.starts_with("CUDA pinned allocation failed:"))throw MfqResourceExhausted(error);
+            throw std::runtime_error(error);
+        }
+        if(tasks_.size()!=warm_tasks || barriers_.size()!=warm_barriers)throw std::logic_error("MFQ window task order changed during capture");
         checkpoint("restore");
         restore();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
         capture_ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()-capture_started).count();
         checkpoint("complete");
     } catch(...) {
+        recording_segments_=false;graphs_.clear();
         report_window_error("capture",phase);
+        bool allocation_rejected=false;
+        try {std::rethrow_exception(std::current_exception());}
+        catch(const MfqResourceExhausted&) {allocation_rejected=true;}
+        catch(const Error& error) {
+            const std::string message=error.what();
+            allocation_rejected=message.starts_with("CUDA process VRAM limit exceeded:") ||
+                message.starts_with("CUDA VRAM limit exceeded:") ||
+                message.starts_with("CUDA pinned allocation failed:");
+        } catch(...) {}
         for(auto& task:tasks_)if(task.cancel)task.cancel();
-        (void)cudaStreamSynchronize(stream_);restore();failed_=true;throw;
+        (void)cudaStreamSynchronize(stream_);
+        if(allocation_rejected)(void)cudaGetLastError();
+        restore();failed_=true;throw;
     }
 }
 void DecodeWindow::run() {
@@ -240,6 +335,7 @@ void DecodeWindow::run() {
     try {
         WindowSubmission submission;
         using Clock=std::chrono::steady_clock;
+        const auto reset_before=reset_ns_,launch_before=launch_ns_,serve_before=serve_ns_,wait_before=wait_ns_,finish_before=finish_ns_;
         auto previous=Clock::now();const auto started=previous;
         const auto sample=[&](int64_t& total) {
             const auto now=Clock::now();
@@ -249,28 +345,40 @@ void DecodeWindow::run() {
         for(auto& task:tasks_)task.reset();
         sample(reset_ns_);
         std::string error;
-        const auto* graph=graphs_.find(0,1);
-        checkpoint("launch");
-        if(!graph->launch(stream_,error))throw std::runtime_error(error);
-        checkpoint("submit");
-        if(runtime_options::single_window_flush()) {
-            check_stream_progress(stream_);
-            flushed_window_stream=stream_;
-            has_flushed_window=true;
+        std::size_t task_begin=0;
+        for(std::size_t segment=0;segment<segments();++segment) {
+            const auto* graph=graphs_.find(segment,1);
+            checkpoint("launch");
+            if(!graph->launch(stream_,error))throw std::runtime_error(error);
+            checkpoint("submit");
+            if(runtime_options::single_window_flush()) {
+                check_stream_progress(stream_);
+                flushed_window_stream=stream_;has_flushed_window=true;
+            }
+            sample(launch_ns_);
+            checkpoint("serve");
+            const auto task_end=segment<barriers_.size()?barriers_[segment].task_end:tasks_.size();
+            for(;task_begin<task_end;++task_begin)tasks_[task_begin].serve();
+            sample(serve_ns_);
+            checkpoint("wait");
+            if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");
+            sample(wait_ns_);
+            if(segment<barriers_.size()) {
+                checkpoint("host_io");barriers_[segment].serve();sample(serve_ns_);
+            }
         }
-        sample(launch_ns_);
-        checkpoint("serve");
-        for(auto& task:tasks_)task.serve();
-        sample(serve_ns_);
-        checkpoint("wait");
-        if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");
-        sample(wait_ns_);
         // Only after all GPU consumers finish may adaptation overwrite L1.
         checkpoint("finish");
         for(auto& task:tasks_)if(task.finish)task.finish();
         sample(finish_ns_);
         observe_layers();sample(profile_ns_);
         replay_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(previous-started).count();++replays_;
+        const auto elapsed=std::chrono::duration<double,std::milli>(previous-started).count();
+        if(trace && replays_<=64 && elapsed>=45.0)
+            std::cerr<<"runtime_decode_window_slow role="<<profile_role_<<" rows="<<profile_rows_
+                <<" replay="<<replays_<<" ms="<<elapsed<<" reset_ms="<<(reset_ns_-reset_before)/1e6
+                <<" launch_ms="<<(launch_ns_-launch_before)/1e6<<" serve_ms="<<(serve_ns_-serve_before)/1e6
+                <<" wait_ms="<<(wait_ns_-wait_before)/1e6<<" finish_ms="<<(finish_ns_-finish_before)/1e6<<'\n';
         checkpoint("complete");
     } catch(...) {
         report_window_error("replay",phase);

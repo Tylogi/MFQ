@@ -1,0 +1,64 @@
+/* Windows 自绘标题栏沿用面板配色，不影响浏览器或 macOS 的窗口。 */
+.desktop-window-browser,
+.desktop-window-browser > .desktop-window-content { display: contents; }
+.desktop-window {
+  display: flex;
+  height: 100dvh;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+.desktop-titlebar {
+  z-index: 50;
+  display: flex;
+  height: 36px;
+  flex: 0 0 36px;
+  border-bottom: 1px solid var(--sidebar-line);
+  color: var(--ink-soft);
+  background: var(--sidebar);
+  pointer-events: auto;
+  user-select: none;
+}
+
+.desktop-titlebar-drag {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 9px;
+  padding-left: 14px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.desktop-titlebar-drag > * { pointer-events: none; }
+.desktop-titlebar-drag img { width: 18px; height: 18px; }
+.desktop-window[data-window-focused="false"] .desktop-titlebar-drag { opacity: 0.65; }
+.desktop-window-controls { display: flex; flex: 0 0 auto; }
+.desktop-window-controls button {
+  display: grid;
+  width: 46px;
+  height: 35px;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  color: var(--ink-soft);
+  background: transparent;
+}
+.desktop-window-controls button:hover { color: var(--ink); background: var(--sidebar-hover); }
+.desktop-window-controls button:focus-visible { outline-offset: -3px; }
+.desktop-window-controls .desktop-window-close:hover { color: white; background: #c42b1c; }
+
+.desktop-window-content { min-height: 0; flex: 1; overflow: hidden; }
+.desktop-window .app-shell,
+.desktop-window .fatal-workspace,
+.desktop-window .login-page { height: 100%; }
+.desktop-window .skip-link { top: 46px; }
+
+@media (max-width: 680px) {
+  .desktop-window .workspace:has(> .failure-page) { height: 100%; }
+  .desktop-window .mobile-menu-trigger { top: 48px; }
+  .desktop-window .sidebar,
+  .desktop-window .mobile-scrim { top: 36px; }
+}

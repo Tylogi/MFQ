@@ -16,7 +16,7 @@
 namespace mfq::models::glm5_next {
 
 struct Config {
-    int64_t vocab, hidden, intermediate, layers, maximum;
+    int64_t vocab, hidden, intermediate, layers, max_position_embeddings;
     int64_t streams, sinkhorn, kda_heads, kda_width, kda_kernel;
     int64_t query_rank, latent, heads, nope, value_width;
     int64_t index_heads, index_width, budget, pool;
@@ -66,7 +66,7 @@ struct Config {
         c.hidden = positive(text, "hidden_size");
         c.intermediate = positive(text, "intermediate_size");
         c.layers = positive(text, "num_hidden_layers");
-        c.maximum = positive(text, "max_position_embeddings");
+        c.max_position_embeddings = positive(text, "max_position_embeddings");
         c.layer_types = text.at("layer_types").get<std::vector<std::string>>();
         c.mlp_types = text.at("mlp_layer_types").get<std::vector<std::string>>();
         const auto indexers = text.at("indexer_types").get<std::vector<std::string>>();

@@ -64,6 +64,7 @@ export const officialCatalog: OfficialModelList = {
 
 interface MockOptions {
   language?: 'zh-CN' | 'en';
+  theme?: 'light' | 'dark';
   /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
   failFirstSync?: boolean;
   /** 挂起生成请求直到用户调用取消接口。 */
@@ -81,24 +82,33 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let responses: ResponseResource[] = [];
   let failedSync = false;
   let releasePending: (() => void) | undefined;
-  await page.addInitScript((language) => {
+  await page.addInitScript(({ language, theme }) => {
     localStorage.setItem(
       'mfq.studio.generation.v1',
-      JSON.stringify({ language, theme: 'light' }),
+      JSON.stringify({ language, theme }),
     );
-  }, options.language ?? 'en');
+  }, { language: options.language ?? 'en', theme: options.theme ?? 'light' });
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
+    if (path === '/api/v1/auth/policy' && method === 'GET') return json({ enabled: false, has_key: false });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
+    if (path === '/api/v1/hub/download-directory') return json({ directory: null, actual_directory: '/tmp/studio/models', default_directory: '/tmp/studio/models' });
     if (path === '/api/v1/quantization/workspace' && method === 'GET')
       return json({ import_directory: '/models', export_directory: '/outputs',
         candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
     if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/serving') return json({
+      scope: new URL(route.request().url()).searchParams.get('scope') || 'session',
+      started_at: Date.now() / 1000, activity: [],
+      totals: { completed_requests: 0, prompt_tokens: 0, prefill_tokens: 0,
+        completion_tokens: 0, cached_tokens: 0, prefill_tps: null, decode_tps: null,
+        ttft_ms: null, cache_hit_rate: null },
+    });
     if (path === '/api/v1/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
       cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
       memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });

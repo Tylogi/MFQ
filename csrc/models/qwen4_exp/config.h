@@ -15,7 +15,7 @@
 namespace mfq::models::qwen4_exp {
 
 struct Config {
-    int64_t vocab, hidden, layers, maximum, heads, kv_heads, width, rotary, interval, streams, rank;
+    int64_t vocab, hidden, layers, max_position_embeddings, heads, kv_heads, width, rotary, interval, streams, rank;
     int64_t key_heads, value_heads, linear_width, kernel, experts, topk, moe_width, shared_width;
     int64_t index_heads, index_width, pool, budget, ple_kernel, ngram, ngram_heads, shards,
         predictor_layers, eos;
@@ -56,7 +56,7 @@ struct Config {
         c.vocab = positive("vocab_size");
         c.hidden = positive("hidden_size");
         c.layers = positive("num_hidden_layers");
-        c.maximum = positive("max_position_embeddings");
+        c.max_position_embeddings = positive("max_position_embeddings");
         c.heads = positive("num_attention_heads");
         c.kv_heads = positive("num_key_value_heads");
         c.width = positive("head_dim");

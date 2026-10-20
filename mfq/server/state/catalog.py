@@ -33,6 +33,7 @@ from mfq.server.protocol.models import (
 )
 from mfq.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, weight_role
 from mfq.server.services.model_context import declared_context_size, yarn_context_limits
+from mfq.server.services.desktop import directory_opener
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 _ROUTED_EXPERT_RE = re.compile(
@@ -385,6 +386,7 @@ class ModelCatalog:
             parent_id=self._directory_id(parent) if parent is not None else None,
             model_file_count=self._immediate_model_count(current),
             files=files,
+            can_open_directory=directory_opener() is not None,
             can_open_in_finder=sys.platform == "darwin",
             data=[self._directory_entry(path) for path in children],
         )
@@ -481,6 +483,17 @@ class ModelCatalog:
         except ValueError:
             parsed = None
         return (parsed[0] if parsed is not None else path).resolve()
+
+    async def invalidate(self) -> None:
+        while True:
+            async with self._lock:
+                task = self._refresh_task
+                if task is None:
+                    self._models.clear()
+                    self._last_scan = float("-inf")
+                    return
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
 
     async def _snapshot(self, *, refresh: bool = False) -> dict[str, DiscoveredModel]:
         if refresh or self.cache_seconds <= 0:
@@ -937,7 +950,7 @@ class ModelCatalog:
                 name=name,
                 architecture="unknown",
                 format="hf",
-                shard_count=0,
+                shard_count=max(1, len(tuple(path.glob("*.safetensors")))),
                 total_bytes=0,
                 tensor_count=0,
                 record_count=0,

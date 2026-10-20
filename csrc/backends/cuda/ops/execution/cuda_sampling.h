@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sampling.h"
+#include "csrc/engine/requests/sampling.h"
 #include "mfq/runtime.h"
 #include "kernels/sampling_ops.h"
 

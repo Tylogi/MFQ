@@ -87,6 +87,8 @@ enum class MixedNvqF16FormatGroup : int {
 MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format);
 
 struct MixedNvqDispatch {
+    // Retain the packed device allocation and its asynchronous upload source.
+    mfq_tensor_backend::Tensor metadata_device,metadata_host;
     mfq_tensor_backend::Tensor map_ptrs;
     mfq_tensor_backend::Tensor weight_ptrs;
     mfq_tensor_backend::Tensor weight_sizes;
@@ -101,6 +103,7 @@ struct MixedNvqDispatch {
 };
 
 struct MixedNintDispatch {
+    mfq_tensor_backend::Tensor metadata_device,metadata_host;
     mfq_tensor_backend::Tensor map_ptrs,expert_pool,expert_local,pool_params;
     std::vector<int> pools;
 };

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_generation_job.h"
-#include "request_executor.h"
+#include "table.h"
 
 namespace mfq::metal {
 
@@ -10,6 +10,14 @@ class MlxEngineModel {
 public:
     virtual ~MlxEngineModel() = default;
     virtual void generate(mfq::engine::InferenceRequest&, MlxGenerationJob&) = 0;
+    virtual std::size_t request_capacity() const { return 1; }
+    virtual bool can_batch(const mfq::engine::EngineRequest&) const { return false; }
+    virtual void execute(const std::vector<mfq::engine::RequestId>&) {}
+    virtual mfq::engine::Generation generate_batch(const mfq::engine::RequestId&,
+        mfq::engine::InferenceRequest&, mfq::engine::InferenceOutput&) {
+        throw std::invalid_argument("continuous batching is unavailable for this Metal model");
+        co_return;
+    }
     virtual std::int64_t reload(std::int64_t context) = 0;
     virtual mfq::engine::SessionResult session(const mfq::engine::SessionCommand&) = 0;
     virtual mfq::engine::ControlResult control(mfq::engine::ControlRequest) = 0;
@@ -31,12 +39,10 @@ public:
     std::int64_t reload(std::int64_t context) override;
     void shutdown() override;
 
-    // RequestExecutor operations: Metal's native pipeline is serial, but does
-    // not block the scheduler on device execution or a slow response consumer.
-    bool can_batch(const mfq::engine::EngineRequest&) const { return false; }
+    bool can_batch(const mfq::engine::EngineRequest& request) const { return model_->can_batch(request); }
     bool exclusive() const { return duplex_active_; }
     bool mtp_available() const { return info_.capabilities.mtp; }
-    void execute(const std::vector<mfq::engine::RequestId>&) {}
+    void execute(const std::vector<mfq::engine::RequestId>& eligible) { model_->execute(eligible); }
     mfq::engine::Generation generate(const mfq::engine::RequestId&,
         mfq::engine::ExecutionRequest& request);
 

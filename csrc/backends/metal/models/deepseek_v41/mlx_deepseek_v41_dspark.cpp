@@ -1,12 +1,12 @@
 #include "mlx_deepseek_v41_dspark.h"
 
-#include "mlx_detached_copy.h"
+#include "runtime/mlx_detached_copy.h"
 #include "mlx_deepseek_v41_attention.h"
-#include "mlx_dsa.h"
-#include "mlx_mx.h"
-#include "mlx_sampling.h"
-#include "mlx_sparse_attention.h"
-#include "mlx_transformer.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_mx.h"
+#include "runtime/mlx_sampling.h"
+#include "ops/mlx_sparse_attention.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -634,7 +634,8 @@ MlxDeepseekV41DSparkState MlxDeepseekV41DSpark::make_state(
 void MlxDeepseekV41DSpark::append_context(
     const array& target_hidden,
     MlxDeepseekV41DSparkState& state,
-    int start_position) const {
+    int start_position,
+    bool replay_window) const {
     const int hidden = checked_int(impl_->config.hidden, "hidden size");
     const int target_width = checked_product(
         hidden,
@@ -652,7 +653,9 @@ void MlxDeepseekV41DSpark::append_context(
     if (source.ndim() != 3 || source.shape(0) != state.batch() ||
         source.shape(1) <= 0 || source.shape(2) != target_width ||
         state.stages() != impl_->stages.size() ||
-        start_position != state.position_ || start_position < 0 ||
+        (replay_window
+            ? start_position < state.position_ || source.shape(1) < state.window()
+            : start_position != state.position_) || start_position < 0 ||
         source.shape(1) > impl_->maximum_context - start_position) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4.1 DSpark context append");
@@ -671,7 +674,7 @@ void MlxDeepseekV41DSpark::append_context(
             state.rings_[stage],
             start_position);
     }
-    state.position_ += source.shape(1);
+    state.position_ = start_position + source.shape(1);
 }
 
 std::optional<MlxDeepseekV41DSparkDraft>
@@ -822,6 +825,35 @@ int MlxDeepseekV41DSpark::block_size() const noexcept {
 
 std::size_t MlxDeepseekV41DSpark::stage_count() const noexcept {
     return impl_->stages.size();
+}
+
+std::size_t MlxDeepseekV41DSpark::resident_routed_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& stage : impl_->stages) bytes += stage.moe.resident_routed_bytes();
+    return bytes;
+}
+
+void MlxDeepseekV41DSpark::validate_offload(
+    const std::shared_ptr<MlxMfeOffloadCache>& cache) const {
+    for (const auto& stage : impl_->stages) stage.moe.validate_offload(cache);
+}
+
+void MlxDeepseekV41DSpark::use_offload(
+    const std::shared_ptr<MlxMfeOffloadCache>& cache) {
+    for (auto& stage : impl_->stages) stage.moe.use_offload(cache);
+}
+
+void MlxDeepseekV41DSpark::offload_until(
+    const std::shared_ptr<MlxMfeOffloadCache>& cache,
+    std::size_t& resident, std::size_t budget) {
+    for (auto& stage : impl_->stages) {
+        if (resident <= budget) break;
+        const auto released = stage.moe.resident_routed_bytes();
+        if (released) {
+            stage.moe.use_offload(cache);
+            resident -= released;
+        }
+    }
 }
 
 } // namespace mfq::metal

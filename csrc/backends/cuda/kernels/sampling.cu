@@ -6,12 +6,13 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
 #include <climits>
 #include <cstdlib>
 #include <cstdint>
+#include <utility>
 
 constexpr int SAMPLE_BD = 256;
 constexpr int SAMPLE_MAX_TOP_K = 1024;
@@ -139,6 +140,8 @@ __global__ void sample_top_k_radix_finish_kernel(
     }
     out[0] = chosen;
 }
+
+#include "sampling_radix_keys.cuh"
 
 __global__ void sample_token_counts_add_kernel(
     int32_t* __restrict__ counts,
@@ -487,7 +490,10 @@ __global__ void sample_top_k_top_p_kernel(
     }
     if (threadIdx.x != 0) return;
     float max_v = top_vals[0];
-    float probs[SAMPLE_MAX_TOP_K];
+    // Selection is complete; reuse its shared values for probabilities. A
+    // 1024-float thread-local array grows the context's device stack backing
+    // even though only thread zero samples, costing hundreds of MiB on Ampere.
+    float* probs = top_vals;
     float sum = 0.0f;
     for (int j = 0; j < top_k; ++j) {
         probs[j] = expf(top_vals[j] - max_v);
@@ -614,6 +620,56 @@ mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits
     return out;
 }
 
+template<bool Conditional>
+static mfq_tensor_backend::Tensor sample_top_k_compact_impl(
+    mfq_tensor_backend::Tensor logits,int64_t top_k,const volatile int32_t* enabled) {
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim()==2,
+        "sample_top_k_compact: logits must be contiguous CUDA [B,V]");
+    MFQ_RUNTIME_CHECK(logits.scalar_type()==mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type()==mfq_tensor_backend::kFloat16 || logits.scalar_type()==mfq_tensor_backend::kBFloat16,
+        "sample_top_k_compact: unsupported logit dtype");
+    const int B=int(logits.size(0)),V=int(logits.size(1));
+    MFQ_RUNTIME_CHECK(B>0 && B<=32 && logits.size(1)<=INT_MAX && top_k>0 && top_k<=V && top_k<=64,
+        "sample_top_k_compact: unsupported rows, vocab or top-k");
+    const int items=V<=8192?1:V<=65536?4:8;
+    const int blocks=(V+SAMPLE_BD*items-1)/(SAMPLE_BD*items);
+    // Explicit types keep these non-dependent for nvcc's MSVC-mode front end.
+    mfq_tensor_backend::Tensor out=mfq_tensor_backend::empty({B,top_k},logits.options().dtype(mfq_tensor_backend::kInt64));
+    mfq_tensor_backend::Tensor a=mfq_tensor_backend::empty({int64_t(B)*blocks*top_k},out.options());
+    mfq_tensor_backend::Tensor b=mfq_tensor_backend::empty(a.sizes(),a.options());
+    auto* first=reinterpret_cast<uint64_t*>(a.data_ptr<int64_t>());
+    auto* second=reinterpret_cast<uint64_t*>(b.data_ptr<int64_t>());
+    const auto stream=mfq_current_cuda_stream();
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half,mfq_dispatch_bfloat16,
+        logits.scalar_type(),"sample_top_k_compact",[&] {
+            if(items==8)sample_radix_keys_first<scalar_t,8,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
+            else if(items==4)sample_radix_keys_first<scalar_t,4,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
+            else sample_radix_keys_first<scalar_t,1,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
+        });
+    int count=blocks*int(top_k);
+    while(count>SAMPLE_BD) {
+        const int next=(count+SAMPLE_BD-1)/SAMPLE_BD;
+        sample_radix_keys_reduce<true,true,Conditional><<<dim3(next,B),SAMPLE_BD,0,stream>>>(first,second,count,int(top_k),enabled);
+        std::swap(first,second);count=next*int(top_k);
+    }
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half,mfq_dispatch_bfloat16,
+        logits.scalar_type(),"sample_top_k_compact_finish",[&] {
+            sample_radix_compact_finish<scalar_t,true,Conditional><<<dim3(1,B),SAMPLE_BD,0,stream>>>(
+                first,logits.data_ptr<scalar_t>(),reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),count,V,int(top_k),enabled);
+        });
+    MFQ_CUDA_CHECK(cudaGetLastError());
+    return out;
+}
+
+mfq_tensor_backend::Tensor sample_top_k_compact_cuda(mfq_tensor_backend::Tensor logits,int64_t top_k) {
+    return sample_top_k_compact_impl<false>(std::move(logits),top_k,nullptr);
+}
+mfq_tensor_backend::Tensor sample_top_k_compact_if_cuda(
+        mfq_tensor_backend::Tensor logits,int64_t top_k,const volatile int32_t* enabled) {
+    MFQ_RUNTIME_CHECK(enabled,"sample_top_k_compact_if: null replay flag");
+    return sample_top_k_compact_impl<true>(std::move(logits),top_k,enabled);
+}
+
 mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
     mfq_tensor_backend::Tensor logits,
     mfq_tensor_backend::Tensor random,
@@ -643,6 +699,38 @@ mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
         (radix_env == nullptr || radix_env[0] != '0');
     if (use_radix) {
         cudaStream_t stream = mfq_current_cuda_stream();
+        const auto* key_option=mfq::cuda::env_lookup("MFQ_SAMPLE_RADIX_KEYS");
+        if(!key_option || key_option[0]!='0') {
+            const auto* item_option=mfq::cuda::env_lookup("MFQ_SAMPLE_RADIX_ITEMS");
+            const int requested=item_option?std::atoi(item_option):(V<=8192?1:V<=65536?4:8);
+            const int items=requested==8?8:requested==1?1:4;
+            const auto* bitonic_option=mfq::cuda::env_lookup("MFQ_SAMPLE_KEY_BITONIC");
+            const bool bitonic=!bitonic_option || bitonic_option[0]!='0';
+            const int blocks=(V+SAMPLE_BD*items-1)/(SAMPLE_BD*items);
+            const int64_t capacity=int64_t(blocks)*top_k;
+            auto a=mfq_tensor_backend::empty({capacity},logits.options().dtype(mfq_tensor_backend::kInt64));
+            auto b=mfq_tensor_backend::empty({capacity},a.options());
+            auto* first=reinterpret_cast<uint64_t*>(a.data_ptr<int64_t>());
+            auto* second=reinterpret_cast<uint64_t*>(b.data_ptr<int64_t>());
+            MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half,mfq_dispatch_bfloat16,
+                logits.scalar_type(),"sample_radix_keys",[&] {
+                    if(items==8)sample_radix_keys_first<scalar_t,8><<<blocks,SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
+                    else if(items==4)sample_radix_keys_first<scalar_t,4><<<blocks,SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
+                    else sample_radix_keys_first<scalar_t,1><<<blocks,SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
+                });
+            int count=blocks*int(top_k);
+            while(count>SAMPLE_BD) {
+                const int next=(count+SAMPLE_BD-1)/SAMPLE_BD;
+                if(bitonic)sample_radix_keys_reduce<true><<<next,SAMPLE_BD,0,stream>>>(first,second,count,int(top_k));
+                else sample_radix_keys_reduce<false><<<next,SAMPLE_BD,0,stream>>>(first,second,count,int(top_k));
+                std::swap(first,second);count=next*int(top_k);
+            }
+            if(bitonic)sample_radix_keys_finish<true><<<1,SAMPLE_BD,0,stream>>>(first,random.data_ptr<float>(),
+                out.data_ptr<int64_t>(),count,int(top_k),float(temperature),float(top_p));
+            else sample_radix_keys_finish<false><<<1,SAMPLE_BD,0,stream>>>(first,random.data_ptr<float>(),
+                out.data_ptr<int64_t>(),count,int(top_k),float(temperature),float(top_p));
+            return out;
+        }
         const int first_blocks = (V + SAMPLE_BD - 1) / SAMPLE_BD;
         const int64_t capacity = (int64_t)first_blocks * top_k;
         auto vals_a = mfq_tensor_backend::empty(

@@ -7,10 +7,12 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,6 +34,7 @@ public:
 
 void check(cudaError_t status, const char* expression, const char* file, int line);
 void check(cublasStatus_t status, const char* expression, const char* file, int line);
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream);
 
 #define MFQ_NATIVE_CUDA_CHECK(expression) \
     ::mfq::cuda::check((expression), #expression, __FILE__, __LINE__)
@@ -201,8 +204,22 @@ public:
     cudaMemPool_t memory_pool() const noexcept { return pool_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
     DeviceMemoryStats memory_stats() const noexcept;
+    std::pair<std::uint64_t,std::uint64_t> pool_memory_stats() const;
     std::size_t local_memory_usage() const;
+    // Process-owned pages, including idle allocator pages and CUDA libraries.
+    std::size_t resident_memory_usage() const;
+    std::size_t available_memory() const;
+    void reclaim_idle_memory();
+    // Temporarily reuse already charged expert-cache storage on one ordered
+    // compute stream. Graph/resident allocations never enter this workspace.
+    void begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                              cudaStream_t stream);
+    void suspend_workspace_loan();
+    void end_workspace_loan();
+    std::size_t workspace_available() const;
+    std::vector<std::pair<void*,std::size_t>> workspace_touched_regions() const;
     void check_memory_limit(std::size_t additional = 0) const;
+    void set_memory_limit(std::size_t bytes);
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
     void release(
@@ -221,9 +238,10 @@ public:
 
 private:
     struct GraphPool {
+        cudaMemPool_t memory = nullptr;
         bool capturing = false;
         bool warming = false;
-        std::unordered_map<std::size_t, std::vector<void*>> available;
+        std::map<std::size_t, std::vector<void*>> available;
         std::unordered_set<void*> owned;
     };
 
@@ -234,7 +252,20 @@ private:
     bool async_allocations_ = false;
     std::atomic<std::size_t> allocation_limit_{0}, allocated_bytes_{0};
     std::shared_ptr<AllocationBudget> allocation_budget_;
-    std::mutex graph_pool_mutex_;
+    void trim_pool_pages() const;
+    mutable std::mutex graph_pool_mutex_;
+    // A tensor may use a larger cached graph block and outlive its pool.
+    // Account/free the allocation's capacity, not that tensor's logical bytes.
+    std::unordered_map<void*,std::size_t> graph_allocation_sizes_;
+    struct WorkspaceLoan {
+        cudaStream_t stream=nullptr;
+        std::thread::id thread;
+        bool enabled=true;
+        std::map<std::uintptr_t,std::size_t> free;
+        std::unordered_map<void*,std::size_t> live;
+        std::vector<std::pair<std::uintptr_t,std::size_t>> touched;
+    };
+    std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };
 

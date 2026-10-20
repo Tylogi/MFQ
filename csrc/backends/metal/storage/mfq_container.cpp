@@ -1,6 +1,6 @@
 #include "mfq_container.h"
 
-#include "mlx_legacy_tensor_compat.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
 
 #include "mfq/model_source/mfq_model_source.h"
 
@@ -43,7 +43,7 @@ std::uint64_t checked_file_size(
 
 } // namespace
 
-struct MfqContainer::RandomAccessFiles {
+struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAccessFiles> {
     struct File {
         explicit File(std::filesystem::path source)
             : path(std::move(source)), size(checked_file_size(path)) {}
@@ -88,8 +88,17 @@ struct MfqContainer::RandomAccessFiles {
         const std::filesystem::path& path,
         std::uint64_t offset,
         std::span<std::byte> destination) {
+        struct LastFile {
+            const RandomAccessFiles* owner = nullptr;
+            std::weak_ptr<RandomAccessFiles> lifetime;
+            std::filesystem::path path;
+            std::weak_ptr<File> file;
+        };
+        static thread_local LastFile last;
         std::shared_ptr<File> source;
-        {
+        if (last.owner == this && !last.lifetime.expired() && last.path.native() == path.native())
+            source = last.file.lock();
+        if (!source) {
             std::scoped_lock lock(mutex);
             const auto found = files.find(path);
             if (found != files.end()) {
@@ -98,6 +107,7 @@ struct MfqContainer::RandomAccessFiles {
                 source = std::make_shared<File>(path);
                 files.emplace(path, source);
             }
+            last = {this, weak_from_this(), path, source};
         }
         if (offset > source->size ||
             destination.size() > source->size - offset) {

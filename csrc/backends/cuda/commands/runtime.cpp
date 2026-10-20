@@ -1,10 +1,11 @@
+#include "native/env.h"
 #include "engine/load_options.h"
 #include "cli.h"
 #include "include/cuda_engine.h"
 #include "minicpmo45.h"
-#include "storage/model_source.h"
+#include "storage/weights/model_source.h"
 #include "mfq/model_source/model_source.h"
-#include "transport.h"
+#include "csrc/transport/include/transport.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -167,7 +168,7 @@ int run_transport_runtime(RuntimeOptions& options) {
     auto engine = load_cuda_engine(options);
     const auto info = engine->info();
     if (options.transport_api_key.empty()) {
-        const char* env_key = std::getenv("MFQ_API_KEY");
+        const char* env_key = mfq::cuda::env_lookup("MFQ_API_KEY");
         if (env_key != nullptr) options.transport_api_key = env_key;
     }
 

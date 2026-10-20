@@ -1,8 +1,8 @@
 #pragma once
 
 #include "deepseek_v41_model.h"
-#include "mlx_tensor.h"
-#include "mlx_mxfp8_row_store.h"
+#include "runtime/mlx_tensor.h"
+#include "storage/mlx_quantized_row_store.h"
 
 #include <cstdint>
 #include <future>
@@ -24,7 +24,7 @@ struct DeepseekV41EngramHashBatch {
     int layers = 0;
     int hash_columns = 0;
     std::vector<std::int64_t> values;
-    std::vector<std::shared_future<mlx::core::array>> prefetched_rows;
+    std::vector<std::shared_future<MlxQuantizedRowBatch>> prefetched_rows;
 
     std::span<const std::int64_t> layer(int index) const;
 };
@@ -94,9 +94,7 @@ private:
     std::vector<std::int64_t> context_;
 };
 
-// V4.1's table remains source-exact E4M3+E8M0 on disk. Only the 24 selected
-// rows per token are faulted in and decoded; a bounded decoded-row LRU avoids
-// repeated storage reads without making the table resident.
+// Only selected Engram rows are read from their original packed table.
 class MlxDeepseekV41Engram {
 public:
     static MlxDeepseekV41Engram load(
@@ -113,21 +111,21 @@ public:
     int layer() const noexcept { return layer_; }
     int hash_layer_index() const noexcept { return hash_layer_index_; }
     std::size_t cached_rows() const noexcept;
-    MlxMxfp8RowStoreStats ssd_stats() const;
+    MlxQuantizedRowStoreStats ssd_stats() const;
 
 private:
     MlxDeepseekV41Engram(
         DeepseekV41Config config,
         int layer,
         int hash_layer_index,
-        std::shared_ptr<MlxMxfp8RowStore> table,
+        std::shared_ptr<MlxQuantizedRowStore> table,
         MlxLinear projection,
         mlx::core::array query_key_weight);
 
     DeepseekV41Config config_;
     int layer_;
     int hash_layer_index_;
-    std::shared_ptr<MlxMxfp8RowStore> table_;
+    std::shared_ptr<MlxQuantizedRowStore> table_;
     MlxLinear projection_;
     mlx::core::array query_key_weight_;
 };

@@ -1652,11 +1652,27 @@ def _mtp_inventory_status(
                 prefix + "self_attn.o_proj.weight",
                 prefix + "self_attn.q_norm.weight",
                 prefix + "self_attn.k_norm.weight",
-                prefix + "mlp.gate_proj.weight",
-                prefix + "mlp.up_proj.weight",
-                prefix + "mlp.down_proj.weight",
             }
         )
+        # The FFN inside the MTP head is dense (gate/up/down_proj) or routed
+        # (gate.weight + experts.N.*); accept either layout.
+        if (prefix + "mlp.gate_proj.weight") in names:
+            required.update(
+                {
+                    prefix + "mlp.gate_proj.weight",
+                    prefix + "mlp.up_proj.weight",
+                    prefix + "mlp.down_proj.weight",
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "mlp.gate.weight",
+                    prefix + "mlp.experts.0.gate_proj.weight",
+                    prefix + "mlp.experts.0.up_proj.weight",
+                    prefix + "mlp.experts.0.down_proj.weight",
+                }
+            )
     missing = sorted(required - names)
     if missing:
         raise ValueError("incomplete Qwen MTP head; missing tensors: " + ", ".join(missing[:8]))
@@ -1965,6 +1981,7 @@ def _hf_plan_requires_imatrix(item: TensorPlan) -> bool:
 def _bind_hf_imatrix(
     imatrix: ImportanceMatrix,
     plan: list[TensorPlan],
+    *, allow_missing: bool = False,
 ) -> dict[str, HfImatrixBinding]:
     """Bind a llama.cpp or HF-namespaced imatrix to an HF conversion plan."""
 
@@ -1977,6 +1994,8 @@ def _bind_hf_imatrix(
         original_shape, storage_shape = _hf_imatrix_shapes(item)
         match = imatrix.find(names)
         if match is None:
+            if allow_missing and not _hf_plan_requires_imatrix(item):
+                continue
             if _hf_plan_requires_imatrix(item) or not any(
                 name in _IMATRIX_OPTIONAL_TENSORS for name in names
             ):
@@ -4664,6 +4683,31 @@ class _ExpertPoolRowSource:
 class _SeparateExpertRowSource:
     """Read canonical separately stored experts without stacking a whole layer."""
 
+    supports_indexed_rows = True
+
+    def read_expert_rows(self, expert, start, end, *, device='cpu'):
+        return self._read(expert, start, end).to(device=device)
+
+    def _indexed_rows(self, ids, device):
+        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if ids.size and (ids.min() < 0 or ids.max() >= self.n_experts*self.rows_per_expert):
+            raise IndexError('HF expert row indices are outside the source')
+        result = torch.empty((len(ids), self.columns), dtype=torch.float32, device=device)
+        for expert in np.unique(ids//self.rows_per_expert):
+            positions = np.flatnonzero(ids//self.rows_per_expert == expert)
+            local = ids[positions] % self.rows_per_expert
+            offset = 0
+            for index in range(len(self.source_names[expert])):
+                reader = self._source(int(expert), index)
+                mask = (local >= offset) & (local < offset+reader.rows)
+                if mask.any():
+                    result[torch.as_tensor(positions[mask], device=device)] = reader.read_rows(
+                        local[mask]-offset, device=device).float()
+                offset += reader.rows
+            if offset != self.rows_per_expert:
+                raise ValueError('HF expert source row count differs from plan')
+        return result
+
     def __init__(
         self,
         root: Path,
@@ -4906,11 +4950,13 @@ class _SeparateExpertRowSource:
 
     def read_rows(
         self,
-        start: int,
-        end: int,
+        start: int | np.ndarray,
+        end: int | None = None,
         *,
         device: str | torch.device,
     ) -> torch.Tensor:
+        if end is None:
+            return self._indexed_rows(start, device)
         total_rows = self.n_experts * self.rows_per_expert
         if start < 0 or end < start or end > total_rows:
             raise IndexError(f"invalid HF expert row slice {start}:{end}")
@@ -7040,7 +7086,8 @@ def convert(args: argparse.Namespace) -> None:
     imatrix = load_importance_matrix(Path(imatrix_path_arg).resolve()) if imatrix_path_arg else None
     if imatrix is None and any(_hf_plan_requires_imatrix(item) for item in plan):
         raise ValueError("explicit imatrix_weighted scheme requires --imatrix")
-    imatrix_bindings = {} if imatrix is None else _bind_hf_imatrix(imatrix, plan)
+    imatrix_bindings = {} if imatrix is None else _bind_hf_imatrix(
+        imatrix, plan, allow_missing=getattr(args, "_alphaq_output", None) is not None)
     alphaq_output = getattr(args, "_alphaq_output", None)
     if alphaq_output is not None:
         if split_max_size or split_max_tensors or base_store is not None:

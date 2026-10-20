@@ -3,6 +3,7 @@ import { FileIcon, FolderIcon, ArrowUpIcon } from '@phosphor-icons/react';
 import { quantizationApi, type QuantizationFiles } from '../../shared/api/resources/quantization';
 import { Dialog } from '../../shared/ui/Dialog';
 import { useSettings } from '../settings/SettingsProvider';
+import { errorMessage } from '../../app/formatters';
 
 interface Props {
   initialPath: string;
@@ -22,11 +23,12 @@ export function WorkbenchFileDialog({ initialPath, directories, allowFiles = fal
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     const controller = new AbortController();
+    const previousFiles = files;
     setLoading(true); setError(''); setFiles(null);
     void quantizationApi.files(directory, controller.signal).then((result) => {
       if (controller.signal.aborted) return;
       setFiles(result); setPath(result.path);
-    }).catch((cause) => { if (!controller.signal.aborted) setError(String(cause)); })
+    }).catch((cause) => { if (!controller.signal.aborted) { setFiles(previousFiles); setPath(previousFiles?.path || initialPath); setError(errorMessage(cause, tr)); } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [directory]);

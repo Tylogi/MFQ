@@ -48,11 +48,25 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
     assert 'if [[ "${mfq_signing_identity}" != "-" ]]' in RELEASE_SCRIPT
     assert '"hardenedRuntime":true' in RELEASE_SCRIPT
-    assert "--remap-path-prefix=${HOME}=/mfq-build/home" in RELEASE_SCRIPT
-    assert "--remap-path-prefix=${mfq_project_dir}=/mfq-src" in RELEASE_SCRIPT
-    assert 'RUSTFLAGS="${mfq_release_rustflags}"' in RELEASE_SCRIPT
+    assert 'source "${mfq_script_dir}/macos_release_paths.sh"' in RELEASE_SCRIPT
+    assert "mfq_configure_release_paths" in RELEASE_SCRIPT
+    assert '-DCMAKE_C_FLAGS="${CFLAGS}"' in RELEASE_SCRIPT
+    assert '-DCMAKE_CXX_FLAGS="${CXXFLAGS}"' in RELEASE_SCRIPT
+    assert '-DCMAKE_OBJCXX_FLAGS="${OBJCXXFLAGS}"' in RELEASE_SCRIPT
+    assert '--additional-hooks-dir "${mfq_script_dir}/hooks"' in RELEASE_SCRIPT
+    assert '"${mfq_packaged_app}" "${mfq_release_dmg}"' in RELEASE_SCRIPT
+    assert '--python-cli "${mfq_packaged_app}/Contents/Resources/mfq-cli/mfq-cli"' in RELEASE_SCRIPT
     assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
+
+
+def test_studio_macos_icons_have_platform_padding():
+    assert "const MACOS_ICON_SCALE: f64 = 0.83;" in BUILD
+    assert 'std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")' in BUILD
+    assert "render(size, MACOS_ICON_SCALE)" in BUILD
+    assert "IconImage::from_rgba_data(size, size, render(size, 1.0))" in BUILD
+    for size in (32, 128, 256):
+        assert f'write_png(&directory.join("{size}x{size}.png"), {size}, png_scale);' in BUILD
 
 
 def test_studio_starts_the_unified_local_server_and_bundled_runtime():
@@ -65,6 +79,15 @@ def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert 'command.arg("--running-executable")' in RUST
     assert "MFQ_MLX_METALLIB" in RUST
     assert "MFQ_AVFOUNDATION_VIDEO_LIBRARY" in RUST
+
+
+def test_studio_keeps_web_ui_available_on_the_server_listener():
+    assert '.arg("--no-web-ui")' not in RUST
+    for platform in ("macos", "windows"):
+        config = json.loads(
+            (TAURI / f"tauri.release-{platform}.conf.json").read_text(encoding="utf-8")
+        )
+        assert config["bundle"]["resources"]["../dist"] == "web-ui"
 
 
 def test_studio_supports_local_and_remote_server_connections_with_voice_controls():

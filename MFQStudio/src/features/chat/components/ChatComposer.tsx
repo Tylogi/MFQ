@@ -10,6 +10,7 @@ import { useDraftStore } from '../state/draftStore';
 interface ChatComposerProps {
   sessionId: string;
   ready: boolean;
+  editable?: boolean;
   busy: boolean;
   recoveryNeeded: boolean;
   phase: GenerationPhase;
@@ -29,6 +30,7 @@ interface ChatComposerProps {
 export function ChatComposer({
   sessionId,
   ready,
+  editable = ready,
   busy,
   recoveryNeeded,
   phase,
@@ -103,7 +105,7 @@ export function ChatComposer({
       )}
       <textarea
         aria-label={tr('消息', 'Message')}
-        disabled={!ready || busy}
+        disabled={!editable || busy}
         maxLength={32768}
         onChange={(event) => setDraft(sessionId, event.target.value)}
         onKeyDown={(event) => {
@@ -135,7 +137,7 @@ export function ChatComposer({
         />
         <button
           aria-label={tr('添加附件', 'Add attachment')}
-          disabled={!ready || busy}
+          disabled={!editable || busy}
           onClick={() => fileInput.current?.click()}
           title={tr('添加文档或媒体', 'Add document or media')}
           type="button"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "step_sequence.h"
+#include "csrc/core/step_sequence.h"
 
 #include "models/common/causal_model_ops.h"
 #include "storage/session/state.h"
@@ -41,22 +41,23 @@ mfq::StepSequence<std::monostate> restore_text_session_state(std::vector<std::un
 namespace mfq::cuda {
 
 struct Qwen35Model : CausalResources {
+    static constexpr CudaFamilyPolicy policy{.continuous_batching = true,
+        .common_rope = true, .dense_cpu_offload = true,
+        .predictor = CudaPredictorAdapter::qwen35};
+    static CudaModelPlan plan_components(const mfq::ModelGraph&);
+
     using BatchRequestState = qwen35::QwenBatchRequestState;
     using BatchStorage = qwen35::Qwen35BatchStorage;
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
-    std::vector<const void*> adapter_batch_state_addresses(const std::vector<std::unique_ptr<Block>>&) const;
+    std::vector<const void*> batch_state_addresses(const std::vector<std::unique_ptr<Block>>&) const;
     mfq::models::qwen35::Config config;
 
-    void adapter_validate_components(const mfq::ModelGraph &graph) const;
-    void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
-    bool adapter_uses_common_rope() const noexcept;
-    bool adapter_supports_dense_cpu_offload() const noexcept;
-    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+    void validate_components(const mfq::ModelGraph &graph) const;
+    void configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
+    std::unique_ptr<Block> load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
-
-    bool adapter_supports_prepared_prompt() const noexcept;
+    mfq_tensor_backend::Tensor post_embed(mfq_tensor_backend::Tensor output) const;
 };
 
 template <> struct CudaSessionCodec<Qwen35Model> {

@@ -1,60 +1,64 @@
 #pragma once
 
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
+#include "cuda_model_list.h"
 #include "model_components.h"
 #include "load_options.h"
-#include "storage/moe/expert_cache.h"
+#include "storage/weights/moe/kv_memory.h"
+#include "storage/weights/moe/expert_cache.h"
 
 #include <chrono>
 #include <memory>
 #include <variant>
 
 namespace mfq::cuda::internal {
-
-template <template<class> class State>
-using CudaModelStates = std::variant<
-    std::unique_ptr<State<Qwen35CausalLm>>, std::unique_ptr<State<MiniCPMO45CausalLm>>,
-    std::unique_ptr<State<MiniCPMOTtsCausalLm>>, std::unique_ptr<State<Gemma4CausalLm>>,
-    std::unique_ptr<State<GlmDsaCausalLm>>, std::unique_ptr<State<Glm5CausalLm>>,
-    std::unique_ptr<State<Qwen4CausalLm>>, std::unique_ptr<State<DeepseekV4CausalLm>>,
-    std::unique_ptr<State<DeepseekV41CausalLm>>>;
+void prepare_sampling_runtime(int64_t vocabulary);
 
 template <typename F>
 auto with_loaded_cuda_model(CudaExecutionContext& execution, const CudaLoadOptions& options,
         bool optional, F&& run) {
     CudaExecutionScope scope(execution);
     auto source = mfq::open_model_source(options.model_path);
-    const auto load = [&]<typename Model>() {
-        const auto started = std::chrono::steady_clock::now();
-        auto model = load_causal_lm<Model>(execution, options.model_path, options.config_path,
-            options.context_size, true, optional, source);
-        auto components = load_runtime_components(model, optional);
-        if (moe_expert_cache_has_sources(execution.moe_expert_cache) && !moe_expert_cache_finalized(execution.moe_expert_cache))
-            finalize_moe_expert_cache(execution.moe_expert_cache);
+    auto load = [&]<typename Model>() {
+        auto started = std::chrono::steady_clock::now();
+        Model model = load_causal_lm<Model>(
+            execution,
+            options.model_path,
+            options.config_path,
+            options.context_size,
+            true,
+            optional,
+            source);
+        auto components =
+            load_runtime_components(model, optional);
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            prepare_sampling_runtime(model.vocab_size());
+        if(execution.stores.kv_memory) {
+            execution.stores.kv_memory->finalize(moe_expert_cache_minimum_bytes(execution.stores.moe_expert_cache));
+            set_moe_kv_expert_loan(execution.stores.moe_expert_cache,execution.stores.kv_memory->expert_loan());
+            if(auto offload=execution.stores.kv_memory->offload())execution.stores.qsa_kv_store=std::move(offload);
+        }
+        if (moe_expert_cache_has_sources(execution.stores.moe_expert_cache) &&
+                !moe_expert_cache_finalized(execution.stores.moe_expert_cache)) {
+            std::size_t graph_reserve=0;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                graph_reserve=qwen4_mtp_graph_reserve(model,components.mtp.get());
+                if(graph_reserve)std::cerr<<"runtime_mtp_flexible_budget maximum_depth="
+                    <<components.mtp->maximum_draft_depth()<<" bytes="<<graph_reserve
+                    <<" initial_depth=3 lend_unused_to_experts=1\n";
+            }
+            finalize_moe_expert_cache(execution.stores.moe_expert_cache,
+                (execution.stores.kv_memory?execution.stores.kv_memory->growth_reserve():0)+graph_reserve,
+                execution.stores.kv_memory?execution.stores.kv_memory->expert_budget_charge():0);
+        }
         mfq_cuda_synchronize();
         const auto loaded = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "loaded");
         return run(model, components, started, loaded);
     };
-    switch (cuda_backbone(source->resolved_model_graph().backbone)) {
-        case CudaBackbone::generic_qwen: return load.template operator()<Qwen35CausalLm>();
-        case CudaBackbone::minicpmo45: return load.template operator()<MiniCPMO45CausalLm>();
-        case CudaBackbone::minicpmo_tts: return load.template operator()<MiniCPMOTtsCausalLm>();
-        case CudaBackbone::gemma4: return load.template operator()<Gemma4CausalLm>();
-        case CudaBackbone::glm_dsa: return load.template operator()<GlmDsaCausalLm>();
-        case CudaBackbone::glm5_next: return load.template operator()<Glm5CausalLm>();
-        case CudaBackbone::qwen4_exp: return load.template operator()<Qwen4CausalLm>();
-        case CudaBackbone::deepseek_v4: return load.template operator()<DeepseekV4CausalLm>();
-        case CudaBackbone::deepseek_v41: return load.template operator()<DeepseekV41CausalLm>();
-        case CudaBackbone::unsupported: throw std::runtime_error("unsupported CUDA model backbone");
-    }
-    throw std::runtime_error("invalid CUDA model backbone");
+    const auto& backbone = source->resolved_model_graph().backbone;
+#define MFQ_CASE(TYPE) if (TYPE::accepts_backbone(backbone)) return load.template operator()<TYPE>();
+    MFQ_CUDA_EACH_MODEL(MFQ_CASE)
+#undef MFQ_CASE
+    throw std::runtime_error("unsupported CUDA model backbone: " + backbone);
 }
 } // namespace mfq::cuda::internal

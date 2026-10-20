@@ -36,6 +36,11 @@ public:
         std::size_t events = 64, bytes = 1024 * 1024;
         std::size_t requests = 256, input_bytes = 512ULL * 1024 * 1024;
     };
+    struct Snapshot {
+        mfq::engine::EngineStatus status;
+        mfq::engine::Metrics runtime, session;
+        mfq::engine::Clock::time_point captured;
+    };
     explicit MfqScheduler(mfq::engine::Engine& engine);
     MfqScheduler(mfq::engine::Engine& engine, Limits limits);
     ~MfqScheduler();
@@ -47,6 +52,7 @@ public:
     mfq::engine::EngineInfo info() const;
     mfq::engine::EngineStatus status() const;
     std::future<mfq::engine::ControlResult> control_async(mfq::engine::ControlRequest request) const;
+    Snapshot snapshot() const;
     mfq::engine::ControlResult control(mfq::engine::ControlRequest request) const;
     mfq::engine::SessionResult session(mfq::engine::SessionCommand command) const;
     std::int64_t reload(std::int64_t context) const;
@@ -89,6 +95,7 @@ private:
     void flush(Request& request);
     void cancel(Request& request);
     void release_input_budget(const Request& request);
+    void refresh_snapshot(bool healthy, bool blocked, bool metrics);
 
     mfq::engine::Engine& engine_;
     Limits limits_;
@@ -97,6 +104,8 @@ private:
     mutable std::deque<Command> mailbox_;
     mutable std::size_t reserved_requests_ = 0, reserved_bytes_ = 0;
     mfq::engine::EngineInfo info_;
+    Snapshot snapshot_;
+    mutable bool snapshot_requested_ = false;
     bool stopping_ = false;
     std::thread worker_;
     std::unordered_map<std::string, Request> requests_;

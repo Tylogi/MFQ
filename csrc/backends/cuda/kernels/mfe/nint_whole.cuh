@@ -1,5 +1,5 @@
 #pragma once
-#include "ffn.h"
+#include "kernels/mfe/ffn.h"
 #include "kernels/warp_multi_sum.cuh"
 #include "kernels/quant/nint_route_group.cuh"
 #include <climits>

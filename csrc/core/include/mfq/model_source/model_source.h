@@ -3,7 +3,7 @@
 #include "mfq/model_graph.h"
 #include "mfq/io/file_range_reader.h"
 #include "mfq/io/read_span.h"
-#include "mfq_legacy_tensor_names.h"
+#include "compat/mfq_legacy_tensor_names.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +83,9 @@ public:
     // An optional retained, bounded, concurrently readable mapping.
     // An empty reader means this source does not offer mapped access.
     virtual TensorReader mapped_tensor_reader(std::string_view) const { return {}; }
+    // Optional mapped range batch: prefetch only the requested pages before
+    // copying. An empty callback leaves the ordinary row reader available.
+    virtual TensorBatchReader mapped_tensor_batch_reader(std::string_view) const { return {}; }
 
     virtual const std::vector<std::string>& assets() const noexcept = 0;
     virtual bool has_asset(std::string_view name) const noexcept = 0;

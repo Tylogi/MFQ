@@ -2,13 +2,13 @@
  * 为原生按钮提供同时支持鼠标悬停和键盘聚焦的工具提示组件。
  */
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
-import type { ReactElement } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import './primitives.css';
 
 /** 工具提示组件属性。 */
 export interface TooltipProps {
   /** 悬停或聚焦时显示的提示文字。 */
-  content: string;
+  content: ReactNode;
   /** 子元素必须接受 DOM 属性和 ref，原生按钮可直接使用。 */
   children: ReactElement;
 }

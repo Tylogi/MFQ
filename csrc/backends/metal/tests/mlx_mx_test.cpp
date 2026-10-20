@@ -1,8 +1,9 @@
-#include "mlx_mx.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_nint8_zero.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "ops/mlx_mx.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_nint8_zero.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
+#include "runtime/mlx_weight_residency.h"
 
 #include <array>
 #include <chrono>
@@ -86,6 +87,19 @@ std::vector<std::uint8_t> make_mxfp8_geometry_blob(
         static_cast<std::size_t>(scale_rows) * scale_columns,
         127);
     return blob;
+}
+
+void test_packed_weight_residency() {
+    if (!__builtin_available(macOS 15, *)) return;
+    for (const int bits : {4, 8}) {
+        mfq::metal::MlxWeightResidency::begin_load();
+        const auto weight = mfq::metal::MlxMxWeight::from_blob(
+            bits == 4 ? "MXFP4" : "MXFP8", make_blob(bits, 128, 256));
+        auto residency = mfq::metal::MlxWeightResidency::finish_load(1u << 20);
+        require(residency && residency->bytes() ==
+            weight.packed_values().buffer_size() + weight.block_scales().buffer_size(),
+            "MX packed values and scales are missing from weight residency");
+    }
 }
 
 std::vector<std::uint8_t> make_block_scaled_mxfp8_blob() {
@@ -407,6 +421,44 @@ void test_native_mxfp8_scale_expansion() {
             output.data<float>()[127] == 320.0f &&
             output.data<float>()[128] == 640.0f,
         "native MXFP8 scale expansion value mismatch");
+}
+
+void test_mxfp8_all_codes() {
+    using namespace mlx::core;
+    std::vector<std::uint8_t> codes(256 * 32);
+    std::vector<float> expected(codes.size());
+    const std::array<std::uint8_t, 8> scale_codes{120, 124, 126, 127, 128, 129, 132, 134};
+    for (int code = 0; code < 256; ++code) {
+        const int magnitude = code & 127;
+        const int exponent = magnitude >> 3;
+        const int mantissa = magnitude & 7;
+        const float value = exponent == 0 ? std::ldexp(float(mantissa), -9)
+            : std::ldexp(1.0f + float(mantissa) / 8.0f, exponent - 7);
+        const float scaled = std::ldexp(std::copysign(value, code & 128 ? -1.0f : 1.0f),
+            int(scale_codes[code / 32]) - 127);
+        for (int column = 0; column < 32; ++column) {
+            codes[code * 32 + column] = std::uint8_t(code);
+            expected[code * 32 + column] = scaled;
+        }
+    }
+    auto weight = mfq::metal::MlxMxWeight::from_arrays("MXFP8",
+        array(codes.begin(), Shape{256, 32}),
+        array(scale_codes.begin(), Shape{8, 1}), 32, 256);
+    for (auto dtype : {float16, float32}) {
+        auto actual = weight.dequantize(dtype);
+        auto reference = astype(array(expected.begin(), Shape{256, 32}), dtype);
+        eval(actual, reference);
+        for (int code = 0; code < 256; ++code) {
+            if ((code & 127) == 127) continue;
+            for (int column = 0; column < 32; ++column) {
+                const int i = code * 32 + column;
+                require(dtype == float16
+                    ? actual.data<std::uint16_t>()[i] == reference.data<std::uint16_t>()[i]
+                    : actual.data<std::uint32_t>()[i] == reference.data<std::uint32_t>()[i],
+                    "MXFP8 code/scale decode is not bit-exact");
+            }
+        }
+    }
 }
 
 void test_mxfp8_small_m_matches_decode() {
@@ -1610,6 +1662,7 @@ void test_block32_mxfp8_projection_batch() {
 
 int main() {
     try {
+        test_packed_weight_residency();
         test_from_arrays_shape_contract();
         test_matmul("MXFP4", 96, 1);
         for (int rows = 2; rows <= 6; ++rows) {
@@ -1625,6 +1678,7 @@ int main() {
         test_matmul("MXFP8", 128, 7);
         test_matmul("MXFP8", 128, 64);
         test_native_mxfp8_scale_expansion();
+        test_mxfp8_all_codes();
         test_mxfp8_small_m_matches_decode();
         test_native_mxfp8_scale_storage();
         test_embedding("MXFP4", 96);

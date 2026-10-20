@@ -1,4 +1,4 @@
-#include "mlx_inference_warmup.h"
+#include "runtime/mlx_inference_warmup.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -17,6 +17,7 @@ int main() {
         int calls = 0, resets = 0, draft_mask = 0;
         mfq::metal::warm_mlx_inference({1, 2, 3}, 128, 64, defaults, true,
             [&](const auto& prompt, const auto& sampling, int count) {
+                require(sampling.warmup, "warmup can stop before covering decode and MTP");
                 require(prompt.size() + count - 1 <= 128, "warmup exceeded context");
                 if (calls == 0) {
                     require(prompt.size() == 64 && count == 2, "bulk prefill not covered");

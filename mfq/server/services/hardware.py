@@ -25,6 +25,8 @@ class GpuMemory:
     capacity_bytes: int | None = None
     bandwidth_bytes_per_second: int | None = None
     unified: bool = False
+    device_id: str | None = None
+    available_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -53,13 +55,18 @@ class HardwareIdentity:
 
 def memory_topology() -> dict[str, Any]:
     hardware = hardware_identity()
+    host_total, host_available = host_memory_capacity()
     architecture = hardware.memory_architecture
     capacities = [item.capacity_bytes for item in hardware.gpu_memory if not item.unified and not _unified_gpu_name(item.name)]
     return {
         "memory_architecture": architecture,
         "unified_memory": architecture == "unified" if architecture != "unknown" else None,
-        "host_memory_total_bytes": hardware.physical_memory_bytes or host_memory_capacity()[0],
+        "host_memory_total_bytes": hardware.physical_memory_bytes or host_total,
+        "host_memory_available_bytes": host_available,
         "device_memory_total_bytes": sum(capacities) if capacities and all(value is not None for value in capacities) else None,
+        "gpu_devices": [{"id": item.device_id or str(index), "name": item.name,
+            "memory_total_bytes": item.capacity_bytes, "unified_memory": item.unified or _unified_gpu_name(item.name)}
+            for index, item in enumerate(hardware.gpu_memory)],
         "prefix_cache_hot_tier": "vram" if architecture == "discrete" else "ram" if architecture == "unified" else None,
         "prefix_cache_cold_tier": "ssd",
     }
@@ -114,7 +121,8 @@ def _nvidia_memory() -> tuple[GpuMemory, ...]:
                 continue
             label = name.value.decode()
             memory = MemoryInfo()
-            capacity = memory.total if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0 else None
+            measured = library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0
+            capacity = memory.total if measured else None
             clock, width = ctypes.c_uint(), ctypes.c_uint()
             bandwidth = None
             clock_query = getattr(library, "nvmlDeviceGetMaxClockInfo", None)
@@ -124,12 +132,20 @@ def _nvidia_memory() -> tuple[GpuMemory, ...]:
                     and width_query(handle, ctypes.byref(width)) == 0):
                 bandwidth = _positive_int(clock.value * 1_000_000 * 2 * width.value // 8)
             unified = bool(re.search(r"\bGB10\b", label, re.IGNORECASE))
-            devices.append(GpuMemory(label, _positive_int(capacity), 273_000_000_000 if unified else bandwidth, unified))
+            devices.append(GpuMemory(label, _positive_int(capacity), 273_000_000_000 if unified else bandwidth,
+                unified, str(index), int(memory.free) if measured else None))
         return tuple(devices)
     except (AttributeError, OSError, UnicodeError, ValueError):
         return ()
     finally:
         library.nvmlShutdown()
+
+
+def gpu_memory_status() -> list[dict[str, Any]]:
+    """Live NVML counters; CUDA worker ordinals are mapped separately by the pool."""
+    return [{"id": item.device_id or str(index), "name": item.name,
+        "memory_total_bytes": item.capacity_bytes, "memory_available_bytes": item.available_bytes,
+        "unified_memory": item.unified} for index, item in enumerate(_nvidia_memory())]
 
 
 def _amd_memory() -> tuple[GpuMemory, ...]:

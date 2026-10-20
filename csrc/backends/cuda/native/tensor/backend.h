@@ -161,16 +161,15 @@ struct MfqCudaMemoryStats {
 
 inline MfqCudaMemoryStats mfq_cuda_memory_stats(int device) {
     ::mfq::cuda::DeviceGuard guard(device);
+    const auto context=::mfq::cuda::default_context(device);
+    const auto owned=context->memory_stats();
     MfqCudaMemoryStats stats;
-    const auto context = ::mfq::cuda::default_context(device);
-    if (context->supports_async_allocations()) {
-        const auto pool = context->memory_pool();
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &stats.allocated_bytes));
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &stats.reserved_bytes));
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &stats.peak_allocated_bytes));
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &stats.peak_reserved_bytes));
-    }
-    stats.active_bytes = stats.requested_bytes = stats.allocated_bytes;
+    stats.allocated_bytes = owned.allocated;
+    stats.active_bytes = stats.allocated_bytes;
+    stats.reserved_bytes = context->resident_memory_usage();
+    stats.requested_bytes = stats.allocated_bytes;
+    stats.peak_allocated_bytes = owned.peak;
+    stats.peak_reserved_bytes = std::max(stats.reserved_bytes,stats.peak_allocated_bytes);
     return stats;
 }
 

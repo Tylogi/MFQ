@@ -74,7 +74,8 @@ public:
         size_t prompt_tokens,
         const CompletionResult & result,
         const RequestMetricValues & values);
-    void fail();
+    void fail(const std::string & id = {});
+    void progress(const std::string & id, const json & value);
     uint64_t active_requests() const;
     json snapshot(
         const MfqRuntimeTransportConfig & config,
@@ -91,6 +92,26 @@ private:
     uint64_t total_prompt_tokens_ = 0;
     uint64_t total_completion_tokens_ = 0;
     json last_request_ = nullptr;
+    json live_requests_ = json::object();
+};
+
+class ActiveRequest {
+public:
+    explicit ActiveRequest(RuntimeRequestMetrics & metrics);
+    ~ActiveRequest();
+    void progress(const std::string & id, const json & value);
+    void complete(
+        const std::string & id,
+        bool chat,
+        bool stream,
+        size_t prompt_tokens,
+        const CompletionResult & result,
+        const RequestMetricValues & values);
+
+private:
+    RuntimeRequestMetrics & metrics_;
+    std::string id_;
+    bool completed_ = false;
 };
 
 int64_t unix_time_seconds();
@@ -171,6 +192,7 @@ public:
     // Returns nullopt after terminal delivery or disconnect.
     std::optional<std::vector<json>> next();
     void cancel();
+    json progress() const;
 private:
     void fail();
     json event(const char* name) const;
@@ -183,6 +205,12 @@ private:
     std::shared_ptr<MfqScheduledRequest> request_;
     bool stream_ = false, include_usage_ = false;
     bool terminal_ = false, accounted_ = false;
+    std::size_t generated_tokens_ = 0;
+    std::size_t processed_tokens_ = 0;
+    double prefill_ms_ = 0.0;
+    double prefill_tps_ = 0.0;
+    std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point first_token_;
 };
 
 } // namespace mfq::transport

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import stat
+import sys
 import textwrap
 from pathlib import Path
 
@@ -22,6 +24,24 @@ from mfq.server.services.tool_jobs import (
 )
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import SessionStore
+
+
+@pytest.fixture(autouse=True)
+def _python_script_executables_on_windows(tmp_path, monkeypatch):
+    if os.name != 'nt':
+        return
+    spawn = asyncio.create_subprocess_exec
+
+    async def run(*argv, **kwargs):
+        path = Path(argv[0])
+        # Windows does not interpret the Python shebangs of our fake tools.
+        # Keep argv as a list so the shell-metacharacter tests remain valid.
+        if (path.is_relative_to(tmp_path) and path.is_file() and
+                path.read_bytes().startswith(b'#!/usr/bin/env python')):
+            argv = (sys.executable, *argv)
+        return await spawn(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', run)
 
 
 def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:
@@ -137,6 +157,55 @@ def test_tool_process_retains_only_a_bounded_output_tail(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('system', ['nt', 'posix'])
+@pytest.mark.parametrize('force_kill', [False, True])
+def test_cancelled_tool_stops_process_and_releases_download_locks(tmp_path, monkeypatch, system, force_kill):
+    from types import SimpleNamespace
+    import mfq.server.services.tool_jobs as tool_jobs
+    from mfq.server.services.jobs import JobCancelledError
+
+    async def run():
+        calls = []
+        class Process:
+            pid = 123
+            returncode = None
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'downloading\n')
+            def terminate(self): calls.append('terminate')
+            def kill(self): calls.append('kill')
+            async def wait(self):
+                if force_kill and len(calls) == 1:
+                    raise asyncio.TimeoutError()
+                self.returncode = 0
+                return 0
+        process = Process()
+        async def spawn(*args, **kwargs): return process
+        def killpg(pid, signum):
+            assert system == 'posix' and pid == process.pid
+            calls.append('terminate' if signum == tool_jobs.signal.SIGTERM else 'kill')
+        monkeypatch.setattr(tool_jobs, 'os', SimpleNamespace(name=system, killpg=killpg))
+        monkeypatch.setattr(tool_jobs, 'signal', SimpleNamespace(SIGTERM=15, SIGKILL=9))
+        monkeypatch.setattr(tool_jobs.asyncio, 'create_subprocess_exec', spawn)
+        class Context:
+            def __init__(self): self.cleanup = []
+            def add_cleanup(self, callback): self.cleanup.append(callback)
+            def raise_if_cancelled(self): raise JobCancelledError()
+        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, tmp_path / 'mfq', None, None, None, None))
+        context = Context()
+        with pytest.raises(JobCancelledError):
+            await handlers._run(context, ['fake-download'])
+        # Child-held disk locks must be gone before the enclosing download
+        # handler releases its reservation, before final JobContext cleanup.
+        assert process.returncode == 0
+        assert calls == (['terminate', 'kill'] if force_kill else ['terminate'])
+        for callback in context.cleanup:
+            await callback()
+        assert calls == (['terminate', 'kill'] if force_kill else ['terminate'])
+        assert process.returncode == 0
+    asyncio.run(run())
+
+
 async def _wait(store: SessionStore, job_id) -> object:
     for _ in range(300):
         job = store.get_job(job_id)
@@ -245,6 +314,169 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
 
     asyncio.run(run())
 
+
+
+def _validation_handlers(tmp_path: Path, **paths) -> tuple[ToolJobHandlers, ModelCatalog]:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(exist_ok=True)
+    _model(model_dir / "tiny.mfq")
+    catalog = ModelCatalog([model_dir], cache_seconds=0)
+    handlers = ToolJobHandlers(
+        catalog,
+        ToolJobPaths(
+            work_root=tmp_path,
+            python=tmp_path / "python",
+            modelscope=None,
+            huggingface=None,
+            **paths,
+        ),
+    )
+    return handlers, catalog
+
+
+@pytest.mark.parametrize("form", ("unset", "missing", "directory", "multi-config"))
+def test_container_validation_requires_explicit_diagnostics_and_never_uses_the_runtime(
+    tmp_path: Path,
+    form: str,
+) -> None:
+    async def run() -> None:
+        runtime = _executable(
+            tmp_path / "mfq-runtime",
+            """\
+            #!/usr/bin/env python3
+            import pathlib
+            pathlib.Path('runtime-invoked').write_text('invoked')
+            print('runtime used for validation')
+            """,
+        )
+        diagnostics: Path | None = tmp_path / "mfq-diagnostics"
+        if form == "directory":
+            diagnostics.mkdir()
+        elif form == "multi-config":
+            diagnostics = tmp_path / "build dir" / "Release" / "mfq-diagnostics.exe"
+        elif form == "unset":
+            diagnostics = None
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=diagnostics,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.FAILED
+        assert result.error.code == "tool_unavailable"
+        assert (
+            'cmake --build "<build-dir>" --config <configuration> '
+            "--target mfq-diagnostics"
+        ) in result.error.message
+        if diagnostics is not None:
+            assert str(diagnostics) in result.error.message
+        if form == "multi-config":
+            assert "cmake --build /" not in result.error.message
+        assert not (tmp_path / "runtime-invoked").exists()
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_metal_container_validation_reports_a_missing_runtime_without_a_target_hint(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        runtime = tmp_path / "mfq-decode-metal"
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=runtime,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.FAILED
+        assert result.error.code == "tool_unavailable"
+        assert result.error.message == "MFQ diagnostics executable is unavailable"
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_metal_container_validation_uses_the_runtime_wired_as_diagnostics(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        runtime = _executable(
+            tmp_path / "mfq-decode-metal",
+            """\
+            #!/usr/bin/env python3
+            import sys
+            assert '--check-mfq-container' in sys.argv
+            print('MFQ container OK via metal runtime')
+            """,
+        )
+        handlers, catalog = _validation_handlers(
+            tmp_path,
+            runtime=runtime,
+            perplexity=None,
+            diagnostics=runtime,
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        artifact = (await catalog.list()).data[0]
+        submitted = await manager.submit(
+            CreateJobRequest(kind="model.validate", payload={"model": artifact.name})
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.SUCCEEDED
+        assert result.result["summary"] == "MFQ container OK via metal runtime"
+        await manager.close()
+
+    asyncio.run(run())
+
+
+def test_native_tool_jobs_are_advertised_only_for_wired_executables(
+    tmp_path: Path,
+) -> None:
+    metal_runtime = tmp_path / "mfq-decode-metal"
+    cuda_runtime = tmp_path / "mfq-runtime"
+    metal = ToolJobHandlers(
+        ModelCatalog([]),
+        ToolJobPaths(
+            tmp_path,
+            tmp_path / "python",
+            None,
+            None,
+            metal_runtime,
+            tmp_path / "mfq-perplexity",
+            metal_runtime,
+        ),
+    ).handlers()
+    cuda = ToolJobHandlers(
+        ModelCatalog([]),
+        ToolJobPaths(
+            tmp_path,
+            tmp_path / "python",
+            None,
+            None,
+            None,
+            None,
+            cuda_runtime.with_name("mfq-diagnostics"),
+        ),
+    ).handlers()
+
+    # Metal keeps its kernel benchmark and WT2 evaluation jobs; CUDA serving wires neither.
+    assert {"benchmark.kernel", "evaluate.wikitext2"} <= set(metal)
+    assert not {"benchmark.kernel", "evaluate.wikitext2"} & set(cuda)
 
 
 def test_imatrix_calibration_job_publishes_native_artifact(tmp_path: Path) -> None:
@@ -428,6 +660,7 @@ def test_download_argv_does_not_execute_shell_metacharacters(tmp_path: Path) -> 
                 payload={
                     "repo_id": "owner/model",
                     "destination": "downloads/value;touch-owned",
+                    "expected_bytes": 4,
                 },
             )
         )
@@ -481,7 +714,7 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
         submitted = await manager.submit(
             CreateJobRequest(
                 kind="download.modelscope",
-                payload={"repo_id": "owner/model", "destination": "models/owner/model"},
+                payload={"repo_id": "owner/model", "destination": "models/owner/model", "expected_bytes": 2},
             )
         )
         result = await _wait(store, submitted.id)
@@ -532,7 +765,7 @@ def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkey
         store = SessionStore(tmp_path / "jobs.sqlite3")
         manager = JobManager(store, handlers.handlers())
         submitted = await manager.submit(CreateJobRequest(kind=f"download.{provider}",
-            payload={"repo_id": "owner/model", "destination": "downloads/model"}))
+            payload={"repo_id": "owner/model", "destination": "downloads/model", "expected_bytes": 2}))
         result = await _wait(store, submitted.id)
         assert result.status == JobStatus.SUCCEEDED and result.result["files"] == 1
         await manager.close()

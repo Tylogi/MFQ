@@ -30,4 +30,8 @@ inline constexpr char kSparseBlockGqaSource[] = R"MFQ_BLOCK_GQA(
 @MFQ_SPARSE_BLOCK_GQA_SOURCE@
 )MFQ_BLOCK_GQA";
 
+inline constexpr char kCsa2PrefillSource[] = R"MFQ_CSA2(
+@MFQ_CSA2_PREFILL_SOURCE@
+)MFQ_CSA2";
+
 } // namespace mfq::metal::detail

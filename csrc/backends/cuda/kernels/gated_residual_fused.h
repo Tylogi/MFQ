@@ -8,6 +8,10 @@
 mfq_tensor_backend::Tensor prepare_gr_dense_vector_right(
     const mfq_tensor_backend::Tensor& right);
 
+// Cache only the effective subgroup scale/min; packed weight bytes stay intact.
+mfq_tensor_backend::Tensor prepare_gr_up_group_coefficients(const NintWeight& weight);
+mfq_tensor_backend::Tensor prepare_gr_up_packed_metadata(const NintWeight& weight);
+
 // Fused norm, Down/injection, and Up/mix residual stages. Markers instrument
 // the same stages used by ordinary decode without replacing their arithmetic.
 std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
@@ -19,4 +23,5 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     int64_t streams,double eps,bool after,
     const mfq_tensor_backend::Tensor& dense_injection={},
     const mfq_tensor_backend::Tensor& prepared_injection_right={},
-    const std::function<void(const char*)>& marker={});
+    const std::function<void(const char*)>& marker={},
+    const mfq_tensor_backend::Tensor& up_group_coefficients={});

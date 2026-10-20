@@ -1,5 +1,5 @@
-#include "mfq_ane.h"
-#include "mtp_lora.h"
+#include "platform/mfq_ane.h"
+#include "runtime/mtp_lora.h"
 
 #include <cmath>
 #include <iostream>

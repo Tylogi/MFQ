@@ -298,6 +298,7 @@ bool parse_cuda_load_option(
         ArgCursor& args,
         CudaLoadOptions& result) {
     if (option == "--model") result.model_path = args.value(option);
+    else if (option == "--yarn-context-extension") result.yarn_context_extension = true;
     else if (option == "--config") result.config_path = args.value(option);
     else if (option == "--tokenizer") result.tokenizer_model = args.value(option);
     else return parse_resource_option(option, args, result) ||

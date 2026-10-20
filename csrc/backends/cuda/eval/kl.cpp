@@ -1,20 +1,13 @@
 #include "kl.h"
 
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
-#include "storage/loaders/weight.h"
+#include "engine/cuda_model_list.h"
+#include "storage/weights/loaders/weight.h"
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
-#include "storage/moe/expert_cache.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
-#include "csrc/backends/cuda/kernels/deepseek_v41.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "kernels/deepseek_v4_attention.h"
+#include "kernels/deepseek_v4_hc.h"
+#include "kernels/deepseek_v41.h"
 #include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>
@@ -1017,7 +1010,7 @@ int run_kl_eval_streamed(
     for (int begin = 0; begin < chunks; begin += chunk_batch) {
         const int count = std::min(chunk_batch, chunks - begin);
         auto x = hidden_cpu.narrow(0, begin, count).to(mfq_tensor_backend::kCUDA);
-        auto y = model.finalize_hidden(x, count, n_ctx);
+        auto y = model.finalize_hidden(x, model.output_norm, count, n_ctx);
         auto selected =
             y.index({Slice(), Slice(first, first + score_count), Slice()});
         auto logits = model.apply_final_logit_softcap(
@@ -1104,22 +1097,14 @@ int run_kl_eval_streamed(
     return 0;
 }
 
-#define MFQ_INSTANTIATE_KL(TYPE)                                           \
-    template int run_kl_eval_batched<TYPE>(                               \
-        TYPE&, const std::string&, int, std::int64_t, int,                 \
-        const KlReferenceContract&);                                       \
-    template int run_selected_kl_eval<TYPE>(                              \
-        TYPE&, const std::string&, int, KlEvaluator, std::int64_t, int,    \
-        const KlReferenceContract&)
+#define MFQ_INSTANTIATE_KL(TYPE)                             \
+    template int run_kl_eval_batched<TYPE>(                            \
+        TYPE&, const std::string&, int, std::int64_t, int,             \
+        const KlReferenceContract&);                                   \
+    template int run_selected_kl_eval<TYPE>(                           \
+        TYPE&, const std::string&, int, KlEvaluator, std::int64_t, int,\
+        const KlReferenceContract&);
 
-MFQ_INSTANTIATE_KL(mfq::cuda::Qwen35CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::MiniCPMO45CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::MiniCPMOTtsCausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::Gemma4CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::GlmDsaCausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::Glm5CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::Qwen4CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV4CausalLm);
-MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV41CausalLm);
+MFQ_CUDA_EACH_MODEL(MFQ_INSTANTIATE_KL)
 
 #undef MFQ_INSTANTIATE_KL

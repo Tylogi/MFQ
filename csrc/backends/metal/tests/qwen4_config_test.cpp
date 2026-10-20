@@ -1,4 +1,5 @@
-#include "mlx_qwen4_causal_lm.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
+#include "nlohmann/json.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -102,12 +103,36 @@ void test_invalid_schedule_is_rejected() {
     throw std::runtime_error("invalid Qwen4 layer schedule was accepted");
 }
 
+void test_vision_config() {
+    auto root = nlohmann::json::parse(kConfig);
+    root["image_token_id"] = 5;
+    root["video_token_id"] = 6;
+    root["vision_config"] = {
+        {"hidden_size", 8}, {"intermediate_size", 16}, {"depth", 1},
+        {"num_heads", 2}, {"patch_size", 2}, {"temporal_patch_size", 1},
+        {"spatial_merge_size", 2}, {"out_hidden_size", 16},
+        {"num_position_embeddings", 16}};
+    const auto config = mfq::metal::Qwen4Config::from_json(root.dump());
+    require(config.vision && config.vision->depth == 1, "vision config missing");
+    require(config.image_token_id == 5 && config.video_token_id == 6, "media IDs mismatch");
+    for (const auto invalid : {"width", "token"}) {
+        auto other = root;
+        if (std::string_view(invalid) == "width") other["vision_config"]["out_hidden_size"] = 32;
+        else other["image_token_id"] = 32;
+        bool rejected = false;
+        try { (void)mfq::metal::Qwen4Config::from_json(other.dump()); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected, "invalid vision geometry or media ID accepted");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_config_contract();
         test_invalid_schedule_is_rejected();
+        test_vision_config();
         std::cout << "Qwen4-Exp config contract test passed\n";
         return 0;
     } catch (const std::exception& error) {

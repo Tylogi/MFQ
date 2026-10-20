@@ -1,4 +1,4 @@
-#include "deepseek_v4_model.h"
+#include "models/deepseek_v4/deepseek_v4_model.h"
 
 #include "nlohmann/json.hpp"
 

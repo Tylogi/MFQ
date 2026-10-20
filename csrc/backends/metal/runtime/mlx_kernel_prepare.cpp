@@ -2,10 +2,14 @@
 #include "mfq_mlx_utils_embedded.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/fast_primitives.h>
@@ -19,7 +23,7 @@ MlxKernelPreparation::MlxKernelPreparation(int context, int chunk_size)
     : previous_(active_), context_(context) {
     if (context < 1 || chunk_size < 1)
         throw std::invalid_argument("invalid Metal kernel preparation geometry");
-    for (const int requested : {1, 2, 3, 4, 5, 6, 8, 128, chunk_size}) {
+    for (const int requested : {1, 2, 3, 4, 5, 6, 8, 25, 32, 128, chunk_size}) {
         const int rows = std::min(context, requested);
         if (std::find(rows_.begin(), rows_.end(), rows) == rows_.end()) rows_.push_back(rows);
     }
@@ -107,18 +111,66 @@ void MlxKernelPreparation::collect_sampling(int vocab, const MlxSamplingParams& 
 }
 
 void MlxKernelPreparation::finish() {
+    struct Restore {
+        MlxKernelPreparation*& active;
+        MlxKernelPreparation* previous;
+        ~Restore() { active = previous; }
+    } restore{active_, previous_};
     const auto started = std::chrono::steady_clock::now();
     const auto total = jobs_.size();
     std::size_t completed = 0;
-    for (const auto& job : jobs_) {
-        std::cerr << "mfq_load_progress stage=compiling completed=" << completed
-                  << " total=" << total << std::endl;
-        job();
-        ++completed;
+    const auto maximum_workers = std::max(1u, std::thread::hardware_concurrency());
+    std::size_t workers = maximum_workers;
+    if (const auto* value = std::getenv("MFQ_METAL_COMPILE_WORKERS")) {
+        char* end = nullptr;
+        const auto requested = std::strtoul(value, &end, 10);
+        if (!*value || *end || requested < 1 || requested > maximum_workers)
+            throw std::invalid_argument("MFQ_METAL_COMPILE_WORKERS must be in [1, "
+                + std::to_string(maximum_workers) + "]");
+        workers = requested;
     }
+    workers = std::min(workers, total);
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex progress;
+    std::exception_ptr failure;
+    const auto run = [&] {
+        auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+        while (!failed.load()) {
+            const auto index = next.fetch_add(1);
+            if (index >= total) break;
+            try { jobs_[index](); }
+            catch (...) {
+                std::lock_guard lock(progress);
+                if (!failure) failure = std::current_exception();
+                failed.store(true);
+                break;
+            }
+            std::lock_guard lock(progress);
+            ++completed;
+            std::cerr << "mfq_load_progress stage=compiling completed=" << completed
+                      << " total=" << total << std::endl;
+        }
+    };
+    {
+        std::vector<std::thread> threads;
+        struct Join {
+            std::vector<std::thread>& threads;
+            ~Join() { for (auto& thread : threads) if (thread.joinable()) thread.join(); }
+        } join{threads};
+        try {
+            for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(run);
+            run();
+        } catch (...) {
+            failed.store(true);
+            throw;
+        }
+    }
+    active_ = previous_;
+    if (failure) { jobs_.clear(); std::rethrow_exception(failure); }
     std::cerr << "mfq_load_progress stage=compiling completed=" << completed
               << " total=" << total << std::endl;
-    std::cerr << "mfq_kernel_prepare kernels=" << total << " unsupported=" << unsupported_.size()
+    std::cerr << "mfq_kernel_prepare kernels=" << total << " workers=" << workers << " unsupported=" << unsupported_.size()
               << " seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
               << std::endl;
     jobs_.clear();

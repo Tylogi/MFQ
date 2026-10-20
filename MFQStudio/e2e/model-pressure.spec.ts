@@ -7,7 +7,7 @@ for (const theme of ['light', 'dark'] as const) {
     await page.addInitScript(value => {
       localStorage.setItem('mfq.studio.generation.v1', JSON.stringify({ language: 'en', theme: value }));
     }, theme);
-    await page.route('**/api/v1/models', route => route.fulfill({ json: { data: [25, 75, 150].map((size, index) => ({
+    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [25, 75, 150].map((size, index) => ({
       id: `pressure-${index}`, name: index === 0 ? 'Studio Test Model' : `Qwen pressure ${index}`,
       architecture: 'qwen3', format: 'mfq', shard_count: 2, total_bytes: size * 2 ** 30,
       estimated_resident_weight_bytes: size * 2 ** 30, tensor_count: 20, record_count: 20,
@@ -24,8 +24,9 @@ for (const theme of ['light', 'dark'] as const) {
     await expect(page.locator('.variant-memory-pressure > strong')).toHaveText(['25.0%', '75.0%', '150.0%']);
     for (const path of ['/models', '/model-hub']) {
       if (path !== '/models') await page.goto(path);
-      await expect(page.locator('.variant-memory-pressure')).toHaveCount(3);
-      const pressure = await page.locator('.variant-memory-pressure').evaluateAll(elements => elements.map(element => {
+      const bars = page.locator(path === '/model-hub' ? '.model-variant-list .variant-memory-pressure' : '.variant-memory-pressure');
+      await expect(bars).toHaveCount(3);
+      const pressure = await bars.evaluateAll(elements => elements.map(element => {
         const fill = getComputedStyle(element.querySelector('.variant-memory-track > span')!);
         return { bar: fill.backgroundColor, image: fill.backgroundImage, text: getComputedStyle(element.querySelector('strong')!).color };
       }));

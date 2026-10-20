@@ -23,8 +23,12 @@ struct Qwen4ExpMtp final : MtpModule {
     CudaExecutionContext *execution = nullptr;
     int64_t batch = 0;
     std::unique_ptr<Qwen4MtpGraph> graph_registry;
+    bool reuse_decode_graphs=false;
+    uint64_t graph_captures=0;
     uint64_t graph_replays = 0;
     bool graph_initialized = false;
+    bool compact_graph_sampling = true;
+    Tensor graph_compact_topk() const;
     bool take_graph_initialization() noexcept override { return std::exchange(graph_initialized,false); }
     uint64_t graph_replay_count() const noexcept override { return graph_replays; }
 
@@ -42,11 +46,15 @@ struct Qwen4ExpMtp final : MtpModule {
     std::pair<Tensor, Tensor> evaluate(const MtpTarget &target, const Tensor &hidden,
                                        const Tensor &ids, int64_t depth = 0, bool cache = true,
                                        const Tensor &supplied_positions = {},
-                                       const Tensor &supplied_embeddings = {});
+                                       const Tensor &supplied_embeddings = {},
+                                       bool history_only = false);
 
     Tensor forward(const MtpTarget &target, Tensor hidden, Tensor ids) override;
 
     MtpStep step(const MtpTarget &target, Tensor hidden, Tensor ids) override;
+    MtpStep step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) override;
+    void history_step(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions = {},
+                      bool scalar_chain = false);
 
     int64_t cache_position() const noexcept override;
 
@@ -57,6 +65,9 @@ struct Qwen4ExpMtp final : MtpModule {
     bool target_bootstrap_decode() const noexcept override;
 
     bool preserve_output_dtype() const noexcept override;
+    bool supports_session_state() const noexcept override;
+    MtpSessionState capture_session_state(int64_t,const Tensor&) const override;
+    void restore_session_state(const MtpSessionState&) override;
 };
 
 } // namespace mfq::cuda::qwen4_exp

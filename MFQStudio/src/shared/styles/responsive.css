@@ -9,7 +9,7 @@
 
 @container (max-width: 390px) {
   .metric-grid, .cache-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .node-form, .dataset-form, .profile-create { grid-template-columns: 1fr; }
+  .node-form, .dataset-form { grid-template-columns: 1fr; }
   .panel-heading p { display: none; }
 }
 
@@ -59,7 +59,6 @@
   .logs-grid { grid-template-columns: 1fr; }
   .logs-grid > .runtime-log-panel { grid-column: 1; }
   .overview-footer-grid { grid-template-columns: 1fr; }
-  .settings-page-grid { grid-template-columns: 1fr; }
   .setting-row { align-items: flex-start; }
   .setting-row-trailing code { max-width: 40vw; }
   .server-page .setting-row-trailing { max-width: 58%; }
@@ -120,7 +119,6 @@
   .setting-row { flex-wrap: wrap; gap: 12px; }
   .setting-row-trailing { max-width: 100%; }
   .server-page .setting-row-trailing { max-width: 100%; }
-  .settings-page .portable-actions { flex-wrap: wrap; }
 }
 
 @media (max-width: 420px) {

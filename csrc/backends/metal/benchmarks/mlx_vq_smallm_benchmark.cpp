@@ -1,9 +1,9 @@
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_vq.h"
-#include "mlx_fp8_sq.h"
-#include "mlx_mxfp4_sq.h"
-#include "mlx_kernel_prepare.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_vq.h"
+#include "ops/mlx_fp8_sq.h"
+#include "ops/mlx_mxfp4_sq.h"
+#include "runtime/mlx_kernel_prepare.h"
 
 #include <mlx/mlx.h>
 #include <mlx/stream.h>

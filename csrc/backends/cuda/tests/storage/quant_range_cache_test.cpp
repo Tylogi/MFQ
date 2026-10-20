@@ -1,7 +1,7 @@
 #include "native/env.h"
-#include "storage/loaders/weight.h"
-#include "storage/moe/expert_cache.h"
-#include "storage/moe/quant_range_source.h"
+#include "storage/weights/loaders/weight.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "storage/weights/moe/quant_range_source.h"
 #include "ops/execution/cuda_execution.h"
 
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "storage/moe/weight_loader.h"
+#include "storage/weights/moe/weight_loader.h"
 
 namespace tb=mfq_tensor_backend;
 namespace {
@@ -54,6 +54,7 @@ std::int64_t slot_bytes(const MixedMoePool& pool) {
     if (pool.family==MixedMoeFamily::Nint)
         fields={pool.nint.q_packed,pool.nint.row_q_bits,pool.nint.row_q_bit_offsets,
             pool.nint.sub_scale,pool.nint.sub_min,pool.nint.neuron_scale,pool.nint.neuron_min};
+    else if(pool.family==MixedMoeFamily::Mxfp4)fields={pool.mxfp4.values,pool.mxfp4.scales};
     else fields={pool.nvq.indices_packed,pool.nvq.aux_packed,pool.nvq.sub_scale_packed,pool.nvq.neuron_scale};
     std::int64_t total=0;
     for (const auto& field:fields) total+=field.numel()*field.element_size();
@@ -305,21 +306,21 @@ int main(int argc,char** argv) try {
         // Exercise the public loader used by the native attention adapters,
         // including its owning ModelSource range callback after model release.
         auto loaded_model=mfq::open_model_source((root/(name+".mfq")).string());
-        execution.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
+        execution.stores.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
         execution.moe_cache_registration_min_slots=1;
         mfq::cuda::weight_loader::validate_load_options(execution);
         auto loaded=load_mfe_gpu(execution,*loaded_model,"linear.weight",true,0,"gate");
-        finalize_moe_expert_cache(execution.moe_expert_cache);
+        finalize_moe_expert_cache(execution.stores.moe_expert_cache);
         loaded_model.reset();
-        execution.moe_expert_cache.reset(); // MfeWeight retains its cache owner.
+        execution.stores.moe_expert_cache.reset(); // MfeWeight retains its cache owner.
         verify_gpu(loaded.forward(execution,x,selected),baseline.forward(execution,x,selected));
         verify_cpu(loaded.forward(execution,x,cold_route),reference,all,tokens,3,output);
         if (!cases) {
             WithoutOwningReader borrowed(mfq::open_model_source((root/(name+".mfq")).string()));
-            execution.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
+            execution.stores.moe_expert_cache=make_moe_expert_cache(bytes,execution.config);
             auto compatible=load_mfe_gpu(execution,borrowed,"linear.weight",true,0,"gate");
-            finalize_moe_expert_cache(execution.moe_expert_cache);
-            execution.moe_expert_cache.reset();
+            finalize_moe_expert_cache(execution.stores.moe_expert_cache);
+            execution.stores.moe_expert_cache.reset();
             verify_gpu(compatible.forward(execution,x,selected),baseline.forward(execution,x,selected));
         }
         MFQ_CUDA_CHECK(cudaDeviceSynchronize());

@@ -50,6 +50,7 @@ void warm_mlx_inference(const std::vector<std::int64_t>& prompt,
         warm_sorting();
         MlxSamplingParams greedy;
         greedy.enable_mtp = false;
+        greedy.warmup = true;
         if (bulk) {
             std::vector<std::int64_t> tokens;
             tokens.reserve(bulk_rows);
@@ -66,6 +67,7 @@ void warm_mlx_inference(const std::vector<std::int64_t>& prompt,
         }
         auto sampled = defaults;
         sampled.enable_mtp = false;
+        sampled.warmup = true;
         for (auto sampling : {greedy, sampled}) {
             for (int draft = 1; draft <= depth; ++draft) {
                 sampling.enable_mtp = true;

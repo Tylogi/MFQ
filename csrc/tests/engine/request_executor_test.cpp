@@ -1,8 +1,8 @@
-#include "request_executor.h"
-#include "generation_flow.h"
-#include "runtime_config.h"
+#include "table.h"
+#include "flow.h"
+#include "settings.h"
 #include "gguf.h"
-#include "engine_instance.h"
+#include "instance.h"
 #include <cstdio>
 
 #include <cassert>
@@ -94,10 +94,11 @@ struct TestBackend {
             std::uint64_t trim_hot(std::uint64_t) { return clear(); }
             Metrics metrics() const { return {{"sessions", double(count)}}; }
         } cache;
-        template <class T> ControlResult control(T) {
-            if constexpr (std::is_same_v<T, RuntimeMetrics>)
+        Cache& session_cache() noexcept { return cache; }
+        ControlResult control(ControlRequest&& command) {
+            if (std::holds_alternative<RuntimeMetrics>(command))
                 return Metrics{{"advances", double(advances)}};
-            else throw std::invalid_argument("no duplex in test backend");
+            throw std::invalid_argument("no duplex in test backend");
         }
     } ops;
     ~TestBackend() { assert(ops.live == 0); }
@@ -498,6 +499,47 @@ int main() {
     }
     check_admission_memory();
     check_async_text_preparation();
+    // Text admission needs a tokenizer; a raw token request does not.
+    {
+        TestOps ops;
+        RequestExecutor executor;
+        auto text = request();
+        text.diagnostic_input.reset();
+        bool rejected = false;
+        try {
+            executor.admit(std::move(text), nullptr, info(), ops);
+        } catch (const std::invalid_argument &error) {
+            rejected = true;
+            assert(std::string(error.what()) == "text input requires a tokenizer");
+        }
+        assert(rejected && executor.empty() && executor.status().healthy);
+        assert(executor.admit(request(), nullptr, info(), ops) == Admission::accepted);
+    }
+    for (const bool batched : {false, true}) {
+        TestOps ops;
+        ops.batch = batched;
+        auto metadata = info();
+        metadata.stop_token_ids = model_stop_token_ids(R"({"eos_token_id":[11,12]})", metadata.vocab_size);
+        auto input = request();
+        input.input.sampling.max_tokens = 8;
+        RequestExecutor executor;
+        assert(executor.admit(std::move(input), nullptr, metadata, ops) == Admission::accepted);
+        std::vector<int64_t> tokens;
+        bool complete = false;
+        for (int step = 0; step < 32 && !complete; ++step) {
+            const auto events = executor.step({"one"}, ops);
+            for (const auto& event : events.events) {
+                if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+                if (const auto* done = std::get_if<Completed>(&event.data)) {
+                    assert(done->finish_reason == "stop" && done->usage.completion_tokens == 2);
+                    complete = true;
+                }
+            }
+        }
+        assert(complete && executor.empty() && ops.advances == 1);
+        assert((tokens == std::vector<int64_t>{10, 11}));
+    }
     check_waiting_and_cleanup();
     check_preparation_steps();
     check_engine_lifecycle();

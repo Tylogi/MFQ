@@ -1,0 +1,291 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1280" viewBox="0 0 1600 1280" role="img" aria-labelledby="title desc" xml:lang="en">
+<title id="title">Fine-grained precision &amp; format fidelity</title>
+<desc id="desc">Qwen3.8-Flash-Next, layer 0. The allocation panels show experts 0–11: this packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary. The base-format panel shows mean reconstruction SSE reductions over all 512 experts, with actual bpw for each of seven format pairs.</desc>
+<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;,&quot;base_format_source&quot;:&quot;data/qwen38-flash-next-base-format-sse.json&quot;,&quot;base_format_evaluation&quot;:{&quot;layer&quot;:0,&quot;experts&quot;:512,&quot;projections&quot;:[&quot;Gate&quot;,&quot;Up&quot;,&quot;Down&quot;],&quot;matrices&quot;:1536,&quot;metric&quot;:&quot;reconstruction_sse&quot;,&quot;aggregation&quot;:&quot;Equally weighted mean of per-matrix SSE&quot;,&quot;lower_is_better&quot;:true,&quot;bpw&quot;:&quot;Actual bits per weight as reported in the supplied table&quot;,&quot;reduction_formula&quot;:&quot;100 * (1 - mfq_sse / gguf_sse)&quot;,&quot;note&quot;:&quot;Each row compares the listed formats at their reported actual bpw. The bpw values are similar, not identical. This is a layer-0 reconstruction comparison, not a whole-model KLD or Top-1 measurement.&quot;},&quot;theme&quot;:&quot;studio-figure-theme.json&quot;}</metadata>
+<rect x="0" y="0" width="1600" height="1280" rx="0" fill="#f6f7f9" stroke="none"/>
+<g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Noto Sans CJK SC, Helvetica Neue, Arial, sans-serif">
+<text x="48" y="63" font-size="30" font-weight="700" fill="#111213" text-anchor="start">Fine-grained precision &amp; format fidelity</text>
+<text x="48" y="96" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · 512 experts</text>
+<g transform="translate(1434 38) scale(0.5)">
+<rect x="1" y="1" width="62" height="62" rx="17" fill="#0e1010" stroke="none"/>
+<path d="M16 44V20L32 37 48 20V44" fill="none" stroke="#f1f2ef" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="48" cy="44" r="3" fill="#d6aa73"/></g>
+<text x="1480" y="62" font-size="21" font-weight="700" fill="#111213" text-anchor="start">MFQ</text>
+<rect x="48" y="128" width="1504" height="250" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="169" font-size="24" font-weight="700" fill="#111213" text-anchor="start">GGUF</text>
+<text x="164" y="168" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Unsloth UD · IQ3_XXS</text>
+<text x="1312" y="170" font-size="30" font-weight="600" fill="#202122" text-anchor="end">3</text>
+<text x="1332" y="168" font-size="15" font-weight="400" fill="#5f6264" text-anchor="start">allocation slots / layer</text>
+<path d="M76 192H1524" fill="none" stroke="#ededed"/>
+<text x="76" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="start">Expert</text>
+<text x="244" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">0</text>
+<text x="352" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">1</text>
+<text x="460" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">2</text>
+<text x="568" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">3</text>
+<text x="676" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">4</text>
+<text x="784" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">5</text>
+<text x="892" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">6</text>
+<text x="1000" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">7</text>
+<text x="1108" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">8</text>
+<text x="1216" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">9</text>
+<text x="1324" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">10</text>
+<text x="1432" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">11</text>
+<text x="76" y="263" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Gate</text>
+<rect x="192" y="238" width="1291" height="36" rx="4" fill="#eceef0" stroke="none"/>
+<text x="838" y="263" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ2_S</text>
+<text x="76" y="307" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Up</text>
+<rect x="192" y="282" width="1291" height="36" rx="4" fill="#eceef0" stroke="none"/>
+<text x="838" y="307" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ2_S</text>
+<text x="76" y="351" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Down</text>
+<rect x="192" y="326" width="1291" height="36" rx="4" fill="#d8dbdf" stroke="none"/>
+<text x="838" y="351" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ4_NL</text>
+<path d="M48 409H734" fill="none" stroke="#e4e4e5"/>
+<text x="800" y="417" font-size="23" font-weight="600" fill="#9f6232" text-anchor="middle">512×</text>
+<path d="M866 409H1552" fill="none" stroke="#e4e4e5"/>
+<rect x="48" y="440" width="1504" height="250" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="481" font-size="24" font-weight="700" fill="#111213" text-anchor="start">MFQ</text>
+<text x="151" y="480" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">V3-XXS</text>
+<text x="1312" y="482" font-size="30" font-weight="600" fill="#9f6232" text-anchor="end">1,536</text>
+<text x="1332" y="480" font-size="15" font-weight="400" fill="#5f6264" text-anchor="start">allocation slots / layer</text>
+<path d="M76 504H1524" fill="none" stroke="#ededed"/>
+<text x="76" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="start">Expert</text>
+<text x="244" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">0</text>
+<text x="352" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">1</text>
+<text x="460" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">2</text>
+<text x="568" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">3</text>
+<text x="676" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">4</text>
+<text x="784" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">5</text>
+<text x="892" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">6</text>
+<text x="1000" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">7</text>
+<text x="1108" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">8</text>
+<text x="1216" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">9</text>
+<text x="1324" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">10</text>
+<text x="1432" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">11</text>
+<text x="76" y="575" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Gate</text>
+<g data-projection="gate" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="gate" data-expert="1" data-profile="NVQ3J-512">
+<rect x="300" y="550" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="352" y="575" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
+</g>
+<g data-projection="gate" data-expert="2" data-profile="NVQ3J">
+<rect x="408" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="460" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="gate" data-expert="3" data-profile="NVQ2J-XL">
+<rect x="516" y="550" width="103" height="36" rx="4" fill="#cab39f" stroke="none"/>
+<text x="568" y="575" font-size="14.5" font-weight="500" fill="#49392c" text-anchor="middle">NVQ2J-XL</text>
+</g>
+<g data-projection="gate" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="gate" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="gate" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="550" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="575" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
+</g>
+<g data-projection="gate" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="gate" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="gate" data-expert="9" data-profile="NVQ3J-L">
+<rect x="1164" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1216" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="gate" data-expert="10" data-profile="NVQ3J-L">
+<rect x="1272" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1324" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="gate" data-expert="11" data-profile="NVQ2J-L">
+<rect x="1380" y="550" width="103" height="36" rx="4" fill="#e4d6c8" stroke="none"/>
+<text x="1432" y="575" font-size="14.5" font-weight="500" fill="#584535" text-anchor="middle">NVQ2J-L</text>
+</g>
+<text x="76" y="619" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Up</text>
+<g data-projection="up" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="1" data-profile="NVQ3J">
+<rect x="300" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="352" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="2" data-profile="NVQ3J">
+<rect x="408" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="460" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="3" data-profile="NVQ3J">
+<rect x="516" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="568" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="up" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="594" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="619" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
+</g>
+<g data-projection="up" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="up" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="up" data-expert="9" data-profile="NVQ3J-L">
+<rect x="1164" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1216" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="up" data-expert="10" data-profile="NVQ3J-L">
+<rect x="1272" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1324" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="up" data-expert="11" data-profile="NVQ2J-L">
+<rect x="1380" y="594" width="103" height="36" rx="4" fill="#e4d6c8" stroke="none"/>
+<text x="1432" y="619" font-size="14.5" font-weight="500" fill="#584535" text-anchor="middle">NVQ2J-L</text>
+</g>
+<text x="76" y="663" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Down</text>
+<g data-projection="down" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="down" data-expert="1" data-profile="NVQ3J-512">
+<rect x="300" y="638" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="352" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
+</g>
+<g data-projection="down" data-expert="2" data-profile="NVQ3J-512">
+<rect x="408" y="638" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="460" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
+</g>
+<g data-projection="down" data-expert="3" data-profile="NVQ3J">
+<rect x="516" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="568" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="down" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="638" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="663" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="down" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="down" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="638" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="663" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
+</g>
+<g data-projection="down" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="638" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="663" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
+</g>
+<g data-projection="down" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
+</g>
+<g data-projection="down" data-expert="9" data-profile="NINT4">
+<rect x="1164" y="638" width="103" height="36" rx="4" fill="#9f6232" stroke="none"/>
+<text x="1216" y="663" font-size="14.5" font-weight="500" fill="#ffffff" text-anchor="middle">NINT4</text>
+</g>
+<g data-projection="down" data-expert="10" data-profile="NINT4">
+<rect x="1272" y="638" width="103" height="36" rx="4" fill="#9f6232" stroke="none"/>
+<text x="1324" y="663" font-size="14.5" font-weight="500" fill="#ffffff" text-anchor="middle">NINT4</text>
+</g>
+<g data-projection="down" data-expert="11" data-profile="NVQ2J">
+<rect x="1380" y="638" width="103" height="36" rx="4" fill="#c9cdd2" stroke="none"/>
+<text x="1432" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ2J</text>
+</g>
+<rect x="48" y="716" width="1504" height="496" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="760" font-size="25" font-weight="700" fill="#111213" text-anchor="start">Base-format reconstruction</text>
+<text x="1524" y="760" font-size="23" font-weight="700" fill="#8e5427" text-anchor="end">Up to 25.16% lower SSE</text>
+<text x="76" y="790" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">Layer 0 · 512 experts × Gate / Up / Down · 1,536 matrices · equal matrix weighting</text>
+<text x="76" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">MFQ format · actual bpw</text>
+<text x="430" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">GGUF format · actual bpw</text>
+<text x="800" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">SSE reduction</text>
+<path d="M800 842V1152" fill="none" stroke="#ededed"/>
+<text x="800" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">0%</text>
+<path d="M1013.3333333333333 842V1152" fill="none" stroke="#ededed"/>
+<text x="1013.3333333333333" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">10%</text>
+<path d="M1226.6666666666665 842V1152" fill="none" stroke="#ededed"/>
+<text x="1226.6666666666665" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">20%</text>
+<path d="M1440 842V1152" fill="none" stroke="#ededed"/>
+<text x="1440" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">30%</text>
+<text x="76" y="861" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ2J</text>
+<text x="76" y="881" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">2.0535</text>
+<text x="430" y="861" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ2_XXS</text>
+<text x="430" y="881" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">2.0625</text>
+<g id="base-format-sse-IQ2_XXS" data-reduction-percent="25.16" data-mfq-bpw="2.0535" data-gguf-bpw="2.0625" data-mfq-sse="25.6356" data-gguf-sse="34.2542">
+<title>NVQ2J (2.0535 bpw), SSE 25.6356; IQ2_XXS (2.0625 bpw), SSE 34.2542; reduction 25.16%</title>
+<rect x="800" y="855" width="536.7466666666667" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1344.7466666666667" y="870" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">25.16%</text>
+</g>
+<text x="76" y="905" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ3J</text>
+<text x="76" y="925" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.0498</text>
+<text x="430" y="905" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ3_XXS</text>
+<text x="430" y="925" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.0625</text>
+<g id="base-format-sse-IQ3_XXS" data-reduction-percent="20.55" data-mfq-bpw="3.0498" data-gguf-bpw="3.0625" data-mfq-sse="7.52099" data-gguf-sse="9.46618">
+<title>NVQ3J (3.0498 bpw), SSE 7.52099; IQ3_XXS (3.0625 bpw), SSE 9.46618; reduction 20.55%</title>
+<rect x="800" y="899" width="438.40000000000003" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1246.4" y="914" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">20.55%</text>
+</g>
+<text x="76" y="949" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ3J-L</text>
+<text x="76" y="969" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.5535</text>
+<text x="430" y="949" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ3_S</text>
+<text x="430" y="969" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.4375</text>
+<g id="base-format-sse-IQ3_S" data-reduction-percent="20.61" data-mfq-bpw="3.5535" data-gguf-bpw="3.4375" data-mfq-sse="4.39932" data-gguf-sse="5.54164">
+<title>NVQ3J-L (3.5535 bpw), SSE 4.39932; IQ3_S (3.4375 bpw), SSE 5.54164; reduction 20.61%</title>
+<rect x="800" y="943" width="439.67999999999995" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1247.6799999999998" y="958" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">20.61%</text>
+</g>
+<text x="76" y="993" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT4 GS24/k6</text>
+<text x="76" y="1013" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5285</text>
+<text x="430" y="993" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q4_K</text>
+<text x="430" y="1013" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5000</text>
+<g id="base-format-sse-Q4_K" data-reduction-percent="10.68" data-mfq-bpw="4.5285" data-gguf-bpw="4.5" data-mfq-sse="1.35714" data-gguf-sse="1.51948">
+<title>NINT4 GS24/k6 (4.5285 bpw), SSE 1.35714; Q4_K (4.5000 bpw), SSE 1.51948; reduction 10.68%</title>
+<rect x="800" y="987" width="227.83999999999997" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1035.84" y="1002" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">10.68%</text>
+</g>
+<text x="76" y="1037" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT4 GS24/k6</text>
+<text x="76" y="1057" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5285</text>
+<text x="430" y="1037" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ4_NL</text>
+<text x="430" y="1057" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5000</text>
+<g id="base-format-sse-IQ4_NL" data-reduction-percent="19.5" data-mfq-bpw="4.5285" data-gguf-bpw="4.5" data-mfq-sse="1.35714" data-gguf-sse="1.68599">
+<title>NINT4 GS24/k6 (4.5285 bpw), SSE 1.35714; IQ4_NL (4.5000 bpw), SSE 1.68599; reduction 19.50%</title>
+<rect x="800" y="1031" width="416" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1224" y="1046" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">19.50%</text>
+</g>
+<text x="76" y="1081" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT5 GS28/k7</text>
+<text x="76" y="1101" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">5.5489</text>
+<text x="430" y="1081" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q5_K</text>
+<text x="430" y="1101" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">5.5000</text>
+<g id="base-format-sse-Q5_K" data-reduction-percent="6.72" data-mfq-bpw="5.5489" data-gguf-bpw="5.5" data-mfq-sse="0.355366" data-gguf-sse="0.380979">
+<title>NINT5 GS28/k7 (5.5489 bpw), SSE 0.355366; Q5_K (5.5000 bpw), SSE 0.380979; reduction 6.72%</title>
+<rect x="800" y="1075" width="143.36" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="951.36" y="1090" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">6.72%</text>
+</g>
+<text x="76" y="1125" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT6 GS24/k7</text>
+<text x="76" y="1145" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">6.6184</text>
+<text x="430" y="1125" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q6_K</text>
+<text x="430" y="1145" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">6.5625</text>
+<g id="base-format-sse-Q6_K" data-reduction-percent="4.04" data-mfq-bpw="6.6184" data-gguf-bpw="6.5625" data-mfq-sse="0.089583" data-gguf-sse="0.0933589">
+<title>NINT6 GS24/k7 (6.6184 bpw), SSE 0.089583; Q6_K (6.5625 bpw), SSE 0.0933589; reduction 4.04%</title>
+<rect x="800" y="1119" width="86.18666666666667" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="894.1866666666667" y="1134" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">4.04%</text>
+</g>
+<a id="repository-url" href="https://github.com/Tylogi/MFQ">
+<text x="1552" y="1254" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="end">https://github.com/Tylogi/MFQ</text>
+</a></g></svg>

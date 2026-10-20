@@ -1,4 +1,4 @@
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "packed_bench_utils.h"
 #include "kernels/moe/ops.h"
 #include "ops/moe/moe.h"

@@ -106,11 +106,11 @@ def test_probability_api_leases_loaded_model_and_preserves_raw_text(tmp_path):
 
 
 def test_truthful_adapter_retains_original_token_slicing_and_sum():
-    import torch
+    import numpy as np
 
     from mfq.server.services.probability_benchmark import NativeLogProbs
-    values = torch.tensor([0., 0., -9., -8., -7., -2., -3., 0.])
+    values = np.array([0., 0., -9., -8., -7., -2., -3., 0.], dtype=np.float32)
     outputs = NativeLogProbs(values).squeeze(0).log_softmax(-1)
     outputs = outputs[2:-1, :]
-    selected = outputs[range(outputs.shape[0]), torch.zeros(5, dtype=torch.int64)]
+    selected = outputs[range(outputs.shape[0]), np.zeros(5, dtype=np.int64)]
     assert selected[3:].sum().item() == -5

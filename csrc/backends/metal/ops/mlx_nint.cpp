@@ -1,14 +1,14 @@
 #include "mlx_nint.h"
 #include "mlx_nint_metadata.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_memory_residency.h"
-#include "mlx_resident_budget.h"
-#include "mlx_weight_residency.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "runtime/mlx_memory_residency.h"
+#include "runtime/mlx_resident_budget.h"
+#include "runtime/mlx_weight_residency.h"
 
 #include "mfq/quant/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
-#include "mlx_platform.h"
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_platform.h"
+#include "runtime/mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -133,7 +133,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel(const char* name = nullptr) {
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1283,7 +1283,8 @@ struct NintMatmulPlan {
             "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
             "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
             "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
-        result += kNintMatmul;
+        result += config.rows > 0 && config.rows <= 6
+            ? detail::nint_matmul_metal_row_q_body() : std::string_view(kNintMatmul);
         result += "\n}\n";
         return result;
     }
@@ -1300,7 +1301,8 @@ const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
     for (const auto& entry : local_cache) {
         if (entry.config == config) return entry.plan;
     }
-    auto key = "mfq_native_nint_matmul_v2_" + nint_matmul_kernel_key(config);
+    auto key = std::string(config.rows > 0 && config.rows <= 6
+        ? "mfq_native_nint_matmul_v3_" : "mfq_native_nint_matmul_v2_") + nint_matmul_kernel_key(config);
     for (const auto dtype : config.epilogue_types)
         key += "_" + mlx::core::type_to_name(dtype);
     static std::mutex mutex;
@@ -1323,7 +1325,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(plan_->kernel_name, options,
@@ -1564,6 +1566,39 @@ std::string_view detail::nint_matmul_metal_header() noexcept {
 
 std::string_view detail::nint_matmul_metal_body() noexcept {
     return kNintMatmul;
+}
+
+std::string_view detail::nint_matmul_metal_row_q_body() {
+    static const auto source = [] {
+        const std::string_view original(kNintMatmul);
+        const auto begin = original.find("        for (uint group = lane;");
+        const auto end = original.find("\n    }\n\n#pragma unroll\n    for (uint output_row", begin);
+        if (begin == std::string_view::npos || end == std::string_view::npos)
+            throw std::logic_error("NINT group-loop markers are missing");
+        const auto loop = original.substr(begin, end - begin);
+        std::string result(original.substr(0, begin));
+        result += "uint row_q = q_widths[0];\n"
+            "for (uint row = 1u; row < OUTPUTS_PER_SIMD; ++row)\n"
+            "    if (q_widths[row] != row_q) row_q = 0u;\n"
+            "switch (row_q) {\n";
+        for (const int q : {4, 5, 6, 8}) {
+            std::string selected(loop);
+            const std::string needle = "q_widths[output_row]";
+            std::size_t offset = 0;
+            while ((offset = selected.find(needle, offset)) != std::string::npos) {
+                const auto literal = std::to_string(q) + "u";
+                selected.replace(offset, needle.size(), literal);
+                offset += literal.size();
+            }
+            result += "case " + std::to_string(q) + "u: {\n" + selected + "break; }\n";
+        }
+        result += "default: {\n";
+        result.append(loop);
+        result += "break; }\n}\n";
+        result.append(original.substr(end));
+        return result;
+    }();
+    return source;
 }
 
 bool is_nint_dtype(std::string_view dtype) noexcept {
@@ -2244,7 +2279,9 @@ std::optional<MlxNintSwiGluPair>
 MlxNintSwiGluPair::from_weights(
     const MlxNintWeight& gate,
     const MlxNintWeight& up) {
-    if (!gate.can_fuse_swiglu(up)) {
+    if (gate.group_size() <= 0 || up.group_size() <= 0 ||
+        gate.input_size() != up.input_size() ||
+        gate.output_size() != up.output_size()) {
         return std::nullopt;
     }
     const auto gate_q_bytes = gate.packed_values().size();
@@ -2340,8 +2377,11 @@ MlxNintSwiGluPair::from_weights(
         std::move(sub_min),
         gate.group_size(),
         gate.groups(),
+        up.group_size(),
+        up.groups(),
         gate.input_size(),
-        gate.output_size());
+        gate.output_size(),
+        gate.has_uniform_q_bits() && up.has_uniform_q_bits());
 }
 
 bool MlxNintWeight::can_fuse_swiglu(
@@ -2351,6 +2391,32 @@ bool MlxNintWeight::can_fuse_swiglu(
         groups_ == up.groups_ &&
         input_size_ == up.input_size_ &&
         output_size_ == up.output_size_;
+}
+
+array pack_nint_single_row(const MlxNintWeight& weight) {
+    if (weight.output_size() != 1)
+        throw std::invalid_argument("packed NINT router requires one output row");
+    constexpr std::size_t header_bytes = 9 * sizeof(std::uint32_t);
+    std::array<std::uint32_t, 9> header{};
+    std::size_t size = header_bytes;
+    const std::array streams{weight.packed_values(), weight.sub_scales(), weight.sub_mins()};
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        header[index] = checked_shape(size, "packed NINT router offset");
+        size += streams[index].nbytes() + 4;
+    }
+    header[3] = weight.group_size();
+    header[8] = weight.input_size();
+    auto metadata = weight.row_metadata();
+    metadata.eval();
+    std::copy_n(metadata.data<std::uint32_t>(), 4, header.begin() + 4);
+    detail::StagingVector<std::uint8_t> packed(checked_shape(size, "packed NINT router bytes"));
+    std::memcpy(packed.data(), header.data(), header_bytes);
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        auto stream = streams[index];
+        stream.eval();
+        std::memcpy(packed.data() + header[index], stream.data<std::uint8_t>(), stream.nbytes());
+    }
+    return make_array(packed, Shape{static_cast<int>(packed.size())});
 }
 
 array MlxNintWeight::swiglu(

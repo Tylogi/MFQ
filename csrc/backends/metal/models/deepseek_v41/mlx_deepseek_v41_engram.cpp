@@ -568,7 +568,7 @@ MlxDeepseekV41Engram MlxDeepseekV41Engram::load(
         config,
         layer,
         hash_layer,
-        std::make_shared<MlxMxfp8RowStore>(
+        std::make_shared<MlxQuantizedRowStore>(
             model,
             prefix + ".embedding.weight",
             config.engram_num_embeddings[static_cast<std::size_t>(hash_layer)],
@@ -583,7 +583,7 @@ MlxDeepseekV41Engram::MlxDeepseekV41Engram(
     DeepseekV41Config config,
     int layer,
     int hash_layer_index,
-    std::shared_ptr<MlxMxfp8RowStore> table,
+    std::shared_ptr<MlxQuantizedRowStore> table,
     MlxLinear projection,
     array query_key_weight)
     : config_(std::move(config)),
@@ -626,7 +626,7 @@ array MlxDeepseekV41Engram::forward(
                 "DeepSeek-V4.1 Engram prefetch state is incomplete");
         }
         gathered = hashes.prefetched_rows[
-            static_cast<std::size_t>(hash_layer_index_)].get();
+            static_cast<std::size_t>(hash_layer_index_)].get().decode();
     }
     auto embeddings = mlx::core::reshape(
         std::move(gathered),
@@ -698,7 +698,7 @@ void MlxDeepseekV41Engram::prefetch(
     slot = std::async(
         std::launch::async,
         [table = table_, rows = std::move(rows)] {
-            return table->gather(rows);
+            return table->prepare_rows(rows);
         }).share();
 }
 
@@ -706,7 +706,7 @@ std::size_t MlxDeepseekV41Engram::cached_rows() const noexcept {
     return table_->cached_rows();
 }
 
-MlxMxfp8RowStoreStats MlxDeepseekV41Engram::ssd_stats() const {
+MlxQuantizedRowStoreStats MlxDeepseekV41Engram::ssd_stats() const {
     return table_->stats();
 }
 

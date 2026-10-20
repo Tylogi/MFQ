@@ -1,4 +1,57 @@
 #pragma once
+#include <filesystem>
+
+void qsa_streamed_graph_case() {
+    for(int width:{32,256}) {
+        CudaExecutionContext execution;
+        constexpr int hidden=32,heads=4,kv=2,iw=8,ih=2,pool=4,maximum=128,budget=16;
+        auto rotary=std::make_shared<RotaryEmbedding>(8,maximum,10000.);
+        auto norm=data({width},1,0),inorm=data({iw},1,0);
+        QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+            linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
+        QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
+        KvMemoryOptions policy;policy.placement="auto_ssd";policy.budget_policy=true;
+        policy.gpu_budget=2*(maximum+maximum/pool)*iw*2+kv*width*4*4;
+        policy.ram_limit_set=true;policy.ram_limit=256;
+        policy.directory=(std::filesystem::current_path()/"qsa-stream-graph-test").string();
+        auto memory=std::make_shared<KvMemoryManager>(policy);
+        Qsa first(weights,cfg,rotary,true,true,{},memory),second(weights,cfg,rotary,true,true,{},memory);
+        Qsa oracle_first(weights,cfg,rotary),oracle_second(weights,cfg,rotary);
+        memory->finalize();
+        if(!memory->offload())throw std::runtime_error("streamed graph oracle requires SSD overflow");
+        auto inputs=data({1,maximum,hidden},17,.4f);
+        auto history=tb::arange(6,inputs.options().dtype(tb::kInt64));
+        const auto eager=[&](Qsa& a,Qsa& b,const Tensor& input,const Tensor& positions,const Tensor& full) {
+            return b.forward(execution,a.forward(execution,input,positions,full,true),positions,full,true);
+        };
+        equal(eager(first,second,inputs.narrow(1,0,6),history,history),
+            eager(oracle_first,oracle_second,inputs.narrow(1,0,6),history,history),"streamed graph prompt");
+        first.prepare_graph(history,maximum);second.prepare_graph(history,maximum);
+        std::map<int,std::unique_ptr<Cell>> cells;
+        const auto run=[&](int tokens) {
+            const auto start=first.position();
+            auto positions=tb::arange(start,start+tokens,history.options());
+            auto& cell=cells[tokens];if(!cell)cell=std::make_unique<Cell>(tokens,hidden);
+            cell->x.copy_(inputs.narrow(1,start,tokens));cell->pos.copy_(positions);
+            cell->window.capture([&] {
+                auto branch=first.forward_graph(execution,cell->x,cell->pos,cell->pos);
+                cell->output=second.forward_graph(execution,branch,cell->pos,cell->pos);
+            },[]{},[&]{cell->output={};});
+            if(cell->window.segments()!=3)throw std::runtime_error("two streamed layers did not split into three graphs");
+            cell->window.run();first.advance_graph(tokens);second.advance_graph(tokens);
+            history=tb::cat({history,positions},-1);
+            equal(cell->output,eager(oracle_first,oracle_second,inputs.narrow(1,start,tokens),positions,history),
+                "streamed QSA graph M=1..8 against resident eager oracle");
+        };
+        for(int tokens:{1,2,3,4,5,6,7,8,1,3,6})run(tokens);
+        for(auto* layer:{&first,&second,&oracle_first,&oracle_second})layer->truncate(13);
+        history=history.narrow(0,0,13);run(6);run(1);
+        bool disk_read=false;
+        for(const auto& [name,value]:memory->offload()->metrics())if(name=="qsa_kv_ssd_reads")disk_read=value>0;
+        if(!disk_read)throw std::runtime_error("streamed QSA graph oracle did not read SSD");
+    }
+    std::cout<<"Streamed QSA M=1..8, shared staging across layers, changing positions and rollback oracle PASS\n";
+}
 
 void qsa_kv_offload_case() {
     const auto metric = [](const std::shared_ptr<KvOffloadStore>& store, const char* key) {

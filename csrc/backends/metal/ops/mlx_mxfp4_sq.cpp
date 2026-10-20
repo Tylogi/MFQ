@@ -1,7 +1,7 @@
 #include "mlx_mxfp4_sq.h"
 
 #include "mfq/quant/mxfp4_sq_blob.h"
-#include "mfq_format_compat.h"
+#include "compat/mfq_format_compat.h"
 
 #include <algorithm>
 #include <cmath>

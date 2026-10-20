@@ -1,4 +1,5 @@
 #include "native/context.h"
+#include "kernels/activation_ops.h"
 #include "kernels/kernels.h"
 #include "native/tensor/tensor.h"
 
@@ -21,7 +22,7 @@ void close(float actual, float expected, float atol, float rtol) {
     }
 }
 
-void check_glu(std::int64_t elements, ScalarType dtype, bool gelu) {
+void check_glu(std::int64_t elements, ScalarType dtype, bool gelu, bool via_wrapper) {
     const Device gpu{DeviceType::cuda, 0};
     auto host = empty({2, elements}, TensorOptions{}.dtype(kFloat32));
     for (std::int64_t i = 0; i < elements; ++i) {
@@ -33,9 +34,14 @@ void check_glu(std::int64_t elements, ScalarType dtype, bool gelu) {
     auto up = input.select(0, 1);
     auto output = empty({elements}, TensorOptions{}.dtype(dtype).device(gpu));
     const auto context = default_context(0);
-    auto fn = gelu ? kernels::gelu_mul : kernels::silu_mul;
-    fn(gate.view_descriptor(), up.view_descriptor(), output.view_descriptor(),
-       context->stream().get());
+    if (via_wrapper) {
+        // The allocating wrapper validates, allocates and takes the stream itself.
+        output = gelu ? gelu_mul_cuda(gate, up) : silu_mul_cuda(gate, up);
+    } else {
+        auto fn = gelu ? kernels::gelu_mul : kernels::silu_mul;
+        fn(gate.view_descriptor(), up.view_descriptor(), output.view_descriptor(),
+           context->stream().get());
+    }
     context->stream().synchronize();
     auto got = output.to(kFloat32).cpu();
     auto rounded = input.to(kFloat32).cpu();
@@ -129,9 +135,11 @@ int main() {
     int checked = 0;
     for (auto dtype : {mfq::cuda::kFloat16, mfq::cuda::kFloat32}) {
         for (auto count : {0, 1, 7, 32, 255, 1024, 1031}) {
-            check_glu(count, dtype, false);
-            check_glu(count, dtype, true);
-            checked += 2;
+            check_glu(count, dtype, false, false);
+            check_glu(count, dtype, true, false);
+            check_glu(count, dtype, false, true);
+            check_glu(count, dtype, true, true);
+            checked += 4;
         }
         for (int tokens = 1; tokens <= 6; ++tokens) {
             check_gate_beta(tokens, dtype);

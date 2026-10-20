@@ -1,8 +1,8 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "kernels/attention/ops.h"
-#include "csrc/backends/cuda/kernels/glm5_next.h"
-#include "csrc/backends/cuda/kernels/qwen4_exp.h"
+#include "kernels/glm5_next.h"
+#include "kernels/qwen4_exp.h"
 #include "models/glm5_next/model.h"
 #include "models/qwen4_exp/model.h"
 #include "ops/execution/cuda_execution.h"
@@ -12,6 +12,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
@@ -221,11 +222,6 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             }
         }
         return out;
-    }
-    if (op == "runtime_rotary") {
-        mfq::cuda::RotaryEmbedding rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
-            p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
-        return {rotary.forward(a.at(0),a.at(1))};
     }
     if (op == "runtime_qsa") {
         const auto linear = [&](int index) -> mfq::cuda::qwen4_exp::Linear {
@@ -589,7 +585,18 @@ int main(int argc, char** argv) {
                 for (const auto& item : request.at("inputs")) tensors.push_back(input(item));
                 const auto op = request.at("op").get<std::string>();
                 const auto params = request.value("params", Json::object());
-                const auto execute = [&] { return run(op, tensors, params); };
+                // Keep parameter caches alive across warmup, capture and replay,
+                // as the production model does.
+                std::unique_ptr<RotaryEmbedding> rotary;
+                if (op == "runtime_rotary") {
+                    rotary = std::make_unique<RotaryEmbedding>(
+                        params.at("rotary"), params.at("maximum"), params.value("base", 1e7),
+                        params.value("sections", std::vector<int64_t>{}), params.value("interleaved", false));
+                }
+                const auto execute = [&]() -> std::vector<Tensor> {
+                    if (rotary) return {rotary->forward(tensors.at(0), tensors.at(1))};
+                    return run(op, tensors, params);
+                };
                 std::vector<Tensor> result;
                 mfq::cuda::Graph graph;
                 if (request.value("graph", false)) {

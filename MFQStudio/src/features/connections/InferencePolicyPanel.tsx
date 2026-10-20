@@ -9,7 +9,7 @@ import { useSettings } from '../settings/SettingsProvider';
 
 export function InferencePolicyPanel() {
   const { runtime, ready, refreshRuntime, connectionRevision } = useRuntime();
-  const { tr } = useSettings();
+  const { settings, updateSettings, tr } = useSettings();
   const [busy, setBusy] = useState(false);
   const revision = useRef(connectionRevision);
   revision.current = connectionRevision;
@@ -26,7 +26,7 @@ export function InferencePolicyPanel() {
       await refreshRuntime();
       if (revision.current === currentRevision) toast.success(tr('服务 MTP 设置已保存', 'Service MTP setting saved'));
     } catch (cause) {
-      if (revision.current === currentRevision) toast.error(errorMessage(cause));
+      if (revision.current === currentRevision) toast.error(errorMessage(cause, tr));
     } finally {
       if (revision.current === currentRevision) setBusy(false);
     }
@@ -39,6 +39,10 @@ export function InferencePolicyPanel() {
         detail={tr('关闭后，所有模型与 API 请求均使用普通解码。切换无需重载模型。', 'When off, all models and API requests use ordinary decoding. No model reload is needed.')}
         trailing={<Switch label={tr('服务 MTP', 'Service MTP')} checked={enabled === true}
           disabled={!ready || busy || typeof enabled !== 'boolean'} onCheckedChange={(next) => void changeMtp(next)} />} />
+      <SettingRow title={tr('视觉输入', 'Vision input')}
+        detail={tr('默认启用；关闭后图片和视频请求会被明确拒绝。', 'On by default; when off, image and video requests are rejected explicitly.')}
+        trailing={<Switch label={tr('视觉输入', 'Vision input')} checked={settings.enableVision}
+          onCheckedChange={next => updateSettings({ enableVision: next, inheritModelDefaults: false })} />} />
     </TMPanel>
   </>;
 }

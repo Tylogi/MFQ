@@ -1,7 +1,7 @@
 #include "mlx_qwen35_causal_lm.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_mtp.h"
-#include "mlx_eval_timing.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_eval_timing.h"
 
 #include <algorithm>
 #include <array>

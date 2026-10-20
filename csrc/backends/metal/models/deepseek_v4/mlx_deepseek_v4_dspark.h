@@ -2,8 +2,8 @@
 
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_moe.h"
-#include "mlx_mtp.h"
-#include "mlx_tensor.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_tensor.h"
 
 #include <cstddef>
 #include <cstdint>

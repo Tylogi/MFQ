@@ -1,0 +1,100 @@
+{
+  "date": "2026-10-15",
+  "model": "Qwen3.8-Flash-Next-EWQ-V1-MFQ S2-L (five shards)",
+  "measurement": "server API; decode timing excludes all latency before first token",
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "seed": 1234
+  },
+  "context_limit": 65536,
+  "prefill_chunk": 8192,
+  "kv_format": "FP16",
+  "ssd_kv": false,
+  "ram_kv_preallocation": true,
+  "results": [
+    {
+      "case": "ordinary-cold",
+      "input_tokens": 4048,
+      "output_tokens": 937,
+      "decode_tps": 62.92700147143633,
+      "previous_decode_tps": 61.846196583461484,
+      "change_percent": 1.7475688848809012,
+      "same_request": true,
+      "same_text": true,
+      "same_usage": true,
+      "mtp_drafted_tokens": 0,
+      "mtp_accepted_tokens": 0
+    },
+    {
+      "case": "ordinary-warm",
+      "input_tokens": 4048,
+      "output_tokens": 937,
+      "decode_tps": 70.0393392111604,
+      "previous_decode_tps": 68.74780976529145,
+      "change_percent": 1.8786481347962791,
+      "same_request": true,
+      "same_text": true,
+      "same_usage": true,
+      "mtp_drafted_tokens": 0,
+      "mtp_accepted_tokens": 0
+    },
+    {
+      "case": "mtp-warm",
+      "input_tokens": 4048,
+      "output_tokens": 715,
+      "decode_tps": 66.03415441841001,
+      "previous_decode_tps": 65.49017379011848,
+      "change_percent": 0.8306293857684333,
+      "same_request": true,
+      "same_text": false,
+      "same_usage": false,
+      "mtp_drafted_tokens": 17,
+      "mtp_accepted_tokens": 11
+    }
+  ],
+  "mtp_caveat": "MTP output trajectory differs; its throughput difference is not a matched-output speedup.",
+  "dispatch_evidence": {
+    "mfe_gu_prequantized_dispatch": 1,
+    "mfe_parity_read_dispatch": 1,
+    "mfe_cache_prepare_sync_dispatch": 1,
+    "moe_kv_gpu_resident_dispatch": 49,
+    "mfe_shared_gate_prepare_dispatch": 292,
+    "mfe_transfer_hidden_fused_dispatch": 1,
+    "moe_native_direct_packet_dispatch": 145,
+    "mfe_transfer_route_list_dispatch": 1
+  },
+  "dispatch_evidence_unit": "observed log entries, not kernel invocation counts",
+  "verification": {
+    "changed_input_and_route_graph_checks": 864,
+    "m1_memcheck_graph_checks": 288,
+    "memcheck_errors": 0,
+    "synccheck_errors": 0,
+    "active_requests": 0,
+    "failed_requests": 0
+  },
+  "measurement_build_source_sha256": {
+    "cpp_runtime/backends/cuda/runtime/kv_expert_loan.h": "85d92c566074dd93477a1bd6bdfdc0fb1326a6dfb439d8865fc8367cf607310c",
+    "cpp_runtime/backends/cuda/ops/mfe_ffn.cpp": "d7c7e07c13833d89254f7ff4d46cac5c6c963d84e8028c9852edc0598909d3b5",
+    "cpp_runtime/backends/cuda/ops/include/mfe_ffn_runtime.h": "91952be1483094d669b54eacf1b8499142af8c32fd31b09e544b01122205c33b",
+    "cpp_runtime/backends/cuda/storage/moe_ffn_pipeline.cpp": "eda37c5cbce130ecdfcd3b9ed348f8eed8c9d7791768c80c70ab282c4f3d22e3",
+    "mfq/kernels/cuda/mfe_ffn_prepare.h": "0edf8297ae41072a5f03d45b79857f293fe0383e9a682dd74e732962139b7b64",
+    "mfq/kernels/cuda/mfe_ffn_prepare.cu": "8971659769826496c81ee84c73923527fe0f0b666c6ff360ff4f841ca34880d5",
+    "mfq/kernels/cuda/mfe_ffn_compact.cu": "f82cb99efe3ce383751615a83ca017769285cd755f1cd04d82da748bdc76c692",
+    "mfq/kernels/cuda/mfe_ffn_parity_read.cu": "865a0778de5de8eff2937706e5069f523acc546a5d9213cf9c925b6cbfcbf10f",
+    "mfq/kernels/cuda/mfe_ffn_gu_prequantized.cuh": "41c2acd16509bc6c46ad30eeb388145def6a93eabf837cb279217100fc6c4146",
+    "mfq/kernels/cuda/mfe_ffn_gu_transfer_routes.cuh": "4237cd1f9e97cb4f0d8b7db086198c4f335ace6dfb0c169dc69f083d8e5dee74",
+    "mfq/kernels/cuda/mfe_nvq_compact_dot.cuh": "2e7412f70f0a710fe50519a148cb543d4fd0e806781098a0931ee48f24b54bfc",
+    "mfq/kernels/cuda/mfe_nvq_parity_read.cuh": "2aa9dccda8b7c52c917d83e3e7fc3c7dae6acabc7687daff7507faea85d8238d",
+    "cpp_runtime/backends/cuda/CMakeLists.txt": "14bf68f4e2cb3456f79fe5d23ce8960f3fecf4b197ac5e127d6074710dba39cc",
+    "build/cuda-parity/mfq-runtime.exe": "090c2415d7121fedd1024cdb98b827721effd2fb0aacbf81c42908347163f6d7"
+  },
+  "limitations": "One measurement per new configuration; saved references reused without repeating baseline runs.",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3090 Ti",
+    "vram_mib": 24564,
+    "nvidia_driver": "581.57",
+    "os": "Windows"
+  }
+}

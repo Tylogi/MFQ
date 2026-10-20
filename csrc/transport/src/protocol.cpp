@@ -23,7 +23,7 @@ RuntimeProtocol::~RuntimeProtocol() {
 }
 
 void RuntimeProtocol::add_session_metrics(json& value) const {
-    for (const auto& [name, number] : scheduler_.session({SessionCommand::Kind::metrics}).metrics)
+    for (const auto& [name, number] : scheduler_.snapshot().session)
         value[name] = number;
 }
 
@@ -31,7 +31,7 @@ json RuntimeProtocol::snapshot(bool health) const {
     const auto defaults = default_sampling_params(config_);
     const auto& capabilities = config_.model_capabilities;
     json value = health ? json{{"status", reloading_ ? "loading" :
-        (scheduler_.status().healthy ? "ok" : "unhealthy")},
+        (scheduler_.snapshot().status.healthy ? "ok" : "unhealthy")},
         {"model", config_.model_name}, {"model_type", config_.model_type},
         {"probability_available", scheduler_.info().probability},
         {"max_context", context_.load()}} : metrics_.snapshot(config_, context_, reloading_);
@@ -53,7 +53,9 @@ json RuntimeProtocol::snapshot(bool health) const {
         std::lock_guard lock(realtime_gate_);
         value["duplex_active"] = !session_.empty();
     }
-    const auto runtime_metrics = std::get<Metrics>(scheduler_.control(RuntimeMetrics{}));
+    const auto snapshot=scheduler_.snapshot();
+    const auto& runtime_metrics=snapshot.runtime;
+    value["runtime_metrics_age_ms"]=std::chrono::duration<double,std::milli>(Clock::now()-snapshot.captured).count();
     for (const auto& [name, number] : runtime_metrics) value[name] = number;
     add_session_metrics(value);
     return value;
@@ -97,8 +99,13 @@ json RuntimeProtocol::call(const std::string& operation, const json& params) {
         const auto target = integer_field(params, "target_bytes", 0);
         if (target < 0) throw ApiError(400, "invalid_request_error",
             "target_bytes must be non-negative", "target_bytes");
-        json result{{"status", "ok"}, {"released_bytes", scheduler_.session(
-            {SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(target)}).count}};
+        SessionCommand command{SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(target)};
+        if(params.contains("weight_target_bytes")) {
+            const auto weight=integer_field(params,"weight_target_bytes",0);
+            if(weight<0)throw ApiError(400,"invalid_request_error","weight_target_bytes must be non-negative","weight_target_bytes");
+            command.weight_bytes=static_cast<uint64_t>(weight);
+        }
+        json result{{"status", "ok"}, {"released_bytes", scheduler_.session(command).count}};
         add_session_metrics(result);
         return result;
     }
@@ -120,6 +127,11 @@ json RuntimeProtocol::call(const std::string& operation, const json& params) {
             if (disk < 0) throw ApiError(400, "invalid_request_error",
                 "disk_target_bytes must be non-negative", "disk_target_bytes");
             command.disk_bytes = static_cast<uint64_t>(disk);
+        }
+        if(budget && params.contains("ram_target_bytes")) {
+            const auto ram=integer_field(params,"ram_target_bytes",0);
+            if(ram<0)throw ApiError(400,"invalid_request_error","ram_target_bytes must be non-negative","ram_target_bytes");
+            command.ram_bytes=static_cast<uint64_t>(ram);
         }
         json result{{"status", "ok"}, {clear ? "released_snapshots" : "released_bytes",
             scheduler_.session(command).count}};

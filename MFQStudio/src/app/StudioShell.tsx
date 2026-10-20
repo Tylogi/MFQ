@@ -7,8 +7,10 @@ import { useSettings } from '../features/settings/SettingsProvider';
 import { ToastContainer } from '../shared/ui/Toast';
 import { FailurePage } from './FailurePage';
 import { LoadingPage } from './LoadingPage';
+import { LoginPage } from './LoginPage';
 import { StudioSidebar } from './StudioSidebar';
 import { RuntimeAlerts } from './RuntimeAlerts';
+import { ServerConnectionPage } from './ServerConnectionPage';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
 
 /** 隔离单个业务路由的渲染错误，切换路径后恢复其他页面。 */
@@ -31,7 +33,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
 export function StudioShell() {
   const location = useLocation();
   const { tr } = useSettings();
-  const { connectionError, refreshError, jobStreamErrors, ready, reloadService, connectionRevision } = useRuntime();
+  const { connectionError, refreshError, jobStreamErrors, ready, reloadService, connectionRevision, authenticationRequired, studio } = useRuntime();
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const pageAvailable = ready || view === 'not-found' ||
@@ -43,8 +45,10 @@ export function StudioShell() {
   useEffect(() => {
     const title = location.pathname === '/'
       ? 'Overview' : location.pathname.slice(1).replaceAll('-', ' ');
-    document.title = `${title} · MFQ Studio`;
-  }, [location.pathname]);
+    document.title = `${authenticationRequired ? tr('登录', 'Sign in') : title} · MFQ Studio`;
+  }, [location.pathname, authenticationRequired, tr]);
+
+  if (authenticationRequired) return <LoginPage />;
 
   return (
     <TooltipPrimitive.Provider delayDuration={300}>
@@ -63,6 +67,8 @@ export function StudioShell() {
                 <Outlet />
               </Suspense>
             </PageErrorBoundary>
+          ) : studio?.connection === 'confirmation_required' || studio?.connection === 'incompatible' ? (
+            <ServerConnectionPage />
           ) : connectionProblem ? (
             <FailurePage detail={connectionProblem} kind="connection"
               onRetry={() => void reloadService()} />

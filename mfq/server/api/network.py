@@ -3,13 +3,76 @@
 from __future__ import annotations
 
 import ipaddress
+import asyncio
 import os
+import ssl
+import time
 import urllib.request
 from collections.abc import Mapping
 from urllib.request import getproxies
 from urllib.parse import urlparse
 
+import httpx
+
 _LOCAL_BYPASS = ("127.0.0.1", "localhost", "::1")
+_DOWNLOAD_ROUTES: dict[tuple[str, str | None], tuple[float, bool, float]] = {}
+
+
+def hub_download_url(provider: str, repo_id: str, revision: str, filename: str) -> str:
+    from urllib.parse import quote
+    if provider == 'huggingface':
+        endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/')
+        return f'{endpoint}/{repo_id}/resolve/{quote(revision, safe="")}/{quote(filename, safe="/")}'
+    endpoint = os.environ.get('MODELSCOPE_ENDPOINT', 'https://modelscope.cn').rstrip('/')
+    return f'{endpoint}/api/v1/models/{repo_id}/repo?Revision={quote(revision, safe="")}&FilePath={quote(filename, safe="/")}'
+
+
+def _proxy_for(endpoint: str, environment: Mapping[str, str]) -> str | None:
+    parsed = urlparse(endpoint)
+    if urllib.request.proxy_bypass_environment(parsed.hostname or '', {'no': environment.get('NO_PROXY', '')}):
+        return None
+    return (environment.get(f'{parsed.scheme}_proxy') or environment.get(f'{parsed.scheme.upper()}_PROXY')
+        or environment.get('all_proxy') or environment.get('ALL_PROXY'))
+
+
+async def probe_download_route(url: str) -> tuple[bool, float]:
+    environment = system_proxy_environment()
+    proxy = _proxy_for(url, environment)
+    parsed = urlparse(url)
+    key = (f'{parsed.scheme}://{parsed.netloc}', proxy)
+    cached = _DOWNLOAD_ROUTES.get(key)
+    if cached is not None and time.monotonic() - cached[0] < 300:
+        return cached[1], cached[2]
+
+    async def measure(route: str | None) -> float:
+        async def read() -> float:
+            started = time.monotonic()
+            verify = ssl.create_default_context(cafile=environment.get('SSL_CERT_FILE'), capath=environment.get('SSL_CERT_DIR'))
+            async with httpx.AsyncClient(proxy=route, trust_env=False, follow_redirects=True, verify=verify,
+                    timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+                async with client.stream('GET', url, headers={'Range': 'bytes=0-1048575', 'Accept-Encoding': 'identity'}) as response:
+                    response.raise_for_status()
+                    if response.status_code not in {200, 206} or 'json' in response.headers.get('content-type', ''):
+                        return 0.0
+                    size = 0
+                    async for chunk in response.aiter_raw(65536):
+                        size += len(chunk)
+                        if size >= 1048576:
+                            break
+                    return size / max(0.001, time.monotonic() - started)
+        try:
+            return await asyncio.wait_for(read(), timeout=6.0)
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError):
+            return 0.0
+
+    speeds = await asyncio.gather(measure(None), measure(proxy)) if proxy else [await measure(None)]
+    use_proxy = bool(proxy and speeds[1] > speeds[0])
+    speed = speeds[int(use_proxy)]
+    if speed > 0:
+        if len(_DOWNLOAD_ROUTES) >= 64:
+            _DOWNLOAD_ROUTES.pop(next(iter(_DOWNLOAD_ROUTES)))
+        _DOWNLOAD_ROUTES[key] = (time.monotonic(), use_proxy, speed)
+    return use_proxy, speed
 
 
 def is_loopback_bind_host(value: str) -> bool:
@@ -113,7 +176,7 @@ def install_system_proxy_environment() -> None:
     os.environ["no_proxy"] = resolved["no_proxy"]
 
 
-async def download_environment(endpoint: str, *, direct: bool = False) -> tuple[dict[str, str], bool]:
+async def download_environment(endpoint: str, *, direct: bool = False, sample_url: str | None = None) -> tuple[dict[str, str], bool]:
     environment = system_proxy_environment()
     direct_environment = dict(environment)
     for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
@@ -126,4 +189,8 @@ async def download_environment(endpoint: str, *, direct: bool = False) -> tuple[
     bypass = urllib.request.proxy_bypass_environment(parsed.hostname or "", {"no": environment["NO_PROXY"]})
     if direct or not proxy or bypass:
         return direct_environment, False
+    if sample_url is not None:
+        use_proxy, speed = await probe_download_route(sample_url)
+        if speed > 0 and not use_proxy:
+            return direct_environment, False
     return environment, True

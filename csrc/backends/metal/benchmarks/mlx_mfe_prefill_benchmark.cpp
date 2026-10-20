@@ -1,7 +1,7 @@
-#include "mfq_container.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_moe.h"
-#include "mlx_moe_ops.h"
+#include "storage/mfq_container.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "ops/mlx_moe.h"
+#include "ops/mlx_moe_ops.h"
 
 #include <mlx/mlx.h>
 #include <mlx/primitives.h>

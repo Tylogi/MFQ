@@ -2,9 +2,9 @@
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
-#include "storage/loaders/weight.h"
+#include "storage/weights/loaders/weight.h"
 #include "common/gated_mlp.h"
-#include "common/moe.h"
+#include "ops/moe/moe.h"
 #include "common/transformer_layer.h"
 #include "models/common/session_codec.h"
 
@@ -105,7 +105,7 @@ struct BlockLoader : weight_loader::Loader {
     }
     static auto mla(MlaWeights weights, const Config &c) {
         MlaConfig geometry{c.heads, c.nope, c.latent, c.value_width, c.index_heads, c.index_width,
-                           c.pool, c.budget, c.maximum, c.tail, c.eps};
+                           c.pool, c.budget, c.max_position_embeddings, c.tail, c.eps};
         return std::make_unique<SparseMla>(std::move(weights), geometry);
     }
     static auto gated_mlp(Linear gate, Linear up, Linear down, double limit) {
@@ -299,11 +299,11 @@ bool Glm5NextMtp::preserve_output_dtype() const noexcept { return true; }
 
 namespace mfq::cuda {
 
-void Glm5Model::adapter_validate_load_options() const {
+void Glm5Model::validate_load_options() const {
     weight_loader::validate_load_options(*execution);
 }
 
-std::unique_ptr<Block> Glm5Model::adapter_load_block(const mfq::ModelSource &source, int layer, int,
+std::unique_ptr<Block> Glm5Model::load_block(const mfq::ModelSource &source, int layer, int,
                                                      const std::string &) {
     return std::make_unique<glm5_next::Glm5NextBlock>(*execution, source, config, layer);
 }
@@ -320,19 +320,19 @@ Glm5Model::normalize_hidden(mfq_tensor_backend::Tensor hidden,
 }
 
 mfq_tensor_backend::Tensor
-Glm5Model::adapter_raw_hidden(const mfq_tensor_backend::Tensor &,
+Glm5Model::extract_raw_hidden(const mfq_tensor_backend::Tensor &,
                               const mfq_tensor_backend::Tensor &finalized) const {
     return finalized;
 }
 
-mfq_tensor_backend::Tensor Glm5Model::adapter_last_logits(const QuantLinear &lm_head,
+mfq_tensor_backend::Tensor Glm5Model::last_logits_from_head(const QuantLinear &lm_head,
                                                           mfq_tensor_backend::Tensor hidden) const {
-    return adapter_logits(lm_head, std::move(hidden));
+    return logits_from_head(lm_head, std::move(hidden));
 }
 
-mfq_tensor_backend::Tensor Glm5Model::adapter_next_token(const QuantLinear &lm_head,
+mfq_tensor_backend::Tensor Glm5Model::next_token_from_head(const QuantLinear &lm_head,
                                                          mfq_tensor_backend::Tensor hidden) const {
-    return mfq_tensor_backend::argmax(adapter_logits(lm_head, std::move(hidden)), -1)
+    return mfq_tensor_backend::argmax(logits_from_head(lm_head, std::move(hidden)), -1)
         .to(mfq_tensor_backend::kInt64);
 }
 
@@ -341,6 +341,13 @@ mfq_tensor_backend::Tensor Glm5Model::adapter_next_token(const QuantLinear &lm_h
 namespace mfq::cuda {
 
 template struct CudaSessionCodec<Glm5Model>;
+
+CudaModelPlan Glm5Model::plan_components(const mfq::ModelGraph &graph) {
+    CudaModelPlan result;
+    if (declares_next_token_predictor(graph))
+        result.predictor = policy.predictor;
+    return result;
+}
 
 } // namespace mfq::cuda
 

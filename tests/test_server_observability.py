@@ -36,6 +36,30 @@ class StatusBackend:
         return None
 
 
+@pytest.mark.parametrize("backend_status,expected_status", [(None, 503), (504, 504), (409, 409)])
+def test_instance_status_timeout_returns_a_valid_http_error(tmp_path, backend_status, expected_status):
+    async def run():
+        async def status(instance_id):
+            raise BackendError("backend_timeout", "stdio status timed out", retryable=True,
+                status_code=backend_status)
+
+        store = SessionStore(tmp_path / "state.sqlite3")
+        service = ServerService(store, StatusBackend())
+        service.runtime_manager = SimpleNamespace(runtime_status=status)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)),
+                base_url="http://test") as client:
+                response = await client.get("/api/v1/runtime/status", params={"instance_id": str(INSTANCE_ID)})
+            assert response.status_code == expected_status
+            assert response.json()["error"]["code"] == "backend_timeout"
+            assert response.json()["error"]["retryable"] is True
+        finally:
+            service.runtime_manager = None
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_runtime_metrics_and_logs_persist_and_filter(tmp_path: Path) -> None:
     async def run() -> None:
         store = SessionStore(tmp_path / "mfq.server.sqlite3")

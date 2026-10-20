@@ -154,7 +154,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "glm5_next"; }
     template <class Graph, class Source>
-    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+    void load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
@@ -165,7 +165,6 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.num_attention_heads = config.heads;
         metadata.num_key_value_heads = 1;
         metadata.head_dim = config.nope;
-        metadata.max_position_embeddings = config.maximum;
         metadata.num_experts = config.experts;
         metadata.hc_mult = config.streams;
         metadata.rope_base = 1.0;
@@ -176,16 +175,15 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.model_type = "glm5_next";
         metadata.layer_types = config.layer_types;
     }
-    Tensor adapter_finalize_hidden(Tensor hidden, const Tensor &output_norm, int64_t batch,
+    Tensor finalize_hidden(Tensor hidden, const Tensor &output_norm, int64_t batch,
                                    int64_t tokens) const {
         auto collapsed = this->collapse_hidden(std::move(hidden), batch, tokens);
         return this->normalize_hidden(std::move(collapsed), output_norm, batch, tokens);
     }
-    Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
+    Tensor prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
         return this->expand_hidden(std::move(hidden), batch, tokens, this->metadata.hc_mult);
     }
-    void adapter_set_max_position_embeddings(int64_t value) { this->config.maximum = value; }
-    void adapter_validate_forward(int64_t, int64_t tokens, int64_t cache_position,
+    void validate_forward(int64_t, int64_t tokens, int64_t cache_position,
                                   bool has_position_override, bool has_cache_position_override,
                                   bool has_attention_mask) const {
         require_model(
@@ -194,7 +192,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
             "GLM Flash-Next currently requires contiguous causal cache positions "
             "without an external mask");
     }
-    bool adapter_supports_speculation() const noexcept { return true; }
+    bool family_supports_speculation() const noexcept { return true; }
 };
 
 } // namespace mfq::models::glm5_next

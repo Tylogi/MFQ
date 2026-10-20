@@ -59,8 +59,8 @@ export function ResourceMonitorPanel() {
   }
   const compute = [{ name: deviceLabel('CPU', resources?.cpu_name, resources?.cpu_cores),
     utilization_percent: resources?.cpu_utilization_percent },
-    ...(resources?.gpus.length ? resources.gpus.map((gpu) => ({
-      name: deviceLabel('GPU', gpu.name, gpu.core_count), utilization_percent: gpu.utilization_percent,
+    ...(resources?.gpus.length ? resources.gpus.map((gpu, index) => ({
+      name: deviceLabel(`GPU ${gpu.id ?? index}`, gpu.name, gpu.core_count), utilization_percent: gpu.utilization_percent,
     })) : [{ name: deviceLabel('GPU'), utilization_percent: null }])];
   return <>
     <SectionLabel title={tr('资源监控', 'Resource monitoring')}
@@ -78,7 +78,7 @@ export function ResourceMonitorPanel() {
           <small>{tr('整机占用', 'System utilization')}</small>
         </div>)}
         {hasSeparateVram(runtime) && resources?.gpus.map((gpu, index) => <div className="resource-monitor-metric" key={`vram-${index}`}>
-          <span>{tr('显存占用', 'VRAM used')} · {gpu.name}</span>
+          <span>{tr('显存占用', 'VRAM used')} · GPU {gpu.id ?? index} · {gpu.name}</span>
           <strong>{gpu.memory_used_bytes == null ? '--' : `${formatNumber(gpu.memory_used_bytes / 2 ** 30, 1)} GiB`}</strong>
           <small>{tr('总显存', 'Total VRAM')} {gpu.memory_total_bytes == null ? '--' : `${formatNumber(gpu.memory_total_bytes / 2 ** 30, 1)} GiB`}
             {' · '}{tr('可用', 'Available')} {gpu.memory_available_bytes == null ? '--' : `${formatNumber(gpu.memory_available_bytes / 2 ** 30, 1)} GiB`}</small>

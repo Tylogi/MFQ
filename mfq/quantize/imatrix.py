@@ -99,7 +99,13 @@ class ImportanceMatrix:
             return None
         name, entry = match
         neuron_len = int(storage_shape[1])
-        if entry.width != neuron_len:
+        flattened_matrix_vectors = (
+            len(original_shape) == 3
+            and entry.matrices == 1
+            and int(original_shape[-1]) == neuron_len
+            and entry.width == int(original_shape[0]) * int(original_shape[-1])
+        )
+        if entry.width != neuron_len and not flattened_matrix_vectors:
             raise ValueError(
                 f"imatrix width mismatch for {name}: {entry.width} != {neuron_len}"
             )
@@ -113,7 +119,19 @@ class ImportanceMatrix:
             int(row_ids.min()) < 0 or int(row_ids.max()) >= int(storage_shape[0])
         ):
             raise IndexError(f"imatrix row selection is outside {storage_shape[0]} rows")
-        if entry.matrices == 1:
+        if flattened_matrix_vectors:
+            matrices, rows_per_matrix, _ = original_shape
+            if int(storage_shape[0]) != int(matrices) * int(rows_per_matrix):
+                raise ValueError(
+                    f"imatrix 3D row layout mismatch for {name}: "
+                    f"{storage_shape[0]} != {int(matrices) * int(rows_per_matrix)}"
+                )
+            matrix_ids = row_ids // int(rows_per_matrix)
+            matrix_vectors = entry.values[0].reshape(int(matrices), neuron_len)
+            input_importance = np.ascontiguousarray(
+                matrix_vectors[matrix_ids], dtype=np.float32
+            )
+        elif entry.matrices == 1:
             input_importance = entry.values[0]
         # Older native activation-aware artifacts may carry one input vector per
         # weight row. Keep reading them, but NAQ-imatrix uses the compact
