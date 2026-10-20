@@ -633,7 +633,11 @@ void check_standalone_prefetch(const std::filesystem::path& root) {
     check(after.at("ssd_router_prefetch_jobs")>before.at("ssd_router_prefetch_jobs") &&
           after.at("ssd_router_prefetch_used_jobs")>before.at("ssd_router_prefetch_used_jobs"),
           "standalone FFN did not consume predicted SSD expert reads");
-    check(after.at("ssd_router_gpu_protected_fields")>0,"standalone forecast did not protect existing GPU fields");
+    // Hybrid dispatch may keep predicted experts entirely on the CPU, with
+    // no temporary GPU fields to retain. GPU-only cases exercise retention;
+    // both placements must still consume predictions and stay within budget.
+    if(!candidate.hybrid)
+        check(after.at("ssd_router_gpu_protected_fields")>0,"standalone forecast did not protect existing GPU fields");
     check(candidate.sources[0]->host_cache()->stats().managed_peak_bytes<=candidate.execution.config.moe_host_cache_bytes,
           "standalone prediction exceeded the RAM expert cache budget");
     {
