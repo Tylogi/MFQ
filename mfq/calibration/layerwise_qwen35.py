@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from mfq.calibration.artifact import CalibrationScheme
+from mfq.calibration.masking import create_causal_mask_compat as _create_causal_mask_compat
 from mfq.calibration.qwen35 import (
     HfSafetensorIndex,
     Qwen35LinearTarget,
@@ -69,19 +70,6 @@ class _OpenSafetensorRows:
 
     def rows(self, start: int, end: int) -> torch.Tensor:
         return self.reader.get_slice(self.name)[start:end].contiguous()
-
-
-def _create_causal_mask_compat(factory, **arguments):
-    """Call the Transformers mask API across its cache-position transition."""
-
-    try:
-        return factory(**arguments)
-    except TypeError as error:
-        # Transformers 5.14 removed the deprecated cache_position argument;
-        # earlier supported releases still require it.
-        if "cache_position" not in str(error):
-            raise
-        return factory(**arguments, cache_position=None)
 
 
 def _module(root: nn.Module, name: str) -> nn.Module:
