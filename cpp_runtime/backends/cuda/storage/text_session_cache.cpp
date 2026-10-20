@@ -91,6 +91,9 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     if (!source.source_paths().empty()) cache.model_path = source.source_paths().front();
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);
     cache.block_size_tokens = static_cast<size_t>(config.block_tokens);
+    // A longer block may lack the local/rolling state of a shorter exact
+    // checkpoint. Retain those boundaries under the existing byte-budget LRU.
+    cache.retain_tail_versions = 0;
     cache.max_disk_bytes = config.disk_bytes;
     const bool separate = cuda_has_separate_memory();
     cache.max_hot_bytes = separate ? config.ram_bytes : config.hot_bytes;

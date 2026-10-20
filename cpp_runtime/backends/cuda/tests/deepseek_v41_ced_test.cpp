@@ -263,6 +263,37 @@ void check_paged_sessions() {
     }
     std::cout<<"paged_session_cases="<<cases<<" compression/ring/Engram/RAM/SSD/media/MTP-upgrade/corruption PASS\n";
 }
+void check_prefix_tail_retention() {
+    using mfq::cuda::internal::TextSessionCache;
+    CudaExecutionContext execution;auto model=make_model(execution);
+    std::vector<int64_t> tokens(62);for(int i=0;i<62;++i)tokens[i]=i%8;
+    deepseek_v41_prefill_hidden(model,ids(62),64);
+    mfq::cache::PagedPrefixCacheConfig config;
+    config.cache_dir=std::filesystem::temp_directory_path()/
+        ("mfq-v41-prefix-retention-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    config.compatibility_key="v41-checkpoint-retention";config.block_size_tokens=64;
+    config.max_hot_bytes=32ULL<<20;config.max_disk_bytes=64ULL<<20;
+    config.spill_hot_on_eviction=true;config.retain_tail_versions=0;
+    auto paged=std::make_shared<mfq::cache::PagedPrefixCache>(config);
+    mfq::engine::PrefixCacheConfig prefix;prefix.hot_bytes=0;prefix.ram_bytes=config.max_hot_bytes;
+    TextSessionCache cache({},prefix,paged,true,0,true);
+    cache.store("",model.capture_text_session_state(tokens));
+    model.hidden_forward(ids(1));tokens.push_back(0);
+    auto saved=model.capture_text_session_state(tokens);cache.store("",saved);
+    const auto prompt=tokens;auto expected=model.hidden_forward(ids(1));tokens.push_back(0);
+    cache.store("",model.capture_text_session_state(tokens));
+    model.hidden_forward(ids(1));tokens.push_back(0);cache.store("",model.capture_text_session_state(tokens));
+    // Extending a generation must preserve the reusable prompt boundary,
+    // even with a longer old tail and a new full block under the same parent.
+    auto retry=prompt;retry.push_back(0);
+    for(bool disk:{false,true}) {
+        if(disk){cache.set_ram_limit(0);paged->flush();}
+        require(cache.restore_best(model,nullptr,"",retry,prompt.size()).tokens==prompt.size(),
+            "generation extension discarded the exact prompt checkpoint");
+        require(model.hidden_forward(ids(1)).equal(expected),"retained prompt checkpoint changed the next token");
+    }
+    std::cout<<"prefix_tail_retention RAM/SSD/short-checkpoint/full-block/retry PASS\n";
+}
 void check_exact_short() {
     CudaExecutionContext execution;
     auto model=make_model(execution);
@@ -389,9 +420,10 @@ int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--modality-routing-check"){check_modality_routing();return 0;}
     if(argc==2 && std::string(argv[1])=="--session-check"){check_session_snapshots();run_dspark_self_check();return 0;}
     if(argc==2 && std::string(argv[1])=="--paged-session-check"){check_paged_sessions();run_dspark_self_check();return 0;}
+    if(argc==2 && std::string(argv[1])=="--prefix-retention-check"){check_prefix_tail_retention();return 0;}
     if(argc==2 && std::string(argv[1])=="--short-prefill-check"){check_short_prefill_tiles();return 0;}
     if(argc==2 && std::string(argv[1])=="--short-prefill-four-check"){check_short_prefill_tiles(4);return 0;}
-    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_short_prefill_tiles(4);check_long_and_cancel();check_retained_prefix();check_session_snapshots();check_paged_sessions();run_dspark_self_check();
+    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_short_prefill_tiles(4);check_long_and_cancel();check_retained_prefix();check_session_snapshots();check_paged_sessions();check_prefix_tail_retention();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;
