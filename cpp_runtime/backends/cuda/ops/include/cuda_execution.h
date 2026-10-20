@@ -68,6 +68,8 @@ struct CudaPreparedPrompt {
     std::vector<std::int64_t> token_ids;
     mfq_tensor_backend::Tensor embeddings;
     mfq_tensor_backend::Tensor positions;
+    // Optional [1,tokens] participation mask for multimodal prompt rows.
+    mfq_tensor_backend::Tensor image_mask;
     int decode_position_delta = 0;
     std::string cache_key;
 

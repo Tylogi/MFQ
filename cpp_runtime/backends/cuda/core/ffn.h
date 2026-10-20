@@ -29,6 +29,7 @@ struct FFN {
     mfq_tensor_backend::Tensor moe_router;
     mfq_tensor_backend::Tensor moe_shared_gate;
     mfq_tensor_backend::Tensor moe_router_bias;
+    mfq_tensor_backend::Tensor moe_vision_bias;
     mfq_tensor_backend::Tensor moe_hash_ids;
     std::unique_ptr<FFN> shared;
     int moe_top_k = 0;
@@ -64,7 +65,8 @@ struct FFN {
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-        bool allow_important_neurons) const;
+        bool allow_important_neurons,
+        MfqOptional<mfq_tensor_backend::Tensor> vision_mask = mfq_nullopt) const;
     bool can_forward_fused_residual(
         const CudaExecutionConfig& config,
         const mfq_tensor_backend::Tensor& x,
@@ -77,7 +79,8 @@ struct FFN {
     mfq_tensor_backend::Tensor forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
-        MfqOptional<mfq_tensor_backend::Tensor> input_ids = mfq_nullopt) const;
+        MfqOptional<mfq_tensor_backend::Tensor> input_ids = mfq_nullopt,
+        MfqOptional<mfq_tensor_backend::Tensor> vision_mask = mfq_nullopt) const;
 };
 
 void prepare_ffn_workspaces(CudaExecutionContext& execution, FFN& ffn);

@@ -12,6 +12,21 @@ FFN load_moe_at(CudaExecutionContext &execution, const mfq::ModelSource &model,
                                    {.layer = static_cast<int>(layer),
                                     .router_bias_required = true,
                                     .shared_gate_up_compatible_prefix = 0});
+    const auto vision_bias_name = prefix + "router.vision_bias";
+    if (has_tensor(model, vision_bias_name)) {
+        result.moe_vision_bias =
+            load_dense_gpu(execution, model, vision_bias_name)
+                .to(mfq_tensor_backend::kFloat32)
+                .contiguous();
+        // The DSpark predictor routes over its own (smaller) expert bank, so
+        // the visual bias must match this MoE's router, not the backbone's.
+        const auto experts = result.moe_router_bias.numel();
+        if (result.moe_vision_bias.dim() != 1 || result.moe_vision_bias.size(0) != experts) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 visual router bias geometry mismatch at " + vision_bias_name +
+                ": expected [" + std::to_string(experts) + "] experts");
+        }
+    }
     result.moe_top_k = static_cast<int>(top_k);
     result.moe_use_sqrt_softplus = true;
     result.moe_normalize = config.norm_topk_prob;

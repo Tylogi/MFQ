@@ -200,6 +200,11 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
     if (model.plan.vision == CudaVisionAdapter::grid_vit && execution.dense_cpu_layer_count > 0) {
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     }
+    if (model.plan.vision == CudaVisionAdapter::deepseek_v41_axial &&
+        execution.dense_cpu_layer_count > 0) {
+        throw std::runtime_error(
+            "CUDA DeepSeek-V4.1 vision requires GPU-resident text layers");
+    }
 
     if (model.adapter_uses_common_rope()) {
         auto make_rope = [&](mfq_tensor_backend::Device device) {
@@ -426,10 +431,26 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
-            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
-             result.plan.predictor !=
-                 mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark)) {
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::deepseek_v41_axial) {
+        const auto* component = result.graph.component("vision");
+        if (component == nullptr || !model.config.has_vision() ||
+            model.config.image_token_id < 0) {
+            throw std::runtime_error(
+                "CUDA DeepSeek-V4.1 vision configuration is incomplete");
+        }
+        result.deepseek_v41_vision.emplace(
+            mfq::cuda::deepseek_v41_vision::
+                CudaDeepseekV41VisionPromptComponent::load(
+                    *model.execution, *model.source, model.config,
+                    component->input_contract, component->position_policy));
+        result.vision_available = true;
+    } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {
+        throw std::runtime_error(
+            "unsupported DeepSeek-V4.1 CUDA vision adapter");
+    }
+    if (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+        result.plan.predictor !=
+            mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark) {
         throw std::runtime_error(
             "unsupported DeepSeek-V4.1 CUDA component adapter");
     }

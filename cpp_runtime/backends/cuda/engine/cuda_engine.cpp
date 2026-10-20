@@ -433,6 +433,8 @@ struct CudaEngineState {
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
         if (components.composite) return components.composite->prepare(input.prompt, *input.vision);
         if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
+        if (components.deepseek_v41_vision)
+            return components.deepseek_v41_vision->prepare(language, input.prompt, *input.vision);
         throw std::invalid_argument("model has no multimodal component");
     }
     auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
@@ -642,7 +644,9 @@ struct CudaBackend {
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();
-            info.multimodal = state.components.grid_vision.has_value() || bool(state.components.composite);
+            info.multimodal = state.components.grid_vision.has_value() ||
+                state.components.deepseek_v41_vision.has_value() ||
+                bool(state.components.composite);
             info.reload = true;
             const auto caps = cuda_runtime_capabilities(state.components.graph, state.components.plan,
                 state.components.state(), info.multimodal, bool(state.components.composite));

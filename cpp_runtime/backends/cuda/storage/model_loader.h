@@ -2,6 +2,7 @@
 
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
+#include "models/deepseek_v41/vision.h"
 #include "models/gemma4/ops.h"
 #include "models/glm5_next/ops.h"
 #include "models/glm_dsa/ops.h"
@@ -28,6 +29,10 @@ struct RuntimeComponents {
     std::optional<
         mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent>
         grid_vision;
+    std::optional<
+        mfq::cuda::deepseek_v41_vision::
+            CudaDeepseekV41VisionPromptComponent>
+        deepseek_v41_vision;
     std::unique_ptr<MtpModule> mtp;
     Model* language_override = nullptr;
     std::unique_ptr<mfq::cuda::minicpmo45::Components> composite;

@@ -26,6 +26,7 @@ enum class CudaBackbone {
 enum class CudaVisionAdapter {
     none,
     grid_vit,
+    deepseek_v41_axial,
     minicpmo45,
 };
 
@@ -100,6 +101,13 @@ inline CudaModelPlan cuda_model_plan(
         vision->position_policy == kMfqGridMropePositionPolicy) {
         result.vision = CudaVisionAdapter::grid_vit;
     }
+    if (graph.backbone == "deepseek_v41" && vision != nullptr &&
+        vision->tensor_root == "vision" &&
+        vision->implementation == kMfqDeepseekV41VisionImplementation &&
+        vision->input_contract == kMfqDeepseekV41VisionInputContract &&
+        vision->position_policy == kMfqDeepseekV41PositionPolicy) {
+        result.vision = CudaVisionAdapter::deepseek_v41_axial;
+    }
     const auto* audio = graph.component("audio_input");
     const auto* tts = graph.component("audio_output");
     // The current CUDA MiniCPM adapter is one composite implementation.  Do
@@ -137,6 +145,7 @@ inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
     if (!result.text) return result;
     result.image_input =
         plan.vision == CudaVisionAdapter::grid_vit ||
+        plan.vision == CudaVisionAdapter::deepseek_v41_axial ||
         plan.vision == CudaVisionAdapter::minicpmo45;
     result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
     result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;

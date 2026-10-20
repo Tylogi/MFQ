@@ -42,6 +42,7 @@ HashBatch append_hash_tail(const HashBatch& previous, const HashBatch& current, 
 Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
                                    int64_t compute_chunk, const std::function<bool()>& stopped, Tensor* raw_hidden) {
     auto scope = model.execution_scope();
+    model.set_multimodal_mask({});
     ids = model.device_ids(std::move(ids));
     const auto batch = ids.size(0), tokens = ids.size(1);
     const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");

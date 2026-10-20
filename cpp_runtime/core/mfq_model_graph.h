@@ -19,6 +19,12 @@ inline constexpr std::string_view kMfqGridVisionInputContract =
     "grid_vision.v1";
 inline constexpr std::string_view kMfqGridMropePositionPolicy =
     "grid_mrope";
+inline constexpr std::string_view kMfqDeepseekV41VisionImplementation =
+    "deepseek_v41_vision";
+inline constexpr std::string_view kMfqDeepseekV41VisionInputContract =
+    "deepseek_v41_vision.v1";
+inline constexpr std::string_view kMfqDeepseekV41PositionPolicy =
+    "deepseek_v41_positions";
 
 struct MfqGraphTopology {
     std::int64_t text_layers = 0;

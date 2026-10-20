@@ -344,11 +344,13 @@ function(mfq_configure_cuda_runtime_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
+    ${MFQ_CUDA_ROOT}/core/axial_patch_vision.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/engram.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/prefill.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/vision.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_memory.cpp
@@ -712,6 +714,16 @@ if(BUILD_TESTING)
     if(MSVC)
         target_compile_options(mfq-deepseek-v41-hc-bench PRIVATE /EHsc)
     endif()
+    add_executable(mfq-cuda-deepseek-v41-axial-vision-test
+        ${MFQ_CUDA_ROOT}/tests/deepseek_v41_axial_vision_gpu_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-deepseek-v41-axial-vision-test)
+    target_compile_definitions(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE mfq-cuda-runtime)
+    target_compile_features(mfq-cuda-deepseek-v41-axial-vision-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-deepseek-v41-axial-vision-test
+        COMMAND mfq-cuda-deepseek-v41-axial-vision-test)
+    set_tests_properties(mfq-cuda-deepseek-v41-axial-vision-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

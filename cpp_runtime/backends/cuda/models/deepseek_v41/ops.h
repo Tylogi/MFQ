@@ -40,6 +40,7 @@ struct SharedState {
     Tensor attention_meta;
     std::unique_ptr<EngramHashState> engram_hash;
     EngramHashBatch engram_hashes;
+    Tensor vision_mask;
     std::vector<Engram*> engram_prefetch;
     std::vector<Tensor> dspark_target_hiddens;
     bool capture_dspark_targets = false;
@@ -143,7 +144,8 @@ struct SharedState {
                                   token_ids.size(0) == current_batch &&
                                   token_ids.size(1) == current_tokens,
                               "DeepSeek-V4.1 Engram token state is unavailable");
-            engram_hashes = engram_hash->forward(token_ids, current_position);
+            engram_hashes = engram_hash->forward(
+                token_ids, current_position, vision_mask);
         }
         MFQ_RUNTIME_CHECK(layer == next_layer && layer >= 0 && layer < layer_count &&
                               current_batch == batch && current_tokens == tokens &&
@@ -815,7 +817,9 @@ struct Block final : ::Block {
             std::move(hidden), bool(engram), shared->previous_pre,
             [&](Tensor value) {
                 return profiler.measure("deepseek_v41.engram", [&] {
-                    return engram->forward(execution, value, shared->engram_hashes);
+                    return engram->forward(
+                        execution, value, shared->engram_hashes,
+                        shared->vision_mask);
                 });
             },
             [&](const Tensor &value) { shared->capture_dspark_target(layer, config, value); },
@@ -841,7 +845,8 @@ struct Block final : ::Block {
             },
             [&](Tensor value) {
                 return profiler.measure("deepseek_v41.mlp", [&] {
-                    return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
+                    return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids,
+                                       shared->vision_mask)
                         .reshape({batch, tokens, config.hidden});
                 });
             });
@@ -910,6 +915,9 @@ struct DeepseekV41Model : CausalResources {
     void adapter_begin_speculative();
     void adapter_commit_speculative();
     void adapter_rollback_speculative(int64_t keep);
+    void set_multimodal_mask(mfq_tensor_backend::Tensor mask) {
+        if (shared) shared->vision_mask = std::move(mask);
+    }
 };
 
 extern template struct CudaSessionCodec<DeepseekV41Model>;

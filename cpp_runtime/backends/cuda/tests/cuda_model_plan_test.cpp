@@ -208,31 +208,58 @@ int main() {
                 "Flash-Next predictor declaration was confused with loaded weights");
         }
 
-        const auto deepseek_v41 = graph_with(
+        auto deepseek_v41 = graph_with(
             "deepseek_v41", "deepseek_v41_vision", "deepseek_v41_dspark");
+        deepseek_v41.components.at(1).input_contract =
+            mfq::kMfqDeepseekV41VisionInputContract;
+        deepseek_v41.components.at(1).position_policy =
+            mfq::kMfqDeepseekV41PositionPolicy;
         const auto deepseek_v41_plan = cuda_model_plan(deepseek_v41);
         require(
             cuda_backbone(deepseek_v41.backbone) ==
                 CudaBackbone::deepseek_v41,
             "DeepSeek-V4.1 text adapter was not selected");
         require(
-            deepseek_v41_plan.vision == CudaVisionAdapter::none &&
+            deepseek_v41_plan.vision ==
+                    CudaVisionAdapter::deepseek_v41_axial &&
                 deepseek_v41_plan.predictor ==
                     CudaPredictorAdapter::deepseek_v41_dspark,
             "DeepSeek-V4.1 optional component selection mismatch");
         const auto deepseek_v41_state = cuda_component_state(
-            deepseek_v41, deepseek_v41_plan, false, true);
+            deepseek_v41, deepseek_v41_plan, true, true);
         require(
             deepseek_v41_state.mtp_supported &&
                 deepseek_v41_state.mtp_enabled &&
-                !deepseek_v41_state.vision_supported,
+                deepseek_v41_state.vision_supported &&
+                deepseek_v41_state.vision_available,
             "DeepSeek-V4.1 DSpark availability state mismatch");
         require_capabilities(
             cuda_runtime_capabilities(
                 deepseek_v41, deepseek_v41_plan,
-                deepseek_v41_state, false, false),
-            {true, false, false, false, false, false, true},
-            "DeepSeek-V4.1 inferred an unimplemented Vision adapter");
+                deepseek_v41_state, true, false),
+            {true, true, false, false, false, false, true},
+            "DeepSeek-V4.1 vision capability matrix mismatch");
+        const auto require_v41_rejected = [](const mfq::ModelGraph& graph) {
+            require(
+                cuda_model_plan(graph).vision ==
+                    CudaVisionAdapter::none,
+                "mutated DeepSeek-V4.1 vision registration was accepted");
+        };
+        auto v41_wrong_root = deepseek_v41;
+        v41_wrong_root.components.at(1).tensor_root = "other_vision";
+        require_v41_rejected(v41_wrong_root);
+        auto v41_wrong_implementation = deepseek_v41;
+        v41_wrong_implementation.components.at(1).implementation =
+            "grid_vit";
+        require_v41_rejected(v41_wrong_implementation);
+        auto v41_wrong_input = deepseek_v41;
+        v41_wrong_input.components.at(1).input_contract =
+            "grid_vision.v1";
+        require_v41_rejected(v41_wrong_input);
+        auto v41_wrong_position = deepseek_v41;
+        v41_wrong_position.components.at(1).position_policy =
+            "grid_mrope";
+        require_v41_rejected(v41_wrong_position);
 
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;

@@ -1502,7 +1502,9 @@ def test_shared_models_own_composition_loading_and_input_rules() -> None:
     assert "mfq::models::minicpmo45::multimodal_forward(" in mini
     assert "for (const auto & bound : images)" not in mini
     grid = (CUDA_MODELS.parent / "core/grid_vision_component.h").read_text()
-    for stage in ("attention", "encode", "merge", "prepare"):
+    vision_ops = (CUDA_MODELS.parent / "core/vision_ops.h").read_text()
+    assert "mfq::models::grid_vision::attention(" in vision_ops
+    for stage in ("encode", "merge", "prepare"):
         assert f"mfq::models::grid_vision::{stage}(" in grid
     assert "token_ids[index] == image_token_id_" not in grid
     for source in shared.rglob("*.h"):

@@ -238,7 +238,9 @@ mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(CudaExecutionContext 
 mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                                              mfq_tensor_backend::Tensor x,
                                              MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-                                             bool allow_important_neurons) const {
+                                             bool allow_important_neurons,
+                                             MfqOptional<mfq_tensor_backend::Tensor>
+                                                 vision_mask) const {
     auto &profiler = execution.profiler;
     mfq_tensor_backend::Tensor xh;
     if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
@@ -293,15 +295,27 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             auto flat = xh.reshape({rows, xh.size(-1)}).contiguous();
             std::vector<mfq_tensor_backend::Tensor> outputs;
             outputs.reserve(static_cast<size_t>(rows));
+            MfqOptional<mfq_tensor_backend::Tensor> flat_mask = mfq_nullopt;
+            if (vision_mask.has_value()) {
+                MFQ_RUNTIME_CHECK(vision_mask.value().numel() == rows,
+                                  "MoE vision mask does not cover every row");
+                flat_mask = vision_mask.value().reshape({rows}).contiguous();
+            }
             for (int64_t row = 0; row < rows; ++row) {
                 auto row_input = flat.narrow(0, row, 1).contiguous();
+                auto row_mask = flat_mask.has_value()
+                    ? MfqOptional<mfq_tensor_backend::Tensor>(
+                          flat_mask.value().narrow(0, row, 1).contiguous())
+                    : mfq_nullopt;
                 if (input_ids.has_value()) {
                     MFQ_RUNTIME_CHECK(input_ids.value().numel() == rows,
                                       "continuous-batch MoE token ids do not match rows");
                     auto row_ids = input_ids.value().reshape({rows}).narrow(0, row, 1).contiguous();
-                    outputs.push_back(forward_impl(execution, row_input, row_ids, false));
+                    outputs.push_back(
+                        forward_impl(execution, row_input, row_ids, false, row_mask));
                 } else {
-                    outputs.push_back(forward_impl(execution, row_input, mfq_nullopt, false));
+                    outputs.push_back(
+                        forward_impl(execution, row_input, mfq_nullopt, false, row_mask));
                 }
             }
             return mfq_tensor_backend::cat(outputs, 0).reshape(xh.sizes());
@@ -385,6 +399,28 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                                 : mfq_nullopt,
                             1e-20, moe_router_scale);
                     });
+                }
+                if (vision_mask.has_value()) {
+                    MFQ_RUNTIME_CHECK(
+                        moe_vision_bias.defined(),
+                        "DeepSeek-V4.1 visual MoE has no router vision bias");
+                    MFQ_RUNTIME_CHECK(
+                        vision_mask.value().numel() == router_logits.size(0),
+                        "DeepSeek-V4.1 visual MoE mask disagrees with logits");
+                    auto visual = profiler.measure("moe.vision_topk", [&]() {
+                        return moe_topk_cuda(
+                            router_logits.contiguous(), moe_top_k, moe_use_sigmoid,
+                            moe_use_sqrt_softplus, moe_normalize, moe_delayed_softmax,
+                            MfqOptional<mfq_tensor_backend::Tensor>(moe_vision_bias),
+                            1e-20, moe_router_scale);
+                    });
+                    auto mask = vision_mask.value()
+                                    .reshape({router_logits.size(0), 1})
+                                    .to(mfq_tensor_backend::kBool);
+                    selected.at(0) =
+                        mfq_tensor_backend::where(mask, visual.at(0), selected.at(0));
+                    selected.at(1) =
+                        mfq_tensor_backend::where(mask, visual.at(1), selected.at(1));
                 }
                 if (!use_pipeline) {
                     route = profiler.measure("moe.route_map", [&]() {
@@ -725,8 +761,10 @@ mfq_tensor_backend::Tensor FFN::forward_fused_residual(CudaProfiler &profiler,
 
 mfq_tensor_backend::Tensor FFN::forward(CudaExecutionContext &execution,
                                         mfq_tensor_backend::Tensor x,
-                                        MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
-    return forward_impl(execution, std::move(x), input_ids, true);
+                                        MfqOptional<mfq_tensor_backend::Tensor> input_ids,
+                                        MfqOptional<mfq_tensor_backend::Tensor>
+                                            vision_mask) const {
+    return forward_impl(execution, std::move(x), input_ids, true, vision_mask);
 }
 
 void prepare_ffn_workspaces(CudaExecutionContext &execution, FFN &f) {

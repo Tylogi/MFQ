@@ -11,6 +11,7 @@ COMMON_CONFIG = (
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
 CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
+VISION_OPS = (CUDA_ROOT / "core/vision_ops.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -52,11 +53,11 @@ def test_grid_vision_policies_are_owned_by_core() -> None:
 
 
 def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None:
-    assert "load_quant_linear(execution, model, weight_name)" in CUDA
+    assert "load_quant_linear(execution, model, weight_name)" in VISION_OPS
     assert "mfq_tensor_backend::layer_norm(" in CUDA
-    assert "attention_cuda(" in CUDA
-    assert "Tensor gelu_tanh(" in CUDA
-    assert 'mfq_tensor_backend::gelu(input,"tanh")' in CUDA
+    assert "attention_cuda(" in VISION_OPS
+    assert "Tensor gelu_tanh(" in VISION_OPS
+    assert 'mfq_tensor_backend::gelu(input, "tanh")' in VISION_OPS
     assert "mfq::models::grid_vision::merge(" in CUDA
     assert "mfq::models::grid_vision::prepare(" in CUDA
     assert "mfq_tensor_backend::gelu(value, \"none\")" in CUDA

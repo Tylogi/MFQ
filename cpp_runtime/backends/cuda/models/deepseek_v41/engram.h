@@ -231,7 +231,8 @@ class EngramHashState : public mfq::models::deepseek_v41::EngramHashState {
             std::move(offsets), std::move(multipliers), std::move(token_map)));
     }
 
-    EngramHashBatch forward(const EngramTensor &token_ids, std::int64_t pos0) {
+    EngramHashBatch forward(const EngramTensor &token_ids, std::int64_t pos0,
+                            MfqOptional<EngramTensor> participation = mfq_nullopt) {
         if (token_ids.dim() != 2 || token_ids.size(0) <= 0 || token_ids.size(1) <= 0 || pos0 < 0 ||
             token_ids.size(0) > std::numeric_limits<int>::max() ||
             token_ids.size(1) > std::numeric_limits<int>::max()) {
@@ -242,7 +243,23 @@ class EngramHashState : public mfq::models::deepseek_v41::EngramHashState {
         const int tokens = static_cast<int>(token_ids.size(1));
         auto host_ids =
             token_ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
-        return HashState::forward(host_ids.data_ptr<int64_t>(), batch, tokens, pos0);
+        std::vector<std::uint8_t> host_mask;
+        if (participation.has_value()) {
+            if (participation.value().dim() != token_ids.dim() ||
+                participation.value().size(0) != token_ids.size(0) ||
+                participation.value().size(1) != token_ids.size(1)) {
+                throw std::invalid_argument(
+                    "DeepSeek-V4.1 Engram participation mask shape disagrees");
+            }
+            auto mask = participation.value()
+                            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kUInt8)
+                            .contiguous();
+            const auto *source = mask.data_ptr<std::uint8_t>();
+            host_mask.assign(source, source + mask.numel());
+        }
+        return HashState::forward(
+            host_ids.data_ptr<int64_t>(), batch, tokens, pos0,
+            host_mask.empty() ? nullptr : host_mask.data());
     }
 
     static void self_check() {
@@ -349,7 +366,8 @@ class Engram {
     }
 
     EngramTensor forward(CudaExecutionContext &execution, const EngramTensor &hidden,
-                         const EngramHashBatch &hashes) const {
+                         const EngramHashBatch &hashes,
+                         MfqOptional<EngramTensor> participation = mfq_nullopt) const {
         const auto batch = hashes.batch;
         const auto tokens = hashes.tokens;
         if (hidden.dim() != 4 || hidden.size(0) != batch || hidden.size(1) != tokens ||
@@ -365,6 +383,18 @@ class Engram {
         auto projected = execution.profiler.measure("deepseek_v41.engram.projection", [&] {
             return projection_.forward(execution, embeddings);
         });
+        if (participation.has_value()) {
+            if (participation.value().dim() != 2 ||
+                participation.value().size(0) != batch ||
+                participation.value().size(1) != tokens) {
+                throw std::invalid_argument(
+                    "DeepSeek-V4.1 Engram gate mask shape disagrees");
+            }
+            auto gate_mask = participation.value()
+                                 .to(projected.scalar_type())
+                                 .reshape({batch, tokens, 1, 1});
+            projected = projected * gate_mask;
+        }
         return execution.profiler.measure("deepseek_v41.engram.gate_add", [&] {
             return deepseek_v41_engram_gate_add_cuda(hidden, projected.contiguous(),
                                                        query_key_weight_, config_.rms_eps);

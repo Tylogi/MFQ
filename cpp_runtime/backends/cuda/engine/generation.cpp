@@ -146,6 +146,14 @@ template <typename Model> struct CudaGenerationOps {
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
                 borrowed=workspace.begin((std::size_t(4)<<30)+
                     std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
+            if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+                model.set_multimodal_mask(
+                    prepared->image_mask.defined()
+                        ? prepared->image_mask
+                              .narrow(1, chunk.offset, chunk.count)
+                              .contiguous()
+                        : mfq_tensor_backend::Tensor());
+            }
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
                 prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
@@ -153,6 +161,8 @@ template <typename Model> struct CudaGenerationOps {
                 nullptr,
                 mfq_nullopt,
                 true);
+            if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
+                model.set_multimodal_mask(mfq_tensor_backend::Tensor());
             finish_prefill();
             if(borrowed) {
                 workspace.suspend();
