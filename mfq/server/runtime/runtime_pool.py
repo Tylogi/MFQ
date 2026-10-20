@@ -139,18 +139,6 @@ _WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
-# WDDM shares the GPU with the desktop compositor and pages overcommitted
-# allocations into host memory instead of failing them. A worker that fills
-# the device makes the whole desktop unstable, so leave a fifth of it free.
-_WINDOWS_VRAM_RESERVE_BYTES = 4 << 30
-_WINDOWS_VRAM_RESERVE_FRACTION = 5
-
-
-def _wddm_host() -> bool:
-    """Whether CUDA devices are driven through the Windows display driver model."""
-    return os.name == "nt"
-
-
 @dataclass(frozen=True)
 class _ExpertHostBudget:
     """Resident expert allowance together with the limit that produced it."""
@@ -3744,14 +3732,26 @@ class RuntimePool:
         )
         if configured:
             try:
-                return max(1, min(capacity, int(float(configured) * (1 << 30))))
-            except ValueError:
-                pass
-        if _wddm_host():
-            reserve = max(_WINDOWS_VRAM_RESERVE_BYTES, capacity // _WINDOWS_VRAM_RESERVE_FRACTION)
+                requested = int(float(configured) * (1 << 30))
+            except (ValueError, OverflowError):
+                raise _job_error("runtime_vram_budget_invalid", "VRAM limit must be a positive finite GiB value") from None
+            if requested <= 0:
+                raise _job_error("runtime_vram_budget_invalid", "VRAM limit must be a positive finite GiB value")
+            limit = min(capacity, requested)
         else:
-            reserve = max(1 << 30, capacity // 16)
-        return max(1, capacity - reserve)
+            limit = max(0, capacity - max(1 << 30, capacity // 16))
+        # Account for other processes on the selected physical devices. Keep
+        # the existing capacity margin and a small live allocation margin,
+        # without reserving a fixed fifth of every Windows GPU.
+        devices = {item["id"]: item for item in gpu_memory_status()}
+        selected = [devices.get(value) for value in self._cuda_device_ids(request)]
+        if selected and all(item is not None and isinstance(item.get("memory_available_bytes"), int)
+                            and item["memory_available_bytes"] >= 0 for item in selected):
+            available = sum(item["memory_available_bytes"] for item in selected)
+            limit = min(limit, max(0, available - (256 << 20)))
+        if limit <= 0:
+            raise _job_error("runtime_vram_budget_exceeded", "No free VRAM remains for the model runtime", retryable=True)
+        return limit
 
     def _apply_automatic_expert_residency(
         self,
@@ -3769,7 +3769,7 @@ class RuntimePool:
         )
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
             device_ceiling = self._cuda_device_vram_limit(request)
-            if device_ceiling:
+            if device_ceiling is not None:
                 # The native worker prices concrete dense/KV allocations and
                 # decode scratch after load; prefill borrows expert storage.
                 # Do not reserve another third before that calculation.
@@ -4737,7 +4737,7 @@ class RuntimePool:
                     "MFQ_MOE_RESIDENCY_INTERVAL": "4",
                 }
                 device_limit = self._cuda_device_vram_limit(request)
-                if device_limit:
+                if device_limit is not None:
                     # WDDM can page overcommitted allocations into host RAM
                     # without reporting OOM. The native limit also trims idle
                     # pool pages before a new allocation reaches that boundary.

@@ -33,7 +33,7 @@ def _no_host_commit_accounting(monkeypatch):
     monkeypatch.setattr(
         "mfq.server.runtime.runtime_pool.host_commit_capacity", lambda: (None, None)
     )
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool._wddm_host", lambda: False)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [])
     monkeypatch.delenv("MFQ_CUDA_VRAM_LIMIT_GIB", raising=False)
 
 
@@ -70,19 +70,16 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
 
 
-@pytest.mark.parametrize("wddm,capacity,configured,limit", [
-    (False, 96 * GIB, None, 90 * GIB),
-    # The desktop shares a WDDM device; a fifth of it stays free.
-    (True, 96 * GIB, None, 96 * GIB - 96 * GIB // 5),
-    (True, 16 * GIB, None, 12 * GIB),
-    # An explicit limit wins on every platform.
-    (True, 96 * GIB, "40", 40 * GIB),
+@pytest.mark.parametrize("capacity,configured,limit", [
+    (96 * GIB, None, 90 * GIB),
+    (24 * GIB, None, 24 * GIB - 24 * GIB // 16),
+    (16 * GIB, None, 15 * GIB),
+    (96 * GIB, "40", 40 * GIB),
 ])
-def test_cuda_vram_limit_leaves_headroom_for_the_windows_desktop(tmp_path, monkeypatch, wddm,
+def test_cuda_vram_limit_keeps_existing_margin_and_explicit_limit(tmp_path, monkeypatch,
                                                                  capacity, configured, limit):
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
         "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", capacity),)))
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool._wddm_host", lambda: wddm)
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
     if configured:
         pool.runtime_environment["MFQ_CUDA_VRAM_LIMIT_GIB"] = configured
@@ -91,6 +88,41 @@ def test_cuda_vram_limit_leaves_headroom_for_the_windows_desktop(tmp_path, monke
     selected = pool._apply_automatic_expert_residency(artifact(tmp_path), request)
     # Automatic residency fills the worker's limit, never the whole device.
     assert pool._estimated_load_bytes(artifact(tmp_path), selected) <= limit
+
+
+def test_cuda_vram_limit_uses_live_headroom_on_the_selected_device(tmp_path, monkeypatch):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB), GpuMemory("RTX GPU", 16 * GIB))))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [
+        {"id": "0", "memory_available_bytes": GIB},
+        {"id": "1", "memory_available_bytes": 12 * GIB},
+    ])
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
+    request = ModelLoadRequest(model="model", device_ids=["1"])
+    assert pool._cuda_device_vram_limit(request) == 12 * GIB - (256 << 20)
+
+
+def test_cuda_vram_limit_rejects_exhausted_live_headroom(tmp_path, monkeypatch):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [
+        {"id": "0", "memory_available_bytes": 0},
+    ])
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
+    with pytest.raises(JobExecutionError) as error:
+        pool._cuda_device_vram_limit(ModelLoadRequest(model="model", device_ids=["0"]))
+    assert error.value.detail.code == "runtime_vram_budget_exceeded"
+
+
+@pytest.mark.parametrize("configured", ["0", "-1", "nan", "inf", "invalid"])
+def test_cuda_vram_limit_rejects_invalid_explicit_values(tmp_path, monkeypatch, configured):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
+    pool.runtime_environment["MFQ_CUDA_VRAM_LIMIT_GIB"] = configured
+    with pytest.raises(JobExecutionError) as error:
+        pool._cuda_device_vram_limit(ModelLoadRequest(model="model", device_ids=["0"]))
+    assert error.value.detail.code == "runtime_vram_budget_invalid"
 
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
@@ -200,6 +232,7 @@ def _commit_budget_pool(
 def test_windows_discrete_expert_budget_is_limited_by_commit(tmp_path, monkeypatch):
     pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
                                commit_available=120 * GIB)
+    monkeypatch.setattr(pool, "_cuda_discrete_device_capacity", lambda _request: None)
     model = artifact(tmp_path)
     request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
     plan = pool._cuda_expert_host_budget_plan(model, request)

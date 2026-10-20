@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <functional>
 #include <vector>
 #include <iosfwd>
@@ -8,12 +9,13 @@ class MoeExpertCache;
 class MoeResidencyManager {
 public:
     struct MemorySample {
-        std::uint64_t resident_bytes=0,available_bytes=0,commit_available_bytes=0;
+        std::uint64_t resident_bytes=0,available_bytes=0;
+        std::optional<std::uint64_t> commit_available_bytes;
         // WDDM also charges device allocations to the commit limit, so the
         // smaller of physical and commit headroom bounds new host allocations.
         std::uint64_t available_host_bytes() const noexcept {
-            return commit_available_bytes && commit_available_bytes<available_bytes
-                ?commit_available_bytes:available_bytes;
+            return commit_available_bytes && *commit_available_bytes<available_bytes
+                ?*commit_available_bytes:available_bytes;
         }
     };
     struct Stats {
