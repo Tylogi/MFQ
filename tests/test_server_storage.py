@@ -423,3 +423,32 @@ def test_running_response_blocks_parallel_generation_and_deletion(tmp_path) -> N
         )
     with pytest.raises(ResponseInProgressError):
         store.delete_session(SESSION_ID)
+
+
+def test_recovery_closes_only_responses_left_running(tmp_path) -> None:
+    store = make_store(tmp_path)
+    store.create_session(CreateSessionRequest(model="model-a"), session_id=SESSION_ID, now=NOW)
+    store.create_session(CreateSessionRequest(model="model-a"), session_id=FORK_ID, now=NOW)
+    store.begin_response(
+        SESSION_ID, REQUEST_ID, RESPONSE_ID, "running", 0,
+        [{"type": "text", "text": "question"}], input_message_id=FIRST_MESSAGE_ID, now=NOW,
+    )
+    finished_id = UUID("99999999-9999-4999-8999-999999999999")
+    store.begin_response(
+        FORK_ID, REQUEST_ID, finished_id, "finished", 0,
+        [{"type": "text", "text": "question"}], now=NOW,
+    )
+    store.complete_response(finished_id, [{"type": "text", "text": "answer"}], "stop", None, now=NOW)
+
+    assert store.recover_interrupted_responses(now=NOW) == [RESPONSE_ID]
+    assert store.recover_interrupted_responses(now=NOW) == []
+
+    recovered = store.get_response(RESPONSE_ID)
+    assert recovered.status == ResponseStatus.CANCELLED
+    assert recovered.error is not None and recovered.error.retryable
+    session = store.get_session(SESSION_ID)
+    assert session.state == SessionState.INTERRUPTED
+    assert session.revision == 1
+    assert [message.id for message in store.list_messages(SESSION_ID)] == [FIRST_MESSAGE_ID]
+    assert store.get_response(finished_id).status == ResponseStatus.COMPLETED
+    assert store.get_session(FORK_ID).state == SessionState.IDLE

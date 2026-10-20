@@ -344,6 +344,7 @@ class ServerService:
             )
 
     async def start(self) -> None:
+        await asyncio.to_thread(self.store.recover_interrupted_responses)
         if self.runtime_manager is not None:
             await self.runtime_manager.start()
         await self.jobs.start()

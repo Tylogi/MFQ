@@ -1898,6 +1898,42 @@ class SessionStore:
             )
         return self.get_response(response_id)
 
+    def recover_interrupted_responses(self, *, now: datetime | None = None) -> list[UUID]:
+        """Close responses left running by a previous process so their sessions can continue."""
+        recovered_at = now or _utcnow()
+        error = ErrorDetail(
+            code="service_restarted",
+            message="response generation was interrupted by service restart",
+            retryable=True,
+        ).model_dump_json()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, session_id FROM responses WHERE status = ?",
+                (ResponseStatus.RUNNING.value,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE responses SET status = ?, error_json = ?, completed_at = ?
+                WHERE status = ?
+                """,
+                (
+                    ResponseStatus.CANCELLED.value,
+                    error,
+                    _timestamp(recovered_at),
+                    ResponseStatus.RUNNING.value,
+                ),
+            )
+            connection.execute(
+                "UPDATE sessions SET state = ?, updated_at = ? WHERE state = ?",
+                (
+                    SessionState.INTERRUPTED.value,
+                    _timestamp(recovered_at),
+                    SessionState.PROCESSING.value,
+                ),
+            )
+        return [UUID(row["id"]) for row in rows]
+
     @staticmethod
     def _append_job_event(
         connection: sqlite3.Connection,

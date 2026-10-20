@@ -307,6 +307,61 @@ def test_explicit_cancel_stops_a_response_and_allows_immediate_edited_retry(
     asyncio.run(run())
 
 
+def test_service_start_recovers_responses_left_running_by_a_crash(tmp_path: Path) -> None:
+    async def run() -> None:
+        crashed = make_service(tmp_path, FakeBackend())
+        await asyncio.to_thread(
+            crashed.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        original = CreateResponseRequest(
+            request_id=REQUEST_ID,
+            expected_revision=0,
+            input=[{"type": "text", "text": "question"}],
+            stream=False,
+        )
+        stranded = await crashed.prepare_response(SESSION_ID, original)
+
+        backend = FakeBackend((BackendDelta(content_delta="answer", finish_reason="stop"),))
+        service = make_service(tmp_path, backend)
+        await service.start()
+        try:
+            session = await service.get_session(SESSION_ID)
+            assert session.state == SessionState.INTERRUPTED
+            assert session.revision == 1
+            assert [message.parts[0].text for message in (await service.list_messages(SESSION_ID)).data] == ["question"]
+            recovered = service.store.get_response(stranded.begin.response.id)
+            assert recovered.status == ResponseStatus.CANCELLED
+            assert recovered.error is not None and recovered.error.code == "service_restarted"
+
+            replay = await service.prepare_response(SESSION_ID, original)
+            assert not replay.begin.started
+            assert replay.begin.response.status == ResponseStatus.CANCELLED
+            with pytest.raises(ServiceError) as caught:
+                await service.cancel_response(SESSION_ID)
+            assert caught.value.detail.code == "response_not_in_progress"
+
+            follow_up = await service.prepare_response(
+                SESSION_ID,
+                CreateResponseRequest(
+                    request_id=UUID("33333333-3333-4333-8333-333333333333"),
+                    expected_revision=1,
+                    input=[{"type": "text", "text": "continue"}],
+                    stream=False,
+                ),
+            )
+            completed = await service.collect_response(follow_up)
+            assert completed.status == ResponseStatus.COMPLETED
+            assert [message["content"] for message in backend.calls[0]["messages"]] == ["question", "continue"]
+            assert (await service.get_session(SESSION_ID)).revision == 3
+            await service.delete_session(SESSION_ID)
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_service_close_cancels_and_drains_active_responses(tmp_path: Path) -> None:
     class BlockingBackend(FakeBackend):
         def __init__(self) -> None:
