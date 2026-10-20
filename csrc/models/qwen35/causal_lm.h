@@ -162,7 +162,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         auto &metadata = this->metadata;
 
         config = Config::from_json(payload, graph);
-        config.legacy_tensor_layout = source.legacy_tensor_compatibility().layout;
+        config.legacy_tensor_layout = source.tensor_layout();
         metadata.vocab_size = config.vocab_size;
         metadata.hidden_size = config.hidden_size;
         metadata.num_hidden_layers = config.num_hidden_layers;

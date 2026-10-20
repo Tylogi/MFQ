@@ -139,14 +139,6 @@ __global__ void mxfp8_small_m_kernel(
     }
 }
 
-int mxfp8_column_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
-    return values.size(1)/scales.size(1)==128?7:5;
-}
-
-int mxfp8_row_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
-    return scales.size(0)==values.size(0)?0:mxfp8_column_shift(values,scales);
-}
-
 template <int TILE_M, typename Output>
 void launch_mxfp8_small_m(
         const mfq_tensor_backend::Tensor & values,

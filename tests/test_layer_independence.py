@@ -3,7 +3,7 @@
 
 The rules are about responsibility, not about directory names:
 
-  1. core, scheduler, transport, engine and models never name a backend
+  1. core, formats, model_source, scheduler, transport, engine, models and file I/O never name a backend
      (mfq::cuda, mfq::metal, mfq_tensor_backend, backends/ includes).
   2. A model family may be named in engine/model/<family>/ and in models/, where
      the family lives.  The generic request table, the Planner, both Stores, the
@@ -38,7 +38,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 CSRC = REPO / "csrc"
-SHARED = ("core", "scheduler", "transport", "engine", "models")
+SHARED = ("core", "formats", "model_source", "scheduler", "transport", "engine", "models", "components/io")
 BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/")
 # Family stems anywhere in an identifier: Qwen35, qwen3_5 and is_qwen35 all hit.
 FAMILY_TOKEN = re.compile(
@@ -71,22 +71,43 @@ def check_tree(csrc):
     for path in sources(csrc):
         relative = os.path.relpath(path, csrc).replace(os.sep, "/")
         module = relative.split("/")[0]
-        if module not in SHARED:
+        if not relative.startswith(tuple(owner + "/" for owner in SHARED)):
             continue
         under_model = relative.startswith("engine/model/")
+        under_io = relative.startswith("components/io/")
+        under_formats = module == "formats"
+        under_source = module == "model_source"
         exempt = relative in FAMILY_EXCEPTIONS
         for lineno, line in code_lines(path):
             if BACKEND_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: shared layer names a backend: {line.strip()}")
             if module == "engine" and not under_model and not exempt and FAMILY_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: generic engine code names a model family: {line.strip()}")
-        if not under_model:
+        if not (under_model or under_io or under_formats or under_source):
             continue
         for lineno, raw in includes(path):
             hits = resolve(raw, path, roots)
             if not hits:
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
+            if under_source:
+                if (path.endswith(".h") and not relative.startswith("model_source/compat/") and
+                        target.startswith("model_source/compat/")):
+                    failures.append(f"{relative}:{lineno}: public source header exposes compatibility: {raw}")
+                if target.startswith(("core/", "engine/", "models/", "backends/")):
+                    failures.append(f"{relative}:{lineno}: model source reaches a runtime layer: {raw}")
+                continue
+            if under_formats:
+                if (target.startswith(("core/", "engine/", "models/", "model_source/")) or
+                        target.startswith("backends/") and not (
+                            path.endswith(".cpp") and target.startswith("backends/cpu/native/"))):
+                    failures.append(f"{relative}:{lineno}: format headers reach a higher layer: {raw}")
+                continue
+            if under_io:
+                if (target.startswith(("core/", "models/", "model_source/", "engine/", "formats/")) or
+                        target.startswith("backends/") and not target.startswith("backends/cpu/native/")):
+                    failures.append(f"{relative}:{lineno}: file I/O reaches a higher layer: {raw}")
+                continue
             if not target.startswith("engine/"):
                 if target.startswith("backends/"):
                     failures.append(f"{relative}:{lineno}: shared model layer includes a backend header: {raw}")
@@ -104,6 +125,53 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("public source headers may not expose private aliases", {
+        "model_source/source.h": '#include "compat/aliases.h"\n',
+        "model_source/compat/aliases.h": "struct Aliases {};\n",
+    }, "public source header exposes compatibility"),
+    ("model source may consume the persisted schema", {
+        "model_source/source.cpp": '#include "model_graph/model_graph.h"\n',
+        "formats/model_graph/model_graph.h": "struct Graph {};\n",
+    }, None),
+    ("model source may not reach runtime values in core", {
+        "model_source/source.cpp": '#include "mfq/runtime.h"\n',
+        "core/include/mfq/runtime.h": "struct Request {};\n",
+    }, "model source reaches a runtime layer"),
+    ("model source may not reach the old model chain", {
+        "model_source/source.cpp": '#include "common/forward.h"\n',
+        "models/common/forward.h": "struct Model {};\n",
+    }, "model source reaches a runtime layer"),
+    ("format readers may use host workers", {
+        "formats/quant/rows.cpp": '#include "mfq/host_parallel.h"\n',
+        "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",
+    }, None),
+    ("format headers may compose other format headers", {
+        "formats/quant/decode.h": '#include "quant/blob.h"\n',
+        "formats/quant/blob.h": "struct Blob {};\n",
+    }, None),
+    ("format headers may not reach the old core", {
+        "formats/quant/blob.h": '#include "mfq/runtime.h"\n',
+        "core/include/mfq/runtime.h": "struct Request {};\n",
+    }, "format headers reach a higher layer"),
+    ("format headers may not reach a backend by a bare include", {
+        "formats/quant/blob.h": '#include "tensor.h"\n',
+        "backends/cuda/tensor.h": "struct Tensor {};\n",
+    }, "format headers reach a higher layer"),
+    ("file I/O may use host thread primitives", {
+        "components/io/read.cpp": '#include "mfq/host_parallel.h"\n',
+        "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",
+    }, None),
+    ("file I/O may not name a backend", {
+        "components/io/read.cpp": "void f() { mfq::cuda::run(); }\n",
+    }, "shared layer names a backend"),
+    ("file I/O may not reach a model source", {
+        "components/io/read.cpp": '#include "model_source.h"\n',
+        "model_source/model_source.h": "struct Source {};\n",
+    }, "file I/O reaches a higher layer"),
+    ("file I/O may not reach a backend tensor by a bare include", {
+        "components/io/read.cpp": '#include "tensor.h"\n',
+        "backends/cuda/tensor.h": "struct Tensor {};\n",
+    }, "file I/O reaches a higher layer"),
     ("model layer may use the state and weight interfaces", {
         "engine/model/qwen35/forward.h": '#include "pages.h"\n#include "slots.h"\n',
         "engine/state/pages.h": "struct Pages {};\n",

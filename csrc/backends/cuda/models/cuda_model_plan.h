@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/model_graph.h"
+#include "model_graph/model_graph.h"
 
 #include <string>
 #include <string_view>
@@ -69,8 +69,8 @@ inline bool declares_grid_vision(const ModelGraph& graph) noexcept {
     const auto* vision = graph.component("vision");
     return vision != nullptr && vision->tensor_root == "vision" &&
         vision->implementation == "grid_vit" &&
-        vision->input_contract == mfq::kMfqGridVisionInputContract &&
-        vision->position_policy == mfq::kMfqGridMropePositionPolicy;
+        vision->input_contract == mfq::kGridVisionInputContract &&
+        vision->position_policy == mfq::kGridMropePositionPolicy;
 }
 
 // MiniCPM-o's CUDA adapter is one composite implementation, so a graph that

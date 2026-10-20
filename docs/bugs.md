@@ -35,6 +35,7 @@
 | B32 | 结构债务 | 待处理（plan 阶段 3） | family 专用 batch 驱动尚未归入共享 Executor |
 | B33 | 结构债务 | 待决（开关归属未定；未复现故障） | 调试开关归属未定；若改成缓存读取会破坏测试内 `setenv` A/B |
 | B34 | 结构债务 | 待处理（plan R4，随阶段 2/3） | `CudaStores` 只是字段包装，Store 所有权未收口 |
+| B35 | 真实缺陷 | 待修复 | MXFP8 反向的 FP16 GEMM 回退在 16 行输入下超过既有容差 |
 
 ## 真实缺陷（待修复）
 
@@ -122,6 +123,15 @@
 - 现象：删除会话或淘汰历史记录时，对应的语音 Blob 留在 IndexedDB。
 - 影响：本地存储持续增长，且已删数据仍留在浏览器里。
 - 验证/关闭条件：删除后 IndexedDB 中对应 Blob 计数为 0，附一次实测。
+
+### B35：MXFP8 反向的 FP16 GEMM 回退超过既有数值容差
+
+- 状态：待修复，2026-10-20 在 RTX 4090、CUDA 13.2、Torch 2.14.1+cu130 上实测复现。
+- 位置：[mx_matmul_backward.cu](../csrc/backends/cuda/kernels/quant/mx_matmul_backward.cu) 的大 batch 回退调用 [packed_backward.cuh](../csrc/backends/cuda/kernels/quant/packed_backward.cuh)；该共享 GEMM 使用 `CUBLAS_COMPUTE_16F`。
+- 复现：`.venv/bin/python -m pytest -q 'tests/test_format_completion_cuda.py::test_mx_packed_backward_and_autograd_match_dequant[16-_mxfp8]'`，退出码 1。固定 seed 1716，权重 `[11,128]`、梯度 `[16,11]`，在 `rtol=0.006, atol=0.03` 下有 2/2048 个元素超标；超标元素中最大绝对差约 0.1122。
+- 对照：权重解码与独立参考的最大绝对差为 0；相同半精度输入交给 Torch matmul（`allow_fp16_accumulation=False`）时，没有元素超过相同容差。上述两个反向文件与 `e590bad9` 一致，格式迁移没有修改其数值实现；冷编译暴露的几何 helper 可见性缺陷单独修复为共用已有实现。
+- 影响：普通 MXFP8 的输入梯度精度不足，影响工具侧反向/校准；MXFP4/FP8-SQ 和原生 SQ fixture 回归通过不构成本条通过。
+- 验证/关闭条件：在原有容差下通过该固定用例，并验证共享回退的其他格式、dtype、batch 和 Graph 路径；精度选择须作为独立数值修复验证，不随目录迁移改变容差。
 
 ## 结构债务
 

@@ -67,6 +67,11 @@ DEVICE_FORBIDDEN = ("executor/", "state/", "weights/", "src/",
 STORAGE_FORBIDDEN = ("executor/", "requests/table.h", "requests/inference.h")
 DEVICE_DIRS = ("ops", "kernels", "native", "device", "execution")
 # (backend file, engine header) still open; delete the entry when the consumer moves.
+# shortcut: old family headers still consume the shared geometry, remove with K2 family migration.
+MODEL_CONSUMERS = {
+    ("models/qwen35/config.h", "model/common/vision/grid_vision.h"),
+    ("models/common/grid_vision_model.h", "model/common/vision/grid_vision.h"),
+}
 BACKEND_EXCEPTIONS = {
     ("backends/cuda/storage/session/text_cache.cpp", "src/settings.h"),
 }
@@ -140,7 +145,8 @@ class Graph:
                     continue
                 if target in self.private_headers:
                     includers[target].add(src)
-                    if self.area(src) not in ALLOWED_CONSUMERS:
+                    if self.area(src) not in ALLOWED_CONSUMERS and (
+                            rel(src, self.csrc), rel(target, self.engine)) not in MODEL_CONSUMERS:
                         violations.append((src, lineno, raw,
                             "engine private headers may not be included here"))
                 if from_engine and src in self.engine_headers:
@@ -171,6 +177,10 @@ def check_tree(csrc, bench=None):
 
 # Small positive and negative trees: a rule that never fires is not a rule.
 FIXTURES = [
+    ("unlisted old model consumer may not include shared model internals", {
+        "models/other/config.h": '#include "common/vision/grid_vision.h"\n',
+        "engine/model/common/vision/grid_vision.h": "struct Geometry {};\n",
+    }, "engine private headers may not be included here"),
     ("backend assembly may use the shared templates", {
         "backends/cuda/engine.cpp": '#include "instance.h"\n',
         "engine/src/instance.h": '#include "table.h"\n',
@@ -202,6 +212,14 @@ FIXTURES = [
     }, "engine/batch may not include executor/driver.h"),
     ("core may not include an engine private header", {
         "core/side.cpp": '#include "table.h"\n',
+        "engine/requests/table.h": "struct Row {};\n",
+    }, "engine private headers may not be included here"),
+    ("file I/O may not include an engine private header", {
+        "components/io/read.cpp": '#include "table.h"\n',
+        "engine/requests/table.h": "struct Row {};\n",
+    }, "engine private headers may not be included here"),
+    ("format headers may not include an engine private header", {
+        "formats/quant/blob.h": '#include "table.h"\n',
         "engine/requests/table.h": "struct Row {};\n",
     }, "engine private headers may not be included here"),
     ("scheduler may not reach a private header by relative path", {

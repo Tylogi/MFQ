@@ -5,7 +5,7 @@
 #include "runtime/mlx_resident_budget.h"
 #include "runtime/mlx_weight_residency.h"
 
-#include "mfq/quant/nint_blob.h"
+#include "quant/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "runtime/mlx_platform.h"
 #include "runtime/mlx_staging_allocator.h"

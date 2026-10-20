@@ -363,7 +363,7 @@ void benchmark_grouped_synthetic(
     weights.reserve(static_cast<std::size_t>(projections));
     for (int projection = 0; projection < projections; ++projection) {
         weights.push_back(MlxVqWeight::from_blob(
-            "NVQ2J-XL",
+            "NVQ",
             make_synthetic_group64_blob(output_size, input_size)));
     }
     std::vector<MlxGroupedLinearWeightRef> refs;
@@ -452,7 +452,7 @@ int main(int argc, char** argv) {
                 "NVQ2J-XL",
                 "synthetic_group64",
                 MlxVqWeight::from_blob(
-                    "NVQ2J-XL",
+                    "NVQ",
                     make_synthetic_group64_blob(output, input)),
                 rows,
                 3,
@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
                 "NVQ2J-XL",
                 "synthetic_streams",
                 MlxVqWeight::from_blob(
-                    "NVQ2J-XL",
+                    "NVQ",
                     make_synthetic_streams_blob(output, input)),
                 rows,
                 3,

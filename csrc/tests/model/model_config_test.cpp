@@ -89,7 +89,7 @@ int main() {
         }
         require(rejected, "invalid GLM DSA schedule was accepted");
 
-        mfq::MfqModelGraph graph;
+        mfq::ModelGraph graph;
         graph.backbone = "qwen3_5";
         const auto qwen = mfq::models::qwen35::Config::from_json(R"({
             "model_type":"qwen3_5","text_config":{

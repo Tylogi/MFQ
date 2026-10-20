@@ -1,4 +1,5 @@
 #include "storage/mfq_container.h"
+#include "compat/format.h"
 #include "ops/mlx_moe.h"
 #include "runtime/mlx_kernel_prepare.h"
 #include "ops/mlx_vq.h"
@@ -49,7 +50,8 @@ std::vector<bool> reusable_vq_experts(std::span<const std::uint8_t> blob, int ex
         const auto total = std::uint64_t(dtype_size) + runtime_size + payload_size;
         if (offset > blob.size() || total > blob.size() - offset)
             throw std::runtime_error("truncated benchmark MFE pool");
-        const std::string_view dtype(reinterpret_cast<const char*>(blob.data() + offset), dtype_size);
+        const auto dtype = mfq::canonical_format_dtype(std::string_view(
+            reinterpret_cast<const char*>(blob.data() + offset), dtype_size));
         offset += dtype_size;
         const auto runtime = blob.subspan(offset, runtime_size);
         offset += runtime_size;

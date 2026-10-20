@@ -3,7 +3,7 @@
 #include "ops/execution/cuda_execution.h"
 #include "kernels/gated_residual_fused.h"
 #include "storage/weights/loaders/weight.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include <array>
 #include <climits>
 #include <cstring>

@@ -7,12 +7,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
-set(MFQ_CORE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core/include")
 
 # Shared engine module headers. They are PRIVATE to mfq-engine; backends, apps
 # and tests add these directories to their include path to drive the shared
 # generation loop, which tests/test_engine_include_graph.py keeps bounded.
 set(MFQ_ENGINE_PRIVATE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine/model
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/requests
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/batch
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/state
@@ -88,8 +88,11 @@ endif()
 # Common code is split by responsibility. JSON is defined first because the
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
-add_subdirectory(core)
+add_subdirectory(formats)
 add_subdirectory(backends/cpu)
+add_subdirectory(components/io)
+add_subdirectory(model_source)
+add_subdirectory(core)
 add_subdirectory(models)
 
 add_subdirectory(components/ggml)

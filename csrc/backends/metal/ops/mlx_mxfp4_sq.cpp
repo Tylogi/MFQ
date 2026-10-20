@@ -1,7 +1,7 @@
 #include "mlx_mxfp4_sq.h"
 
-#include "mfq/quant/mxfp4_sq_blob.h"
-#include "compat/mfq_format_compat.h"
+#include "quant/mxfp4_sq_blob.h"
+#include "dtype.h"
 
 #include <algorithm>
 #include <cmath>
@@ -873,7 +873,7 @@ templates(const MlxMxfp4SqWeight& weight, Dtype dtype) {
 } // namespace
 
 bool is_mxfp4_sq_dtype(std::string_view dtype) noexcept {
-    return mfq::canonical_format_dtype(dtype) == mfq::kMxfp4SqDtype;
+    return dtype == mfq::kMxfp4SqDtype;
 }
 
 MlxMxfp4SqWeight::MlxMxfp4SqWeight(

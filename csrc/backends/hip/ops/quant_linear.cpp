@@ -11,10 +11,9 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
-#include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
-#include "nvq_codebooks.generated.h"
-#include "mfq/mxfp4_sq_decode.h"
+#include "generated/nvq_codebooks.generated.h"
+#include "quant/mxfp4_sq_decode.h"
 
 #include <algorithm>
 #include <array>

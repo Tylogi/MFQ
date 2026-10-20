@@ -3003,7 +3003,7 @@ int run_loaded_runtime(
             vision != nullptr && runtime_components.multimodal_generate) {
             capabilities.image_input = true;
             capabilities.video_input =
-                vision->input_contract == mfq::kMfqGridVisionInputContract ||
+                vision->input_contract == mfq::kGridVisionInputContract ||
                 vision->input_contract == "minicpmo45.v1";
         }
         capabilities.audio_input =

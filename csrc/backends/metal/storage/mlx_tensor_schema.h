@@ -1,6 +1,6 @@
 #pragma once
 
-#include "grid_vision.h"
+#include "../../../engine/model/common/vision/grid_vision.h"
 
 namespace mfq::metal {
 

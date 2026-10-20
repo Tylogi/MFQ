@@ -10,6 +10,14 @@
 
 namespace {
 
+int mxfp8_column_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return values.size(1)/scales.size(1)==128?7:5;
+}
+
+int mxfp8_row_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return scales.size(0)==values.size(0)?0:mxfp8_column_shift(values,scales);
+}
+
 __device__ __forceinline__ float decode_e8m0(std::uint8_t raw) {
     if (raw == 255u) {
         return __int_as_float(0x7fffffff);

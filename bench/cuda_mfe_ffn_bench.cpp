@@ -2,7 +2,7 @@
 #include "packed_bench_utils.h"
 #include "kernels/moe/ops.h"
 #include "ops/moe/mfe_ffn_runtime.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include <array>
 #include <atomic>
 #include <cstring>

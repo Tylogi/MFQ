@@ -3,7 +3,7 @@
 
 #include "quant_linear.h"
 #include "mfe_weight.h"
-#include "../../hip/storage/model_source.h"
+#include "../../hip/storage/source_config.h"
 #include "gated_residual.h"
 
 struct MfqDropFileCacheGuard {

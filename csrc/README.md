@@ -3,18 +3,33 @@
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
 target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`, and adds `formats/`, `model_source/` and
-`components/io/`. That end state is defined in
+`engine/model/<family>/`.
+Format schemas, range readers and frozen codebooks live in `formats/`,
+model input lives in `model_source/`, and file
+I/O lives in `components/io/`. That end state is defined in
 [docs/refactor.md](../docs/refactor.md) and sequenced in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — canonical model graph, request/value contracts, policies, and
-  generated tables; temporary old-artifact name adapters live in
-  `core/compat/`. This is a transitional aggregation target (`mfq-core`), not a
-  target module: its responsibilities are reassigned in
-  [docs/refactor.md](../docs/refactor.md) and removed by K1–K4 in
+- `core/` — remaining request/value contracts, placement rules and state storage.
+  The transitional `mfq-core` aggregation is removed by K2–K4 in
   [docs/plan.md](../docs/plan.md);
+- `model_source/` — input discovery, metadata normalization and bounded reads,
+  built as `mfq-model-source`. Headers sit beside implementations; old graph/name
+  readers stay in `compat/`. The public source contract exposes layout facts,
+  without the private canonical-to-stored name map. Mapping hints and read
+  profiling belong here with the mapped reader;
+- `formats/` — packed quantization schemas, byte-range decoding helpers and
+  frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
+  dependency. Compiled NINT/NVQ/MFE range readers live beside those headers
+  in `formats/quant/` and build as `mfq-quant-readers`, with file-read values
+  and host workers but no core/model dependency. Canonical dtype identifiers
+  live in `formats/dtype.h`; legacy spelling recognition stays in `formats/compat/`.
+  Model sources and backend operators consume the headers directly; CUDA
+  native kernels no longer depend on `mfq-core`. Persisted model schema and
+  validation live in `formats/model_graph/` (`mfq-model-graph`); that target
+  contains no vision algorithm or old model reader. Legacy dtype spellings are
+  normalized at metadata/cohort input; VQ/SQ operators accept canonical IDs;
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
@@ -22,11 +37,20 @@ has landed.
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral logical request lifecycle, admission,
   cancellation decisions and bounded output queues;
+- `engine/model/common/vision/` — shared grid vision configuration, geometry,
+  positions and canonical tensor roles, compiled by `mfq-engine`. Two old model
+  headers still consume this implementation until their K2 migration;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
-  and `json`);
+  `json`, and `io`). `mfq-io` owns file-range and batched reads and statistics,
+  independently of model sources and Engine; its only library dependency is
+  `mfq-host-parallel`. `mfq-model-source` exposes the reader value contracts
+  through its public link to `mfq-io`;
+- `backends/cpu/` — host thread primitives, CPU expert execution and host math;
+  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`, which no longer publishes
+  the old core include directory;
 - `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests. `native/` implements
   Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains

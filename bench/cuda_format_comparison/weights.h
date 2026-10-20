@@ -2,7 +2,7 @@
 #include "timing.h"
 #include "kernels/quant_ops.h"
 #include "storage/weights/moe/quant_range_source.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 #include <cstring>
 #include <filesystem>
 #include <map>

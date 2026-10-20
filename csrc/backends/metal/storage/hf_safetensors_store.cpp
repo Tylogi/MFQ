@@ -1,6 +1,6 @@
 #include "hf_safetensors_store.h"
 
-#include "mfq/model_source/hf_safetensors_source.h"
+#include "hf_safetensors_source.h"
 
 #include <algorithm>
 #include <cerrno>

@@ -1,4 +1,4 @@
-#include "grid_vision.h"
+#include "common/vision/grid_vision.h"
 
 #include <iostream>
 #include <stdexcept>

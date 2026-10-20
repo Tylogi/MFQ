@@ -5,9 +5,9 @@
 #include "native/resident_allocations.h"
 #include "mfq/host_parallel.h"
 #include "mfq/runtime.h"
-#include "mfq/mapped_read_profile.h"
-#include "mfq/mapped_prefetch_scope.h"
-#include "mfq/mapped_tensor_pages.h"
+#include "mapped_read_profile.h"
+#include "mapped_prefetch_scope.h"
+#include "mapped_tensor_pages.h"
 #include <thread>
 #include <map>
 #include <condition_variable>

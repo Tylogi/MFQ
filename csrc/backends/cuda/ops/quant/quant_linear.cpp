@@ -8,7 +8,7 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
-#include "mfq/quant/mxfp4_sq_decode.h"
+#include "quant/mxfp4_sq_decode.h"
 
 #include <algorithm>
 #include <cmath>

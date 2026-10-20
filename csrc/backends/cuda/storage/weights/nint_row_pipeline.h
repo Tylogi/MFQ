@@ -1,6 +1,6 @@
 #pragma once
 #include "native/tensor/backend.h"
-#include "mfq/quant/nint_rows.h"
+#include "quant/nint_rows.h"
 #include <memory>
 namespace mfq {class NintRowCache;}
 class NintRowStage {

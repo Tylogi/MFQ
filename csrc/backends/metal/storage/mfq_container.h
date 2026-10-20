@@ -1,9 +1,8 @@
 #pragma once
 
-#include "mfq/model_source/hf_model_source.h"
-#include "compat/mfq_legacy_tensor_names.h"
-#include "compat/mfq_format_compat.h"
-#include "mfq_model_graph.h"
+#include "hf_model_source.h"
+#include "tensor_layout.h"
+#include "model_graph/model_graph.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -113,18 +112,18 @@ public:
     // New canonical artifacts describe their executable graph explicitly.
     // A missing asset identifies a pre-schema artifact and is handled only by
     // the dedicated compatibility adapter at the application boundary.
-    std::optional<mfq::MfqModelGraph> model_graph() const;
+    std::optional<mfq::ModelGraph> model_graph() const;
 
     // Compatibility adapters may expose a pre-schema record under its
     // canonical name exactly once at the container boundary. Runtime modules
     // never probe aliases or source-framework spellings themselves.
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
-        mfq::MfqLegacyTensorLayout layout = {});
+        mfq::TensorLayout layout = {});
     bool has_legacy_aliases() const noexcept {
         return !legacy_aliases_.empty();
     }
-    const mfq::MfqLegacyTensorLayout& legacy_tensor_layout() const noexcept {
+    const mfq::TensorLayout& legacy_tensor_layout() const noexcept {
         return legacy_tensor_layout_;
     }
 
@@ -140,7 +139,7 @@ private:
     RecordMap records_;
     std::shared_ptr<mfq::HfModelSource> hf_source_;
     std::unordered_map<std::string, std::string> legacy_aliases_;
-    mfq::MfqLegacyTensorLayout legacy_tensor_layout_;
+    mfq::TensorLayout legacy_tensor_layout_;
     std::shared_ptr<RandomAccessFiles> random_access_files_;
     mutable std::shared_ptr<LoadProgress> load_progress_;
 };

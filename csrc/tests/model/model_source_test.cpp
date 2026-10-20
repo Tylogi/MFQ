@@ -1,9 +1,9 @@
-#include "mfq/quant/fp8_sq_blob.h"
-#include "mfq/model_source/hf_model_source.h"
-#include "mfq/model_source/hf_safetensors_source.h"
-#include "mfq/model_source/mfq_model_source.h"
-#include "mfq/mapped_tensor_pages.h"
-#include "mfq/mapped_prefetch_scope.h"
+#include "quant/fp8_sq_blob.h"
+#include "hf_model_source.h"
+#include "hf_safetensors_source.h"
+#include "mfq_model_source.h"
+#include "mapped_tensor_pages.h"
+#include "mapped_prefetch_scope.h"
 
 #include <algorithm>
 #include <array>
@@ -84,6 +84,41 @@ void write_mfq(
     stream.write(config.data(), static_cast<std::streamsize>(config.size()));
 }
 
+void test_dtype_normalization(const std::filesystem::path& path) {
+    const std::vector<std::pair<std::string_view, std::string_view>> dtypes{
+        {"NINTv2", "NINT"}, {"NINT1", "NINT"}, {"NINT8", "NINT"},
+        {"NINTM", "MFE"}, {"NINTMD", "MFED"}, {"NIQ2", "NVQ"},
+        {"NVQ2J-XL", "NVQ"}, {"NPQ0-S", "NPQ"}, {"NEPQ1-A", "NEPQ"},
+        {"MXFP4-SQ2", "MXFP4-SQ"}, {"MXFP4-SQ3", "MXFP4-SQ"},
+        {"NVQ", "NVQ"}, {"MXFP8-SQ", "MXFP8-SQ"}, {"NVQ4", "NVQ4"},
+    };
+    {
+        std::ofstream stream(path, std::ios::binary);
+        stream.write("MFQ1", 4);
+        write_scalar<std::uint32_t>(stream, 2);
+        write_string(stream, "unit-test");
+        write_scalar<std::uint32_t>(stream, 0);
+        write_scalar<std::uint32_t>(stream, dtypes.size());
+        for (std::size_t i = 0; i < dtypes.size(); ++i) {
+            write_string(stream, "tensor." + std::to_string(i));
+            write_string(stream, dtypes[i].first);
+            write_scalar<std::uint64_t>(stream, 1);
+        }
+        for (std::size_t i = 0; i < dtypes.size(); ++i) stream.put(static_cast<char>(i));
+    }
+    const mfq::MfqModelSource source(path);
+    for (std::size_t i = 0; i < dtypes.size(); ++i) {
+        const auto name = "tensor." + std::to_string(i);
+        const auto* tensor = source.find_tensor(name);
+        require(tensor && tensor->dtype == dtypes[i].second &&
+                    tensor->stored_dtype == dtypes[i].first && tensor->nbytes == 1,
+                "model input did not normalize dtype while preserving its stored identity");
+        const auto payload = source.read(name);
+        require(payload.size() == 1 && std::to_integer<std::size_t>(payload[0]) == i,
+                "dtype normalization changed payload bytes or record bounds");
+    }
+}
+
 void write_hf(const std::filesystem::path& root) {
     std::filesystem::create_directories(root / ".mfq-assets" / "hf");
     std::ofstream(root / "config.json") << R"({"model_type":"qwen3_5"})";
@@ -156,6 +191,7 @@ int main() {
         ("mfq-model-source-test-" + std::to_string(nonce));
     try {
         std::filesystem::create_directories(root);
+        test_dtype_normalization(root / "dtype-input.mfq");
         const auto mfq_path = root / "model.mfq";
         const auto legacy_mfq_path = root / "legacy-model.mfq";
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";
@@ -345,13 +381,12 @@ int main() {
         require_bytes(
             legacy_mfq_source.read("model.token_embedding.weight"));
         const auto& gguf_compatibility =
-            legacy_gguf_source.legacy_tensor_compatibility();
+            legacy_gguf_source.tensor_layout();
         require(
-            gguf_compatibility.canonical_to_stored.at(
-                "model.token_embedding.weight") == "token_embd.weight" &&
-                gguf_compatibility.layout.norm_weight_offset == 0.0 &&
-                !gguf_compatibility.layout.linear_attention_a_is_log &&
-                gguf_compatibility.layout.qwen_gdn_gguf_layout,
+            legacy_gguf_source.find_tensor("model.token_embedding.weight") != nullptr &&
+                gguf_compatibility.norm_weight_offset == 0.0 &&
+                !gguf_compatibility.linear_attention_a_is_log &&
+                gguf_compatibility.qwen_gdn_gguf_layout,
             "legacy MFQ tensor layout was not preserved");
         require_bytes(
             legacy_gguf_source.read("model.token_embedding.weight"));

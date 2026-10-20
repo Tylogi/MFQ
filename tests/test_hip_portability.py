@@ -179,6 +179,24 @@ def test_staging_is_content_addressed_and_excludes_cuda(tmp_path):
     assert target.read_text().endswith("WIDTH 8\n")
 
 
+def test_staging_tracks_format_headers_without_the_old_core(tmp_path):
+    root = tmp_path / "repository"
+    blob = root / "csrc/formats/quant/blob.h"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("#define WIDTH 8\n")
+    core = root / "csrc/core/include/mfq/runtime.h"
+    core.parent.mkdir(parents=True)
+    core.write_text("#pragma once\n")
+    cache = tmp_path / "cache"
+    stage = stage_sources(root, cache)
+    assert (stage / blob.relative_to(root)).read_bytes() == blob.read_bytes()
+    assert not (stage / "csrc/core").exists()
+    blob.write_text("#define WIDTH 16\n")
+    updated = stage_sources(root, cache)
+    assert updated != stage
+    assert (updated / blob.relative_to(root)).read_bytes() == blob.read_bytes()
+
+
 def test_real_hipify_does_not_replace_staged_or_repository_hip_headers(tmp_path):
     pytest.importorskip("torch")
     from torch.utils.hipify import hipify_python

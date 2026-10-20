@@ -3,8 +3,8 @@
 #include "cli.h"
 #include "include/cuda_engine.h"
 #include "minicpmo45.h"
-#include "storage/weights/model_source.h"
-#include "mfq/model_source/model_source.h"
+#include "storage/weights/source_config.h"
+#include "model_source.h"
 #include "csrc/transport/include/transport.h"
 
 #include <cstddef>

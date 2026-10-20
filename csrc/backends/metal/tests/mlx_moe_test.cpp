@@ -1,3 +1,5 @@
+#include "compat/format.h"
+
 #include "ops/mlx_moe.h"
 #include "ops/mlx_grouped_linear.h"
 #include "runtime/mlx_tensor.h"
@@ -4307,7 +4309,7 @@ void test_vq_small_m_route_order() {
         std::vector<mfq::metal::MlxVqWeight> direct;
         direct.reserve(routes);
         for (const auto& expert : fixture.expert_weights) {
-            direct.push_back(mfq::metal::MlxVqWeight::from_blob(expert.dtype, expert.blob));
+            direct.push_back(mfq::metal::MlxVqWeight::from_blob(mfq::canonical_format_dtype(expert.dtype), expert.blob));
         }
         for (int tokens = 1; tokens <= 6; ++tokens) {
             for (bool shared : {true, false}) {
@@ -8735,7 +8737,7 @@ void test_vq_anchor_conversion() {
     auto fixture = make_nvq1_l(rows, 8);
     for (std::uint16_t bits = 0; bits < rows; ++bits)
         std::memcpy(fixture.blob.data() + 40 + bits * sizeof(bits), &bits, sizeof(bits));
-    const auto parsed = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {});
+    const auto parsed = mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {});
     for (std::uint16_t bits = 0; bits < rows; ++bits) {
         const int exponent = bits >> 10;
         const int mantissa = bits & 0x3ff;
@@ -8746,12 +8748,12 @@ void test_vq_anchor_conversion() {
     }
     const std::uint16_t negative_zero = 0x8000;
     std::memcpy(fixture.blob.data() + 40, &negative_zero, sizeof(negative_zero));
-    require(std::signbit(mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}).anchors[0]),
+    require(std::signbit(mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {}).anchors[0]),
         "VQ FP16 anchor conversion lost negative zero");
     for (const std::uint16_t invalid : {0x7c00, 0xfc00, 0x7e00, 0xfe00, 0x8001}) {
         std::memcpy(fixture.blob.data() + 40, &invalid, sizeof(invalid));
         bool rejected = false;
-        try { (void)mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}); }
+        try { (void)mfq::metal::detail::parse_vq_blob(mfq::canonical_format_dtype(fixture.dtype), fixture.blob, {}); }
         catch (const std::exception&) { rejected = true; }
         require(rejected, "VQ anchor validation accepted an invalid value");
     }

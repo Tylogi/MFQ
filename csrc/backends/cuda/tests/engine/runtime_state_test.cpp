@@ -943,7 +943,7 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
     image.input.sampling.enable_mtp = false;
     auto& media = image.input.media.emplace();
     media.processor = MfqMultimodalProcessor::grid_vision;
-    media.processor_name = mfq::kMfqGridVisionInputContract;
+    media.processor_name = mfq::kGridVisionInputContract;
     media.vision_grid = media.image_grid = {1, side, side};
     media.vision_grid_shape = media.image_grid_shape = {1, 3};
     media.vision_types = {1};

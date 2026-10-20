@@ -24,12 +24,26 @@ Anything that can be shared by more than one model architecture **must not**
 be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
-- Backend-neutral value contracts, schemas, canonical names and model sources
-  live in `csrc/core/` today. That aggregation is transitional, not the target:
-  [refactor.md](docs/refactor.md) assigns them to `formats/`,
-  `model_source/`, `components/io/`, `backends/cpu/` and the Engine modules, and
-  [plan.md](docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
-  Do not add new code to `core/` that belongs in one of those owners.
+- Remaining runtime values, placement rules and state storage still pass through
+  transitional `mfq-core`; K2–K4 remove that aggregation. Schemas and row readers
+  already belong to `formats/`, model input to `model_source/`, and vision
+  geometry to `engine/model/common/vision/`. Do not add new code to `core/`.
+- `mfq-model-graph` parses only persisted schema. `mfq-model-source` opens inputs,
+  normalizes metadata and retains bounded readers; neither may depend on core,
+  Engine or model execution. Keep alias maps in `model_source/compat/`; public
+  source headers expose only layout values. Headers sit beside implementations.
+  Normalize legacy dtype spellings in input parsing; operator dispatch receives
+  canonical IDs. Tests and synthetic benchmarks normalize their fixture input.
+- Packed format headers and frozen codebooks live in `csrc/formats/`
+  (`mfq-formats`), without a model-source, Engine or backend dependency.
+  Compiled range readers in `formats/quant/` use `mfq-quant-readers`; keep them
+  independent of core and model loading, and keep kernels on the header target.
+  CUDA native kernels link this header target directly; they must not link
+  `mfq-core` or use its include directories.
+- File ranges, batched reads and I/O statistics live in `csrc/components/io/`
+  (`mfq-io`), with headers beside the implementation. It links only host
+  thread primitives and must not depend on model loading, formats, Engine
+  or device operations. Host memory copying belongs in `backends/cpu/ops/`.
 - Logical scheduling, cancellation, deadlines and output backpressure belong
   in `csrc/scheduler/`; wire protocols belong in `csrc/transport/`.
 - Cross-backend request execution, tokenization, sampling semantics, physical
@@ -116,11 +130,12 @@ directory share a name prefix, the prefix becomes a subdirectory
 (`kernels/nvq/device.cuh`, not `kernels/nvq_device.cuh`).  The include rule is
 unchanged, the path is still rooted at the layer directory.
 
-`engine/<module>` (`requests`, `batch`, `state`, `weights`, `executor`, `text`,
+`engine/<module>` (`model`, `requests`, `batch`, `state`, `weights`, `executor`, `text`,
 `src`) is PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add
 those directories to their include path and include their headers bare. That is
 the only way a backend drives the shared generation loop, so it is allowed for
-`backends/` and `tests/` and for nobody else: `core/`, `transport/`,
+`backends/` and `tests/`; the boundary check lists the two temporary old-model
+geometry consumers explicitly. Other consumers are forbidden: `core/`, `transport/`,
 `scheduler/`, `models/` and `components/` must not include an engine private
 header. `engine/` never includes a backend header, and inside `engine/` the
 request table, Planner, Store rules and text layer never reach the Executor
@@ -167,7 +182,7 @@ weights provide them; missing weights or an explicit user override disables them
 
 Before submitting a runtime or quantization change:
 
-1. Identify the owner: core, transport, scheduler, shared Engine/model,
+1. Identify the owner: core, file I/O, transport, scheduler, shared Engine/model,
    backend operation/storage, importer, or application.
 2. Search all architectures and both backends for an equivalent implementation.
 3. Extract reusable behavior before extending it; keep model adapters thin.

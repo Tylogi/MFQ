@@ -861,6 +861,11 @@ void test_blob_validation() {
 
 int main() {
   try {
+    if (!mfq::metal::is_mxfp4_sq_dtype("MXFP4-SQ") ||
+        mfq::metal::is_mxfp4_sq_dtype("MXFP4-SQ2") ||
+        mfq::metal::is_mxfp4_sq_dtype("MXFP4-SQ3")) {
+      throw std::runtime_error("SQ operator requires a canonical dtype");
+    }
     test_dequantize();
     test_adaptive_q1234_dequant_and_small_m();
     test_adaptive_dequantize_shapes();

@@ -2,7 +2,7 @@
 
 #include "native/tensor/backend.h"
 #include "native/nint_weight.h"
-#include "mfq/quant/nint_rows.h"
+#include "quant/nint_rows.h"
 
 #include <cstdint>
 #include <string>

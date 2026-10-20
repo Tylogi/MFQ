@@ -29,12 +29,12 @@ jobs:
       - name: Build storage and cache regression tests
         run: >-
           cmake --build build/linux-core --parallel 2 --target
-          mfq-file-range-reader-test mfq-model-source-test mfq-quant-expert-range-test
+          mfq-file-range-reader-test mfq-host-memory-copy-test mfq-model-source-test mfq-quant-expert-range-test
           mfq-moe-cache-policy-test mfq-moe-cache-profile-test mfq-native-tensor-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
+          -R '^mfq-(file-range-reader|host-memory-copy|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
 
   macos-metal:
     name: macOS Metal

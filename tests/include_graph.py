@@ -26,13 +26,16 @@ def engine_modules(csrc):
 def include_roots(csrc):
     """Directories a bare include can resolve against, per the CMake targets."""
     engine = os.path.join(csrc, "engine")
-    roots = [csrc, os.path.join(engine, "include"), os.path.join(csrc, "core", "include")]
+    roots = [csrc, os.path.join(engine, "include"), os.path.join(csrc, "core", "include"),
+             os.path.join(csrc, "formats"), os.path.join(csrc, "model_source")]
     roots += [os.path.join(engine, d) for d in engine_modules(csrc)]
     for backend in ("cuda", "metal", "cpu"):
         roots += [os.path.join(csrc, "backends", backend),
                   os.path.join(csrc, "backends", backend, "include")]
     roots += [os.path.join(csrc, "backends", "cpu", layer, "include")
               for layer in ("native", "execution")]
+    roots += [os.path.join(csrc, "backends", "cpu", "ops"),
+              os.path.join(csrc, "components", "io")]
     roots += [os.path.join(csrc, "components", "tokenizer"),
               os.path.join(csrc, "components", "tokenizer", "include"),
               os.path.join(csrc, "models")]

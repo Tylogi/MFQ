@@ -16,8 +16,10 @@ class SqWireTest(unittest.TestCase):
         spec.loader.exec_module(module)
         extension = types.ModuleType("torch.utils.cpp_extension")
         extension.load = mock.Mock(return_value=object())
+        torch_stub = types.ModuleType("torch")
+        torch_stub.version = types.SimpleNamespace(hip=None)
         with mock.patch.object(module, "_ensure_msvc"), mock.patch.dict(sys.modules, {
-            "torch": types.ModuleType("torch"),
+            "torch": torch_stub,
             "torch.utils": types.ModuleType("torch.utils"),
             "torch.utils.cpp_extension": extension,
         }):
@@ -25,6 +27,8 @@ class SqWireTest(unittest.TestCase):
         kwargs = extension.load.call_args.kwargs
         self.assertTrue(any("std:c++20" in flag or "std=c++20" in flag for flag in kwargs["extra_cflags"]))
         self.assertIn("-std=c++20", kwargs["extra_cuda_cflags"])
+        self.assertIn(str(ROOT / "csrc/formats"), kwargs["extra_include_paths"])
+        self.assertNotIn(str(ROOT / "csrc/core/include"), kwargs["extra_include_paths"])
 
     def test_frozen_palette_parity(self):
         source = (ROOT / "csrc/backends/cuda/kernels/quant/mxfp4_sq_impl.cuh").read_text()

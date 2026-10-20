@@ -1,6 +1,6 @@
 #include "text_cancel.h"
 #include "processor.h"
-#include "mfq/model_source/model_source.h"
+#include "model_source.h"
 
 #include "constraint.h"
 #include "tokenizer.h"

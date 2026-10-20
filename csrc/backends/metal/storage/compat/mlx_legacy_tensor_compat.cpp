@@ -3,7 +3,7 @@
 #include "storage/mfq_container.h"
 #include "compat/mfq_legacy_model_graph.h"
 #include "compat/mfq_legacy_tensor_names.h"
-#include "mfq_model_graph.h"
+#include "model_graph/model_graph.h"
 
 #include <stdexcept>
 #include <string>
@@ -50,7 +50,7 @@ void install_legacy_tensor_compatibility(MfqContainer& model) {
         compatibility.layout);
 }
 
-mfq::MfqModelGraph effective_model_graph(const MfqContainer& model) {
+mfq::ModelGraph effective_model_graph(const MfqContainer& model) {
     if (auto graph = model.model_graph()) return *graph;
     return mfq::synthesize_legacy_model_graph(
         model.header().architecture,

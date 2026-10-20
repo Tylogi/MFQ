@@ -2,7 +2,7 @@
 
 #include "storage/compat/mlx_legacy_tensor_compat.h"
 
-#include "mfq/model_source/mfq_model_source.h"
+#include "mfq_model_source.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -441,15 +441,15 @@ void MfqContainer::drop_source_file_cache() const noexcept {
     if (hf_source_) hf_source_->drop_file_cache();
 }
 
-std::optional<mfq::MfqModelGraph> MfqContainer::model_graph() const {
-    const std::string asset(mfq::kMfqModelGraphAsset);
+std::optional<mfq::ModelGraph> MfqContainer::model_graph() const {
+    const std::string asset(mfq::kModelGraphAsset);
     if (!contains(asset)) return std::nullopt;
-    return mfq::MfqModelGraph::from_json(read_text(asset));
+    return mfq::ModelGraph::from_json(read_text(asset));
 }
 
 void MfqContainer::install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
-        mfq::MfqLegacyTensorLayout layout) {
+        mfq::TensorLayout layout) {
     if (model_graph()) {
         throw std::invalid_argument(
             "canonical MFQ model graphs cannot install legacy tensor aliases");

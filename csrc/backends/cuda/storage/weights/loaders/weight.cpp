@@ -9,7 +9,7 @@
 #include "kernels/gated_residual_fused.h"
 #include "kernels/quant_ops.h"
 #include "kernels/attention/selected_attention.h"
-#include "mfq/quant/mxfp4_sq_decode.h"
+#include "quant/mxfp4_sq_decode.h"
 
 #include <algorithm>
 #include <cstring>
@@ -21,7 +21,7 @@
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/weights/mfe_expert_store.h"
 #include "storage/weights/moe/quant_range_source.h"
-#include "mfq/quant/packed_nint_expert_store.h"
+#include "quant/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
 #include "storage/weights/moe/weight_loader.h"
