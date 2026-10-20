@@ -819,7 +819,10 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
       logical_chunk=request.prompt.size();
   }
   if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
-    if(!prepared || !prepared->transformed())logical_chunk=request.prompt.size();
+    // Retained small-M continuations must bound decoder replay as well as
+    // encoder tiles; merging the suffix would re-enter the large PP pipeline.
+    const bool retained_chunks=reused_tokens>0 && prefill_chunk_size<=8;
+    if(!retained_chunks && (!prepared || !prepared->transformed()))logical_chunk=request.prompt.size();
   }
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
