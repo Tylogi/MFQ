@@ -436,7 +436,22 @@ template <class Model> struct CudaGenerationContext {
         }
 #endif
     }
+    bool short_streamed_prefill(std::size_t tokens) const {
+        // A short continuation can reuse the bounded MFE path without
+        // returning its expert images and captured graphs for a large PP arena.
+        return model.cache_pos>0 && tokens<=128 &&
+            moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
+    }
+    int64_t prefill_chunk(std::size_t tokens) const {
+        return short_streamed_prefill(tokens)?std::min<int64_t>(8,config.generation.prefill_chunk_size):
+            config.generation.prefill_chunk_size;
+    }
     void prepare_prefill_workspace(std::size_t tokens) {
+        if(short_streamed_prefill(tokens)) {
+            std::cerr<<"runtime_streamed_prefill retained_decode=1 tokens="<<tokens
+                <<" chunk="<<prefill_chunk(tokens)<<'\n';
+            return;
+        }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const bool streamed=tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
@@ -523,7 +538,7 @@ template <class Model> struct CudaGenerationContext {
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
         prepare_prefill_workspace(input.prompt.size()-reused);
-        auto logical_chunk=config.generation.prefill_chunk_size;
+        auto logical_chunk=prefill_chunk(input.prompt.size()-reused);
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
             // prompts advance each bounded chunk through all layers.
@@ -534,7 +549,8 @@ template <class Model> struct CudaGenerationContext {
                 logical_chunk=input.prompt.size();
         }
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
-            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
+            if(!short_streamed_prefill(input.prompt.size()-reused) &&
+                    (!prepared || !prepared->transformed()))logical_chunk=input.prompt.size();
         }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
@@ -548,7 +564,7 @@ template <class Model> struct CudaGenerationContext {
             *mtp,
             input,
             output,
-            config.generation.prefill_chunk_size,
+            prefill_chunk(input.prompt.size()-reused),
             prepared ? &*prepared : nullptr,
             reused,
             std::move(restored),
