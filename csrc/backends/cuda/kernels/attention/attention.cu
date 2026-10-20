@@ -10,7 +10,7 @@
 
 #include "native/env.h"
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cfloat>

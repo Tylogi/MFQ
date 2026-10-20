@@ -7,12 +7,12 @@ import {
   SectionLabel,
   TMPanel,
   ModelMonogram,
-  MetricTile,
   EmptyPanel,
 } from '../../app/display';
-import { errorMessage, formatNumber, formatBytes, formatDuration } from '../../app/formatters';
+import { errorMessage, formatNumber } from '../../app/formatters';
 import { runtimeModelNames } from './modelSelection';
-import { displayPrefillMetric, preferPositiveMetric } from './metrics';
+import { ServingStatisticsPanel, ServingTotalsPanel } from './ServingStatisticsPanel';
+import { useServingStatistics } from './useServingStatistics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { residentMemoryCapacity } from './memoryArchitecture';
@@ -35,6 +35,8 @@ export function OverviewPage() {
     connectionRevision,
   } = useRuntime();
   const { tr } = useSettings();
+  const [scope, setScope] = useState<'session' | 'alltime'>('session');
+  const { data: servingStatistics, error: statisticsError } = useServingStatistics(scope, connectionRevision);
   const [endpointCopied, setEndpointCopied] = useState<string | null>(null);
   const [listener, setListener] = useState<{ url: string; revision: number; port: number | null } | null>(null);
   const serviceUrl = studio?.service_url || getApiBaseUrl();
@@ -69,9 +71,6 @@ export function OverviewPage() {
     return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
   }, [serviceUrl, connectionRevision]);
   const availableModelNames = runtimeModelNames(models, instances);
-  const last = runtime?.last_request;
-  const lastPrefill = displayPrefillMetric(last);
-  const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
   const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
   const endpoints = [
     { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
@@ -88,30 +87,6 @@ export function OverviewPage() {
       toast.error(errorMessage(cause));
     }
   }
-  const runtimeMemory = Number(
-    runtime?.mlx_active_bytes ??
-      runtime?.cuda_allocated_bytes ??
-      runtime?.process_resident_bytes ??
-      0,
-  );
-  const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
-  const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
-  const prefixCacheHitRate =
-    prefixCacheQueries > 0 ? (prefixCacheHits / prefixCacheQueries) * 100 : 0;
-  const prefixCacheHotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
-  const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === 'number';
-  const prefixCacheSupported = runtime?.prefix_cache_supported !== undefined
-    ? Number(runtime.prefix_cache_supported) > 0
-    : prefixCachePersistent || prefixCacheHotOnly;
-  const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
-    ? tr(
-        '连续批处理模式暂不支持 Session KV 缓存',
-        'Session KV cache is unavailable with continuous batching',
-      )
-    : tr(
-        '当前模型不支持 Session KV 缓存',
-        'The current model does not support Session KV cache',
-      );
 
   return (
     <section className="dashboard-view" id="dashboard-overview">
@@ -184,61 +159,7 @@ export function OverviewPage() {
           </TMPanel>
         </>
       )}
-      <SectionLabel
-        title={tr('实时性能', 'Live performance')}
-        subtitle={tr(
-          '最近请求吞吐与累计缓存复用',
-          'Latest request throughput · cumulative cache reuse',
-        )}
-      />
-      <div className="metric-grid">
-        <MetricTile
-          label={tr('预填充', 'Prefill')}
-          value={formatNumber(lastPrefill.tokensPerSecond, 1)}
-          unit="tok/s"
-          detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr('输入处理', 'Prompt processing')}`}
-          icon="text-forward"
-        />
-        <MetricTile
-          label={tr('解码', 'Decode')}
-          value={formatNumber(last?.decode_tps, 1)}
-          unit="tok/s"
-          detail={tr('输出生成', 'Token generation')}
-          icon="waveform"
-        />
-        <MetricTile
-          label={tr('首字延迟', 'TTFT')}
-          value={formatNumber(lastTtftMs, 1)}
-          unit="ms"
-          detail={tr('首次输出耗时', 'Time to first token')}
-          icon="clock"
-        />
-        <MetricTile
-          label={tr('前缀复用', 'Prefix reuse')}
-          value={
-            !prefixCacheSupported
-              ? tr('不支持', 'Unavailable')
-              : prefixCacheQueries > 0
-                ? `${formatNumber(prefixCacheHitRate, 1)}%`
-                : '--'
-          }
-          detail={
-            !prefixCacheSupported
-              ? prefixCacheUnavailableReason
-              : tr(
-                  `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
-                  `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
-                )
-          }
-          icon="reuse"
-        />
-        <MetricTile
-          label={tr('内存', 'Memory')}
-          value={formatBytes(runtimeMemory)}
-          detail={tr('当前模型活动内存', 'Current model active memory')}
-          icon="memory"
-        />
-      </div>
+      <ServingStatisticsPanel data={servingStatistics} error={statisticsError} scope={scope} onScopeChange={setScope} />
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
         <MemoryHierarchy instances={instances} runtime={runtime} connectionRevision={connectionRevision}
@@ -273,31 +194,7 @@ export function OverviewPage() {
             ))}
           </div>
         </TMPanel>
-        <TMPanel className="overview-session-panel">
-          <div className="overview-panel-title">
-            <Icon name="chart" size={15} />
-            <h2>{tr('会话统计', 'Session')}</h2>
-            <span>{formatDuration(runtime?.uptime_seconds)}</span>
-          </div>
-          <div className="overview-session-stats">
-            <div>
-              <strong>{formatNumber(runtime?.total_requests || 0)}</strong>
-              <small>{tr('已完成', 'Completed')}</small>
-            </div>
-            <div>
-              <strong>{formatNumber(runtime?.total_prompt_tokens || 0)}</strong>
-              <small>{tr('提示词', 'Prompt')}</small>
-            </div>
-            <div>
-              <strong>{formatNumber(runtime?.total_completion_tokens || 0)}</strong>
-              <small>{tr('已生成', 'Generated')}</small>
-            </div>
-          </div>
-          <p>
-            {formatNumber(runtime?.failed_requests || 0)} {tr('个失败请求', 'failed requests')} ·{' '}
-            {formatNumber(runtime?.active_requests || 0)} {tr('个活动请求', 'active')}
-          </p>
-        </TMPanel>
+        <ServingTotalsPanel data={servingStatistics} scope={scope} runtime={runtime} />
       </div>
     </section>
   );

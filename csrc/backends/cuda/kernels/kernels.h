@@ -10,6 +10,9 @@
 
 namespace mfq::cuda::kernels {
 
+void clipped_silu_mul(const TensorView& gate, const TensorView& up,
+    const TensorView& output, double limit, cudaStream_t stream);
+
 void silu_mul(
     const TensorView& gate,
     const TensorView& up,

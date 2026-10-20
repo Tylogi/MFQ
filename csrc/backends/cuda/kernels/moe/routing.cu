@@ -12,8 +12,9 @@
 // nint_matmul.cu; q/k metadata does not create an MFE-specific compute kernel.
 
 #include "native/env.h"
+#include <math_constants.h>
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -192,7 +193,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
     ids += size_t(blockIdx.x) * 10;
     weights += size_t(blockIdx.x) * 10;
     float values[16];
-    float maximum = -INFINITY;
+    float maximum = -CUDART_INF_F;
 #pragma unroll
     for (int slot = 0; slot < 16; ++slot) {
         float raw = load_float(logits, lane + slot * 32);
@@ -213,7 +214,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
         values[slot] /= sum;
         expert_ids[slot] = lane + slot * 32;
         if constexpr (Sorted) {
-            if (isnan(values[slot])) { values[slot] = -INFINITY; expert_ids[slot] = INT_MAX; }
+            if (isnan(values[slot])) { values[slot] = -CUDART_INF_F; expert_ids[slot] = INT_MAX; }
         }
     }
     if constexpr (Sorted) {
@@ -241,7 +242,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
     float selected = 0.0f;
 #pragma unroll 1
     for (int rank = 0; rank < 10; ++rank) {
-        float best = -INFINITY;
+        float best = -CUDART_INF_F;
         int expert = INT_MAX;
         if constexpr (Sorted) { best = values[0]; expert = expert_ids[0]; }
         else {
@@ -281,12 +282,12 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
                 for (int slot = 0; slot < 15; ++slot) {
                     values[slot] = values[slot + 1]; expert_ids[slot] = expert_ids[slot + 1];
                 }
-                values[15] = -INFINITY; expert_ids[15] = INT_MAX;
+                values[15] = -CUDART_INF_F; expert_ids[15] = INT_MAX;
             }
         } else {
 #pragma unroll
             for (int slot = 0; slot < 16; ++slot) {
-                if (expert == lane + slot * 32) values[slot] = -INFINITY;
+                if (expert == lane + slot * 32) values[slot] = -CUDART_INF_F;
             }
         }
     }
@@ -316,7 +317,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
-    float softmax_max = -INFINITY;
+    float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
             float value = load_float(row_logits, expert);
@@ -344,8 +345,8 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 
     for (int rank = 0; rank < top_k; ++rank) {
-        float best_score = -INFINITY;
-        float best_weight = -INFINITY;
+        float best_score = -CUDART_INF_F;
+        float best_weight = -CUDART_INF_F;
         int best_expert = INT_MAX;
 
         for (int expert = lane; expert < experts; expert += kWarpSize) {
@@ -406,7 +407,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         ? weights[static_cast<size_t>(row) * top_k + lane]
         : 0.0f;
     if (delayed_softmax) {
-        float selected_max = lane < top_k ? value : -INFINITY;
+        float selected_max = lane < top_k ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(
@@ -457,7 +458,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
-    float softmax_max = -INFINITY;
+    float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
             float value = load_float(row_logits, expert);
@@ -504,8 +505,8 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
     }
 
     for (int rank = 0; rank < top_k; ++rank) {
-        float best_score = -INFINITY;
-        float best_weight = -INFINITY;
+        float best_score = -CUDART_INF_F;
+        float best_weight = -CUDART_INF_F;
         int best_expert = INT_MAX;
 
 #pragma unroll
@@ -551,7 +552,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
         ? weights[static_cast<size_t>(row) * top_k + lane]
         : 0.0f;
     if (delayed_softmax) {
-        float selected_max = lane < top_k ? value : -INFINITY;
+        float selected_max = lane < top_k ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(
@@ -622,7 +623,7 @@ __global__ void __launch_bounds__(32) moe_topk_1x128_8_kernel(
             }
         }
         if (lane == (best_expert & 31)) {
-            values[best_expert >> 5] = -INFINITY;
+            values[best_expert >> 5] = -CUDART_INF_F;
         }
         if (lane == rank) {
             selected = best;
@@ -630,7 +631,7 @@ __global__ void __launch_bounds__(32) moe_topk_1x128_8_kernel(
         }
     }
 
-    float selected_max = lane < 8 ? selected : -INFINITY;
+    float selected_max = lane < 8 ? selected : -CUDART_INF_F;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         selected_max = fmaxf(
@@ -683,7 +684,7 @@ __global__ void __launch_bounds__(256) moe_topk_1x256_8_kernel(
 
     if (tid < 32) {
         float value = tid < 8 ? scores[tid] : 0.0f;
-        float selected_max = tid < 8 ? value : -INFINITY;
+        float selected_max = tid < 8 ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(
@@ -2049,15 +2050,16 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         return {ids, weights};
     }
     const char* topk512_flag = mfq::cuda::env_lookup("MFQ_MOE_TOPK_512");
-    if (rows == 1 && experts == 512 && top_k == 10 && bias_ptr == nullptr &&
+    const auto* topk512_batch=mfq::cuda::env_lookup("MFQ_MOE_TOPK_512_BATCH");
+    if ((rows == 1 || (rows<=6 && (!topk512_batch || topk512_batch[0]!='0'))) && experts == 512 && top_k == 10 && bias_ptr == nullptr &&
             !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax &&
             (topk512_flag == nullptr || std::atoi(topk512_flag) != 0)) {
         if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
-            topk512_specialized_kernel<mfq_half, true, true><<<1, 32, 0, stream>>>(
+            topk512_specialized_kernel<mfq_half, true, true><<<rows, 32, 0, stream>>>(
                 logits.data_ptr<mfq_half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
                 static_cast<float>(norm_floor), static_cast<float>(scale));
         } else {
-            topk512_specialized_kernel<float, true, true><<<1, 32, 0, stream>>>(
+            topk512_specialized_kernel<float, true, true><<<rows, 32, 0, stream>>>(
                 logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
                 static_cast<float>(norm_floor), static_cast<float>(scale));
         }

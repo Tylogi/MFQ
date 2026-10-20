@@ -78,10 +78,11 @@ std::vector<MlxGridShape> grid_shapes(
 
 } // namespace
 
-MlxEngineComponents make_mlx_engine_components(
+template <class Runtime>
+static MlxEngineComponents make_grid_vision_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
-    std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime_holder,
+    std::shared_ptr<std::optional<Runtime>> runtime_holder,
     mlx::core::Stream runtime_stream) {
     MlxEngineComponents result;
     result.mtp_available =
@@ -167,6 +168,15 @@ MlxEngineComponents make_mlx_engine_components(
                 token_constraint);
         };
     return result;
+}
+
+MlxEngineComponents make_mlx_engine_components(
+    const MfqModelGraph* graph,
+    std::shared_ptr<std::mutex> runtime_mutex,
+    std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime_holder,
+    mlx::core::Stream runtime_stream) {
+    return make_grid_vision_engine_components(graph, std::move(runtime_mutex),
+        std::move(runtime_holder), runtime_stream);
 }
 
 MlxEngineComponents make_mlx_engine_components(
@@ -766,15 +776,11 @@ MlxEngineComponents make_mlx_engine_components(
 
 MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
-    std::shared_ptr<std::mutex>,
+    std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
-    mlx::core::Stream) {
-    MlxEngineComponents result;
-    result.mtp_available =
-        component_declared(graph, "predictor") &&
-        runtime_holder->has_value() &&
-        runtime_holder->value().supports_mtp();
-    return result;
+    mlx::core::Stream runtime_stream) {
+    return make_grid_vision_engine_components(graph, std::move(runtime_mutex),
+        std::move(runtime_holder), runtime_stream);
 }
 
 } // namespace mfq::metal

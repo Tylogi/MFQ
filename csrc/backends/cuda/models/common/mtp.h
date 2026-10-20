@@ -3,7 +3,7 @@
 #include "storage/session/state.h"
 #include "predictor.h"
 #include "native/tensor/backend.h"
-#include "models/common/causal_model_ops.h"
+#include "causal_model_ops.h"
 
 #include <cstdint>
 #include <variant>
@@ -84,6 +84,11 @@ struct MtpModule {
     virtual void restore_session_state(const MtpSessionState&) {
         throw std::runtime_error(
             "this CUDA MTP predictor has no session state");
+    }
+    virtual void seed_target_context(mfq_tensor_backend::Tensor hidden, std::int64_t tokens) {
+        MFQ_RUNTIME_CHECK(hidden.dim() == 3 && hidden.size(1) == tokens,
+                          "this CUDA MTP predictor requires complete prompt context");
+        append_target_context(std::move(hidden), 0);
     }
     virtual void append_target_context(
         mfq_tensor_backend::Tensor,

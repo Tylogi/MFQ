@@ -33,12 +33,12 @@ Mxfp8Cpu unpack_mxfp8(
     const uint64_t storage_columns = read_u64_from(blob, offset);
     const uint64_t scale_rows = read_u64_from(blob, offset);
     const uint64_t scale_columns = read_u64_from(blob, offset);
-    if (rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+    const bool block128=columns%128==0 && scale_rows==(rows+127)/128 && scale_columns==columns/128;
+    const bool block32=columns%32==0 && scale_rows==(rows+31)/32 && scale_columns==columns/32;
+    const bool row32=columns%32==0 && scale_rows==rows && scale_columns==columns/32;
+    if (!rows || !columns || rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
             columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-            columns % 128 != 0 ||
-            storage_rows != rows || storage_columns != columns ||
-            scale_rows != (rows + 127) / 128 ||
-            scale_columns != columns / 128) {
+            storage_rows != rows || storage_columns != columns || !(block128 || block32 || row32)) {
         throw std::runtime_error("invalid MXFP8 payload geometry");
     }
     const size_t value_bytes = checked_mxfp8_size(
@@ -50,6 +50,8 @@ Mxfp8Cpu unpack_mxfp8(
         throw std::runtime_error("invalid MXFP8 payload length");
     }
     Mxfp8Cpu result;
+    result.block_columns=block128?128:32;
+    result.block_rows=block128?128:row32?1:32;
     result.out = static_cast<int64_t>(rows);
     result.neuron_len = static_cast<int64_t>(columns);
     result.values.assign(
@@ -230,13 +232,13 @@ Mxfp8Cpu slice_mxfp8_cpu(
     }
     const int64_t extent = axis == TensorParallelAxis::Output
         ? source.out : source.neuron_len;
+    const int block=axis==TensorParallelAxis::Output?source.block_rows:source.block_columns;
     if (begin < 0 || begin >= end || end > extent ||
-            begin % 128 != 0 ||
-            (end != extent && end % 128 != 0)) {
+            begin % block != 0 || (end != extent && end % block != 0)) {
         throw std::runtime_error(
-            "MXFP8 tensor-parallel shards must preserve 128-element blocks");
+            "MXFP8 tensor-parallel shards must preserve scale blocks");
     }
-    Mxfp8Cpu result;
+    Mxfp8Cpu result;result.block_rows=source.block_rows;result.block_columns=source.block_columns;
     if (axis == TensorParallelAxis::Output) {
         result.out = end - begin;
         result.neuron_len = source.neuron_len;
@@ -247,11 +249,11 @@ Mxfp8Cpu slice_mxfp8_cpu(
         result.values.assign(
             source.values.begin() + static_cast<ptrdiff_t>(value_begin),
             source.values.begin() + static_cast<ptrdiff_t>(value_end));
-        const int64_t scale_columns = source.neuron_len / 128;
+        const int64_t scale_columns = source.neuron_len / source.block_columns;
         const size_t scale_begin =
-            static_cast<size_t>((begin / 128) * scale_columns);
+            static_cast<size_t>((begin / source.block_rows) * scale_columns);
         const size_t scale_end = static_cast<size_t>(
-            ((end + 127) / 128) * scale_columns);
+            ((end + source.block_rows-1) / source.block_rows) * scale_columns);
         result.scales.assign(
             source.scales.begin() + static_cast<ptrdiff_t>(scale_begin),
             source.scales.begin() + static_cast<ptrdiff_t>(scale_end));
@@ -270,9 +272,9 @@ Mxfp8Cpu slice_mxfp8_cpu(
                 static_cast<size_t>(row * source.neuron_len + begin),
             static_cast<size_t>(result.neuron_len));
     }
-    const int64_t source_scale_columns = source.neuron_len / 128;
-    const int64_t result_scale_columns = result.neuron_len / 128;
-    const int64_t scale_rows = (source.out + 127) / 128;
+    const int64_t source_scale_columns = source.neuron_len / source.block_columns;
+    const int64_t result_scale_columns = result.neuron_len / source.block_columns;
+    const int64_t scale_rows = (source.out + source.block_rows-1) / source.block_rows;
     result.scales.resize(
         static_cast<size_t>(scale_rows * result_scale_columns));
     for (int64_t row = 0; row < scale_rows; ++row) {
@@ -280,7 +282,7 @@ Mxfp8Cpu slice_mxfp8_cpu(
             result.scales.data() +
                 static_cast<size_t>(row * result_scale_columns),
             source.scales.data() + static_cast<size_t>(
-                row * source_scale_columns + begin / 128),
+                row * source_scale_columns + begin / source.block_columns),
             static_cast<size_t>(result_scale_columns));
     }
     return result;
@@ -297,7 +299,7 @@ Mxfp8Weight to_device_mxfp8(
         {source.out, source.neuron_len});
     result.scales = cpu_u8_tensor(
         source.scales,
-        {(source.out + 127) / 128, source.neuron_len / 128});
+        {(source.out + source.block_rows-1) / source.block_rows, source.neuron_len / source.block_columns});
     if (cuda) {
         const int target_device = device >= 0
             ? device : mfq_current_cuda_device();

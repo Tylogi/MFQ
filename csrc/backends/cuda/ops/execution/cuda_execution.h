@@ -1,13 +1,14 @@
 #pragma once
 namespace mfq::cuda {
-class KvOffloadStore;
+class KvOffloadStore; class KvMemoryManager;
 // Defined in ops/decode_window.cpp.  Declared here so operator code can ask
 // whether a decode graph is being captured without pulling in DecodeWindow.
 bool decode_window_recording() noexcept;
 }
 
 #include "native/tensor/backend.h"
-#include "tensor_parallel.h"
+#include "csrc/core/tensor_parallel.h"
+#include "mfq/yarn.h"
 
 #include <cuda_runtime_api.h>
 #ifdef MFQ_HAVE_NCCL
@@ -52,6 +53,7 @@ class MoeExpertCache;
 // context, and nothing else takes ownership.  An execution reset drops the
 // Engine's reference to the expert cache; a live model keeps that cache alive.
 struct CudaStores {
+    std::shared_ptr<mfq::cuda::KvMemoryManager> kv_memory;
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
     std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
 };
@@ -329,6 +331,8 @@ struct MoeRouteLayerStats {
 
 struct CudaExecutionContext {
     CudaExecutionContext();
+    bool yarn_context_extension=false;
+    mfq::models::YarnScaling yarn;
 
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     mfq::cuda::ContextSet native_contexts;
@@ -349,6 +353,8 @@ struct CudaExecutionContext {
     bool decode_graph_serial_branches = false;
     bool decode_graph_tp_projection_major = false;
     bool continuous_batch_cache_serial = false;
+    int continuous_batch_ffn_tile = 0;
+    int continuous_batch_ffn_tiles = 1;
     int moe_cache_registration_min_slots = 8;
     int gemma_trace_layer = -1;
     std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*

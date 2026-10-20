@@ -14,16 +14,31 @@ export function routerWeightLabel(info?: AnalysisAdvanced): string {
     ? `L1(${activation})` : activation;
 }
 
-export function categoryLabel(category: string, tr: Translate): string {
-  const labels: Record<string, [string, string]> = {
-    routed_experts: ['路由专家', 'Routed experts'], shared_expert: ['共享专家', 'Shared experts'],
-    attention: ['注意力', 'Attention'], gdn: ['GDN', 'GDN'], mhc: ['MHC', 'MHC'],
-    router: ['路由器', 'Router'], ffn: ['稠密 FFN', 'Dense FFN'], ple: ['PLE 表', 'PLE tables'],
-    ple_projection: ['PLE 投影', 'PLE projections'], embedding: ['嵌入', 'Embedding'],
-    lm_head: ['LM Head', 'LM Head'], predictor: ['MTP', 'MTP'], vision: ['视觉', 'Vision'],
-    audio: ['音频', 'Audio'], tts: ['语音输出', 'Speech output'], other: ['其他', 'Other'],
+export function categoryLabel(category: string): string {
+  const labels: Record<string, string> = {
+    routed_experts: 'Routed experts', shared_expert: 'Shared experts',
+    attention: 'Attention', gdn: 'GDN', mhc: 'MHC',
+    router: 'Router', ffn: 'Dense FFN', ple: 'PLE tables',
+    ple_projection: 'PLE projections', embedding: 'Embedding',
+    lm_head: 'LM Head', predictor: 'MTP', vision: 'Vision',
+    audio: 'Audio', tts: 'Speech output', other: 'Other',
   };
-  return labels[category] ? tr(...labels[category]) : category;
+  return labels[category] ?? category;
+}
+
+export function analysisCategoryLabel(analysis: CheckpointAnalysis, category: string, projection?: string): string {
+  if (category === 'shared_expert' && projection && /(^|\.)router(\.|$)/.test(projection)) return 'Shared expert router';
+  if (category !== 'attention') return categoryLabel(category);
+  const ids = new Set(analysis.tensors.filter(item => item.category === category &&
+    (!projection || item.projection === projection)).map(item => item.layer));
+  const specific = (kind: string) => !['attention', 'unknown', 'full_attention', 'linear_attention', 'gdn'].includes(kind.toLowerCase());
+  const kinds = [...new Set(analysis.layers.filter(layer => ids.has(layer.layer)).map(layer => layer.attention_type).filter(specific))];
+  if (kinds.length) return kinds.join(' / ');
+  const known = Object.keys(analysis.attention_distribution).filter(specific);
+  if (known.length) return known.join(' / ');
+  const query = analysis.attention_heads, kv = analysis.kv_heads;
+  if (query && kv && query % kv === 0) return query === kv ? 'MHA' : 'GQA';
+  return 'Unidentified type';
 }
 
 export function parameterLabel(value: number): string {
@@ -33,10 +48,13 @@ export function parameterLabel(value: number): string {
   return String(value);
 }
 
-export function precisionColor(value: number, min: number, max: number): string {
-  const amount = Math.max(0, Math.min(1, (value - min) / (max - min || 1)));
-  const low = [245, 234, 216], high = [126, 70, 29];
-  return `rgb(${low.map((channel, index) => Math.round(channel + (high[index] - channel) * amount)).join(',')})`;
+export const PRECISION_BPW_MIN = 1;
+export const PRECISION_BPW_MAX = 8;
+
+export function precisionColor(value: number): string {
+  const amount = Math.max(0, Math.min(1, (value - PRECISION_BPW_MIN) / (PRECISION_BPW_MAX - PRECISION_BPW_MIN)));
+  const shade = Math.round(245 - 200 * amount);
+  return `rgb(${shade},${shade},${shade})`;
 }
 
 export function averageBpw(items: Iterable<{ parameters: number; bpw: number | null }>): number | null {
@@ -77,13 +95,31 @@ export function expertPoints(experts: AnalysisExpert[], projection?: string): Ma
 }
 
 export function projectionSeries(tensors: AnalysisTensor[], category: string, projection: string, layers: number) {
+  return tensorPrecisionSeries(tensors.filter(item => item.category === category && item.projection === projection), layers);
+}
+
+export function isFfnTensor(item: { category: string; projection: string }): boolean {
+  return ['ffn', 'routed_experts', 'shared_expert'].includes(item.category) && !/(^|\.)router(\.|$)/.test(item.projection);
+}
+
+export function tensorPrecisionSeries(tensors: AnalysisTensor[], layers: number) {
   return Array.from({ length: layers }, (_, layer) => {
-    const items = tensors.filter(item => item.layer === layer && item.category === category && item.projection === projection);
+    const items = tensors.filter(item => item.layer === layer);
     const parameters = items.reduce((sum, item) => sum + item.parameters, 0);
     const bytes = items.reduce((sum, item) => sum + item.stored_bytes, 0);
     return { layer, bpw: parameters && items.every(item => item.bpw != null) ? bytes * 8 / parameters : null,
       parameters, bytes, formats: [...new Set(items.map(item => item.format))] };
   });
+}
+
+export function ffnPrecisionSeries(analysis: CheckpointAnalysis, projection?: string, shared = false) {
+  return tensorPrecisionSeries(analysis.tensors.filter(item => isFfnTensor(item) && item.category === (shared ? 'shared_expert' : 'ffn') &&
+    (!projection || item.projection === projection)), analysis.layer_count);
+}
+
+export function otherProjectionSeries(analysis: CheckpointAnalysis, category?: string, projection?: string) {
+  return tensorPrecisionSeries(analysis.tensors.filter(item => !isFfnTensor(item) &&
+    (!category || item.category === category) && (!projection || item.projection === projection)), analysis.layer_count);
 }
 
 function tensorBudget(items: AnalysisTensor[]) {
@@ -100,25 +136,18 @@ export function specialTensorBudgets(analysis: CheckpointAnalysis) {
 }
 
 export function layerBudgetSeries(analysis: CheckpointAnalysis) {
-  const groups = new Map<number, { moe: AnalysisTensor[]; attention: AnalysisTensor[]; total: AnalysisTensor[] }>();
+  const groups = new Map<number, { ffn: AnalysisTensor[]; attention: AnalysisTensor[]; total: AnalysisTensor[] }>();
   for (const item of analysis.tensors) {
     if (item.layer == null || ['ple', 'ple_projection'].includes(item.category)) continue;
-    const kind = ['routed_experts', 'shared_expert', 'router'].includes(item.category) ? 'moe'
+    const kind = isFfnTensor(item) ? 'ffn'
       : ['attention', 'gdn'].includes(item.category) ? 'attention' : null;
     let group = groups.get(item.layer);
-    if (!group) { group = { moe: [], attention: [], total: [] }; groups.set(item.layer, group); }
+    if (!group) { group = { ffn: [], attention: [], total: [] }; groups.set(item.layer, group); }
     group.total.push(item);
     if (kind) group[kind].push(item);
   }
   return analysis.layers.map(layer => ({
-    ...layer, moe: tensorBudget(groups.get(layer.layer)?.moe ?? []), attention: tensorBudget(groups.get(layer.layer)?.attention ?? []),
+    ...layer, ffn: tensorBudget(groups.get(layer.layer)?.ffn ?? []), attention: tensorBudget(groups.get(layer.layer)?.attention ?? []),
     total: tensorBudget(groups.get(layer.layer)?.total ?? []),
   }));
-}
-
-export function precisionRange(analysis: CheckpointAnalysis): [number, number] {
-  if (!analysis.experts.length) return [0, 8];
-  const minimum = analysis.experts.reduce((value, item) => Math.min(value, item.bpw), Infinity);
-  const maximum = analysis.experts.reduce((value, item) => Math.max(value, item.bpw), -Infinity);
-  return [Math.floor(minimum * 10) / 10, Math.ceil(maximum * 10) / 10];
 }

@@ -3,7 +3,7 @@
 // add this unit.  The wide-M path reuses the inference dequant entry point so
 // the packed decode stays one implementation.
 #include "native/env.h"
-#include "mxfp4_sq.h"
+#include "kernels/quant/mxfp4_sq.h"
 
 #include <algorithm>
 #include <cstddef>

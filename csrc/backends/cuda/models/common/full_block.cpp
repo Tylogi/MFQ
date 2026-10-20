@@ -5,6 +5,7 @@
 #include "common/attention.h"
 #include "common/gated_mlp.h"
 #include "common/transformer_layer.h"
+#include "ops/execution/execution_options.h"
 #include <array>
 
 #include "kernels/activation_ops.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -42,6 +44,14 @@ void FullBlock::plan_resources(mfq::cuda::CudaResourcePlan& plan,
         std::size_t(attention_head_dim + 2), 4});
     plan.add(cuda_device, {graph_copies, std::size_t(kv_heads), (context + 63) / 64,
         8, std::size_t(2 + attention_head_dim / 2), 8});
+}
+
+void FullBlock::preallocate_kv() {
+    if (!mfq::cuda::runtime_options::kv_vram_preallocated() || cpu_offloaded || state->cache.defined()) return;
+    MfqCudaGuard guard(cuda_device);
+    state->cache = KVCache(1, kv_heads, sliding ? attention_window : max_position_embeddings,
+        attention_head_dim, sliding, mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, cuda_device),
+        official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
 }
 
 void FullBlock::reset(int64_t B) {
@@ -110,8 +120,9 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
     if (!state->cache.defined()) {
         state->cache =
             KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
-                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
+                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
     }
+    state->cache.quantization=kv_quantization;
     if (x.is_cuda()) {
         const int64_t total = B * nh;
         if (!state->decode_partial_o.defined() || state->decode_partial_o.size(0) < total ||
@@ -158,7 +169,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 B == 1 && cache_positions.has_value() && pos.dim() == 2 && pos.size(0) == 3;
             const bool fused_qk_rope_kv =
                 official_bf16 && x.is_cuda() && write_positions.dim() == 1 && pos.dim() == 1 &&
-                T == 1 && !state->cache.is_paged() && !state->cache.ring && !v_norm.defined() &&
+                T == 1 && !state->cache.is_paged() && !state->cache.ring && !state->cache.quantization.enabled() && !v_norm.defined() &&
                 q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
                 active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
                 state->cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
@@ -408,6 +419,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
                     mfq_tensor_backend::Tensor a;
                     a = profiler.measure("full.attention", [&]() {
+                        if(state->cache.quantization.enabled()) {
+                            attention_token_major=true;
+                            const auto capacity=planned_kv_length>0?planned_kv_length:cache_pos+T;
+                            return mfq::cuda::cuda_kv_attention(q,state->cache.k,state->cache.v,state->cache.quantization,{},write_positions,
+                                cache_pos,state->cache.quantized_pages(),capacity,seq_len.value_or(mfq_tensor_backend::Tensor{}),
+                                attention_mask.value_or(mfq_tensor_backend::Tensor{}),attn_scale);
+                        }
                         if (!x.is_cuda()) {
                             MFQ_RUNTIME_CHECK(
                                 !sliding, "CPU dense offload does not support sliding attention");
@@ -935,7 +953,7 @@ mfq_tensor_backend::Tensor qwen_rms_norm_bf16(const CudaExecutionConfig &config,
 
 FullBlockSessionState capture_full_attention_session_state(const FullBlock& block, int64_t cache_pos, size_t& bytes) {
     const auto& cache = block.state->cache;
-    if (!cache.k.defined() || !cache.v.defined() || cache.k.dim() != 4 || cache.v.sizes() != cache.k.sizes() || cache.k.size(0) != 1)
+    if (!cache.k.defined() || !cache.v.defined() || cache.k.dim() != 4 || !session_kv_geometry_matches(cache.k,cache.v) || cache.k.size(0) != 1)
         throw std::runtime_error("full-attention KV cache is unavailable");
     FullBlockSessionState state;
     state.capacity = cache.k.size(2);
@@ -949,9 +967,10 @@ FullBlockSessionState capture_full_attention_session_state(const FullBlock& bloc
 
 void restore_full_attention_session_state(FullBlock& block, const FullBlockSessionState& state) {
     if (!state.k.defined() || !state.v.defined() || state.capacity <= 0 || state.k.dim() != 4 ||
-            state.v.sizes() != state.k.sizes() || state.k.size(0) != 1 || state.k.size(2) > state.capacity)
+            !session_kv_geometry_matches(state.k,state.v) || state.k.size(0) != 1 || state.k.size(2) > state.capacity)
         throw CudaSessionStateError("full-attention session KV layout is invalid");
     restore_session_prefix_tensor(block.state->cache.k, state.k, 2, state.capacity);
     restore_session_prefix_tensor(block.state->cache.v, state.v, 2, state.capacity);
     block.state->cache.ring = state.ring;
+    block.state->cache.quantization=block.kv_quantization;
 }

@@ -10,6 +10,25 @@
 #include <cstdint>
 #include <vector>
 
+mfq_tensor_backend::Tensor clipped_silu_mul_cuda(mfq_tensor_backend::Tensor gate,
+    mfq_tensor_backend::Tensor up, double limit) {
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && up.device()==gate.device() &&
+        gate.scalar_type()==mfq_tensor_backend::kFloat16 && up.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        gate.sizes()==up.sizes() && gate.is_contiguous() && up.is_contiguous() && limit>0,
+        "clipped SwiGLU requires matching contiguous CUDA FP16 tensors and a positive limit");
+    auto output=mfq_tensor_backend::empty_like(gate);
+    const auto shape=gate.sizes().vec();
+    const auto dtype=mfq::cuda::ScalarType::float16;
+    const auto device=mfq::cuda::Device{mfq::cuda::DeviceType::cuda,gate.get_device()};
+    mfq::cuda::kernels::clipped_silu_mul(
+        mfq::cuda::make_contiguous_view(gate.data_ptr(),shape,dtype,device),
+        mfq::cuda::make_contiguous_view(up.data_ptr(),shape,dtype,device),
+        mfq::cuda::make_contiguous_view(output.data_ptr(),shape,dtype,device),
+        limit,mfq_current_cuda_stream());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 mfq_tensor_backend::Tensor silu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up)
 {
     MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous(), "silu_mul: gate must be cuda contiguous");

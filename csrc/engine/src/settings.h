@@ -18,6 +18,7 @@ struct PrefixCacheConfig {
     std::uint64_t block_tokens = 256;
     std::uint64_t disk_bytes = 100ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t hot_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::uint64_t ram_bytes = 2ULL << 30;
     std::size_t pending_writes = 64;
     std::uint64_t pending_bytes = 512ULL * 1024ULL * 1024ULL;
     bool enabled = true;

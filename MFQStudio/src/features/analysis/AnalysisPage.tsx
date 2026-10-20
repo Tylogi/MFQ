@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
+import { CaretRightIcon } from '@phosphor-icons/react';
 import { useSearchParams } from 'react-router';
 import { Icon, EmptyPanel } from '../../app/display';
 import { errorMessage, formatBytes } from '../../app/formatters';
@@ -10,8 +11,8 @@ import { useSettings } from '../settings/SettingsProvider';
 import { ArchitectureDiagram } from './ArchitectureDiagram';
 import { AdvancedDetails } from './AdvancedDetails';
 import { KvCachePlanner } from '../models/KvCachePlanner';
-import { ExpertHeatmap, LayerBudget, PrecisionLegend, ProjectionBars } from './PrecisionCharts';
-import { categoryLabel, parameterLabel, precisionRange } from './analysisData';
+import { ExpertHeatmap, FfnBars, LayerBudget, PrecisionLegend, ProjectionBars } from './PrecisionCharts';
+import { analysisCategoryLabel, parameterLabel } from './analysisData';
 import { CompactSelect } from '../../shared/ui/CompactSelect';
 
 export function AnalysisPage() {
@@ -25,7 +26,7 @@ export function AnalysisPage() {
   const [listing, setListing] = useState(true);
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
-  const [visualization, setVisualization] = useState<'experts' | 'projections'>('experts');
+  const [visualization, setVisualization] = useState<'ffn' | 'projections'>('ffn');
   const [category, setCategory] = useState('all');
   const [tensorSearch, setTensorSearch] = useState('');
   const [tensorPage, setTensorPage] = useState(0);
@@ -57,7 +58,6 @@ export function AnalysisPage() {
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [selected, listing, connectionRevision, revision]);
-  const range = useMemo(() => analysis ? precisionRange(analysis) : [0, 8] as [number, number], [analysis]);
   const categories = [...new Set(analysis?.projections.map(item => item.category) ?? [])];
   const projections = analysis?.projections.filter(item => category === 'all' || item.category === category) ?? [];
   const tensors = analysis?.tensors.filter(item => !tensorSearch || item.name.toLowerCase().includes(tensorSearch.toLowerCase())) ?? [];
@@ -104,26 +104,30 @@ export function AnalysisPage() {
             </div>
             <div className="analysis-section-heading analysis-projection-heading"><h3>{tr('各类投影', 'Projection breakdown')}</h3>
               <select aria-label={tr('投影分类', 'Projection category')} value={category} onChange={event => setCategory(event.target.value)}>
-                <option value="all">{tr('全部组件', 'All components')}</option>{categories.map(item => <option key={item} value={item}>{categoryLabel(item, tr)}</option>)}</select></div>
+                <option value="all">All components</option>{categories.map(item => <option key={item} value={item}>{analysisCategoryLabel(analysis, item)}</option>)}</select></div>
             <div className="analysis-table-scroll analysis-projection-table"><table><thead><tr>
               <th>{tr('组件 / 投影', 'Component / projection')}</th><th>{tr('参数量', 'Parameters')}</th><th>bpw</th><th>{tr('格式', 'Formats')}</th></tr></thead>
-              <tbody>{projections.map((item, index) => <tr key={`${item.category}:${item.name}:${index}`}><td><span>{categoryLabel(item.category, tr)}</span><strong>{item.name}</strong></td>
+              <tbody>{projections.map((item, index) => <tr key={`${item.category}:${item.name}:${index}`}><td><span>{analysisCategoryLabel(analysis, item.category, item.name)}</span><strong>{item.name}</strong></td>
                 <td title={item.parameters.toLocaleString()}>{parameterLabel(item.parameters)}</td><td>{item.average_bpw?.toFixed(3) ?? '—'}</td><td>{item.formats.join(' · ')}</td></tr>)}</tbody></table></div>
           </section>
           <section className="analysis-panel analysis-visualizations">
             <div className="analysis-panel-heading"><h2>{tr('量化可视化', 'Quantization visualization')}</h2><Icon name="chart" size={16} /></div>
             <div className="analysis-tabs" role="tablist" aria-label={tr('量化图表', 'Quantization charts')}>
-              <button role="tab" id="analysis-expert-tab" aria-controls="analysis-chart-content" aria-selected={visualization === 'experts'} onClick={() => setVisualization('experts')} type="button">{tr('路由专家', 'Routed experts')}</button>
-              <button role="tab" id="analysis-projection-tab" aria-controls="analysis-chart-content" aria-selected={visualization === 'projections'} onClick={() => setVisualization('projections')} type="button">{tr('注意力与投影', 'Attention & projections')}</button></div>
-            <div id="analysis-chart-content" role="tabpanel" aria-labelledby={visualization === 'experts' ? 'analysis-expert-tab' : 'analysis-projection-tab'}>
-              {visualization === 'experts' ? analysis.experts.length ? <>
-                <PrecisionLegend range={range} tr={tr} /><ExpertHeatmap analysis={analysis} range={range} tr={tr} />
+              <button role="tab" id="analysis-ffn-tab" aria-controls="analysis-chart-content" aria-selected={visualization === 'ffn'} onClick={() => setVisualization('ffn')} type="button">FFN</button>
+              <button role="tab" id="analysis-projection-tab" aria-controls="analysis-chart-content" aria-selected={visualization === 'projections'} onClick={() => setVisualization('projections')} type="button">{tr('注意力与其它投影', 'Attention & other projections')}</button></div>
+            <div id="analysis-chart-content" role="tabpanel" aria-labelledby={visualization === 'ffn' ? 'analysis-ffn-tab' : 'analysis-projection-tab'}>
+              {visualization === 'ffn' ? <>
+                {analysis.expert_count > 0 || analysis.experts.length > 0 ? <>
+                  <PrecisionLegend tr={tr} /><ExpertHeatmap analysis={analysis} tr={tr} />
+                  <div className="analysis-projection-maps">{['gate', 'up', 'down'].map(projection =>
+                    <ExpertHeatmap key={projection} analysis={analysis} projection={projection} tr={tr} />)}</div>
+                  {analysis.tensors.some(item => item.category === 'shared_expert') && <details key={analysis.model_id} className="analysis-shared-ffn">
+                    <summary>{tr('共享专家', 'Shared experts')}<CaretRightIcon size={13} /></summary>
+                    <FfnBars analysis={analysis} shared tr={tr} />
+                  </details>}
+                </> : <FfnBars analysis={analysis} tr={tr} />}
                 <LayerBudget analysis={analysis} tr={tr} />
-                <div className="analysis-projection-maps">{['gate', 'up', 'down'].map(projection =>
-                  <ExpertHeatmap key={projection} analysis={analysis} projection={projection} range={range} tr={tr} />)}</div>
-              </> : <div className="analysis-empty-chart"><Icon name="chart" size={22} /><span>{tr('这个检查点没有可读取的路由专家精度，稠密与注意力投影见另一页。', 'No routed expert precision metadata. Inspect dense and attention projections in the other tab.')}</span>
-                <LayerBudget analysis={analysis} tr={tr} /></div>
-                : <><ProjectionBars analysis={analysis} tr={tr} /><LayerBudget analysis={analysis} tr={tr} /></>}
+              </> : <><ProjectionBars key={analysis.model_id} analysis={analysis} tr={tr} /><LayerBudget analysis={analysis} tr={tr} /></>}
             </div>
             <p className="analysis-method">{tr('bpw = 实际存储位数 / 参数量，含量化元数据、码本与格式开销；平均值按参数量加权。不含资源文件、整数缓冲、KV Cache 或运行时展开。', 'bpw = stored bits / parameters, including quantization metadata, codebooks and format overhead; averages are parameter-weighted. Excludes assets, integer buffers, KV cache and runtime expansion.')}</p>
           </section>

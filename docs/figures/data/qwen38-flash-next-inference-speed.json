@@ -1,0 +1,137 @@
+{
+  "model": "Qwen3.8-Flash-Next",
+  "input_tokens": 4096,
+  "unit": "tokens/second",
+  "source": {
+    "path": "README.md",
+    "section": "Benchmarks",
+    "repository_commit": "75059a7fc0b54a9ce3320067c599787544158d10",
+    "description": "Existing published MFQ benchmark table; this figure introduces no new measurements."
+  },
+  "backends": [
+    {
+      "id": "metal",
+      "measurements": [
+        {
+          "tier": "V1-M",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2538.5,
+          "generation_no_mtp": 71.6,
+          "generation_mtp": 101.2,
+          "reported_memory_usage": "43.36 GiB"
+        },
+        {
+          "tier": "S2-L",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2538.9,
+          "generation_no_mtp": 71,
+          "generation_mtp": 97.9,
+          "reported_memory_usage": "47.41 GiB"
+        },
+        {
+          "tier": "V3-XXS",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2527.6,
+          "generation_no_mtp": 70.8,
+          "generation_mtp": 105.4,
+          "reported_memory_usage": "50.33 GiB"
+        },
+        {
+          "tier": "S3-L",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2565.6,
+          "generation_no_mtp": 68.1,
+          "generation_mtp": 98.2,
+          "reported_memory_usage": "57.95 GiB"
+        },
+        {
+          "tier": "V4-XS",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2540.1,
+          "generation_no_mtp": 67.7,
+          "generation_mtp": 96.7,
+          "reported_memory_usage": "61.48 GiB"
+        },
+        {
+          "tier": "S4-L",
+          "device": "Apple M5 Max · 40-core GPU · 128 GB",
+          "input_tokens": 4096,
+          "prefill": 2481.7,
+          "generation_no_mtp": 63.6,
+          "generation_mtp": 93.6,
+          "reported_memory_usage": "78.25 GiB"
+        }
+      ]
+    },
+    {
+      "id": "cuda",
+      "measurements": [
+        {
+          "tier": "V1-S",
+          "device": "3090Ti + 32GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1779.7,
+          "generation_no_mtp": 62.9,
+          "generation_mtp": 87,
+          "system_ram_gib": 32,
+          "reported_memory_usage": "≈41.04 GiB"
+        },
+        {
+          "tier": "V1-M",
+          "device": "3090Ti + 32GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1787.2,
+          "generation_no_mtp": 63.4,
+          "generation_mtp": 77.5,
+          "system_ram_gib": 32,
+          "reported_memory_usage": "≈42.90 GiB"
+        },
+        {
+          "tier": "S2-L",
+          "device": "3090Ti + 32GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1707.8,
+          "generation_no_mtp": 58.8,
+          "generation_mtp": 77.8,
+          "system_ram_gib": 32,
+          "reported_memory_usage": "≈46.93 GiB"
+        },
+        {
+          "tier": "V3-XXS",
+          "device": "3090Ti + 32GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1626.2,
+          "generation_no_mtp": 51.7,
+          "generation_mtp": 61,
+          "system_ram_gib": 32,
+          "reported_memory_usage": "≈49.81 GiB"
+        },
+        {
+          "tier": "S3-L",
+          "device": "3090Ti + 64GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1408.5,
+          "generation_no_mtp": 39.4,
+          "generation_mtp": 42.1,
+          "system_ram_gib": 64,
+          "reported_memory_usage": "≈57.28 GiB"
+        },
+        {
+          "tier": "V4-XS",
+          "device": "3090Ti + 64GiB RAM",
+          "input_tokens": 4096,
+          "prefill": 1317.1,
+          "generation_no_mtp": 36,
+          "generation_mtp": 36.2,
+          "system_ram_gib": 64,
+          "reported_memory_usage": "≈60.72 GiB"
+        }
+      ]
+    }
+  ]
+}

@@ -30,7 +30,15 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
         {!messages.length && !currentVoiceMessages.length && !live && (
           <div className="welcome">
             <Icon name="chat" size={34} />
-            {!chat.conversation.modelAvailable ? (
+            {!active ? (
+              <>
+                <h1>{tr('开始对话', 'Start a conversation')}</h1>
+                <p>{tr('连接到当前配置的 MFQ 服务。', 'Connected to your configured MFQ service.')}</p>
+                <button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">
+                  {tr('开始对话', 'Start chat')}
+                </button>
+              </>
+            ) : !chat.conversation.modelAvailable ? (
               <>
                 <h1>{inference.selectedModelLoading
                   ? tr('模型加载中', 'Model loading')
@@ -43,14 +51,6 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
                     <Icon name="folder" />{tr('选择模型', 'Choose model')}
                   </button>
                 )}
-              </>
-            ) : !active ? (
-              <>
-                <h1>{tr('开始对话', 'Start a conversation')}</h1>
-                <p>{tr('连接到当前配置的 MFQ 服务。', 'Connected to your configured MFQ service.')}</p>
-                <button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">
-                  {tr('开始对话', 'Start chat')}
-                </button>
               </>
             ) : (
               <>

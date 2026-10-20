@@ -65,7 +65,7 @@ function useChatDomain() {
   const runtimeContext = useRuntime();
   const { connectionRevision, ready, refreshRuntime, voiceComponent } = runtimeContext;
   const inference = useChatInference(active?.mode ?? 'text');
-  const voice = useVoiceConversation(activeId, connectionRevision, setError);
+  const voice = useVoiceConversation(activeId, connectionRevision, setError, inference.selectedModel);
   useEffect(() => {
     const controller = voice.voiceRef.current;
     if (controller && !controller.active)
@@ -125,6 +125,8 @@ function useChatDomain() {
         generation.getSnapshot().recoveryNeeded
       )
         return;
+      const inference = inferenceRef.current;
+      if (!inference.availableModelNames.includes(inference.selectedModel)) return;
       setError(null);
       if (optimistic)
         setMessages((current) => [
@@ -137,9 +139,9 @@ function useChatDomain() {
             created_at: new Date().toISOString(),
           },
         ]);
-      const inference = inferenceRef.current;
       await generation.start(session.id, {
         request_id: crypto.randomUUID(),
+        model: inference.selectedModel,
         expected_revision: session.revision,
         input,
         input_role: role,
@@ -251,6 +253,7 @@ function useChatDomain() {
       deleteSession: conversation.deleteSession,
       renameSession: conversation.renameSession,
       conversationReady: conversation.conversationReady,
+      historyReady: conversation.historyReady,
       modelAvailable: conversation.modelAvailable,
     }),
     [
@@ -262,6 +265,7 @@ function useChatDomain() {
       conversation.deleteSession,
       conversation.renameSession,
       conversation.conversationReady,
+      conversation.historyReady,
       conversation.modelAvailable,
     ],
   );
@@ -302,7 +306,7 @@ function useChatDomain() {
       return;
     setBusy(true);
     try {
-      const replacement = await sessionsApi.createSession(active.model, active.mode);
+      const replacement = await sessionsApi.createSession(undefined, active.mode);
       await sessionsApi.deleteSession(active.id);
       if (activeIdRef.current !== active.id) return;
       setSessions((current) => [

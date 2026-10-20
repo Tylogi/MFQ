@@ -1,0 +1,31 @@
+{
+  "source": "MFQStudio/src/shared/styles/tokens.css (light theme; translucent colors composited on white)",
+  "colors": {
+    "canvas": "#f6f7f9",
+    "surface": "#ffffff",
+    "ink": "#202122",
+    "strong": "#111213",
+    "soft": "#454748",
+    "muted": "#5f6264",
+    "muted_light": "#6c6f71",
+    "line": "#e4e4e5",
+    "line_soft": "#ededed",
+    "accent": "#9f6232",
+    "accent_ink": "#8e5427",
+    "accent_soft": "#f4eee8",
+    "neutral_bar": "#a1a4a7"
+  },
+  "profiles": {
+    "IQ2_S": ["#eceef0", "#454748"],
+    "IQ4_NL": ["#d8dbdf", "#454748"],
+    "NVQ1-S": ["#f5ede5", "#685442"],
+    "NVQ1-L": ["#eddac7", "#685442"],
+    "NVQ2J": ["#c9cdd2", "#35383c"],
+    "NVQ2J-L": ["#e4d6c8", "#584535"],
+    "NVQ2J-XL": ["#cab39f", "#49392c"],
+    "NVQ3J": ["#e6e8eb", "#454748"],
+    "NVQ3J-512": ["#d1d5db", "#35383c"],
+    "NVQ3J-L": ["#d2b194", "#49311f"],
+    "NINT4": ["#9f6232", "#ffffff"]
+  }
+}

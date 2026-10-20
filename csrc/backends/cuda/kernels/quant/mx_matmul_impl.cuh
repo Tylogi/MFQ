@@ -3,7 +3,7 @@
 // Shared by the MXFP8/MXFP4 inference unit and the tool-only backward unit:
 // the format decoders and the weight geometry checks both sides run.
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 #include <limits>
@@ -64,11 +64,12 @@ void validate_mxfp8(
     MFQ_RUNTIME_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
                     values.size(0) <= std::numeric_limits<int>::max() &&
                     values.size(1) <= std::numeric_limits<int>::max() &&
-                    values.size(1) % 128 == 0,
-                "MXFP8 input width must be divisible by 128");
-    MFQ_RUNTIME_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
-                    scales.size(1) == values.size(1) / 128,
-                "MXFP8 scale geometry mismatch");
+                    values.size(1) % 32 == 0,
+                "MXFP8 input width must be divisible by 32");
+    const bool block128=values.size(1)%128==0 && scales.size(0)==(values.size(0)+127)/128 && scales.size(1)==values.size(1)/128;
+    const bool block32=scales.size(0)==(values.size(0)+31)/32 && scales.size(1)==values.size(1)/32;
+    const bool row32=scales.size(0)==values.size(0) && scales.size(1)==values.size(1)/32;
+    MFQ_RUNTIME_CHECK(block128 || block32 || row32,"MXFP8 scale geometry mismatch");
 }
 
 void validate_mxfp4_dense(

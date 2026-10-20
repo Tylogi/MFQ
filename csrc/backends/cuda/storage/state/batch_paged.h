@@ -17,6 +17,7 @@ struct PagedKvLayerGeometry {
     int device;
     int64_t heads, head_dim;
     mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16;
+    KvQuantization quantization;
 };
 struct PagedKvStats {
     int64_t page_size = 0, live_pages = 0, peak_live_pages = 0, capacity_pages = 0;
@@ -57,6 +58,7 @@ class BatchPagedKvPool {
         }
     }
 
+    void preallocate_context() { ensure_storage(static_cast<size_t>(logical_pages_)); }
     bool ensure_tokens(PagedKvSequence& sequence, int64_t tokens) {
         MFQ_RUNTIME_CHECK(tokens >= 0 && tokens <= logical_pages_ * kPageSize,
                           "Paged KV sequence exceeds configured context");
@@ -108,8 +110,10 @@ class BatchPagedKvPool {
         MFQ_RUNTIME_CHECK(bound_rows_ > 0, "paged KV views require bound rows");
         const auto& pool = layers_.at(layer);
         const auto& geometry = pool.geometry;
-        return KVCache::paged_view(pool.k_pointers, pool.v_pointers, tables_.at(geometry.device),
+        auto cache=KVCache::paged_view(pool.k_pointers, pool.v_pointers, tables_.at(geometry.device),
             bound_rows_, geometry.heads, geometry.head_dim, kPageSize, kPagesPerChunk, geometry.dtype);
+        cache.quantization=geometry.quantization;
+        return cache;
     }
     PagedKvStats stats() const noexcept {
         return {kPageSize, int64_t(allocator_.live_pages()), int64_t(allocator_.peak_live_pages()),
@@ -145,10 +149,15 @@ class BatchPagedKvPool {
                 const auto& geometry = layer.geometry;
                 MfqCudaGuard guard(geometry.device);
                 auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::Device(
-                    mfq_tensor_backend::kCUDA, geometry.device)).dtype(geometry.dtype);
+                    mfq_tensor_backend::kCUDA, geometry.device)).dtype(
+                        geometry.quantization.enabled()?mfq_tensor_backend::kInt32:geometry.dtype);
+                const auto key_width=geometry.quantization.enabled()
+                    ?cuda_kv_packed_width(int(geometry.head_dim),geometry.quantization.key_bits()):geometry.head_dim;
+                const auto value_width=geometry.quantization.enabled()
+                    ?cuda_kv_packed_width(int(geometry.head_dim),geometry.quantization.value_bits()):geometry.head_dim;
                 pending.emplace_back(
-                    mfq_tensor_backend::empty({int64_t(pages), geometry.heads, kPageSize, geometry.head_dim}, options),
-                    mfq_tensor_backend::empty({int64_t(pages), geometry.heads, kPageSize, geometry.head_dim}, options));
+                    mfq_tensor_backend::empty({int64_t(pages), geometry.heads, kPageSize, key_width}, options),
+                    mfq_tensor_backend::empty({int64_t(pages), geometry.heads, kPageSize, value_width}, options));
             }
             const auto index = storage_pages_ / kPagesPerChunk;
             for (size_t layer = 0; layer < layers_.size(); ++layer) {

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/common/causal_model_ops.h"
-#include "models/common/full_block.h"
+#include "causal_model_ops.h"
+#include "full_block.h"
 #include "storage/session/state.h"
 #include <algorithm>
 

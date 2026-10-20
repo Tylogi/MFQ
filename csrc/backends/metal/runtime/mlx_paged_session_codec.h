@@ -1,9 +1,9 @@
 #pragma once
 
 #include "mfq_paged_prefix_cache.h"
-#include "mlx_minicpmo45.h"
-#include "mlx_qwen35_causal_lm.h"
-#include "mlx_qwen4_causal_lm.h"
+#include "models/minicpmo45/mlx_minicpmo45.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
 
 #include <cstddef>
 #include <cstdint>

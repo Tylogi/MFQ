@@ -34,9 +34,45 @@ def test_memory_resources_use_worker_measurements_not_allocator_or_io_totals():
     assert memory.ssd_ple is False
 
 
+def test_ram_kv_preallocation_and_ram_only_streaming_do_not_enable_ssd():
+    memory = RuntimePool._memory_resources({
+        'kv_memory_ram_bytes': 4096, 'qsa_kv_ram_bytes': 2048,
+        'qsa_kv_offload_enabled': 1, 'qsa_kv_ssd_enabled': 0,
+    })
+    assert memory.ram_kv_bytes == 6144
+    assert memory.ram_kv_limit_bytes == 6144
+    assert memory.ram_kv is True
+    assert memory.ssd_kv is False
+
+
 def test_busy_worker_retains_last_breakdown_instead_of_resetting_to_zero():
     previous = RuntimePool._memory_resources({"resident_weight_bytes": 1024, "ssd_ple_enabled": 1})
     assert RuntimePool._memory_resources({"mlx_active_bytes": 2048}, previous) == previous
+
+
+def test_gpu_memory_maps_visible_ordinals_and_keeps_each_device_separate():
+    status = {f"gpu_{index}_{name}": value for index, fields in enumerate([
+        {"resident_bytes": 100, "resident_weight_bytes": 60, "resident_buffer_bytes": 20, "kv_bytes": 20,
+         "memory_total_bytes": 200, "memory_available_bytes": 40},
+        {"resident_bytes": 80, "resident_weight_bytes": 50, "resident_buffer_bytes": 10, "kv_bytes": 20,
+         "memory_total_bytes": 400, "memory_available_bytes": 240}]) for name, value in fields.items()}
+    memory = RuntimePool._memory_resources(status, device_ids=["3", "1"])
+    assert [device.device_id for device in memory.devices] == ["3", "1"]
+    assert [device.resident_weight_bytes for device in memory.devices] == [60, 50]
+    assert [device.memory_available_bytes for device in memory.devices] == [40, 240]
+    assert RuntimePool._memory_resources({}, memory, device_ids=["3", "1"]).devices == memory.devices
+
+
+def test_model_buffers_remain_separate_from_weights_kv_and_device_global_usage():
+    previous = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
+        "resident_buffer_bytes": 512, "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 100,
+        "device_total_bytes": 100000, "device_free_bytes": 20000})
+    assert previous.resident_buffer_bytes == 512
+    assert previous.resident_weight_bytes == 1024 and previous.kv_bytes == 300
+    assert RuntimePool._memory_resources({"device_free_bytes": 10000}, previous) == previous
+    assert RuntimePool._memory_resources({"cuda_allocated_bytes": 99999}).resident_buffer_bytes is None
+    assert RuntimePool._memory_resources({"resident_buffer_bytes": math.nan}).resident_buffer_bytes is None
+    assert RuntimePool._memory_resources({"resident_buffer_bytes": 0}).resident_buffer_bytes == 0
 
 
 def test_older_worker_does_not_fabricate_weight_bytes_or_ssd_modes():

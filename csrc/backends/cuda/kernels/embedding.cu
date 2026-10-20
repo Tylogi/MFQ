@@ -10,7 +10,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/kernels.h"
+#include "kernels.h"
 
 
 namespace {

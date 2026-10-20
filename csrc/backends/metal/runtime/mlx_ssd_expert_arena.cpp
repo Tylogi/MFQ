@@ -17,6 +17,18 @@ namespace {
 using mlx::core::Shape;
 using mlx::core::array;
 
+template <typename Allocation>
+void* allocation_pointer(Allocation& storage) {
+    if constexpr (requires { storage.buffer(); }) return storage.buffer().raw_ptr();
+    else return storage.raw_ptr();
+}
+
+template <typename Allocation>
+void release_failed_allocation(Allocation& storage) {
+    if constexpr (requires { storage.raw_ptr(); })
+        mlx::core::allocator::allocator().free(storage);
+}
+
 int checked_dimension(std::size_t value, const char* name) {
     if (value == 0 || value > static_cast<std::size_t>(
         std::numeric_limits<std::int32_t>::max())) {
@@ -55,13 +67,13 @@ MlxMxfp4SsdExpertArena::allocate_bank(
     std::size_t bytes_per_slot) {
     const auto bytes = checked_product(slots, bytes_per_slot, "bank size");
     auto buffer = mlx::core::allocator::malloc(bytes);
-    auto* data = static_cast<std::byte*>(buffer.raw_ptr());
+    auto* data = static_cast<std::byte*>(allocation_pointer(buffer));
     if (data == nullptr) {
-        mlx::core::allocator::free(buffer);
+        release_failed_allocation(buffer);
         throw std::bad_alloc();
     }
     auto value = array(
-        buffer,
+        std::move(buffer),
         Shape{
             checked_dimension(slots, "slot count"),
             checked_dimension(bytes_per_slot, "slot stride"),

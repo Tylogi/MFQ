@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <variant>
 
 namespace {
 
@@ -560,7 +561,8 @@ array mtp_sampling_row(
         " logits must have [1,vocab] or [1,1,vocab] shape");
 }
 
-PreparedMtpDraft prepare_mtp_draft(
+using MtpDraftStep = std::variant<MlxMtpTargetRequest, PreparedMtpDraft>;
+mfq::StepSequence<MtpDraftStep> prepare_mtp_draft(
     const MlxMtpDraftContext& context,
     const MlxMtpEngineRequest& request,
     const MlxMtpEngineCallbacks& callbacks,
@@ -630,7 +632,15 @@ PreparedMtpDraft prepare_mtp_draft(
         return token;
     };
 
-    callbacks.prepare_draft(context, select_token);
+    if (callbacks.prepare_draft_history) {
+        callbacks.prepare_draft_history(context);
+        for (int row = 0; row < requested; ++row) {
+            co_yield MtpDraftStep{MlxMtpTargetRequest{context.pending_token,
+                row ? tokens.back() : mlx::core::zeros(Shape{0}, mlx::core::int32),
+                row, row == 0 ? MlxMtpTargetRequest::Kind::first_draft : MlxMtpTargetRequest::Kind::next_draft}};
+            select_token(callbacks.draft_logits());
+        }
+    } else callbacks.prepare_draft(context, select_token);
     if (static_cast<int>(tokens.size()) != requested) {
         throw std::runtime_error(
             "MTP predictor did not produce the requested draft depth");
@@ -650,13 +660,13 @@ PreparedMtpDraft prepare_mtp_draft(
         pending.push_back(*probabilities);
     }
     mlx::core::async_eval(std::move(pending));
-    return {
+    co_yield MtpDraftStep{PreparedMtpDraft{
         requested,
         std::move(token_values),
         std::move(indices),
         std::move(probabilities),
         std::move(host_probabilities),
-    };
+    }};
 }
 
 } // namespace
@@ -775,9 +785,9 @@ void mlx_prime_mtp_chunk(const array& hidden, const array& ids,
     previous_hidden = last;
 }
 
-std::int32_t run_mlx_mtp_generation(
+MlxMtpGeneration mlx_mtp_generation(
     MlxMtpEngineRequest request,
-    const MlxMtpEngineCallbacks& callbacks,
+    MlxMtpEngineCallbacks callbacks,
     MlxMtpGenerationStats& stats) {
     if (request.vocab <= 0 || request.generation_limit <= 0 ||
         request.maximum_context <= 0 ||
@@ -785,8 +795,14 @@ std::int32_t run_mlx_mtp_generation(
         callbacks.predictor.maximum_depth >
             kMlxMtpEngineMaximumDraftDepth ||
         !callbacks.target_cache_position || !callbacks.prepare_draft ||
-        !callbacks.verify_target || !callbacks.resolve_target) {
+        !callbacks.verify_target || !callbacks.resolve_target ||
+        (callbacks.prepare_draft_history && !callbacks.draft_logits)) {
         throw std::invalid_argument("invalid MTP engine configuration");
+    }
+    if (request.sampling.warmup) {
+        request.eos_token_ids = {};
+        callbacks.policy_state = nullptr;
+        callbacks.draft_depth = [depth = request.sampling.mtp_max_draft_tokens] { return depth; };
     }
     mlx_validate_token_set(request.eos_token_ids, request.vocab);
 
@@ -807,12 +823,16 @@ std::int32_t run_mlx_mtp_generation(
     const auto sample_token = [&] (
             const array& raw_logits,
             const std::optional<array>& token_counts,
-            const MfqTokenConstraintPtr& constraint) {
+            const MfqTokenConstraintPtr& constraint,
+            const std::optional<array>& prepared = std::nullopt) {
         const auto logits = mtp_sampling_row(
             raw_logits, request.vocab, "target");
-        auto sampled = token_counts
+        auto sampled = prepared && request.sampling.greedy() && !token_counts ? *prepared : token_counts
             ? sampler.sample(logits, *token_counts)
             : sampler.sample(logits);
+        if (sampled.dtype() != mlx::core::int32 || sampled.size() != 1 ||
+            !sampled.flags().row_contiguous)
+            throw std::runtime_error("MTP target sampler returned incompatible tokens");
         sampled.eval();
         auto token = sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= request.vocab) {
@@ -879,6 +899,10 @@ std::int32_t run_mlx_mtp_generation(
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
     mfq::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(
         maximum_depth, callbacks.predictor.dspark, callbacks.policy_state);
+    const auto desired_depth = [&] {
+        return callbacks.draft_depth ? std::clamp(callbacks.draft_depth(), 0, maximum_depth)
+            : depth_controller.depth();
+    };
 
     auto pending = sample_token(
         request.initial_logits, counts, request.token_constraint);
@@ -886,7 +910,7 @@ std::int32_t run_mlx_mtp_generation(
         constraint_cursor->accept(pending);
     }
     if (!emit(pending)) {
-        return generated;
+        co_return;
     }
 
     const auto bounded_depth = [&](int desired) {
@@ -904,7 +928,7 @@ std::int32_t run_mlx_mtp_generation(
     MlxMtpDraftContext initial_context{
         true,
         pending,
-        bounded_depth(depth_controller.depth()),
+        bounded_depth(desired_depth()),
         callbacks.target_cache_position(),
         0,
         nullptr,
@@ -914,7 +938,8 @@ std::int32_t run_mlx_mtp_generation(
     const bool profile_phases = mtp_phase_profile_requested();
     const auto initial_draft_started = std::chrono::steady_clock::now();
     auto cycle_started = initial_draft_started;
-    auto draft = prepare_mtp_draft(
+    PreparedMtpDraft draft{0, mlx::core::zeros(Shape{0}, mlx::core::int32), {}, {}, {}};
+    auto preparation = prepare_mtp_draft(
         initial_context,
         request,
         callbacks,
@@ -922,6 +947,10 @@ std::int32_t run_mlx_mtp_generation(
         counts,
         compact_stochastic,
         draft_sampling);
+    while (auto step = preparation.next()) if (step.value) {
+        if (auto* work = std::get_if<MlxMtpTargetRequest>(&*step.value)) co_yield std::move(*work);
+        else draft = std::move(std::get<PreparedMtpDraft>(*step.value));
+    }
     if (profile_phases) {
         materialize_profiled_draft(draft);
         std::cerr
@@ -935,42 +964,51 @@ std::int32_t run_mlx_mtp_generation(
 
     while (generated < request.generation_limit) {
         const int cycle_cache_start = callbacks.target_cache_position();
-        if (depth_controller.parked()) {
+        if (callbacks.draft_depth ? draft.depth == 0 : depth_controller.parked()) {
+            co_yield MlxMtpTargetRequest{pending, draft.tokens, 0};
             auto target = callbacks.decode_target
                 ? callbacks.decode_target(pending)
                 : callbacks.verify_target(pending, draft.tokens, 0);
-            const auto next = sample_token(target.logits, counts, constraint_cursor);
+            const auto next = sample_token(target.logits, counts, constraint_cursor, target.greedy_tokens);
             if (constraint_cursor) constraint_cursor->accept(next);
             if (callbacks.committed_target) {
                 callbacks.committed_target(MlxMtpDraftContext{
                     false, pending, 0, cycle_cache_start, 0, &target.hidden, {}});
             }
             ++stats.standard_tokens;
-            if (!emit(next)) return generated;
-            depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
+            if (!emit(next)) co_return;
+            if (!callbacks.draft_depth) depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now()-cycle_started).count(), time_sample);
-            stats.selected_depth = depth_controller.depth();
+            stats.selected_depth = desired_depth();
+            if (callbacks.batch_park_count) stats.park_count = callbacks.batch_park_count();
+            if (callbacks.batch_cycle_ms) for (int depth = 0; depth <= maximum_depth; ++depth)
+                if (const auto measured = callbacks.batch_cycle_ms(depth)) stats.measured_depth_ms.at(depth) = *measured;
             stats.reentry_probes = depth_controller.reentries();
             pending = next;
             const std::array<std::int32_t, 1> next_ids{pending};
             MlxMtpDraftContext context{
-                false, pending, bounded_depth(depth_controller.depth()),
+                false, pending, bounded_depth(desired_depth()),
                 cycle_cache_start, 0, &target.hidden, next_ids, &time_sample};
             time_sample = true;
             cycle_started = std::chrono::steady_clock::now();
             if (context.requested_depth == 0) {
                 callbacks.prepare_draft(context, {});
             } else {
-                draft = prepare_mtp_draft(context, request, callbacks, sampler, counts,
+                preparation = prepare_mtp_draft(context, request, callbacks, sampler, counts,
                     compact_stochastic, draft_sampling);
+                while (auto step = preparation.next()) if (step.value) {
+                    if (auto* work = std::get_if<MlxMtpTargetRequest>(&*step.value)) co_yield std::move(*work);
+                    else draft = std::move(std::get<PreparedMtpDraft>(*step.value));
+                }
             }
             continue;
         }
         const int draft_count = draft.depth;
-        const auto target_started = std::chrono::steady_clock::now();
         detail::ComponentProfile target_profile;
         const bool profile_target_components =
             profile_phases && detail::component_profile_requested();
+        co_yield MlxMtpTargetRequest{pending, draft.tokens, draft_count};
+        const auto target_started = std::chrono::steady_clock::now();
         auto target = [&]() {
             detail::ScopedComponentProfile profile_scope(
                 profile_target_components ? &target_profile : nullptr);
@@ -1034,21 +1072,33 @@ std::int32_t run_mlx_mtp_generation(
                 target_rows, std::nullopt, constraint_cursor);
             verification = {0, next, true};
         } else if (request.sampling.greedy()) {
-            auto target_tokens = sample_greedy(target_rows);
-            auto compact = mlx::core::concatenate(
-                {
-                    mlx::core::reshape(draft.tokens, Shape{draft_count}),
-                    mlx::core::reshape(
-                        target_tokens, Shape{draft_count + 1}),
-                },
-                0);
-            compact.eval();
-            const auto* resolved = compact.data<std::int32_t>();
-            draft_ids.assign(resolved, resolved + draft_count);
-            verification = verify_greedy_mtp(
-                std::span<const std::int32_t>(resolved, draft_count),
-                std::span<const std::int32_t>(
-                    resolved + draft_count, draft_count + 1));
+            if (target.greedy_tokens && !counts) {
+                auto target_tokens = *target.greedy_tokens;
+                if (target_tokens.dtype() != mlx::core::int32 ||
+                    target_tokens.shape() != Shape{draft_count + 1} || !target_tokens.flags().row_contiguous)
+                    throw std::runtime_error("MTP verification received incompatible greedy tokens");
+                mlx::core::eval(draft.tokens, target_tokens);
+                const auto* ids = draft.tokens.data<std::int32_t>();
+                draft_ids.assign(ids, ids + draft_count);
+                verification = verify_greedy_mtp(draft_ids,
+                    std::span<const std::int32_t>(target_tokens.data<std::int32_t>(), draft_count + 1));
+            } else {
+                auto target_tokens = sample_greedy(target_rows);
+                auto compact = mlx::core::concatenate(
+                    {
+                        mlx::core::reshape(draft.tokens, Shape{draft_count}),
+                        mlx::core::reshape(
+                            target_tokens, Shape{draft_count + 1}),
+                    },
+                    0);
+                compact.eval();
+                const auto* resolved = compact.data<std::int32_t>();
+                draft_ids.assign(resolved, resolved + draft_count);
+                verification = verify_greedy_mtp(
+                    std::span<const std::int32_t>(resolved, draft_count),
+                    std::span<const std::int32_t>(
+                        resolved + draft_count, draft_count + 1));
+            }
         } else if (draft.compact_indices &&
                    draft.compact_probabilities && compact_stochastic) {
             auto target_distribution = sample_top_k_distribution(
@@ -1181,10 +1231,10 @@ std::int32_t run_mlx_mtp_generation(
         }
         const auto resolve_finished = std::chrono::steady_clock::now();
         if (!continue_generation) {
-            return generated;
+            co_return;
         }
         if (!emit(verification.next_token)) {
-            return generated;
+            co_return;
         }
 
         const double cycle_ms = std::chrono::duration<double, std::milli>(
@@ -1209,11 +1259,12 @@ std::int32_t run_mlx_mtp_generation(
                 << " cycle_ms=" << cycle_ms
                 << '\n';
         }
-        depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
-        stats.selected_depth = depth_controller.depth();
-        stats.park_count = depth_controller.parks();
+        if (!callbacks.draft_depth) depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
+        stats.selected_depth = desired_depth();
+        stats.park_count = callbacks.batch_park_count ? callbacks.batch_park_count() : depth_controller.parks();
         for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
-            const auto measured = depth_controller.measured_cycle_ms(depth);
+            const auto measured = callbacks.batch_cycle_ms ? callbacks.batch_cycle_ms(depth)
+                : depth_controller.measured_cycle_ms(depth);
             if (measured) {
                 stats.measured_depth_ms.at(
                     static_cast<std::size_t>(depth)) = *measured;
@@ -1229,7 +1280,7 @@ std::int32_t run_mlx_mtp_generation(
         MlxMtpDraftContext next_context{
             false,
             pending,
-            bounded_depth(depth_controller.depth()),
+            bounded_depth(desired_depth()),
             cycle_cache_start,
             accepted,
             &target.hidden,
@@ -1239,7 +1290,7 @@ std::int32_t run_mlx_mtp_generation(
         time_sample = true;
         const auto draft_started = std::chrono::steady_clock::now();
         cycle_started = draft_started;
-        draft = prepare_mtp_draft(
+        preparation = prepare_mtp_draft(
             next_context,
             request,
             callbacks,
@@ -1247,6 +1298,10 @@ std::int32_t run_mlx_mtp_generation(
             counts,
             compact_stochastic,
             draft_sampling);
+        while (auto step = preparation.next()) if (step.value) {
+            if (auto* work = std::get_if<MlxMtpTargetRequest>(&*step.value)) co_yield std::move(*work);
+            else draft = std::move(std::get<PreparedMtpDraft>(*step.value));
+        }
         if (profile_phases) {
             materialize_profiled_draft(draft);
             std::cerr
@@ -1258,6 +1313,19 @@ std::int32_t run_mlx_mtp_generation(
                 << '\n';
         }
     }
+    co_return;
+}
+
+std::int32_t run_mlx_mtp_generation(MlxMtpEngineRequest request,
+    const MlxMtpEngineCallbacks& callbacks, MlxMtpGenerationStats& stats) {
+    std::int32_t generated = 0;
+    const auto callback = std::move(request.callback);
+    request.callback = [&](std::int64_t token) {
+        ++generated;
+        return !callback || callback(token);
+    };
+    auto sequence = mlx_mtp_generation(std::move(request), callbacks, stats);
+    while (sequence.next()) {}
     return generated;
 }
 

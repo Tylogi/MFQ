@@ -1,6 +1,7 @@
 /** 提供 Studio 现有图标、页面标题、业务面板与指标展示组件。 */
 import { ReactNode } from 'react';
 import { formatNumber } from './formatters';
+import mfqMark from '../assets/mfq-mark.svg';
 
 export type ModelMonogramState = "idle" | "loading" | "ready" | "failed";
 
@@ -17,6 +18,7 @@ export type IconName =
   | "flask"
   | "file"
   | "download"
+  | "droplet"
   | "edit"
   | "folder"
   | "gauge"
@@ -43,7 +45,6 @@ export type IconName =
   | "sun-moon"
   | "text-forward"
   | "trash"
-  | "tools"
   | "upload"
   | "volume"
   | "volume-off"
@@ -71,6 +72,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "copy" && <><rect height="13" rx="2" width="11" x="8" y="8" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
       {name === "flask" && <><path d="M9 3h6M10 3v6l-5.7 9.2A1.8 1.8 0 0 0 5.8 21h12.4a1.8 1.8 0 0 0 1.5-2.8L14 9V3" /><path d="M7.5 15h9" /></>}
       {name === "download" && <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>}
+      {name === "droplet" && <path d="M12 3C10 6.3 5 10.7 5 14a7 7 0 0 0 14 0c0-3.3-5-7.7-7-11z" />}
       {name === "edit" && <><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z" /><path d="m13.5 6.5 4 4" /></>}
       {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
       {name === "file" && <><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6" /><path d="M8 13h8M8 17h5" /></>}
@@ -91,7 +93,6 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "send" && <><path d="m5 12 7-7 7 7M12 5v14" /></>}
       {name === "scroll" && <><path d="M5 7H3V5a2 2 0 0 1 4 0v12a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-2h-4v2a3 3 0 0 1-3 3M5 3h11a2 2 0 0 1 2 2v10M10 7h5M10 11h5" /></>}
       {name === "search" && <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m15.5 15.5 5 5" /></>}
-      {name === "tools" && <g strokeWidth="1.5"><path d="M2 4h6v4H2zM8 4c2.5 0 3.5 1.5 3.5 3.5L9 6.5V8H8M5 8v12h2V8" /><path d="M15 3h6v5h-6zM15 8h6l-1 3-2-1v3l-2-1v3l-2-1v3l-2-1-1 4h-1z" /></g>}
       {name === "server-rack" && <><rect height="7" rx="1.8" width="16" x="4" y="3" /><rect height="7" rx="1.8" width="16" x="4" y="14" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" /></>}
       {name === "settings" && <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z" /></>}
       {name === "stop" && <><rect height="9" rx="1" width="9" x="7.5" y="7.5" /></>}
@@ -160,7 +161,7 @@ export function ModelMonogram({
   const initial = Array.from(name.trim())[0]?.toLocaleUpperCase() || "E";
   return (
     <span aria-hidden="true" className={`model-monogram ${state}`}>
-      {state === "idle" ? <img src="/mfq-mark.svg" alt="" /> : initial}
+      {state === "idle" ? <img src={mfqMark} alt="" /> : initial}
     </span>
   );
 }

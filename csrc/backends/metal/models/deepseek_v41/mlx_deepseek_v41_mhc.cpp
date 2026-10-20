@@ -24,6 +24,44 @@ constexpr int kPostThreads = 256;
 constexpr int kOfficialHidden = 5120;
 constexpr int kCollapseThreads = 1024;
 
+const mlx::core::fast::CustomKernelFunction& projection_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Safe;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_dsv41_hc_projection", {"residual", "weight", "params"}, {"output"},
+            R"METAL(
+                uint row = threadgroup_position_in_grid.x / 24u;
+                uint projection = threadgroup_position_in_grid.x % 24u;
+                uint tid = thread_index_in_threadgroup;
+                uint lane = thread_index_in_simdgroup;
+                uint group = simdgroup_index_in_threadgroup;
+                float product = 0.0f, square = 0.0f;
+                for (uint column = tid * 4u; column < uint(WIDTH); column += 1024u) {
+                    float4 x = float4(float(residual[row * WIDTH + column]),
+                        float(residual[row * WIDTH + column + 1u]),
+                        float(residual[row * WIDTH + column + 2u]),
+                        float(residual[row * WIDTH + column + 3u]));
+                    float4 w = reinterpret_cast<device const float4*>(weight + projection * WIDTH)[column / 4u];
+                    product += dot(x, w);
+                    square += dot(x, x);
+                }
+                product = simd_sum(product);
+                square = simd_sum(square);
+                threadgroup float products[8], squares[8];
+                if (lane == 0u) { products[group] = product; squares[group] = square; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (group == 0u) {
+                    product = simd_sum(lane < 8u ? products[lane] : 0.0f);
+                    square = simd_sum(lane < 8u ? squares[lane] : 0.0f);
+                    if (lane == 0u) output[row * 24u + projection] =
+                        product * metal::precise::rsqrt(square / float(WIDTH) + params[0]);
+                }
+            )METAL", "", true, false, options);
+    }();
+    return kernel;
+}
+
 constexpr const char* kV41HcCollapseNormSource = R"METAL(
     const int ROWS = residual_shape[0] * residual_shape[1];
     constexpr uint CONNECTIONS = 4u;
@@ -106,9 +144,8 @@ constexpr const char* kV41HcCollapseNormSource = R"METAL(
 
 constexpr const char* kV41HcMetadataExactSource = R"METAL(
     const int ROWS = logits_shape[0] * logits_shape[1];
-    uint row = threadgroup_position_in_grid.x;
-    uint local_thread = thread_index_in_threadgroup;
-    if (row >= uint(ROWS) || local_thread != 0u) {
+    uint row = thread_position_in_grid.x;
+    if (row >= uint(ROWS)) {
         return;
     }
 
@@ -237,6 +274,56 @@ constexpr const char* kV41HcPostSource = R"METAL(
     output[index] = output_activation_t(direct + residual_sum);
 )METAL";
 
+constexpr const char* kV41HcMetadataLanesSource = R"METAL(
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    const uint rows = uint(mixes_shape[0] * mixes_shape[1]);
+    const uint row = thread_position_in_grid.x / 16u;
+    const uint lane = thread_index_in_simdgroup;
+    const uint first = lane & ~15u;
+    const uint entry = lane & 15u;
+    const uint source = entry / 4u, destination = entry & 3u;
+    const uint offset = (row < rows ? row : 0u) * 24u;
+    const float epsilon = params[0];
+    float value = mixes[offset + 8u + entry] * scale[2] + base[8u + entry];
+    const float v0 = simd_shuffle(value, first + source * 4u);
+    const float v1 = simd_shuffle(value, first + source * 4u + 1u);
+    const float v2 = simd_shuffle(value, first + source * 4u + 2u);
+    const float v3 = simd_shuffle(value, first + source * 4u + 3u);
+    const float maximum = max(max(v0, v1), max(v2, v3));
+    value = metal::precise::exp(value - maximum);
+    float total = simd_shuffle(value, first + source * 4u + 3u) +
+        (simd_shuffle(value, first + source * 4u + 2u) +
+         (simd_shuffle(value, first + source * 4u + 1u) +
+          simd_shuffle(value, first + source * 4u)));
+    value = value / total + epsilon;
+    for (uint iteration = 0u; iteration < uint(SINKHORN_ITERATIONS); ++iteration) {
+        if (iteration != 0u) {
+            total = simd_shuffle(value, first + source * 4u + 3u) +
+                (simd_shuffle(value, first + source * 4u + 2u) +
+                 (simd_shuffle(value, first + source * 4u + 1u) +
+                  simd_shuffle(value, first + source * 4u)));
+            value = value / (total + epsilon);
+        }
+        total = simd_shuffle(value, first + 12u + destination) +
+            (simd_shuffle(value, first + 8u + destination) +
+             (simd_shuffle(value, first + 4u + destination) +
+              simd_shuffle(value, first + destination)));
+        value = value / (total + epsilon);
+    }
+    if (row < rows) {
+        combination[row * 16u + entry] = value;
+        if (entry < 4u) {
+            const float a = mixes[offset + entry] * scale[0] + base[entry];
+            const float b = mixes[offset + 4u + entry] * scale[1] + base[4u + entry];
+            const float pa = 1.0f / (1.0f + metal::precise::exp(metal::abs(a)));
+            const float pb = 1.0f / (1.0f + metal::precise::exp(metal::abs(b)));
+            pre[row * 4u + entry] = (a < 0.0f ? pa : 1.0f - pa) + epsilon;
+            post[row * 4u + entry] = 2.0f * (b < 0.0f ? pb : 1.0f - pb);
+        }
+    }
+)METAL";
+
 mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
@@ -278,6 +365,15 @@ const mlx::core::fast::CustomKernelFunction& metadata_exact_kernel() {
         {"logits", "params"},
         {"combination"},
         kV41HcMetadataExactSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& metadata_lanes_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv41_hc_metadata_lanes_f32",
+        {"mixes", "scale", "base", "params"},
+        {"post", "combination", "pre"},
+        kV41HcMetadataLanesSource);
     return kernel;
 }
 
@@ -429,6 +525,35 @@ array dense_array(const MfqContainer& model, const std::string& name) {
 
 } // namespace
 
+array deepseek_v41_hc_projection(
+    const array& residual,
+    const array& weight,
+    float eps) {
+    if (residual.ndim() != 4 || residual.shape(0) <= 0 || residual.shape(1) <= 0 ||
+        residual.shape(2) != 4 || residual.shape(3) <= 0 ||
+        residual.shape(3) > std::numeric_limits<int>::max() / 4 ||
+        weight.shape() != Shape{24, 4 * residual.shape(3)} ||
+        weight.dtype() != mlx::core::float32 || !std::isfinite(eps) || eps <= 0) {
+        throw std::invalid_argument("invalid DeepSeek-V4.1 HC projection");
+    }
+    const int width = 4 * residual.shape(3);
+    const int rows = checked_int(static_cast<std::size_t>(residual.shape(0)) *
+        residual.shape(1), "projection row count");
+    if (rows <= 6 && width % 1024 == 0 &&
+        (residual.dtype() == mlx::core::float16 || residual.dtype() == mlx::core::bfloat16)) {
+        auto outputs = projection_kernel()(
+            {mlx::core::contiguous(residual), mlx::core::contiguous(weight), array({eps})},
+            {Shape{residual.shape(0), residual.shape(1), 24}}, {mlx::core::float32},
+            {rows * 24 * 256, 1, 1}, {256, 1, 1}, {{"WIDTH", width}},
+            std::nullopt, false, {});
+        return std::move(outputs.front());
+    }
+    auto flattened = mlx::core::reshape(mlx::core::astype(residual, mlx::core::float32),
+        Shape{residual.shape(0), residual.shape(1), width});
+    auto inverse = mlx::core::rsqrt(mlx::core::mean(flattened * flattened, -1, true) + eps);
+    return mlx::core::matmul(flattened * inverse, mlx::core::transpose(weight));
+}
+
 array deepseek_v41_hc_collapse_norm(
     const array& residual,
     const array& pre,
@@ -513,6 +638,15 @@ MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
     const int rows = checked_int(
         static_cast<std::size_t>(batch) * tokens,
         "metadata row count");
+    if (rows <= 512) {
+        auto outputs = metadata_lanes_kernel()(
+            {mix_values, scale_values, base_values, array({eps}, mlx::core::float32)},
+            {Shape{batch, tokens, 4}, Shape{batch, tokens, 4, 4}, Shape{batch, tokens, 4}},
+            {mlx::core::float32, mlx::core::float32, mlx::core::float32},
+            {((rows + 1) / 2) * 32, 1, 1}, {32, 1, 1},
+            {{"SINKHORN_ITERATIONS", sinkhorn_iterations}}, std::nullopt, false, {});
+        return {std::move(outputs[0]), std::move(outputs[1]), std::move(outputs[2])};
+    }
     auto pre = mlx::core::sigmoid(
         slice_last(mix_values, 0, kConnections) *
             slice_last(scale_values, 0, 1) +
@@ -536,7 +670,7 @@ MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
         {logits, params},
         {matrix_shape},
         {mlx::core::float32},
-        {rows * 32, 1, 1},
+        {((rows + 31) / 32) * 32, 1, 1},
         {32, 1, 1},
         {
             {"SINKHORN_ITERATIONS", sinkhorn_iterations},
@@ -618,14 +752,20 @@ MlxDeepseekV41MhcResult MlxDeepseekV41Mhc::collapse(
     }
     const int batch = residual.shape(0);
     const int tokens = residual.shape(1);
-    auto flattened = mlx::core::reshape(
-        mlx::core::astype(residual, mlx::core::float32),
-        Shape{batch, tokens, static_cast<int>(4 * config_.hidden)});
-    auto inverse = mlx::core::rsqrt(
-        mlx::core::mean(flattened * flattened, -1, true) +
-        static_cast<float>(config_.rms_eps));
-    auto mixes = mlx::core::astype(
-        function_(flattened * inverse), mlx::core::float32);
+    auto mixes = [&]() {
+        const auto* dense = function_.dense_weight_ref();
+        if (dense && dense->dtype() == mlx::core::float32) {
+            return deepseek_v41_hc_projection(residual, *dense,
+                static_cast<float>(config_.rms_eps));
+        }
+        auto flattened = mlx::core::reshape(
+            mlx::core::astype(residual, mlx::core::float32),
+            Shape{batch, tokens, static_cast<int>(4 * config_.hidden)});
+        auto inverse = mlx::core::rsqrt(
+            mlx::core::mean(flattened * flattened, -1, true) +
+            static_cast<float>(config_.rms_eps));
+        return mlx::core::astype(function_(flattened * inverse), mlx::core::float32);
+    }();
     auto expansion = deepseek_v41_hc_metadata_exact(
         mixes,
         scale_,

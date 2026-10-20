@@ -6,7 +6,9 @@
       "../../packaging/sidecars/mfq-perplexity"
     ],
     "resources": {
+      "../dist": "web-ui",
       "../../packaging/Resources/mlx.metallib": "mlx.metallib",
+      "../../packaging/Resources/mfq-metal": "mfq-metal",
       "../../packaging/Resources/mfq-cli": "mfq-cli",
       "../../packaging/Resources/licenses": "licenses"
     },

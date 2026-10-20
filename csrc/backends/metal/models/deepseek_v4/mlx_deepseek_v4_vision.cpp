@@ -1,6 +1,6 @@
 #include "mlx_deepseek_v4_vision.h"
 
-#include "mlx_multimodal.h"
+#include "runtime/mlx_multimodal.h"
 
 #include <algorithm>
 #include <cmath>

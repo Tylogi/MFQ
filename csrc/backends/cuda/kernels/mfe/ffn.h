@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstddef>
 #include <algorithm>
 
 namespace mfq::cuda {
@@ -9,7 +10,7 @@ struct MfePackedProjection {
     const void* fields[9]{};
     std::int64_t sizes[3]{};
     const std::int32_t* expert_local=nullptr;
-    int family=0; // 1: canonical NINT; 2: packed NVQ.
+    int family=0; // 1: canonical NINT; 2: packed NVQ; 3: canonical MXFP4.
     int local_experts=0,output_rows=0,input_width=0,groups=0,group_size=0;
     int format=0,sub_bits=0,sign_mode=0,nvec=0,nsign=0;
     int q_expert_stride=0,fallback=-1;
@@ -27,8 +28,11 @@ struct MfePackedProjection {
     bool dense_narrow=false;
     // Checked fixed-width NINT group decoder; reuses existing descriptor padding.
     bool nint_whole=false;
+    // Sixteen JSC states, two bits per bank; occupies existing padding.
+    std::uint32_t nvq_bank_map=0;
     std::int64_t decode_record_bytes=0;
 };
+static_assert(sizeof(MfePackedProjection)==184 && offsetof(MfePackedProjection,decode_record_bytes)==176);
 struct MfeInputQuantization {
     std::int8_t* values=nullptr;
     float* scales=nullptr;
@@ -71,6 +75,7 @@ struct MfeFfnBatch {
     void* output=nullptr;
     int tokens=0,routes=0,experts=0,input_width=0,output_width=0;
     int intermediate=0,shared_intermediate=0;
+    float swiglu_limit=0;
     // Immutable family metadata across resident/transfer views. Raw callers
     // default to the complete decoder; the runtime computes its actual mask.
     std::uint32_t nvq_format_mask=0x3fffeu;
@@ -88,7 +93,22 @@ struct MfeFfnBatch {
     // All compact E8/D4 resident and transfer views prove local decoder bounds.
     bool compact_nvq=false;
     bool token_group_aligned_gu=false;
+    // Every projection proves the short grouped decoder's arithmetic and
+    // compact expert-local address bounds; raw callers retain the wide path.
+    bool token_group_compact=false;
 };
+#ifdef __CUDACC__
+__device__ __forceinline__ __half mfe_ffn_swiglu(const MfeFfnBatch& b,__half gate,__half up,
+        const __half* table) {
+    if(b.swiglu_limit>0) {
+        const float g=fminf(__half2float(gate),b.swiglu_limit);
+        const float u=fminf(fmaxf(__half2float(up),-b.swiglu_limit),b.swiglu_limit);
+        return __float2half_rn((g/(1.0f+expf(-g)))*u);
+    }
+    const auto activated=__float2half_rn(__half2float(gate)*__half2float(table[__half_as_ushort(gate)]));
+    return __float2half_rn(__half2float(activated)*__half2float(up));
+}
+#endif
 inline int mfe_token_group_bound(const MfeFfnBatch& b,int capacity) {
     return b.token_group_buckets ?
         std::min(b.token_groups,b.tokens*(b.routes+int(b.shared!=nullptr))/(capacity==1?1:capacity/2+1)):

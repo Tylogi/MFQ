@@ -1,5 +1,5 @@
 #include "mlx_qsa_kv_offload.h"
-#include "qwen4_ops.h"
+#include "models/flash_next/qwen4_ops.h"
 #include "mlx_resident_budget.h"
 #include "mlx_mtp.h"
 

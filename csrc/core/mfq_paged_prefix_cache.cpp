@@ -1,4 +1,5 @@
 #include "mfq_paged_prefix_cache.h"
+#include "mfq/disk_budget.h"
 
 #include <algorithm>
 #include <atomic>
@@ -396,6 +397,7 @@ public:
     }
 
     ~Implementation() {
+        if (config_.spill_hot_on_eviction) trim_hot(0);
         flush();
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -545,6 +547,26 @@ public:
                 return hash;
             }
             schedule_tail_cleanup_locked(hash, parent, token_ids, token_count, extra_key);
+            if (config_.spill_hot_on_eviction && payload_bytes <= config_.max_hot_bytes && config_.max_hot_bytes) {
+                if (!replace_existing && hot_.count(hash)) {
+                    hot_.at(hash).last_used = ++clock_;
+                    ++metrics_.deduplicated_writes;
+                    return hash;
+                }
+                deferred_[hash] = WriteRequest{hash, parent, static_cast<std::uint32_t>(token_count),
+                    payload, cache_epoch_, replace_existing,
+                    std::vector<std::int64_t>(token_ids, token_ids + token_count)};
+                put_hot_locked(hash, std::move(payload));
+                remember_tail_locked(hash, parent, token_count);
+                prune_tail_cleanup_locked();
+                trim_for_ram_pressure_locked();
+                const bool drain = pending_write_bytes_ > config_.max_pending_bytes ||
+                    writes_.size() >= config_.max_pending_writes;
+                lock.unlock();
+                if (drain) flush();
+                return hash;
+            }
+            deferred_.erase(hash);
             if (config_.max_disk_bytes == 0) {
                 if (!replace_existing && hot_.count(hash) != 0) {
                     ++metrics_.deduplicated_writes;
@@ -803,19 +825,38 @@ public:
         enforce_disk_budget_locked();
     }
 
+    std::uint64_t reserve_ram(std::uint64_t allocation_bytes) {
+        if (!config_.available_ram_bytes) return 0;
+        const auto available = config_.available_ram_bytes();
+        const auto reserve = config_.min_free_ram_bytes;
+        const auto free = available > reserve ? available - reserve : 0;
+        if (free >= allocation_bytes) return 0;
+        const auto shortage = allocation_bytes - free;
+        std::uint64_t target;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            target = hot_bytes_ > shortage ? hot_bytes_ - shortage : 0;
+        }
+        return trim_hot(target);
+    }
+
     std::uint64_t trim_hot(std::uint64_t target_bytes) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         const auto released = trim_hot_locked(target_bytes);
         sync_metrics_locked();
+        lock.unlock();
+        if (config_.spill_hot_on_eviction) flush();
         return released;
     }
 
     std::uint64_t set_hot_limit(std::uint64_t max_bytes) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         config_.max_hot_bytes = max_bytes;
         metrics_.hot_pressure_bytes = 0;
         const auto released = trim_hot_locked(max_bytes);
         sync_metrics_locked();
+        lock.unlock();
+        if (config_.spill_hot_on_eviction) flush();
         return released;
     }
 
@@ -851,6 +892,7 @@ public:
                 hot_bytes_ -= hot->second.payload->size();
                 hot_.erase(hot);
             }
+            deferred_.erase(hash);
             forget_tail_if_unused_locked(hash);
             ++removed;
         }
@@ -875,6 +917,7 @@ public:
         }
         disk_.clear();
         hot_.clear();
+        deferred_.clear();
         tail_cleanup_.clear();
         pending_.clear();
         pins_.clear();
@@ -899,6 +942,9 @@ public:
         result.disk_bytes = disk_bytes_;
         result.hot_blocks = hot_.size();
         result.hot_bytes = hot_bytes_;
+        result.blocks = disk_.size();
+        for (const auto& [hash, entry] : hot_) if (!disk_.count(hash)) ++result.blocks;
+        for (const auto& [hash, entry] : pending_) if (!disk_.count(hash) && !hot_.count(hash)) ++result.blocks;
         result.pending_writes = pending_.size();
         result.pending_bytes = pending_write_bytes_;
         result.pending_max_bytes = config_.max_pending_bytes;
@@ -923,6 +969,8 @@ private:
     }
 
     void write_text(const WriteRequest& request) {
+        DiskWriteGuard space_guard(namespace_dir_, 108 + request.tokens.size() * 8, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return;
         const auto target = path_for(request.hash).string() + ".tokens";
         const auto temporary = target + ".tmp." + std::to_string(monotonic_tick());
         std::vector<std::uint8_t> bytes;
@@ -1039,6 +1087,8 @@ private:
         const auto temporary = final_path.parent_path() /
             (".mfqkv.tmp." + std::to_string(monotonic_tick()) + "." +
              std::to_string(temp_counter_.fetch_add(1)));
+        DiskWriteGuard space_guard(final_path.parent_path(), bytes + overhead, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return false;
         std::ofstream output(
             temporary,
             std::ios::binary | std::ios::trunc);
@@ -1120,6 +1170,8 @@ private:
     }
 
     void write_identity() {
+        DiskWriteGuard space_guard(namespace_dir_, 32768, config_.min_disk_free_bytes);
+        if (!space_guard.allowed()) return;
         const auto target = namespace_dir_ / "identity.txt";
         const auto temporary = namespace_dir_ / (".identity.tmp." + std::to_string(monotonic_tick()));
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -1199,9 +1251,10 @@ private:
             WriteRequest request;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                work_available_.wait(lock, [this] {
+                work_available_.wait_for(lock, std::chrono::milliseconds(250), [this] {
                     return stopping_ || !writes_.empty() || disk_budget_pending_;
                 });
+                if (!clearing_) trim_for_ram_pressure_locked();
                 if (disk_budget_pending_) {
                     if (disk_identity_pending_) {
                         write_identity();
@@ -1212,6 +1265,7 @@ private:
                     continue;
                 }
                 if (stopping_ && writes_.empty()) return;
+                if (writes_.empty()) continue;
                 request = std::move(writes_.front());
                 writes_.pop_front();
                 ++active_writes_;
@@ -1363,7 +1417,7 @@ private:
                 // A block with no durable copy must remain available while a
                 // live session pins it. Durable pinned blocks may still leave
                 // the hot tier and be restored from SSD on demand.
-                if (disk_.count(iterator->first) == 0 &&
+                if (!config_.spill_hot_on_eviction && disk_.count(iterator->first) == 0 &&
                     pins_.count(iterator->first) != 0) {
                     continue;
                 }
@@ -1375,13 +1429,34 @@ private:
             if (victim == hot_.end()) break;
             hot_bytes_ -= victim->second.payload->size();
             const auto hash = victim->first;
+            const auto dirty = deferred_.find(hash);
+            if (dirty != deferred_.end()) {
+                if (config_.max_disk_bytes > 0) {
+                    pending_[hash] = dirty->second.payload;
+                    pending_write_bytes_ += dirty->second.payload->size();
+                    writes_.push_back(std::move(dirty->second));
+                    work_available_.notify_one();
+                }
+                deferred_.erase(dirty);
+            }
             hot_.erase(victim);
             forget_tail_if_unused_locked(hash);
         }
         return before - hot_bytes_;
     }
 
+
+    void trim_for_ram_pressure_locked() {
+        if (!config_.available_ram_bytes || hot_bytes_ == 0) return;
+        const auto available = config_.available_ram_bytes();
+        if (available >= config_.min_free_ram_bytes) return;
+        const auto shortage = config_.min_free_ram_bytes - available;
+        trim_hot_locked(hot_bytes_ > shortage ? hot_bytes_ - shortage : 0);
+        sync_metrics_locked();
+    }
+
     bool erase_corrupt_locked(const BlockHash& hash) {
+        deferred_.erase(hash);
         bool removed = false;
         auto found = disk_.find(hash);
         if (found != disk_.end()) {
@@ -1424,11 +1499,8 @@ private:
         std::error_code error;
         const auto space = std::filesystem::space(namespace_dir_, error);
         if (error) return config_.max_disk_bytes;
-        const auto available = static_cast<std::uint64_t>(space.available);
-        const auto managed_and_available = disk_bytes_ >
-                std::numeric_limits<std::uint64_t>::max() - available
-            ? std::numeric_limits<std::uint64_t>::max()
-            : disk_bytes_ + available;
+        std::uint64_t managed_and_available = 0;
+        try { managed_and_available = unreserved_disk_space(namespace_dir_, disk_bytes_); } catch (...) { return 0; }
         const auto safe_available = managed_and_available -
             managed_and_available / kDiskSafeDenominator;
         return std::min(config_.max_disk_bytes, safe_available);
@@ -1443,7 +1515,11 @@ private:
             auto victim = disk_.end();
             for (auto iterator = disk_.begin(); iterator != disk_.end();
                  ++iterator) {
-                if (iterator->second.pins != 0 ||
+                const auto binding = pins_.find(iterator->first);
+                const auto session_pins = binding == pins_.end() ? 0 : binding->second;
+                // Disposable session bindings must not hold SSD above quota,
+                // but active file readers still need their pin until read ends.
+                if (iterator->second.pins > (config_.spill_hot_on_eviction ? session_pins : 0) ||
                     pending_.count(iterator->first) != 0) {
                     continue;
                 }
@@ -1461,6 +1537,9 @@ private:
             // Disk and RAM are independent tiers. A hot payload remains a
             // valid content-addressed hit after its durable copy is evicted.
             const auto hash = victim->first;
+            if (config_.spill_hot_on_eviction && hot_.count(hash) && !deferred_.count(hash))
+                deferred_[hash] = WriteRequest{hash, victim->second.parent, victim->second.token_count,
+                    hot_.at(hash).payload, cache_epoch_, false, {}};
             disk_.erase(victim);
             forget_tail_if_unused_locked(hash);
             ++metrics_.evictions;
@@ -1515,6 +1594,7 @@ private:
                     hot_bytes_ -= hot->second.payload->size();
                     hot_.erase(hot);
                 }
+                deferred_.erase(*victim);
                 forget_tail_if_unused_locked(*victim);
                 ++metrics_.superseded_blocks;
                 victim = victims.erase(victim);
@@ -1569,6 +1649,7 @@ private:
         HashHasher> pending_;
     std::unordered_map<BlockHash, DiskEntry, HashHasher> disk_;
     std::unordered_map<BlockHash, HotEntry, HashHasher> hot_;
+    std::unordered_map<BlockHash, WriteRequest, HashHasher> deferred_;
     std::unordered_map<BlockHash, std::size_t, HashHasher> pins_;
     std::unordered_map<BlockHash, std::map<std::size_t, std::size_t>, HashHasher> tail_lengths_;
     std::unordered_map<BlockHash, std::pair<BlockHash, std::size_t>, HashHasher> tail_metadata_;
@@ -1687,6 +1768,10 @@ std::size_t PagedPrefixCache::refresh_disk_index() {
 
 std::uint64_t PagedPrefixCache::trim_hot(std::uint64_t target_bytes) {
     return implementation_->trim_hot(target_bytes);
+}
+
+std::uint64_t PagedPrefixCache::reserve_ram(std::uint64_t allocation_bytes) {
+    return implementation_->reserve_ram(allocation_bytes);
 }
 
 void PagedPrefixCache::flush() {

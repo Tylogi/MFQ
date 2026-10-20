@@ -54,6 +54,9 @@ target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)
+if(MSVC)
+    target_compile_options(mfq-model-source PRIVATE /EHsc)
+endif()
 set_target_properties(mfq-model-source PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
@@ -89,6 +92,7 @@ add_library(mfq-paged-prefix-cache STATIC
     mfq_paged_prefix_cache.h
 )
 target_include_directories(mfq-paged-prefix-cache PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(mfq-paged-prefix-cache PUBLIC Threads::Threads)

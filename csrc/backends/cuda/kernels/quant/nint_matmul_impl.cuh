@@ -3,7 +3,7 @@
 // Shared by the NINT8-0 inference unit and the tool-only backward unit: the
 // symmetric-quantization metadata both sides check before launching.
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 namespace {
 

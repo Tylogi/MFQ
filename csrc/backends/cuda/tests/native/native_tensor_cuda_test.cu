@@ -2,6 +2,7 @@
 #include "native/context.h"
 #include "native/tensor/tensor.h"
 #include "native/matmul_rows.h"
+#include "native/weight_memory.h"
 #include <cstring>
 
 #include <cuda_runtime_api.h>
@@ -49,7 +50,79 @@ void set_test_environment(const char* name, const char* value) {
     mfq::cuda::env_set(name, value);
 }
 
+void check_strided_reshape() {
+    using namespace mfq::cuda;
+    int checks=0;
+    set_test_environment("MFQ_TENSOR_VIEW_RESHAPE","1");
+    for(const auto device:{Device{kCPU,0},Device{kCUDA,0}}) {
+        std::vector<float> input(24);for(size_t i=0;i<input.size();++i)input[i]=float(i);
+        auto base=tensor<float>(input).reshape({2,3,4}).to(device);
+        auto source=base.narrow(1,1,2);
+        for(const auto& shape:std::vector<std::vector<int64_t>>{{2,8},{1,2,2,4},{2,2,2,2},{2,1,8,1},{2,-1}}) {
+            auto view=source.reshape(shape);
+            require(view.data_ptr()==source.data_ptr(),"legal strided reshape copied its data");
+            require(host_values(view)==host_values(source),"legal strided reshape changed logical order");++checks;
+        }
+        auto packed=source.reshape({4,4});
+        require(packed.data_ptr()!=source.data_ptr() && packed.is_contiguous(),"reshape across row gap must copy");
+        require(host_values(packed)==host_values(source),"copied reshape changed logical order");++checks;
+        auto transpose=base.reshape({6,4}).transpose(0,1);
+        auto same=transpose.reshape({4,1,6});
+        require(same.data_ptr()==transpose.data_ptr() && same.stride(0)==transpose.stride(0) &&
+            same.stride(2)==transpose.stride(1),"transpose reshape lost its strides");
+        require(host_values(same)==host_values(transpose),"transpose reshape changed logical order");++checks;
+        auto expanded=base.narrow(0,0,1).expand({3,3,4});
+        auto broadcast=expanded.reshape({3,12});
+        require(broadcast.data_ptr()==expanded.data_ptr() && broadcast.stride(0)==0,"reshape lost broadcast stride");
+        require(host_values(broadcast)==host_values(expanded),"broadcast reshape changed logical order");++checks;
+        auto alias=source.reshape({2,8});
+        if(device.is_cpu())base.fill_(37);else alias.fill_(37);
+        require(host_values(source)==std::vector<float>(16,37.f),"reshape view does not share mutations");++checks;
+    }
+    auto source=tensor<float>({1,2,3,4,5,6,7,8}).reshape({2,4}).to(kCUDA).narrow(1,1,2);
+    Graph graph;graph.prepare_memory();
+    auto output=source.reshape({1,2,2}).square();
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));output={};
+    graph.capture_begin();auto view=source.reshape({1,2,2});output=view.square();graph.capture_end();
+    for(int step=1;step<=3;++step) {
+        source.fill_(step);graph.replay();
+        require(host_values(output)==std::vector<float>(4,float(step*step)),"reshape graph replay used stale values");++checks;
+    }
+    std::cout<<"strided_reshape views, fallback, aliases and changing graphs checks="<<checks<<" PASS\n";
+}
+
+void check_weight_memory() {
+    using namespace mfq::cuda;
+    WeightMemoryLedger ledger,nested;
+    Tensor weight,view;
+    auto table=std::make_shared<int>(1);
+    {
+        const WeightMemoryLoadScope loading(ledger);
+        auto workspace=zeros({16384},TensorOptions{}.device(kCUDA));
+        {
+            const WeightAllocationScope weights;
+            weight=zeros({16},TensorOptions{}.dtype(kFloat32).device(kCUDA));
+            view=weight.narrow(0,0,4);
+            auto replaced=zeros({32},weight.options());
+            require(ledger.resident_bytes()==192,"weight ledger excludes unrelated workspace and shared views");
+            {
+                const WeightMemoryLoadScope inner(nested);
+                auto other=zeros({8},weight.options());
+                require(nested.resident_bytes()==32 && ledger.resident_bytes()==192,"nested weight ledger isolates engines");
+            }
+            require(nested.resident_bytes()==0,"weight ledger releases expired allocations");
+        }
+        observe_streamed_ple(table,4096);
+        require(ledger.resident_bytes()==64 && ledger.ple_bytes()==4096,"weight ledger drops replaced projections and counts PLE payload");
+    }
+    weight={};
+    require(ledger.resident_bytes()==64,"weight view retains its full allocation");
+    view={};table.reset();
+    require(ledger.resident_bytes()==0 && ledger.ple_bytes()==0,"telemetry must not retain weights or tables");
+}
+
 #include "matmul_rows_test.h"
+#include "tests/kernels/contiguous_convert_test.h"
 }  // namespace
 
 int main(int argc,char** argv) try {
@@ -62,13 +135,45 @@ int main(int argc,char** argv) try {
 
     using namespace mfq::cuda;
     const Device cuda_device{DeviceType::cuda, 0};
+    if(argc==2 && std::string(argv[1])=="--contiguous-convert-check") {
+        check_contiguous_convert();return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--matmul-rows-check") {
         verify_matmul_rows();return 0;
     }
     if(argc==2 && std::string(argv[1])=="--parallel-row-chain-check") {
         verify_parallel_row_chains();return 0;
     }
+    if(argc==2 && std::string(argv[1])=="--pinned-allocation-recovery-check") {
+        // An impossible pinned allocation exercises the real driver failure,
+        // then verifies both ordinary kernels and graph execution still work.
+        bool rejected=false;
+        try {(void)empty({int64_t(1)<<40},TensorOptions{}.device(kCPU).dtype(kUInt8).pinned_memory(true));}
+        catch(const Error& error) {
+            rejected=std::string(error.what()).starts_with("CUDA pinned allocation failed:");
+        }
+        require(rejected,"impossible pinned allocation was not rejected");
+        require(cudaPeekAtLastError()==cudaSuccess,"pinned allocation left a stale CUDA error");
+        bool mapped_rejected=false;
+        try {HostBuffer unreachable(std::size_t(1)<<40,true);}
+        catch(const Error& error) {
+            mapped_rejected=std::string(error.what()).starts_with("CUDA pinned allocation failed:");
+        }
+        require(mapped_rejected,"impossible mapped pinned allocation was not rejected");
+        require(cudaPeekAtLastError()==cudaSuccess,"mapped pinned allocation left a stale CUDA error");
+        auto input=ones({16},TensorOptions{}.device(cuda_device).dtype(kFloat32));
+        require_close(host_values(input.square())[0],1.0f,0.0f,"kernel after pinned allocation failure");
+        Graph graph;Tensor output;
+        graph.prepare_memory();output=input+2.0;
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));output={};
+        graph.capture_begin();output=input+2.0;graph.capture_end();graph.replay();graph.replay();
+        require_close(host_values(output)[0],3.0f,0.0f,"graph after pinned allocation failure");
+        std::cout<<"pinned_allocation_recovery driver_rejection=PASS mapped_driver_rejection=PASS subsequent_kernel=PASS graph_replays=2 PASS\n";
+        return 0;
+    }
     if(argc!=1)throw std::invalid_argument("unknown native tensor check");
+    check_weight_memory();
+    check_strided_reshape();
 
     auto empty_host_blob = from_blob(
         static_cast<void*>(nullptr), {0}, TensorOptions{}.dtype(kFloat32));

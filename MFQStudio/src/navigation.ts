@@ -4,7 +4,7 @@
 
 export type ViewName = 'chat' | 'dashboard' | 'lab' | 'applications' | 'versions';
 export type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs' | 'settings';
-export type LabPage = 'models' | 'evaluations' | 'quantization' | 'analysis';
+export type LabPage = 'models' | 'evaluations' | 'analysis';
 
 export interface StudioLocation {
   view: ViewName;
@@ -20,7 +20,6 @@ export const STUDIO_PATHS = {
   resources: '/resources',
   modelHub: '/model-hub',
   evaluations: '/evaluations',
-  quantization: '/quantization',
   analysis: '/analysis',
   applications: '/applications',
   versions: '/versions',
@@ -40,7 +39,6 @@ const DASHBOARD_PATHS: Record<DashboardPage, string> = {
 const LAB_PATHS: Record<LabPage, string> = {
   models: STUDIO_PATHS.modelHub,
   evaluations: STUDIO_PATHS.evaluations,
-  quantization: STUDIO_PATHS.quantization,
   analysis: STUDIO_PATHS.analysis,
 };
 

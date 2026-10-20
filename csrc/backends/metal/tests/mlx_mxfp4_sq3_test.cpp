@@ -1,4 +1,4 @@
-#include "mlx_mxfp4_sq.h"
+#include "ops/mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <array>

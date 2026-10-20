@@ -170,6 +170,23 @@ def _cuda_compiler() -> Path | None:
     return None
 
 
+def _hip_compiler() -> Path | None:
+    found = shutil.which("hipcc")
+    if found:
+        return Path(found)
+    for variable in ("ROCM_PATH", "ROCM_HOME"):
+        root = os.environ.get(variable)
+        if root:
+            candidate = Path(root) / "bin" / "hipcc"
+            if candidate.is_file():
+                return candidate
+    for root in (Path("/opt/rocm"),):
+        candidate = root / "bin" / "hipcc"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def detect_backend(requested: str = "auto") -> str:
     system = platform.system()
     machine = platform.machine().lower()
@@ -183,15 +200,23 @@ def detect_backend(requested: str = "auto") -> str:
         if _cuda_compiler() is None:
             raise BuildError("CUDA was selected but nvcc was not found")
         return "cuda"
+    if requested == "hip":
+        if system != "Linux":
+            raise BuildError("the HIP runtime is supported on Linux")
+        if _hip_compiler() is None:
+            raise BuildError("HIP was selected but hipcc was not found")
+        return "hip"
     if requested != "auto":
         raise BuildError(f"unsupported inference backend: {requested}")
     if system == "Darwin" and machine in {"arm64", "aarch64"}:
         return "metal"
     if system in {"Linux", "Windows"} and _cuda_compiler() is not None:
         return "cuda"
+    if system == "Linux" and _hip_compiler() is not None:
+        return "hip"
     raise BuildError(
         "no supported inference accelerator was detected; MFQ requires Apple silicon/Metal "
-        "on macOS or an NVIDIA CUDA toolkit on Linux or Windows"
+        "on macOS, an NVIDIA CUDA toolkit, or an AMD ROCm/HIP toolchain on Linux"
     )
 
 
@@ -268,6 +293,8 @@ def create_build_plan(
         configure.extend(
             [
                 "-DMFQ_BUILD_METAL_RUNTIME=ON",
+                "-DMFQ_BUILD_CUDA_RUNTIME=OFF",
+                "-DMFQ_BUILD_HIP_RUNTIME=OFF",
                 f"-DMFQ_MLX_ROOT={_mlx_root()}",
             ]
         )
@@ -280,6 +307,27 @@ def create_build_plan(
                 "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF",
             ]
         )
+    if selected == "hip":
+        configure.extend(
+            [
+                "-DMFQ_BUILD_HIP_RUNTIME=ON",
+                "-DMFQ_BUILD_CUDA_RUNTIME=OFF",
+            ]
+        )
+        rocm = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
+        if not rocm:
+            rocmpath = shutil.which("rocmpath")
+            if rocmpath:
+                try:
+                    rocm = subprocess.check_output(
+                        [rocmpath], text=True, stderr=subprocess.DEVNULL
+                    ).strip()
+                except (OSError, subprocess.CalledProcessError):
+                    rocm = None
+        if rocm:
+            configure.append(f"-DROCM_PATH={rocm}")
+    elif selected == "cuda":
+        configure.extend(["-DMFQ_BUILD_CUDA_RUNTIME=ON", "-DMFQ_BUILD_HIP_RUNTIME=OFF"])
     configure.extend(str(value) for value in cmake_args)
     parallelism = jobs if jobs is not None else max(1, os.cpu_count() or 1)
     if parallelism < 1:
@@ -379,7 +427,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Arguments after '--' are forwarded to the CMake configure command."
         ),
     )
-    parser.add_argument("--backend", choices=("auto", "cuda", "metal"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "cuda", "hip", "metal"), default="auto")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--build-type", default="Release")
     parser.add_argument("-j", "--jobs", type=int)

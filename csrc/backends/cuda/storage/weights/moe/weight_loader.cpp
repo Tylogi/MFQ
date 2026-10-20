@@ -1,4 +1,4 @@
-#include "weight_loader.h"
+#include "storage/weights/loaders/weight.h"
 
 #include "ops/execution/execution_options.h"
 #include "ops/format.h"

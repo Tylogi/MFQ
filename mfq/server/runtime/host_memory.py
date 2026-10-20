@@ -7,6 +7,8 @@ import ctypes.util
 import functools
 import os
 import sys
+import time
+from collections import deque
 from dataclasses import dataclass
 
 _HOST_VM_INFO64 = 4
@@ -69,6 +71,48 @@ def automatic_memory_reserve(total: int) -> int:
     return min(8 << 30, max(3 << 30, total * 8 // 100))
 
 
+class MemoryReleaseCredit:
+    def __init__(self) -> None:
+        self._previous: tuple[float, int, int] | None = None
+        self._released: deque[list[float | int]] = deque()
+        self._available: deque[list[float | int]] = deque()
+
+    @staticmethod
+    def _consume(entries: deque[list[float | int]], amount: int) -> int:
+        while entries and amount > 0:
+            consumed = min(int(entries[0][1]), amount)
+            entries[0][1] -= consumed
+            amount -= consumed
+            if entries[0][1] <= 0:
+                entries.popleft()
+        return amount
+
+    def update(self, used: int, available: int) -> int:
+        now = time.monotonic()
+        previous = self._previous
+        self._previous = (now, used, available)
+        for entries in (self._released, self._available):
+            while entries and entries[0][0] <= now:
+                entries.popleft()
+        if previous is None or not 0 <= now - previous[0] <= 2.0:
+            self._released.clear()
+            self._available.clear()
+            return 0
+        arrived = max(0, available - previous[2])
+        if arrived:
+            unmatched = self._consume(self._released, arrived)
+            if unmatched:
+                self._available.append([now + 2.0, unmatched])
+        released = previous[1] - used
+        if released > 0:
+            unmatched = self._consume(self._available, released)
+            if unmatched:
+                self._released.append([now + 2.0, unmatched])
+        elif released < 0:
+            self._consume(self._released, -released)
+        return sum(int(entry[1]) for entry in self._released)
+
+
 @dataclass(frozen=True)
 class HostMemorySnapshot:
     """Stable leading counters from macOS ``vm_statistics64`` in bytes."""
@@ -82,11 +126,11 @@ class HostMemorySnapshot:
     swapout_bytes: int | None = None
     external: int = 0
 
-    def reclaimable(self, *, active_ratio: float = 0.5) -> int:
+    def reclaimable(self, *, active_ratio: float = 0.5, own_cpu_bytes: int = 0) -> int:
         ratio = min(1.0, max(0.0, active_ratio))
         file_active = max(0, self.external - max(0, self.inactive))
         return max(0, self.free) + max(0, self.inactive, self.external) + int(
-            max(0, self.active - file_active) * ratio
+            max(0, self.active - file_active - max(0, own_cpu_bytes)) * ratio
         )
 
 

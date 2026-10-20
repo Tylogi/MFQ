@@ -6,12 +6,12 @@ import type {
   RuntimeListener,
   RuntimeModel,
   RuntimeInstance,
-  RuntimeProfile,
   RuntimeMetricSnapshot,
   RuntimeLogEntry,
   RealtimeCapabilities,
   VoiceOutputComponentStatus,
   JobResource,
+  ServingStatistics,
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
@@ -22,8 +22,15 @@ export interface RuntimeMemoryPolicy {
   model_limit_bytes: number | null;
   prefix_limit_bytes: number | null;
   prefix_disk_limit_bytes?: number | null;
+  prefix_ram_limit_bytes?: number | null;
+  effective_prefix_ram_limit_bytes?: number;
   prefix_directory: string | null;
   actual_prefix_directory: string;
+}
+
+export interface RuntimeAuthenticationPolicy {
+  enabled: boolean;
+  has_key: boolean;
 }
 
 export interface RuntimeContextPolicy {
@@ -33,6 +40,12 @@ export interface RuntimeContextPolicy {
   model_yarn_enabled?: Record<string, boolean>;
   model_qsa_kv_offload?: Record<string, QsaKvStorageSettings>;
   model_kv_quantization?: Record<string, KvQuantizationSettings>;
+  model_kv_memory?: Record<string, KvMemorySettings>;
+}
+
+export interface KvMemorySettings {
+  placement: 'auto' | 'auto_ssd' | 'vram' | 'ram';
+  allocation: 'preallocated' | 'dynamic';
 }
 
 export interface KvQuantizationSettings {
@@ -120,6 +133,15 @@ export interface PrefixCacheText {
 }
 
 export const runtimeApi = {
+  servingStatistics(scope: 'session' | 'alltime', signal?: AbortSignal): Promise<ServingStatistics> {
+    return request(`/api/v1/runtime/serving?scope=${scope}`, { signal });
+  },
+  authenticationPolicy(): Promise<RuntimeAuthenticationPolicy> {
+    return request('/api/v1/auth/policy');
+  },
+  configureAuthenticationPolicy(enabled: boolean, apiKey?: string): Promise<RuntimeAuthenticationPolicy> {
+    return request('/api/v1/auth/policy', { method: 'PUT', body: JSON.stringify({ enabled, ...(apiKey === undefined ? {} : { api_key: apiKey }) }) });
+  },
   qsaKvOffloadInfo(instanceId: string, targetContext: number, signal?: AbortSignal): Promise<QsaKvOffloadInfo> {
     return request(`/api/v1/runtime/qsa-kv/${encodeURIComponent(instanceId)}?target_context=${targetContext}`, { signal });
   },
@@ -158,7 +180,7 @@ export const runtimeApi = {
   memoryPolicy(): Promise<RuntimeMemoryPolicy> {
     return request('/api/v1/runtime/memory-policy');
   },
-  configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
+  configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_ram_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
     return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
   runtimeListener(): Promise<RuntimeListener> {
@@ -192,41 +214,6 @@ export const runtimeApi = {
     return (await request<{ data: RuntimeInstance[] }>('/api/v1/runtime/instances')).data;
   },
 
-  /** 获取模型加载配置档案列表。 */
-  async runtimeProfiles(): Promise<RuntimeProfile[]> {
-    return (await request<{ data: RuntimeProfile[] }>('/api/v1/runtime/profiles')).data;
-  },
-
-  /** 保存模型加载参数为可复用配置档案。 */
-  createRuntimeProfile(body: {
-    name: string;
-    load: RuntimeProfile['load'];
-  }): Promise<RuntimeProfile> {
-    return request('/api/v1/runtime/profiles', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
-  },
-
-  /** 删除加载配置档案，不卸载现有实例。 */
-  async deleteRuntimeProfile(id: string): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/runtime/profiles/${id}`), {
-      method: 'DELETE',
-      headers: authorizedHeaders(),
-    });
-    if (!response.ok) throw await errorFromResponse(response);
-  },
-
-  /** 按配置档案提交加载任务，可显式接受资产版本漂移。 */
-  loadRuntimeProfile(
-    id: string,
-    allowDrift = false,
-  ): Promise<{ operation_id: string; status: 'accepted' }> {
-    return request(`/api/v1/runtime/profiles/${id}/load`, {
-      method: 'POST',
-      body: JSON.stringify({ allow_drift: allowDrift }),
-    });
-  },
 
   /** 获取运行指标快照历史，供概览趋势展示。 */
   async runtimeMetrics(limit = 200, signal?: AbortSignal, since?: string): Promise<RuntimeMetricSnapshot[]> {
@@ -276,13 +263,17 @@ export const runtimeApi = {
     return request('/api/v1/runtime/context-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
 
+  reloadGlobalContextCap(): Promise<JobResource> {
+    return request('/api/v1/runtime/context', { method: 'POST', body: JSON.stringify({ apply_global_cap: true }) });
+  },
+
   yarnContextInfo(instanceId: string): Promise<YarnContextInfo> {
     return request(`/api/v1/runtime/yarn/${encodeURIComponent(instanceId)}`);
   },
 
-  configureContext(contextSize: number | null, instanceId: string, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings): Promise<JobResource> {
+  configureContext(contextSize: number | null, instanceId: string, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings): Promise<JobResource> {
     return request('/api/v1/runtime/context', {
-      method: 'POST', body: JSON.stringify({ context_size: contextSize, instance_id: instanceId, yarn_enabled: yarnEnabled, qsa_kv_offload: qsaKvOffload, kv_quantization: kvQuantization }),
+      method: 'POST', body: JSON.stringify({ context_size: contextSize, instance_id: instanceId, yarn_enabled: yarnEnabled, qsa_kv_offload: qsaKvOffload, kv_quantization: kvQuantization, kv_memory: kvMemory }),
     });
   },
 

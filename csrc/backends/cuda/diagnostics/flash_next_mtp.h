@@ -61,6 +61,42 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     auto normalized=model.hidden_forward(ids,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
     result["target_raw"]=json_tensor(raw);result["target_normalized"]=json_tensor(normalized);
     if constexpr(requires { mtp.graph_replays; }) {
+        // Restore A after an unrelated B has overwritten every recurrent,
+        // PLE and predictor cache. Snapshots must own their saved tensors.
+        auto state=model.capture_text_session_state({1,2,3,4,5,6,7});
+        mtp.reset();
+        (void)mtp.evaluate(target,raw.narrow(1,0,6),ids.narrow(1,1,6));
+        auto predictor=mtp.capture_session_state(7,raw.narrow(1,6,1));
+        state.mtp=predictor;state.bytes+=predictor.bytes;
+        std::vector<CudaPagedPayload> disk{encode_cuda_qwen4_paged_block(state,4,0),encode_cuda_qwen4_paged_block(state,4,1)};
+        MFQ_RUNTIME_CHECK(cuda_paged_decodable_blocks({disk.front()})==0 && cuda_paged_decodable_blocks(disk)==2 &&
+            cuda_paged_payload_tokens(disk.back())==3,"Qwen4 SSD prefix lost its exact boundary or tail");
+        auto cold=decode_cuda_qwen4_paged_session(disk,state.tokens,4);
+        auto next=tb::tensor(std::vector<int64_t>{2,3},options).reshape({1,2});
+        tb::Tensor extension_raw;
+        auto extension=model.hidden_forward(next,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&extension_raw);
+        auto pairs=tb::cat({raw.narrow(1,6,1),extension_raw.narrow(1,0,1)},1);
+        auto expected=mtp.evaluate(target,pairs,next);
+        for(const auto* saved:{&state,&cold}) {
+            model.reset(1);(void)model.hidden_forward(ids.narrow(1,0,3));
+            model.restore_text_session_state(*saved);mtp.restore_session_state(*saved->mtp);
+            tb::Tensor restored_raw;
+            auto restored=model.hidden_forward(next,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&restored_raw);
+            auto restored_pairs=tb::cat({saved->mtp->last_target_hidden,restored_raw.narrow(1,0,1)},1);
+            auto actual=mtp.evaluate(target,restored_pairs,next);
+            for(const auto& pair:std::vector<std::pair<tb::Tensor,tb::Tensor>>{
+                {restored,extension},{restored_raw,extension_raw},{actual.first,expected.first},{actual.second,expected.second}}) {
+                auto a=pair.first.to(tb::kFloat32).contiguous().cpu(),b=pair.second.to(tb::kFloat32).contiguous().cpu();
+                MFQ_RUNTIME_CHECK(a.sizes()==b.sizes(),"Qwen4 restored session changed output shape");
+                for(int64_t i=0;i<a.numel();++i)MFQ_RUNTIME_CHECK(
+                    std::abs(a.template data_ptr<float>()[i]-b.template data_ptr<float>()[i])<=.003+.003*std::abs(b.template data_ptr<float>()[i]),
+                    "Qwen4 restored session changed target or predictor output");
+            }
+        }
+        result["session_restore_checked"]=true;
+        result["ssd_session_restore_checked"]=true;
+    }
+    if constexpr(requires { mtp.graph_replays; }) {
         double maximum_error=0;
         for(int tokens=1;tokens<=6;++tokens) {
             const auto prime=[&] {

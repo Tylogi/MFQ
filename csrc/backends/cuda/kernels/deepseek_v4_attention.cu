@@ -1,6 +1,7 @@
+#include <math_constants.h>
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "deepseek_v4_attention.h"
+#include "native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 12080
@@ -147,10 +148,10 @@ __global__ void dsv4_compress_kernel(
     const int d = threadIdx.x;
     if (b >= B || d >= HEAD_DIM) return;
 
-    float max_score = -INFINITY;
+    float max_score = -CUDART_INF_F;
     const int candidates = overlap ? 2 * ratio : ratio;
     for (int i = 0; i < candidates; ++i) {
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (((static_cast<int64_t>(b) * W + w) * ratio + i) * out_dim + d);
@@ -183,7 +184,7 @@ __global__ void dsv4_compress_kernel(
     float denominator = 0.0f;
     for (int i = 0; i < candidates; ++i) {
         float value = 0.0f;
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (((static_cast<int64_t>(b) * W + w) * ratio + i) * out_dim + d);
@@ -361,9 +362,9 @@ __global__ void dsv4_decode_pool_update_kernel(
     if (pool_index >= pool_capacity) return;
     const bool have_previous = pool_index > 0;
     const int candidates = overlap ? 2 * ratio : ratio;
-    float max_score = -INFINITY;
+    float max_score = -CUDART_INF_F;
     for (int i = 0; i < candidates; ++i) {
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (static_cast<int64_t>(b) * ratio + i) * out_dim + d;
@@ -391,7 +392,7 @@ __global__ void dsv4_decode_pool_update_kernel(
     float denominator = 0.0f;
     for (int i = 0; i < candidates; ++i) {
         float value = 0.0f;
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (static_cast<int64_t>(b) * ratio + i) * out_dim + d;
@@ -555,12 +556,14 @@ __global__ void dsv4_fp4_sim_kernel(
 
 // One block covers 32 or 64 index heads by 64 pooled keys. Warps map the
 // 16x16 WMMA tiles and the head-weighted ReLU reduction remains on chip.
-template<int INDEXER_HEADS>
+template<int INDEXER_HEADS, bool Indexed = false>
 __global__ void dsv4_indexer_scores_kernel(
     const half * __restrict__ q,
     const half * __restrict__ k,
     const half * __restrict__ weights,
     half * __restrict__ out,
+    const int64_t * __restrict__ candidates,
+    int output_keys,
     int B,
     int M,
     int K,
@@ -589,8 +592,11 @@ __global__ void dsv4_indexer_scores_kernel(
     for (int i = tid; i < kIndexerKeysPerTile * kIndexerDim; i += threads) {
         const int key_local = i / kIndexerDim;
         const int dim = i - key_local * kIndexerDim;
-        const int key = key_base + key_local;
-        reinterpret_cast<half *>(k_tile)[i] = key < K
+        const int selected = key_base + key_local;
+        int64_t key = selected;
+        if constexpr (Indexed)
+            key = selected < output_keys ? candidates[(static_cast<int64_t>(batch) * M + query) * output_keys + selected] : -1;
+        reinterpret_cast<half *>(k_tile)[i] = selected < output_keys && key >= 0 && key < K
             ? k[(static_cast<int64_t>(batch) * K + key) * kIndexerDim + dim]
             : __float2half(0.0f);
     }
@@ -615,8 +621,11 @@ __global__ void dsv4_indexer_scores_kernel(
     __syncthreads();
 
     if (tid < kIndexerKeysPerTile) {
-        const int key = key_base + tid;
-        if (key < K) {
+        const int selected = key_base + tid;
+        int64_t key = selected;
+        if constexpr (Indexed)
+            key = selected < output_keys ? candidates[(static_cast<int64_t>(batch) * M + query) * output_keys + selected] : -1;
+        if (selected < output_keys) {
             float sum = 0.0f;
 #pragma unroll
             for (int head = 0; head < INDEXER_HEADS; ++head) {
@@ -628,10 +637,10 @@ __global__ void dsv4_indexer_scores_kernel(
             }
             const int visible = min(
                 K, (query_offset + query + 1) / ratio);
-            out[(static_cast<int64_t>(batch) * M + query) * K + key] =
-                key < visible
+            out[(static_cast<int64_t>(batch) * M + query) * output_keys + selected] =
+                key >= 0 && key < visible
                     ? __float2half_rn(sum * score_scale)
-                    : __float2half(-INFINITY);
+                    : __float2half(-CUDART_INF_F);
         }
     }
 #else
@@ -789,7 +798,7 @@ __global__ void dsv4_prefill_plan_kernel(
             }
         }
         indices[linear] = index;
-        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 
@@ -834,7 +843,7 @@ __global__ void dsv4_decode_plan_kernel(
             }
         }
         indices[linear] = index;
-        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 
@@ -1112,12 +1121,13 @@ mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
     return pool;
 }
 
-mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+static mfq_tensor_backend::Tensor dsv4_indexer_scores_impl(
     mfq_tensor_backend::Tensor q,
     mfq_tensor_backend::Tensor k,
     mfq_tensor_backend::Tensor weights,
     int64_t query_offset,
-    int64_t ratio)
+    int64_t ratio,
+    mfq_tensor_backend::Tensor candidates)
 {
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
@@ -1138,33 +1148,42 @@ mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
             weights.size(2) == q.size(2) &&
             query_offset >= 0 && ratio > 0,
         "dsv4_indexer_scores: shape mismatch");
+    const bool indexed = candidates.defined();
+    if (indexed) MFQ_RUNTIME_CHECK(candidates.is_cuda() && candidates.is_contiguous() &&
+        candidates.device() == q.device() && candidates.scalar_type() == mfq_tensor_backend::kInt64 &&
+        candidates.dim() == 3 && candidates.size(0) == q.size(0) && candidates.size(1) == q.size(1),
+        "dsv4_indexer_scores: invalid candidate positions");
     const int B = static_cast<int>(q.size(0));
     const int M = static_cast<int>(q.size(1));
     const int K = static_cast<int>(k.size(1));
-    auto out = mfq_tensor_backend::empty({B, M, K}, q.options());
+    const int N = indexed ? static_cast<int>(candidates.size(2)) : K;
+    auto out = mfq_tensor_backend::empty({B, M, N}, q.options());
+    if (!N) return out;
     const dim3 grid(
-        (K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
+        (N + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
     const int indexer_heads = static_cast<int>(q.size(2));
-    const auto launch = [&](auto heads_tag) {
+    const auto launch = [&](auto heads_tag, auto indexed_tag) {
         constexpr int indexer_heads_static = decltype(heads_tag)::value;
-        dsv4_indexer_scores_kernel<indexer_heads_static><<<
+        dsv4_indexer_scores_kernel<indexer_heads_static, decltype(indexed_tag)::value><<<
             grid, dim3(32, indexer_heads_static / 4, 1), 0,
             mfq_current_cuda_stream()>>>(
             reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
             reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
             reinterpret_cast<const half *>(weights.data_ptr<mfq_half>()),
             reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
+            indexed ? candidates.data_ptr<int64_t>() : nullptr, N,
             B, M, K, static_cast<int>(query_offset),
             static_cast<int>(ratio),
             1.0f / std::sqrt(
                 static_cast<float>(
                     kIndexerDim * indexer_heads_static)));
     };
-    if (indexer_heads == 32) {
-        launch(std::integral_constant<int, 32>{});
-    } else {
-        launch(std::integral_constant<int, 64>{});
-    }
+    const auto select_heads = [&](auto indexed_tag) {
+        if (indexer_heads == 32) launch(std::integral_constant<int, 32>{}, indexed_tag);
+        else launch(std::integral_constant<int, 64>{}, indexed_tag);
+    };
+    if (indexed) select_heads(std::true_type{});
+    else select_heads(std::false_type{});
     const cudaError_t status = cudaGetLastError();
     MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
@@ -1172,6 +1191,20 @@ mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
         cudaGetErrorString(status));
     return out;
 }
+
+mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights, int64_t query_offset, int64_t ratio) {
+    return dsv4_indexer_scores_impl(q, k, weights, query_offset, ratio, {});
+}
+
+mfq_tensor_backend::Tensor dsv4_indexer_candidate_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights, mfq_tensor_backend::Tensor candidates,
+    int64_t query_offset, int64_t ratio) {
+    return dsv4_indexer_scores_impl(q, k, weights, query_offset, ratio, candidates);
+}
+
 
 mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores) {
     MFQ_RUNTIME_CHECK(

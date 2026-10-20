@@ -1,6 +1,6 @@
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_vq.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_vq.h"
 
 #include <algorithm>
 #include <bit>

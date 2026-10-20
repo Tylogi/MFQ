@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react';
+import { useLocation } from 'react-router';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, ScreenHeader } from '../../app/display';
 import { useModelCatalog } from './useModelCatalog';
@@ -10,6 +12,11 @@ import { formatBytes } from '../../app/formatters';
 export function ModelsPage() {
   const catalog = useModelCatalog();
   const { tr } = useSettings();
+  const { hash } = useLocation();
+  const checkpoints = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (hash === '#local-checkpoints') checkpoints.current?.scrollIntoView({ block: 'start' });
+  }, [hash]);
   const { artifacts, busy, availableModelNames,
     openStudioPage, chooseModelDirectory, modelFolderPath } = catalog;
   const totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.total_bytes, 0);
@@ -63,14 +70,9 @@ export function ModelsPage() {
       </div>
       <LoadedModels catalog={catalog} />
       <ModelLoadPolicy catalog={catalog} />
-      <LocalCheckpoints catalog={catalog} />
-      <div className="model-workbench-links">
-        <span>{tr('自定义模型精度', 'Custom model precision')}</span>
-        <button onClick={() => openStudioPage('lab', 'quantization')} type="button">
-          {tr('打开量化工作台', 'Open quantization workspace')}
-          <Icon name="text-forward" size={14} />
-        </button>
-      </div>
+      <section id="local-checkpoints" ref={checkpoints}>
+        <LocalCheckpoints catalog={catalog} />
+      </section>
       <ModelDirectoryDialog catalog={catalog} />
     </section>
   );

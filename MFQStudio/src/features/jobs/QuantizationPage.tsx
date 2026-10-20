@@ -6,6 +6,7 @@ import { quantizationApi, type QuantizationSource, type QuantizationWorkspace } 
 import { SourceLoadingControl } from './SourceLoadingControl';
 import type { JobResource } from '../../shared/api/types';
 import { ApiError } from '../../shared/api/client';
+import { errorMessage } from '../../app/formatters';
 import { useJobStore } from '../../stores/jobStore';
 import { useSettings } from '../settings/SettingsProvider';
 import { WorkbenchFileDialog } from './WorkbenchFileDialog';
@@ -56,7 +57,7 @@ export function QuantizationPage() {
       if (disposed) return;
       setWorkspace(settings); setImportDirectory(settings.import_directory); setExportDirectory(settings.export_directory); setCandidates(settings.candidates);
       records.forEach((job) => useJobStore.getState().addJob(job));
-    }).catch((cause) => { if (!disposed) setError(message(cause)); });
+    }).catch((cause) => { if (!disposed) setError(validationMessage(cause)); });
     return () => { disposed = true; };
   }, []);
 
@@ -78,7 +79,7 @@ export function QuantizationPage() {
   }
 
   function validationMessage(cause: unknown) {
-    if (!(cause instanceof ApiError)) return message(cause);
+    if (!(cause instanceof ApiError)) return errorMessage(cause, tr);
     const value = (key: string) => typeof cause.details?.[key] === 'number' ? Number(cause.details[key]).toFixed(4) : '—';
     if (cause.code === 'quantization_empty_candidates') return tr('请至少选择一个与源模型兼容的候选。', 'Select at least one source-compatible candidate.');
     if (cause.code === 'quantization_invalid_target') return tr('目标 bpw 必须是大于 0、不超过 32 的有限数值。', 'Target bpw must be finite and in (0, 32].');
@@ -86,7 +87,7 @@ export function QuantizationPage() {
     if (cause.code === 'quantization_target_above_source') return tr(`目标 ${value('target_bpw')} bpw 高于源模型实际平均 ${value('source_bpw')} bpw，请降低目标。`, `Target ${value('target_bpw')} bpw exceeds the source model average ${value('source_bpw')} bpw. Lower the target.`);
     if (cause.code === 'quantization_target_below_candidates') return tr(`目标 ${value('target_bpw')} bpw 低于所选候选的最低预算 ${value('minimum_bpw')} bpw，请提高目标或加入更低精度候选。`, `Target ${value('target_bpw')} bpw is below the selected candidate minimum budget ${value('minimum_bpw')} bpw. Raise the target or add lower-precision candidates.`);
     if (cause.code === 'quantization_target_above_candidates') return tr(`目标 ${value('target_bpw')} bpw 高于所选候选最高精度方案的 ${value('maximum_bpw')} bpw，请降低目标或加入更高精度候选。`, `Target ${value('target_bpw')} bpw exceeds the highest-precision candidate plan ${value('maximum_bpw')} bpw. Lower the target or add higher-precision candidates.`);
-    return message(cause);
+    return errorMessage(cause, tr);
   }
 
   function chatRenderingMessage(job: JobResource) {
@@ -160,7 +161,9 @@ export function QuantizationPage() {
         <label><span>{tr('默认导出目录', 'Default export directory')}</span><div className="qw-path-row"><input value={exportDirectory} onChange={(event) => setExportDirectory(event.target.value)} /><button type="button" disabled={!workspace} onClick={() => browse(tr('默认导出目录', 'Default export directory'), setExportDirectory, true, false, exportDirectory)} aria-label={tr('浏览默认导出目录', 'Browse default export directory')}><FolderOpenIcon size={17} /></button></div></label>
       </div>
       <div className="qw-actions"><button type="button" disabled={busy || !importDirectory.trim() || !exportDirectory.trim()} onClick={() => { void run(async () => {
-        const settings = await quantizationApi.configure(importDirectory, exportDirectory);
+        let settings: QuantizationWorkspace;
+        try { settings = await quantizationApi.configure(importDirectory, exportDirectory); }
+        catch (cause) { if (workspace) { setImportDirectory(workspace.import_directory); setExportDirectory(workspace.export_directory); } throw cause; }
         if (workspace && output.startsWith(workspace.export_directory + '/')) setOutput(join(settings.export_directory, output.slice(workspace.export_directory.length + 1)));
         setWorkspace(settings); setImportDirectory(settings.import_directory); setExportDirectory(settings.export_directory);
         setNotice(tr('默认目录已保存', 'Default directories saved'));

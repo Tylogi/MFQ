@@ -21,6 +21,7 @@ FFN load_moe_at(CudaExecutionContext &execution, const mfq::ModelSource &model,
     result.moe_router_scale = config.routed_scaling;
     result.swiglu_limit = config.swiglu_limit;
     result.shared->swiglu_limit = config.swiglu_limit;
+    result.prepare_moe_pipeline(execution);
     return result;
 }
 
@@ -38,9 +39,12 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
     result->shared = shared;
     if (config.has_engram(layer)) {
         result->engram = Engram::load(execution, model, config, static_cast<int>(layer));
+        shared->engram_prefetch.push_back(result->engram.get());
     }
-    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight");
-    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight");
+    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight")
+                                 .to(mfq_tensor_backend::kFloat32).contiguous();
+    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight")
+                           .to(mfq_tensor_backend::kFloat32).contiguous();
     result->query_a_norm =
         load_dense_gpu(execution, model, prefix + "attention.query_a_norm.weight");
     result->key_value_norm =
@@ -188,6 +192,17 @@ void DeepseekV41Model::prepare_blocks(const mfq::ModelSource &source) {
     shared = deepseek_v41_runtime::load_shared_state(source, config);
 }
 
+bool DeepseekV41Model::adapter_prefetch_token_rows(DeepseekV41CausalLm& model,
+        const mfq_tensor_backend::Tensor& ids) {
+    if(!shared || shared->batch!=1 || !shared->engram_hash || shared->engram_prefetch.empty())return false;
+    if(!ids.is_cpu() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<=0 ||
+            ids.size(1)>std::numeric_limits<int>::max() || ids.scalar_type()!=mfq_tensor_backend::kInt64 ||
+            !ids.is_contiguous())throw std::invalid_argument("Engram prefetch needs contiguous host token IDs");
+    const auto hashes=shared->engram_hash->preview(ids.data_ptr<int64_t>(),1,int(ids.size(1)),model.cache_pos);
+    for(const auto* memory:shared->engram_prefetch)memory->prefetch(hashes);
+    return true;
+}
+
 std::unique_ptr<Block> DeepseekV41Model::load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {
@@ -233,9 +248,9 @@ void DeepseekV41Model::native_commit_speculation() {
     shared->commit_speculative();
 }
 
-void DeepseekV41Model::native_rollback_speculation(int64_t) {
+void DeepseekV41Model::native_rollback_speculation(int64_t position) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
-    shared->rollback_speculative();
+    shared->rollback_speculative(position);
 }
 
 } // namespace mfq::cuda

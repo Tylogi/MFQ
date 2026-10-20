@@ -1,11 +1,13 @@
 #pragma once
-
 #include "engine.h"
+
 #include "depth.h"
+#include "sampling.h"
 
 // Host-side MTP depth selection and chain verification shared by engines.
 // Inputs to distribution() have already received the sampler's penalties.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -18,12 +20,15 @@
 
 namespace mfq::engine::mtp {
 
+
+
 struct ChainVerification {
     std::size_t accepted_drafts = 0;
     int32_t next_token = -1;
     bool bonus = false;
 };
 
+;
 
 inline ChainVerification verify_greedy(
         std::span<const int32_t> drafts,
@@ -41,6 +46,8 @@ inline ChainVerification verify_greedy(
         accepted == drafts.size(),
     };
 }
+
+;
 
 inline std::vector<float> distribution(std::span<const float> logits,
                                       double temperature, int top_k, double top_p) {

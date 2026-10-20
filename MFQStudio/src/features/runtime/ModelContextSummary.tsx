@@ -1,6 +1,6 @@
 import { formatNumber } from '../../app/formatters';
 import type { ModelCacheProfile } from '../../shared/api/types';
-import type { KvQuantizationSettings } from '../../shared/api/resources/runtime';
+import type { KvQuantizationSettings, KvMemorySettings } from '../../shared/api/resources/runtime';
 import { useSettings } from '../settings/SettingsProvider';
 import { contextCacheEstimate, streamingCacheEstimate } from '../models/cacheData';
 
@@ -16,9 +16,10 @@ interface Props {
   ramBudget?: number | null;
   changed: boolean;
   quantization?: KvQuantizationSettings;
+  memory?: KvMemorySettings;
 }
 
-export function ModelContextSummary({ model, context, nativeContext, yarnEnabled, profile, streaming, budget, separateVram = false, ramBudget, changed, quantization }: Props) {
+export function ModelContextSummary({ model, context, nativeContext, yarnEnabled, profile, streaming, budget, separateVram = false, ramBudget, changed, quantization, memory }: Props) {
   const { tr } = useSettings();
   const full = profile ? contextCacheEstimate(profile, context) : null;
   const stream = profile && streaming ? streamingCacheEstimate(profile, context, budget) : null;
@@ -46,6 +47,11 @@ export function ModelContextSummary({ model, context, nativeContext, yarnEnabled
     <div className="model-context-summary-reads"><span>{tr('KV量化', 'KV quantization')}</span>
       <b>{quantization?.enabled ? `TurboQuant · K ${Math.floor(quantization.bits)} / V ${Math.ceil(quantization.bits)} bit` : tr('未启用', 'Off')}</b>
     </div>
+    {memory && <div className="model-context-summary-reads"><span>{tr('KV 存储', 'KV storage')}</span>
+      <b>{memory.placement === 'vram' ? 'VRAM' : memory.placement === 'ram' ? 'RAM'
+        : memory.placement === 'auto_ssd' ? 'VRAM → RAM → SSD' : 'VRAM → RAM'} · {memory.allocation === 'dynamic'
+          ? tr('动态（实验性）', 'Dynamic (experimental)') : tr('预分配', 'Preallocated')}</b>
+    </div>}
     {streaming && <div className="model-context-summary-reads" title={tr('全部 QSA 层合计的最坏情况 SSD 读取量，不是实测流量；原始 KV 按所有检索位置均未命中计算。', 'Worst-case SSD reads across all QSA layers, not measured traffic; raw KV assumes every selected position misses the resident cache.')}>
       <span>{tr('最大读取量/token', 'Maximum reads/token')}</span>
       <span>Indexer <b>{capacity(stream?.indexerReadPerToken)}</b></span>

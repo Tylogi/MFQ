@@ -1,0 +1,37 @@
+.login-page {
+  display: flex;
+  height: 100dvh;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 32px 22px;
+  background: var(--canvas);
+}
+.login-card {
+  width: min(400px, 100%);
+  flex: 0 0 auto;
+  margin: auto;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 36px 32px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+.login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 32px; color: var(--ink-strong); font-size: 15px; font-weight: 600; }
+.login-brand img { width: 30px; height: 30px; }
+.login-card h1 { margin: 0 0 10px; color: var(--ink-strong); font-size: 25px; font-weight: 600; }
+.login-description { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.login-endpoint { overflow: hidden; margin: 10px 0 28px; color: var(--muted-light); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.login-card form { display: grid; gap: 10px; }
+.login-card label { color: var(--ink-soft); font-size: 12px; font-weight: 500; }
+.login-key-field { position: relative; }
+.login-key-field input { width: 100%; height: 44px; border: 1px solid var(--line-strong); border-radius: 8px; padding: 10px 42px 10px 12px; color: var(--ink); background: var(--surface-control); font-size: 13px; }
+.login-key-field input:focus { border-color: var(--accent); outline: 2px solid var(--accent-soft); outline-offset: 1px; }
+.login-key-field .login-key-visibility { position: absolute; top: 4px; right: 4px; display: grid; width: 36px; height: 36px; place-items: center; border: 0; border-radius: 6px; padding: 0; color: var(--muted); background: transparent; }
+.login-key-visibility:hover { color: var(--ink); background: var(--surface-hover); }
+.login-card .login-submit { min-height: 42px; border: 1px solid var(--accent-border); border-radius: 8px; margin-top: 12px; color: var(--accent-ink); background: var(--accent-soft); font-size: 13px; font-weight: 500; }
+.login-card .login-submit:hover:not(:disabled) { border-color: var(--accent); }
+.login-card .login-submit:disabled { cursor: default; opacity: 0.55; }
+.login-error { margin: 2px 0 0; color: var(--danger); font-size: 12px; line-height: 1.7; }
+@media (max-width: 440px) {
+  .login-card { padding: 28px 24px; }
+}

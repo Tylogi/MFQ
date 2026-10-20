@@ -1,7 +1,9 @@
 #include "native/env.h"
 #include "tensor.h"
+#include "native/weight_memory.h"
 
 #include "native/context.h"
+#include "mfq/runtime.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,6 +20,39 @@
 #include <type_traits>
 
 namespace mfq::cuda {
+namespace {
+thread_local WeightMemoryLedger* loading_weight_memory=nullptr;
+thread_local bool loading_weight_allocation=false;
+}
+void WeightMemoryLedger::observe(const std::shared_ptr<TensorStorage>& storage) {
+    if(storage && storage->device.is_cuda())weights_.push_back(storage);
+}
+void WeightMemoryLedger::observe_ple(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    ple_.push_back({owner,bytes});
+}
+std::size_t WeightMemoryLedger::resident_bytes(int device) const {
+    std::size_t bytes=0;
+    for(const auto& weak:weights_)if(auto storage=weak.lock())
+        if(device < 0 || storage->device.index == device)bytes+=storage->bytes;
+    return bytes;
+}
+std::size_t WeightMemoryLedger::ple_bytes() const {
+    std::size_t bytes=0;
+    for(const auto& payload:ple_)if(!payload.owner.expired())bytes+=payload.bytes;
+    return bytes;
+}
+WeightMemoryLoadScope::WeightMemoryLoadScope(WeightMemoryLedger& ledger):previous_(loading_weight_memory) {
+    loading_weight_memory=&ledger;
+}
+WeightMemoryLoadScope::~WeightMemoryLoadScope(){loading_weight_memory=previous_;}
+WeightAllocationScope::WeightAllocationScope():previous_(loading_weight_allocation){loading_weight_allocation=true;}
+WeightAllocationScope::~WeightAllocationScope(){loading_weight_allocation=previous_;}
+void observe_weight_allocation(const std::shared_ptr<TensorStorage>& storage) {
+    if(loading_weight_memory && loading_weight_allocation)loading_weight_memory->observe(storage);
+}
+void observe_streamed_ple(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    if(loading_weight_memory)loading_weight_memory->observe_ple(owner,bytes);
+}
 namespace {
 
 std::shared_ptr<TensorStorage> allocate_cuda_storage(
@@ -54,6 +89,7 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
         if (std::find(uses->streams.begin(), uses->streams.end(), usage_stream) == uses->streams.end())
             uses->streams.push_back(usage_stream);
     };
+    observe_weight_allocation(storage);
     return storage;
 }
 
@@ -61,9 +97,13 @@ std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
     void* pointer = nullptr;
     if (bytes != 0) {
         const auto result=cudaHostAlloc(&pointer,bytes,cudaHostAllocDefault);
-        if(result==cudaErrorMemoryAllocation)
-            throw Error("CUDA pinned allocation failed: requested="+std::to_string(bytes)+
+        if(result==cudaErrorMemoryAllocation) {
+            // Allocation rejection is recoverable. Do not leave the driver's
+            // last error for an unrelated kernel launch or state restoration.
+            (void)cudaGetLastError();
+            throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes)+
                 " host_allocated="+std::to_string(tensor_host_bytes.load()));
+        }
         MFQ_NATIVE_CUDA_CHECK(result);
     }
     charge_tensor_host_bytes(bytes);
@@ -113,6 +153,19 @@ __device__ Destination convert_value(Source value) {
         return __float2bfloat16_rn(static_cast<float>(promoted));
     } else {
         return static_cast<Destination>(promoted);
+    }
+}
+
+template <typename Destination, typename Source>
+__global__ void convert_contiguous_kernel(
+    Destination* __restrict__ output,
+    const Source* __restrict__ input,
+    std::int64_t elements) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < elements;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        output[linear] = convert_value<Destination>(input[linear]);
     }
 }
 
@@ -295,6 +348,16 @@ void launch_convert(
             MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
             return;
         }
+    }
+    const char* contiguous_disabled =
+        mfq::cuda::env_lookup("MFQ_DISABLE_NATIVE_CONTIGUOUS_CONVERT");
+    if (source.is_contiguous() && destination.is_contiguous() &&
+            (contiguous_disabled == nullptr || contiguous_disabled[0] != '1')) {
+        convert_contiguous_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
+            static_cast<Destination*>(destination.data_ptr()),
+            static_cast<const Source*>(source.data_ptr()), source.numel());
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return;
     }
     convert_strided_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
         destination.view_descriptor(), source.view_descriptor(), source.numel());

@@ -1,6 +1,6 @@
 #include "transformer_loader.h"
 #include "storage/weights/loaders/weight.h"
-#include "models/common/full_block.h"
+#include "full_block.h"
 #include "ops/moe/moe.h"
 #include "storage/weights/moe/weight_loader.h"
 

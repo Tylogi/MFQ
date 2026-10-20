@@ -2,8 +2,7 @@ import { useRuntime } from '../../app/RuntimeProvider';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
-import { PrefixCacheDirectory } from './PrefixCacheDirectory';
-import { PrefixDiskBudgetControls } from './PrefixDiskBudgetControls';
+import { PrefixCacheControls } from './PrefixCacheControls';
 import { hasSeparateVram } from '../runtime/memoryArchitecture';
 
 export function PrefixCacheSettingsPanel() {
@@ -11,16 +10,13 @@ export function PrefixCacheSettingsPanel() {
   const { tr } = useSettings();
   const separate = hasSeparateVram(runtime);
   const diskBudget = Number(runtime?.prefix_cache_total_disk_max_bytes ?? runtime?.prefix_cache_disk_max_bytes ?? 0);
-  const persistent = typeof runtime?.prefix_cache_total_disk_max_bytes === 'number'
-    || typeof runtime?.prefix_cache_max_bytes === 'number';
-  const hotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
   return <>
     <SectionLabel title={tr('持久化前缀缓存', 'Persistent prefix cache')} />
     <TMPanel className="server-settings-panel server-prefix-panel">
       <div className="setting-list">
         <SettingRow title={tr('前缀缓存层级', 'Prefix cache hierarchy')}
-          detail={separate ? tr('显存热层 + SSD 冷层，不保留 RAM 中间缓存层。', 'VRAM hot tier + SSD cold tier, without an intermediate RAM cache.') : tr('RAM 热层 + SSD 冷层。', 'RAM hot tier + SSD cold tier.')}
-          trailing={<span className="server-managed-value">{separate ? 'VRAM → SSD' : 'RAM → SSD'}</span>} />
+          detail={separate ? tr('显存热层 + 低优先级 RAM 层 + 可选 SSD 冷层。', 'VRAM hot tier + low-priority RAM tier + optional SSD cold tier.') : tr('RAM 热层 + SSD 冷层。', 'RAM hot tier + SSD cold tier.')}
+          trailing={<span className="server-managed-value">{separate ? 'VRAM → RAM → SSD' : 'RAM → SSD'}</span>} />
         <SettingRow
           title={tr('前缀块大小', 'Prefix block size')}
           detail={tr(
@@ -32,20 +28,7 @@ export function PrefixCacheSettingsPanel() {
             <span>tokens</span>
           </div>}
         />
-        <SettingRow
-          title={tr('启用 SSD 层', 'Enable SSD tier')}
-          detail={tr(
-            '保存经过校验的增量前缀块，并允许服务重启后继续复用。',
-            'Persist incremental, checksummed prefix blocks and recover them after restart.',
-          )}
-          trailing={<input
-            aria-label={tr('启用 SSD 层', 'Enable SSD tier')}
-            checked={persistent && !hotOnly && diskBudget > 0}
-            disabled readOnly type="checkbox"
-          />}
-        />
-        <PrefixCacheDirectory />
-        <PrefixDiskBudgetControls budget={diskBudget} />
+        <PrefixCacheControls budget={diskBudget} />
       </div>
     </TMPanel>
   </>;

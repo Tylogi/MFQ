@@ -1,12 +1,19 @@
 #pragma once
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 #include <vector>
 
 std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
     mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor mixes,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base,
+    std::int64_t iterations,
+    double eps);
+
+std::vector<mfq_tensor_backend::Tensor> dsv4_hc_coefficients_cuda(
     mfq_tensor_backend::Tensor mixes,
     mfq_tensor_backend::Tensor scale,
     mfq_tensor_backend::Tensor base,

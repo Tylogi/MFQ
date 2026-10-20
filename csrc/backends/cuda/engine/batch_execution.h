@@ -387,3 +387,9 @@ void CudaBatchExecution<Model>::recover(std::span<const std::shared_ptr<Request>
     invalidate_decode_graph();
 }
 } // namespace mfq::cuda
+
+namespace mfq::cuda {
+template<class Model,class=void>struct BatchExecutor {using type=CudaBatchExecution<Model>;};
+template<class Model>struct BatchExecutor<Model,std::void_t<typename Model::BatchExecution>> {using type=typename Model::BatchExecution;};
+template<class Model>using batch_executor_t=typename BatchExecutor<Model>::type;
+}

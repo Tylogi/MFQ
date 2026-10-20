@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mlx_linear_attention.h"
+#include "ops/mlx_linear_attention.h"
 #include "mlx_qwen35_full_attention.h"
 #include "qwen35_model.h"
 

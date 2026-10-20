@@ -1,6 +1,6 @@
 [package]
 name = "mfq-studio"
-version = "0.3.2"
+version = "0.4.0"
 description = "Desktop client for MFQ Server"
 edition = "2021"
 publish = false
@@ -20,3 +20,7 @@ sha2 = "0.10.9"
 tauri = { version = "2.11.5", features = [] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 url = "2.5.8"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

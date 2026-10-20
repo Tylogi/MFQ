@@ -9,10 +9,12 @@ const context = vi.hoisted(() => ({
   ready: true,
   connectionRevision: 1,
   refreshRuntime: vi.fn(),
+  settings: { enableVision: true },
+  updateSettings: vi.fn(),
 }));
 const notify = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => context }));
-vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ settings: context.settings, updateSettings: context.updateSettings, tr: (_zh: string, en: string) => en }) }));
 vi.mock('../../stores/toastStore', () => ({ toast: notify }));
 
 beforeEach(() => {
@@ -22,6 +24,7 @@ beforeEach(() => {
   context.ready = true;
   context.connectionRevision = 1;
   context.refreshRuntime.mockResolvedValue(true);
+  context.settings = { enableVision: true };
 });
 
 it('saves the service switch remotely without reloading a model', async () => {
@@ -40,6 +43,16 @@ it('saves the service switch remotely without reloading a model', async () => {
   expect(context.refreshRuntime).toHaveBeenCalledOnce();
   expect(reload).not.toHaveBeenCalled();
   expect(notify.success).toHaveBeenCalledOnce();
+});
+
+it('places the vision switch below MTP and immediately persists its existing preference', () => {
+  render(<InferencePolicyPanel />);
+  const mtp = screen.getByRole('switch', { name: 'Service MTP' });
+  const vision = screen.getByRole('switch', { name: 'Vision input' });
+  expect(mtp.compareDocumentPosition(vision) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(vision).toHaveAttribute('aria-checked', 'true');
+  fireEvent.click(vision);
+  expect(context.updateSettings).toHaveBeenCalledExactlyOnceWith({ enableVision: false, inheritModelDefaults: false });
 });
 
 it('does not fake a changed switch when the server rejects the save', async () => {

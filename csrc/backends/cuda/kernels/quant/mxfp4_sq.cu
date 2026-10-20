@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "mxfp4_sq.h"
+#include "kernels/quant/mxfp4_sq.h"
 #include <algorithm>
 #include <cstdint>
 #include <limits>

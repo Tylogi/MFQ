@@ -5,7 +5,7 @@
 #include "kernels/quant_ops.h"
 #include "ops/format.h"
 #include "ops/quant/nint_prefill_cache.h"
-#include "packed_nint.h"
+#include "csrc/backends/cpu/ops/packed_nint.h"
 
 #include <array>
 #include <cstring>
@@ -641,7 +641,9 @@ NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.distribution_entropy = c.distribution_entropy;
     w.shape = c.shape;
     w.aligned_q8 = c.gs % 4 == 0;
+    w.uniform_qbits=c.row_q_bits.empty()?0:c.row_q_bits.front();
     for (size_t row = 0; row < c.row_q_bits.size(); ++row) {
+        if(c.row_q_bits[row]!=w.uniform_qbits)w.uniform_qbits=0;
         w.aligned_q8 = w.aligned_q8 && c.row_q_bits[row] == 8 &&
             (c.row_q_bit_offsets[row] & 31) == 0;
     }

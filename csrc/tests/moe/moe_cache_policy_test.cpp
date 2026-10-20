@@ -175,6 +175,18 @@ int main() {
             book.mark_inflight(first.slot);book.rollback_replace(stale);
             require(book.inflight(first.slot) && book.slot_for(d)==first.slot,"stale rollback changed another owner's slot");
         }
+        {
+            mfq::engine::MoeCacheSlotBook book(3);
+            const mfq::engine::MoeCacheKey encoder{0,0,0},decoder{1,0,0},held{1,0,1};
+            auto early=book.acquire(encoder),cold=book.acquire(decoder),busy=book.acquire(held);
+            book.mark_inflight(busy.slot);book.set_low_priority_sources({1});
+            auto fresh=book.acquire({0,0,1});
+            require(fresh.replaced==decoder && book.slot_for(encoder)==early.slot && book.inflight(busy.slot),
+                    "prefill priority evicted an Encoder or in-flight Decoder expert");
+            book.set_low_priority_sources({});book.clear_inflight(busy.slot);
+            fresh=book.acquire({1,0,2});
+            require(fresh.replaced==encoder,"decode did not restore ordinary GPU LRU");
+        }
         test_lru_replaces_oldest_non_inflight_slot();
         test_inflight_slot_is_not_replaced();
         test_all_inflight_slots_reject_replacement();

@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 PROTOCOL_VERSION: Final[Literal["1.0"]] = "1.0"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -209,7 +209,7 @@ class RuntimeIdentity(ProtocolModel):
 
 
 class CreateSessionRequest(ProtocolModel):
-    model: str = Field(min_length=1, max_length=255)
+    model: str = Field(default="", max_length=255, json_schema_extra={"deprecated": True})
     mode: SessionMode = SessionMode.TEXT
     title: str | None = Field(default=None, max_length=512)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -416,6 +416,7 @@ class ResponsePerformance(ProtocolModel):
 
 class CreateResponseRequest(ProtocolModel):
     request_id: UUID
+    model: str | None = Field(default=None, min_length=1, max_length=255)
     expected_revision: int = Field(ge=0)
     input: list[ContentPart] = Field(min_length=1)
     input_role: Literal["user", "tool"] = "user"
@@ -447,6 +448,7 @@ class CreateResponseRequest(ProtocolModel):
 
 class ResponseRequestSettings(ProtocolModel):
     sampling: SamplingParams
+    model: str | None = Field(default=None, min_length=1, max_length=255)
     system_prompt: str | None = None
     include_reasoning_history: bool = True
     input_role: Literal["user", "tool"] = "user"
@@ -533,6 +535,20 @@ class QsaKvStorageSettings(ProtocolModel):
     ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
 
 
+class KvMemorySettings(ProtocolModel):
+    placement: Literal["auto", "auto_ssd", "vram", "ram"] = "auto"
+    allocation: Literal["preallocated", "dynamic"] = "preallocated"
+    gpu_budget_bytes: int | None = Field(default=None, ge=1, le=1 << 50)
+    ram_preallocated: bool = Field(default=True, strict=True)
+    ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
+
+    @model_validator(mode="after")
+    def validate_ram_storage(self) -> "KvMemorySettings":
+        if not self.ram_preallocated and self.placement != "auto_ssd":
+            raise ValueError("kv_ssd_required: disabling RAM preallocation requires SSD KV")
+        return self
+
+
 class KvQuantizationSettings(ProtocolModel):
     enabled: bool = Field(default=False, strict=True)
     bits: Literal[2, 2.5, 3, 3.5, 4, 6, 8] = 4
@@ -546,6 +562,7 @@ class RuntimeContextPolicy(ProtocolModel):
     model_yarn_enabled: dict[str, bool] = Field(default_factory=dict)
     model_qsa_kv_offload: dict[str, QsaKvStorageSettings] = Field(default_factory=dict)
     model_kv_quantization: dict[str, KvQuantizationSettings] = Field(default_factory=dict)
+    model_kv_memory: dict[str, KvMemorySettings] = Field(default_factory=dict)
 
 
 class RuntimeMemoryPolicy(ProtocolModel):
@@ -553,6 +570,7 @@ class RuntimeMemoryPolicy(ProtocolModel):
     model_limit_bytes: int | None = Field(default=None, ge=1)
     prefix_limit_bytes: int | None = Field(default=None, ge=0)
     prefix_disk_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_ram_limit_bytes: int | None = Field(default=None, ge=0)
     prefix_directory: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
@@ -572,6 +590,14 @@ class ConfigureQsaKvOffloadRequest(ProtocolModel):
     enabled: bool = False
     budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
     ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
+
+
+class ModelLoadContextSettings(ProtocolModel):
+    automatic: bool = Field(default=True, strict=True)
+    ssd_kv: bool = Field(default=False, strict=True)
+    ram_preallocated: bool = Field(default=True, strict=True)
+    vram_preallocated: bool = Field(default=True, strict=True)
+    kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
 
 
 class ModelLoadRequest(ProtocolModel):
@@ -594,12 +620,15 @@ class ModelLoadRequest(ProtocolModel):
     prefix_cache_enabled: bool = True
     prefix_cache_disk_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_hot_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_block_tokens: int | None = Field(default=None, ge=1, le=65536)
     prefix_cache_pending_bytes: int | None = Field(default=None, ge=0)
     sampling_defaults: SamplingParams | None = None
 
     qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
+    kv_memory: KvMemorySettings = Field(default_factory=KvMemorySettings)
+    context_management: ModelLoadContextSettings | None = None
 
 class CreateRuntimeProfileRequest(ProtocolModel):
     name: str = Field(min_length=1, max_length=64)
@@ -711,6 +740,7 @@ class ModelUnloadRequest(ProtocolModel):
 
 
 class RuntimeGpuUtilization(ProtocolModel):
+    id: str | None = None
     name: str
     core_count: int | None = Field(default=None, ge=1)
     utilization_percent: float | None = Field(default=None, ge=0, le=100)
@@ -754,6 +784,17 @@ class RuntimeResourceSnapshot(ProtocolModel):
     weights: list[RuntimeWeightTraffic]
 
 
+class RuntimeDeviceMemory(ProtocolModel):
+    device_id: str
+    resident_bytes: int | None = Field(default=None, ge=0)
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    resident_buffer_bytes: int | None = Field(default=None, ge=0)
+    kv_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_bytes: int | None = Field(default=None, ge=0)
+    memory_total_bytes: int | None = Field(default=None, ge=0)
+    memory_available_bytes: int | None = Field(default=None, ge=0)
+
+
 class RuntimeMemoryResources(ProtocolModel):
     """Physical residency and file payloads are separate, never added together.
 
@@ -763,6 +804,8 @@ class RuntimeMemoryResources(ProtocolModel):
     """
 
     resident_weight_bytes: int | None = Field(default=None, ge=0)
+    devices: list[RuntimeDeviceMemory] = Field(default_factory=list)
+    resident_buffer_bytes: int | None = Field(default=None, ge=0)
     wired_bytes: int | None = Field(default=None, ge=0)
     wired_limit_bytes: int | None = Field(default=None, ge=0)
     wired_available: bool | None = None
@@ -771,6 +814,9 @@ class RuntimeMemoryResources(ProtocolModel):
     prefix_cache_blocks: int | None = Field(default=None, ge=0)
     prefix_cache_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_blocks: int | None = Field(default=None, ge=0)
     ram_experts: bool | None = None
     ram_expert_bytes: int | None = Field(default=None, ge=0)
     ram_kv: bool | None = None
@@ -812,6 +858,8 @@ class RuntimeInstanceResource(ProtocolModel):
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
     kv_quantization_supported: bool = False
+    kv_memory_supported: bool = False
+    kv_memory: KvMemorySettings = Field(default_factory=KvMemorySettings)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
     qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     identity: RuntimeIdentity | None = None
@@ -894,6 +942,18 @@ class ModelArtifactList(ProtocolModel):
     data: list[ModelArtifactResource]
 
 
+class ModelDeletionPlan(ProtocolModel):
+    model_id: str
+    name: str
+    files: list[str]
+    total_bytes: int = Field(ge=0)
+    token: str = Field(pattern=SHA256_PATTERN)
+
+
+class DeleteModelRequest(ProtocolModel):
+    token: str = Field(pattern=SHA256_PATTERN)
+
+
 class ModelDirectoryEntry(ProtocolModel):
     id: str = Field(pattern=r"^[0-9a-f]{32}$")
     name: str = Field(min_length=1, max_length=512)
@@ -920,6 +980,7 @@ class ModelDirectoryList(ProtocolModel):
     parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     model_file_count: int = Field(default=0, ge=0)
     files: list[ModelDirectoryFile] = Field(default_factory=list)
+    can_open_directory: bool = False
     can_open_in_finder: bool = False
     data: list[ModelDirectoryEntry]
 
@@ -933,6 +994,21 @@ class RegisterModelDirectoryRequest(ProtocolModel):
         if (self.directory_id is None) == (self.path is None):
             raise ValueError("exactly one of directory_id or path is required")
         return self
+
+
+class ConfigureDownloadDirectoryRequest(ProtocolModel):
+    directory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    evict_prefix_cache: bool | None = None
+
+
+class HubDownloadSource(ProtocolModel):
+    provider: Literal['huggingface', 'modelscope']
+    repo_id: str = Field(pattern=r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+    revision: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class HubDownloadProbeRequest(ProtocolModel):
+    sources: list[HubDownloadSource] = Field(min_length=1, max_length=2)
 
 
 class HubModelSummary(ProtocolModel):
@@ -1049,6 +1125,12 @@ class ModelCacheProfile(ProtocolModel):
     components: list[ModelCacheComponent] = Field(default_factory=list)
 
 
+class ModelAttentionProfile(ProtocolModel):
+    sparse: bool
+    compressed: bool
+    hybrid: bool
+
+
 class HubModelInfo(HubModelSummary):
     revision: str
     files: list[HubModelFile]
@@ -1057,6 +1139,8 @@ class HubModelInfo(HubModelSummary):
     library: str | None = Field(default=None, max_length=255)
     pipeline_tag: str | None = Field(default=None, max_length=255)
     architectures: list[str] = Field(default_factory=list)
+    attention_profile: ModelAttentionProfile | None = None
+    config_inspected: bool = False
     modalities: list[str] = Field(default_factory=list)
     parameter_count: int | None = Field(default=None, ge=0)
     parameter_breakdown: ModelParameterBreakdown | None = None
@@ -1087,6 +1171,7 @@ class OfficialModelInfo(ProtocolModel):
     name: str = Field(min_length=1, max_length=255)
     family: str = Field(min_length=1, max_length=255)
     architecture: str = Field(min_length=1, max_length=128)
+    attention_profile: ModelAttentionProfile | None = None
     description: str = Field(min_length=1, max_length=2048)
     description_zh: str = Field(min_length=1, max_length=2048)
     parameter_label: str | None = Field(default=None, max_length=128)
@@ -1336,17 +1421,24 @@ class JobEventList(ProtocolModel):
     data: list[JobEventResource]
 
 
+class AuthenticationPolicyRequest(ProtocolModel):
+    enabled: bool = Field(strict=True)
+    api_key: SecretStr | None = None
+
+
 class RuntimeListenerRequest(ProtocolModel):
     port: int = Field(strict=True, ge=1, le=65535)
     protocol: Literal["openai", "anthropic"] = "openai"
 
 
 class RuntimeReloadRequest(ProtocolModel):
+    apply_global_cap: bool = Field(default=False, strict=True)
     context_size: int | None = Field(default=None, ge=512, le=2147483647)
     instance_id: UUID | None = None
     yarn_enabled: bool | None = Field(default=None, strict=True)
     qsa_kv_offload: QsaKvStorageSettings | None = None
     kv_quantization: KvQuantizationSettings | None = None
+    kv_memory: KvMemorySettings | None = None
 
 
 class RuntimeCacheClearRequest(ProtocolModel):

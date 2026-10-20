@@ -21,6 +21,14 @@ export interface ModelArtifact {
   error?: string | null;
 }
 
+export interface ModelDeletionPlan {
+  model_id: string;
+  name: string;
+  files: string[];
+  total_bytes: number;
+  token: string;
+}
+
 export interface AnalysisProjection {
   name: string;
   category: string;
@@ -160,6 +168,7 @@ export interface ModelDirectoryList {
   parent_id: string | null;
   model_file_count: number;
   files?: Array<{ name: string; byte_size: number }>;
+  can_open_directory?: boolean;
   can_open_in_finder?: boolean;
   data: ModelDirectoryEntry[];
 }
@@ -248,6 +257,12 @@ export interface ModelCacheProfile {
   }>;
 }
 
+export interface ModelAttentionProfile {
+  sparse: boolean;
+  compressed: boolean;
+  hybrid: boolean;
+}
+
 export interface HubModelInfo extends HubModelSummary {
   revision: string;
   files: Array<{ name: string; byte_size: number; sha256?: string | null; weight_bytes?: number | null; weight_bytes_by_dtype?: Record<string, number>; ssd_ple_bytes?: number | null }>;
@@ -256,6 +271,7 @@ export interface HubModelInfo extends HubModelSummary {
   library?: string | null;
   pipeline_tag?: string | null;
   architectures: string[];
+  attention_profile?: ModelAttentionProfile | null;
   modalities: string[];
   parameter_count?: number | null;
   parameter_breakdown?: ModelParameterBreakdown | null;
@@ -281,6 +297,7 @@ export interface OfficialModelInfo {
   name: string;
   family: string;
   architecture: string;
+  attention_profile?: ModelAttentionProfile | null;
   description: string;
   description_zh: string;
   parameter_label?: string | null;

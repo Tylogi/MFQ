@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from typing import Annotated
 
 from fastapi import Depends, Request, WebSocket
@@ -45,16 +44,20 @@ def require_api_keys(request: Request) -> ApiKeyManager:
 
 
 async def authorize_websocket(websocket: WebSocket) -> bool:
-    api_key: str = websocket.app.state.api_key
+    expected = websocket.headers.get("x-mfq-instance-id") or websocket.query_params.get("server_instance")
+    if expected and expected != websocket.app.state.server_identity["instance_id"]:
+        await websocket.close(code=1008, reason="server instance changed; reconnect and confirm the server")
+        return False
+    policy = websocket.app.state.auth_policy
     api_keys: ApiKeyManager | None = websocket.app.state.api_keys
-    if not api_key and api_keys is None:
+    if not policy.enabled:
         return True
     authorization = websocket.headers.get("authorization", "")
     supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
     if not supplied:
         supplied = websocket.query_params.get("access_token", "")
-    authenticated = api_keys.authenticate(supplied) if api_keys is not None else None
-    if (api_key and secrets.compare_digest(supplied, api_key)) or (
+    authenticated = api_keys.authenticate(supplied, include_root=False) if api_keys is not None else None
+    if policy.matches(supplied) or (
         authenticated is not None and api_keys and api_keys.permits(authenticated, "inference")
     ):
         return True

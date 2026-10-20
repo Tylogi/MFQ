@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <vector>
 
+void qsa_pool_rotary_cache_cuda(
+    const mfq_tensor_backend::Tensor& index, const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions, const mfq_tensor_backend::Tensor& cache_positions,
+    const mfq_tensor_backend::Tensor& frequencies, const mfq_tensor_backend::Tensor& axes,
+    const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps);
+
 mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor frequencies, mfq_tensor_backend::Tensor axes,
@@ -80,6 +86,9 @@ mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda(
     double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask,
     mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
 mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim);
+mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim);
 mfq_tensor_backend::Tensor glm_dsa_indexer_scores_cuda(

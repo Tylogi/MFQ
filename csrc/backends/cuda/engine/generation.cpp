@@ -1,12 +1,18 @@
+#include "native/env.h"
 #include "generation.h"
 #include "flow.h"
 #include "cuda_model_list.h"
+#include "token_row_prefetch.h"
+#include "models/deepseek_v4/ops.h"
 #include "models/common/full_block.h"
 #include "ops/execution/cuda_sampling.h"
 #include "storage/session/text_cache.h"
 #include "kernels/sampling_ops.h"
+#include "storage/weights/moe/expert_cache.h"
+#include "ops/execution/execution_options.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
 namespace mfq::cuda::internal {
@@ -16,12 +22,29 @@ template <typename Model>
 static mfq_tensor_backend::Tensor sample_token(Model &model, mfq_tensor_backend::Tensor ids,
     mfq::cuda::Sampler &sampler, mfq_tensor_backend::Tensor counts,
     const MfqTokenConstraintPtr &token_constraint) {
-    if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
-        return model.next_token(ids);
-    }
+    const auto run = [&]() {
+        if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
+            return model.next_token(ids);
+        }
 
-    auto logits = model.last_logits(ids).contiguous().view({1, -1});
-    return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+        auto logits = model.last_logits(ids).contiguous().view({1, -1});
+        return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+    };
+    const auto* setting = mfq::cuda::env_lookup("MFQ_PROFILE_DECODE");
+    if (!setting || setting[0] != '1' || ids.numel() > 8) return run();
+    auto& profiler = model.execution->profiler;
+    const bool previous = profiler.enabled;
+    profiler.reset();
+    profiler.enabled = true;
+    try {
+        auto next = profiler.measure("runtime.decode", run);
+        profiler.report("runtime.decode");
+        profiler.enabled = previous;
+        return next;
+    } catch (...) {
+        profiler.enabled = previous;
+        throw;
+    }
 }
 
 template <typename Model> struct CudaGenerationOps {
@@ -29,6 +52,7 @@ template <typename Model> struct CudaGenerationOps {
     DecodeGraphCache &graph;
     const MfqTokenConstraintPtr &constraint;
     mfq_tensor_backend::Tensor pending, counts;
+    mfq_tensor_backend::Tensor known_token_host;
     mfq::cuda::Sampler sampler;
     bool has_penalties;
     const CudaPreparedPrompt *prepared;
@@ -65,21 +89,58 @@ template <typename Model> struct CudaGenerationOps {
     double prefill(const mfq::engine::PrefillChunk &chunk) {
         using Tensor = mfq_tensor_backend::Tensor;
         PrefillCudaTimer timer;
+        bool prefill_finished=false;
+        const auto finish_prefill=[&] {
+            if(prefill_finished)return;
+            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            prefill_finished=true;
+        };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        if constexpr (Model::policy.layer_major_prefill) {
-            if((!prepared || !prepared->transformed()) &&
-                qwen4_layer_major_prefill_eligible(model,chunk.count))
+        bool layer_major=false,short_windows=false;
+        if constexpr(Model::policy.layer_major_prefill) {
+            if((!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
+                    model.graph_registry && chunk.count<=128) {
+                // The same bounded prompt windows as MTP avoid materializing
+                // a whole expert layer before a short prompt has any scratch.
+                short_windows=true;
+                for(int64_t offset=0;offset<chunk.count;) {
+                    if(output && output->stopped())break;
+                    const auto rows=model.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
+                    auto part=ids.narrow(1,offset,rows);
+                    Tensor window_logits;
+                    if(auto result=qwen4_decode_graph_hidden(model,part,nullptr,rows>1?1:0,
+                            nullptr,{},&window_logits))
+                        hidden=std::move(*result);
+                    else hidden=model.hidden_forward(part,mfq_nullopt,mfq_nullopt,nullptr,
+                        mfq_nullopt,nullptr,rows>1?1:0);
+                    if(rows>1)model.commit_speculative();
+                    offset+=rows;
+                }
+            } else if((!prepared || !prepared->transformed()) &&
+                qwen4_layer_major_prefill_eligible(model,chunk.count)) {
+                layer_major=true;
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
+                    [&] {return output && output->stopped();},nullptr,false,finish_prefill);
+            }
+        }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())
+                hidden=deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
                     [&] {return output && output->stopped();});
         }
         if(output && output->stopped()) {
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            finish_prefill();
             return timer.elapsed_ms();
         }
         if (hidden.defined()) {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
+            MoePrefillWorkspaceLoan workspace(model.execution->stores.moe_expert_cache);
+            bool borrowed=false;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                borrowed=workspace.begin((std::size_t(4)<<30)+
+                    std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
                 prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
@@ -87,6 +148,12 @@ template <typename Model> struct CudaGenerationOps {
                 nullptr,
                 mfq_nullopt,
                 true);
+            finish_prefill();
+            if(borrowed) {
+                workspace.suspend();
+                hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
+                workspace.finish();
+            }
             model.decode_position_delta = prepared->decode_position_delta;
         } else {
             MfqOptional<Tensor> length = mfq_nullopt;
@@ -94,19 +161,32 @@ template <typename Model> struct CudaGenerationOps {
                 length = mfq_tensor_backend::full({1}, chunk.offset + 1, full_ids.options());
             hidden = model.hidden_forward(ids, mfq_nullopt, length);
         }
+        // Match prompt-progress timing: first-token head/sampling and expert
+        // restoration remain in TTFT, outside reported prefill throughput.
+        finish_prefill();
         if (chunk.offset + chunk.count == full_ids.size(1)) {
             auto logits = model
                               .logits_from_hidden(hidden.index({Slice(), -1, Slice()})
                                       .to(mfq_tensor_backend::kFloat16)
                                       .contiguous())
                               .reshape({1, -1});
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
-        } else
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
-        return timer.elapsed_ms();
+        }
+        const auto elapsed=timer.elapsed_ms();
+        if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
+            <<" tokens="<<chunk.count<<" layer_major="<<layer_major
+            <<" short_windows="<<short_windows
+            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed
+            <<" timing=before_cache_restore"<<'\n';
+        return elapsed;
     }
-    std::int64_t first_token() { return pending.template item<int64_t>(); }
+    std::int64_t first_token() {
+        const auto token=pending.template item<int64_t>();
+        // Prefill temporaries have retired; expert-cache maintenance remains
+        // before token publication, inside TTFT for every CUDA model family.
+        if(model.restore_decode_workspace)model.restore_decode_workspace();
+        return token;
+    }
 
     bool graph_eligible() const {
         const auto &execution = *model.execution;
@@ -214,6 +294,16 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t advance() {
         if (!graph_active) {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(known_token_host.defined()) {
+                    const bool greedy=sampler.greedy() && !has_penalties && !constraint;
+                    if(auto result=qwen4_decode_graph_logits(model,pending.reshape({1,1}),greedy?2:1,known_token_host)) {
+                        pending=greedy?std::move(*result):mfq::cuda::sample_logits(sampler,
+                            result->contiguous().view({1,-1}),counts,constraint);
+                        return pending.template item<int64_t>();
+                    }
+                }
+            }
             pending = sample_token(model, pending.reshape({1, 1}), sampler, counts, constraint);
             return pending.template item<int64_t>();
         }
@@ -238,9 +328,24 @@ template <typename Model> struct CudaGenerationOps {
         ++model.cache_pos;
         return token;
     }
-    void accept(std::int64_t) {
+    void accept(std::int64_t token) {
         if (has_penalties && !graph_active) {
             sample_token_counts_add_cuda(counts, pending.contiguous());
+        }
+        if constexpr(requires {model.adapter_prefetch_token_rows(model,known_token_host);}) {
+            const auto* option=mfq::cuda::env_lookup("MFQ_DECODE_EARLY_PLE");
+            if((option && option[0]=='0') || (prepared && prepared->transformed()) ||
+               (output && output->stopped()))return;
+            if(!known_token_host.defined())known_token_host=mfq_tensor_backend::empty({1,1},
+                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
+            known_token_host.template data_ptr<int64_t>()[0]=token;
+            if(prefetch_token_rows(model,known_token_host)) {
+                static bool reported=false;
+                if(!reported) {
+                    reported=true;
+                    std::cerr<<"runtime_decode_early_token_rows enabled=1 host_token_reuse=1\n";
+                }
+            }
         }
     }
 };
@@ -259,6 +364,108 @@ template <class Model> struct CudaGenerationContext {
     std::optional<Generation> execution;
 
     bool batched() const { return execution.has_value(); }
+    void trace_expert_cache(const char* boundary) {
+        // Request boundaries only: these existing counters need no events or
+        // extra per-token synchronization. Diagnostic output drains exchanges.
+        static const bool enabled=[] {
+            const char* value=mfq::cuda::env_lookup("MFQ_TRACE_MOE_SUMMARY");
+            return value && value[0] && value[0]!='0';
+        }();
+        if (!enabled || execution || std::uncaught_exceptions()) return;
+        std::cerr << "moe_request_cache_stats boundary=" << boundary << '\n';
+        print_moe_expert_cache_stats(model.execution->stores.moe_expert_cache,std::cerr);
+        if(model.source) {
+            const auto io=model.source->file_read_stats();
+            std::cerr<<"runtime_model_io_stats boundary="<<boundary<<" calls="<<io.calls
+                <<" logical_bytes="<<io.logical_bytes<<" physical_bytes="<<io.physical_bytes
+                <<" read_ms="<<double(io.read_nanoseconds)/1e6<<'\n';
+        }
+    }
+    void prepare_request(const mfq::engine::InferenceRequest& input) {
+        trace_expert_cache("begin");
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            model.decode_reserve_until=std::min<int64_t>(model.max_position_embeddings(),
+                int64_t(input.prompt.size())+std::min<int64_t>(input.sampling.max_tokens,256));
+            if(!execution && input.prompt.size()>1024) {
+                finish_moe_expert_exchanges(model.execution->stores.moe_expert_cache);
+                if(model.cache_pos==0 && !model.graph_registry)
+                    release_moe_decode_buffers(model.execution->stores.moe_expert_cache);
+                else release_moe_prefill_buffers(model.execution->stores.moe_expert_cache);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
+    }
+    void reserve_workspace(std::size_t bytes) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        {
+            reserve_moe_workspace(model.execution->stores.moe_expert_cache,bytes);
+            auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+            auto available=context->available_memory();
+            if(available>=bytes)return;
+            std::size_t hot=0;
+            for(const auto& metric:cache.metrics())
+                if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
+            const auto shortage=bytes-available;
+            const auto released=cache.trim_hot(hot>shortage?hot-shortage:0);
+            context->reclaim_idle_memory();
+            std::cerr<<"runtime_workspace_budget requested_bytes="<<bytes
+                <<" available_bytes="<<context->available_memory()
+                <<" prefix_released_bytes="<<released<<'\n';
+        }
+#endif
+    }
+    void prepare_prefill_workspace(std::size_t tokens) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        const bool streamed=tokens>8 && moe_expert_cache_ssd_experts(model.execution->stores.moe_expert_cache);
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
+            if(streamed)graph.invalidate();
+        const bool retained=streamed && lend_moe_decode_cache_for_prefill(model.execution->stores.moe_expert_cache,
+            mfq::cuda::runtime_options::workspace_reserve_bytes());
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(streamed && !retained) {
+                // Private FFN graphs retain their transfer arenas after a
+                // request. Retire consumers before a new grouped prefill;
+                // otherwise these arenas can reduce its ring to one expert.
+                release_moe_decode_buffers(model.execution->stores.moe_expert_cache);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
+        if(tokens>1024 || moe_expert_cache_ssd_experts(model.execution->stores.moe_expert_cache))
+            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+    }
+    bool prepare_snapshot() {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            // Retire prefill buffers before copying KV/recurrent state. Evict
+            // old hot entries before allocating the incoming checkpoint.
+            release_moe_prefill_buffers(model.execution->stores.moe_expert_cache);
+            // A prefix stores occupied rows, not the full preallocated context
+            // or graph-owned speculative checkpoints.
+            const auto incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            std::size_t hot=0,limit=0;
+            for(const auto& metric:cache.metrics()) {
+                if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
+                if(metric.first=="prefix_cache_max_bytes")limit=std::size_t(metric.second);
+            }
+            const auto target=limit>incoming?limit-incoming:0;
+            if(hot>target)cache.trim_hot(target);
+            // Transposing graph KV can temporarily hold a contiguous copy in
+            // addition to the checkpoint. Include that peak and metadata.
+            const auto needed=incoming*2+(std::size_t(64)<<20);
+            reserve_workspace(needed);
+            const auto available=mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
+            if(available<needed) {
+                std::cerr<<"runtime_session_cache action=skip reason=workspace_pressure"
+                    <<" requested_bytes="<<needed<<" available_bytes="<<available<<'\n';
+                return false;
+            }
+        }
+#endif
+        return true;
+    }
     void invalidate_plan() { graph.invalidate(); }
     bool has_hidden(const Hidden &value) const { return value.defined(); }
     void reset() {
@@ -269,6 +476,7 @@ template <class Model> struct CudaGenerationContext {
     }
     void release() {
         if (execution) return; // The supplied sequence owns its native cleanup.
+        trace_expert_cache("end");
         try { reset(); }
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();
@@ -276,12 +484,19 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (execution) return std::move(*execution);
-        auto logical_chunk = config.generation.prefill_chunk_size;
-        if constexpr (Model::policy.layer_major_prefill) {
-            if (reused == 0 && (stable == 0 || stable == input.prompt.size()) &&
-                    (!prepared || !prepared->transformed()) &&
-                    qwen4_layer_major_prefill_eligible(model, input.prompt.size()))
-                logical_chunk = input.prompt.size();
+        prepare_prefill_workspace(input.prompt.size()-reused);
+        auto logical_chunk=config.generation.prefill_chunk_size;
+        if constexpr(Model::policy.layer_major_prefill) {
+            // Bound residual/FFN storage as well as projection tiles. Long
+            // prompts advance each bounded chunk through all layers.
+            logical_chunk=std::min<int64_t>(logical_chunk,8192);
+            if(reused==0 && (stable==0 || stable==input.prompt.size()) &&
+                (!prepared || !prepared->transformed()) &&
+                qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
+                logical_chunk=input.prompt.size();
+        }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
         }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
@@ -290,6 +505,7 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
+        prepare_prefill_workspace(input.prompt.size()-reused);
         return run_mtp_generation(model,
             *mtp,
             input,

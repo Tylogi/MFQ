@@ -1,6 +1,6 @@
-#include "mlx_deepseek_v4_hc.h"
-#include "mlx_deepseek_v41_mhc.h"
-#include "mlx_transformer.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_hc.h"
+#include "models/deepseek_v41/mlx_deepseek_v41_mhc.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <array>
@@ -868,6 +868,66 @@ void test_v41_post_matches_generic_graph() {
     }
 }
 
+void test_v41_fused_projection() {
+    using namespace mlx::core;
+    constexpr int hidden = 5120, width = 4 * hidden;
+    std::vector<float> weights(24 * width);
+    for (std::size_t index = 0; index < weights.size(); ++index)
+        weights[index] = std::sin(index * 0.017f) * 0.01f;
+    const array weight(weights.begin(), Shape{24, width});
+    for (const auto dtype : {float16, bfloat16}) for (const int rows : {1, 2, 3, 4, 5, 6, 7}) {
+        std::vector<float> values(rows * width);
+        for (std::size_t index = 0; index < values.size(); ++index)
+            values[index] = std::sin(index * 0.013f) * 1.3f + std::cos(index * 0.019f);
+        auto input = astype(array(values.begin(), Shape{1, rows, 4, hidden}), dtype);
+        const auto reference = [&]() {
+            auto x = reshape(astype(input, float32), Shape{1, rows, width});
+            auto inverse = rsqrt(mean(x * x, -1, true) + 1e-20f);
+            return matmul(x * inverse, transpose(weight));
+        };
+        const auto actual = evaluated_float(mfq::metal::deepseek_v41_hc_projection(input, weight));
+        const auto generic = evaluated_float(reference());
+        if (rows > 6) require_close(actual, generic, 0, "V4.1 RMS/projection GEMM fallback");
+        if (rows <= 6) {
+            const auto source = evaluated_float(input);
+            std::vector<float> expected(rows * 24);
+            for (int row = 0; row < rows; ++row) {
+                double square = 0;
+                for (int column = 0; column < width; ++column) {
+                    const double x = source[row * width + column];
+                    square += x * x;
+                }
+                const double inverse = 1 / std::sqrt(square / width + 1e-20);
+                for (int projection = 0; projection < 24; ++projection) {
+                    double dot = 0;
+                    for (int column = 0; column < width; ++column)
+                        dot += double(source[row * width + column]) * weights[projection * width + column];
+                    expected[row * 24 + projection] = static_cast<float>(dot * inverse);
+                }
+            }
+            require_close(actual, expected, 3e-5f, "V4.1 fused RMS/projection CPU reference");
+        }
+        if (std::getenv("MFQ_METAL_HC_PROJECTION_BENCH") && dtype == float16 && (rows == 1 || rows == 6)) {
+            const auto benchmark = [](const auto& make_output) {
+                for (int warmup = 0; warmup < 4; ++warmup) make_output().eval();
+                synchronize();
+                const auto start = std::chrono::steady_clock::now();
+                for (int iteration = 0; iteration < 10; ++iteration) {
+                    std::vector<array> outputs;
+                    for (int call = 0; call < 32; ++call) outputs.push_back(make_output());
+                    eval(std::move(outputs));
+                }
+                synchronize();
+                return std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count() / 320;
+            };
+            std::cout << "HC RMS/projection rows=" << rows << " ms/call generic="
+                << benchmark(reference) << " fused="
+                << benchmark([&] { return mfq::metal::deepseek_v41_hc_projection(input, weight); }) << '\n';
+        }
+    }
+}
+
 void test_v41_metadata_matches_generic_graph() {
     using namespace mlx::core;
     for (int test_case = 0; test_case < 14; ++test_case) {
@@ -1038,6 +1098,36 @@ void test_v41_metadata_matches_generic_graph() {
         actual.combination,
         expected.combination,
         "V4.1 HC exact M=6 Sinkhorn");
+    for (const int tokens : {1, 2, 3, 4, 5, 7, 8, 16, 31, 32, 33, 63, 64, 65, 128, 512, 4096}) {
+        const int batch = tokens == 31 || tokens == 33 ? 2 : 1;
+        std::vector<float> entries(batch * tokens * kMixWidth);
+        for (std::size_t index = 0; index < entries.size(); ++index)
+            entries[index] = std::sin(static_cast<float>(index * 13 + 7) * 0.017f) * 2.3f;
+        const array input(entries.begin(), Shape{batch, tokens, kMixWidth});
+        auto reference = generic_v41_metadata(input, scale, base);
+        auto fused = mfq::metal::deepseek_v41_hc_metadata_exact(input, scale, base, 20, kEps);
+        require_float_bits_equal(fused.pre, reference.pre, "V4.1 HC variable-row pre");
+        require_float_bits_equal(fused.post, reference.post, "V4.1 HC variable-row post");
+        require_float_bits_equal(fused.combination, reference.combination,
+            "V4.1 HC variable-row Sinkhorn");
+        if (std::getenv("MFQ_METAL_HC_METADATA_BENCH") && tokens >= 128) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < 10; ++iteration) {
+                std::vector<array> outputs;
+                for (int call = 0; call < 32; ++call) {
+                    auto value = mfq::metal::deepseek_v41_hc_metadata_exact(input, scale, base, 20, kEps);
+                    outputs.push_back(std::move(value.pre));
+                    outputs.push_back(std::move(value.post));
+                    outputs.push_back(std::move(value.combination));
+                }
+                mlx::core::eval(std::move(outputs));
+            }
+            mlx::core::synchronize();
+            std::cout << "HC metadata rows=" << tokens << " ms/call="
+                << std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start).count() / 320 << '\n';
+        }
+    }
 }
 
 void test_v41_collapse_norm_matches_generic_graph() {
@@ -1194,6 +1284,7 @@ int main() {
         test_hc_pre_post();
         test_v41_hidden_width();
         test_v41_post_matches_generic_graph();
+        test_v41_fused_projection();
         test_v41_metadata_matches_generic_graph();
         test_v41_collapse_norm_matches_generic_graph();
         test_invalid_shapes();

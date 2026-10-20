@@ -1,4 +1,4 @@
-#include "fp8_sq.h"
+#include "kernels/quant/fp8_sq.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

@@ -3,9 +3,9 @@
 #include "mfq/token_constraint.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
-#include "mlx_mtp.h"
-#include "mlx_prefix_cache.h"
-#include "mlx_multimodal.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_prefix_cache.h"
+#include "runtime/mlx_multimodal.h"
 #include "qwen35_model.h"
 
 #include <cstddef>

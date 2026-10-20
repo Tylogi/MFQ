@@ -56,7 +56,8 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
         const auto end = offset < stable_prefix_tokens
                              ? std::min(prompt_tokens, stable_prefix_tokens)
                              : prompt_tokens;
-        const auto chunk = next_prefill_chunk(end, offset, chunk_size);
+        auto chunk = next_prefill_chunk(end, offset, chunk_size);
+        if constexpr (requires { ops.prefill_chunk(chunk); }) chunk = ops.prefill_chunk(chunk);
         if constexpr (requires { ops.schedule_prefill(chunk); }) {
             ops.schedule_prefill(chunk);
             co_yield StepState::advanced;
@@ -72,15 +73,23 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
     }
     if (output.stopped())
         co_return;
+    if constexpr (requires { ops.generate_decode(output); }) {
+        auto generation = ops.generate_decode(output);
+        if (generation) {
+            while (auto step = generation->next()) co_yield std::move(step);
+            co_return;
+        }
+    }
     auto token = ops.first_token();
     while (!output.stopped()) {
         auto delta = output.append(std::vector<std::int64_t>{token});
         ops.accept(token);
+        if constexpr (requires { ops.schedule_decode(); }) {
+            if (!output.stopped()) ops.schedule_decode();
+        }
         co_yield std::move(delta);
         if (!output.stopped()) {
             if constexpr (requires { ops.schedule_decode(); }) {
-                ops.schedule_decode();
-                co_yield StepState::advanced;
                 while (!ops.ready() && !output.stopped()) co_yield StepState::waiting;
                 if (output.stopped()) co_return;
             }

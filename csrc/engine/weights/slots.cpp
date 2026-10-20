@@ -18,6 +18,34 @@ MoeCacheSlotBook::MoeCacheSlotBook(int capacity) : slots_(static_cast<size_t>(st
     for (int slot = capacity - 1; slot >= 0; --slot) free_.push_back(slot);
 }
 int MoeCacheSlotBook::capacity() const noexcept { return static_cast<int>(slots_.size()); }
+void MoeCacheSlotBook::prepare_resize(int capacity) {
+        if (capacity <= 0) throw std::invalid_argument("MoE cache capacity must be positive");
+        for (const auto& slot : slots_) if (slot.inflight)
+            throw std::runtime_error("cannot resize an in-flight MoE cache");
+        slots_.reserve(static_cast<size_t>(capacity));
+        free_.reserve(static_cast<size_t>(capacity));
+    }
+
+void MoeCacheSlotBook::resize(int capacity) {
+        prepare_resize(capacity);
+        const int previous = this->capacity();
+        if (capacity < previous) {
+            for (int slot = capacity; slot < previous; ++slot) {
+                if (slots_[slot].key) by_key_.erase(*slots_[slot].key);
+                erase_lru(slot);
+            }
+            free_.erase(std::remove_if(free_.begin(), free_.end(), [&](int slot) { return slot >= capacity; }), free_.end());
+        }
+        slots_.resize(static_cast<size_t>(capacity));
+        for (int slot = capacity - 1; slot >= previous; --slot) free_.push_back(slot);
+    }
+
+void MoeCacheSlotBook::set_low_priority_sources(std::vector<int> sources) {
+        std::sort(sources.begin(), sources.end());
+        sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+        low_priority_sources_ = std::move(sources);
+    }
+
 int MoeCacheSlotBook::size() const noexcept { return static_cast<int>(by_key_.size()); }
 int MoeCacheSlotBook::slot_for(const MoeCacheKey& key) const noexcept {
     const auto found = by_key_.find(key);
@@ -34,7 +62,11 @@ MoeCacheSlotLease MoeCacheSlotBook::acquire(const MoeCacheKey& key) {
     std::optional<MoeCacheKey> replaced;
     if (!free_.empty()) { slot = free_.back(); free_.pop_back(); }
     else {
-        for (int candidate : lru_) if (!slots_[candidate].inflight) { slot = candidate; break; }
+        if (!low_priority_sources_.empty()) for (int candidate : lru_) {
+            const auto& state = slots_[candidate];
+            if (!state.inflight && state.key && std::binary_search(low_priority_sources_.begin(), low_priority_sources_.end(), state.key->source)) { slot = candidate; break; }
+        }
+        for (int candidate : lru_) if (slot < 0 && !slots_[candidate].inflight) { slot = candidate; break; }
         if (slot < 0) throw std::runtime_error("all MoE cache slots are in-flight");
         auto& state = checked(slot);
         replaced = state.key;

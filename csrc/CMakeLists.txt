@@ -28,18 +28,41 @@ option(
     ${APPLE}
 )
 
-# Only this backend enables the CUDA language or requires the CUDA toolkit.
-if(APPLE)
-    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT OFF)
-else()
+include(CheckLanguage)
+if(NOT DEFINED MFQ_BUILD_CUDA_RUNTIME)
+    check_language(CUDA)
+endif()
+if(NOT APPLE AND CMAKE_CUDA_COMPILER AND NOT MFQ_BUILD_HIP_RUNTIME)
     set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT OFF)
 endif()
 option(
     MFQ_BUILD_CUDA_RUNTIME
-    "Build the native CUDA runtime, which requires the CUDA toolkit"
+    "Build the native CUDA runtime (requires the CUDA toolkit)"
     ${_MFQ_BUILD_CUDA_RUNTIME_DEFAULT}
 )
 unset(_MFQ_BUILD_CUDA_RUNTIME_DEFAULT)
+
+if(NOT DEFINED MFQ_BUILD_HIP_RUNTIME)
+    check_language(HIP)
+endif()
+if(NOT APPLE AND CMAKE_HIP_COMPILER AND NOT MFQ_BUILD_CUDA_RUNTIME)
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT ON)
+else()
+    set(_MFQ_BUILD_HIP_RUNTIME_DEFAULT OFF)
+endif()
+option(
+    MFQ_BUILD_HIP_RUNTIME
+    "Build the native HIP runtime on AMD ROCm hosts"
+    ${_MFQ_BUILD_HIP_RUNTIME_DEFAULT}
+)
+unset(_MFQ_BUILD_HIP_RUNTIME_DEFAULT)
+
+if(MFQ_BUILD_CUDA_RUNTIME AND MFQ_BUILD_HIP_RUNTIME)
+    message(FATAL_ERROR
+        "Select either MFQ_BUILD_CUDA_RUNTIME or MFQ_BUILD_HIP_RUNTIME; use separate build directories for both backends")
+endif()
 
 if(APPLE)
     set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT OFF)
@@ -91,6 +114,10 @@ endif()
 
 if(MFQ_BUILD_CUDA_RUNTIME)
     add_subdirectory(backends/cuda cuda)
+endif()
+
+if(MFQ_BUILD_HIP_RUNTIME)
+    add_subdirectory(backends/hip hip)
 endif()
 
 if(BUILD_TESTING)

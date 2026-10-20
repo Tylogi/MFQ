@@ -100,7 +100,7 @@ it('切换会话后迟到的旧历史不能覆盖当前消息', async () => {
   expect(result.current.messages[0]?.id).toBe('b-message');
 });
 
-it('后台生成期间不派生新模型会话，完成后再执行模型切换', async () => {
+it('生成期间或完成后切换模型都沿用当前会话，不派生副本', async () => {
   const { result, rerender } = renderHook(({ busy }) => useConversationSessions(true, busy), {
     initialProps: { busy: true },
   });
@@ -109,8 +109,9 @@ it('后台生成期间不派生新模型会话，完成后再执行模型切换'
   rerender({ busy: true });
   expect(sessionsApi.forkSession).not.toHaveBeenCalled();
   rerender({ busy: false });
-  await waitFor(() => expect(result.current.activeId).toBe('fork'));
-  expect(sessionsApi.forkSession).toHaveBeenCalledOnce();
+  expect(result.current.activeId).toBe('a');
+  expect(result.current.conversationReady).toBe(true);
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
 });
 
 it('模型只在已载入实例里，也能切换并用于会话，无需资产注册', async () => {
@@ -119,8 +120,49 @@ it('模型只在已载入实例里，也能切换并用于会话，无需资产�
   runtime.selectedModel = 'model-b';
   const { result } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
-  expect(result.current.active?.model).toBe('model-b');
-  expect(sessionsApi.forkSession).toHaveBeenCalledWith('a', null, true, 'A', 'model-b');
+  expect(result.current.activeId).toBe('a');
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
+  expect(runtime.setSelectedModel).not.toHaveBeenCalled();
+});
+
+it('没有加载模型也能创建无模型会话并读取旧会话，不修改模型选择', async () => {
+  runtime.selectedModel = '';
+  runtime.models = [];
+  const created = { ...first, id: 'unbound', model: '' };
+  vi.spyOn(sessionsApi, 'createSession').mockResolvedValueOnce(created);
+  const message = { id: 'old-message', role: 'user', parts: [], parent_id: null, created_at: '' } as Message;
+  vi.mocked(sessionsApi.listMessages).mockResolvedValue([message]);
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.historyReady).toBe(true));
+  expect(result.current.conversationReady).toBe(false);
+  await act(async () => { await result.current.createSession(); });
+  expect(sessionsApi.createSession).toHaveBeenCalledWith(undefined, 'text');
+  expect(result.current.activeId).toBe('unbound');
+  await act(async () => result.current.selectSession('b'));
+  await waitFor(() => expect(result.current.messages).toEqual([message]));
+  expect(result.current.activeId).toBe('b');
+  expect(runtime.setSelectedModel).not.toHaveBeenCalled();
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
+});
+
+it('打开模型已卸载的旧会话后，运行时模型回退不复制或切走历史', async () => {
+  const old = { ...second, model: 'unloaded-model', title: null };
+  const message = { id: 'old-message', role: 'user', parts: [], parent_id: null, created_at: '' } as Message;
+  vi.mocked(sessionsApi.listSessions).mockResolvedValue([first, old]);
+  vi.mocked(sessionsApi.listMessages).mockResolvedValue([message]);
+  useDraftStore.getState().setDraft(old.id, 'keep draft');
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.historyReady).toBe(true));
+  await act(async () => result.current.selectSession(old.id));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  runtime.selectedModel = 'model-b';
+  rerender();
+  expect(result.current.activeId).toBe(old.id);
+  expect(result.current.messages).toEqual([message]);
+  expect(result.current.sessions).toHaveLength(2);
+  expect(useDraftStore.getState().drafts[old.id]).toBe('keep draft');
+  expect(runtime.setSelectedModel).not.toHaveBeenCalled();
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
 });
 
 it('删除当前会话后切换到剩余会话并清除旧历史', async () => {
@@ -130,7 +172,7 @@ it('删除当前会话后切换到剩余会话并清除旧历史', async () => {
   expect(sessionsApi.deleteSession).toHaveBeenCalledWith('a');
   expect(result.current.sessions).toEqual([second]);
   expect(result.current.activeId).toBe('b');
-  expect(runtime.setSelectedModel).toHaveBeenCalledWith(second.model);
+  expect(runtime.setSelectedModel).not.toHaveBeenCalled();
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
 });
 

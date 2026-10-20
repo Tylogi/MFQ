@@ -2,6 +2,10 @@
 // Adapted from jundot/omlx qsa_nax.py, with FP16, batching and index bounds.
 constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
 
+#ifndef MFQ_QSA_SPLIT_PARTITIONS
+#define MFQ_QSA_SPLIT_PARTITIONS 1
+#endif
+
     constexpr int D = 256;
     constexpr int TDH = 8;
     constexpr int SB = 8;
@@ -11,7 +15,8 @@ constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
     threadgroup float xchg[2][8 * 32];
 #endif
 
-    const int tq = int(threadgroup_position_in_grid.x);
+    const int tq = int(threadgroup_position_in_grid.x) / MFQ_QSA_SPLIT_PARTITIONS;
+    const int partition = int(threadgroup_position_in_grid.x) % MFQ_QSA_SPLIT_PARTITIONS;
     const int kvh = int(threadgroup_position_in_grid.y);
     const int batch = int(threadgroup_position_in_grid.z);
     q += size_t(batch) * q_strides[0];
@@ -101,9 +106,9 @@ constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
 #endif
       }
     };
-    fetch(0);
+    fetch(partition * SB);
 
-    for (int step = 0; step < nsteps; ++step) {
+    for (int step = partition; step < nsteps; step += MFQ_QSA_SPLIT_PARTITIONS) {
 
       uint krow[4];
       UNROLL for (short r = 0; r < 4; ++r) {
@@ -118,8 +123,8 @@ constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
       UNROLL for (short f = 0; f < 2; ++f) {
         nvis[f] = ncol_n[f];
       }
-      if (step + 1 < nsteps) {
-        fetch((step + 1) * SB);
+      if (step + MFQ_QSA_SPLIT_PARTITIONS < nsteps) {
+        fetch((step + MFQ_QSA_SPLIT_PARTITIONS) * SB);
       }
 
       auto s_ct = qk_op.template get_destination_cooperative_tensor<qa_t, kb_t, float>();
@@ -323,10 +328,21 @@ constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
       if (i == 1 && !r1_ok) {
         continue;
       }
+      const size_t row = (size_t(batch) * size_t(params[2]) + size_t(tq)) * (2 * GQA) + (i == 0 ? h0 : h1);
+#if MFQ_QSA_SPLIT_PARTITIONS > 1
+      using Output = float;
+      const float rr = 1.0f;
+      if (dh == 0 && fcol == 0) {
+        partial_maximum[row * MFQ_QSA_SPLIT_PARTITIONS + partition] = max_s[i] * M_LN2_F;
+        partial_denominator[row * MFQ_QSA_SPLIT_PARTITIONS + partition] = sum_s[i];
+      }
+#else
+      using Output = T;
       const float rr = sum_s[i] > 0.0f ? 1.0f / sum_s[i] : 0.0f;
-      device T* o = (device T*)out + ((size_t(batch) * size_t(params[2]) + size_t(tq)) * (2 * GQA) + (i == 0 ? h0 : h1)) * D + dh * 128 + fcol;
+#endif
+      device Output* o = (device Output*)out + (row * MFQ_QSA_SPLIT_PARTITIONS + partition) * D + dh * 128 + fcol;
       UNROLL for (short jj = 0; jj < TDH / 2; ++jj) {
-        vec<T, 8> w;
+        vec<Output, 8> w;
         UNROLL for (short j = 0; j < 4; ++j) {
           float e0, e1;
           if (jj == 0) {
@@ -342,10 +358,10 @@ constexpr const char* kSparseBlockNaxSource = R"MFQ_METAL(
             e0 = of3[4 * i + j];
             e1 = of3[8 + 4 * i + j];
           }
-          w[j] = T(e0 * rr);
-          w[4 + j] = T(e1 * rr);
+          w[j] = Output(e0 * rr);
+          w[4 + j] = Output(e1 * rr);
         }
-        *(device vec<T, 8>*)(o + 32 * jj) = w;
+        *(device vec<Output, 8>*)(o + 32 * jj) = w;
       }
     }
 

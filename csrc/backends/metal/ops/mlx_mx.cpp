@@ -1,7 +1,8 @@
 #include "mlx_mx.h"
 
-#include "mlx_platform.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_platform.h"
+#include "runtime/mlx_transformer.h"
+#include "runtime/mlx_weight_residency.h"
 
 #include <algorithm>
 #include <array>
@@ -210,7 +211,9 @@ int checked_dimension(std::uint64_t value, const char* name) {
 
 template <typename T>
 array make_array(std::span<const T> values, Shape shape) {
-    return array(values.begin(), std::move(shape));
+    auto result = array(values.begin(), std::move(shape));
+    MlxWeightResidency::track(result);
+    return result;
 }
 
 constexpr const char* kMxHeader = R"METAL(

@@ -18,6 +18,8 @@ void RequestExecutor::finish(
         else
             result.events.push_back({id,
                 Completed{request.output.result.finish_reason, usage, request.output.metrics}});
+    } catch (const MfqResourceExhausted &error) {
+        result.events.push_back({id, Failed{healthy_ ? "resource_exhausted" : "backend_failure", error.what(), healthy_}});
     } catch (const InferenceInputError &error) {
         const auto code = !healthy_                                            ? "backend_failure"
                           : error.code == InferenceInputErrorCode::Unsupported ? "unsupported_input"

@@ -29,6 +29,9 @@ public:
     explicit MoeCacheSlotBook(int capacity);
     int capacity() const noexcept;
     int size() const noexcept;
+    void prepare_resize(int capacity);
+    void resize(int capacity);
+    void set_low_priority_sources(std::vector<int> sources);
     int slot_for(const MoeCacheKey& key) const noexcept;
     const std::optional<MoeCacheKey>& key_for(int slot) const;
     MoeCacheSlotLease acquire(const MoeCacheKey& key);
@@ -62,6 +65,7 @@ private:
     void erase_lru(int slot);
     void append_lru(int slot);
     std::vector<Slot> slots_;
+    std::vector<int> low_priority_sources_;
     std::vector<int> free_;
     std::list<int> lru_;
     std::unordered_map<MoeCacheKey, int, MoeCacheKeyHash> by_key_;

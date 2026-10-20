@@ -34,9 +34,9 @@ def test_prefill_speed_uses_cuda_events_per_bounded_model_chunk() -> None:
     prefill = prefill.split("std::int64_t first_token()", 1)[0]
     assert prefill.index("PrefillCudaTimer timer") < prefill.index("auto ids =")
     logits = prefill.index(".logits_from_hidden(")
-    finished = prefill.index("cudaEventRecord(timer.finished_event()", logits)
+    finished = prefill.index("finish_prefill();", prefill.index("hidden = model.hidden_forward("))
     sampling = prefill.index("mfq::cuda::sample_logits(", logits)
-    assert logits < finished < sampling
+    assert finished < logits < sampling
     assert "return timer.elapsed_ms()" in prefill
     flow = (ROOT / "csrc/engine/requests/step.h").read_text()
     assert "next_prefill_chunk(end, offset, chunk_size)" in flow

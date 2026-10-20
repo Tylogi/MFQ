@@ -1,6 +1,6 @@
 /** 验证传输层保留标准 HeadersInit 并仅在内存中注入当前服务凭据。 */
 import { afterEach, expect, it, vi } from 'vitest';
-import { browserServiceUrl, request, setApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../src/shared/api/client';
+import { browserServiceUrl, getApiToken, onAuthenticationRequired, onServerInstanceChanged, request, runtimeRealtimeUrl, setApiBaseUrl, setApiToken, setApiServerInstance, setBrowserServiceUrl, verifyApiToken } from '../src/shared/api/client';
 import { jobsApi } from '../src/shared/api/resources/jobs';
 
 afterEach(() => {
@@ -8,6 +8,22 @@ afterEach(() => {
   setBrowserServiceUrl('');
   setApiBaseUrl('');
   setApiToken('');
+  setApiServerInstance('');
+});
+
+it('binds requests to the confirmed server instance and reports a replacement', async () => {
+  const changed = vi.fn();
+  const stop = onServerInstanceChanged(changed);
+  setApiServerInstance('confirmed-instance');
+  expect(new URL(runtimeRealtimeUrl()).searchParams.get('server_instance')).toBe('confirmed-instance');
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: {
+    code: 'server_instance_changed', message: 'Reconnect', retryable: false, details: {},
+  } }), { status: 409 }));
+  vi.stubGlobal('fetch', fetchMock);
+  await expect(request('/api/v1/runtime/status')).rejects.toMatchObject({ code: 'server_instance_changed' });
+  expect(fetchMock.mock.calls[0][1].headers.get('X-MFQ-Instance-ID')).toBe('confirmed-instance');
+  expect(changed).toHaveBeenCalledOnce();
+  stop();
 });
 
 it('支持 Headers 实例和 AbortSignal，保留业务头并添加鉴权', async () => {
@@ -27,6 +43,35 @@ it('支持 Headers 实例和 AbortSignal，保留业务头并添加鉴权', asyn
   expect(init.headers.get('Authorization')).toBe('Bearer test-token');
   expect(headers.has('Authorization')).toBe(false);
   expect(localStorage.length).toBe(0);
+});
+
+it.each(['endpoint', 'credential', 'aborted'])('ignores stale 401 responses after the %s changes', async (change) => {
+  const listener = vi.fn();
+  const stop = onAuthenticationRequired(listener);
+  let finish!: (response: Response) => void;
+  vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; })));
+  const controller = new AbortController();
+  const pending = request('/api/v1/runtime/status', { signal: controller.signal });
+  if (change === 'endpoint') setApiBaseUrl('https://new.invalid');
+  else if (change === 'credential') setApiToken('new-fixture-key');
+  else controller.abort();
+  finish(new Response('{}', { status: 401 }));
+  await expect(pending).rejects.toMatchObject({ status: 401 });
+  expect(listener).not.toHaveBeenCalled();
+  stop();
+});
+
+it('verifies an explicit key without overwriting the current credential or emitting a session-expired event', async () => {
+  const listener = vi.fn();
+  const stop = onAuthenticationRequired(listener);
+  setApiToken('previous-fixture-key');
+  const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 401 }));
+  vi.stubGlobal('fetch', fetchMock);
+  await expect(verifyApiToken(' new-fixture-key ')).rejects.toMatchObject({ status: 401 });
+  expect(fetchMock.mock.calls[0][1].headers.get('Authorization')).toBe('Bearer new-fixture-key');
+  expect(getApiToken()).toBe('previous-fixture-key');
+  expect(listener).not.toHaveBeenCalled();
+  stop();
 });
 
 it('keeps browser connections usable when storage cannot be read or written', () => {

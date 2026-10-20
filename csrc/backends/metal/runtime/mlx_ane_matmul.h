@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_ane.h"
+#include "platform/mfq_ane.h"
 #include <mlx/mlx.h>
 #include <map>
 #include <mutex>

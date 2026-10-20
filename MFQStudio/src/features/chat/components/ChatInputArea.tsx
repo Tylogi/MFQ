@@ -70,6 +70,7 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
       <ChatComposer
         sessionId={activeId ?? 'new'}
         ready={conversation.conversationReady}
+        editable={conversation.historyReady}
         busy={busy}
         recoveryNeeded={recoveryNeeded}
         phase={generationPhase}
@@ -77,7 +78,7 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
           ? tr('向模型发送消息', 'Message MFQ')
           : conversation.modelAvailable
             ? tr('正在加载会话', 'Loading conversation')
-            : tr('请先加载模型', 'Load a model first')}
+            : tr('加载模型后即可发送消息', 'Load a model to send messages')}
         attachmentAccept={inference.attachmentAccept}
         tr={tr}
         onSend={send}

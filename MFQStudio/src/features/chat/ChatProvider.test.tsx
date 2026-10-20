@@ -6,7 +6,7 @@ import { act, render, renderHook, screen, waitFor } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { Profiler, type ProfilerOnRenderCallback, type ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatProvider, useChat } from './ChatProvider';
 import { useConversationStore } from './state/conversationStore';
 import { useDraftStore } from './state/draftStore';
@@ -14,7 +14,7 @@ import { setVoiceLevel } from '../voice/voiceLevelStore';
 import { ChatComposer } from './components/ChatComposer';
 import { ChatToolbar } from './components/ChatToolbar';
 import { SavedMessageList } from './SavedMessageList';
-import type { JobResource, Message, Session } from '../../shared/api/types';
+import type { JobResource, Message, RuntimeModel, Session } from '../../shared/api/types';
 import { sessionsApi } from '../../shared/api/resources/sessions';
 import { studioConfirm } from '../../studio';
 import { TooltipProvider } from '../../shared/ui/Tooltip';
@@ -22,7 +22,7 @@ import { useJobStore } from '../../stores/jobStore';
 
 const mockRuntime = {
   runtime: null,
-  models: [],
+  models: [] as RuntimeModel[],
   instances: [],
   jobs: [],
   capabilities: null,
@@ -135,6 +135,55 @@ describe('ChatProvider conversation deletion confirmation', () => {
 vi.mock('../../studio', () => ({
   studioConfirm: vi.fn().mockResolvedValue(true),
 }));
+
+describe('ChatProvider model-independent conversations', () => {
+  const session = { id: 'old-chat', title: 'Old chat', model: 'unloaded-model', mode: 'text', revision: 0 } as Session;
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <MemoryRouter initialEntries={['/chat']}><ChatProvider>{children}</ChatProvider></MemoryRouter>
+  );
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useConversationStore.getState().reset();
+    mockRuntime.models = [{ id: 'model-a' }, { id: 'model-b' }] as RuntimeModel[];
+    mockRuntime.selectedModel = 'model-a';
+    vi.mocked(sessionsApi.listSessions).mockResolvedValue([session]);
+  });
+  afterEach(() => {
+    mockRuntime.models = [];
+    mockRuntime.selectedModel = '';
+  });
+
+  it('sends using the selected model without replacing or rebinding an old conversation', async () => {
+    const fork = vi.spyOn(sessionsApi, 'forkSession');
+    const { result, rerender } = renderHook(() => useChat(), { wrapper });
+    await waitFor(() => expect(result.current.conversation.conversationReady).toBe(true));
+    const start = vi.spyOn(result.current.generation, 'start').mockResolvedValue(undefined);
+    await act(async () => { await result.current.send('first message', vi.fn()); });
+    expect(start).toHaveBeenLastCalledWith('old-chat', expect.objectContaining({ model: 'model-a' }), expect.any(Function));
+    mockRuntime.selectedModel = 'model-b';
+    mockRuntime.models = [...mockRuntime.models];
+    rerender();
+    await act(async () => { await result.current.send('second message', vi.fn()); });
+    expect(start).toHaveBeenLastCalledWith('old-chat', expect.objectContaining({ model: 'model-b' }), expect.any(Function));
+    expect(useConversationStore.getState().sessions).toEqual([session]);
+    expect(useConversationStore.getState().activeId).toBe('old-chat');
+    expect(fork).not.toHaveBeenCalled();
+  });
+
+  it('keeps unloaded history readable and does not send until a model is available', async () => {
+    mockRuntime.models = [];
+    mockRuntime.selectedModel = '';
+    const { result } = renderHook(() => useChat(), { wrapper });
+    await waitFor(() => expect(result.current.conversation.historyReady).toBe(true));
+    expect(result.current.conversation.conversationReady).toBe(false);
+    const start = vi.spyOn(result.current.generation, 'start').mockResolvedValue(undefined);
+    const accepted = vi.fn();
+    await act(async () => { await result.current.send('unsent', accepted); });
+    expect(start).not.toHaveBeenCalled();
+    expect(accepted).not.toHaveBeenCalled();
+    expect(useConversationStore.getState().activeId).toBe('old-chat');
+  });
+});
 
 describe('ChatProvider Context 重渲染拦截与缓存', () => {
   beforeEach(() => {

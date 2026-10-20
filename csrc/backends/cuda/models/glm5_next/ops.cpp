@@ -4,7 +4,7 @@
 #include "mtp.h"
 #include "storage/weights/loaders/weight.h"
 #include "common/gated_mlp.h"
-#include "common/moe.h"
+#include "ops/moe/moe.h"
 #include "common/transformer_layer.h"
 #include "models/common/session_codec.h"
 

@@ -14,6 +14,28 @@ permissions:
   contents: read
 
 jobs:
+  linux-core:
+    name: Linux storage and expert cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure portable runtime tests
+        run: >-
+          cmake -S csrc -B build/linux-core -DCMAKE_BUILD_TYPE=Release
+          -DMFQ_BUILD_CUDA_RUNTIME=OFF -DMFQ_BUILD_HIP_RUNTIME=OFF
+          -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF
+          -DBUILD_TESTING=ON
+      - name: Build storage and cache regression tests
+        run: >-
+          cmake --build build/linux-core --parallel 2 --target
+          mfq-file-range-reader-test mfq-model-source-test mfq-quant-expert-range-test
+          mfq-moe-cache-policy-test mfq-moe-cache-profile-test mfq-native-tensor-test
+      - name: Run Linux regression tests
+        run: >-
+          ctest --test-dir build/linux-core --output-on-failure
+          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor)-test$'
+
   macos-metal:
     name: macOS Metal
     runs-on: macos-14

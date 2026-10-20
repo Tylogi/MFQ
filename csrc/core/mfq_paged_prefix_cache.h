@@ -39,6 +39,10 @@ struct PagedPrefixCacheConfig {
     std::uint64_t min_disk_free_bytes = 1ULL << 30;
     std::filesystem::path model_path;
     std::function<void(std::size_t)> reserve_memory;
+    // Disposable intermediate RAM tier: persist on eviction, never pin RAM.
+    bool spill_hot_on_eviction = false;
+    std::function<std::uint64_t()> available_ram_bytes;
+    std::uint64_t min_free_ram_bytes = 512ULL << 20;
 };
 
 struct PrefixMatch {
@@ -47,6 +51,7 @@ struct PrefixMatch {
 };
 
 struct PagedPrefixCacheMetrics {
+    std::uint64_t blocks = 0;
     std::uint64_t queries = 0;
     std::uint64_t hits = 0;
     std::uint64_t hit_tokens = 0;
@@ -131,10 +136,11 @@ public:
 
     void pin(const std::vector<BlockHash>& blocks);
     void unpin(const std::vector<BlockHash>& blocks);
-    // Reclaim the RAM tier without deleting durable SSD blocks or breaking
-    // live RAM-only bindings. Returns the number of payload bytes released.
+    // Reclaim the RAM tier. Disposable RAM ignores session pins and spills
+    // dirty blocks to enabled SSD, or discards them. Returns payload bytes freed.
     std::uint64_t trim_hot(std::uint64_t target_bytes = 0);
     std::uint64_t set_hot_limit(std::uint64_t max_bytes);
+    std::uint64_t reserve_ram(std::uint64_t allocation_bytes);
     std::uint64_t set_disk_limit(std::uint64_t max_bytes);
     std::size_t refresh_disk_index();
     void flush();

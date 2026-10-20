@@ -3,6 +3,7 @@
 #include <memory>
 #include <functional>
 #include <vector>
+#include <iosfwd>
 class MoeExpertCache;
 class MoeResidencyManager {
 public:
@@ -27,18 +28,39 @@ public:
         std::uint64_t direct_exchange_rounds=0,direct_exchange_bytes=0,direct_exchange_ns=0;
         std::uint64_t cached_copy_descriptors=0,cached_copy_blocks=0;
         std::uint64_t exchange_defaults=0;
+        std::uint64_t kv_refill_bytes=0;
+        std::uint64_t native_dma_batches=0,native_dma_copies=0,native_dma_fallbacks=0;
+        std::uint64_t staging_budget_skips=0;
+        std::uint64_t plan_ns=0,decode_plan_ns=0;
+        std::uint64_t speculative_route_windows=0,speculative_routes_committed=0;
+        std::uint64_t speculative_routes_discarded=0,speculative_route_cancels=0;
+        std::uint64_t shadow_backup_bytes=0,shadow_backup_fields=0;
+        std::uint64_t shadow_index_rebuilds=0,shadow_index_matches=0,shadow_index_backup_bytes=0;
+        std::uint64_t speculative_heat_routes=0;
+        std::uint64_t predictor_overlap_rounds=0,predictor_overlap_serves=0;
+        std::uint64_t ssd_load_requests=0,ssd_load_bytes=0;
+        std::uint64_t ssd_gpu_image_bytes=0,ssd_gpu_images=0,ssd_gpu_image_ns=0,ssd_gpu_image_copies=0;
     };
     using Observer=std::function<void(const char*,std::size_t)>;
     using MemoryProbe=std::function<MemorySample()>;
+    static MemorySample sample_host_memory();
     explicit MoeResidencyManager(MoeExpertCache*,Observer observer={},MemoryProbe memory_probe={});
     ~MoeResidencyManager();
     void before_layer(int layer);
-    void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false);
+    void prepare_predictor();
+    void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false,bool independent_sequences=false);
+    void begin_speculative_routes(int rows);
+    void commit_speculative_routes(int rows);
+    void discard_speculative_routes() noexcept;
     bool prepare_during_window() const noexcept;
     void finish_window(int layer);
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
+    void record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* stream);
+    void prepare_decode();
+    void release_transfer_stages();
     Stats stats() const noexcept;
+    void trace_rank_summary(std::ostream&) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

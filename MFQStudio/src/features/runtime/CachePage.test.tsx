@@ -1,7 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { TooltipProvider } from '../../shared/ui/Tooltip';
+import { act, fireEvent, render as baseRender, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CachePage } from './CachePage';
 import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
+
+function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 
 const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, connectionRevision: 0,
   refreshRuntime: vi.fn().mockResolvedValue(true), clearRuntimeCache: vi.fn().mockResolvedValue({}), confirm: vi.fn(),
@@ -18,6 +22,17 @@ beforeEach(() => {
   state.runtime = null;
   state.connectionRevision = 0;
   state.confirm.mockResolvedValue(true);
+});
+
+it('shows separate VRAM, RAM and SSD prefix totals', () => {
+  state.runtime = { memory_architecture: 'discrete', prefix_cache_total_hot_bytes: 100,
+    prefix_cache_total_hot_max_bytes: 1000, prefix_cache_total_ram_bytes: 200,
+    prefix_cache_total_ram_max_bytes: 2000, prefix_cache_total_disk_bytes: 300,
+    prefix_cache_total_disk_max_bytes: 3000 };
+  render(<CachePage />);
+  expect(screen.getByText('Total VRAM hot cache')).toBeInTheDocument();
+  expect(screen.getByText('Total RAM prefix cache')).toBeInTheDocument();
+  expect(screen.getByText('Total SSD prefix cache')).toBeInTheDocument();
 });
 
 it('resources contains monitoring and cache but no service configuration', () => {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "step_sequence.h"
+#include "csrc/core/step_sequence.h"
 #include "storage/session/state.h"
 #include "kernels/attention/ops.h"
 #include "kernels/cache/ops.h"
@@ -10,8 +10,8 @@
 #include "deepseek_v4/causal_lm.h"
 
 #include "models/common/causal_model_ops.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
+#include "kernels/deepseek_v4_attention.h"
+#include "kernels/deepseek_v4_hc.h"
 #include "models/common/block.h"
 #include "deepseek_v4/config.h"
 #include "models/common/ffn.h"
@@ -82,13 +82,9 @@ inline mfq_tensor_backend::Tensor dsv4_rotate_rope_tail(mfq_tensor_backend::Tens
     if (x.dim() != 4 || x.size(-1) < 64) {
         throw std::runtime_error("DeepSeek V4 RoPE expects contiguous [B,H,T,D>=64]");
     }
-    const int64_t width = x.size(-1);
-    auto head = x.slice(-1, 0, width - 64).contiguous();
-    auto tail = x.slice(-1, width - 64, width).contiguous();
-    auto rotated = glm_interleaved_rope_cuda(
-        tail, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
+    return dsv4_tail_rope_cuda(
+        x, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
         table.cos, inverse ? table.negative_sin : table.sin, 64);
-    return mfq_tensor_backend::cat({head, rotated}, -1).contiguous();
 }
 
 inline std::vector<mfq_tensor_backend::Tensor>

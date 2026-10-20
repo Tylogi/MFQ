@@ -201,7 +201,7 @@ class JobContext:
 
 
 class JobManager:
-    """Run only explicitly registered job kinds with bounded concurrency."""
+    """Run registered jobs with independently bounded execution lanes."""
 
     def __init__(
         self,
@@ -215,6 +215,8 @@ class JobManager:
         self.store = store
         self.handlers: dict[str, JobHandler] = dict(handlers or {})
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._download_semaphore = asyncio.Semaphore(max_concurrency)
+        self._runtime_semaphore = asyncio.Semaphore(max_concurrency)
         self._tasks: dict[UUID, asyncio.Task[None]] = {}
         self._cancel_events: dict[UUID, asyncio.Event] = {}
         self._started = False
@@ -290,7 +292,21 @@ class JobManager:
         return job
 
     async def retry(self, job_id: UUID) -> JobResource:
+        await self.start()
         previous = await asyncio.to_thread(self.store.get_job, job_id)
+        if previous.kind in {'download.huggingface', 'download.modelscope'}:
+            if previous.kind not in self.handlers:
+                raise JobKindNotRegisteredError(previous.kind)
+            if previous.status in {JobStatus.RUNNING, JobStatus.QUEUED}:
+                return previous
+            task = self._tasks.get(job_id)
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(task)
+                self._forget(job_id, task)
+            resumed = await asyncio.to_thread(self.store.requeue_job, job_id)
+            self._schedule(job_id)
+            return resumed
         if previous.status not in {
             JobStatus.FAILED,
             JobStatus.CANCELLED,
@@ -314,16 +330,25 @@ class JobManager:
         self._cancel_events[job_id] = event
         task = asyncio.create_task(self._run(job_id, event), name=f"mfq-server-job-{job_id}")
         self._tasks[job_id] = task
-        task.add_done_callback(lambda _: self._forget(job_id))
+        task.add_done_callback(lambda completed: self._forget(job_id, completed))
 
-    def _forget(self, job_id: UUID) -> None:
+    def _forget(self, job_id: UUID, task: asyncio.Task[None] | None = None) -> None:
+        if task is not None and self._tasks.get(job_id) is not task:
+            return
         self._tasks.pop(job_id, None)
         self._cancel_events.pop(job_id, None)
 
     async def _run(self, job_id: UUID, cancel_event: asyncio.Event) -> None:
         context = JobContext(self.store, job_id, cancel_event)
         try:
-            async with self._semaphore:
+            job = await asyncio.to_thread(self.store.get_job, job_id)
+            if job.kind.startswith("download.") or job.kind.endswith(".download"):
+                semaphore = self._download_semaphore
+            elif job.kind.startswith(("model.", "runtime.")):
+                semaphore = self._runtime_semaphore
+            else:
+                semaphore = self._semaphore
+            async with semaphore:
                 job = await asyncio.to_thread(self.store.get_job, job_id)
                 if job.status != JobStatus.QUEUED:
                     return
@@ -350,6 +375,9 @@ class JobManager:
             with suppress(InvalidJobStateError, JobNotFoundError):
                 if self._closing:
                     await asyncio.to_thread(self.store.interrupt_job, job_id)
+                    job = await asyncio.to_thread(self.store.get_job, job_id)
+                    if job.kind in {'download.huggingface', 'download.modelscope'} and not job.cancel_requested:
+                        await asyncio.to_thread(self.store.requeue_job, job_id)
                 else:
                     await asyncio.to_thread(self.store.cancel_job, job_id)
             raise

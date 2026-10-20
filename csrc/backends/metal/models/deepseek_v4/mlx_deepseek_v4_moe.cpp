@@ -1,8 +1,8 @@
 #include "mlx_deepseek_v4_moe.h"
 
-#include "mlx_eval_timing.h"
-#include "mlx_platform.h"
-#include "mlx_moe_ops.h"
+#include "runtime/mlx_eval_timing.h"
+#include "runtime/mlx_platform.h"
+#include "ops/mlx_moe_ops.h"
 
 #include <algorithm>
 #include <cmath>

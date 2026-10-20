@@ -14,7 +14,7 @@ for (const language of ['zh', 'en'] as const) {
     await expect(sidebar).toBeVisible();
     const tools = sidebar.locator('nav > section').filter({ has: page.getByText(language === 'zh' ? '工具' : 'Tools', { exact: true }) });
     await expect(tools.locator('button')).toHaveText(language === 'zh'
-      ? ['分析', '下载', '测评', '量化'] : ['Analysis', 'Downloads', 'Evaluations', 'Quantization']);
+      ? ['分析', '下载', '测评'] : ['Analysis', 'Downloads', 'Evaluations']);
     expect((await sidebar.boundingBox())!.width).toBeCloseTo(200, 3);
     for (const button of await tools.locator('button').all()) {
       expect(await button.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
@@ -41,14 +41,14 @@ test('resource telemetry and service profiles have separate responsive homes', a
   await page.goto('/resources');
   await expect(page.getByText('Resource monitoring', { exact: true })).toBeVisible();
   await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '36');
-  await expect(page.getByRole('meter', { name: 'GPU: Apple M5 Max 40C' })).toBeVisible();
+  await expect(page.getByRole('meter', { name: 'GPU 0: Apple M5 Max 40C' })).toBeVisible();
   await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');
   await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.resource-monitor-panel').screenshot({ path: testInfo.outputPath('resource-monitor.png') });
   await page.goto('/runtime');
   await expect(page.getByRole('heading', { name: 'Service', exact: true })).toBeVisible();
-  await expect(page.getByText('Runtime profiles', { exact: true })).toBeVisible();
+  await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Resource monitoring', { exact: true })).toHaveCount(0);
   await page.goto('/resources');
   await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');
@@ -154,7 +154,7 @@ test('每个模型独立保留 ctx 草稿，保存整套设置且不丢失另一
   await selected.selectOption(instances[1].model);
   await expect(save).toBeEnabled();
   await expect(dense).toHaveValue('65536');
-  await expect(page.locator('.memory-budget-actions')).toContainText('96.3');
+  await expect(page.locator('.server-memory-panel .memory-budget-actions')).toContainText('96.3');
   await page.screenshot({ path: testInfo.outputPath('per-model-context.png'), animations: 'disabled' });
   complete();
   await selected.selectOption(instances[0].model);
@@ -317,14 +317,16 @@ test('注册资产显示文件总大小，已载入模型可在生成期间切�
     { id: 'instance-2', model: nextModel, state: 'ready', devices: ['cpu'] },
   ] } }));
   let forks = 0;
-  await page.route('**/api/v1/sessions/session-1/fork', (route) => {
-    forks += 1;
-    expect(route.request().postDataJSON().model).toBe(nextModel);
-    return route.fulfill({ json: { id: 'session-2', model: nextModel, mode: 'text', state: 'idle',
-      revision: 0, title: 'Regression conversation', created_at: '2026-01-01', updated_at: '2026-01-01', metadata: {} } });
+  const responseModels: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/v1/sessions/session-1/responses') {
+      responseModels.push(request.postDataJSON().model);
+    }
   });
-  await page.route('**/api/v1/sessions/session-2/messages', (route) => route.fulfill({ json: { data: [] } }));
-  await page.route('**/api/v1/sessions/session-2/responses?*', (route) => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/v1/sessions/*/fork', (route) => {
+    forks += 1;
+    return route.abort();
+  });
   await page.goto('/models');
   await expect(page.locator('.model-workbench-summary > div').last()).toContainText('Registered model assets size');
   await expect(page.locator('.model-workbench-summary > div').last().locator('strong')).toHaveText('40 GiB');
@@ -342,10 +344,20 @@ test('注册资产显示文件总大小，已载入模型可在生成期间切�
   await expect(selector).toHaveValue(nextModel);
   expect(forks).toBe(0);
   state.releaseResponse();
-  await expect.poll(() => forks).toBe(1);
   await expect(input).toBeEnabled();
+  await expect(page.locator('.message-assistant')).toContainText('A streamed answer with formatted content.');
+  expect(forks).toBe(0);
   await expect(selector).toHaveValue(nextModel);
   expect(state.submissions).toBe(1);
+  expect(responseModels).toEqual(['Studio Test Model']);
+  await input.fill('Continue this conversation on the selected model');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect.poll(() => state.submissions).toBe(2);
+  expect(responseModels).toEqual(['Studio Test Model', nextModel]);
+  state.releaseResponse();
+  await expect(input).toBeEnabled();
+  expect(forks).toBe(0);
+  expect(state.requests.filter((request) => /^POST \/api\/v1\/sessions(?:\?|$)/.test(request))).toEqual([]);
   expect(state.requests.filter((request) => request.startsWith('POST /api/v1/models'))).toEqual([]);
   expect(state.unexpected).toEqual([]);
 });
@@ -373,7 +385,7 @@ test('下载来源与九宫格保留统一字体，仅降低文字对比度', as
       });
     });
     for (const css of styles) {
-      expect(css.font).toBe(css.expectedFont);
+      expect(css.font.replace(/^"MFQ Small Numerals",\s*/, '')).toBe(css.expectedFont);
       expect(css.weight).toBe('400');
       expect(css.color).toBe(css.expectedColor);
       expect(css.color).not.toBe(css.primaryColor);
@@ -530,8 +542,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   const routes = [
     ['/evaluations', '/api/v1/evaluations'],
     ['/model-hub', null],
-    ['/quantization', null],
-    ['/settings', '/api/v1/presets'],
+    ['/settings', null],
     ['/runtime', '/api/v1/cluster/nodes'],
     ['/resources', '/api/v1/runtime/resources'],
     ['/logs', '/api/v1/runtime/logs'],
@@ -540,12 +551,13 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
     await navigateClient(page, path);
     await expect(page.locator('main h1')).toBeVisible();
     if (endpoint) await expect.poll(() => state.requests.includes(`GET ${endpoint}`)).toBe(true);
+    if (path === '/settings') expect(state.requests).not.toContain('GET /api/v1/presets');
   }
   expect(errors).toEqual([]);
   expect(state.unexpected).toEqual([]);
 });
 
-test('模型下载留在本页，飞入圆圈后打开第三个队列标签，与量化任务保持独立', async ({ page }, testInfo) => {
+test('模型下载留在本页，飞入圆圈后打开第三个队列标签', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
     payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
@@ -580,18 +592,8 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签，�
   await expect(page.getByText('Not a download')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('download-queue.png'), animations: 'disabled' });
-  await navigateClient(page, '/quantization');
-  const workspace = page.getByRole('region', { name: 'Quantization workspace' });
-  await expect(workspace).toBeVisible();
-  await expect(workspace.getByText('3 / 3', { exact: true })).toBeVisible();
-  await expect(workspace.getByRole('textbox', { name: 'Source model directory or MFQ file' })).toBeVisible();
-  await expect(workspace.getByRole('button', { name: 'Register quantization task' })).toBeDisabled();
-  await expect(workspace.getByText('No quantization tasks yet', { exact: true })).toBeVisible();
-  await expect(workspace.locator('.qw-task')).toHaveCount(0);
-  await expect(workspace.getByText('example/studio-layout-test')).toHaveCount(0);
   expect(state.requests).not.toContain('GET /api/v1/artifacts/lineage');
   expect(state.unexpected).toEqual([]);
-  await page.screenshot({ path: testInfo.outputPath('quantization-separate-from-downloads.png'), animations: 'disabled' });
 });
 
 test('生成期间离开聊天页后返回仍完成同一次请求，草稿按会话保留', async ({ page }) => {
@@ -775,12 +777,8 @@ test('明暗主题的页面内容保持在工作区内且可滚动访问', async
   for (const theme of ['light', 'dark']) {
     await page.goto('/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
-    const inherit = page.getByRole('switch', { name: 'Use model or architecture defaults' });
-    await expect(inherit).toBeChecked();
-    await inherit.click();
-    await expect(page.locator('#settings-system-prompt')).toBeEnabled();
-    await inherit.click();
-    await expect(page.locator('#settings-system-prompt')).toBeDisabled();
+    await expect(page.getByRole('switch', { name: 'Use model or architecture defaults' })).toHaveCount(0);
+    await expect(page.locator('#settings-system-prompt')).toHaveCount(0);
     await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
     await page.getByRole('button', { name: 'Apply settings', exact: true }).first().click();
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);

@@ -2,6 +2,7 @@
 import { ArrowLeftIcon, ArrowClockwiseIcon, PlugsIcon, WarningCircleIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
+import mfqMark from '../assets/mfq-mark.svg';
 
 interface FailurePageProps {
   kind: 'connection' | 'render';
@@ -57,7 +58,7 @@ export function FailureView({ kind, code, title, description, retryLabel, leaveL
         )}
       </div>
       <div className="failure-page-footer" aria-hidden="true">
-        <img src="/mfq-mark.svg" alt="" />
+        <img src={mfqMark} alt="" />
         <span>MFQ Studio</span>
       </div>
     </section>

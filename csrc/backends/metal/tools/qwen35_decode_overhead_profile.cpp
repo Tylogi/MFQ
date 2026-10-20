@@ -1,9 +1,9 @@
-#include "mfq_container.h"
-#include "mlx_linear_attention.h"
-#include "mlx_qwen35_causal_lm.h"
-#include "mlx_sampling.h"
-#include "mlx_transformer.h"
-#include "qwen35_model.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_linear_attention.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
+#include "runtime/mlx_sampling.h"
+#include "runtime/mlx_transformer.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include <algorithm>
 #include <chrono>

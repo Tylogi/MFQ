@@ -1,3 +1,4 @@
+#include "native/env.h"
 #include "tensor.h"
 
 #include <cstdlib>
@@ -5,7 +6,9 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <new>
+#include <cstdio>
 #include <string_view>
 #include <unordered_set>
 
@@ -24,18 +27,77 @@ std::size_t normalize_dimension(std::int64_t dimension, std::size_t rank, bool a
     return static_cast<std::size_t>(normalized);
 }
 
+struct HostStoragePool {
+    static constexpr std::size_t minimum=256u<<10,maximum=8u<<20,budget=64u<<20;
+    struct Block {void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;};
+    std::mutex mutex;
+    std::array<Block,16> blocks{};
+    std::size_t idle=0;
+    std::uint64_t order=0;
+    void erase(Block& block) noexcept {
+        if(!block.data)return;
+        ::operator delete(block.data,std::align_val_t{64});
+        tensor_host_bytes.fetch_sub(block.bytes);
+        idle-=block.bytes;block={};
+    }
+    ~HostStoragePool(){for(auto& block:blocks)erase(block);}
+    Block acquire(std::size_t bytes) {
+        Block result;
+        const auto capacity=(bytes+4095)/4096*4096;
+        {
+            std::lock_guard lock(mutex);
+            auto best=blocks.end();
+            for(auto it=blocks.begin();it!=blocks.end();++it)
+                if(it->data && it->bytes==capacity){best=it;break;}
+            if(best!=blocks.end()){result=*best;*best={};idle-=result.bytes;}
+        }
+        if(result.data) {
+            static std::atomic<bool> reported{false};
+            if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"tensor_host_storage_pool scope=first_reuse enabled=1 max_idle_bytes=%zu bytes=%zu\n",budget,result.bytes);
+            return result;
+        }
+        result={::operator new(capacity,std::align_val_t{64}),capacity};
+        charge_tensor_host_bytes(capacity);return result;
+    }
+    void release(void* data,std::size_t bytes) noexcept {
+        std::lock_guard lock(mutex);
+        for(;;) {
+            auto free=blocks.end(),oldest=blocks.end();
+            for(auto it=blocks.begin();it!=blocks.end();++it) {
+                if(!it->data)free=it;
+                else if(oldest==blocks.end() || it->order<oldest->order)oldest=it;
+            }
+            if(free!=blocks.end() && bytes<=budget-idle) {
+                *free={data,bytes,++order};idle+=bytes;return;
+            }
+            erase(*oldest);
+        }
+    }
+};
+
 std::shared_ptr<TensorStorage> allocate_cpu_storage(std::size_t bytes, bool pinned) {
     if (pinned) {
         throw std::invalid_argument(
             "pinned host allocation is provided by the native CUDA translation unit");
     }
     const auto allocation_bytes = std::max<std::size_t>(bytes, 1);
-    void* pointer = ::operator new(allocation_bytes, std::align_val_t{64});
-    charge_tensor_host_bytes(allocation_bytes);
-    auto owner = std::shared_ptr<void>(pointer, [allocation_bytes](void* value) {
-        ::operator delete(value, std::align_val_t{64});
-        tensor_host_bytes.fetch_sub(allocation_bytes);
-    });
+    void* pointer=nullptr;
+    std::shared_ptr<void> owner;
+    if(allocation_bytes>=HostStoragePool::minimum && allocation_bytes<=HostStoragePool::maximum) {
+        // Keep only a bounded idle working set. SSD expert churn can reuse
+        // these pages instead of repeatedly freeing and faulting megabytes.
+        // Live views retain the allocation; pinned storage uses its own path.
+        static auto pool=std::make_shared<HostStoragePool>();
+        const auto block=pool->acquire(allocation_bytes);pointer=block.data;
+        owner=std::shared_ptr<void>(pointer,[held=pool,capacity=block.bytes](void* value){held->release(value,capacity);});
+    } else {
+        pointer=::operator new(allocation_bytes,std::align_val_t{64});
+        charge_tensor_host_bytes(allocation_bytes);
+        owner=std::shared_ptr<void>(pointer,[allocation_bytes](void* value) {
+            ::operator delete(value,std::align_val_t{64});tensor_host_bytes.fetch_sub(allocation_bytes);
+        });
+    }
     auto storage = std::make_shared<TensorStorage>();
     storage->owner = std::move(owner);
     storage->base = pointer;
@@ -232,7 +294,34 @@ Tensor Tensor::reshape(std::span<const std::int64_t> shape) const {
     if (!defined()) {
         throw std::invalid_argument("cannot reshape an undefined tensor");
     }
-    if (!is_contiguous()) return contiguous().reshape(shape);
+    if (!is_contiguous()) {
+        const auto* option=mfq::cuda::env_lookup("MFQ_TENSOR_VIEW_RESHAPE");
+        if(option && option[0]=='0')return contiguous().reshape(shape);
+        // Validate/infer the requested dimensions without copying storage.
+        auto packed=view_;packed.rank=1;packed.sizes[0]=numel();packed.strides[0]=1;
+        auto result=reshape_view(packed,shape);
+        if(numel()==0)return Tensor(storage_,result,byte_offset_);
+        // Each contiguous source chunk can be split or joined independently.
+        // A row gap (grouped projection), transpose or broadcast stays a gap;
+        // a reshape crossing it still requires the original copy.
+        int output_axis=int(result.rank)-1;
+        int64_t source_count=1,output_count=1,chunk_stride=view_.strides[view_.rank-1];
+        bool compatible=true;
+        for(int axis=int(view_.rank)-1;axis>=0;--axis) {
+            source_count*=view_.sizes[axis];
+            const bool boundary=axis==0 || (view_.sizes[axis-1]!=1 &&
+                view_.strides[axis-1]!=source_count*chunk_stride);
+            if(!boundary)continue;
+            while(output_axis>=0 && (output_count<source_count || result.sizes[output_axis]==1)) {
+                result.strides[output_axis]=output_count*chunk_stride;
+                output_count*=result.sizes[output_axis];--output_axis;
+            }
+            if(output_count!=source_count){compatible=false;break;}
+            if(axis>0){chunk_stride=view_.strides[axis-1];source_count=output_count=1;}
+        }
+        if(compatible && output_axis==-1)return Tensor(storage_,result,byte_offset_);
+        return contiguous().reshape(shape);
+    }
     return Tensor(storage_, reshape_view(view_, shape), byte_offset_);
 }
 

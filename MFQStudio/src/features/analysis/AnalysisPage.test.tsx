@@ -31,23 +31,96 @@ it('inspects an unloaded checkpoint with four expert heatmaps and projection det
   expect(screen.getAllByRole('img').filter(item => item.tagName === 'CANVAS')).toHaveLength(4);
   const experts = analysisFixture().experts;
   for (const projection of [undefined, 'gate', 'up', 'down']) {
-    const title = projection ? projection[0].toUpperCase() + projection.slice(1) : 'Routed expert precision';
+    const title = projection ? projection[0].toUpperCase() + projection.slice(1) : 'FFN precision';
     const section = screen.getByRole('heading', { name: title }).closest('section')!;
     expect(section.querySelector('.precision-chart-average')).toHaveTextContent(`Average ${averageBpw(expertPoints(experts, projection).values())!.toFixed(3)} bpw`);
   }
   expect(fillRect.mock.calls.filter(call => call[2] === 2).every(call => call[3] === 7)).toBe(true);
   fireEvent.focus(screen.getAllByRole('img').find(item => item.tagName === 'CANVAS')!);
   expect(screen.getByText('L0 · E0')).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('tab', { name: 'Attention & projections' }));
+  fireEvent.click(screen.getByRole('tab', { name: 'Attention & other projections' }));
   expect(screen.getByRole('combobox', { name: 'Select projection' })).toBeInTheDocument();
-  expect(screen.getByRole('img', { name: 'query per-layer bpw bar heatmap' })).toBeInTheDocument();
-  expect(screen.getByText('Average 6.400 bpw')).toBeInTheDocument();
+  expect(screen.getByRole('img', { name: 'All per-layer bpw bar heatmap' })).toBeInTheDocument();
+  expect(screen.getByRole('combobox', { name: 'Select projection' })).toHaveValue('all');
+  expect(screen.getByRole('heading', { name: 'Selected projection precision' })).toBeInTheDocument();
   fireEvent.change(screen.getByRole('combobox', { name: 'Select projection' }), { target: { value: 'gdn:qkv' } });
   expect(screen.getByText('Average 5.200 bpw')).toBeInTheDocument();
   fireEvent.click(screen.getByText('Tensor details'));
   fireEvent.change(screen.getByRole('textbox', { name: 'Search tensors' }), { target: { value: 'block.11.' } });
   expect(screen.getByText('model.block.11.attention.query.weight')).toBeInTheDocument();
   expect(screen.queryByText('model.block.0.linear_attention.qkv.weight')).not.toBeInTheDocument();
+});
+
+it('shows Dense FFN total and Gate/Up/Down bars with the absolute grayscale scale', async () => {
+  vi.mocked(modelsApi.checkpointAnalysis).mockResolvedValue(analysisFixture(true));
+  const { container } = render(<MemoryRouter><AnalysisPage /></MemoryRouter>);
+  await screen.findByText('Model structure');
+  expect(within(screen.getByRole('tablist', { name: 'Quantization charts' })).getByRole('tab', { name: 'FFN' })).toHaveAttribute('aria-selected', 'true');
+  expect(container.querySelectorAll('.expert-heatmap canvas')).toHaveLength(0);
+  const charts = container.querySelectorAll('.dense-ffn-bars .projection-bars');
+  expect(charts).toHaveLength(4);
+  for (const chart of charts) {
+    expect(chart.querySelector('.precision-chart-average')).toHaveTextContent('Average 4.000 bpw');
+    expect(chart.querySelector('.precision-legend')).toHaveTextContent('1.08+ bpw');
+    expect(chart.querySelectorAll('rect[fill^="rgb"]')).toHaveLength(12);
+  }
+  expect(screen.getByRole('img', { name: 'FFN per-layer bpw bar heatmap' })).toBeInTheDocument();
+  for (const projection of ['gate', 'up', 'down']) {
+    expect(screen.getByRole('img', { name: `${projection} per-layer bpw bar heatmap` })).toBeInTheDocument();
+  }
+  fireEvent.click(screen.getByRole('tab', { name: 'Attention & other projections' }));
+  const option = within(screen.getByRole('combobox', { name: 'Select projection' })).getByRole('option', { name: 'GQA · query' });
+  expect(option).toHaveValue('attention:query');
+  expect(container.querySelector('.analysis-projection-table')).toHaveTextContent('GQA');
+});
+
+it('keeps Shared charts collapsed, excludes FFN from All and places both routers in other projections', async () => {
+  const analysis = analysisFixture();
+  for (const category of ['ffn', 'shared_expert', 'routed_experts']) {
+    for (const projection of ['gate', 'up', 'down']) {
+      analysis.tensors.push({ name: `model.block.0.${category}.${projection}.weight`, shape: [4, 8],
+        category, projection, layer: 0, parameters: 32, stored_bytes: 8, bpw: 2, format: 'NINTv2' });
+      analysis.projections.push({ name: projection, category, parameters: 32, stored_bytes: 8,
+        average_bpw: 2, tensor_count: 1, formats: ['NINTv2'] });
+    }
+  }
+  for (const [category, bpw] of [['router', 2], ['shared_expert', 16]] as const) {
+    analysis.tensors.push({ name: `model.block.0.${category}.router.weight`, shape: [4, 8], category, projection: 'router',
+      layer: 0, parameters: 32, stored_bytes: bpw * 4, bpw, format: 'NINTv2' });
+    analysis.projections.push({ name: 'router', category, parameters: 32, stored_bytes: bpw * 4, average_bpw: bpw,
+      tensor_count: 1, formats: ['NINTv2'] });
+  }
+  vi.mocked(modelsApi.checkpointAnalysis).mockResolvedValue(analysis);
+  const { container } = render(<MemoryRouter><AnalysisPage /></MemoryRouter>);
+  await screen.findByText('Model structure');
+  const shared = container.querySelector('.analysis-shared-ffn') as HTMLDetailsElement;
+  expect(shared.open).toBe(false);
+  expect(shared.querySelectorAll('.projection-bars')).toHaveLength(4);
+  fireEvent.click(within(shared).getByText('Shared experts'));
+  expect(shared.open).toBe(true);
+  expect(within(shared).getByRole('img', { name: 'Shared FFN per-layer bpw bar heatmap' })).toBeInTheDocument();
+  expect(within(shared).getAllByText('Average 2.000 bpw')).toHaveLength(4);
+  fireEvent.click(screen.getByRole('tab', { name: 'Attention & other projections' }));
+  const choice = screen.getByRole('combobox', { name: 'Select projection' });
+  expect(choice).toHaveValue('all');
+  for (const option of within(choice).getAllByRole('option')) {
+    if (option.getAttribute('value') !== 'shared_expert:router') expect(option.getAttribute('value')).not.toMatch(/^(ffn|shared_expert|routed_experts):/);
+  }
+  expect(within(choice).getByRole('option', { name: 'Router · router' })).toBeInTheDocument();
+  expect(within(choice).getByRole('option', { name: 'Shared expert router · router' })).toBeInTheDocument();
+  expect(container.querySelectorAll('.other-projection-bars .precision-legend')).toHaveLength(1);
+  fireEvent.focus(container.querySelector('.other-projection-bars rect[role="button"]')!);
+  expect(container.querySelector('.other-projection-bars .chart-readout')).toHaveTextContent(`${((32768 * 5.2 + 32 * 18) / (32768 + 64)).toFixed(3)} bpw`);
+  fireEvent.change(choice, { target: { value: 'router:router' } });
+  fireEvent.click(container.querySelector('.other-projection-bars rect[role="button"]')!);
+  expect(container.querySelector('.other-projection-bars .chart-readout')).toHaveTextContent('2.000 bpw');
+  fireEvent.change(choice, { target: { value: 'shared_expert:router' } });
+  fireEvent.click(container.querySelector('.other-projection-bars rect[role="button"]')!);
+  expect(container.querySelector('.other-projection-bars .chart-readout')).toHaveTextContent('16.000 bpw');
+  fireEvent.change(choice, { target: { value: 'attention:query' } });
+  expect(screen.getByRole('img', { name: 'query per-layer bpw bar heatmap' })).toBeInTheDocument();
+  fireEvent.change(choice, { target: { value: 'all' } });
+  expect(screen.getByRole('img', { name: 'All per-layer bpw bar heatmap' })).toBeInTheDocument();
 });
 
 it('marks incomplete shards without requesting invented precision', async () => {
@@ -174,16 +247,29 @@ it('shows three budget lines, switches units and reports PLE separately', async 
   await screen.findByText('Model structure');
   const chart = container.querySelector('.layer-budget')!;
   expect(chart.querySelectorAll('.budget-line')).toHaveLength(3);
-  expect(chart.querySelector('.budget-legend')).toHaveTextContent('MoEAttentionTotal');
+  expect(chart.querySelector('.budget-legend')).toHaveTextContent('FFNAttentionTotal');
   expect(chart.querySelector('.analysis-special-weights')).toHaveTextContent('PLE tables1.07B2.000 GiB16.000');
   fireEvent.focus(chart.querySelector('rect[role="button"]')!);
   const readout = chart.querySelector('.chart-readout')!;
-  expect(readout).toHaveTextContent('MoE0.000 GiB · 4.000 bpw');
+  expect(readout).toHaveTextContent('FFN0.000 GiB · 4.000 bpw');
   expect(readout).toHaveTextContent('Attention0.000 GiB · 5.200 bpw');
   expect(readout).toHaveTextContent('Total0.000 GiB · 5.196 bpw');
   fireEvent.click(screen.getByRole('button', { name: 'GiB' }));
   expect(screen.getByRole('button', { name: 'GiB' })).toHaveAttribute('aria-pressed', 'true');
-  expect(chart.querySelector('rect[role="button"]')).toHaveAttribute('aria-label', 'L0: MoE 0.000, Attention 0.000, Total 0.000 GiB');
+  expect(chart.querySelector('rect[role="button"]')).toHaveAttribute('aria-label', 'L0: FFN 0.000, Attention 0.000, Total 0.000 GiB');
+});
+
+it('shows dense FFN budgets without putting their weights into Attention', async () => {
+  const analysis = analysisFixture(true);
+  vi.mocked(modelsApi.checkpointAnalysis).mockResolvedValue(analysis);
+  const { container } = render(<MemoryRouter><AnalysisPage /></MemoryRouter>);
+  await screen.findByText('Model structure');
+  const chart = container.querySelector('.layer-budget')!;
+  expect(chart.querySelector('.budget-legend')).toHaveTextContent('FFNAttentionTotal');
+  expect(chart).not.toHaveTextContent('MoE');
+  fireEvent.focus(chart.querySelector('rect[role="button"]')!);
+  expect(chart.querySelector('.budget-series-ffn.budget-readout-series')).toHaveTextContent('4.000 bpw');
+  expect(chart.querySelector('.budget-series-attention.budget-readout-series')).toHaveTextContent('5.200 bpw');
 });
 
 it('ignores a late response from the previously selected checkpoint', async () => {

@@ -1,3 +1,7 @@
+#include "kernels/qwen4_exp.h"
+#include "native/weight_memory.h"
+#include "ops/gated_residual.h"
+#include "native/env.h"
 #include "ops/execution/execution_options.h"
 #include "weight.h"
 #include "ops/format.h"
@@ -21,7 +25,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "storage/weights/moe/weight_loader.h"
-#include "storage/weights/loaders/quant.h"
+#include "quant.h"
 
 const mfq::TensorMetadata& require_tensor(
         const mfq::ModelSource& source,
@@ -99,9 +103,16 @@ mfq_tensor_backend::Tensor load_dense_gpu(
         CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
+    if (rec.dtype == "MFE") {
+        auto dense = materialize_mfe_dense(load_mfe_cpu(mfq, name))
+            .to(mfq_tensor_backend::kFloat32)
+            .contiguous();
+        return cpu_layer ? dense.cpu().contiguous() : dense;
+    }
     if (rec.dtype != "NINT8-0" && rec.dtype != "NINT") {
         auto value = load_dense_cpu(execution, mfq, name);
         if (rec.dtype == "BF16" || rec.dtype == "F16")
@@ -115,11 +126,10 @@ mfq_tensor_backend::Tensor load_dense_gpu(
             return dequant_nint8_zero_cpu(source);
         }
         const auto packed = to_gpu_nint8_zero(source);
-        auto dense = nint8_zero_dequant_cuda(
+        auto dense = nint8_zero_dequant_f32_cuda(
             packed.q_packed,
             packed.q8_zero_scale,
             packed.neuron_len)
-            .to(mfq_tensor_backend::kFloat32)
             .contiguous();
         if (packed.shape.size() != 2 ||
             dense.size(0) != packed.shape[0] ||
@@ -136,7 +146,7 @@ mfq_tensor_backend::Tensor load_dense_gpu(
 }
 
 static bool is_nint_linear_dtype(const std::string & dtype) {
-    return dtype == "NINT";
+    return dtype == "NINT" || dtype == "NINT8-0";
 }
 
 static bool is_nvq_linear_dtype(const std::string & dtype) {
@@ -214,6 +224,7 @@ QuantLinear load_quant_linear(
         std::optional<TensorParallelAxis> axis_override,
         const std::vector<mfq::TensorParallelSlice> *
             slices_override) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     const auto & dtype = require_tensor(mfq, name).dtype;
     QuantLinear result;
@@ -748,28 +759,35 @@ std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
 }
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
-        const mfq::ModelSource& source, const std::string& name) {
+        const mfq::ModelSource& source, const std::string& name, bool prefer_mapping) {
     const auto& metadata = require_tensor(source, name);
     MFQ_RUNTIME_CHECK(metadata.dtype == "NINT", "NINT row table requires packed NINT");
     MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
         "NINT row table size overflow");
     auto read = source.tensor_reader(name);
     bool parallel=source.supports_parallel_tensor_reads();
-    auto batch=source.tensor_batch_reader(name);
+    const auto* batched=mfq::cuda::env_lookup("MFQ_PLE_BATCH_READ");
+    auto batch=(!batched || batched[0]!='0') ? source.tensor_batch_reader(name) : mfq::ModelSource::TensorBatchReader{};
     bool mapped_file=false;
     const auto mapped=mfq::cuda::runtime_options::ple_file_map();
-    if(mapped.value_or(false)) {
-        if(auto mapping=source.mapped_tensor_reader(name)) {
+    if(mapped.value_or(prefer_mapping && source.file_read_stats().mode!=mfq::FileReadMode::Direct)) {
+        if(auto mapping=source.mapped_tensor_batch_reader(name)) {
+            batch=std::move(mapping);
+            read=[batch](uint64_t offset,std::byte* out,std::size_t count){batch({{offset,out,count}});};
+            parallel=true;mapped_file=true;
+        } else if(auto mapping=source.mapped_tensor_reader(name)) {
             read=std::move(mapping);parallel=true;batch={};mapped_file=true;
         }
     }
     if(const auto trace=mfq::cuda::runtime_options::trace_ple_timings();trace && *trace)
         std::fprintf(stderr,"nint_row_source mapped_file=%d nbytes=%llu name=%s\n",int(mapped_file),
             static_cast<unsigned long long>(metadata.nbytes),name.c_str());
-    return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
+    auto table=std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
         [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
             read(offset, reinterpret_cast<std::byte*>(out), count);
         }, parallel,std::move(batch));
+    mfq::cuda::observe_streamed_ple(table,static_cast<std::size_t>(metadata.nbytes));
+    return table;
 }
 
 MfeWeight load_mfe_gpu(
@@ -778,66 +796,65 @@ MfeWeight load_mfe_gpu(
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     auto& cache = execution.stores.moe_expert_cache;
     if (cache && cacheable &&
             !moe_parallel_config(execution).enabled() &&
             execution.config.moe_ssd_ranges) {
         const auto & record = require_tensor(mfq, name);
         mfq::ModelSource::TensorReader reader;
+        mfq::ModelSource::TensorBatchReader batch_reader;
         try {
-            reader=mfq.tensor_reader(name);
+            // Streaming workers read independent experts concurrently. A
+            // shared buffered FILE serializes their seeks across all fields.
+            const bool direct=mfq.file_read_stats().mode==mfq::FileReadMode::Direct;
+            bool mapped=false;
+            if(!execution.config.moe_preload_all && !direct) {
+                reader=mfq.mapped_tensor_reader(name);
+                batch_reader=mfq.mapped_tensor_batch_reader(name);
+                mapped=bool(reader);
+            }
+            // Final GPU allocation can leave too little RAM for complete
+            // residency. Keep batched I/O ready even when that decision is
+            // made after these canonical sources have been registered.
+            if(!batch_reader)batch_reader=mfq.tensor_batch_reader(name);
+            if(direct && batch_reader)reader=[batch=batch_reader](uint64_t offset,std::byte* out,std::size_t count) {
+                batch({{offset,out,count}});
+            };
+            if(!reader)reader=mfq.tensor_reader(name);
+            static std::atomic_bool reported{false};
+            if(reader && !reported.exchange(true))
+                std::fprintf(stderr,"moe_ssd_source_dispatch mapped=%d parallel_reads=%d batch_fields=%d direct=%d\n",
+                    int(mapped),int(mapped || mfq.supports_parallel_tensor_reads()),int(bool(batch_reader)),int(direct));
         } catch (const mfq::TensorReaderUnsupported&) {
             // Sources without retained readers keep the existing CPU loader.
         }
         if (reader) {
             if (record.dtype == "NINT") {
+                if(batch_reader)batch_reader=[batch=std::move(batch_reader)](const std::vector<mfq::ReadSpan>& spans) {
+                    static std::atomic_bool reported{false};
+                    if(!reported.exchange(true))
+                        std::fprintf(stderr,"moe_nint_expert_batch_dispatch fields=%zu\n",spans.size());
+                    batch(spans);
+                };
                 auto store = mfq::make_packed_nint_expert_store(record.nbytes,
                     [reader](std::size_t offset, std::uint8_t* output, std::size_t bytes) {
                         reader(offset, reinterpret_cast<std::byte*>(output), bytes);
-                    });
+                    },std::move(batch_reader));
                 const int minimum = std::min(execution.moe_cache_registration_min_slots, store->num_experts());
                 return cache_quant_moe_weight(cache, name,
                     std::make_shared<MoeQuantRangeSource>(std::move(store)), minimum, layer_id, projection_role);
             }
             try {
-                auto store =
-                    std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
-                        mfq::cuda::MfqRecordRange{
-                            name,
-                            record.dtype,
-                            {},
-                            0,
-                            record.nbytes,
-                            [reader](
-                                    std::uint64_t offset,
-                                    std::span<std::uint8_t> destination) {
-                                reader(offset,
-                                    reinterpret_cast<std::byte*>(destination.data()),
-                                    destination.size());
-                            },
-                        });
-                auto runtime = make_mxfp4_range_runtime(*store);
-                return cache_moe_weight(
-                    cache,
-                    name,
-                    runtime,
-                    std::min(
-                        execution.moe_cache_registration_min_slots,
-                        runtime->n_experts),
-                    layer_id,
-                    projection_role, std::move(store));
-            } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
-                try {
-                    auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
-                        [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
-                            reader(offset,reinterpret_cast<std::byte*>(output),bytes);
-                        });
-                    const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
-                    return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
-                        minimum,layer_id,projection_role);
-                } catch (const mfq::MfeQuantRangeUnsupported&) {
-                    // Other canonical pool families retain the existing CPU path.
-                }
+                auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
+                    [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
+                        reader(offset,reinterpret_cast<std::byte*>(output),bytes);
+                    },batch_reader);
+                const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
+                return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
+                    minimum,layer_id,projection_role);
+            } catch (const mfq::MfeQuantRangeUnsupported&) {
+                // Other canonical pool families retain the existing CPU path.
             }
         }
     }
@@ -916,8 +933,10 @@ std::shared_ptr<const QuantLinear> linear_weight(const Linear& function) {
     const auto* loaded=function.target<LoadedLinear>();return loaded?loaded->weight:nullptr;
 }
 
-LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions) {
+LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions,
+                           std::size_t joined_prefix) {
     if (functions.empty() || execution.loading_cpu_layer || !execution.config.diagnostic_nint_group) return {};
+    MFQ_RUNTIME_CHECK(joined_prefix>=1 && joined_prefix<=functions.size(),"invalid grouped projection prefix");
     std::vector<QuantLinear> weights;
     weights.reserve(functions.size());
     for (const auto& function : functions) {
@@ -962,17 +981,40 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
     MFQ_RUNTIME_CHECK(row == 0 && matrix_index == (group->nint.split_w.empty() ? 1 : group->nint.split_w.size()),
         "grouped projection storage is not fully covered");
     functions = separate;
-    return [group=std::move(group), separate=std::move(separate)](CudaExecutionContext& context, const Tensor& input) {
+    // Q/K/V already occupy adjacent rows of the same packed projection. Change
+    // only the returned view boundaries, preserving all separate GEMM weights.
+    bool joined_view=joined_prefix>1 && (group->nint.split_w.empty() ||
+        group->nint.split_outs.front().size()>=joined_prefix);
+    const auto join_sizes=[joined_prefix](auto& sizes) {
+        const auto combined=std::accumulate(sizes.begin(),sizes.begin()+joined_prefix,int64_t(0));
+        sizes.erase(sizes.begin(),sizes.begin()+joined_prefix);sizes.insert(sizes.begin(),combined);
+    };
+    if(joined_view) {
+        if(group->nint.split_w.empty())join_sizes(group->nint.outs);
+        else join_sizes(group->nint.split_outs.front());
+    }
+    return [group=std::move(group), separate=std::move(separate),joined_prefix,joined_view](CudaExecutionContext& context, const Tensor& input) {
+        const auto join=[joined_prefix](std::vector<Tensor> outputs) {
+            if(joined_prefix<=1)return outputs;
+            std::vector<Tensor> prefix(outputs.begin(),outputs.begin()+joined_prefix);
+            auto joined=tb::cat(prefix,-1);
+            outputs.erase(outputs.begin(),outputs.begin()+joined_prefix);
+            outputs.insert(outputs.begin(),std::move(joined));return outputs;
+        };
         if (input.is_cuda() && context.kl_mmq.mode == KlMmqMode::Default &&
-            input.numel() / input.size(-1) <= 8) return group->forward(context, input);
+            input.numel() / input.size(-1) <= 8) {
+            auto outputs=group->forward(context,input);
+            return joined_view?outputs:join(std::move(outputs));
+        }
         std::vector<Tensor> outputs;
         outputs.reserve(separate.size());
         for (const auto& projection : separate) outputs.push_back(projection(context, input));
-        return outputs;
+        return join(std::move(outputs));
     };
 }
 
 ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
     MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint(),
         "floating residual projection requires dense or NINT weights: ", name);
@@ -994,7 +1036,27 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
                 return tb::matmul(input.to(tb::kFloat32),promoted);
             return mfq_selected_attention::promoted_matmul(input,right);
         };
-        return {std::move(forward),{}, {},std::move(weight),std::move(prepared_right)};
+        GatedResidualActivationProjection activated;
+        GatedResidualMixProjection mixed;
+        if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
+                (name=="model.mhc.pre.down.weight" || name=="predictor.mhc.pre.down.weight"))
+            activated=[weight,forward](CudaExecutionContext& execution,const Tensor& input,int64_t streams,bool injection) {
+                const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
+                if(!injection && (!option || *option))
+                    if(auto output=try_gr_bf16_down_cuda(input,weight->dense,streams);output.defined())return output;
+                auto projected=forward(execution,input);
+                return injection?mfq_qwen4_exp::gated_residual_injection(projected,streams):
+                    mfq_qwen4_exp::gated_residual_bottleneck(projected,streams);
+            };
+        if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
+                (name=="model.mhc.pre.up.weight" || name=="predictor.mhc.pre.up.weight"))
+            mixed=[weight,forward](CudaExecutionContext& execution,const Tensor& input,const Tensor& normalized,int64_t streams) {
+                const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
+                if(!option || *option)
+                    if(auto output=try_gr_bf16_up_mix_cuda(input,normalized,weight->dense,streams);output.defined())return output;
+                return mfq_qwen4_exp::gated_residual_mix(forward(execution,input),normalized,streams);
+            };
+        return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),std::move(prepared_right)};
     }
     Linear forward=[weight](CudaExecutionContext& execution, const Tensor& input) {
         auto output = execution.profiler.measure("nint.float_projection", [&] {
@@ -1020,14 +1082,24 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
                 execution.config.gr_native_projection_input,execution.config.gr_fixed_group_projection);
         });
     };
-    return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight)};
+    Tensor group_coefficients;
+    const auto group_option=mfq::cuda::runtime_options::gr_up_group_coefficients();
+    if(group_option && *group_option!='0' && weight->nint.aligned_q8 && !weight->nint.q8_zero &&
+            weight->nint.gs==48 && weight->nint.out==10240 && weight->nint.neuron_len==320)
+        group_coefficients=*group_option=='2'?prepare_gr_up_packed_metadata(weight->nint):
+            prepare_gr_up_group_coefficients(weight->nint);
+    return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),Tensor{},std::move(group_coefficients)};
 }
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const auto& dtype=require_tensor(file, name).dtype;
-    MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
+    const bool dense_storage = dtype=="F32" || dtype=="F16" || dtype=="BF16";
+    const bool quantized_storage = dtype=="NINT" || dtype=="NINT8-0" || dtype=="MFE";
+    MFQ_RUNTIME_CHECK(dense_storage || quantized_storage,
         "expected a dense parameter: ",name);
     auto value=load_dense_gpu(execution, file,name);
+    if (!dense_storage) return value;
     return value.to(dtype=="F16" ? tb::kFloat16 : dtype=="BF16" ? tb::kBFloat16 : tb::kFloat32);
 }
 
@@ -1133,6 +1205,7 @@ mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
 mfq_tensor_backend::Tensor load_dense_native_gpu(CudaExecutionContext &execution,
                                                  const mfq::ModelSource &source,
                                                  const std::string &name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     MfqCudaGuard guard(active_weight_load_device(execution));
     return load_dense_cpu(execution, source, name).to(mfq_tensor_backend::kCUDA).contiguous();
 }

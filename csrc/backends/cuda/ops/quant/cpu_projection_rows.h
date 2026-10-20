@@ -1,8 +1,9 @@
 #pragma once
-#include "packed_nint.h"
-#include "nvq_group.h"
+#include "csrc/backends/cpu/ops/packed_nint.h"
+#include "csrc/backends/cpu/ops/nvq_group.h"
 #include "nint.h"
 #include "vq.h"
+#include "mx.h"
 #include <functional>
 
 // The plan borrows an immutable expert lease. It never converts activations
@@ -23,3 +24,4 @@ struct CpuProjectionRows {
 };
 CpuProjectionRows make_cpu_projection_rows(const NintWeight&);
 CpuProjectionRows make_cpu_projection_rows(const NvqWeight&);
+CpuProjectionRows make_cpu_projection_rows(const Mxfp4Weight&);

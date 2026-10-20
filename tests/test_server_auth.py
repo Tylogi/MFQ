@@ -34,6 +34,9 @@ def test_scoped_keys_rotate_revoke_and_never_persist_plaintext(tmp_path: Path) -
             assert (await client.get("/api/v1/jobs", headers=job_key)).status_code == 501
             assert (await client.get("/api/v1/sessions", headers=job_key)).status_code == 403
             assert (await client.get("/api/v1/auth/keys", headers=job_key)).status_code == 403
+            desktop_denied = await client.get("/api/v1/auth/keys", headers={**job_key, "Origin": "tauri://localhost"})
+            assert desktop_denied.status_code == 403
+            assert desktop_denied.headers["access-control-allow-origin"] == "tauri://localhost"
 
             operator = await client.post(
                 "/api/v1/auth/keys",

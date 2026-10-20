@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/common/block.h"
+#include "block.h"
 #include "models/common/ffn.h"
 #include "common/weight_loading.h"
 

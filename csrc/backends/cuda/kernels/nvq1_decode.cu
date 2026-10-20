@@ -1,5 +1,5 @@
 #include "native/env.h"
-#include "kernels/nvq1_decode.h"
+#include "nvq1_decode.h"
 #include "kernels/quant/packed_nvq.cuh"
 #include <cstdlib>
 #include <type_traits>
@@ -151,17 +151,7 @@ bool nvq1_try_decode_cuda(Nvq1DecodeView w,mfq_tensor_backend::Tensor x,mfq_tens
     const int routes=int(ids.size(1)),pairs=int(ids.numel()),input_rows=int(x.numel()/x.size(-1));
     auto stream=mfq_current_cuda_stream();
     const auto* quant_setting=mfq::cuda::env_lookup("MFQ_NVQ1_QUANT_WARPS");
-    int automatic_warps=1;
-    if(!quant_setting && !quantized && w.groups<=32 && input_rows>=10) {
-        thread_local int cached_device=-1,major=0,minor=0;
-        const int device=output.get_device();
-        if(device!=cached_device) {
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device));
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device));
-            cached_device=device;
-        }
-        if(major==8 && minor==6)automatic_warps=4;
-    }
+    const int automatic_warps=!quantized && w.groups<=32 && input_rows>=10?4:1;
     const int requested=quant_setting?std::atoi(quant_setting):automatic_warps;
     const int quant_warps=requested==2 || requested==4 || requested==8?requested:1;
     if(!quantized)quantize_input<<<dim3(input_rows,(w.groups+quant_warps-1)/quant_warps),dim3(32,quant_warps),0,stream>>>(

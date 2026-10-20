@@ -1,5 +1,5 @@
-#include "mfq_container.h"
-#include "mlx_deepseek_v4_causal_lm.h"
+#include "storage/mfq_container.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
 #include "transport.h"
 
 #include <algorithm>

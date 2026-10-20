@@ -1,6 +1,6 @@
-#include "mlx_deepseek_v4_causal_lm.h"
-#include "mlx_eval_timing.h"
-#include "mfq_container.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
+#include "runtime/mlx_eval_timing.h"
+#include "storage/mfq_container.h"
 
 #include <mlx/mlx.h>
 

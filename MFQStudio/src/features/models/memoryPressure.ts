@@ -3,7 +3,7 @@ import type { HubModelVariant, HubSystemProfile } from '../../shared/api/types';
 export type WeightRoles = Partial<Record<'dense' | 'experts' | 'embedding', number>>;
 export type PressureSystem = Pick<HubSystemProfile, 'memory_pools' | 'physical_memory_bytes' | 'runtime_memory_budget_bytes'>;
 export interface PressureRow {
-  kind: 'vram' | 'ram' | 'shared';
+  kind: 'vram' | 'ram' | 'shared' | 'combined';
   required: number | null | undefined;
   available: number | null | undefined;
 }
@@ -12,16 +12,18 @@ export function variantMemoryPressureRows(variant: HubModelVariant | undefined, 
   if (!variant) return undefined;
   return memoryPressureRows({ weights: variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
       ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes),
-    roles: variant.estimated_weight_bytes_by_role, system, cacheBytes, moe, available: variant.configuration.available_memory_bytes });
+    roles: variant.estimated_weight_bytes_by_role, system, cacheBytes, moe, combineMoe: true,
+    available: variant.configuration.available_memory_bytes });
 }
 
-export function memoryPressureRows({ weights, roles, system, available, cacheBytes = 0, moe = false }: {
+export function memoryPressureRows({ weights, roles, system, available, cacheBytes = 0, moe = false, combineMoe = false }: {
   weights?: number | null;
   roles?: WeightRoles;
   system?: PressureSystem;
   available?: number | null;
   cacheBytes?: number;
   moe?: boolean;
+  combineMoe?: boolean;
 }): PressureRow[] {
   const pools = system?.memory_pools ?? [];
   const vram = pools.find(pool => pool.kind === 'vram');
@@ -30,6 +32,11 @@ export function memoryPressureRows({ weights, roles, system, available, cacheByt
       available: available ?? system?.runtime_memory_budget_bytes ?? system?.physical_memory_bytes }];
   }
   if (moe || (roles?.experts ?? 0) > 0) {
+    if (combineMoe) {
+      const ram = pools.find(pool => pool.kind === 'ram')?.capacity_bytes ?? system?.physical_memory_bytes;
+      return [{ kind: 'combined', required: weights == null ? null : weights + cacheBytes,
+        available: vram.capacity_bytes == null || ram == null ? null : vram.capacity_bytes + ram }];
+    }
     return [{ kind: 'vram', required: roles?.dense == null ? null : roles.dense + cacheBytes,
       available: vram.capacity_bytes },
     { kind: 'ram', required: roles?.experts == null || roles?.embedding == null ? null : roles.experts + roles.embedding,

@@ -1,4 +1,4 @@
-#include "mlx_linear_attention.h"
+#include "ops/mlx_linear_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -462,6 +462,93 @@ void test_gdn_decode_step(
     require_vector_close(
         recurrent_state.data<float>(), recurrent_state_data, 0.0f,
         "GDN retained recurrent checkpoint");
+
+    for (const bool silu_gate : {false, true}) {
+        std::vector<mfq::metal::MlxGatedDeltaDecodeInput> rows{
+            {qk, value, output_gate, alpha, beta, convolution_state, recurrent_state},
+            {astype(qk * array(.7f), qk.dtype()), astype(value * array(.8f), value.dtype()), output_gate, alpha, beta,
+                convolution_state * array(.3f), recurrent_state * array(.5f)}};
+        for (int step = 0; step < 4; ++step) {
+            std::vector<mfq::metal::MlxGatedDeltaDecodeResult> expected;
+            for (const auto& row : rows)
+                expected.push_back(mfq::metal::gated_delta_decode_step(row.qk, row.value,
+                    row.output_gate, row.alpha, row.beta, row.convolution_state, row.recurrent_state,
+                    convolution_weight, bias, decay, norm, key_heads, value_heads, dimension,
+                    1e-6f, 1e-6f, silu_gate));
+            auto actual = mfq::metal::gated_delta_decode_steps(rows, convolution_weight,
+                bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f, silu_gate);
+            std::vector<array> evaluated;
+            for (std::size_t row = 0; row < rows.size(); ++row)
+                evaluated.insert(evaluated.end(), {expected[row].output, expected[row].convolution_state,
+                    expected[row].recurrent_state, actual[row].output, actual[row].convolution_state,
+                    actual[row].recurrent_state});
+            eval(evaluated);
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                const std::array<array, 3> reference{expected[row].output,
+                    expected[row].convolution_state, expected[row].recurrent_state};
+                const std::array<array, 3> result{actual[row].output,
+                    actual[row].convolution_state, actual[row].recurrent_state};
+                for (int field = 0; field < 3; ++field)
+                    require_vector_close(result[field].data<float>(), std::vector<float>(
+                        reference[field].data<float>(), reference[field].data<float>() + reference[field].size()),
+                        0.0f, "GDN independent multi-request state");
+                rows[row].convolution_state = std::move(actual[row].convolution_state);
+                rows[row].recurrent_state = std::move(actual[row].recurrent_state);
+            }
+        }
+    }
+
+    for (const bool silu_gate : {false, true}) {
+        for (int tokens = 2; tokens <= 6; ++tokens) {
+            std::vector<array> qs, vs, zs, as, bs;
+            for (int token = 0; token < tokens; ++token) {
+                const auto scaled = [&](const array& value, float amount) {
+                    return astype(value * array(amount), value.dtype());
+                };
+                qs.push_back(scaled(qk, 1.0f + token * .13f));
+                vs.push_back(scaled(value, .8f + token * .07f));
+                zs.push_back(scaled(output_gate, .7f + token * .11f));
+                as.push_back(scaled(alpha, .9f + token * .05f));
+                bs.push_back(scaled(beta, .6f + token * .03f));
+            }
+            const std::vector<mfq::metal::MlxGatedDeltaDecodeInput> requests{
+                {concatenate(qs, 1), concatenate(vs, 1), concatenate(zs, 1),
+                    concatenate(as, 1), concatenate(bs, 1), convolution_state, recurrent_state},
+                {concatenate(qs, 1), concatenate(vs, 1), concatenate(zs, 1),
+                    concatenate(as, 1), concatenate(bs, 1), convolution_state * array(.3f),
+                    recurrent_state * array(.5f)}};
+            auto actual = mfq::metal::gated_delta_decode_steps(requests, convolution_weight,
+                bias, decay, norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f, silu_gate);
+            for (std::size_t row = 0; row < requests.size(); ++row) {
+                auto conv = requests[row].convolution_state;
+                auto state = requests[row].recurrent_state;
+                std::vector<array> output;
+                for (int token = 0; token < tokens; ++token) {
+                    auto step = mfq::metal::gated_delta_decode_step(qs[token], vs[token], zs[token],
+                        as[token], bs[token], conv, state, convolution_weight, bias, decay,
+                        norm, key_heads, value_heads, dimension, 1e-6f, 1e-6f, silu_gate);
+                    output.push_back(std::move(step.output));
+                    conv = std::move(step.convolution_state);
+                    state = std::move(step.recurrent_state);
+                }
+                auto gates = mfq::metal::gated_delta_gates(requests[row].alpha,
+                    requests[row].beta, bias, decay);
+                const std::array<array, 5> expected{concatenate(output, 1), conv, state,
+                    gates.gate, gates.beta};
+                if (!actual[row].gate || !actual[row].beta)
+                    throw std::runtime_error("GDN sequence lost replay gates");
+                const std::array<array, 5> result{actual[row].output, actual[row].convolution_state,
+                    actual[row].recurrent_state, *actual[row].gate, *actual[row].beta};
+                for (int field = 0; field < 5; ++field) {
+                    eval(expected[field], result[field]);
+                    require_vector_close(result[field].data<float>(), std::vector<float>(
+                        expected[field].data<float>(), expected[field].data<float>() + expected[field].size()),
+                        field >= 3 ? 5e-7f : field == 1 ? 0.0f : 5e-6f,
+                        "GDN fused sequence versus independent decode");
+                }
+            }
+        }
+    }
 
     bool rejected = false;
     try {

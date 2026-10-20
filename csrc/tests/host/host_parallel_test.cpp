@@ -1,4 +1,5 @@
 #include "mfq/host_parallel.h"
+#include "mfq/host_copy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,30 @@ void coverage(int threads, int count) {
             for (auto i = begin; i < end; ++i) ++visits[i-17];
         });
     for (const auto& visit : visits) require(visit == 1, "host work omitted or duplicated");
+}
+
+void copy_checks() {
+    const std::size_t width=(2u<<20)+7;
+    std::vector<std::vector<unsigned char>> inputs(4),outputs(4);
+    std::vector<mfq::HostCopy> copies;
+    for(std::size_t i=0;i<inputs.size();++i) {
+        inputs[i].resize(width);
+        for(std::size_t j=0;j<width;++j)inputs[i][j]=static_cast<unsigned char>(j*17+i*79);
+        outputs[i].assign(width+2,0x5a);
+        copies.push_back({outputs[i].data()+1,inputs[i].data(),width});
+    }
+    for(int round=0;round<3;++round) {
+        mfq::copy_host_ranges(copies);
+        for(std::size_t i=0;i<inputs.size();++i)
+            require(outputs[i].front()==0x5a && outputs[i].back()==0x5a &&
+                    std::equal(inputs[i].begin(),inputs[i].end(),outputs[i].begin()+1),
+                    "parallel host copy changed bytes or destination guards");
+    }
+    mfq::copy_host_ranges({{nullptr,nullptr,0}});
+    unsigned char guard=0x5a;bool rejected=false;
+    try{mfq::copy_host_ranges({{&guard,inputs[0].data(),1},{nullptr,inputs[1].data(),1}});}
+    catch(const std::invalid_argument&){rejected=true;}
+    require(rejected && guard==0x5a,"invalid host copy modified an earlier destination");
 }
 
 void baseline(std::int64_t end, int threads,
@@ -187,7 +212,8 @@ int main(int argc, char**) {
         catch (const std::runtime_error& error) { rejected = std::string(error.what()) == "worker init failed"; }
         require(rejected, "worker initialization failure did not reach the caller");
         mfq::host_parallel_for(0, 0, 1, 12, [](auto, auto) { throw std::runtime_error("empty work invoked"); });
-        std::cout << "Host pool: coverage, concurrency, nested work and failure recovery passed\n";
+        copy_checks();
+        std::cout << "Host pool: coverage, concurrency, nested work, copy guards and failure recovery passed\n";
         if (argc>1) benchmark();
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -33,6 +33,7 @@ struct GenerationStats {
     std::uint64_t standard_tokens = 0;
     std::uint64_t park_count = 0;
     std::uint64_t reentry_probes = 0;
+    double target_ms = 0, head_ms = 0, rollback_ms = 0;
 };
 
 } // namespace mfq::engine::mtp
@@ -184,7 +185,11 @@ struct EngineRequest {
     std::optional<DiagnosticTokenInput> diagnostic_input;
 };
 
-struct PrefillProgress { MfqPrefillTiming timing; };
+struct PrefillProgress {
+    MfqPrefillTiming timing;
+    // Prompt state is ready for caching before decode timing starts.
+    bool session_boundary = false;
+};
 struct UsageUpdate { std::size_t prompt_tokens = 0, completion_tokens = 0; };
 // Text/tool output travels only in deltas, so terminals have a bounded size.
 struct Completed { std::string finish_reason; UsageUpdate usage; InferenceMetrics metrics; };
@@ -210,6 +215,7 @@ struct EngineInfo {
     ModelCapabilities capabilities;
     std::string backend;
     bool probability = false;
+    std::unordered_set<std::int64_t> stop_token_ids;
 };
 struct EngineStatus {
     std::size_t available = 0;
@@ -234,6 +240,8 @@ struct SessionCommand {
     std::string source, target;
     std::uint64_t bytes = 0;
     std::optional<std::uint64_t> disk_bytes;
+    std::optional<std::uint64_t> weight_bytes;
+    std::optional<std::uint64_t> ram_bytes;
 };
 struct SessionResult { std::uint64_t count = 0; Metrics metrics; };
 struct DecodeTokens {

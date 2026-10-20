@@ -12,8 +12,8 @@ http://127.0.0.1:8090
 ```
 
 The versioned API root is `http://127.0.0.1:8090/api/v1`. The current OpenAPI
-contract contains 57 HTTP paths and 75 operations. The unversioned `/health`
-endpoint is not part of OpenAPI.
+contract contains 88 HTTP paths and 112 operations. The unversioned `/health`
+endpoint and the compatibility endpoints under `/v1` are not part of OpenAPI.
 
 The running server exposes Swagger and the live schema at:
 
@@ -50,8 +50,9 @@ additional scopes:
 | Sessions, presets, media, and documents | `inference` |
 | `GET` operations under `/models`, `/runtime`, and `/hub` | `inference` |
 | Model or runtime mutations | `models` |
-| Jobs, lineage, datasets, and evaluations | `jobs` |
-| Key management and cluster nodes | `admin` |
+| Jobs, lineage, datasets, evaluations, and quantization | `jobs` |
+| Admin routes: auth keys, cluster nodes, prefix-cache inspection and purge, listener and policy `PUT` | `admin` |
+| `/v1` compatibility endpoints | `inference` |
 
 The `admin` scope permits every operation. `/health` is outside `/api/` and
 never requires a bearer credential.
@@ -130,6 +131,13 @@ parameters and field constraints.
 | `POST` | `/api/v1/auth/keys` | `CreateApiKeyRequest` | `201 ApiKeySecretResource` |
 | `POST` | `/api/v1/auth/keys/{key_id}/revoke` | — | `200 ApiKeyResource` |
 | `POST` | `/api/v1/auth/keys/{key_id}/rotate` | — | `200 ApiKeySecretResource` |
+| `GET` | `/api/v1/auth/policy` | — | `200 Object` |
+| `PUT` | `/api/v1/auth/policy` | `AuthenticationPolicyRequest` | `200 Object` |
+
+The policy routes report and change runtime authentication state. `PUT` may
+enable authentication and set a new root key, or disable it; disabling is
+rejected with `400 authentication_required` while the server listens on a
+non-loopback address, and the change is persisted across restarts.
 
 ### 2.2 Sessions
 
@@ -203,10 +211,37 @@ jobs.
 | `POST` | `/api/v1/models/directories/register` | `RegisterModelDirectoryRequest` | `200 ModelArtifactList` |
 | `POST` | `/api/v1/models/load` | `ModelLoadRequest` | `202 OperationAccepted` |
 | `POST` | `/api/v1/models/unload` | `ModelUnloadRequest` | `202 OperationAccepted` |
+| `GET` | `/api/v1/hub/official` | — | `200 OfficialModelList` |
+| `POST` | `/api/v1/hub/resolve` | `HubReferenceRequest` | `200 HubModelInfo` |
+| `GET` | `/api/v1/hub/download-directory` | — | `200 Object` |
+| `PUT` | `/api/v1/hub/download-directory` | `ConfigureDownloadDirectoryRequest` | `200 Object` |
+| `POST` | `/api/v1/hub/download-sources/probe` | `HubDownloadProbeRequest` | `200 Object` |
+| `POST` | `/api/v1/models/directories/open` | `OpenModelDirectoryRequest` | `200 OpenModelDirectoryResult` |
+| `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` |
+| `GET` | `/api/v1/models/{model_id}/cache-profile` | — | `200 ModelCacheProfile` or `200 null` |
+| `GET` | `/api/v1/models/{model_id}/directory` | — | `200 ModelDirectoryList` |
 
 Hub providers are `huggingface` and `modelscope`. Artifact removal accepts only
 restricted `workspace://` URIs; it does not delete arbitrary host paths or
 model roots.
+
+`GET /api/v1/hub/official` lists the curated catalog; pass `?refresh=true` to
+ignore the cached copy. `POST /api/v1/hub/resolve` accepts a free-form
+`reference` (a `provider/owner/name` path or a URL) with an optional fallback
+provider and returns the resolved hub model.
+`POST /api/v1/hub/download-sources/probe` checks candidate download sources
+before a download. The download-directory routes report where hub downloads
+land and select it by registered directory id; selecting a different directory
+can evict the prefix cache, and an unknown id returns `400
+invalid_download_directory`.
+`POST /api/v1/models/directories/open` opens a browsed directory in the server
+host's file manager: Finder on macOS, File Explorer on Windows, or `xdg-open`
+on a Linux desktop. It accepts only an opaque directory id returned by the
+directory browser. `can_open_directory` reports availability; a server without
+a desktop opener returns `501 file_manager_unavailable`.
+For a registered artifact, `GET /api/v1/models/{model_id}/directory` lists its
+files, `/analysis` returns checkpoint composition, and `/cache-profile`
+returns the embedded cache profile or `null`.
 
 ### 2.7 Datasets and evaluations
 
@@ -217,8 +252,19 @@ model roots.
 | `DELETE` | `/api/v1/datasets/{dataset_id}` | — | `204` |
 | `GET` | `/api/v1/evaluations` | — | `200 EvaluationResultList` |
 | `POST` | `/api/v1/evaluations/compare` | `CompareEvaluationsRequest` | `200 EvaluationComparisonResource` |
+| `GET` | `/api/v1/datasets/catalog` | — | `200 OfficialDatasetList` |
+| `GET` | `/api/v1/evaluations/tools` | — | `200 EvaluationToolsResource` |
+| `POST` | `/api/v1/evaluations/probabilities` | `ProbabilityScoreRequest` | `200 ProbabilityScoreResult` |
 
 Only evaluations with compatible kinds and comparison keys can be compared.
+
+`GET /api/v1/datasets/catalog` lists the built-in official datasets.
+`GET /api/v1/evaluations/tools` reports which evaluation handlers the current
+deployment registers and the OpenAI-compatible base URL it serves.
+`POST /api/v1/evaluations/probabilities` scores continuation log-likelihood on
+a resident instance (`mode` is `continuation` or `next_token`); it returns
+`501 probability_unavailable` when no managed runtime is configured or the
+loaded runtime cannot score probabilities.
 
 ### 2.8 Cluster nodes
 
@@ -252,10 +298,86 @@ by environment-variable name and are not persisted as plaintext values.
 | `GET` | `/api/v1/runtime/realtime/capabilities` | — | `200 Object` |
 | `POST` | `/api/v1/runtime/reload` | `RuntimeReloadRequest` | `200 Object` |
 | `GET` | `/api/v1/runtime/status` | — | `200 Object` |
+| `POST` | `/api/v1/runtime/cache/trim` | `RuntimeCacheTrimRequest` | `200 Object` |
+| `GET` | `/api/v1/runtime/cache/entries` | — | `200 Object` |
+| `GET` | `/api/v1/runtime/cache/entries/{namespace}/{block}/text` | — | `200 Object` |
+| `POST` | `/api/v1/runtime/cache/purge` | `RuntimePrefixCachePurgeRequest` | `200 Object` |
+| `POST` | `/api/v1/runtime/context` | `RuntimeReloadRequest` | `202 JobResource` |
+| `GET` | `/api/v1/runtime/context-policy` | — | `200 RuntimeContextPolicy` |
+| `PUT` | `/api/v1/runtime/context-policy` | `RuntimeContextPolicy` | `200 RuntimeContextPolicy` |
+| `GET` | `/api/v1/runtime/inference-policy` | — | `200 RuntimeInferencePolicy` |
+| `PUT` | `/api/v1/runtime/inference-policy` | `RuntimeInferencePolicy` | `200 RuntimeInferencePolicy` |
+| `GET` | `/api/v1/runtime/listener` | — | `200 Object` |
+| `PUT` | `/api/v1/runtime/listener` | `RuntimeListenerRequest` | `200 Object` |
+| `GET` | `/api/v1/runtime/memory-policy` | — | `200 Object` |
+| `PUT` | `/api/v1/runtime/memory-policy` | `RuntimeMemoryPolicy` | `202 OperationAccepted` |
+| `GET` | `/api/v1/runtime/model-aliases` | — | `200 RuntimeModelAliases` |
+| `PUT` | `/api/v1/runtime/model-aliases` | `RuntimeModelAliases` | `200 RuntimeModelAliases` |
+| `PUT` | `/api/v1/runtime/qsa-kv` | `ConfigureQsaKvOffloadRequest` | `202 OperationAccepted` |
+| `GET` | `/api/v1/runtime/qsa-kv/{instance_id}` | — | `200 Object` |
+| `GET` | `/api/v1/runtime/resources` | — | `200 RuntimeResourceSnapshot` |
+| `GET` | `/api/v1/runtime/yarn/{instance_id}` | — | `200 Object` |
 
 Runtime status, realtime capabilities, reload, cache-clear, and model-list
 responses may contain backend-specific fields. Cache clearing can be rejected
 while generation or a full-duplex session is active.
+
+`POST /api/v1/runtime/context` queues a `runtime.context.configure` job and
+returns its `JobResource`. The policy routes read and replace server-wide
+defaults: the context policy holds fallback and maximum context sizes plus
+per-model YaRN, QSA KV offload, and KV-quantization overrides; the inference
+policy toggles MTP; the memory policy caps total, model, and prefix-cache
+memory and selects the prefix-cache disk directory. Policy mutations and
+listener changes require the `admin` scope.
+
+`PUT /api/v1/runtime/listener` changes the serving port and default
+compatibility protocol in place; it returns `409` when the listener is managed
+externally or the change fails. `PUT /api/v1/runtime/qsa-kv` queues an offload
+reconfiguration and returns `400` when the model or backend does not support
+it; `GET /api/v1/runtime/qsa-kv/{instance_id}` reports current offload state
+and accepts an optional `target_context` estimate.
+`GET /api/v1/runtime/resources` samples current resource usage, and
+`GET /api/v1/runtime/yarn/{instance_id}` reports YaRN context information for
+one instance.
+
+The prefix-cache routes expose paginated entry inspection with text search and
+filters (`/cache/entries`), block text
+(`/cache/entries/{namespace}/{block}/text`), selective purge (`/cache/purge`),
+and byte-target trimming (`/cache/trim`). They return `501
+cache_management_unavailable` when the backend lacks support.
+
+### 2.10 Voice output component
+
+| Method | Path | Request | Success |
+|---|---|---|---|
+| `GET` | `/api/v1/components/voice-output` | — | `200 Object` |
+| `POST` | `/api/v1/components/voice-output/install` | — | `202 OperationAccepted` |
+| `POST` | `/api/v1/components/voice-output/activate` | — | `200 Object` |
+
+Status merges the local component state with runtime state (`active`,
+`supported_model_loaded`). Install queues a `component.voice_output.install`
+job. Activation enables the realtime voice path and returns `501` when no
+managed runtime or component manager is configured.
+
+### 2.11 Quantization workbench
+
+| Method | Path | Request | Success |
+|---|---|---|---|
+| `GET` | `/api/v1/quantization/workspace` | — | `200 QuantizationWorkspace` |
+| `PUT` | `/api/v1/quantization/workspace` | `QuantizationDirectories` | `200 QuantizationWorkspace` |
+| `GET` | `/api/v1/quantization/files` | — | `200 QuantizationFiles` |
+| `POST` | `/api/v1/quantization/source` | `QuantizationSourceRequest` | `200 QuantizationSource` |
+| `POST` | `/api/v1/quantization/loading-plan` | `SourceLoadingRequest` | `200 SourceLoadingPlan` |
+| `GET` | `/api/v1/quantization/jobs/{job_id}/recipe` | — | `200` recipe JSON file |
+
+The workbench is available only when the deployment configures the Python
+quantization tools; otherwise every route returns `501
+quantization_unavailable`. `GET files` lists the workspace tree below the
+optional `path` query. `POST source` inspects one source artifact, and
+`POST loading-plan` computes how a source checkpoint would load. The recipe
+export streams the JSON recipe of a succeeded quantization job; any other job
+state returns `409 recipe_not_ready`, and a deleted artifact returns `404`.
+Validation failures return `422 quantization_validation_failed`.
 
 ## 3. Session and response workflow
 
@@ -548,7 +670,34 @@ The stream sends comment keep-alives while idle and ends after the job reaches
 
 `/health` is not in OpenAPI and never requires authentication.
 
-## 8. Contract maintenance
+## 8. OpenAI and Anthropic compatibility
+
+The unversioned `/v1` routes serve OpenAI and Anthropic SDK clients directly.
+They are intentionally outside OpenAPI. `/v1/messages*` always speaks
+Anthropic; on `/v1` and `/v1/models` an `anthropic-version` or `x-api-key`
+header selects Anthropic, as does serving on the configured Anthropic port
+(`PUT /api/v1/runtime/listener`). Everything else speaks OpenAI.
+
+| Method | Path | Protocol | Success |
+|---|---|---|---|
+| `GET` | `/v1` | Both | `200 Object` listing the sibling endpoints |
+| `GET` | `/v1/models` | OpenAI | `200 Object`, OpenAI list shape |
+| `GET` | `/v1/models` | Anthropic | `200 Object`, paginated Anthropic list shape |
+| `GET` | `/v1/models/{model_id}` | Anthropic | `200 Object`; `404` unknown id |
+| `POST` | `/v1/chat/completions` | OpenAI | `200` JSON or `text/event-stream` |
+| `POST` | `/v1/messages` | Anthropic | `200` JSON or `text/event-stream` |
+| `POST` | `/v1/messages/count_tokens` | Anthropic | always `501` |
+
+When an API credential is configured, `/v1` requests authenticate like
+`/api/v1` and require the `inference` scope; Anthropic clients may send the
+credential as `x-api-key`. The `model` field is resolved through the server
+model-alias table before routing. Streaming requests are validated before the
+stream opens, and retryable backend failures set `Retry-After: 1`.
+Token counting is not supported, so `count_tokens` always answers `501`.
+Errors use the error envelope of the selected protocol, not the common
+`error` envelope.
+
+## 9. Contract maintenance
 
 Regenerate and verify OpenAPI after changing routes or protocol models:
 

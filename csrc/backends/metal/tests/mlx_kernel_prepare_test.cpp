@@ -1,11 +1,18 @@
-#include "mlx_kernel_prepare.h"
-#include "mlx_nint.h"
-#include "mlx_resident_budget.h"
-#include "mlx_sampling.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "ops/mlx_nint.h"
+#include "runtime/mlx_resident_budget.h"
+#include "runtime/mlx_sampling.h"
+#include "runtime/mlx_tensor.h"
+#include <mlx/primitives.h>
 
 #include <cstdint>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <iostream>
+#include <future>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace mlx::core;
@@ -23,6 +30,93 @@ void append(std::vector<std::uint8_t>& blob, T value) {
 
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
+}
+
+struct ProbeState {
+    std::atomic<int> active{0}, peak{0}, calls{0};
+};
+
+class PrepareProbe final : public UnaryPrimitive, public mfq::metal::MlxPreparableKernel {
+public:
+    PrepareProbe(std::shared_ptr<ProbeState> state, int key, bool fail)
+        : UnaryPrimitive(default_stream(Device::gpu)), state_(std::move(state)), key_(key), fail_(fail) {}
+    std::string preparation_key() const override { return "probe_" + std::to_string(key_); }
+    void prepare_gpu() override {
+        const int active = state_->active.fetch_add(1) + 1;
+        auto peak = state_->peak.load();
+        while (peak < active && !state_->peak.compare_exchange_weak(peak, active)) {}
+        ++state_->calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        --state_->active;
+        if (fail_) throw std::runtime_error("expected preparation failure");
+    }
+    void eval_cpu(const std::vector<array>&, array&) override { throw std::runtime_error("probe evaluated"); }
+    void eval_gpu(const std::vector<array>&, array&) override { throw std::runtime_error("probe evaluated"); }
+    const char* name() const override { return "PrepareProbe"; }
+private:
+    std::shared_ptr<ProbeState> state_;
+    int key_;
+    bool fail_;
+};
+
+void test_parallel_jobs() {
+    constexpr int jobs = 32;
+    auto state = std::make_shared<ProbeState>();
+    {
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        for (int key = 0; key < jobs; ++key) {
+            for (int duplicate = 0; duplicate < 2; ++duplicate)
+                preparation.add(array({1}, float32, std::make_shared<PrepareProbe>(state, key, false), {}));
+        }
+        require(preparation.size() == jobs, "preparation jobs were not deduplicated");
+        preparation.finish();
+    }
+    require(state->calls.load() == jobs && state->active.load() == 0, "parallel preparation lost jobs");
+    if (!std::getenv("MFQ_METAL_COMPILE_WORKERS") && std::thread::hardware_concurrency() > 1)
+        require(state->peak.load() > 1 && state->peak.load() <= std::min<unsigned>(jobs,
+            std::thread::hardware_concurrency()), "preparation exceeded available CPU concurrency");
+    {
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        for (int key = 0; key < 8; ++key)
+            preparation.add(array({1}, float32, std::make_shared<PrepareProbe>(state, 99 + key, key == 0), {}));
+        bool failed = false;
+        try { preparation.finish(); }
+        catch (const std::runtime_error& e) { failed = std::string(e.what()) == "expected preparation failure"; }
+        require(failed && state->active.load() == 0, "preparation did not propagate its worker error");
+        require(mfq::metal::MlxKernelPreparation::current() == nullptr, "failed preparation remained active");
+    }
+    std::cout << "parallel_prepare_peak=" << state->peak.load() << std::endl;
+}
+
+void test_shared_compilation() {
+    std::atomic<int> builds{0};
+    std::vector<std::future<MTL::ComputePipelineState*>> jobs;
+    for (int i = 0; i < 8; ++i) jobs.push_back(std::async(std::launch::async, [&] {
+        auto& device = mfq::metal::kernel_device(Device::gpu);
+        auto* library = device.get_library("mfq_compile_cache_test_v1", [&] {
+            ++builds;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return std::string("#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void mfq_cache_unit(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] = 1.0f; }\n");
+        });
+        return device.get_kernel("mfq_cache_unit", library);
+    }));
+    auto* expected = jobs.front().get();
+    for (std::size_t i = 1; i < jobs.size(); ++i)
+        require(jobs[i].get() == expected, "concurrent preparation returned different pipelines");
+    require(builds.load() == 1, "concurrent preparation compiled a library more than once");
+    auto& device = mfq::metal::kernel_device(Device::gpu);
+    bool failed = false;
+    try {
+        device.get_library("mfq_compile_cache_retry_v1", []() -> std::string {
+            throw std::runtime_error("transient compilation failure");
+        });
+    } catch (const std::runtime_error&) { failed = true; }
+    require(failed, "compilation failure was swallowed");
+    auto* retry = device.get_library("mfq_compile_cache_retry_v1", [] {
+        return std::string("#include <metal_stdlib>\nkernel void mfq_cache_retry() {}\n");
+    });
+    require(device.get_kernel("mfq_cache_retry", retry) != nullptr, "compilation failure could not be retried");
 }
 
 mfq::metal::MlxNintWeight weight(int output_size = 2) {
@@ -44,6 +138,31 @@ mfq::metal::MlxNintWeight weight(int output_size = 2) {
     blob.insert(blob.end(), output_size * 32, 0x11);
     return mfq::metal::MlxNintWeight::from_blob(blob);
 }
+
+void test_model_projection_paths() {
+    mfq::metal::MlxLinear first(weight(128)), second(weight(128));
+    std::size_t all = 0;
+    {
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        mfq::metal::MlxProjectionBatch projections({&first, &second});
+        all = preparation.size();
+    }
+    {
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        preparation.use_model_paths();
+        mfq::metal::MlxProjectionBatch projections({&first, &second});
+        require(preparation.size() == 0, "model projections prepared unused constructor variants");
+        const auto outputs = projections(zeros({1, 64}, float16));
+        for (const auto& output : outputs) preparation.add(output);
+        const auto selected = preparation.size();
+        require(selected > 0 && selected < all, "model projections did not select execution paths");
+        for (const auto& output : outputs) preparation.add(output);
+        require(preparation.size() == selected, "model projections collected duplicate jobs");
+        preparation.finish();
+        for (const auto& output : outputs) require(!output.is_available(), "model preparation evaluated projections");
+        std::cout << "projection_variants=" << all << " projection_selected=" << selected << std::endl;
+    }
+}
 }
 
 int main() {
@@ -52,6 +171,9 @@ int main() {
         metal::set_metallib_path(MFQ_MLX_METALLIB_DEFAULT);
 #endif
         set_default_device(Device::gpu);
+        test_parallel_jobs();
+        test_shared_compilation();
+        test_model_projection_paths();
         const auto packed = weight();
         const auto expanded = weight(129);
         mfq::metal::MlxKernelPreparation preparation(2048, 2048);

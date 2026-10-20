@@ -20,6 +20,7 @@ struct MlxSamplingParams {
     bool enable_mtp = true;
     int mtp_max_draft_tokens = 3;
     std::uint64_t seed = 0;
+    bool warmup = false;
 
     bool greedy() const noexcept {
         return temperature <= 0.0 || top_k == 1;

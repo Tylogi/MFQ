@@ -39,6 +39,10 @@ class SessionSnapshotCache {
     };
 
 public:
+    template <class Visitor> void visit_states(Visitor&& visitor) const {
+        for (const auto& [id, history] : states_)
+            for (const auto& entry : history) visitor(entry.state);
+    }
     struct Match {
         State* state = nullptr;
         std::string session_id;
@@ -143,7 +147,8 @@ public:
         auto found = states_.find(match.session_id);
         if (found == states_.end() || match.index >= found->second.size() ||
                 &found->second[match.index].state != match.state) {
-            throw std::logic_error("session snapshot match is stale");
+            // A suspended restore retains its state after the cached entry is evicted.
+            return;
         }
         found->second[match.index].last_used = ++clock_;
         ++hits_;

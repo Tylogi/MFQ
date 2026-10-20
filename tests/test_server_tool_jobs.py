@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import stat
+import sys
 import textwrap
 from pathlib import Path
 
@@ -22,6 +24,24 @@ from mfq.server.services.tool_jobs import (
 )
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import SessionStore
+
+
+@pytest.fixture(autouse=True)
+def _python_script_executables_on_windows(tmp_path, monkeypatch):
+    if os.name != 'nt':
+        return
+    spawn = asyncio.create_subprocess_exec
+
+    async def run(*argv, **kwargs):
+        path = Path(argv[0])
+        # Windows does not interpret the Python shebangs of our fake tools.
+        # Keep argv as a list so the shell-metacharacter tests remain valid.
+        if (path.is_relative_to(tmp_path) and path.is_file() and
+                path.read_bytes().startswith(b'#!/usr/bin/env python')):
+            argv = (sys.executable, *argv)
+        return await spawn(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', run)
 
 
 def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:
@@ -134,6 +154,55 @@ def test_tool_process_retains_only_a_bounded_output_tail(
             await callback()
 
     monkeypatch.setattr(tool_jobs, "_TOOL_OUTPUT_TAIL_LINES", 3)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('system', ['nt', 'posix'])
+@pytest.mark.parametrize('force_kill', [False, True])
+def test_cancelled_tool_stops_process_and_releases_download_locks(tmp_path, monkeypatch, system, force_kill):
+    from types import SimpleNamespace
+    import mfq.server.services.tool_jobs as tool_jobs
+    from mfq.server.services.jobs import JobCancelledError
+
+    async def run():
+        calls = []
+        class Process:
+            pid = 123
+            returncode = None
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'downloading\n')
+            def terminate(self): calls.append('terminate')
+            def kill(self): calls.append('kill')
+            async def wait(self):
+                if force_kill and len(calls) == 1:
+                    raise asyncio.TimeoutError()
+                self.returncode = 0
+                return 0
+        process = Process()
+        async def spawn(*args, **kwargs): return process
+        def killpg(pid, signum):
+            assert system == 'posix' and pid == process.pid
+            calls.append('terminate' if signum == tool_jobs.signal.SIGTERM else 'kill')
+        monkeypatch.setattr(tool_jobs, 'os', SimpleNamespace(name=system, killpg=killpg))
+        monkeypatch.setattr(tool_jobs, 'signal', SimpleNamespace(SIGTERM=15, SIGKILL=9))
+        monkeypatch.setattr(tool_jobs.asyncio, 'create_subprocess_exec', spawn)
+        class Context:
+            def __init__(self): self.cleanup = []
+            def add_cleanup(self, callback): self.cleanup.append(callback)
+            def raise_if_cancelled(self): raise JobCancelledError()
+        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, tmp_path / 'mfq', None, None, None, None))
+        context = Context()
+        with pytest.raises(JobCancelledError):
+            await handlers._run(context, ['fake-download'])
+        # Child-held disk locks must be gone before the enclosing download
+        # handler releases its reservation, before final JobContext cleanup.
+        assert process.returncode == 0
+        assert calls == (['terminate', 'kill'] if force_kill else ['terminate'])
+        for callback in context.cleanup:
+            await callback()
+        assert calls == (['terminate', 'kill'] if force_kill else ['terminate'])
+        assert process.returncode == 0
     asyncio.run(run())
 
 
@@ -591,6 +660,7 @@ def test_download_argv_does_not_execute_shell_metacharacters(tmp_path: Path) -> 
                 payload={
                     "repo_id": "owner/model",
                     "destination": "downloads/value;touch-owned",
+                    "expected_bytes": 4,
                 },
             )
         )
@@ -644,7 +714,7 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
         submitted = await manager.submit(
             CreateJobRequest(
                 kind="download.modelscope",
-                payload={"repo_id": "owner/model", "destination": "models/owner/model"},
+                payload={"repo_id": "owner/model", "destination": "models/owner/model", "expected_bytes": 2},
             )
         )
         result = await _wait(store, submitted.id)
@@ -695,7 +765,7 @@ def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkey
         store = SessionStore(tmp_path / "jobs.sqlite3")
         manager = JobManager(store, handlers.handlers())
         submitted = await manager.submit(CreateJobRequest(kind=f"download.{provider}",
-            payload={"repo_id": "owner/model", "destination": "downloads/model"}))
+            payload={"repo_id": "owner/model", "destination": "downloads/model", "expected_bytes": 2}))
         result = await _wait(store, submitted.id)
         assert result.status == JobStatus.SUCCEEDED and result.result["files"] == 1
         await manager.close()

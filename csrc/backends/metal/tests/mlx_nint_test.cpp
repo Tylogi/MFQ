@@ -1,7 +1,7 @@
-#include "mlx_nint.h"
-#include "mlx_moe_ops.h"
-#include "mlx_platform.h"
-#include "mlx_resident_budget.h"
+#include "ops/mlx_nint.h"
+#include "ops/mlx_moe_ops.h"
+#include "runtime/mlx_platform.h"
+#include "runtime/mlx_resident_budget.h"
 
 #include <cmath>
 #include <algorithm>

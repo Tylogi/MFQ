@@ -10,6 +10,7 @@ import { Icon } from '../../app/display';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';
+import { DownloadDirectoryControl } from './DownloadDirectoryControl';
 
 export function ModelHubPage() {
   const { tr } = useSettings();
@@ -20,6 +21,7 @@ export function ModelHubPage() {
   const active = downloads.filter(isActiveDownload);
   const progress = active.length ? active.reduce((sum, job) => sum + downloadProgress(job), 0) / active.length : 0;
   const [tab, setTab] = useState<ModelBrowserTab>('official');
+  const [downloadDirectory, setDownloadDirectory] = useState<string | undefined>();
   const circle = useRef<HTMLButtonElement>(null);
   const page = useRef<HTMLDivElement>(null);
   const [flight, setFlight] = useState<{ id: string; origin: DownloadOrigin; dx: number; dy: number } | null>(null);
@@ -33,7 +35,7 @@ export function ModelHubPage() {
         if (active) setJobKinds(items);
       })
       .catch((cause) => {
-        if (active) toast.error(errorMessage(cause));
+        if (active) toast.error(errorMessage(cause, tr));
       });
     return () => {
       active = false;
@@ -48,7 +50,9 @@ export function ModelHubPage() {
 
   function trackDownload(job: JobResource, origin: DownloadOrigin) {
     if (!connectionScope()()) return;
+    const existing = useJobStore.getState().jobs.some(item => item.id === job.id);
     addJob(job);
+    if (existing) { toast.success(tr('该下载任务已在队列中', 'This download is already in the queue')); return; }
     toast.success(tr('下载任务已提交', 'Download job submitted'));
     const rect = circle.current?.getBoundingClientRect();
     if (rect) setFlight({ id: job.id, origin, dx: rect.left + rect.width / 2 - origin.x, dy: rect.top + rect.height / 2 - origin.y });
@@ -63,6 +67,8 @@ export function ModelHubPage() {
         tab={tab}
         onTabChange={setTab}
         downloadQueue={<DownloadQueue jobs={downloads} onJobCreated={trackDownload} />}
+        downloadDirectory={downloadDirectory}
+        downloadDirectoryControl={<DownloadDirectoryControl onDirectoryChange={setDownloadDirectory} />}
         tr={tr}
       />
       <button ref={circle} className={`download-circle${flight ? ' receiving' : ''}`} type="button"

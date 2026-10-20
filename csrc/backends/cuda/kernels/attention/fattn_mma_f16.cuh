@@ -1,8 +1,9 @@
-#include "common.cuh"
-#include "cp-async.cuh"
-#include "mma.cuh"
-#include "fattn-common.cuh"
-#include "fattn-swizzle.cuh"
+#include <math_constants.h>
+#include "csrc/components/ggml/src/ggml-cuda/common.cuh"
+#include "csrc/components/ggml/src/ggml-cuda/cp-async.cuh"
+#include "csrc/components/ggml/src/ggml-cuda/mma.cuh"
+#include "csrc/components/ggml/src/ggml-cuda/fattn-common.cuh"
+#include "csrc/components/ggml/src/ggml-cuda/fattn-swizzle.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -14,6 +15,10 @@ struct mfq_fattn_runtime_input {
     int causal_query_offset = 0;
     int causal_row_count = 0;
     bool half_query = false;
+    const half2* hot_keys = nullptr;
+    const half2* hot_values = nullptr;
+    const int32_t* hot_mapping = nullptr;
+    const int32_t* cold_mapping = nullptr;
 };
 
 // Config options for the MMA kernel.
@@ -373,13 +378,13 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 
 template<int stride_tile, bool swizzled, int nwarps, int nbatch_fa,
          bool use_cp_async, bool oob_check,
-         bool use_indirect = false>
+         bool use_indirect = false, bool use_hot = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_KV, const int i_sup,
         const int * const __restrict__ row_indices = nullptr,
         const int implicit_row_start = 0,
-        const int implicit_row_count = 0) {
+        const int implicit_row_count = 0, const half2* hot = nullptr, const int32_t* mapping = nullptr, const int32_t* cold_mapping = nullptr) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity is 16 bytes.
@@ -413,6 +418,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 const int implicit_row = implicit_row_start + i;
                 const int row = use_indirect ? (row_indices ? row_indices[i]
                     : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
+                const half2* source_row=KV+int64_t(row)*stride_KV;
+                if constexpr(use_hot) {const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
@@ -423,14 +430,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                             tile_KV_32 +
                                 ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(
                                     i, k * h2_per_chunk),
-                            KV + int64_t(row) * stride_KV +
-                                k * h2_per_chunk);
+                            source_row + k * h2_per_chunk);
                     } else {
                         cp_async_cg_16<preload>(
                             tile_KV_32 + i * (stride_tile * sizeof(half2)) +
                                 k * 16,
-                            KV + int64_t(row) * stride_KV +
-                                k * h2_per_chunk);
+                            source_row + k * h2_per_chunk);
                     }
                 }
             }
@@ -466,13 +471,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 const int implicit_row = implicit_row_start + i;
                 const int row = use_indirect && valid ? (row_indices ? row_indices[i]
                     : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
+                const half2* source_row=KV+int64_t(row)*stride_KV;
+                if constexpr(use_hot) {if(valid){const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}}
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
                     const half2 * source = valid
-                        ? KV + int64_t(row) * stride_KV + k * h2_per_chunk
+                        ? source_row + k * h2_per_chunk
                         : zero;
                     if constexpr (swizzled) {
                         ggml_cuda_memcpy_1<16>(
@@ -594,14 +601,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_make_causal_mask(
         const int key_min = max(0, query_key_min + index / nbatch_fa);
         tile_mask[(index / nbatch_fa) * (nbatch_fa + 8) +
                   index % nbatch_fa] = key >= key_min && key <= query
-            ? __float2half(0.0f) : __float2half(-INFINITY);
+            ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_indirect,
     bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
-    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
+    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ, bool use_hot = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -682,10 +689,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             : V_h2 + int64_t(k_VKQ_0)*stride_V;
         flash_attn_ext_f16_load_tile<stride_tile_V, swizzled_V,
                                      nwarps, nbatch_fa,
-                                     use_cp_async, oob_check, use_indirect>
+                                     use_cp_async, oob_check, use_indirect, use_hot>
             (V_tile, tile_V, nbatch_V2, stride_V, k_VKQ_sup,
              use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
-             k_VKQ_0, input.causal_row_count);
+             k_VKQ_0, input.causal_row_count, input.hot_values, input.hot_mapping, input.cold_mapping);
     } else {
         constexpr bool use_cp_async = nstages == 1;
         if (mask_h) {
@@ -711,10 +718,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 : K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start;
             flash_attn_ext_f16_load_tile<stride_tile_K, swizzled_K,
                                          nwarps, nbatch_fa,
-                                         use_cp_async, oob_check, use_indirect>
+                                         use_cp_async, oob_check, use_indirect, use_hot>
                 (K_tile, tile_K, k0_diff, stride_K, k_VKQ_sup,
                  use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
-                 k_VKQ_0, input.causal_row_count);
+                 k_VKQ_0, input.causal_row_count, input.hot_keys, input.hot_mapping, input.cold_mapping);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1062,10 +1069,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 : K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K;
             flash_attn_ext_f16_load_tile<stride_tile_K, swizzled_K,
                                          nwarps, nbatch_fa,
-                                         use_cp_async, oob_check, use_indirect>
+                                         use_cp_async, oob_check, use_indirect, use_hot>
                 (K_tile, tile_K, nbatch_K2, stride_K, k_VKQ_sup,
                  use_indirect && row_indices ? row_indices + k_VKQ_0 + nbatch_fa : nullptr,
-                 k_VKQ_0 + nbatch_fa, input.causal_row_count);
+                 k_VKQ_0 + nbatch_fa, input.causal_row_count, input.hot_keys, input.hot_mapping, input.cold_mapping);
         }
     }
 
@@ -1085,10 +1092,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     : V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2;
                 flash_attn_ext_f16_load_tile<stride_tile_V, swizzled_V,
                                              nwarps, nbatch_fa,
-                                             use_cp_async, oob_check, use_indirect>
+                                             use_cp_async, oob_check, use_indirect, use_hot>
                     (V_tile, tile_V, i0_diff/2, stride_V, k_VKQ_sup,
                      use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
-                     k_VKQ_0, input.causal_row_count);
+                     k_VKQ_0, input.causal_row_count, input.hot_values, input.hot_mapping, input.cold_mapping);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1254,7 +1261,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
          bool use_logit_softcap, bool V_is_K_view, bool needs_fixup,
-         bool is_fixup, bool use_indirect = false>
+         bool is_fixup, bool use_indirect = false, bool use_hot = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -1440,10 +1447,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             : K_h2 + int64_t(kb0)*nbatch_fa*stride_K;
         flash_attn_ext_f16_load_tile<stride_tile_K, swizzled_K,
                                      nwarps, nbatch_fa,
-                                     use_cp_async, oob_check, use_indirect>
+                                     use_cp_async, oob_check, use_indirect, use_hot>
             (K_tile, tile_K, nbatch_K2, stride_K, k_VKQ_sup,
               use_indirect && row_indices ? row_indices + kb0*nbatch_fa : nullptr,
-              kb0*nbatch_fa, input.causal_row_count);
+              kb0*nbatch_fa, input.causal_row_count, input.hot_keys, input.hot_mapping, input.cold_mapping);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -1455,7 +1462,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_indirect,
                  needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_hot>
                 (Q_f2, K_h2, V_h2, row_indices, mask_h, implicit_causal,
                  dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1467,7 +1474,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_indirect,
              needs_fixup, is_fixup, last_iter, oob_check,
-              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_hot>
             (Q_f2, K_h2, V_h2, row_indices, mask_h, implicit_causal,
              dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1481,7 +1488,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_indirect,
                  needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_hot>
                 (Q_f2, K_h2, V_h2, row_indices, mask_h, implicit_causal,
                  dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1493,7 +1500,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_indirect,
              needs_fixup, is_fixup, last_iter, oob_check,
-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_hot>
             (Q_f2, K_h2, V_h2, row_indices, mask_h, implicit_causal,
              dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,

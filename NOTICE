@@ -4,6 +4,12 @@ MFQ
 MFQ's original code is licensed under the Apache License 2.0 in `LICENSE`.
 The following integrated components retain their original license terms.
 
+zip
+---
+The Windows standalone updater uses the zip Rust crate to read release ZIPs.
+Copyright (c) 2014 Mathijs van de Nes
+License: MIT (`LICENSES/zip-MIT.txt`)
+
 oMLX
 ----
 Parts of MFQ's Metal scheduling and model-specific kernels are adapted from
@@ -12,6 +18,9 @@ oMLX, with MFQ-specific model layouts and runtime integration.
 Copyright (c) 2026 Apple Inc.
 License: Apache License 2.0 (`LICENSE`)
 Source: https://github.com/jundot/omlx
+
+The balanced memory-budget and release-credit accounting follow
+omlx/process_memory_enforcer.py, adapted to MFQ's managed runtime processes.
 
 The Flash-Next grouped decode-submission policy is adapted from oMLX's
 Qwen4 eager dispatch in language.py at revision
@@ -101,6 +110,14 @@ weight integration.
 Copyright (c) 2026 Niko1221 and the Strata contributors
 License: MIT (`LICENSES/Strata-MIT.txt`)
 Source: https://github.com/Niko1221/strata
+
+oMLX
+----
+MFQ's continuous-batch MTP depth policy is adapted from oMLX's BatchPolicy and
+ParkMemory algorithms, with native coroutine and per-request cache integration.
+License: Apache-2.0 (`LICENSE`)
+Source: https://github.com/jundot/omlx
+Reference: omlx/patches/mlx_lm_mtp/batch_policy.py
 
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.

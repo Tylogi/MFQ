@@ -1,10 +1,10 @@
 #pragma once
 
-#include "mlx_resource_telemetry.h"
+#include "runtime/mlx_resource_telemetry.h"
 
 #include "deepseek_v4_model.h"
-#include "mlx_dsa.h"
-#include "mlx_tensor.h"
+#include "ops/mlx_dsa.h"
+#include "runtime/mlx_tensor.h"
 
 #include <cstdint>
 #include <memory>

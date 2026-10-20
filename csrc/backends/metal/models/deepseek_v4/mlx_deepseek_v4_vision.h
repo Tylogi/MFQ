@@ -1,8 +1,8 @@
 #pragma once
 
 #include "deepseek_v4_model.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
 
 #include <cstdint>
 #include <vector>

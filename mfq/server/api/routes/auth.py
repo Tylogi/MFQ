@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from mfq.server.api.dependencies import ApiKeysDependency
 from mfq.server.api.routes import ERROR_RESPONSES
@@ -14,11 +14,32 @@ from mfq.server.protocol.models import (
     ApiKeyResource,
     ApiKeySecretResource,
     CreateApiKeyRequest,
+    AuthenticationPolicyRequest,
 )
 from mfq.server.services.service import ServiceError
 from mfq.server.state.storage import ApiKeyNotFoundError, StorageError
 
 router = APIRouter()
+
+
+@router.get("/api/v1/auth/policy", responses=ERROR_RESPONSES, tags=["auth"])
+async def authentication_policy(request: Request) -> dict[str, bool]:
+    return request.app.state.auth_policy.status()
+
+
+@router.put("/api/v1/auth/policy", responses=ERROR_RESPONSES, tags=["auth"])
+async def configure_authentication_policy(request: Request, body: AuthenticationPolicyRequest) -> dict[str, bool]:
+    from mfq.server.api.network import is_loopback_bind_host
+
+    listener = getattr(request.app.state, "listener", None)
+    if not body.enabled and listener is not None and not is_loopback_bind_host(listener.config.host):
+        raise ServiceError(400, "authentication_required", "authentication cannot be disabled for a network listener")
+    try:
+        return await request.app.state.auth_policy.configure(body.enabled, body.api_key.get_secret_value() if body.api_key is not None else None)
+    except ValueError as error:
+        raise ServiceError(400, "invalid_authentication_policy", str(error)) from error
+    except OSError:
+        raise ServiceError(500, "authentication_save_failed", "could not persist authentication settings") from None
 
 
 @router.post(

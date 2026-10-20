@@ -1,0 +1,9 @@
+.model-delete-dialog { width: min(560px, calc(100vw - 32px)); }
+.model-delete-details { display: grid; gap: 9px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; }
+.model-delete-details > strong { overflow-wrap: anywhere; color: var(--ink); font-size: 13px; }
+.model-delete-details > span { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.model-delete-details ul { display: grid; gap: 8px; max-height: 220px; overflow-y: auto; margin: 3px 0 0; padding: 12px 0 0; border-top: 1px solid var(--line); list-style: none; }
+.model-delete-details code { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.model-delete-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.model-row-actions .model-delete-action { display: inline-flex; align-items: center; padding: 6px; color: var(--muted); }
+.model-row-actions .model-delete-action:not(:disabled):hover { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }

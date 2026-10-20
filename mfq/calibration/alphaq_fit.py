@@ -89,7 +89,8 @@ class FittedPayloadCache:
         else:
             directory.mkdir(parents=True, exist_ok=True)
             temporary = directory/'tensor.partial'
-            binding = None if self.data_free else q._bind_hf_imatrix(self.imatrix, [item]).get(item.name)
+            binding = None if self.data_free or item.name.startswith('predictor.') else q._bind_hf_imatrix(
+                self.imatrix, [item], allow_missing=True).get(item.name)
             rows = math.prod(item.shape[:-1]) if len(item.shape) > 1 else item.shape[0]
             chunk = self.row_chunk or max(8, (rows+7)//8*8)
             failures, started = [], time.monotonic()

@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -154,6 +154,82 @@ def completed_deltas() -> tuple[BackendDelta, ...]:
         ),
         BackendDelta(usage=TokenUsage(prompt_tokens=4, completion_tokens=5, total_tokens=9)),
     )
+
+
+def test_chat_can_be_created_without_model_and_continue_with_different_models(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend((BackendDelta(content_delta="answer", finish_reason="stop"),))
+        service = make_service(tmp_path, backend)
+        transport = httpx.ASGITransport(app=create_app(service=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post("/api/v1/sessions", json={"mode": "text"})
+            assert created.status_code == 201
+            session = created.json()
+            assert session["model"] == ""
+            assert not backend.calls
+            base = f"/api/v1/sessions/{session['id']}"
+            request = {
+                "request_id": str(uuid4()), "expected_revision": 0,
+                "input": [{"type": "text", "text": "first question"}], "stream": False,
+            }
+            missing = await client.post(f"{base}/responses", json=request)
+            assert missing.status_code == 400
+            assert missing.json()["error"]["code"] == "model_required"
+            assert (await client.get(f"{base}/messages")).json() == {"data": []}
+            first = await client.post(f"{base}/responses", json={**request, "model": "model-a"})
+            assert first.status_code == 200
+            assert first.json()["settings"]["model"] == "model-a"
+            request.update(request_id=str(uuid4()), expected_revision=2)
+            request["input"] = [{"type": "text", "text": "next question"}]
+            second = await client.post(f"{base}/responses", json={**request, "model": "model-b", "stream": True})
+            assert second.status_code == 200
+            assert "response.completed" in second.text
+            assert [call["model"] for call in backend.calls] == ["model-a", "model-b"]
+            assert [call["session_id"] for call in backend.calls] == [UUID(session["id"])] * 2
+            assert backend.calls[1]["messages"] == [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "next question"},
+            ]
+            stored = (await client.get(base)).json()
+            assert stored["id"] == session["id"]
+            assert stored["model"] == ""
+            assert stored["revision"] == 4
+            assert len((await client.get("/api/v1/sessions")).json()["data"]) == 1
+            replay = await client.post(f"{base}/responses", json={**request, "model": "model-b", "stream": False})
+            assert replay.status_code == 200
+            assert len(backend.calls) == 2
+            conflict = await client.post(f"{base}/responses", json={**request, "model": "model-a"})
+            assert conflict.status_code == 409
+            assert conflict.json()["error"]["code"] == "idempotency_conflict"
+    asyncio.run(run())
+
+
+def test_old_chat_model_is_only_a_legacy_default_not_a_binding(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend((BackendDelta(content_delta="answer", finish_reason="stop"),))
+        service = make_service(tmp_path, backend)
+        session = await service.create_session(CreateSessionRequest(model="removed-model"))
+        request = CreateResponseRequest(
+            request_id=REQUEST_ID, model="loaded-model", expected_revision=0,
+            input=[{"type": "text", "text": "question"}], stream=False,
+        )
+        prepared = await service.prepare_response(session.id, request)
+        await service.collect_response(prepared)
+        assert backend.calls[0]["model"] == "loaded-model"
+        assert service.store.get_session(session.id).id == session.id
+        assert len(service.store.list_sessions()) == 1
+    asyncio.run(run())
+
+
+def test_legacy_response_fingerprint_is_unchanged_without_explicit_model() -> None:
+    request = CreateResponseRequest(
+        request_id=REQUEST_ID, expected_revision=0,
+        input=[{"type": "text", "text": "question"}],
+    )
+    old_payload = request.model_dump(mode="json", exclude={"stream", "model"})
+    encoded = json.dumps(old_payload, separators=(",", ":"), sort_keys=True).encode()
+    assert ServerService._request_fingerprint(request) == hashlib.sha256(encoded).hexdigest()
 
 
 def test_explicit_cancel_stops_a_response_and_allows_immediate_edited_retry(
@@ -768,7 +844,7 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             assert trimmed.status_code == 200
             assert trimmed.json()["released_bytes"] == 1024
             assert trimmed.json()["target_bytes"] == 4096
-            invalid = await client.post("/api/v1/sessions", json={"model": ""})
+            invalid = await client.post("/api/v1/sessions", json={"model": "x" * 256})
             assert invalid.status_code == 422
             assert invalid.json()["error"]["code"] == "invalid_request"
             forked = await client.post(

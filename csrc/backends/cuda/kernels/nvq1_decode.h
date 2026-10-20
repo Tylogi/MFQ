@@ -1,5 +1,5 @@
 #pragma once
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 struct Nvq1DecodeView {
     int64_t pointers[7]{}; // indices, delta, state, anchor, book, records, integer book

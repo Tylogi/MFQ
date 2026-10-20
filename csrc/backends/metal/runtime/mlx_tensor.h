@@ -1,13 +1,13 @@
 #pragma once
 
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_fp8_sq.h"
-#include "mlx_mx.h"
-#include "mlx_mxfp4_sq.h"
-#include "mlx_nint.h"
-#include "mlx_nint8_zero.h"
-#include "mlx_vq.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "ops/mlx_fp8_sq.h"
+#include "ops/mlx_mx.h"
+#include "ops/mlx_mxfp4_sq.h"
+#include "ops/mlx_nint.h"
+#include "ops/mlx_nint8_zero.h"
+#include "ops/mlx_vq.h"
 
 #include <cstddef>
 #include <memory>

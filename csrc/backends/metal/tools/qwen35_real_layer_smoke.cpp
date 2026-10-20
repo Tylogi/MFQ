@@ -1,7 +1,7 @@
-#include "mlx_qwen35_full_attention.h"
-#include "mlx_qwen35_linear_attention.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "qwen35_model.h"
+#include "models/qwen35/mlx_qwen35_full_attention.h"
+#include "models/qwen35/mlx_qwen35_linear_attention.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include <algorithm>
 #include <cmath>

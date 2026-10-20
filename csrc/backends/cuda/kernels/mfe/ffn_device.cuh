@@ -8,10 +8,13 @@
 #if MFQ_MFE_COMPACT_NVQ
 #include "nvq_compact_dot.cuh"
 #endif
-#include "ffn.h"
+#include "kernels/mfe/ffn.h"
 #include <cuda_bf16.h>
 #include "kernels/quant/packed_nint.cuh"
 #include "kernels/quant/packed_nvq.cuh"
+#include "ffn.h"
+#include "mxfp4_dot.cuh"
+#include "ffn_cached_reduce.cuh"
 #include "e8_narrow.cuh"
 #include "kernels/nvq/device.cuh"
 #include "ffn_launch.h"
@@ -712,9 +715,11 @@ __device__ __forceinline__ bool nint_late_group_pair(const MfePackedProjection& 
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __device__ MFQ_MFE_PROJECT_INLINE void project_pair(const MfePackedProjection* d,int local,
-        int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false) {
+        int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false,
+        const __half* original=nullptr) {
     result[0]=result[1]=__float2half(0.0f);
     if(!d || local<0 || local>=d->local_experts)return;
+    if(d->family==3) {mfe_mxfp4_pair(*d,local,first,original,result);return;}
     if(d->family==1) {
         if constexpr(!DefaultMath) {
         if(d->dense_reduction_warps) {
@@ -784,17 +789,18 @@ __device__ MFQ_MFE_PROJECT_INLINE void project_pair(const MfePackedProjection* d
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __device__ MFQ_MFE_PROJECT_INLINE void project_quad(const MfePackedProjection* d,int local,
-        int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false,bool canonical=false) {
+        int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false,bool canonical=false,
+        const __half* original=nullptr) {
     if constexpr(!Grouped) {
-        project_pair<false,Formats,DefaultMath,E8Narrow>(d,local,first,input,scales,result,multi_sum);
-        project_pair<false,Formats,DefaultMath,E8Narrow>(d,local,first+2,input,scales,result+2,multi_sum);
+        project_pair<false,Formats,DefaultMath,E8Narrow>(d,local,first,input,scales,result,multi_sum,original);
+        project_pair<false,Formats,DefaultMath,E8Narrow>(d,local,first+2,input,scales,result+2,multi_sum,original);
         return;
     }
-    if(canonical) {
+    if(canonical || (d && d->family==3)) {
         // Preserve the two-row NVQ reduction order while processing four
         // output rows per block, avoiding the doubled Down grid.
-        project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first,input,scales,result,multi_sum);
-        project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first+2,input,scales,result+2,multi_sum);
+        project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first,input,scales,result,multi_sum,original);
+        project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first+2,input,scales,result+2,multi_sum,original);
         return;
     }
 #pragma unroll
@@ -992,7 +998,7 @@ __global__ void __launch_bounds__(64) mfe_ffn_prepare_kernel(MfeFfnBatch b,
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+    partition&=3;
     const int all_routes=b.routes+(b.shared?1:0),slot=blockIdx.y;
     const int token=slot/all_routes,route=slot%all_routes;
     const bool shared=route==b.routes;
@@ -1012,21 +1018,22 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
     const auto* down=projection(b,2,expert,shared,d_local,transferred);
     __half gate[2],up[2];
     project_pair<Grouped,Formats,DefaultMath,E8Narrow>(g,g_local,first,g?static_cast<const int8_t*>(g->fields[7])+int64_t(token)*g->groups*g->group_size:nullptr,
-        g?static_cast<const float*>(g->fields[8])+int64_t(token)*g->groups:nullptr,gate,b.warp_multi_sum);
+        g?static_cast<const float*>(g->fields[8])+int64_t(token)*g->groups:nullptr,gate,b.warp_multi_sum,
+        b.input+int64_t(token)*b.input_width);
     project_pair<Grouped,Formats,DefaultMath,E8Narrow>(u,u_local,first,u?static_cast<const int8_t*>(u->fields[7])+int64_t(token)*u->groups*u->group_size:nullptr,
-        u?static_cast<const float*>(u->fields[8])+int64_t(token)*u->groups:nullptr,up,b.warp_multi_sum);
+        u?static_cast<const float*>(u->fields[8])+int64_t(token)*u->groups:nullptr,up,b.warp_multi_sum,
+        b.input+int64_t(token)*b.input_width);
     const auto* table=b.sigmoid_table+(!shared && b.tokens*b.routes>1?65536:0);
     if(lane==0) {
 #pragma unroll
         for(int row=0;row<2;++row)if(first+row<width) {
-            const auto sigmoid=table[__half_as_ushort(gate[row])];
-            const auto activated=__float2half_rn(__half2float(gate[row])*__half2float(sigmoid));
             b.hidden[int64_t(slot)*b.hidden_stride+first+row]=
-                __float2half_rn(__half2float(activated)*__half2float(up[row]));
+                mfe_ffn_swiglu(b,gate[row],up[row],table);
         }
-        __threadfence();
+        if(b.completion)__threadfence();
     }
     __syncwarp();
+    if(!b.completion)return;
     if(!down || d_local<0 || d_local>=down->local_experts)return;
     const int gs=down->group_size;
     for(int row=0;row<2;++row)if(first+row<width) {
@@ -1042,7 +1049,6 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
 }
 template<int MinimumBlocks,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool TokenSingles=false>
 __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;
     const bool shared_first=(partition&4)!=0;
     const bool early_gu=(partition&8)!=0;
     partition&=3;
@@ -1093,7 +1099,8 @@ __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_ke
     __half values[2]={__float2half(0.0f),__float2half(0.0f)};
     if(first<width)project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first,
         d?static_cast<const int8_t*>(d->fields[7])+int64_t(token)*d->groups*d->group_size:nullptr,
-        d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum);
+        d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum,
+        b.input+int64_t(token)*b.input_width);
     __shared__ __half projected[32][2];
     if(lane==0) {
         projected[warp][0]=values[0];projected[warp][1]=values[1];
@@ -1105,13 +1112,12 @@ __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_ke
     if(base+lane<end) {
         const int pair=lane/2,row=lane&1;
         const auto gate=projected[pair][row],up=projected[pair+team][row];
-        const auto sigmoid=table[__half_as_ushort(gate)];
-        const auto activated=__float2half_rn(__half2float(gate)*__half2float(sigmoid));
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            __float2half_rn(__half2float(activated)*__half2float(up));
-        __threadfence();
+            mfe_ffn_swiglu(b,gate,up,table);
+        if(b.completion)__threadfence();
     }
     __syncwarp();
+    if(!b.completion)return;
     const int d_local=block_locals[2];
     const auto* down=block_present[2]?block_descriptors+2:nullptr;
     if(!down || (!block_early && (d_local<0 || d_local>=down->local_experts)))return;
@@ -1155,14 +1161,18 @@ __global__ void mfe_ffn_transfer_ready_kernel(MfeFfnBatch b) {
             reinterpret_cast<const volatile int32_t*>(b.host_transfer_index)[expert]);
     }
 }
-template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool CachedReduce=false>
+__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b,int partition,const uint32_t* cached=nullptr) {
+    if constexpr(CachedReduce)if(mfe_ffn_cached_reduce<32>(b,cached))return;
+    partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*2,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
     __shared__ __half results[32][2];
     for(int route=threadIdx.y;route<all_routes;route+=blockDim.y) {
+        // Zero shared width reserves its original slot while an independent
+        // stream computes the shared expert. Never overwrite that slot here.
+        if(route==b.routes && b.shared_intermediate==0 && partition==1)continue;
         __half values[2]={__float2half(0.0f),__float2half(0.0f)};
         const MfePackedProjection* descriptor=nullptr;int descriptor_local=-1;
         if(route<b.routes) {
@@ -1184,11 +1194,12 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
                         int local;const auto* d=projection(b,2,expert,false,local,b.plan_ready && kind==2);
                         const int slot=token*all_routes+route;
                         project_pair<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                            b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+                            b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,
+                            b.hidden+int64_t(slot)*b.hidden_stride);
                     }
                 }
             }
-        }else if(partition==2) {
+        }else if(partition==2 || b.shared_intermediate==0) {
     #pragma unroll
             for(int row=0;row<2;++row)if(first+row<b.output_width)
                 values[row]=b.resident_pairs[(int64_t(token)*all_routes+route)*b.output_width+first+row];
@@ -1198,13 +1209,15 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
             }else {
                 const int slot=token*all_routes+b.routes;
                 project_pair<Grouped,Formats,DefaultMath,E8Narrow>(b.shared+2,0,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                    b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+                    b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,
+                    b.hidden+int64_t(slot)*b.hidden_stride);
             }
         }
         if constexpr(UnifiedProjection)if(descriptor) {
             const int slot=token*all_routes+route;
             project_pair<Grouped,Formats,DefaultMath,E8Narrow>(descriptor,descriptor_local,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+                b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,
+                b.hidden+int64_t(slot)*b.hidden_stride);
         }
         if(partition==1) {
             if(lane<2 && first+lane<b.output_width)
@@ -1241,14 +1254,16 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
         else static_cast<__half*>(b.output)[index]=__float2half(output);
     }
 }
-template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool CachedReduce=false>
+__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBatch b,int partition,const uint32_t* cached=nullptr) {
+    if constexpr(CachedReduce)if(mfe_ffn_cached_reduce<32>(b,cached))return;
+    partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*4,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
     __shared__ __half results[32][4];
     for(int route=threadIdx.y;route<all_routes;route+=blockDim.y) {
+        if(route==b.routes && b.shared_intermediate==0 && partition==1)continue;
         __half values[4]={__float2half(0.0f),__float2half(0.0f)};
         const MfePackedProjection* descriptor=nullptr;int descriptor_local=-1;
         if(route<b.routes) {
@@ -1270,11 +1285,12 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBa
                         int local;const auto* d=projection(b,2,expert,false,local,b.plan_ready && kind==2);
                         const int slot=token*all_routes+route;
                         project_quad<Grouped,Formats,DefaultMath,E8Narrow>(d,local,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                            b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math);
+                            b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math,
+                            b.hidden+int64_t(slot)*b.hidden_stride);
                     }
                 }
             }
-        }else if(partition==2) {
+        }else if(partition==2 || b.shared_intermediate==0) {
     #pragma unroll
             for(int row=0;row<4;++row)if(first+row<b.output_width)
                 values[row]=b.resident_pairs[(int64_t(token)*all_routes+route)*b.output_width+first+row];
@@ -1284,13 +1300,15 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBa
             }else {
                 const int slot=token*all_routes+b.routes;
                 project_quad<Grouped,Formats,DefaultMath,E8Narrow>(b.shared+2,0,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                    b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math);
+                    b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math,
+                    b.hidden+int64_t(slot)*b.hidden_stride);
             }
         }
         if constexpr(UnifiedProjection)if(descriptor) {
             const int slot=token*all_routes+route;
             project_quad<Grouped,Formats,DefaultMath,E8Narrow>(descriptor,descriptor_local,first,b.hidden_quantized+int64_t(slot)*b.quantized_stride,
-                b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math);
+                b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,b.shared_dense_math,
+                b.hidden+int64_t(slot)*b.hidden_stride);
         }
         if(partition==1) {
             if(lane<4 && first+lane<b.output_width)

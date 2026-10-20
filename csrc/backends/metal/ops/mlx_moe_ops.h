@@ -126,6 +126,11 @@ mlx::core::array moe_weighted_reduce_sorted(
 mlx::core::array moe_inverse_permutation(
     const mlx::core::array& order);
 
+mlx::core::array moe_restore_routed_rows(
+    const mlx::core::array& sorted_output,
+    const mlx::core::array& route_order,
+    const mlx::core::array& expert_ids);
+
 mlx::core::array moe_swiglu_split(
     const mlx::core::array& gate_up);
 

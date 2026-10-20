@@ -7,7 +7,7 @@
 
 #include "ops/quant/quant_linear.h"
 #include "ops/format.h"
-#include "mfq_format_compat.h"
+#include "compat/mfq_format_compat.h"
 #include "kernels/moe/pipeline.h"
 
 #include <algorithm>
@@ -244,6 +244,33 @@ MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format) {
     }
 }
 
+static void upload_mixed_dispatch_metadata(
+        std::initializer_list<std::pair<mfq_tensor_backend::Tensor*,mfq_tensor_backend::Tensor>> tables,
+        mfq_tensor_backend::Device device,bool asynchronous,
+        mfq_tensor_backend::Tensor& device_owner,mfq_tensor_backend::Tensor& host_owner) {
+    namespace tb=mfq_tensor_backend;
+    std::size_t bytes=0;
+    for(const auto& [target,source]:tables) {
+        bytes=(bytes+15)&~std::size_t(15);
+        bytes+=source.nbytes();
+    }
+    host_owner=tb::empty({int64_t(bytes)},tb::TensorOptions().dtype(tb::kUInt8).pinned_memory(true));
+    device_owner=tb::empty({int64_t(bytes)},host_owner.options().device(device).pinned_memory(false));
+    std::memset(host_owner.data_ptr(),0,bytes);
+    std::size_t offset=0;
+    for(const auto& [target,source]:tables) {
+        offset=(offset+15)&~std::size_t(15);
+        std::memcpy(host_owner.data_ptr<uint8_t>()+offset,source.data_ptr(),source.nbytes());
+        *target=tb::from_blob(device_owner.data_ptr<uint8_t>()+offset,source.sizes(),source.options().device(device));
+        offset+=source.nbytes();
+    }
+    const auto stream=mfq_current_cuda_stream();
+    MFQ_CUDA_CHECK(cudaMemcpyAsync(device_owner.data_ptr(),host_owner.data_ptr(),bytes,cudaMemcpyHostToDevice,stream));
+    // Prefill submits its consumers on this stream and retains both packets.
+    // Other callers keep the existing cross-stream initialization guarantee.
+    if(!asynchronous)MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 static void initialize_mixed_nint_dispatch(MixedMoeRuntime& runtime) {
     namespace tb=mfq_tensor_backend;
     runtime.nint_dispatch.reset();runtime.nint_input_plans.clear();
@@ -273,10 +300,14 @@ static void initialize_mixed_nint_dispatch(MixedMoeRuntime& runtime) {
         params.insert(params.end(),{int32_t(w.ng),int32_t(w.gs),int32_t(w.q_packed.numel()/pool.local_experts)});
     }
     if(dispatch->pools.empty())return;
-    dispatch->map_ptrs=tb::tensor(maps).to(device);
-    dispatch->pool_params=tb::tensor(params).reshape({int64_t(dispatch->pools.size()),3}).to(device);
-    dispatch->expert_pool=tb::full({runtime.n_experts},-1,dispatch->pool_params.options());
-    dispatch->expert_local=tb::full({runtime.n_experts},-1,dispatch->pool_params.options());
+    std::vector<int32_t> missing(runtime.n_experts,-1);
+    const auto i32=tb::TensorOptions().dtype(tb::kInt32),i64=tb::TensorOptions().dtype(tb::kInt64);
+    upload_mixed_dispatch_metadata({
+        {&dispatch->map_ptrs,tb::from_blob(maps.data(),{int64_t(maps.size())},i64)},
+        {&dispatch->pool_params,tb::from_blob(params.data(),{int64_t(dispatch->pools.size()),3},i32)},
+        {&dispatch->expert_pool,tb::from_blob(missing.data(),{runtime.n_experts},i32)},
+        {&dispatch->expert_local,tb::from_blob(missing.data(),{runtime.n_experts},i32)}},
+        device,runtime.prefill_only,dispatch->metadata_device,dispatch->metadata_host);
     runtime.nint_dispatch=std::move(dispatch);
 }
 
@@ -420,30 +451,19 @@ void initialize_mixed_nvq_dispatch(
 
     auto dispatch = std::make_shared<MixedNvqDispatch>();
     dispatch->pool_count = dispatch_pool;
-    dispatch->map_ptrs=mfq_tensor_backend::tensor(map_ptrs).to(target).contiguous();
     dispatch->f16_format_group = f16_format_group;
     dispatch->masked_experts = owned_experts < runtime.n_experts;
     dispatch->dense_groups = has_dense_groups;
-    dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
-        weight_ptrs.data(), {dispatch_pool, 5},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-        .clone().to(target).contiguous();
-    dispatch->weight_sizes = mfq_tensor_backend::from_blob(
-        weight_sizes.data(), {dispatch_pool, 3},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-        .clone().to(target).contiguous();
-    dispatch->pool_params = mfq_tensor_backend::from_blob(
-        pool_params.data(), {dispatch_pool, 7},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
-    dispatch->expert_pool = mfq_tensor_backend::from_blob(
-        expert_pool.data(), {runtime.n_experts},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
-    dispatch->expert_local = mfq_tensor_backend::from_blob(
-        expert_local.data(), {runtime.n_experts},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
+    namespace tb=mfq_tensor_backend;
+    const auto i32=tb::TensorOptions().dtype(tb::kInt32),i64=tb::TensorOptions().dtype(tb::kInt64);
+    upload_mixed_dispatch_metadata({
+        {&dispatch->map_ptrs,tb::from_blob(map_ptrs.data(),{int64_t(map_ptrs.size())},i64)},
+        {&dispatch->weight_ptrs,tb::from_blob(weight_ptrs.data(),{dispatch_pool,5},i64)},
+        {&dispatch->weight_sizes,tb::from_blob(weight_sizes.data(),{dispatch_pool,3},i64)},
+        {&dispatch->pool_params,tb::from_blob(pool_params.data(),{dispatch_pool,7},i32)},
+        {&dispatch->expert_pool,tb::from_blob(expert_pool.data(),{runtime.n_experts},i32)},
+        {&dispatch->expert_local,tb::from_blob(expert_local.data(),{runtime.n_experts},i32)}},
+        target,runtime.prefill_only,dispatch->metadata_device,dispatch->metadata_host);
     runtime.nvq_dispatch = std::move(dispatch);
 }
 
@@ -707,13 +727,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             const auto& w=pools[nint_dispatch->pools.front()].nint;
             if(neuron_len==2560 && out_per_expert==640 && w.gs==28 && w.bits==5 &&
                     nint_late_scale_enabled(neuron_len,int(w.bits),x.get_device())) {
-                thread_local int cached_device=-1,major=0,minor=0;
-                if(cached_device!=x.get_device()) {
-                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,x.get_device()));
-                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,x.get_device()));
-                    cached_device=x.get_device();
-                }
-                request_rows=major==8 && minor==6;
+                request_rows=true;
             }
         }
         bool prepare_rows=request_rows && nint_dispatch->pools.size()==1 &&

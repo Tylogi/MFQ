@@ -1,9 +1,9 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 
-#include "mfe_expert_store.h"
-#include "mlx_eval_timing.h"
-#include "mlx_mtp.h"
-#include "mlx_transformer.h"
+#include "storage/mfe_expert_store.h"
+#include "runtime/mlx_eval_timing.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <array>
@@ -2666,7 +2666,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     token))) {
             break;
         }
-        if (mlx_token_in_set(eos, token) ||
+        if ((!sampling.warmup && mlx_token_in_set(eos, token)) ||
             generated == max_tokens) {
             report_components();
             break;

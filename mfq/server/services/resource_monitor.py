@@ -54,10 +54,11 @@ def _gpu_usage() -> list[dict[str, Any]]:
             devices.append({"name": card.name, "utilization_percent": _percent(value)})
         if devices:
             return devices
-    rows = _command(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"])
+    rows = _command(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"])
     devices = []
     for row in rows.splitlines():
         columns = [value.strip() for value in row.split(",")]
+        device_id = columns.pop(0) if len(columns) == 6 else None
         if len(columns) not in {2, 5}:
             continue
         name, value = columns[:2]
@@ -67,6 +68,8 @@ def _gpu_usage() -> list[dict[str, Any]]:
             utilization = None
         if name.strip():
             device = {"name": name.strip(), "utilization_percent": utilization}
+            if device_id is not None:
+                device["id"] = device_id
             if len(columns) == 5:
                 for key, counter in zip(("memory_total_bytes", "memory_used_bytes", "memory_available_bytes"), columns[2:]):
                     try:

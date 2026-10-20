@@ -28,6 +28,7 @@ struct CudaLoadOptions {
     double moe_gpu_cache_gb = 0.0;
     int64_t context_size = 0;
     bool parallel_test_duplicates = false;
+    bool yarn_context_extension = false;
 };
 
 struct CudaEngineOptions : CudaLoadOptions {

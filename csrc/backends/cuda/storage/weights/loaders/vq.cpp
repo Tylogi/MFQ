@@ -2,12 +2,12 @@
 
 #include "ops/quant/cpu_projection_rows.h"
 #include "ops/execution/execution_options.h"
-#include "nvq_codebooks.generated.h"
-#include "nvq_dense_pack.h"
-#include "nvq_group.h"
+#include "generated/nvq_codebooks.generated.h"
+#include "csrc/backends/cpu/ops/nvq_dense_pack.h"
+#include "csrc/backends/cpu/ops/nvq_group.h"
 #include "ops/format.h"
-#include "packed_nint.h"
-#include "quant_dot.h"
+#include "csrc/backends/cpu/ops/packed_nint.h"
+#include "csrc/backends/cpu/ops/quant_dot.h"
 
 #include <algorithm>
 #include <cstring>
@@ -975,14 +975,14 @@ NvqWeight to_device_nvq(
         const CudaExecutionConfig& config) {
     NvqWeight w;
     std::array<uint8_t, 16> e8_state_remap = {};
-    auto e8_index_remap =
-        std::make_unique<std::array<std::array<uint16_t, 4096>, 4>>();
+    std::unique_ptr<std::array<std::array<uint16_t,4096>,4>> e8_index_remap;
     std::vector<int8_t> e8_runtime_codebook;
     std::vector<uint8_t> e8_runtime_sub_scale;
     const bool use_extended_e8 =
         cuda && c.format == 14 &&
         extended_jsc_group_layout_enabled(config);
     if (use_extended_e8) {
+        e8_index_remap=std::make_unique<std::array<std::array<uint16_t,4096>,4>>();
         e8_runtime_codebook = reorder_extended_e8_codebook_for_stage3(
             c, e8_state_remap, *e8_index_remap);
         e8_runtime_sub_scale = remap_extended_e8_sub_scale_states(
@@ -1054,6 +1054,21 @@ NvqWeight to_device_nvq(
         const int entries = c.format == 1 ? 2048 : (c.format == 8 ? 1024 : 256);
         w.codebook = cpu_i8_tensor(c.codebook, {entries, dims});
     }
+    // Retain the immutable map before upload. Decode and graph capture must
+    // never copy codebook metadata back from the device.
+    if ((w.kernel_format==5 || w.kernel_format==13 || w.kernel_format==14 ||
+         w.kernel_format==10 || w.kernel_format==12 || w.kernel_format==15) &&
+        w.codebook.numel()>=64) {
+        const auto* metadata=w.codebook.data_ptr<int8_t>();
+        for(unsigned state=0;state<16;++state)
+            w.bank_map|=uint32_t(uint8_t(metadata[36+state])&3u)<<(2*state);
+        if((w.kernel_format==12 || w.kernel_format==15) && metadata[1]==2 && metadata[3]==1) {
+            static std::atomic<uint32_t> reported{0};const uint32_t bit=1u<<w.kernel_format;
+            if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+                "mfe_d4_analytic_scale_metadata scope=first_validated_table format=%d banks=2 mode=1\n",
+                int(w.kernel_format));
+        }
+    }
     if (cuda) {
         const auto target = mfq_tensor_backend::Device(
             mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
@@ -1066,7 +1081,7 @@ NvqWeight to_device_nvq(
         w.neuron_scale = w.neuron_scale.to(target).contiguous();
         w.codebook = w.codebook.to(target).contiguous();
         prepare_nvq_decode_records(w,true);
-        (void)w.workspace(1);
+        (void)resident_nvq_workspace(w,1);
     }
     return w;
 }

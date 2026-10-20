@@ -1,11 +1,11 @@
 #include "mlx_minicpmo45.h"
-#include "mlx_multimodal.h"
+#include "runtime/mlx_multimodal.h"
 
-#include "mlx_platform.h"
-#include "mlx_sampling.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
-#include "mlx_eval_timing.h"
+#include "runtime/mlx_platform.h"
+#include "runtime/mlx_sampling.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
+#include "runtime/mlx_eval_timing.h"
 
 #include "nlohmann/json.hpp"
 
@@ -1252,6 +1252,7 @@ mini_gqa_reduce_kernel() {
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float global_max = reductions[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint block = dimension; block < blocks; block += uint(HEAD_DIM)) {
@@ -4284,6 +4285,77 @@ void test_minicpmo45_gqa_attention() {
                 "MiniCPM-o fused GQA attention mismatch at " +
                 std::to_string(sequence) + ": " +
                 std::to_string(maximum));
+        }
+    }
+}
+
+void test_minicpmo45_gqa_reduction() {
+    constexpr int head_dim = 128;
+    constexpr int query_heads = 4'096;
+    std::uint32_t state = 7'391;
+    const auto uniform = [&state]() {
+        state = 1'664'525u * state + 1'013'904'223u;
+        return static_cast<float>(state >> 8) / 16'777'216.0f;
+    };
+    for (const int blocks : {2, 8, 16, 48, 64}) {
+        for (int trial = 0; trial < 5; ++trial) {
+            std::vector<float> stats(query_heads * blocks * 2);
+            std::vector<float> partials(query_heads * blocks * head_dim);
+            std::vector<float> expected(query_heads * head_dim);
+            for (int head = 0; head < query_heads; ++head) {
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int block = 0; block < blocks; ++block) {
+                    const int index = head * blocks + block;
+                    const float local_max = uniform() * 10.0f - 5.0f;
+                    const float local_sum = uniform() * 19.9f + 0.1f;
+                    maximum = std::max(maximum, local_max);
+                    stats[index * 2] = local_max;
+                    stats[index * 2 + 1] = local_sum;
+                    for (int dimension = 0; dimension < head_dim; ++dimension) {
+                        partials[index * head_dim + dimension] =
+                            (uniform() * 2.0f - 1.0f) * local_sum;
+                    }
+                }
+                double denominator = 0.0;
+                std::vector<double> numerators(head_dim, 0.0);
+                for (int block = 0; block < blocks; ++block) {
+                    const int index = head * blocks + block;
+                    const double factor = std::exp(
+                        static_cast<double>(stats[index * 2]) - maximum);
+                    denominator += stats[index * 2 + 1] * factor;
+                    for (int dimension = 0; dimension < head_dim; ++dimension) {
+                        numerators[dimension] +=
+                            partials[index * head_dim + dimension] * factor;
+                    }
+                }
+                for (int dimension = 0; dimension < head_dim; ++dimension) {
+                    expected[head * head_dim + dimension] =
+                        static_cast<float>(numerators[dimension] / denominator);
+                }
+            }
+            auto reduced = mini_gqa_reduce_kernel()(
+                {
+                    array(stats.begin(), Shape{query_heads, blocks, 2}),
+                    array(partials.begin(), Shape{query_heads, blocks, head_dim}),
+                    array({blocks}, mlx::core::int32),
+                },
+                {Shape{query_heads, head_dim}},
+                {mlx::core::float16},
+                {query_heads * head_dim, 1, 1},
+                {head_dim, 1, 1},
+                {}, std::nullopt, false, {}).front();
+            auto difference = mlx::core::max(mlx::core::abs(
+                mlx::core::astype(reduced, mlx::core::float32) -
+                array(expected.begin(), Shape{query_heads, head_dim})));
+            difference.eval();
+            const float maximum = difference.item<float>();
+            if (!std::isfinite(maximum) || maximum > 0.002f) {
+                throw std::runtime_error(
+                    "MiniCPM-o GQA reduction mismatch: blocks=" +
+                    std::to_string(blocks) + " trial=" +
+                    std::to_string(trial) + " error=" +
+                    std::to_string(maximum));
+            }
         }
     }
 }

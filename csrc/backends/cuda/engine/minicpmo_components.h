@@ -1,6 +1,6 @@
 #pragma once
 
-#include "inference.h"
+#include "csrc/engine/requests/inference.h"
 #include "models/minicpmo45/ops.h"
 
 #include <memory>

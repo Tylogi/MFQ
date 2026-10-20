@@ -3,7 +3,7 @@
 #include "tokenizer.h"
 
 #include "chat.h"
-#include "chat/common.h"
+#include "common.h"
 #include "mfq_grammar.h"
 #include "mfq_text.h"
 

@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/cache/paged_kv.h"
+#include "paged_kv.h"
 
 #include <algorithm>
 #include <cstdint>

@@ -49,6 +49,16 @@ function fixture() {
   } as unknown as ChatPageState;
 }
 
+it('没有加载模型也能新建会话，列表不再显示模型绑定', async () => {
+  const page = fixture();
+  page.chat.conversation.modelAvailable = false;
+  render(<ChatSessionSidebar page={page} />);
+  await userEvent.click(screen.getByRole('button', { name: 'New chat' }));
+  expect(page.createSession).toHaveBeenCalledOnce();
+  expect(screen.queryByText('model-a')).not.toBeInTheDocument();
+  expect(screen.queryByText('model-b')).not.toBeInTheDocument();
+});
+
 it('三角标收起列表，全部删除按钮不触发会话切换', async () => {
   const page = fixture();
   render(<ChatSessionSidebar page={page} />);

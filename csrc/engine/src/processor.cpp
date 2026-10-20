@@ -5,7 +5,7 @@
 #include "constraint.h"
 #include "tokenizer.h"
 
-#include "chat/common.h"
+#include "common.h"
 #include "json-schema-to-grammar.h"
 #include "nlohmann/json.hpp"
 

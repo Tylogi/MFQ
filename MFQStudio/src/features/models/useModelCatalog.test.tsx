@@ -12,6 +12,7 @@ import { useModelCatalog } from './useModelCatalog';
 import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
 import { setApiBaseUrl } from '../../shared/api/client';
 import { isStudio, selectLocalModelDirectory } from '../../studio';
+import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 const state = vi.hoisted(() => ({
   ready: false,
@@ -75,6 +76,139 @@ beforeEach(() => {
 });
 
 describe('useModelCatalog', () => {
+  it('prepares deletion without removing files and requires explicit confirmation', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    const remove = vi.spyOn(modelsApi, 'deleteModel').mockResolvedValue({ files: 1, total_bytes: 128 });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(remove).not.toHaveBeenCalled();
+    act(() => result.current.cancelModelDeletion());
+    expect(result.current.modelDeletion).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).toHaveBeenCalledExactlyOnceWith(artifact.id, plan.token);
+    expect(result.current.modelDeletion).toBeNull();
+    expect(result.current.artifacts).toEqual([]);
+  });
+
+  it('connection changes dismiss deletion confirmation and discard old previews', async () => {
+    state.ready = true;
+    let resolve!: (plan: Awaited<ReturnType<typeof modelsApi.modelDeletionPlan>>) => void;
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockReturnValue(new Promise(done => { resolve = done; }));
+    const remove = vi.spyOn(modelsApi, 'deleteModel');
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    let pending!: Promise<void>;
+    act(() => { pending = result.current.prepareModelDeletion(artifact.id); });
+    setApiBaseUrl('http://other-server:8090');
+    state.connectionRevision++;
+    rerender();
+    await act(async () => {
+      resolve({ model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) });
+      await pending;
+    });
+    expect(result.current.modelDeletion).toBeNull();
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('deletion failure preserves the model and confirmation for retry', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    vi.spyOn(modelsApi, 'deleteModel').mockRejectedValue(new Error('permission denied'));
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    await act(async () => result.current.confirmModelDeletion());
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(result.current.artifacts).toEqual([artifact]);
+    expect(result.current.busy).toBe(false);
+  });
+
+  it('removes deleted checkpoints on the next fresh scan without a job change', async () => {
+    vi.useFakeTimers();
+    try {
+      state.ready = true;
+      const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
+      await act(async () => { await Promise.resolve(); });
+      expect(modelsApi.modelArtifacts).toHaveBeenLastCalledWith(true);
+      expect(result.current.artifacts).toEqual([artifact]);
+      vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(result.current.artifacts).toEqual([]);
+      expect(result.current.filteredArtifacts).toEqual([]);
+      unmount();
+      const calls = vi.mocked(modelsApi.modelArtifacts).mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(calls);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rescans on focus or visibility without overlapping catalog reads', async () => {
+    vi.useFakeTimers();
+    try {
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+      state.ready = true;
+      let resolve!: (items: ModelArtifact[]) => void;
+      vi.mocked(modelsApi.modelArtifacts).mockReturnValue(new Promise(done => { resolve = done; }));
+      const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).not.toHaveBeenCalled();
+      hidden.mockReturnValue(false);
+      act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+      act(() => { window.dispatchEvent(new Event('focus')); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(1);
+      await act(async () => { resolve([artifact]); await Promise.resolve(); });
+      expect(result.current.artifacts).toEqual([artifact]);
+      vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+      await act(async () => { window.dispatchEvent(new Event('focus')); await Promise.resolve(); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(2);
+      expect(result.current.artifacts).toEqual([]);
+      unmount();
+      act(() => { window.dispatchEvent(new Event('focus')); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not resurrect an old catalog response after changing servers', async () => {
+    state.ready = true;
+    let resolve!: (items: ModelArtifact[]) => void;
+    vi.mocked(modelsApi.modelArtifacts).mockReturnValueOnce(new Promise(done => { resolve = done; }))
+      .mockResolvedValue([]);
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    setApiBaseUrl('http://other-server:8090');
+    state.connectionRevision++;
+    rerender();
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { resolve([artifact]); await Promise.resolve(); });
+    expect(result.current.artifacts).toEqual([]);
+  });
+
+  it('does not overwrite a newly registered catalog with an older poll', async () => {
+    state.ready = true;
+    let resolve!: (items: ModelArtifact[]) => void;
+    vi.mocked(modelsApi.modelArtifacts).mockReturnValueOnce(new Promise(done => { resolve = done; }))
+      .mockResolvedValue([artifact]);
+    vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
+      current_path: '/models', parent_id: null, model_file_count: 1, data: [] });
+    vi.spyOn(modelsApi, 'registerModelDirectory').mockResolvedValue([artifact]);
+    vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await act(async () => result.current.chooseModelDirectory());
+    await act(async () => result.current.registerCurrentModelDirectory());
+    expect(result.current.artifacts).toEqual([artifact]);
+    await act(async () => { resolve([{ ...artifact, id: 'deleted', name: 'Deleted model' }]); await Promise.resolve(); });
+    expect(result.current.artifacts).toEqual([artifact]);
+  });
+
   it('does not continue registration or save the old folder after changing server', async () => {
     vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'old-folder', current_name: 'models',
       current_path: '/old/models', parent_id: null, model_file_count: 1, data: [] });
@@ -181,20 +315,38 @@ describe('useModelCatalog', () => {
     expect(state.refreshRuntime).not.toHaveBeenCalled();
   });
 
-  it('opens the browsed directory in Finder without loading, registering, or changing the saved folder', async () => {
+  it.each([
+    { can_open_directory: true, can_open_in_finder: true },
+    { can_open_directory: true, can_open_in_finder: false },
+    { can_open_in_finder: true },
+  ])('opens the browsed directory without loading, registering, or changing the saved folder (%j)', async (capability) => {
     saveModelDirectory('/chosen/models');
-    const open = vi.spyOn(modelsApi, 'openModelDirectoryInFinder').mockResolvedValue({ opened: true });
+    const open = vi.spyOn(modelsApi, 'openModelDirectory').mockResolvedValue({ opened: true });
     const register = vi.spyOn(modelsApi, 'registerModelDirectory');
     const load = vi.spyOn(modelsApi, 'loadModel');
     vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
-      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], can_open_in_finder: true, files: [] });
+      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], ...capability, files: [] });
     const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
     await act(async () => result.current.chooseModelDirectory());
-    await act(async () => result.current.openCurrentDirectoryInFinder());
+    await act(async () => result.current.openCurrentDirectory());
     expect(open).toHaveBeenCalledWith('folder');
     expect(register).not.toHaveBeenCalled();
     expect(load).not.toHaveBeenCalled();
     expect(readModelDirectory()).toBe('/chosen/models');
+    expect(result.current.busy).toBe(false);
+  });
+
+  it.each([
+    { can_open_directory: false, can_open_in_finder: false },
+    { can_open_directory: false, can_open_in_finder: true },
+  ])('does not launch a file manager when unavailable (%j)', async (capability) => {
+    const open = vi.spyOn(modelsApi, 'openModelDirectory').mockResolvedValue({ opened: true });
+    vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
+      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], ...capability });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await act(async () => result.current.chooseModelDirectory());
+    await act(async () => result.current.openCurrentDirectory());
+    expect(open).not.toHaveBeenCalled();
     expect(result.current.busy).toBe(false);
   });
 
@@ -299,11 +451,14 @@ describe('useModelCatalog', () => {
     act(() => {
       result.current.setLoadPinned(true);
       result.current.setLoadIdleTtl(300);
+      result.current.setLoadDeviceIds(['2']);
     });
     await act(async () => result.current.loadArtifact(artifact.name));
-    expect(load).toHaveBeenCalledWith('Local Model', 8192, 2048, {
+    expect(load).toHaveBeenCalledWith('Local Model', 32768, 2048, {
       pin: true,
       idle_ttl_seconds: 300,
+      device_ids: ['2'],
+      context_management: DEFAULT_LOAD_CONTEXT,
     });
     expect(state.refreshRuntime).toHaveBeenCalledWith(false);
     expect(state.setSelectedModel).toHaveBeenCalledWith('Local Model');
@@ -413,5 +568,31 @@ describe('useModelCatalog', () => {
     useToastStore.getState().clearToasts();
     renderHook(useModelCatalog, { wrapper: Wrapper });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('reports an interrupted load without requiring an error in the first terminal SSE event', () => {
+    const job = { id: 'interrupted-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'interrupted' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Model loading was interrupted. Please load the model again.');
+    act(() => useJobStore.getState().setJobs([{ ...job, status: 'interrupted' }]));
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+
+  it('waits for the failure detail instead of losing the error after a terminal state-only event', () => {
+    const job = { id: 'failed-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'failed' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    act(() => useJobStore.getState().updateJob(job.id, {
+      error: { code: 'LOAD_FAILED', message: 'load failed', retryable: false, details: {} },
+    }));
+    expect(screen.getByRole('alert')).toHaveTextContent('LOAD_FAILED: load failed');
   });
 });

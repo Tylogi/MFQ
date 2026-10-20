@@ -5,9 +5,9 @@
 #include "ops/quant/quant_linear.h"
 #include "ops/execution/cuda_execution.h"
 #include "storage/weights/moe/expert_cache.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
-#include "csrc/backends/cuda/kernels/deepseek_v41.h"
+#include "kernels/deepseek_v4_attention.h"
+#include "kernels/deepseek_v4_hc.h"
+#include "kernels/deepseek_v41.h"
 #include "native/tensor/backend.h"
 
 #include <cuda_runtime_api.h>

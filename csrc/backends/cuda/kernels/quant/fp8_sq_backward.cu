@@ -2,7 +2,7 @@
 // compiles fp8_sq.cu alone; the Python calibration extension adds this unit.
 // The dense weight comes from the shared inference dequant entry point, so the
 // packed decode stays one implementation.
-#include "fp8_sq.h"
+#include "kernels/quant/fp8_sq.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,7 +1,7 @@
-#include "mlx_grouped_linear.h"
-#include "mlx_tensor.h"
+#include "ops/mlx_grouped_linear.h"
+#include "runtime/mlx_tensor.h"
 
-#include "nvq_codebooks.generated.h"
+#include "generated/nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>
@@ -835,7 +835,8 @@ void require_close(
     float actual,
     float expected,
     float tolerance) {
-    if (std::fabs(actual - expected) > tolerance) {
+    if (!std::isfinite(actual) || !std::isfinite(expected) ||
+        std::fabs(actual - expected) > tolerance) {
         throw std::runtime_error(
             "grouped linear result mismatch: actual="
             + std::to_string(actual)
@@ -1061,7 +1062,7 @@ int main() {
                     static_cast<std::size_t>(widths[projection]) * inputs);
                 for (std::size_t index = 0; index < values.size(); ++index) {
                     values[index] = static_cast<float>(
-                        (index * 13 + projection * 17) % 41 - 20) /
+                        int((index * 13 + projection * 17) % 41) - 20) /
                         256.0f;
                 }
                 auto weight = contiguous(astype(
@@ -1087,7 +1088,7 @@ int main() {
                     static_cast<std::size_t>(rows) * inputs);
                 for (std::size_t index = 0; index < values.size(); ++index) {
                     values[index] = static_cast<float>(
-                        (index * 7 + rows * 11) % 37 - 18) /
+                        int((index * 7 + rows * 11) % 37) - 18) /
                         128.0f;
                 }
                 auto input = contiguous(astype(

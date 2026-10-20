@@ -1,4 +1,4 @@
-#include "mlx_engine.h"
+#include "runtime/mlx_engine.h"
 #include "grammar_fixture.h"
 
 #include <atomic>

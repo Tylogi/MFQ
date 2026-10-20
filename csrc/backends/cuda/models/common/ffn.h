@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 
 struct FFN {
     QuantLinearGroup gate_up;
@@ -39,8 +40,13 @@ struct FFN {
     double moe_router_scale = 1.0;
     double swiglu_limit = 0.0;
     int moe_layer = -1;
+    mutable bool moe_pipeline_initialized=false;
+    mutable std::function<mfq_tensor_backend::Tensor(CudaExecutionContext&,
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,
+        const mfq_tensor_backend::Tensor&)> moe_pipeline_forward;
 
     bool uses_moe_expert_cache() const;
+    void prepare_moe_pipeline(CudaExecutionContext& execution) const;
     bool tensor_parallel_dense_compatible() const;
     mfq_tensor_backend::Tensor forward_tensor_parallel_dense(
         CudaExecutionContext& execution,

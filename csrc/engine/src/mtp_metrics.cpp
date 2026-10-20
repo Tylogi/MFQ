@@ -20,6 +20,9 @@ void append_generation_metrics(
     metrics.emplace_back("mtp_standard_tokens", static_cast<double>(stats.standard_tokens));
     metrics.emplace_back("mtp_park_count", static_cast<double>(stats.park_count));
     metrics.emplace_back("mtp_reentry_probes", static_cast<double>(stats.reentry_probes));
+    metrics.emplace_back("mtp_target_ms", stats.target_ms);
+    metrics.emplace_back("mtp_head_ms", stats.head_ms);
+    metrics.emplace_back("mtp_rollback_ms", stats.rollback_ms);
     metrics.emplace_back(
         "mtp_selected_depth", static_cast<double>(stats.selected_depth));
     for (std::size_t depth = 0; depth < stats.depth_cycles.size(); ++depth) {

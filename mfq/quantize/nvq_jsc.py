@@ -410,6 +410,25 @@ def _native_e8_search_banks(
     return scales, indices.to(torch.int64)
 
 
+def _metal_d4_jsc_assignment_supported(
+    codebooks: torch.Tensor,
+    config: NvqJscConfig,
+    bank_for_state: torch.Tensor,
+) -> bool:
+    return (
+        codebooks.device.type == "mps"
+        and codebooks.dtype == torch.int8
+        and config.banks == 2
+        and config.spec.vector_size == 4
+        and config.spec.codebook_entries in {256, 512, 1024}
+        and tuple(codebooks.shape) == (2, config.spec.codebook_entries, 4)
+        and bool(
+            ((bank_for_state == 0).sum() == 8)
+            & ((bank_for_state == 1).sum() == 8)
+        )
+    )
+
+
 def _assign_groups(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
@@ -424,12 +443,16 @@ def _assign_groups(
     config: NvqJscConfig,
     raw_scales: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _metal_e8_jsc_assignment_supported(codebooks, config):
-        from mfq.quantize.metal.nvq_jsc import nvq2j_assign
+    if (
+        _metal_e8_jsc_assignment_supported(codebooks, config)
+        or _metal_d4_jsc_assignment_supported(codebooks, config, bank_for_state)
+    ):
+        from mfq.quantize.metal.nvq_jsc import nvq2j_assign, nvq3j_assign
 
         padded_width = ng * _GROUP_SIZE
         valid_width = (ng - 1) * _GROUP_SIZE + valid_last
-        state_2d, indices_3d = nvq2j_assign(
+        assign = nvq2j_assign if config.spec.vector_size == 8 else nvq3j_assign
+        state_2d, indices_3d = assign(
             xgroup.reshape(out, padded_width),
             wgroup.reshape(out, padded_width),
             neuron_scale,
@@ -730,6 +753,16 @@ def _validate_tables(
     return np.ascontiguousarray(alpha), bank, codebooks, tables.spec
 
 
+def _load_cuda_row_sse():
+    try:
+        from mfq.quantize.cuda.nvq_sse import jsc_row_sse
+    except ModuleNotFoundError as error:
+        if error.name != 'triton':
+            raise
+        return None
+    return jsc_row_sse
+
+
 @torch.inference_mode()
 def quantize_nvq_jsc_fixed(
     weight: torch.Tensor,
@@ -768,6 +801,7 @@ def quantize_nvq_jsc_fixed(
     ).contiguous()
     alpha = torch.as_tensor(alpha_np, device=value.device, dtype=torch.float32)
     bank_for_state = torch.as_tensor(bank_np, device=value.device, dtype=torch.int64)
+    cuda_row_sse = _load_cuda_row_sse() if target.is_cuda else None
     def packed_sse(anchor, state, indices):
         from mfq.quantize.cuda.packed_result import jsc
         error = row_sse(anchor, state, indices)
@@ -776,10 +810,9 @@ def quantize_nvq_jsc_fixed(
     def row_sse(anchor, state, indices):
         # target equals original weights times the encoded even-parity signs.
         # Comparing it with unsigned codewords retains sign-flip error exactly.
-        if target.is_cuda:
-            from mfq.quantize.cuda.nvq_sse import jsc_row_sse
-            return jsc_row_sse(target, objective_weight, anchor, state, indices,
-                               alpha, bank_for_state, codebooks, spec.vector_size)
+        if cuda_row_sse is not None:
+            return cuda_row_sse(target, objective_weight, anchor, state, indices,
+                                alpha, bank_for_state, codebooks, spec.vector_size)
         states = state.reshape(out, ng).long()
         banks = bank_for_state[states].repeat_interleave(_GROUP_SIZE // spec.vector_size, 1)
         codes = codebooks[banks, indices.reshape(out, -1).long()].float().reshape_as(target)

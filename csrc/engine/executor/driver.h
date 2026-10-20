@@ -28,6 +28,8 @@ struct BatchSample {
     MfqPrefillTiming timing;
 };
 
+template <class Sample> struct PrefillBatchResult { Sample sample; std::exception_ptr failure; };
+
 template <class Request> struct PrefillWork {
     const std::shared_ptr<Request>& request;
     PrefillChunk chunk;
@@ -50,7 +52,7 @@ template <class Execution> class ContinuousBatch {
         std::exception_ptr failure;
         bool decode = false;
     };
-    int64_t prefill_chunk_size;
+    int64_t prefill_chunk_size, prefill_token_budget;
     Execution execution;
     std::vector<std::shared_ptr<Request>> active;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
@@ -103,10 +105,21 @@ template <class Execution> class ContinuousBatch {
     };
 
   public:
+    bool empty() const noexcept { return requests.empty(); }
+    void invalidate_runtime_policy() {
+        if constexpr(requires { execution.invalidate_runtime_policy(); })execution.invalidate_runtime_policy();
+    }
+    void release_idle_buffers() {
+        if(!empty())throw std::runtime_error("cannot release active batch buffers");
+        if constexpr(requires { execution.suspend_decode(); })execution.suspend_decode();
+        else execution.recover(active);
+    }
     template <class... Args>
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
-        : prefill_chunk_size(std::min(chunk_size, token_budget)),
+        : prefill_chunk_size(std::min(chunk_size, token_budget)), prefill_token_budget(token_budget),
           execution(std::forward<Args>(args)...) {
+        if constexpr(requires { execution.prefill_batch_token_budget(); })
+            prefill_chunk_size=std::min(prefill_chunk_size,execution.prefill_batch_token_budget());
         if (prefill_chunk_size <= 0)
             throw std::invalid_argument("continuous batching requires a positive prefill chunk");
     }
@@ -126,8 +139,25 @@ template <class Execution> class ContinuousBatch {
 
     void step(const std::vector<std::string>& eligible) {
         const auto plan = plan_batch(eligible, decode_next);
+        std::vector<std::pair<std::shared_ptr<Request>,PrefillChunk>> prefills;
+        const auto finish_prefill = [&](const std::shared_ptr<Request>& request, PrefillChunk chunk, BatchSample sample) {
+            auto& work=*requests.at(request->id);
+            request->prefill_offset=chunk.offset+chunk.count;
+            ++prefill_chunks;
+            if(request->prefill_offset==static_cast<int64_t>(request->prompt.size())) {
+                request->cache_length=request->prompt.size();active.push_back(request);++admissions;
+            } else ++prefill_yields;
+            work.result=std::move(sample);work.prefill.reset();
+        };
+        const auto fail = [&](const std::shared_ptr<Request>& request, std::exception_ptr failure) {
+            execution.release(request);
+            std::erase(active,request);
+            auto& work=*requests.at(request->id);work.failure=failure;work.prefill.reset();work.decode=false;
+        };
         try {
             if (!plan.decode.empty()) {
+                for(const auto& request:active)
+                    if(std::find(eligible.begin(),eligible.end(),request->id)!=eligible.end() && !requests.at(request->id)->decode)return;
                 auto decoded = execution.execute(DecodeWork<Request>{plan.decode});
                 if (!decoded) return; // Preparation committed no row.
                 if (decoded->size() != plan.decode.size())
@@ -140,24 +170,59 @@ template <class Execution> class ContinuousBatch {
                     work.decode = false;
                 }
             } else if (plan.prefill) {
-                auto& work = *requests.at(plan.prefill->id);
-                const auto chunk = plan.prefill_chunk;
                 PrefillActivity prefill_activity;
-                auto sample = execution.execute(PrefillWork<Request>{plan.prefill, chunk});
-                plan.prefill->prefill_offset = chunk.offset + chunk.count;
-                ++prefill_chunks;
-                if (plan.prefill->prefill_offset == static_cast<int64_t>(plan.prefill->prompt.size())) {
-                    plan.prefill->cache_length = plan.prefill->prompt.size();
-                    active.push_back(plan.prefill);
-                    ++admissions;
-                } else ++prefill_yields;
-                work.result = std::move(sample);
-                work.prefill.reset();
+                if constexpr(requires { execution.prefill_batch(prefills); }) {
+                    std::size_t limit=eligible.size();
+                    if constexpr(requires { execution.prefill_batch_limit(); })limit=execution.prefill_batch_limit();
+                    auto budget=prefill_token_budget;
+                    if constexpr(requires { execution.prefill_batch_token_budget(); })budget=std::min(budget,execution.prefill_batch_token_budget());
+                    for(const auto& id:eligible) {
+                        const auto it=requests.find(id);
+                        if(it==requests.end() || !it->second->prefill || prefills.size()>=limit || budget<=0)continue;
+                        auto chunk=*it->second->prefill;
+                        if(chunk.count>budget)continue;
+                        prefills.emplace_back(it->second->request,chunk);budget-=chunk.count;
+                    }
+                    if(prefills.empty())throw std::logic_error("packed prefill selected no work");
+                    auto samples=execution.prefill_batch(prefills);
+                    if(samples.size()!=prefills.size())throw std::logic_error("packed prefill result count disagrees with selected rows");
+                    for(std::size_t row=0;row<samples.size();++row) {
+                        if constexpr(requires { samples[row].failure; }) {
+                            if(samples[row].failure)fail(prefills[row].first,samples[row].failure);
+                            else finish_prefill(prefills[row].first,prefills[row].second,std::move(samples[row].sample));
+                        } else finish_prefill(prefills[row].first,prefills[row].second,std::move(samples[row]));
+                    }
+                } else {
+                    prefills.emplace_back(plan.prefill,plan.prefill_chunk);
+                    auto sample=execution.execute(PrefillWork<Request>{plan.prefill,plan.prefill_chunk});
+                    finish_prefill(plan.prefill,plan.prefill_chunk,std::move(sample));
+                }
             }
             decode_next = !decode_next;
         } catch (...) {
-            recover(std::current_exception());
-            throw;
+            auto failure=std::current_exception();
+            bool capacity=false;
+            try {std::rethrow_exception(failure);}
+            catch(const InferenceInputError& error) {capacity=error.code==InferenceInputErrorCode::ContextLength;}
+            catch(...) {}
+            bool isolate=false;
+            if constexpr(requires { Execution::isolate_prefill_failures; })
+                isolate=plan.prefill && Execution::isolate_prefill_failures;
+            if constexpr(requires { Execution::isolate_context_growth_failures; })
+                isolate|=capacity && !plan.decode.empty() && Execution::isolate_context_growth_failures;
+            bool recoverable=false;
+            if constexpr(requires { execution.recoverable_failure(failure); })
+                recoverable=execution.recoverable_failure(failure);
+            if(isolate || recoverable) {
+                try {
+                    if(recoverable && !plan.decode.empty()) { recover(failure); return; }
+                    if(!plan.decode.empty())fail(plan.decode.back(),failure);
+                    for(const auto& [request,chunk]:prefills)fail(request,failure);
+                    return;
+                } catch(...) {failure=std::current_exception();}
+            }
+            recover(failure);
+            std::rethrow_exception(failure);
         }
     }
 

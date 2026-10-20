@@ -1,9 +1,9 @@
 #pragma once
 
-#include "mfq_container.h"
-#include "mlx_grid_vision.h"
-#include "mlx_tensor.h"
-#include "mlx_transformer.h"
+#include "storage/mfq_container.h"
+#include "runtime/mlx_grid_vision.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_transformer.h"
 
 #include <cstddef>
 #include <cstdint>

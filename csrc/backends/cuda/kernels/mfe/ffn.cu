@@ -105,11 +105,22 @@ void launch_mfe_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     else launch_mfe_down_math<false>(b,partition,stream);
 }
 void launch_mfe_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
-    if(mfe_ffn_token_group_gate_up(b,partition,width,stream))return;
-    if(mfe_ffn_compact_gate_up(b,partition,width,stream))return;
-    if(mfe_e8_narrow_enabled(b,false))launch_mfe_gate_up_math<true,true>(b,partition,width,stream);
-    else if(mfe_default_math_enabled(b,false))launch_mfe_gate_up_math<true>(b,partition,width,stream);
-    else launch_mfe_gate_up_math<false>(b,partition,width,stream);
+    if(mfe_ffn_compact_group_gate_up(b,partition,stream))return;
+    const auto* option=mfq::cuda::env_lookup("MFQ_MFE_SEPARATE_HIDDEN_QUANT");
+    const bool separate=(!option || option[0]!='0') && !b.token_group_aligned_gu && b.tokens<=8;
+    auto producer=b;
+    if(separate)producer.completion=nullptr;
+    if(!mfe_ffn_token_group_gate_up(producer,partition,width,stream) &&
+            !mfe_ffn_compact_gate_up(producer,partition,width,stream)) {
+        if(mfe_e8_narrow_enabled(producer,false))launch_mfe_gate_up_math<true,true>(producer,partition,width,stream);
+        else if(mfe_default_math_enabled(producer,false))launch_mfe_gate_up_math<true>(producer,partition,width,stream);
+        else launch_mfe_gate_up_math<false>(producer,partition,width,stream);
+    }
+    if(separate) {
+        const auto* early=mfq::cuda::env_lookup("MFQ_MFE_EARLY_GU");
+        if(b.plan_ready && b.resident_plan_overlap && (!early || early[0]!='0'))partition|=8;
+        mfe_ffn_quantize_hidden(b,partition,stream);
+    }
 }
 
 }

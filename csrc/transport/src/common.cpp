@@ -31,7 +31,10 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1208,6 +1211,7 @@ void RuntimeRequestMetrics::complete(
         const RequestMetricValues & values) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_requests_ > 0) --active_requests_;
+    live_requests_.erase(id);
     total_prompt_tokens_ += prompt_tokens;
     total_completion_tokens_ +=
         static_cast<uint64_t>(std::max<int32_t>(result.completion_tokens, 0));
@@ -1233,8 +1237,14 @@ void RuntimeRequestMetrics::complete(
     };
 }
 
-void RuntimeRequestMetrics::fail() {
+void RuntimeRequestMetrics::progress(const std::string & id, const json & value) {
     std::lock_guard<std::mutex> lock(mutex_);
+    live_requests_[id] = value;
+}
+
+void RuntimeRequestMetrics::fail(const std::string & id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    live_requests_.erase(id);
     if (active_requests_ > 0) --active_requests_;
     ++failed_requests_;
 }
@@ -1268,10 +1278,36 @@ json RuntimeRequestMetrics::snapshot(
         {"total_prompt_tokens", total_prompt_tokens_},
         {"total_completion_tokens", total_completion_tokens_},
         {"last_request", last_request_},
+        {"live_requests", live_requests_},
     };
 }
 
-static json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
+ActiveRequest::ActiveRequest(RuntimeRequestMetrics & metrics)
+    : metrics_(metrics) {
+    metrics_.begin();
+}
+
+ActiveRequest::~ActiveRequest() {
+    if (!completed_) metrics_.fail(id_);
+}
+
+void ActiveRequest::progress(const std::string & id, const json & value) {
+    id_ = id;
+    metrics_.progress(id, value);
+}
+
+void ActiveRequest::complete(
+        const std::string & id,
+        bool chat,
+        bool stream,
+        size_t prompt_tokens,
+        const CompletionResult & result,
+        const RequestMetricValues & values) {
+    metrics_.complete(id, chat, stream, prompt_tokens, result, values);
+    completed_ = true;
+}
+
+json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
     return {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", completion_tokens},
@@ -1514,10 +1550,13 @@ public:
                 parameter + " has an invalid size", parameter);
         }
         size_ = static_cast<size_t>(declared_size);
-        const std::filesystem::path path(spec["path"].get<std::string>());
-        const std::string filename = path.filename().string();
+        // Preserve UTF-8 paths on Windows by building the path from UTF-8 bytes.
+        const std::string utf8_path = spec["path"].get<std::string>();
+        const auto path = std::filesystem::path(
+            std::u8string(utf8_path.begin(), utf8_path.end()));
+        const auto filename = path.filename().native();
         if (!path.is_absolute() ||
-            filename.rfind("mfq-multimodal-", 0) != 0 ||
+            filename.rfind(std::filesystem::path("mfq-multimodal-").native(), 0) != 0 ||
             path.extension() != ".bin") {
             throw ApiError(
                 400, "invalid_request_error",
@@ -1526,10 +1565,33 @@ public:
         const auto token = decode_file_token(
             spec["token"].get<std::string>(), parameter + ".token");
 #ifdef _WIN32
-        (void) token;
-        throw ApiError(
-            400, "invalid_request_error",
-            parameter + " is unavailable on this platform", parameter);
+        descriptor_=CreateFileW(path.c_str(),GENERIC_READ|READ_CONTROL,FILE_SHARE_READ,
+            nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        BY_HANDLE_FILE_INFORMATION metadata{};
+        bool valid=descriptor_!=INVALID_HANDLE_VALUE && GetFileType(descriptor_)==FILE_TYPE_DISK &&
+            GetFileInformationByHandle(descriptor_,&metadata) && metadata.nNumberOfLinks==1 &&
+            !(metadata.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            ((uint64_t(metadata.nFileSizeHigh)<<32)|metadata.nFileSizeLow)==size_;
+        if(valid) {
+            PSID owner=nullptr;PSECURITY_DESCRIPTOR security=nullptr;HANDLE process_token=nullptr;
+            valid=GetSecurityInfo(descriptor_,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION,
+                &owner,nullptr,nullptr,nullptr,&security)==ERROR_SUCCESS;
+            if(valid)valid=OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&process_token)!=0;
+            if(valid) {
+                DWORD bytes=0;
+                GetTokenInformation(process_token,TokenOwner,nullptr,0,&bytes);
+                std::vector<uint8_t> info(bytes);
+                valid=bytes && GetTokenInformation(process_token,TokenOwner,info.data(),bytes,&bytes) &&
+                    EqualSid(owner,reinterpret_cast<TOKEN_OWNER*>(info.data())->Owner);
+            }
+            if(process_token)CloseHandle(process_token);
+            if(security)LocalFree(security);
+        }
+        if(!valid) {
+            close_descriptor();
+            throw ApiError(400,"invalid_request_error",
+                parameter+" failed ownership, type, or size validation",parameter);
+        }
 #else
         int flags = O_RDONLY;
 #ifdef O_CLOEXEC
@@ -1556,8 +1618,10 @@ public:
                 400, "invalid_request_error",
                 parameter + " failed ownership, mode, or size validation", parameter);
         }
+#endif
         std::array<uint8_t, 64> header{};
-        read_exact(0, header.data(), header.size(), parameter);
+        try {read_exact(0, header.data(), header.size(), parameter);}
+        catch(...) {close_descriptor();throw;}
         constexpr std::array<uint8_t, 8> magic{
             'M', 'F', 'Q', 'M', 'M', '0', '1', 0};
         if (!std::equal(magic.begin(), magic.end(), header.begin()) ||
@@ -1567,7 +1631,6 @@ public:
                 400, "invalid_request_error",
                 parameter + " header or token does not match", parameter);
         }
-#endif
     }
 
     ~TensorFileReader() {
@@ -1593,7 +1656,11 @@ public:
 
 private:
     void close_descriptor() noexcept {
-#ifndef _WIN32
+#ifdef _WIN32
+        if(descriptor_!=INVALID_HANDLE_VALUE) {
+            CloseHandle(descriptor_);descriptor_=INVALID_HANDLE_VALUE;
+        }
+#else
         if (descriptor_ >= 0) {
             ::close(descriptor_);
             descriptor_ = -1;
@@ -1607,12 +1674,17 @@ private:
             size_t length,
             const std::string & parameter) const {
 #ifdef _WIN32
-        (void) offset;
-        (void) destination;
-        (void) length;
-        throw ApiError(
-            400, "invalid_request_error",
-            parameter + " is unavailable on this platform", parameter);
+        LARGE_INTEGER position{};position.QuadPart=static_cast<LONGLONG>(offset);
+        if(!SetFilePointerEx(descriptor_,position,nullptr,FILE_BEGIN))
+            throw ApiError(400,"invalid_request_error",parameter+" could not be positioned",parameter);
+        size_t completed=0;
+        while(completed<length) {
+            DWORD count=0;
+            if(!ReadFile(descriptor_,static_cast<uint8_t*>(destination)+completed,
+                    static_cast<DWORD>(length-completed),&count,nullptr) || !count)
+                throw ApiError(400,"invalid_request_error",parameter+" could not be read completely",parameter);
+            completed+=count;
+        }
 #else
         auto * output = static_cast<uint8_t *>(destination);
         size_t completed = 0;
@@ -1633,7 +1705,9 @@ private:
     }
 
     size_t size_ = 0;
-#ifndef _WIN32
+#ifdef _WIN32
+    HANDLE descriptor_=INVALID_HANDLE_VALUE;
+#else
     mutable int descriptor_ = -1;
 #endif
 };
@@ -1868,7 +1942,7 @@ CompletionStream::~CompletionStream() {
 
 void CompletionStream::fail() {
     if (accounted_) return;
-    metrics_store_.fail();
+    metrics_store_.fail(response_id_);
     accounted_ = true;
 }
 
@@ -1890,6 +1964,10 @@ std::optional<std::vector<json>> CompletionStream::next() {
             std::visit([&](auto& data) {
                 using T = std::decay_t<decltype(data)>;
                 if constexpr (std::is_same_v<T, mfq::engine::OutputDelta>) {
+                    if(!data.token_ids.empty()) {
+                        if(!generated_tokens_)first_token_=std::chrono::steady_clock::now();
+                        generated_tokens_+=data.token_ids.size();
+                    }
                     for (const auto& diff : data.diffs) {
                         if (stream_) {
                             auto delta = chat_diff_json(diff);
@@ -1909,6 +1987,12 @@ std::optional<std::vector<json>> CompletionStream::next() {
                             call.arguments += diff.tool_call_delta.arguments;
                         }
                     }
+                } else if constexpr (std::is_same_v<T, mfq::engine::PrefillProgress>) {
+                    const auto& timing=data.timing;
+                    const auto interval=timing.llm_ms-prefill_ms_;
+                    if(interval>0 && timing.prompt_tokens>=processed_tokens_)
+                        prefill_tps_=1000.0*(timing.prompt_tokens-processed_tokens_)/interval;
+                    processed_tokens_=timing.prompt_tokens;prefill_ms_=timing.llm_ms;
                 } else if constexpr (std::is_same_v<T, mfq::engine::Completed> ||
                                      std::is_same_v<T, mfq::engine::Cancelled>) {
                     terminal_ = true;
@@ -1953,9 +2037,21 @@ std::optional<std::vector<json>> CompletionStream::next() {
                 }
             }, item.data);
         }
+        if(!terminal_)metrics_store_.progress(response_id_,progress());
         if (!frames.empty()) return frames;
     }
     return {};
+}
+
+json CompletionStream::progress() const {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - started_).count();
+    const double decode = generated_tokens_ ? std::chrono::duration<double>(now - first_token_).count() : 0;
+    return {{"phase", generated_tokens_ ? "generating" : "prefilling"},
+        {"processed_tokens", processed_tokens_}, {"generated_tokens", generated_tokens_},
+        {"prefill_tps", prefill_tps_}, {"elapsed_seconds", elapsed},
+        {"decode_tps", decode > 0 ? (generated_tokens_ - 1) / decode : 0},
+        {"updated_at", unix_time_seconds()}};
 }
 
 } // namespace mfq::transport

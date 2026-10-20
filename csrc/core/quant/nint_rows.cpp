@@ -179,6 +179,32 @@ std::vector<std::uint8_t> NintRows::slice_rows_blob(std::int64_t begin,std::int6
     const auto count=static_cast<std::uint32_t>(end-begin);
     std::vector<std::uint8_t> result;
     result.reserve(row_range_nbytes(begin,end));
+    std::vector<ReadSpan> reads;
+    struct OutputRead {std::size_t source,destination,bytes;};
+    std::vector<OutputRead> output_reads;
+    struct Rebase {std::size_t offset,bytes;unsigned shift,tail;std::vector<std::uint8_t> source;};
+    std::vector<Rebase> rebases;
+    const auto append_range=[&](std::size_t stream,std::uint64_t bit,std::uint64_t bits) {
+        if(!read_batch_){detail::append_packed_range(result,read_,stream,bit,bits);return;}
+        if(!bits)return;
+        const auto shift=unsigned(bit&7);
+        if(bits>std::numeric_limits<std::uint64_t>::max()-shift-7)
+            throw std::overflow_error("packed row batch range is too large");
+        const auto bytes64=(bits+7)/8,source64=(bits+shift+7)/8;
+        if(source64>std::numeric_limits<std::size_t>::max() ||
+                bit/8>std::numeric_limits<std::size_t>::max()-stream ||
+                bytes64>result.max_size()-result.size())
+            throw std::overflow_error("packed row batch exceeds reserved storage");
+        const auto offset=stream+std::size_t(bit/8),bytes=std::size_t(bytes64),start=result.size();
+        result.resize(start+bytes);
+        if(shift) {
+            rebases.push_back({start,bytes,shift,unsigned(bits&7),std::vector<std::uint8_t>(std::size_t(source64))});
+            reads.push_back({offset,reinterpret_cast<std::byte*>(rebases.back().source.data()),std::size_t(source64)});
+        }else {
+            output_reads.push_back({offset,start,bytes});
+            if(bits&7)rebases.push_back({start,bytes,0,unsigned(bits&7),{}});
+        }
+    };
     const auto scalar=[&](auto value) {
         const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);
         result.insert(result.end(),bytes,bytes+sizeof(value));
@@ -191,7 +217,8 @@ std::vector<std::uint8_t> NintRows::slice_rows_blob(std::int64_t begin,std::int6
     scalar(count); scalar(static_cast<std::uint32_t>(groups_));
     for (auto base: {neuron_scale_offset_,neuron_min_offset_}) {
         const auto start=result.size(); result.resize(start+std::size_t(count)*2);
-        read_(base+static_cast<std::size_t>(begin)*2,result.data()+start,std::size_t(count)*2);
+        if(read_batch_)output_reads.push_back({base+static_cast<std::size_t>(begin)*2,start,std::size_t(count)*2});
+        else read_(base+static_cast<std::size_t>(begin)*2,result.data()+start,std::size_t(count)*2);
     }
     const auto selected_bits=[&](const std::uint8_t* selectors,int bits) {
         detail::append_packed_range(result,[&](std::size_t offset,std::uint8_t* out,std::size_t size) {
@@ -210,8 +237,8 @@ std::vector<std::uint8_t> NintRows::slice_rows_blob(std::int64_t begin,std::int6
         const int bits=adaptive_ ? sub_bits_-1+cohort : sub_bits_;
         const auto first_bit=std::uint64_t(first)*groups_*bits;
         const auto total_bits=std::uint64_t(last-first)*groups_*bits;
-        detail::append_packed_range(result,read_,scale_offsets_[cohort],first_bit,total_bits);
-        detail::append_packed_range(result,read_,min_offsets_[cohort],first_bit,total_bits);
+        append_range(scale_offsets_[cohort],first_bit,total_bits);
+        append_range(min_offsets_[cohort],first_bit,total_bits);
     }
     if (adaptive_) selected_bits(q_selectors_,3);
     for (int cohort=0; cohort<(adaptive_ ? 8 : 1); ++cohort) {
@@ -223,8 +250,22 @@ std::vector<std::uint8_t> NintRows::slice_rows_blob(std::int64_t begin,std::int6
         const auto first=rank(begin), last=rank(end);
         const auto values=std::uint64_t(groups_)*group_size_;
         const int bits=adaptive_ ? cohort+1 : bits_;
-        detail::append_packed_range(result,read_,q_offsets_[cohort],
+        append_range(q_offsets_[cohort],
             std::uint64_t(first)*values*bits,std::uint64_t(last-first)*values*bits);
+    }
+    if(read_batch_) {
+        for(const auto& read:output_reads)
+            reads.push_back({read.source,reinterpret_cast<std::byte*>(result.data()+read.destination),read.bytes});
+        read_batch_(reads);
+        for(const auto& range:rebases) {
+            auto* destination=result.data()+range.offset;
+            if(range.shift)for(std::size_t i=0;i<range.bytes;++i) {
+                std::uint16_t word=range.source[i];
+                if(i+1<range.source.size())word|=std::uint16_t(range.source[i+1])<<8;
+                destination[i]=std::uint8_t(word>>range.shift);
+            }
+            if(range.tail)destination[range.bytes-1]&=std::uint8_t((1u<<range.tail)-1);
+        }
     }
     return result;
 }

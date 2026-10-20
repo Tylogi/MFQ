@@ -15,8 +15,10 @@ from tests.test_server_models import _TestJobContext
 
 
 @pytest.mark.parametrize('bits', [2, 2.5, 3, 3.5, 4, 6, 8])
-def test_quantization_saves_with_context_and_preserves_streaming(tmp_path, bits):
+@pytest.mark.parametrize('backend', ['metal', 'cuda'])
+def test_quantization_saves_with_context_and_preserves_streaming(tmp_path, bits, backend):
     model, pool, service, instance, _, previous = fixture(tmp_path)
+    pool.backend = backend
     instance.kv_quantization_supported = True
     quantization = {'enabled': True, 'bits': bits, 'algorithm': 'turboquant'}
     previous.qsa_kv_offload.enabled = True

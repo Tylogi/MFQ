@@ -16,13 +16,14 @@ from mfq.formats.header import FileHeader
 from mfq.formats.nint import NintSpec, NintTensor
 
 
-def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) -> tuple[Path, Path]:
+def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
+            context_size=64, quantized_experts=False, vocab_size=32) -> tuple[Path, Path]:
     rng = np.random.default_rng(20261001)
     hidden, streams, experts, intermediate = 128, 2, 2, 32
     qsa = qsa or ple_layer == 3
     config = dict(
-        model_type="qwen4_exp_text", vocab_size=32, hidden_size=hidden,
-        num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=64,
+        model_type="qwen4_exp_text", vocab_size=vocab_size, hidden_size=hidden,
+        num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=context_size,
         num_attention_heads=24 if wide else 2, num_key_value_heads=2 if wide else 1,
         head_dim=256 if wide else 64,
         full_attention_interval=2,
@@ -55,8 +56,8 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) ->
         if injection:
             weight(root + ".post.inject.weight", (streams, streams * hidden))
 
-    weight("model.token_embedding.weight", (32, hidden))
-    weight("model.output.weight", (32, hidden))
+    weight("model.token_embedding.weight", (vocab_size, hidden))
+    weight("model.output.weight", (vocab_size, hidden))
     mixer("model.mhc", False)
     block = "model.block.0"
     mixer(block + ".attention.mhc", True)
@@ -151,11 +152,59 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) ->
         fp8[name] = np.array([0x00, 0x30, 0x38, 0x3C], dtype=np.uint8)[
             codes.reshape(rows, -1)[:, :width]].view(io.Float8E4M3Array)
     asset = model_config_asset({"model_type": "qwen4_exp", "text_config": config})
+    if quantized_experts:
+        from mfq.formats.mfe import MfePool, MfeTensor
+        from mfq.quantize.nint_quant import quantize
+        for values in (fp8, nint):
+            for name, weight in list(values.items()):
+                if ".mlp.experts.gate_up.weight" in name:
+                    gate, up = np.split(weight, 2, axis=1)
+                    values[name.replace("gate_up.weight", "gate.weight")] = gate
+                    values[name.replace("gate_up.weight", "up.weight")] = up
+                    del values[name]
+            for name, weight in list(values.items()):
+                if ".mlp.experts." not in name:
+                    continue
+                experts, output, width = weight.shape
+                if quantized_experts == "nvq":
+                    from mfq.formats.nvq import NvqSpec
+                    from mfq.quantize.nvq_quant import quantize as quantize_nvq
+                    values[name] = MfeTensor(shape=weight.shape, pools=tuple(
+                        MfePool(expert_ids=np.array([expert], dtype=np.int32), tensor=quantize_nvq(
+                            weight[expert], NvqSpec("e8_256" if expert == 0 else "d4_256", groupsize=24),
+                            search_steps=3, group_chunk=128)) for expert in range(experts)))
+                else:
+                    packed = quantize(weight.reshape(experts * output, width), NintSpec(4, 8, 6))
+                    values[name] = MfeTensor(shape=weight.shape, pools=(
+                        MfePool(expert_ids=np.arange(experts, dtype=np.int32), tensor=packed),))
     paths = (tmp_path / "fp8.mfq", tmp_path / "nintv2.mfq")
     for path, values in zip(paths, (fp8, nint), strict=True):
         values[asset.name] = asset.data
         io.save(path, FileHeader(model_arch="qwen4_exp", num_tensors=len(values)), values)
     return paths
+
+
+@pytest.mark.parametrize("quantized_experts", [True, "nvq"])
+def test_native_cuda_flash_mtp_graph_position_buffer(tmp_path, quantized_experts):
+    executable = Path(__file__).resolve().parents[1] / "build/cuda-parity/mfq-diagnostics.exe"
+    if not executable.is_file():
+        pytest.skip("build mfq-diagnostics to check CUDA MTP graphs")
+    model = _models(tmp_path, mtp=True, qsa=True, ple_layer=3, context_size=512,
+                    quantized_experts=quantized_experts)[1]
+    env = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+               MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+               MFQ_MOE_HOST_CACHE_BYTES="8388608", MFQ_TRACE_LAYER_TIMINGS="0")
+    outputs = []
+    for buffered in ("0", "1"):
+        env["MFQ_MTP_POSITION_BUFFER"] = buffered
+        result = subprocess.run([str(executable), "--model", str(model), "--ids", "1,2,3,4,5,6,7",
+            "--ctx-size", "512", "--moe-gpu-cache-gb", "0.25", "--check-flash-next-mtp"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr[-3000:] + result.stdout[-1000:]
+        record = next(line for line in result.stdout.splitlines() if line.startswith("flash_next_mtp_check "))
+        outputs.append(json.loads(record.removeprefix("flash_next_mtp_check ")))
+    assert outputs[0]["greedy"] == outputs[1]["greedy"]
+    assert outputs[1]["predictor_graph_replays"] > 0
 
 
 @pytest.mark.parametrize("ple_layer", [1, 3])
@@ -395,8 +444,11 @@ def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projection
 
 
 @pytest.mark.parametrize("adaptive", [False, True])
-@pytest.mark.parametrize("group_sizes", [(48, 24, 7), (28, 7, 24)])
-def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
+@pytest.mark.parametrize("group_sizes,decode_only", [
+    ((48, 24, 7), False), ((28, 7, 24), False),
+    ((24, 28, 48), True), ((12, 12, 12), True), ((48, 48, 28), True),
+])
+def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes, decode_only):
     executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-qwen-gated-hc-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-qwen-gated-hc-test to exercise packed MHC kernels")
@@ -409,7 +461,8 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
         kbits = np.arange(rows, dtype=np.uint8) % 3 + 6 if adaptive else np.full(rows, 7, dtype=np.uint8)
         codes = np.empty((rows, groups, gs), dtype=np.uint8)
         for row in range(rows):
-            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % min(8, 1 << int(qbits[row]))
+            levels = 1 << int(qbits[row])
+            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % (levels if decode_only else min(8, levels))
         tensors[f"test.mhc.{suffix}.weight"] = NintTensor(
             spec=NintSpec(8, gs, 7), shape=(rows, width), axis=0, q=codes,
             neuron_scale=np.full(rows, 1 / 8192, dtype=np.float32),
@@ -420,10 +473,11 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
         )
     path = tmp_path / "packed_mhc.mfq"
     io.save(path, FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)), tensors)
-    result = subprocess.run([str(executable), "--packed-mhc", str(path)],
+    mode = "--packed-mhc-decode" if decode_only else "--packed-mhc"
+    result = subprocess.run([str(executable), mode, str(path)],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "4096-row prefill passed" in result.stdout
+    assert ("final mixer passed" if decode_only else "4096-row prefill passed") in result.stdout
 
 
 @pytest.mark.parametrize("name", [
@@ -462,6 +516,229 @@ def _cuda_models(tmp_path):
     baseline = tmp_path / "dense.mfq"
     io.save(baseline, header, tensors)
     return baseline, nint
+
+
+@pytest.mark.parametrize("requests", [2, 4, 6, 8, 9, 16, 17, 32])
+@pytest.mark.parametrize("quantized_experts", [False, True, "nvq"])
+def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, requests, quantized_experts):
+    executable = os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
+    if not executable:
+        pytest.skip("MFQ_NINT_PLE_CUDA_DECODE must point to CUDA mfq-diagnostics")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512,
+                      quantized_experts=quantized_experts)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+                       MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    trace_gdn = requests == 32 and quantized_experts == "nvq"
+    if trace_gdn:
+        environment["MFQ_TRACE_GDN_BATCH"] = "1"
+    if requests == 17 and quantized_experts == "nvq":
+        environment["MFQ_TRACE_LAYER_TIMINGS"] = "3"
+        environment["MFQ_CONTINUOUS_BATCH_KV_INITIAL_CAPACITY"] = "64"
+    process = subprocess.run([
+        executable, "--model", str(model), "--ctx-size", "512",
+        "--check-continuous-batching", "--continuous-batching-check-requests", str(requests),
+        "--moe-gpu-cache-gb", "0.00004" if quantized_experts == "nvq" else ("0.1" if quantized_experts else "0"),
+    ], capture_output=True, text=True, timeout=90, env=environment)
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "continuous_batching_check PASS" in process.stdout
+    if trace_gdn:
+        assert "gdn_batch_state eligible=1" in process.stderr
+        assert "gdn_batch_core rows=32" in process.stderr
+    if requests == 17 and quantized_experts == "nvq":
+        phases = [dict(field.split("=", 1) for field in line.split()[1:])
+                  for line in process.stderr.splitlines() if line.startswith("native_layer_gpu ")]
+        tile_rows = int(environment.get("MFQ_CONTINUOUS_FFN_TILE", "8"))
+        expected_tiles = {str(tile) for tile in range((requests + tile_rows - 1) // tile_rows)}
+        assert {phase["tile"] for phase in phases if phase["from"] == "hot_begin"
+                and phase["to"] == "hot_end"} >= expected_tiles
+    if requests == 32:
+        assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in process.stdout
+    state = next(line for line in process.stdout.splitlines()
+                 if line.startswith("continuous_batching_state_check"))
+    metrics = dict(field.split("=", 1) for field in state.split()[1:])
+    assert int(metrics["captures"]) > 0
+    assert int(metrics["replays"]) > int(metrics["captures"])
+    if os.environ.get("MFQ_BATCH_PACKED_PREFILL") != "0":
+        assert int(metrics["packed_prefills"]) > 0
+
+
+async def _fresh_idle_status(client):
+    # Status uses the scheduler's nonblocking 250 ms snapshot. Require a
+    # snapshot captured after this call before asserting final counters.
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    while loop.time() - started < 5:
+        requested = loop.time()
+        status = await client.status()
+        if (status["runtime_metrics_age_ms"] <= (requested - started) * 1000
+                and status.get("active_requests", 0) == 0
+                and status.get("continuous_batching_active", 0) == 0):
+            return status
+        await asyncio.sleep(0.02)
+    raise AssertionError("runtime metrics did not publish an idle snapshot")
+
+
+@pytest.mark.parametrize("requests", [2, 32])
+def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512,
+                      quantized_experts=True)
+    # Token 0 is the fixture tokenizer's ordinary "a" token. Keep the worker
+    # producing long enough for both requests to overlap, without EOS timing.
+    header, weights = io.load(model)
+    weights["model.output.weight"].fill(0)
+    io.save(model,header,weights)
+    tokenizer = _worker_tokenizer(tmp_path)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+                       MFQ_MOE_HOST_CACHE_BYTES="8388608")
+
+    async def run():
+        with (tmp_path / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(executable,"--model",str(model),
+                "--tokenizer",str(tokenizer),"--transport","stdio","--ctx-size","512",
+                "--continuous-batching","32","--moe-gpu-cache-gb","0.00004",
+                stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=log,env=environment)
+            client = StdioRuntimeClient(process,control_timeout_seconds=10)
+            try:
+                await client.status()
+                async def generate(content, penalty=False):
+                    async with client.generate({"messages":[{"role":"user","content":content}],
+                            "temperature":0,"top_k":1,"max_tokens":32,"stream":True,
+                            "presence_penalty":-0.01 if penalty else 0}) as events:
+                        return [event async for event in events if event is not None]
+                prompts = ["ab" * (4 + row % 5 * 8) for row in range(requests)]
+                reference = [await generate(prompt,row == 0) for row,prompt in enumerate(prompts)]
+                parallel = await asyncio.gather(*(generate(prompt,row == 0) for row,prompt in enumerate(prompts)))
+                def text(events):
+                    return "".join(choice.get("delta",{}).get("content","")
+                        for event in events for choice in event.get("choices",[]))
+                assert list(map(text,parallel)) == list(map(text,reference))
+                assert list(map(text,parallel)) == ["ab"*32] + ["a"*32] * (requests-1)
+                status = await _fresh_idle_status(client)
+                (tmp_path / "worker-status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")
+                assert status["continuous_batching_admissions"] == 2 * requests
+                assert status["continuous_batching_cuda_graph_replays"] > 0
+                assert status["continuous_batching_batched_greedy_batches"] > 0
+                if requests == 32 and os.environ.get("MFQ_BATCH_PACKED_PREFILL") != "0":
+                    assert status["continuous_batching_packed_prefill_batches"] > 0
+                assert status["continuous_batching_decode_tokens"] > status["continuous_batching_decode_batches"]
+                assert status["continuous_batching_active"] == 0
+                assert status["kv_cache_bytes"] == 0
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await process.wait()
+
+    asyncio.run(asyncio.wait_for(run(),30))
+
+
+def test_cuda_flash_next_stdio_mtp_avoids_ordinary_batch_path(tmp_path):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable=os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _,model=_models(tmp_path,mtp=True,qsa=True,ple_layer=3,context_size=512,
+        quantized_experts=True)
+    header,weights=io.load(model);weights["model.output.weight"].fill(0);io.save(model,header,weights)
+    tokenizer=_worker_tokenizer(tmp_path)
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+
+    async def run():
+        with (tmp_path/"worker.log").open("wb") as log:
+            process=await asyncio.create_subprocess_exec(executable,"--model",str(model),
+                "--tokenizer",str(tokenizer),"--transport","stdio","--ctx-size","512",
+                "--continuous-batching","2","--moe-gpu-cache-gb","0.00004",
+                stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=log,env=environment)
+            client=StdioRuntimeClient(process,control_timeout_seconds=15)
+            try:
+                await client.status()
+                for use_mtp in [False,True,False,True]:
+                    before=await client.status()
+                    async with client.generate({"messages":[{"role":"user","content":"ababab"}],
+                        "temperature":0,"top_k":1,"max_tokens":16,"enable_mtp":use_mtp,
+                        "stream":True,"stream_options":{"include_usage":True},
+                        "mfq_prefix_cache_enabled":False}) as events:
+                        chunks=[event async for event in events if event is not None]
+                    after=await _fresh_idle_status(client)
+                    text="".join(choice.get("delta",{}).get("content","")
+                        for event in chunks for choice in event.get("choices",[]))
+                    assert text=="a"*16
+                    metrics={key:value for event in chunks for key,value in event.get("mfq_metrics",{}).items()}
+                    assert metrics["mtp_used"]==int(use_mtp),metrics
+                    if use_mtp:
+                        assert metrics["mtp_cycles"]>0,metrics
+                        assert after["continuous_batching_admissions"]==before["continuous_batching_admissions"]
+                        assert after["mtp_predictor_graph_replays"]>0,after
+                    else:
+                        assert after["continuous_batching_admissions"]==before["continuous_batching_admissions"]+1
+            finally:
+                with suppress(Exception):await client.aclose()
+                if process.returncode is None:process.terminate()
+                await process.wait()
+    asyncio.run(asyncio.wait_for(run(),30))
+
+
+@pytest.mark.parametrize("requests",[9,16,17,32])
+def test_cuda_flash_next_large_nint_head_matches_serial_batches(tmp_path,requests):
+    from mfq.quantize.nint_quant import quantize
+
+    executable=os.environ.get("MFQ_NINT_PLE_CUDA_DECODE")
+    if not executable:
+        pytest.skip("MFQ_NINT_PLE_CUDA_DECODE must point to CUDA mfq-diagnostics")
+    _,model=_models(tmp_path,qsa=True,ple_layer=3,context_size=512,
+        quantized_experts=True,vocab_size=65536)
+    header,weights=io.load(model)
+    output=weights["model.output.weight"].copy()
+    output[-32:]*=8
+    weights["model.output.weight"]=quantize(output,NintSpec(4,8,6))
+    io.save(model,header,weights)
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    process=subprocess.run([executable,"--model",str(model),"--ctx-size","512",
+        "--check-continuous-batching","--continuous-batching-check-requests",str(requests),
+        "--moe-gpu-cache-gb","0.1"],capture_output=True,text=True,env=environment,timeout=30)
+    assert process.returncode==0,process.stdout+process.stderr
+    assert "continuous_batching_check PASS" in process.stdout
+    assert f"continuous_batching_growth_check requests={requests} boundary=256 PASS" in process.stdout
+
+
+@pytest.mark.parametrize("cancel",[False,True])
+def test_cuda_flash_next_stdio_eof_cancels_concurrent_admissions(tmp_path,cancel):
+    from mfq.server.runtime.client import _runtime_generate_params
+
+    executable=os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _,model=_models(tmp_path,qsa=True,ple_layer=3,context_size=512,quantized_experts=True)
+    tokenizer=_worker_tokenizer(tmp_path)
+    params=_runtime_generate_params({"messages":[{"role":"user","content":"aa"}],
+        "temperature":0,"top_k":1,"max_tokens":128,"stream":True})
+    commands=[{"v":1,"id":f"eof-{row}","op":"generate","params":params} for row in range(32)]
+    if cancel:
+        commands.extend({"v":1,"id":f"cancel-{row}","op":"request.cancel",
+            "params":{"target_id":f"eof-{row}"}} for row in range(32))
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    result=subprocess.run([executable,"--model",str(model),"--tokenizer",str(tokenizer),
+        "--transport","stdio","--ctx-size","512","--continuous-batching","32",
+        "--moe-gpu-cache-gb","0.00004"],
+        input="".join(json.dumps(command)+"\n" for command in commands),
+        capture_output=True,text=True,env=environment,timeout=15)
+    assert result.returncode==0,result.stderr
+    frames=[json.loads(line) for line in result.stdout.splitlines()]
+    terminals=[frame for frame in frames if frame["type"] in {"done","error"}]
+    assert sorted(frame["id"] for frame in terminals)==sorted(f"eof-{row}" for row in range(32))
+    assert not any(frame["type"]=="error" for frame in frames)
 
 
 def test_cuda_dense_fixture_matches_canonical_nint_rows(tmp_path):

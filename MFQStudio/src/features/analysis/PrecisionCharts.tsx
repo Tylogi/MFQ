@@ -1,22 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { KeyboardEvent, MouseEvent } from 'react';
+import type { KeyboardEvent, MouseEvent, ReactNode } from 'react';
 import type { CheckpointAnalysis } from '../../shared/api/types';
-import { averageBpw, categoryLabel, expertPoints, layerBudgetSeries, parameterLabel, precisionColor, projectionSeries, specialTensorBudgets, type Translate } from './analysisData';
+import { analysisCategoryLabel, averageBpw, categoryLabel, expertPoints, ffnPrecisionSeries, isFfnTensor, layerBudgetSeries, otherProjectionSeries, parameterLabel, PRECISION_BPW_MIN, PRECISION_BPW_MAX, precisionColor, specialTensorBudgets, type tensorPrecisionSeries, type Translate } from './analysisData';
 
-export function PrecisionLegend({ range, tr }: { range: [number, number]; tr: Translate }) {
-  return <div className="precision-legend"><span>{range[0].toFixed(1)}</span>
-    <i style={{ background: `linear-gradient(90deg, ${precisionColor(range[0], ...range)}, ${precisionColor(range[1], ...range)})` }} />
-    <span>{range[1].toFixed(1)} bpw</span><small>{tr('精度越高，颜色越深', 'Higher precision, darker color')}</small></div>;
+export function PrecisionLegend({ tr }: { tr: Translate }) {
+  return <div className="precision-legend"><span>{PRECISION_BPW_MIN.toFixed(1)}</span>
+    <i style={{ background: `linear-gradient(90deg, ${precisionColor(PRECISION_BPW_MIN)}, ${precisionColor(PRECISION_BPW_MAX)})` }} />
+    <span>{PRECISION_BPW_MAX}+ bpw</span><small>{tr('精度越高，颜色越深', 'Higher precision, darker color')}</small></div>;
 }
 
-export function ExpertHeatmap({ analysis, projection, range, tr }: {
-  analysis: CheckpointAnalysis; projection?: string; range: [number, number]; tr: Translate;
+export function ExpertHeatmap({ analysis, projection, tr }: {
+  analysis: CheckpointAnalysis; projection?: string; tr: Translate;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const points = useMemo(() => expertPoints(analysis.experts, projection), [analysis.experts, projection]);
   const average = useMemo(() => averageBpw(points.values()), [points]);
   const [hover, setHover] = useState<{ layer: number; expert: number } | null>(null);
-  const title = projection ? `${projection[0].toUpperCase()}${projection.slice(1)}` : tr('路由专家精度总览', 'Routed expert precision');
+  const title = projection ? `${projection[0].toUpperCase()}${projection.slice(1)}` : tr('FFN 精度总览', 'FFN precision');
   const point = hover ? points.get(`${hover.layer}:${hover.expert}`) : null;
   const rowHeight = 7;
   useEffect(() => {
@@ -26,13 +26,13 @@ export function ExpertHeatmap({ analysis, projection, range, tr }: {
     if (!context) return;
     element.width = Math.max(1, analysis.expert_count * 2);
     element.height = Math.max(1, analysis.layer_count * rowHeight);
-    context.fillStyle = '#e9e7e3';
+    context.fillStyle = '#e8e8e8';
     context.fillRect(0, 0, element.width, element.height);
     for (const item of points.values()) {
-      context.fillStyle = precisionColor(item.bpw, ...range);
+      context.fillStyle = precisionColor(item.bpw);
       context.fillRect(item.expert * 2, item.layer * rowHeight, 2, rowHeight);
     }
-  }, [analysis.expert_count, analysis.layer_count, points, range]);
+  }, [analysis.expert_count, analysis.layer_count, points]);
   function locate(event: MouseEvent<HTMLCanvasElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
     setHover({ expert: Math.max(0, Math.min(analysis.expert_count - 1, Math.floor((event.clientX - rect.left) / rect.width * analysis.expert_count))),
@@ -74,7 +74,7 @@ export function LayerBudget({ analysis, tr }: { analysis: CheckpointAnalysis; tr
   const layers = useMemo(() => layerBudgetSeries(analysis), [analysis]);
   const special = useMemo(() => specialTensorBudgets(analysis), [analysis]);
   const series = [
-    { key: 'moe' as const, label: 'MoE' }, { key: 'attention' as const, label: 'Attention' }, { key: 'total' as const, label: tr('总计', 'Total') },
+    { key: 'ffn' as const, label: 'FFN' }, { key: 'attention' as const, label: 'Attention' }, { key: 'total' as const, label: tr('总计', 'Total') },
   ].map(item => ({ ...item, values: layers.map(layer => mode === 'storage' ? layer[item.key].storedBytes / 2 ** 30 : layer[item.key].bpw) }));
   const maximum = Math.max(1, ...series.flatMap(item => item.values).filter((value): value is number => value != null)) * 1.12;
   const x = (index: number) => 52 + index / Math.max(1, analysis.layer_count - 1) * 588;
@@ -94,7 +94,7 @@ export function LayerBudget({ analysis, tr }: { analysis: CheckpointAnalysis; tr
       <div className="analysis-segmented"><button aria-pressed={mode === 'storage'} onClick={() => setMode('storage')} type="button">GiB</button>
         <button aria-pressed={mode === 'bpw'} onClick={() => setMode('bpw')} type="button">bpw</button></div></div>
     <div className="budget-legend">{series.map(item => <span key={item.key} className={`budget-series-${item.key}`}><i />{item.label}</span>)}</div>
-    <svg viewBox="0 0 670 208" role="img" aria-label={tr('MoE、Attention 与总计的逐层预算折线图', 'Per-layer budget for MoE, Attention and Total')}>
+    <svg viewBox="0 0 670 208" role="img" aria-label={tr('FFN、Attention 与总计的逐层预算折线图', 'Per-layer budget for FFN, Attention and Total')}>
       <text x="52" y="18">{mode === 'storage' ? 'GiB' : 'bpw'}</text>
       {[0, 0.5, 1].map(step => <g key={step}><line x1="52" x2="640" y1={y(step * maximum)} y2={y(step * maximum)} className="chart-gridline" />
         <text x="43" y={y(step * maximum) + 4} textAnchor="end">{(step * maximum).toFixed(1)}</text></g>)}
@@ -113,50 +113,73 @@ export function LayerBudget({ analysis, tr }: { analysis: CheckpointAnalysis; tr
     <div className="chart-readout">{selected ? <><strong>L{selected.layer} · {selected.attention_type}</strong>
       {series.map(item => <span key={item.key} className={`budget-readout-series budget-series-${item.key}`}><i />{item.label}
         <span>{(selected[item.key].storedBytes / 2 ** 30).toFixed(3)} GiB · {selected[item.key].bpw?.toFixed(3) ?? '—'} bpw</span></span>)}
-      </> : <span>{tr('悬停或点击查看每层的 MoE、Attention 和总预算。', 'Hover or click to inspect MoE, Attention and the total budget of each layer.')}</span>}</div>
-    <p className="budget-note">{tr('MoE 含共享专家与路由器；Attention 含 GDN；总计包含其他层权重。所有曲线均不含 PLE 与 KV Cache。', 'MoE includes shared experts and routers; Attention includes GDN; Total includes other layer weights. All curves exclude PLE and KV cache.')}</p>
+      </> : <span>{tr('悬停或点击查看每层的 FFN、Attention 和总预算。', 'Hover or click to inspect FFN, Attention and the total budget of each layer.')}</span>}</div>
+    <p className="budget-note">{tr('FFN 包括稠密前馈网络、路由专家与共享专家；Attention 含 GDN；总计包含路由器与其他层权重。所有曲线均不含 PLE 与 KV Cache。', 'FFN includes dense feed-forward networks, routed experts and shared experts; Attention includes GDN; Total includes routers and other layer weights. All curves exclude PLE and KV cache.')}</p>
     {special.length > 0 && <section className="analysis-special-weights">
       <div className="analysis-section-heading"><h3>{tr('特殊张量', 'Special tensors')}</h3><span>{tr('不计入层预算', 'Excluded from layer budgets')}</span></div>
       <div className="analysis-table-scroll"><table><thead><tr><th>{tr('类型', 'Type')}</th><th>{tr('参数量', 'Parameters')}</th><th>{tr('存储', 'Storage')}</th><th>{tr('平均 bpw', 'Average bpw')}</th></tr></thead>
-        <tbody>{special.map(item => <tr key={item.category}><td>{categoryLabel(item.category, tr)}</td><td>{parameterLabel(item.parameters)}</td>
+        <tbody>{special.map(item => <tr key={item.category}><td>{categoryLabel(item.category)}</td><td>{parameterLabel(item.parameters)}</td>
           <td>{(item.storedBytes / 2 ** 30).toFixed(3)} GiB</td><td>{item.bpw?.toFixed(3) ?? '—'}</td></tr>)}</tbody></table></div>
     </section>}
   </section>;
 }
 
-export function ProjectionBars({ analysis, tr }: { analysis: CheckpointAnalysis; tr: Translate }) {
-  const options = analysis.projections.filter(projection => !['routed_experts', 'ple'].includes(projection.category) &&
-    analysis.tensors.some(tensor => tensor.category === projection.category && tensor.projection === projection.name && tensor.layer != null && tensor.shape.length >= 2));
-  const [choice, setChoice] = useState('');
-  const [active, setActive] = useState<number | null>(null);
-  const option = options.find(item => `${item.category}:${item.name}` === choice) ?? options.find(item => item.category === 'attention' && item.name === 'query') ?? options[0];
-  const series = useMemo(() => option ? projectionSeries(analysis.tensors, option.category, option.name, analysis.layer_count) : [], [analysis.tensors, analysis.layer_count, option]);
+function PrecisionBars({ series, title, chartName, controls, className = '', tr }: {
+  series: ReturnType<typeof tensorPrecisionSeries>; title: string; chartName: string;
+  controls?: ReactNode; className?: string; tr: Translate;
+}) {
+  const [active, setActive] = useState<{ series: typeof series; index: number } | null>(null);
+  const activate = (index: number) => setActive({ series, index });
   const average = useMemo(() => averageBpw(series), [series]);
-  if (!option) return null;
   const maximum = Math.max(1, ...series.map(item => item.bpw ?? 0)) * 1.1;
-  const width = 588 / Math.max(1, analysis.layer_count);
-  const selected = active == null ? null : series[active];
-  return <section className="precision-chart projection-bars">
-    <div className="precision-chart-heading"><div className="precision-chart-title"><h3>{tr('非专家投影精度', 'Non-expert projection precision')}</h3>
+  const width = 588 / Math.max(1, series.length);
+  const selected = active?.series === series ? series[active.index] : null;
+  return <section className={`precision-chart projection-bars ${className}`}>
+    <div className="precision-chart-heading"><div className="precision-chart-title"><h3>{title}</h3>
       <span className="precision-chart-average">{tr('平均', 'Average')} {average?.toFixed(3) ?? '—'} bpw</span></div>
-      <select aria-label={tr('选择投影', 'Select projection')} value={`${option.category}:${option.name}`} onChange={event => { setChoice(event.target.value); setActive(null); }}>
-        {options.map(item => <option key={`${item.category}:${item.name}`} value={`${item.category}:${item.name}`}>{item.category === 'attention' && analysis.attention_distribution.QSA ? 'QSA' : item.category.toUpperCase()} · {item.name}</option>)}</select></div>
-    <svg viewBox="0 0 670 214" role="img" aria-label={`${option.name} ${tr('逐层 bpw 柱状热力图', 'per-layer bpw bar heatmap')}`}>
+      {controls}</div>
+    <PrecisionLegend tr={tr} />
+    <svg viewBox="0 0 670 214" role="img" aria-label={`${chartName} ${tr('逐层 bpw 柱状热力图', 'per-layer bpw bar heatmap')}`}>
       {[0, 0.5, 1].map(step => <g key={step}><line x1="52" x2="640" y1={172 - step * 142} y2={172 - step * 142} className="chart-gridline" />
         <text x="43" y={176 - step * 142} textAnchor="end">{(step * maximum).toFixed(1)}</text></g>)}
       <text x="52" y="18">bpw</text>
       {series.map((item, index) => <g key={item.layer}>
         {item.bpw != null && <rect x={52 + index * width + 1} y={172 - item.bpw / maximum * 142} width={Math.max(1, width - 2)} height={item.bpw / maximum * 142}
-          fill={precisionColor(item.bpw, 0, maximum / 1.1)} rx="1" />}
+          fill={precisionColor(item.bpw)} rx="1" />}
         <rect x={52 + index * width} y="24" width={width} height="152" fill="transparent" tabIndex={0} role="button"
           aria-label={`L${index}: ${item.bpw?.toFixed(3) ?? tr('无此投影', 'No projection')} bpw`}
-          onMouseEnter={() => setActive(index)} onFocus={() => setActive(index)} onClick={() => setActive(index)}
-          onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setActive(index); } }} />
+          onMouseEnter={() => activate(index)} onFocus={() => activate(index)} onClick={() => activate(index)}
+          onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(index); } }} />
       </g>)}
-      <text x="52" y="199">0</text><text x="346" y="199" textAnchor="middle">{tr('层号', 'Layer ID')}</text><text x="640" y="199" textAnchor="end">{analysis.layer_count - 1}</text>
+      <text x="52" y="199">0</text><text x="346" y="199" textAnchor="middle">{tr('层号', 'Layer ID')}</text><text x="640" y="199" textAnchor="end">{Math.max(0, series.length - 1)}</text>
     </svg>
     <div className="chart-readout">{selected ? <><strong>L{selected.layer}</strong><span>{selected.bpw == null ? tr('此层无该投影', 'No projection in this layer') : `${selected.bpw.toFixed(3)} bpw`}</span>
       <small>{selected.formats.join(' · ')} {selected.parameters > 0 && `· ${parameterLabel(selected.parameters)}`}</small></>
       : <span>{tr('横轴层号，纵轴 bpw；空白表示该层没有此投影。', 'Layer ID on x, bpw on y; blank bars indicate absent projections.')}</span>}</div>
   </section>;
+}
+
+export function FfnBars({ analysis, shared = false, tr }: { analysis: CheckpointAnalysis; shared?: boolean; tr: Translate }) {
+  const charts = useMemo(() => [undefined, 'gate', 'up', 'down'].map(projection => ({
+    projection, series: ffnPrecisionSeries(analysis, projection, shared),
+  })), [analysis, shared]);
+  return <div className={shared ? 'shared-ffn-bars' : 'dense-ffn-bars'}>
+    {charts.map(({ projection, series }) => <PrecisionBars key={projection ?? 'all'} series={series}
+      title={projection ? `${projection[0].toUpperCase()}${projection.slice(1)}` : tr('FFN 精度总览', 'FFN precision')}
+      chartName={projection ? `${shared ? 'Shared ' : ''}${projection}` : shared ? 'Shared FFN' : 'FFN'} tr={tr} />)}
+  </div>;
+}
+
+export function ProjectionBars({ analysis, tr }: { analysis: CheckpointAnalysis; tr: Translate }) {
+  const options = analysis.projections.filter(projection => !isFfnTensor({ category: projection.category, projection: projection.name }) &&
+    analysis.tensors.some(tensor => tensor.category === projection.category && tensor.projection === projection.name && tensor.layer != null && tensor.shape.length >= 2));
+  const [choice, setChoice] = useState('all');
+  const option = options.find(item => `${item.category}:${item.name}` === choice);
+  const series = useMemo(() => otherProjectionSeries(analysis, option?.category, option?.name), [analysis, option?.category, option?.name]);
+  return <PrecisionBars series={series} title={tr('该类型投影精度', 'Selected projection precision')}
+    chartName={option?.name ?? 'All'} tr={tr} className="other-projection-bars" controls={
+      <select aria-label={tr('选择投影', 'Select projection')} value={option ? `${option.category}:${option.name}` : 'all'} onChange={event => setChoice(event.target.value)}>
+        <option value="all">All (excluding FFN)</option>
+        {options.map(item => <option key={`${item.category}:${item.name}`} value={`${item.category}:${item.name}`}>{analysisCategoryLabel(analysis, item.category, item.name)} · {item.name}</option>)}
+      </select>} />;
 }

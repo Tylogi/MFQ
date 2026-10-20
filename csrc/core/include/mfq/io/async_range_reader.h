@@ -7,7 +7,7 @@ namespace mfq {
 // Sector deduplication and range coalescing precede concurrent file submission.
 class AsyncRangeReader {
 public:
-    explicit AsyncRangeReader(const std::filesystem::path& path);
+    explicit AsyncRangeReader(const std::filesystem::path& path,FileReadMode mode=FileReadMode::Direct);
     ~AsyncRangeReader();
     void read(const std::vector<ReadSpan>& spans) const;
     FileReadStats stats() const noexcept;

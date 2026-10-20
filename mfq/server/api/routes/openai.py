@@ -43,6 +43,11 @@ async def openai_root(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/health/identity", include_in_schema=False)
+async def server_identity(request: Request) -> dict[str, Any]:
+    return request.app.state.server_identity
+
+
 @router.get("/v1/models", include_in_schema=False)
 async def openai_models(
     service: ServiceDependency, request: Request,

@@ -1,10 +1,10 @@
-#include "mlx_vq.h"
-#include "mlx_nvq_decode.h"
-#include "mlx_tensor.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_kernel_prepare.h"
+#include "ops/mlx_vq.h"
+#include "ops/mlx_nvq_decode.h"
+#include "runtime/mlx_tensor.h"
+#include "ops/mlx_grouped_linear.h"
+#include "runtime/mlx_kernel_prepare.h"
 
-#include "nvq_codebooks.generated.h"
+#include "generated/nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>
@@ -1692,6 +1692,79 @@ void test_nvq1_unaligned_inputs() {
     }
 }
 
+void test_nvq_group64_validation() {
+    const auto seed = make_jsc("NVQ2J-XL", 5, 8, 12, true);
+    const auto check = [](const Fixture& fixture, const char* expected) {
+        for (const bool borrowed : {false, true}) {
+            try {
+                (void)mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}, borrowed);
+                if (expected) throw std::runtime_error("group64 corruption was accepted");
+            } catch (const std::runtime_error& error) {
+                if (!expected || std::string(error.what()) != expected) throw;
+            }
+        }
+    };
+    for (const int width : {8, 16, 24, 32, 40, 48, 88, 96}) {
+        auto fixture = varied_projection_fixture(seed, 3, width);
+        check(fixture, nullptr);
+        const auto groups = (width + 23) / 24;
+        const auto vectors = width / 8;
+        const auto begin = fixture.blob.size() - std::size_t(3 * groups) * 8;
+        for (int row = 0; row < 3; ++row) for (int group = 0; group < groups; ++group) {
+            const auto offset = begin + std::size_t(row * groups + group) * 8;
+            std::uint64_t original{};
+            std::memcpy(&original, fixture.blob.data() + offset, sizeof(original));
+            for (int local = 0; local < 3; ++local) {
+                for (int bit = 0; bit < 8; ++bit) {
+                    const auto invalid = original ^ (std::uint64_t{1} << (local * 20 + 12 + bit));
+                    std::memcpy(fixture.blob.data() + offset, &invalid, sizeof(invalid));
+                    check(fixture, "invalid NVQ-JSC group64 parity bit");
+                }
+                if (group * 3 + local >= vectors) {
+                    for (const auto bits : {std::uint64_t{1}, std::uint64_t{3} << 12}) {
+                        const auto invalid = original | (bits << (local * 20));
+                        std::memcpy(fixture.blob.data() + offset, &invalid, sizeof(invalid));
+                        check(fixture, "NVQ-JSC group64 padding must be zero");
+                    }
+                }
+            }
+            std::memcpy(fixture.blob.data() + offset, &original, sizeof(original));
+        }
+    }
+    auto fixture = varied_projection_fixture(seed, 1, 24);
+    const auto offset = fixture.blob.size() - 8;
+    for (int local = 0; local < 3; ++local) for (unsigned sign = 0; sign < 256; ++sign) {
+        const auto packed = (std::uint64_t{0xabcde123456789} & ~(std::uint64_t{0xff} << (local * 20 + 12)))
+            | (std::uint64_t(sign) << (local * 20 + 12));
+        auto valid = packed;
+        for (int other = 0; other < 3; ++other) if (other != local) {
+            const auto low = unsigned((valid >> (other * 20 + 12)) & 0x7f);
+            valid = (valid & ~(std::uint64_t{1} << (other * 20 + 19)))
+                | (std::uint64_t(std::popcount(low) & 1u) << (other * 20 + 19));
+        }
+        std::memcpy(fixture.blob.data() + offset, &valid, sizeof(valid));
+        check(fixture, (std::popcount(sign) & 1u) ? "invalid NVQ-JSC group64 parity bit" : nullptr);
+    }
+}
+
+void test_nvq_jsc_borrowed_codebooks() {
+    for (const auto& fixture : {make_jsc("NVQ2J", 1, 8, 8), make_jsc("NVQ3J", 2, 4, 8),
+             make_jsc("NVQ2J-L", 4, 8, 10), make_jsc("NVQ2J-XL", 5, 8, 12),
+             make_jsc("NVQ2J-XL", 5, 8, 12, true), make_jsc("NVQ3J-512", 3, 4, 9),
+             make_jsc("NVQ3J-L", 6, 4, 10)}) {
+        const auto owned = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {});
+        const auto borrowed = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}, true);
+        const auto table = borrowed.borrowed_codebooks;
+        const auto* begin = reinterpret_cast<const std::int8_t*>(fixture.blob.data());
+        if (!owned.borrowed_codebooks.empty() || !borrowed.codebooks.empty()
+            || table.size() != owned.codebooks.size() || table.data() < begin
+            || table.data() + table.size() > begin + fixture.blob.size()
+            || !std::equal(table.begin(), table.end(), owned.codebooks.begin(), owned.codebooks.end())) {
+            throw std::runtime_error("JSC borrowed codebook differs from owned storage");
+        }
+    }
+}
+
 void test_nvq_group64_large_shapes() {
     using namespace mlx::core;
     const auto seed = make_jsc("NVQ2J-XL", 5, 8, 12, true, 4);
@@ -1882,6 +1955,8 @@ int main() {
         test_nvq_dequantize_tails();
         test_nvq1_projection_dispatch();
         test_nvq1_unaligned_inputs();
+        test_nvq_group64_validation();
+        test_nvq_jsc_borrowed_codebooks();
         test_nvq_group64_large_shapes();
         test_nvq_scale_values();
         test_nvq_projection_batches();

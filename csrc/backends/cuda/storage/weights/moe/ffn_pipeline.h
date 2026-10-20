@@ -12,7 +12,8 @@ struct QuantLinear;
 struct MoeFfnSharedWeights {
     std::array<std::shared_ptr<const QuantLinear>,3> projections;
     MoeFfnShared gate;
+    std::shared_ptr<const QuantLinear> scalar_gate;
 };
 MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>>& gate_up,
     const std::vector<std::shared_ptr<MfeWeight>>& down,MoeFfnShared shared={},MoeFfnDispatchObserver observer={},
-    MoeFfnSharedWeights shared_weights={},MoeFfnPrefetch* prefetch=nullptr);
+    MoeFfnSharedWeights shared_weights={},MoeFfnPrefetch* prefetch=nullptr,double swiglu_limit=0);

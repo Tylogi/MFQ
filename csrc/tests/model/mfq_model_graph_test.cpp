@@ -1,6 +1,6 @@
 #include "mfq_model_graph.h"
-#include "mfq_legacy_model_graph.h"
-#include "mfq_legacy_tensor_names.h"
+#include "compat/mfq_legacy_model_graph.h"
+#include "compat/mfq_legacy_tensor_names.h"
 
 #include <iostream>
 #include <stdexcept>

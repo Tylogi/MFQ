@@ -155,6 +155,55 @@ void run_benchmark() {
 int main() try {
     using namespace mfq::cache;
     const auto inspect_root = temporary_directory();
+    for (const bool disk : {false, true}) {
+        PagedPrefixCacheConfig config{inspect_root, disk ? "disposable-ram-ssd" : "disposable-ram", 4,
+            disk ? 4096ULL : 0ULL, 8, 8};
+        config.spill_hot_on_eviction = true;
+        PagedPrefixCache cache(config);
+        const std::vector<std::int64_t> a{1,2,3,4}, b{5,6,7,8}, c{9,10,11,12};
+        const auto first = cache.store({}, a.data(), a.size(), payload({1,2,3,4}));
+        const auto second = cache.store({}, b.data(), b.size(), payload({5,6,7,8}));
+        cache.pin({first, second});
+        cache.flush();
+        require(cache.metrics().disk_bytes == 0, "RAM hits must not write through to SSD");
+        require(cache.load(first).has_value(), "first RAM hit missing");
+        cache.store({}, c.data(), c.size(), payload({9,10,11,12}));
+        cache.flush();
+        require(cache.metrics().hot_bytes == 8, "pinned prefixes exceeded disposable RAM budget");
+        require(cache.metrics().disk_blocks == (disk ? 1 : 0), "LRU eviction did not spill to enabled SSD");
+        require(cache.match(a).matched_tokens == 4, "most recent RAM prefix evicted");
+        require(cache.match(b).matched_tokens == (disk ? 4 : 0), "LRU victim retention incorrect");
+        require(cache.set_hot_limit(4) == 4, "partial RAM reclaim failed");
+        require(cache.set_hot_limit(0) == 4, "complete RAM reclaim failed");
+        require(cache.metrics().hot_bytes == 0 && cache.metrics().pending_bytes == 0,
+            "reclaimed prefixes still hold RAM");
+        require(cache.load(second).has_value() == disk, "SSD restore/discard behavior incorrect");
+        cache.set_hot_limit(8);
+        cache.set_disk_limit(0);
+        cache.flush();
+        cache.store({}, a.data(), a.size(), payload({1,2,3,4}));
+        cache.set_hot_limit(0);
+        require(cache.metrics().disk_bytes == 0 && !cache.load(first), "disabling SSD still retained an evicted prefix");
+    }
+    {
+        PagedPrefixCacheConfig config{inspect_root, "ram-pressure", 4, 0, 8, 8};
+        config.spill_hot_on_eviction = true;
+        std::atomic<std::uint64_t> available{100};
+        config.available_ram_bytes = [&] { return available.load(); };
+        config.min_free_ram_bytes = 8;
+        PagedPrefixCache cache(config);
+        const std::vector<std::int64_t> tokens{1,2,3,4};
+        auto hash = cache.store({}, tokens.data(), tokens.size(), payload({1,2,3,4}));
+        cache.pin({hash});
+        require(cache.reserve_ram(96) == 4 && cache.metrics().hot_bytes == 0,
+            "higher priority RAM allocation did not reclaim prefixes first");
+        hash = cache.store({}, tokens.data(), tokens.size(), payload({1,2,3,4}));
+        available = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (cache.metrics().hot_bytes && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(cache.metrics().hot_bytes == 0 && !cache.load(hash), "host pressure must reclaim pinned RAM without a request");
+    }
     {
         PagedPrefixCacheConfig config{inspect_root, "text-record-test", 4, 4096, 4096, 8};
         config.model_path = inspect_root / "sample.mfq";
@@ -167,8 +216,10 @@ int main() try {
         const auto block = directory / name.substr(0, 2) / (name + ".mfqkv");
         const auto text = std::filesystem::path(block.string() + ".tokens");
         require(std::filesystem::file_size(text) == 108 + 4 * 8, "token record has incorrect size");
+#ifndef _WIN32
         require((std::filesystem::status(text).permissions() & std::filesystem::perms::others_read)
             == std::filesystem::perms::none, "token record is publicly readable");
+#endif
         std::ifstream record(text, std::ios::binary);
         std::array<char, 8> magic{};
         record.read(magic.data(), magic.size());
@@ -181,6 +232,7 @@ int main() try {
                 [](unsigned char value) { return value == 0; }), "token record did not retain original IDs");
         }
         require(std::filesystem::exists(directory / "identity.txt"), "model cache identity is missing");
+        record.close();
         std::filesystem::remove(block);
         std::filesystem::remove(text);
         require(cache.refresh_disk_index() == 1, "external deletion did not refresh native cache index");

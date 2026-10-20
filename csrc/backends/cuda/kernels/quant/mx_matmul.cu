@@ -1,5 +1,5 @@
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -34,7 +34,8 @@ __global__ void mxfp8_small_m_kernel(
         int outputs,
         int width,
         int groups,
-        int outputs_per_group) {
+        int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
     extern __shared__ float shared_activation[];
     constexpr int kWarps = 8;
     const int lane = int(threadIdx.x) & 31;
@@ -70,20 +71,21 @@ __global__ void mxfp8_small_m_kernel(
         }
     }
 
-    const int scale_columns = width / 128;
-    for (int block_column = 0; block_column < width; block_column += 128) {
+    const int scale_columns = width >> scale_column_shift;
+    const int block_columns=1<<scale_column_shift;
+    for (int block_column = 0; block_column < width; block_column += block_columns) {
         float scale[OUTPUTS_PER_WARP];
 #pragma unroll
         for (int output = 0; output < OUTPUTS_PER_WARP; ++output) {
             const int global_output = first_output + output;
             scale[output] = global_output < outputs
                 ? decode_e8m0(scales[
-                    (global_output / 128) * scale_columns +
-                    block_column / 128])
+                    (global_output >> scale_row_shift) * scale_columns +
+                    (block_column >> scale_column_shift)])
                 : 0.0f;
         }
 #pragma unroll
-        for (int local_column = lane; local_column < 128;
+        for (int local_column = lane; local_column < block_columns;
              local_column += 32) {
             const int column = block_column + local_column;
             float activation[TILE_M];
@@ -137,6 +139,14 @@ __global__ void mxfp8_small_m_kernel(
     }
 }
 
+int mxfp8_column_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return values.size(1)/scales.size(1)==128?7:5;
+}
+
+int mxfp8_row_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
+    return scales.size(0)==values.size(0)?0:mxfp8_column_shift(values,scales);
+}
+
 template <int TILE_M, typename Output>
 void launch_mxfp8_small_m(
         const mfq_tensor_backend::Tensor & values,
@@ -164,7 +174,7 @@ void launch_mxfp8_small_m(
                 reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
                 reinterpret_cast<Output *>(y.data_ptr()), \
                 int(x.size(0)), outputs, int(values.size(1)), \
-                groups, outputs_per_group); \
+                groups, outputs_per_group,mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales)); \
     } while (false)
 #define MFQ_LAUNCH_MXFP8_OPW(OPW) \
     do { \
@@ -191,7 +201,7 @@ __global__ void mxfp8_dequant_kernel(
         const std::uint8_t * __restrict__ scales,
         __half * __restrict__ dense,
         int outputs,
-        int width) {
+        int width,int scale_row_shift,int scale_column_shift) {
     const std::size_t index =
         std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t count = std::size_t(outputs) * width;
@@ -200,9 +210,9 @@ __global__ void mxfp8_dequant_kernel(
     }
     const int output = int(index / width);
     const int column = int(index - std::size_t(output) * width);
-    const int scale_columns = width / 128;
+    const int scale_columns = width >> scale_column_shift;
     const float scale = decode_e8m0(
-        scales[(output / 128) * scale_columns + column / 128]);
+        scales[(output >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
     dense[index] = __float2half_rn(decode_e4m3fn(values[index]) * scale);
 }
 
@@ -213,7 +223,7 @@ __global__ void mxfp8_embedding_kernel(
         __half * __restrict__ output,
         int count,
         int vocab,
-        int width) {
+        int width,int scale_row_shift,int scale_column_shift) {
     const int64_t total = static_cast<int64_t>(count) * width;
     for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x +
              threadIdx.x;
@@ -224,73 +234,77 @@ __global__ void mxfp8_embedding_kernel(
         const int64_t token = ids[token_index];
         float value = 0.0f;
         if (token >= 0 && token < vocab) {
-            const int scale_columns = width / 128;
+            const int scale_columns = width >> scale_column_shift;
             const float scale = decode_e8m0(scales[
-                (token / 128) * scale_columns + column / 128]);
+                (token >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
             value = decode_e4m3fn(values[token * width + column]) * scale;
         }
         output[linear] = __float2half_rn(value);
     }
 }
 
+struct alignas(16) PackedPrefillStorage {
+    static constexpr int k=64,stride=k+8;
+    __align__(16) __half activation[16*stride];
+    __align__(16) unsigned char weights[64*stride*sizeof(__half)];
+    __device__ __forceinline__ __half* decoded() {return reinterpret_cast<__half*>(weights);}
+    __device__ __forceinline__ float* result() {return reinterpret_cast<float*>(weights);}
+    template<class Accumulator>
+    __device__ __forceinline__ void accumulate(Accumulator& acc,int warp) {
+        using namespace nvcuda;
+        __syncthreads();
+        #pragma unroll
+        for(int sub=0;sub<k;sub+=16) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af,activation+sub,stride);
+            wmma::load_matrix_sync(bf,decoded()+warp*16*stride+sub,stride);
+            wmma::mma_sync(acc,af,bf,acc);
+        }
+        __syncthreads();
+    }
+};
+
 template <typename Output>
-__global__ void __launch_bounds__(256) mxfp8_matmul_kernel(
-        const std::uint8_t * __restrict__ values,
-        const std::uint8_t * __restrict__ scales,
-        const __half * __restrict__ input,
-        Output * __restrict__ output,
-        int rows,
-        int outputs,
-        int width,
-        int row_tiles,
-        int output_tiles) {
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int warp = int(threadIdx.y);
-    const int lane = int(threadIdx.x);
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    for (int64_t task = blockIdx.x; task < tasks; task += gridDim.x) {
-        const int output_tile = static_cast<int>(task % output_tiles);
-        const int row_tile = static_cast<int>(task / output_tiles);
-        const int neuron = output_tile * kOutputsPerTile + warp;
-        if (neuron >= outputs) continue;
-        const int first_row = row_tile * kRowsPerTile;
-        float accumulators[kRowsPerTile];
-#pragma unroll
-        for (int item = 0; item < kRowsPerTile; ++item) {
-            accumulators[item] = 0.0f;
+__global__ void __launch_bounds__(128) mxfp8_matmul_kernel(
+        const std::uint8_t* __restrict__ values,const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ input,Output* __restrict__ output,
+        int rows,int outputs,int width,int scale_row_shift,int scale_column_shift) {
+    using namespace nvcuda;
+    __shared__ PackedPrefillStorage tile;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile.activation;auto* b=tile.decoded();auto* c=tile.result();
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int first_row=blockIdx.y*16,first_output=blockIdx.x*64;
+    const int scale_columns=width>>scale_column_shift;
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;
+    wmma::fill_fragment(acc,0.0f);
+    for(int k=0;k<width;k+=tile_k) {
+        for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+            const int row=first_row+i/tile_k,column=k+i%tile_k;
+            a[(i/tile_k)*stride+i%tile_k]=row<rows && column<width?
+                input[std::size_t(row)*width+column]:__float2half_rn(0);
         }
-        const int scale_columns = width / 128;
-        for (int column = lane; column < width; column += 32) {
-            const float weight = decode_e4m3fn(values[
-                static_cast<int64_t>(neuron) * width + column]) *
-                decode_e8m0(scales[
-                    static_cast<int64_t>(neuron / 128) * scale_columns +
-                    column / 128]);
-#pragma unroll
-            for (int item = 0; item < kRowsPerTile; ++item) {
-                const int row = first_row + item;
-                if (row < rows) {
-                    accumulators[item] = fmaf(
-                        __half2float(input[
-                            static_cast<int64_t>(row) * width + column]),
-                        weight,
-                        accumulators[item]);
-                }
+        for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+            const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+            float lo=0,hi=0;
+            if(neuron<outputs && column<width) {
+                const auto offset=std::size_t(neuron)*width+column;
+                const float scale=decode_e8m0(scales[std::size_t(neuron>>scale_row_shift)*scale_columns+(column>>scale_column_shift)]);
+                lo=decode_e4m3fn(values[offset])*scale;
+                hi=decode_e4m3fn(values[offset+1])*scale;
             }
+            reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
         }
-#pragma unroll
-        for (int item = 0; item < kRowsPerTile; ++item) {
-            const float value = warp_sum(accumulators[item]);
-            const int row = first_row + item;
-            if (lane == 0 && row < rows) {
-                if constexpr (std::is_same_v<Output, float>) {
-                    output[static_cast<int64_t>(row) * outputs + neuron] = value;
-                } else {
-                    output[static_cast<int64_t>(row) * outputs + neuron] =
-                        __float2half_rn(value);
-                }
-            }
+        tile.accumulate(acc,warp);
+    }
+    wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
+    __syncwarp();
+    for(int i=lane;i<16*16;i+=32) {
+        const int row=first_row+i/16,neuron=first_output+warp*16+i%16;
+        if(row<rows && neuron<outputs) {
+            if constexpr(std::is_same_v<Output,float>)output[std::size_t(row)*outputs+neuron]=c[warp*16*16+i];
+            else output[std::size_t(row)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
         }
     }
 }
@@ -311,7 +325,7 @@ mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
-            int(values.size(0)), int(values.size(1)));
+            int(values.size(0)), int(values.size(1)),mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
 }
@@ -342,7 +356,7 @@ mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-                count, vocab, width);
+                count, vocab, width,mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
@@ -394,21 +408,11 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
     auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
-    const int output_tiles =
-        (outputs + kOutputsPerTile - 1) / kOutputsPerTile;
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
-    const dim3 threads(32, kOutputsPerTile);
-    mxfp8_matmul_kernel<__half><<<
-        blocks, threads, 0, mfq_current_cuda_stream()>>>(
-            values.data_ptr<std::uint8_t>(),
-            scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-            rows, outputs, width, row_tiles, output_tiles);
+    mxfp8_matmul_kernel<__half><<<dim3((outputs+63)/64,(rows+15)/16),128,0,mfq_current_cuda_stream()>>>(
+        values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+        reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+        reinterpret_cast<__half*>(result.data_ptr<mfq_half>()),rows,outputs,width,
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
@@ -458,20 +462,10 @@ mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
     const int N = int(values.size(0));
     auto y = mfq_tensor_backend::empty(
         {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
-    constexpr int kRowsPerTile = 8;
-    constexpr int kOutputsPerTile = 8;
-    const int row_tiles = (M + kRowsPerTile - 1) / kRowsPerTile;
-    const int output_tiles = (N + kOutputsPerTile - 1) / kOutputsPerTile;
-    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
-    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
-    const dim3 threads(32, kOutputsPerTile);
-    mxfp8_matmul_kernel<float><<<
-        blocks, threads, 0, mfq_current_cuda_stream()>>>(
-            values.data_ptr<std::uint8_t>(),
-            scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-            y.data_ptr<float>(), M, N, int(x.size(1)),
-            row_tiles, output_tiles);
+    mxfp8_matmul_kernel<float><<<dim3((N+63)/64,(M+15)/16),128,0,mfq_current_cuda_stream()>>>(
+        values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),y.data_ptr<float>(),M,N,int(x.size(1)),
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -768,6 +762,72 @@ __global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
     }
 }
 
+__global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
+        const std::uint8_t* __restrict__ values,
+        const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ input,
+        const std::int32_t* __restrict__ expert_local,
+        const std::int32_t* __restrict__ ids_dst,
+        const std::int32_t* __restrict__ expert_bounds,
+        const std::int32_t* __restrict__ tile_bounds,
+        const std::int32_t* __restrict__ tile_experts,
+        __half* __restrict__ output,
+        int routes,int global_experts,int pool_experts,
+        int outputs,int width,int max_tiles,int output_tiles,bool routed_input) {
+    using namespace nvcuda;
+    __shared__ PackedPrefillStorage tile_storage;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile_storage.activation;auto* b=tile_storage.decoded();auto* c=tile_storage.result();
+    __shared__ int pair_ids[16];
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int64_t tasks=int64_t(max_tiles)*output_tiles;
+    for(int64_t task=blockIdx.x;task<tasks;task+=gridDim.x) {
+        const int tile=int(task/output_tiles);
+        if(tile>=tile_bounds[global_experts])continue;
+        const int expert=tile_experts[tile],local=expert_local[expert];
+        if(static_cast<unsigned>(local)>=static_cast<unsigned>(pool_experts))continue;
+        const int local_tile=tile-tile_bounds[expert];
+        if(local_tile&1)continue;
+        const int first=expert_bounds[expert]+local_tile*8;
+        const int last=min(first+16,expert_bounds[expert+1]);
+        const int first_output=int(task%output_tiles)*64;
+        if(threadIdx.x<16)pair_ids[threadIdx.x]=first+threadIdx.x<last?
+            ids_dst[first+threadIdx.x]:-1;
+        __syncthreads();
+        wmma::fragment<wmma::accumulator,16,16,16,float> acc;
+        wmma::fill_fragment(acc,0.0f);
+        for(int k=0;k<width;k+=tile_k) {
+            for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+                const int pair=pair_ids[i/tile_k],column=k+i%tile_k;
+                const int source_row=routed_input?pair:pair/routes;
+                a[(i/tile_k)*stride+i%tile_k]=pair>=0 && column<width?
+                    input[int64_t(source_row)*width+column]:__float2half_rn(0);
+            }
+            for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+                const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+                float lo=0,hi=0;
+                if(neuron<outputs && column<width) {
+                    const int64_t packed_row=int64_t(local)*outputs+neuron;
+                    const auto packed=values[packed_row*(width/2)+column/2];
+                    const float scale=decode_e8m0(scales[packed_row*(width/32)+column/32]);
+                    lo=decode_mxfp4_e2m1(packed&15u)*scale;
+                    hi=decode_mxfp4_e2m1(packed>>4u)*scale;
+                }
+                reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
+            }
+            tile_storage.accumulate(acc,warp);
+        }
+        wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
+        __syncwarp();
+        for(int i=lane;i<16*16;i+=32) {
+            const int pair=pair_ids[i/16],neuron=first_output+warp*16+i%16;
+            if(pair>=0 && neuron<outputs)
+                output[int64_t(pair)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
+        }
+        __syncthreads();
+    }
+}
+
 void validate_mxfp4_moe(
         const mfq_tensor_backend::Tensor & values,
         const mfq_tensor_backend::Tensor & scales,
@@ -935,6 +995,26 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
                         tile_bounds.numel() >= global_experts + 1,
                     "MXFP4 compact route map is invalid");
         const int max_tiles = (pairs + 7) / 8 + static_cast<int>(global_experts);
+        if(pairs>=8*global_experts) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mxfp4_moe_prefill_dispatch path=packed_tensor_core tokens=%d routes=%d experts=%lld pool=%lld width=%lld outputs=%lld\n",
+                tokens,routes,static_cast<long long>(global_experts),static_cast<long long>(pool_experts),
+                static_cast<long long>(neuron_len),static_cast<long long>(out_per_expert));
+            const int output_tiles=(static_cast<int>(out_per_expert)+63)/64;
+            const int blocks=static_cast<int>(std::min<int64_t>(int64_t(max_tiles)*output_tiles,4096));
+            mxfp4_moe_grouped_tensor_kernel<<<blocks,128,0,stream>>>(
+                values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+                expert_local.data_ptr<std::int32_t>(),ids_dst.data_ptr<std::int32_t>(),
+                expert_bounds.data_ptr<std::int32_t>(),tile_bounds.data_ptr<std::int32_t>(),
+                tile_experts.data_ptr<std::int32_t>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                routes,static_cast<int>(global_experts),static_cast<int>(pool_experts),
+                static_cast<int>(out_per_expert),static_cast<int>(neuron_len),max_tiles,
+                output_tiles,input.dim()==3);
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+            return output;
+        }
         const int blocks = static_cast<int>(std::min<int64_t>(
             static_cast<int64_t>(max_tiles) * row_tiles, 4096));
         mxfp4_moe_grouped_f16_kernel<true><<<blocks, threads, 0, stream>>>(

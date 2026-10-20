@@ -1,6 +1,7 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
   ModelArtifact,
+  ModelDeletionPlan,
   ModelCacheProfile,
   CheckpointAnalysis,
   ModelDirectoryList,
@@ -10,8 +11,43 @@ import type {
   ArtifactLineage,
 } from '../types';
 import { request } from '../client';
+import type { KvQuantizationSettings } from './runtime';
+
+export interface ModelLoadContextSettings {
+  automatic: boolean;
+  ssd_kv: boolean;
+  ram_preallocated: boolean;
+  vram_preallocated: boolean;
+  kv_quantization: KvQuantizationSettings;
+}
+
+export interface DownloadDirectoryStatus {
+  directory: string | null;
+  actual_directory: string;
+  default_directory: string;
+  disk_total_bytes?: number | null;
+  disk_free_bytes?: number | null;
+  disk_available_bytes?: number | null;
+  download_reserved_bytes?: number;
+  reclaimable_prefix_bytes?: number;
+  evict_prefix_cache?: boolean;
+}
 
 export const modelsApi = {
+  downloadDirectory(): Promise<DownloadDirectoryStatus> {
+    return request('/api/v1/hub/download-directory');
+  },
+  configureDownloadDirectory(directoryId: string | null): Promise<DownloadDirectoryStatus> {
+    return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ directory_id: directoryId }) });
+  },
+  configureDownloadReclaim(evictPrefixCache: boolean): Promise<DownloadDirectoryStatus> {
+    return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ evict_prefix_cache: evictPrefixCache }) });
+  },
+  probeDownloadSources(sources: { provider: HubModelSummary['provider']; repo_id: string; revision?: string | null }[], signal?: AbortSignal): Promise<{
+    data: { provider: HubModelSummary['provider']; repo_id: string; bytes_per_second: number; route?: 'direct' | 'proxy' }[];
+  }> {
+    return request('/api/v1/hub/download-sources/probe', { method: 'POST', body: JSON.stringify({ sources }), signal });
+  },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
     return (
@@ -32,15 +68,25 @@ export const modelsApi = {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/directory`);
   },
 
+  modelDeletionPlan(modelId: string): Promise<ModelDeletionPlan> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/deletion`);
+  },
+
+  deleteModel(modelId: string, token: string): Promise<{ files: number; total_bytes: number }> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/delete`, {
+      method: 'POST', body: JSON.stringify({ token }),
+    });
+  },
+
   checkpointAnalysis(modelId: string, signal?: AbortSignal): Promise<CheckpointAnalysis> {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/analysis`, { signal });
   },
 
-  modelCacheProfile(modelId: string, signal?: AbortSignal): Promise<ModelCacheProfile | null> {
-    return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile`, { signal });
+  modelCacheProfile(modelId: string, signal?: AbortSignal, includeRecurrent = false): Promise<ModelCacheProfile | null> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile${includeRecurrent ? '?include_recurrent=true' : ''}`, { signal });
   },
 
-  openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {
+  openModelDirectory(directoryId: string): Promise<{ opened: boolean }> {
     return request('/api/v1/models/directories/open', {
       method: 'POST', body: JSON.stringify({ directory_id: directoryId }),
     });
@@ -61,7 +107,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize = 2048,
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -70,6 +116,12 @@ export const modelsApi = {
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
+        ...(policy.context_management ? { context_management: {
+          automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,
+          ram_preallocated: policy.context_management.ram_preallocated, vram_preallocated: policy.context_management.vram_preallocated,
+          kv_quantization: policy.context_management.kv_quantization,
+        } } : {}),
+        ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });

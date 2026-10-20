@@ -1,4 +1,4 @@
-#include "mlx_qwen35_causal_lm.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
 #include "grammar_fixture.h"
 
 #include <algorithm>

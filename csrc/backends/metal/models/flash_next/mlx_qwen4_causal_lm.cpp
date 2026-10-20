@@ -1,21 +1,21 @@
 #include "mlx_qwen4_causal_lm.h"
 
-#include "mlx_eval_timing.h"
-#include "mlx_detached_copy.h"
+#include "runtime/mlx_eval_timing.h"
+#include "runtime/mlx_detached_copy.h"
 #include "qwen4_ops.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_linear_attention.h"
-#include "mlx_moe.h"
-#include "mlx_moe_ops.h"
-#include "mlx_nint_rows.h"
-#include "mfe_expert_store.h"
-#include "mlx_sparse_attention.h"
-#include "mlx_tensor.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_mtp_lora.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "ops/mlx_linear_attention.h"
+#include "ops/mlx_moe.h"
+#include "ops/mlx_moe_ops.h"
+#include "ops/mlx_nint_rows.h"
+#include "storage/mfe_expert_store.h"
+#include "ops/mlx_sparse_attention.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_kernel_prepare.h"
+#include "runtime/mlx_mtp_lora.h"
 #include "settings.h"
 #include "mfq_paged_prefix_cache.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
 #include <mlx/compile.h>
@@ -49,6 +49,7 @@
 #include <vector>
 
 namespace mfq::metal {
+
 namespace {
 
 using json = nlohmann::json;
@@ -61,6 +62,51 @@ constexpr std::string_view kModelConfigAsset =
 // Qwen4/Flash-Next recursively reuses its single predictor layer to form a
 // draft chain. Predictor layer count and maximum draft depth are independent.
 constexpr int kQwen4MtpMaximumDraftDepth = 5;
+
+struct Qwen4PromptPositions {
+    std::optional<array> prompt;
+    int delta = 0;
+
+    array full(int count) const {
+        if (!prompt) return mlx::core::arange(0, count, 1, mlx::core::int32);
+        const int prefix = std::min(count, prompt->shape(-1));
+        auto positions = mlx::core::slice(*prompt, {0, 0}, {3, prefix});
+        if (count > prefix) {
+            auto tail = mlx::core::broadcast_to(
+                mlx::core::arange(prefix + delta, count + delta, 1, mlx::core::int32),
+                Shape{3, count - prefix});
+            positions = mlx::core::concatenate({positions, tail}, -1);
+        }
+        return positions;
+    }
+
+    array current(const array& full, int start, int count) const {
+        return prompt ? mlx::core::slice(full, {0, start}, {3, start + count})
+                      : mlx::core::arange(start, start + count, 1, mlx::core::int32);
+    }
+};
+
+struct Qwen4PleSpeculativeState {
+    std::optional<array> convolution_state;
+    std::vector<std::int64_t> ngram_context;
+    std::optional<array> token_ids, convolution_inputs;
+    int confirmed_tokens = 0, total_tokens = 0;
+};
+
+struct Qwen4RequestLayerCache {
+    int position = 0, batch = 0, index_start = 0, index_position = 0;
+    int ple_batch = 0, ngram_batch = 0;
+    std::unique_ptr<MlxKvCache> kv;
+    std::unique_ptr<MlxQsaKvOffload> offloaded_kv;
+    std::unique_ptr<MlxQsaIndexOffload> offloaded_pool;
+    std::optional<MlxSequenceCache> pooled;
+    std::optional<array> convolution, recurrent, index_tail, ple_convolution;
+    std::vector<std::int64_t> ple_context;
+    std::optional<Qwen4PleSpeculativeState> ple_rollback;
+    std::optional<MlxGatedDeltaSpeculativeState> gdn_rollback;
+    int qsa_speculative_trim = 0;
+    MlxResourceTelemetry attention_resources, ple_resources;
+};
 
 std::string mtp_source_identity(const MfqContainer& model) {
     std::ostringstream identity;
@@ -303,10 +349,11 @@ public:
     array routed_matmul_reduce(
         const array& input,
         const array& expert_ids,
-        const array& route_weights) const {
+        const array& route_weights,
+        const array* route_groups = nullptr) const {
         if (packed_) {
             return packed_->routed_matmul_reduce(
-                input, expert_ids, route_weights);
+                input, expert_ids, route_weights, route_groups);
         }
         return moe_weighted_reduce(
             dense_matmul(input, expert_ids), route_weights);
@@ -324,8 +371,8 @@ public:
         return packed_ && packed_->supports_grouped_mmq();
     }
 
-    bool supports_fused_routed_reduce() const noexcept {
-        return packed_ && packed_->supports_fused_routed_reduce();
+    bool supports_fused_routed_reduce(const array* route_groups = nullptr) const noexcept {
+        return packed_ && packed_->supports_fused_routed_reduce(route_groups);
     }
 
     int recommended_grouped_mmq_block_rows(
@@ -669,6 +716,8 @@ private:
     std::optional<MlxNintSwiGluPair> nint_gate_up_;
 };
 
+using Qwen4CachedRoute = MlxMfeCachedRoute;
+
 class Qwen4Moe {
 public:
     const std::optional<array>& training_routes() const { return training_routes_; }
@@ -795,9 +844,23 @@ public:
         return std::nullopt;
     }
 
+    std::optional<Qwen4CachedRoute> cached_route() const {
+        if (!mfe_offload_cache_) return std::nullopt;
+        Qwen4CachedRoute route{mfe_offload_cache_, {}, std::nullopt};
+        for (const auto& name : {gate_name_, up_name_.value_or(down_name_), down_name_}) {
+            if (route.projections.size() == 2 && !up_name_) break;
+            auto projection = mfe_offload_cache_->cached_projection(name);
+            if (!projection) return std::nullopt;
+            route.projections.push_back(std::move(projection));
+        }
+        return route;
+    }
+
     array operator()(
         const array& value,
-        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) const {
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
+        bool batched_decode = false,
+        Qwen4CachedRoute* deferred_route = nullptr) const {
         auto source = mlx::core::reshape(
             value.dtype() == mlx::core::float16
                 ? value : mlx::core::astype(value, mlx::core::float16),
@@ -834,7 +897,7 @@ public:
                 std::vector<array>{routes.ids, routes.weights});
         }
         std::optional<array> shared_gate_logits;
-        if (source.shape(0) >= 1 && source.shape(0) <= 6 && config_.norm_topk_prob &&
+        if (source.shape(0) >= 1 && (source.shape(0) <= 6 || batched_decode) && config_.norm_topk_prob &&
             gate_up_ && down_) {
             const auto* gate_up = gate_up_->packed_weight_ref();
             const auto* down = down_->packed_weight_ref();
@@ -844,7 +907,7 @@ public:
                 shared_gate_.dense_weight_ref();
             if (gate_up != nullptr && down != nullptr &&
                 shared_gate_up != nullptr && shared_down != nullptr) {
-                auto shared_gate_input = shared_gate_weight != nullptr
+                auto shared_gate_input = packed_shared_gate_ ? *packed_shared_gate_ : shared_gate_weight != nullptr
                     ? *shared_gate_weight
                     : shared_gate_logits.emplace(shared_gate_(source));
                 if (auto fused = gate_up->decode_nint_shared(
@@ -855,7 +918,7 @@ public:
                         source,
                         routes.ids,
                         routes.weights,
-                        shared_gate_weight == nullptr, route_groups)) {
+                        shared_gate_weight == nullptr, route_groups, &router_logits)) {
                     if (detail::component_profile_active()) {
                         detail::profile_eval(
                             "qwen4.moe.two_stage", *fused);
@@ -929,6 +992,16 @@ public:
                 return output;
             }
             if (mfe_offload_cache_) {
+                if (tokens == 1 && !detail::component_profile_active()) {
+                    auto local_route = deferred_route ? std::nullopt : cached_route();
+                    auto* cached = deferred_route ? deferred_route : local_route ? &*local_route : nullptr;
+                    if (cached) {
+                        auto output = cached->forward(source, routes.ids);
+                        if (deferred_route) return output;
+                        mlx::core::async_eval({output});
+                        if (cached->resolve()) return output;
+                    }
+                }
                 auto global_ids = mlx::core::contiguous(
                     mlx::core::astype(routes.ids, mlx::core::int32));
                 global_ids.eval();
@@ -948,7 +1021,7 @@ public:
                     }
                     ++seen[static_cast<std::size_t>(expert)];
                 }
-                if (tokens > 6) {
+                if (tokens > 6 && !batched_decode) {
                     std::vector<std::string> names{gate_name_, down_name_};
                     if (up_name_) names.push_back(*up_name_);
                     if (auto layer = mfe_offload_cache_->layer_mfe(names, active)) {
@@ -964,32 +1037,50 @@ public:
                     global_to_local[static_cast<std::size_t>(active[local])] =
                         static_cast<std::int32_t>(local);
                 }
-                auto local_ids = mlx::core::take(
-                    array(
-                        global_to_local.begin(),
-                        Shape{static_cast<int>(config_.num_experts)}),
-                    global_ids);
+                std::vector<std::int32_t> local_routes(global_ids.size());
+                for (std::size_t index = 0; index < local_routes.size(); ++index)
+                    local_routes[index] = global_to_local[ids[index]];
+                auto local_ids = array(local_routes.begin(), global_ids.shape(), mlx::core::int32);
                 std::vector<std::uint32_t> activation_counts;
                 activation_counts.reserve(active.size());
                 for (const auto expert : active) activation_counts.push_back(seen[expert]);
                 std::optional<array> groups;
-                if (tokens > 1 && tokens <= 6) {
-                    std::vector<std::int32_t> local_routes(global_ids.size());
-                    for (std::size_t index = 0; index < local_routes.size(); ++index)
-                        local_routes[index] = global_to_local[ids[index]];
+                if (tokens > 1 && (tokens <= 6 || (batched_decode && tokens <= 24))) {
                     groups = moe_route_groups_host(local_routes, tokens, global_ids.shape(1));
                 }
                 const auto* local_groups = groups ? &*groups : nullptr;
-                auto gate = mfe_offload_cache_->grouped_mfe(
-                    gate_name_, active, activation_counts);
-                auto down = mfe_offload_cache_->grouped_mfe(
-                    down_name_, active, activation_counts);
+                std::optional<MlxMfeWeight> up;
+                const bool prefill_scan = tokens > 6 && !batched_decode;
+                auto gate = [&] {
+                    if (!up_name_) return mfe_offload_cache_->grouped_mfe(gate_name_, active, activation_counts, prefill_scan);
+                    const std::array names{gate_name_, *up_name_};
+                    auto weights = mfe_offload_cache_->grouped_mfe(names, active, activation_counts, prefill_scan);
+                    up.emplace(std::move(weights[1]));
+                    return std::move(weights[0]);
+                }();
+                std::optional<array> sorted_routes;
+                std::optional<MlxGroupedMmqPlan> gate_plan;
+                if (prefill_scan && tokens >= 32 && gate.supports_grouped_mmq()
+                    && (!up || up->supports_grouped_mmq())) {
+                    sorted_routes = mlx::core::contiguous(mlx::core::astype(
+                        mlx::core::argsort(mlx::core::reshape(local_ids, Shape{route_count})), mlx::core::int32));
+                    gate_plan = gate.build_grouped_mmq_plan(local_ids, *sorted_routes,
+                        gate.recommended_grouped_mmq_block_rows(route_count, !up));
+                }
                 auto intermediate = [&]() {
-                    if (up_name_) {
-                        auto up = mfe_offload_cache_->grouped_mfe(
-                            *up_name_, active, activation_counts);
+                    if (sorted_routes) {
+                        auto result = gate.routed_matmul_sorted(source, local_ids,
+                            *sorted_routes, false, !up, 0.0f, &*gate_plan);
+                        if (!up) return result;
+                        const int rows = up->recommended_grouped_mmq_block_rows(route_count, false);
+                        const auto plan = rows == gate_plan->block_rows ? *gate_plan
+                            : up->build_grouped_mmq_plan(local_ids, *sorted_routes, rows);
+                        return moe_swiglu_pair(std::move(result), up->routed_matmul_sorted(
+                            source, local_ids, *sorted_routes, false, false, 0.0f, &plan));
+                    }
+                    if (up) {
                         return gate.routed_swiglu_pair(
-                            up, source, local_ids, 0.0f, local_groups);
+                            *up, source, local_ids, 0.0f, local_groups);
                     }
                     return gate.routed_swiglu(source, local_ids, 0.0f, local_groups);
                 }();
@@ -997,13 +1088,32 @@ public:
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
+                if ((tokens <= 6 || batched_decode || sorted_routes) && !detail::component_profile_active())
+                    mlx::core::async_eval({intermediate});
+                auto down = mfe_offload_cache_->grouped_mfe(
+                    down_name_, active, activation_counts, prefill_scan);
+                if (sorted_routes && down.supports_grouped_mmq()) {
+                    const int rows = down.recommended_grouped_mmq_block_rows(route_count, false);
+                    const auto plan = rows == gate_plan->block_rows ? *gate_plan
+                        : down.build_grouped_mmq_plan(local_ids, *sorted_routes, rows);
+                    auto output = down.routed_matmul_sorted(intermediate, local_ids,
+                        *sorted_routes, true, false, 0.0f, &plan);
+                    if (detail::component_profile_active())
+                        detail::profile_eval("qwen4.moe.routed_down", output);
+                    return mlx::core::reshape(mlx::core::take(output,
+                        moe_inverse_permutation(*sorted_routes), 0),
+                        Shape{tokens, global_ids.shape(1), down.out_per_expert()});
+                }
+                if (sorted_routes) intermediate = mlx::core::reshape(mlx::core::take(
+                    intermediate, moe_inverse_permutation(*sorted_routes), 0),
+                    Shape{tokens, global_ids.shape(1), down.neuron_len()});
                 const bool combine_routes = tokens <= 6 &&
-                    down.supports_fused_routed_reduce();
+                    down.supports_fused_routed_reduce(local_groups);
                 auto output = combine_routes
                     ? down.routed_matmul_reduce(
                           intermediate,
                           local_ids,
-                          routes.weights)
+                          routes.weights, local_groups)
                     : down.routed_matmul(intermediate, local_ids, local_groups);
                 routed_is_reduced = combine_routes;
                 if (detail::component_profile_active()) {
@@ -1089,12 +1199,12 @@ public:
             // reduce/shared-gate epilogue instead of separate reduction and
             // shared-gate launches.
             const bool combine_routes = tokens <= 6 &&
-                down_->supports_fused_routed_reduce();
+                down_->supports_fused_routed_reduce(route_groups);
             auto output = combine_routes
                 ? down_->routed_matmul_reduce(
                       intermediate,
                       routes.ids,
-                      routes.weights)
+                      routes.weights, route_groups)
                 : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
             if (detail::component_profile_active()) {
@@ -1170,6 +1280,9 @@ private:
           expert_cache_layer_(expert_cache_layer) {
         const bool cached = static_cast<bool>(ssd_expert_cache_)
             || static_cast<bool>(mfe_offload_cache_);
+        if (shared_.nint_gate_up_pair_ref())
+            if (const auto* weight = shared_gate_.nint_weight_ref())
+                packed_shared_gate_ = pack_nint_single_row(*weight);
         if (gate_up_.has_value() != down_.has_value() ||
             gate_up_.has_value() == cached
             || (ssd_expert_cache_ && mfe_offload_cache_)) {
@@ -1193,12 +1306,26 @@ private:
             mfe_offload_cache_->prepare_projection(gate_name_, true, !up_name_);
             if (up_name_) mfe_offload_cache_->prepare_projection(*up_name_, true);
             mfe_offload_cache_->prepare_projection(down_name_, false);
+            if (up_name_) mfe_offload_cache_->prepare_swiglu_pair(
+                gate_name_, *up_name_, static_cast<int>(config_.num_experts_per_tok));
+        }
+        if (auto* preparation = MlxKernelPreparation::current(); preparation && cached) {
+            preparation->collect([&] {
+                auto routes = moe_topk(router_(mlx::core::zeros(
+                    Shape{8, static_cast<int>(config_.hidden_size)}, mlx::core::float16)),
+                    static_cast<int>(config_.num_experts_per_tok), false, false, config_.norm_topk_prob);
+                preparation->add(routes.ids);
+                preparation->add(routes.weights);
+                if (routes.groups) preparation->add(*routes.groups);
+            });
         }
         if (auto* preparation = MlxKernelPreparation::current(); preparation && !cached) {
             preparation->collect([&] {
                 for (const auto rows : preparation->row_buckets())
                     preparation->add((*this)(mlx::core::zeros(
                         Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16)));
+                preparation->add((*this)(mlx::core::zeros(
+                    Shape{1, 8, static_cast<int>(config_.hidden_size)}, mlx::core::float16), nullptr, true));
             });
         }
     }
@@ -1210,6 +1337,7 @@ private:
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
+    std::optional<array> packed_shared_gate_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::string gate_name_;
@@ -1323,6 +1451,11 @@ public:
         return context_;
     }
 
+    void exchange_context(Qwen4RequestLayerCache& cache) {
+        std::swap(batch_, cache.ngram_batch);
+        context_.swap(cache.ple_context);
+    }
+
     void restore_context(std::vector<std::int64_t> context) {
         if (context.size() != context_.size()) {
             throw std::runtime_error(
@@ -1378,13 +1511,46 @@ public:
             });
     }
 
+    Prefetched prefetch_requests(const array& ids, const std::vector<int>& offsets,
+        const std::vector<Qwen4RequestLayerCache*>& caches) {
+        std::vector<std::int64_t> contexts;
+        contexts.reserve(caches.size() * static_cast<std::size_t>(config_.ngram_size - 1));
+        for (const auto* cache : caches) {
+            if (cache->ple_context.empty() && cache->ngram_batch == 0)
+                contexts.insert(contexts.end(), static_cast<std::size_t>(config_.ngram_size - 1), config_.eos_token_id);
+            else contexts.insert(contexts.end(), cache->ple_context.begin(), cache->ple_context.end());
+        }
+        return std::async(std::launch::async,
+            [this, lookup = select_rows(ids, true, &contexts, &offsets)]() mutable {
+                return read_rows(std::move(lookup), true);
+            });
+    }
+
+    array forward_requests(const array& ids, const std::vector<int>& offsets,
+        const std::vector<Qwen4RequestLayerCache*>& caches, Prefetched* prefetched) {
+        auto pending = prefetched && prefetched->valid()
+            ? std::move(*prefetched) : prefetch_requests(ids, offsets, caches);
+        auto lookup = pending.get();
+        if (lookup.batch != ids.shape(0) || lookup.tokens != ids.shape(1))
+            throw std::runtime_error("Qwen4 PLE prefetched request shape disagrees");
+        const int prefix = static_cast<int>(config_.ngram_size - 1);
+        if (lookup.context.size() != caches.size() * static_cast<std::size_t>(prefix))
+            throw std::runtime_error("Qwen4 PLE prefetched request contexts disagree");
+        for (int row = 0; row < static_cast<int>(caches.size()); ++row) {
+            caches[row]->ngram_batch = 1;
+            caches[row]->ple_context.assign(lookup.context.begin() + row * prefix,
+                lookup.context.begin() + (row + 1) * prefix);
+        }
+        return decode_lookup(std::move(lookup));
+    }
+
     array forward(
         const array& token_ids,
         bool use_cache,
         Prefetched* prefetched = nullptr) {
-        auto lookup = prefetched && prefetched->valid()
-            ? prefetched->get()
-            : read_rows(select_rows(token_ids, use_cache));
+        auto pending = prefetched && prefetched->valid()
+            ? std::move(*prefetched) : prefetch(token_ids, use_cache);
+        auto lookup = pending.get();
         if (lookup.batch != token_ids.shape(0) || lookup.tokens != token_ids.shape(1)) {
             throw std::runtime_error("Qwen4 PLE prefetched shape disagrees");
         }
@@ -1392,6 +1558,11 @@ public:
             batch_ = lookup.batch;
             context_ = std::move(lookup.context);
         }
+        return decode_lookup(std::move(lookup));
+    }
+
+private:
+    array decode_lookup(Lookup lookup) const {
         const Shape shape{lookup.batch, lookup.tokens,
             lookup.heads * static_cast<int>(width_)};
         if (shards_.front().nint) {
@@ -1400,14 +1571,21 @@ public:
         return array(lookup.values.begin(), shape);
     }
 
-private:
-    Lookup select_rows(const array& token_ids, bool use_cache) {
+    Lookup select_rows(const array& token_ids, bool use_cache,
+        const std::vector<std::int64_t>* contexts = nullptr,
+        const std::vector<int>* request_offsets = nullptr) {
         if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
             token_ids.shape(1) <= 0) {
             throw std::runtime_error("Qwen4 PLE IDs must have [B,T] shape");
         }
-        const int batch = token_ids.shape(0);
+        const int batch = request_offsets ? static_cast<int>(request_offsets->size()) - 1 : token_ids.shape(0);
         const int tokens = token_ids.shape(1);
+        if (request_offsets && (batch <= 0 || token_ids.shape(0) != 1 ||
+            request_offsets->front() != 0 || request_offsets->back() != tokens || !contexts))
+            throw std::runtime_error("Qwen4 PLE request offsets disagree");
+        if (request_offsets) for (int row = 0; row < batch; ++row)
+            if ((*request_offsets)[row] >= (*request_offsets)[row + 1])
+                throw std::runtime_error("Qwen4 PLE request windows must be nonempty");
         const bool int32_ids = token_ids.dtype() == mlx::core::int32;
         auto host = int32_ids || token_ids.dtype() == mlx::core::int64
             ? mlx::core::contiguous(token_ids)
@@ -1419,41 +1597,46 @@ private:
         const auto* source64 = int32_ids
             ? nullptr : host.data<std::int64_t>();
         const int prefix = static_cast<int>(config_.ngram_size - 1);
-        const int length = prefix + tokens;
         const int heads = static_cast<int>(
             (config_.ngram_size - 1) * config_.heads_per_ngram);
-        if (use_cache && (batch_ != batch || context_.empty())) reset(batch);
-        std::vector<std::int64_t> history(
-            static_cast<std::size_t>(batch * length), config_.eos_token_id);
+        if (contexts && contexts->size() != static_cast<std::size_t>(batch * prefix))
+            throw std::runtime_error("Qwen4 PLE request context shape disagrees");
+        if (use_cache && !contexts && (batch_ != batch || context_.empty())) reset(batch);
+        const auto& cached = contexts ? *contexts : context_;
         Lookup lookup;
-        lookup.batch = batch;
+        lookup.batch = token_ids.shape(0);
         lookup.tokens = tokens;
         lookup.heads = heads;
-        lookup.rows.resize(static_cast<std::size_t>(batch * tokens * heads));
+        lookup.rows.resize(token_ids.size() * static_cast<std::size_t>(heads));
+        if (use_cache) lookup.context.resize(static_cast<std::size_t>(batch * prefix));
         auto& global = lookup.rows;
         for (int bi = 0; bi < batch; ++bi) {
+            const int start = request_offsets ? (*request_offsets)[bi] : bi * tokens;
+            const int count = request_offsets ? (*request_offsets)[bi + 1] - start : tokens;
+            const int length = prefix + count;
+            std::vector<std::int64_t> history(static_cast<std::size_t>(length), config_.eos_token_id);
             if (use_cache) {
                 std::copy_n(
-                    context_.data() + static_cast<std::size_t>(bi * prefix),
+                    cached.data() + static_cast<std::size_t>(bi * prefix),
                     prefix,
-                    history.data() + static_cast<std::size_t>(bi * length));
+                    history.data());
             }
-            for (int token = 0; token < tokens; ++token) {
+            for (int token = 0; token < count; ++token) {
                 const auto source_index =
-                    static_cast<std::size_t>(bi * tokens + token);
+                    static_cast<std::size_t>(start + token);
                 history[static_cast<std::size_t>(
-                    bi * length + prefix + token)] = int32_ids
+                    prefix + token)] = int32_ids
                     ? static_cast<std::int64_t>(source32[source_index])
                     : source64[source_index];
             }
             int segment = 0;
             for (int token = 0; token < length; ++token) {
                 std::uint64_t mixed =
-                    static_cast<std::uint64_t>(history[bi * length + token]) *
+                    static_cast<std::uint64_t>(history[token]) *
                     static_cast<std::uint64_t>(multipliers_[0]);
                 for (int shift = 1; shift < config_.ngram_size; ++shift) {
                     const auto previous = token - shift >= segment
-                        ? history[bi * length + token - shift]
+                        ? history[token - shift]
                         : config_.eos_token_id;
                     mixed ^= static_cast<std::uint64_t>(previous) *
                         static_cast<std::uint64_t>(multipliers_[shift]);
@@ -1464,21 +1647,18 @@ private:
                             const int h = (shift - 1) * config_.heads_per_ngram + head;
                             auto remainder = signed_hash % vocab_[h];
                             if (remainder < 0) remainder += vocab_[h];
-                            global[(bi * tokens + token - prefix) * heads + h] =
+                            global[(start + token - prefix) * heads + h] =
                                 remainder + offsets_[h];
                         }
                     }
                 }
-                if (history[bi * length + token] == config_.eos_token_id) {
+                if (history[token] == config_.eos_token_id) {
                     segment = token + 1;
                 }
             }
-        }
-        if (use_cache) {
-            lookup.context.resize(static_cast<std::size_t>(batch * prefix));
-            for (int bi = 0; bi < batch; ++bi) {
+            if (use_cache) {
                 std::copy_n(
-                    history.data() + static_cast<std::size_t>(bi * length + tokens),
+                    history.data() + static_cast<std::size_t>(count),
                     prefix,
                     lookup.context.data() + static_cast<std::size_t>(bi * prefix));
             }
@@ -1617,6 +1797,13 @@ private:
 
 class Qwen4Ple {
 public:
+    void exchange_cache(Qwen4RequestLayerCache& cache) {
+        rollback_.swap(cache.ple_rollback);
+        std::swap(batch_, cache.ple_batch);
+        convolution_state_.swap(cache.ple_convolution);
+        std::swap(resources_, cache.ple_resources);
+        embedding_.exchange_context(cache);
+    }
     void snapshot(MlxQwen4LayerCacheSnapshot& state) const {
         if (!convolution_state_ || rollback_) throw std::runtime_error("PLE checkpoint is not committed");
         state.ple_convolution = detached_copy(*convolution_state_);
@@ -1676,6 +1863,45 @@ public:
         return embedding_.prefetch(token_ids, use_cache);
     }
 
+    Qwen4NgramEmbedding::Prefetched prefetch_requests(const array& ids, const std::vector<int>& offsets,
+        const std::vector<Qwen4RequestLayerCache*>& caches) {
+        return embedding_.prefetch_requests(ids, offsets, caches);
+    }
+
+    array forward_requests(const array& hidden, const array& ids, const std::vector<int>& offsets,
+        const std::vector<Qwen4RequestLayerCache*>& caches, int confirmed,
+        Qwen4NgramEmbedding::Prefetched* prefetched) {
+        const int batch = static_cast<int>(caches.size());
+        for (int row = 0; row < batch; ++row) {
+            const int tokens = offsets[row + 1] - offsets[row];
+            const int retained = tokens > 1 ? confirmed : 0;
+            if (retained < 0 || retained >= tokens)
+                throw std::runtime_error("Qwen4 PLE speculative request boundary disagrees");
+            auto& cache = *caches[row];
+            if (cache.ple_rollback) throw std::runtime_error("Qwen4 PLE request is not committed");
+            if (retained) cache.ple_rollback.emplace(Qwen4PleSpeculativeState{
+                cache.ple_convolution, cache.ple_context,
+                mlx::core::slice(ids, {0, offsets[row]}, {1, offsets[row + 1]}), std::nullopt, retained, tokens});
+        }
+        auto embeddings = embedding_.forward_requests(ids, offsets, caches, prefetched);
+        auto [gated, normalized] = project(hidden, embeddings);
+        std::vector<array> output;
+        output.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            auto& cache = *caches[row];
+            auto inputs = mlx::core::slice(normalized, {0, offsets[row], 0}, {1, offsets[row + 1], normalized.shape(2)});
+            if (cache.ple_rollback) cache.ple_rollback->convolution_inputs = inputs;
+            auto convolution = cached_depthwise_conv_silu(inputs, convolution_weight_, cache.ple_convolution,
+                static_cast<int>(config_.ngram_size));
+            cache.ple_convolution = std::move(convolution.state);
+            cache.ple_batch = 1;
+            cache.ple_resources.set({cache.ple_convolution->nbytes(), 1});
+            output.push_back(mlx::core::slice(gated, {0, offsets[row], 0}, {1, offsets[row + 1], gated.shape(2)}) + convolution.output);
+        }
+        auto result = mlx::core::concatenate(output, 1);
+        return result.dtype() == hidden.dtype() ? result : mlx::core::astype(result, hidden.dtype());
+    }
+
     array forward(
         const array& hidden_streams,
         const array& token_ids,
@@ -1700,7 +1926,7 @@ public:
         }
         if (speculative_confirmed > 0) {
             if (batch_ != batch) reset(batch);
-            rollback_.emplace(Rollback{
+            rollback_.emplace(Qwen4PleSpeculativeState{
                 convolution_state_,
                 embedding_.context(),
                 token_ids,
@@ -1724,6 +1950,29 @@ public:
         }
         if (use_cache && batch_ != batch) reset(batch);
         auto embeddings = embedding_.forward(token_ids, use_cache, prefetched);
+        auto [gated, normalized] = project(hidden_streams, embeddings);
+        if (use_cache && rollback_ &&
+            rollback_->total_tokens == tokens &&
+            rollback_->confirmed_tokens > 0) {
+            rollback_->convolution_inputs = normalized;
+        }
+        auto convolution = cached_depthwise_conv_silu(
+            normalized,
+            convolution_weight_,
+            use_cache ? convolution_state_ : std::nullopt,
+            static_cast<int>(config_.ngram_size));
+        if (use_cache) {
+            convolution_state_ = convolution.state;
+            resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
+        }
+        auto output = gated + convolution.output;
+        return output.dtype() == hidden_streams.dtype()
+            ? output : mlx::core::astype(output, hidden_streams.dtype());
+    }
+
+private:
+    std::pair<array, array> project(const array& hidden_streams, const array& embeddings) const {
+        const int batch = hidden_streams.shape(0), tokens = hidden_streams.shape(1);
         auto key_value = key_value_(embeddings);
         if (key_value.size() != 2) {
             throw std::logic_error(
@@ -1773,25 +2022,10 @@ public:
         auto normalized = qwen4_grouped_rms_norm(
             gated, norm_conv_, static_cast<int>(config_.hidden_size),
             static_cast<float>(config_.rms_norm_eps));
-        if (use_cache && rollback_ &&
-            rollback_->total_tokens == tokens &&
-            rollback_->confirmed_tokens > 0) {
-            rollback_->convolution_inputs = normalized;
-        }
-        auto convolution = cached_depthwise_conv_silu(
-            normalized,
-            convolution_weight_,
-            use_cache ? convolution_state_ : std::nullopt,
-            static_cast<int>(config_.ngram_size));
-        if (use_cache) {
-            convolution_state_ = convolution.state;
-            resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
-        }
-        auto output = gated + convolution.output;
-        return output.dtype() == hidden_streams.dtype()
-            ? output : mlx::core::astype(output, hidden_streams.dtype());
+        return {std::move(gated), std::move(normalized)};
     }
 
+public:
     void commit_speculative() noexcept {
         rollback_.reset();
     }
@@ -1849,7 +2083,12 @@ private:
             preparation->collect([&] {
                 for (const auto rows : preparation->row_buckets()) {
                     const auto input = mlx::core::zeros(
-                        Shape{1, rows, static_cast<int>(config_.hidden_size * config_.hc_count)}, mlx::core::float32);
+                        Shape{1, rows, static_cast<int>(config_.hidden_size * config_.hc_count)}, mlx::core::float16);
+                    const auto embeddings = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    const auto projected = project(input, embeddings);
+                    preparation->add(projected.first);
+                    preparation->add(projected.second);
                     const auto normalized = qwen4_grouped_rms_norm(input, norm_conv_,
                         static_cast<int>(config_.hidden_size), static_cast<float>(config_.rms_norm_eps));
                     preparation->add(qwen4_grouped_rms_norm(input, norm_query_,
@@ -1869,14 +2108,6 @@ private:
     }
 
     Qwen4Config config_;
-    struct Rollback {
-        std::optional<array> convolution_state;
-        std::vector<std::int64_t> ngram_context;
-        std::optional<array> token_ids;
-        std::optional<array> convolution_inputs;
-        int confirmed_tokens = 0;
-        int total_tokens = 0;
-    };
     Qwen4NgramEmbedding embedding_;
     MlxLinear key_;
     MlxLinear value_;
@@ -1887,7 +2118,7 @@ private:
     array convolution_weight_;
     std::optional<array> convolution_state_;
     MlxResourceTelemetry resources_;
-    std::optional<Rollback> rollback_;
+    std::optional<Qwen4PleSpeculativeState> rollback_;
     int batch_ = 0;
 };
 
@@ -1914,14 +2145,160 @@ public:
     virtual void rollback_speculative(int accepted_tokens) = 0;
     virtual MlxQwen4LayerCacheSnapshot snapshot(bool detached) const = 0;
     virtual void restore(const MlxQwen4LayerCacheSnapshot& state) = 0;
+    virtual void exchange_cache(Qwen4RequestLayerCache& state) = 0;
+    virtual std::vector<array> decode_input_projections(const array& hidden) = 0;
+    virtual array decode_projected_row(const array& hidden,
+        const std::vector<array>& projected, int position, int confirmed) = 0;
+    virtual array decode_output_projection(const array& hidden) = 0;
+    virtual array forward_requests(const array& hidden,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, int confirmed = 0) {
+        const int batch = hidden.shape(0);
+        const int tokens = hidden.shape(1);
+        auto grouped = mlx::core::reshape(hidden, {1, batch * tokens, hidden.shape(2)});
+        std::vector<int> offsets(batch + 1);
+        for (int row = 0; row <= batch; ++row) offsets[row] = row * tokens;
+        auto output = forward_packed_requests(grouped, caches, positions, offsets, confirmed);
+        return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
+    }
+    array forward_packed_requests(const array& grouped,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, const std::vector<int>& offsets, int confirmed = 0) {
+        const int batch = static_cast<int>(caches.size());
+        auto projected = decode_input_projections(grouped);
+        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        std::vector<array> outputs;
+        outputs.reserve(batch);
+        for (int index = 0; index < batch; ++index) {
+            std::vector<array> inputs;
+            inputs.reserve(projected.size());
+            for (const auto& value : projected)
+                inputs.push_back(mlx::core::slice(value, {0, offsets[index], 0},
+                    {1, offsets[index + 1], value.shape(2)}));
+            exchange_cache(*caches[index]);
+            try {
+                outputs.push_back(decode_projected_row(mlx::core::slice(grouped,
+                    {0, offsets[index], 0}, {1, offsets[index + 1], grouped.shape(2)}),
+                    inputs, positions[index], offsets[index + 1] - offsets[index] > 1 ? confirmed : 0));
+            } catch (...) {
+                exchange_cache(*caches[index]);
+                throw;
+            }
+            exchange_cache(*caches[index]);
+        }
+        detail::profile_eval("qwen4.batch.attention.core", outputs);
+        auto output = decode_output_projection(mlx::core::concatenate(outputs, 1));
+        detail::profile_eval("qwen4.batch.attention.output", output);
+        return output;
+    }
     virtual void trim_cache_to(int) {
         throw std::runtime_error(
             "Qwen4 attention cache does not support arbitrary trimming");
     }
 };
 
+struct Qwen4GdnRouteCheckpoint {
+    array convolution, recurrent;
+    int position, batch;
+};
+
 class Qwen4Gdn final : public Qwen4Attention {
 public:
+    bool can_defer_routes() const noexcept {
+        return batch_ == 1 && position_ > 0 && convolution_state_ && recurrent_state_ && !rollback_;
+    }
+    Qwen4GdnRouteCheckpoint route_checkpoint() const {
+        if (!can_defer_routes()) throw std::logic_error("GDN route checkpoint is unavailable");
+        return {*convolution_state_, *recurrent_state_, position_, batch_};
+    }
+    void restore_route_checkpoint(const Qwen4GdnRouteCheckpoint& state) {
+        convolution_state_ = state.convolution;
+        recurrent_state_ = state.recurrent;
+        position_ = state.position;
+        batch_ = state.batch;
+        rollback_.reset();
+    }
+    array forward_requests(const array& hidden,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, int confirmed = 0) override {
+        const int tokens = hidden.shape(1);
+        if (tokens < 1 || tokens > 2 || !gdn_decode_step_enabled() || config_.linear_key_head_dim != 128 ||
+            config_.linear_value_head_dim != 128 || config_.linear_conv_kernel_dim != 4)
+            return Qwen4Attention::forward_requests(hidden, caches, positions, confirmed);
+        if (confirmed < 0 || confirmed >= tokens)
+            throw std::logic_error("invalid batched GDN speculative boundary");
+        const int batch = hidden.shape(0);
+        auto grouped = mlx::core::reshape(hidden, {1, batch * tokens, hidden.shape(2)});
+        auto projected = project_inputs(grouped);
+        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        std::vector<MlxGatedDeltaDecodeInput> inputs;
+        inputs.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            const auto& cache = *caches[row];
+            if (cache.batch != 1 || !cache.convolution || !cache.recurrent || cache.gdn_rollback)
+                throw std::logic_error("cannot batch uninitialized GDN state");
+            std::vector<array> values;
+            for (const auto& value : projected)
+                values.push_back(mlx::core::slice(value, {0, row * tokens, 0},
+                    {1, (row + 1) * tokens, value.shape(2)}));
+            inputs.push_back({std::move(values[0]), std::move(values[1]), std::move(values[2]),
+                std::move(values[3]), std::move(values[4]), *cache.convolution, *cache.recurrent});
+        }
+        auto decoded = gated_delta_decode_steps(inputs, convolution_weight_, dt_bias_, decay_scale_,
+            output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
+            static_cast<int>(config_.linear_num_value_heads), 128,
+            1e-6f, output_norm_.eps(), config_.output_gate_silu);
+        std::vector<array> outputs;
+        outputs.reserve(batch);
+        for (int row = 0; row < batch; ++row) {
+            auto& cache = *caches[row];
+            if (confirmed) cache.gdn_rollback.emplace(MlxGatedDeltaSpeculativeState{
+                *cache.convolution, *cache.recurrent, inputs[row].qk, inputs[row].value,
+                decoded[row].gate, decoded[row].beta, cache.position, cache.batch, confirmed, tokens});
+            cache.convolution = std::move(decoded[row].convolution_state);
+            cache.recurrent = std::move(decoded[row].recurrent_state);
+            cache.position += tokens;
+            outputs.push_back(std::move(decoded[row].output));
+        }
+        detail::profile_eval("qwen4.batch.attention.core", outputs);
+        auto output = output_(mlx::core::astype(mlx::core::concatenate(outputs, 1), hidden.dtype()));
+        detail::profile_eval("qwen4.batch.attention.output", output);
+        return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
+    }
+    std::vector<array> decode_input_projections(const array& hidden) override {
+        return project_inputs(hidden);
+    }
+    array decode_projected_row(const array& hidden,
+        const std::vector<array>& projected, int, int confirmed) override {
+        if (rollback_) throw std::logic_error("cannot batch speculative GDN state");
+        if (batch_ != 1 || !convolution_state_) reset(1);
+        const int tokens = hidden.shape(1);
+        if (confirmed) rollback_.emplace(MlxGatedDeltaSpeculativeState{
+            *convolution_state_, *recurrent_state_, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, position_, batch_, confirmed, tokens});
+        std::vector<array> inputs{hidden, *convolution_state_, *recurrent_state_};
+        inputs.insert(inputs.end(), projected.begin(), projected.end());
+        auto decoded = compiled_projected_step_(inputs);
+        if (rollback_) {
+            rollback_->qk = decoded[3];
+            rollback_->value = decoded[4];
+            rollback_->gate = decoded[5];
+            rollback_->beta = decoded[6];
+        }
+        convolution_state_ = std::move(decoded[1]);
+        recurrent_state_ = std::move(decoded[2]);
+        position_ += tokens;
+        return std::move(decoded[0]);
+    }
+    array decode_output_projection(const array& hidden) override { return output_(hidden); }
+    void exchange_cache(Qwen4RequestLayerCache& state) override {
+        rollback_.swap(state.gdn_rollback);
+        std::swap(position_, state.position);
+        std::swap(batch_, state.batch);
+        convolution_state_.swap(state.convolution);
+        recurrent_state_.swap(state.recurrent);
+        std::swap(resources_, state.attention_resources);
+    }
     MlxQwen4LayerCacheSnapshot snapshot(bool) const override {
         if (!convolution_state_ || !recurrent_state_ || rollback_ || position_ <= 0)
             throw std::runtime_error("GDN checkpoint is not committed");
@@ -2191,6 +2568,16 @@ private:
             [this](const std::vector<array>& inputs) {
                 return batch_step(inputs);
             });
+        compiled_projected_step_ = mlx::core::compile(
+            [this](const std::vector<array>& inputs) {
+                const std::vector<array> states(inputs.begin(), inputs.begin() + 3);
+                const std::vector<array> projected(inputs.begin() + 3, inputs.end());
+                const bool fused = states[0].shape(1) == 1 && gdn_decode_step_enabled() &&
+                    config_.linear_key_head_dim == 128 && config_.linear_value_head_dim == 128 &&
+                    config_.linear_conv_kernel_dim == 4;
+                return fused ? decode_step(states, &projected, false)
+                    : batch_step(states, &projected, false);
+            });
         compiled_replay_ = compile_gated_delta_speculative_replay(
             convolution_weight_,
             static_cast<int>(config_.linear_num_key_heads),
@@ -2217,6 +2604,25 @@ private:
                     const auto outputs = fused ? compiled_decode_(inputs)
                         : rows <= 6 ? compiled_batch_step_(inputs) : batch_step(inputs);
                     for (const auto& output : outputs) preparation->add(output);
+                    if (rows == 1) {
+                        auto projected_inputs = inputs;
+                        const auto projected = project_inputs(hidden);
+                        projected_inputs.insert(projected_inputs.end(), projected.begin(), projected.end());
+                        for (const auto& output : compiled_projected_step_(projected_inputs)) preparation->add(output);
+                    }
+                }
+                if (gdn_decode_step_enabled() && config_.linear_key_head_dim == 128 &&
+                    config_.linear_value_head_dim == 128 && config_.linear_conv_kernel_dim == 4) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, 2, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    const auto projected = project_inputs(hidden);
+                    const auto decoded = gated_delta_decode_steps({{projected[0], projected[1], projected[2],
+                        projected[3], projected[4], conv, state}}, convolution_weight_, dt_bias_, decay_scale_,
+                        output_norm_.weight(), static_cast<int>(config_.linear_num_key_heads),
+                        static_cast<int>(config_.linear_num_value_heads), 128, 1e-6f,
+                        output_norm_.eps(), config_.output_gate_silu).front();
+                    for (const auto& output : {decoded.output, decoded.convolution_state,
+                            decoded.recurrent_state, *decoded.gate, *decoded.beta}) preparation->add(output);
                 }
             });
         }
@@ -2233,8 +2639,9 @@ private:
             std::move(projected[2]), std::move(projected[3])};
     }
 
-    std::vector<array> decode_step(const std::vector<array>& inputs) {
-        auto projections = project_inputs(inputs[0]);
+    std::vector<array> decode_step(const std::vector<array>& inputs,
+        const std::vector<array>* projected = nullptr, bool project_output = true) {
+        auto projections = projected ? *projected : project_inputs(inputs[0]);
         detail::profile_eval("qwen4.gdn.qkv", {projections[0], projections[1]});
         detail::profile_eval("qwen4.gdn.gate", projections[2]);
         const Shape gates{1, 1, static_cast<int>(config_.linear_num_value_heads)};
@@ -2250,17 +2657,19 @@ private:
             1e-6f, output_norm_.eps(), config_.output_gate_silu);
         detail::profile_eval("qwen4.gdn.decode_step",
             {decoded.output, decoded.convolution_state, decoded.recurrent_state});
-        auto output = output_(mlx::core::astype(decoded.output, inputs[0].dtype()));
+        auto normalized = mlx::core::astype(decoded.output, inputs[0].dtype());
+        auto output = project_output ? output_(normalized) : std::move(normalized);
         detail::profile_eval("qwen4.gdn.output", output);
         return {std::move(output), std::move(decoded.convolution_state),
             std::move(decoded.recurrent_state)};
     }
 
-    std::vector<array> batch_step(const std::vector<array>& inputs) {
+    std::vector<array> batch_step(const std::vector<array>& inputs,
+        const std::vector<array>* projected = nullptr, bool project_output = true) {
         const auto& hidden = inputs[0];
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
-        auto input_projections = project_inputs(hidden);
+        auto input_projections = projected ? *projected : project_inputs(hidden);
         auto qk = std::move(input_projections[0]);
         auto value = std::move(input_projections[1]);
         detail::profile_eval("qwen4.gdn.qkv", {qk, value});
@@ -2338,7 +2747,7 @@ private:
             return mlx::core::astype(value, hidden.dtype());
         }();
         detail::profile_eval("qwen4.gdn.output_gate", normalized);
-        auto output = output_(normalized);
+        auto output = project_output ? output_(normalized) : std::move(normalized);
         detail::profile_eval("qwen4.gdn.output", output);
         return {std::move(output), std::move(convolved.state), std::move(recurrent.state),
             std::move(qk), std::move(value), std::move(recurrent_gate), std::move(recurrent_beta)};
@@ -2366,6 +2775,7 @@ private:
     MlxLinear output_;
     std::function<std::vector<array>(const std::vector<array>&)> compiled_decode_;
     std::function<std::vector<array>(const std::vector<array>&)> compiled_batch_step_;
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_projected_step_;
     MlxGatedDeltaReplay compiled_replay_;
     std::optional<array> convolution_state_;
     std::optional<array> recurrent_state_;
@@ -2377,6 +2787,50 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    void prepare_history_projections() const {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const int rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    for (const auto& output : cache_projections_(hidden)) preparation->add(output);
+                }
+            });
+        }
+    }
+    bool can_defer_routes() const noexcept {
+        return batch_ == 1 && cache_ && cache_->position() > 0 &&
+            index_position_ == cache_->position() && !speculative_trim_;
+    }
+    int route_checkpoint() const {
+        if (!can_defer_routes()) throw std::logic_error("QSA route checkpoint is unavailable");
+        return cache_->position();
+    }
+    std::vector<array> decode_input_projections(const array& hidden) override {
+        return input_projections_(hidden);
+    }
+    array decode_projected_row(const array& hidden,
+        const std::vector<array>& projected, int position, int confirmed) override {
+        if (speculative_trim_) throw std::logic_error("cannot batch speculative QSA state");
+        auto current = mlx::core::arange(position, position + hidden.shape(1), 1, mlx::core::int32);
+        auto full = mlx::core::arange(0, position + hidden.shape(1), 1, mlx::core::int32);
+        return forward_projected(hidden, current, full, true, confirmed, projected, false);
+    }
+    array decode_output_projection(const array& hidden) override { return output_(hidden); }
+    void exchange_cache(Qwen4RequestLayerCache& state) override {
+        std::swap(speculative_trim_, state.qsa_speculative_trim);
+        if (!state.pooled) state.pooled.emplace(maximum_,
+            static_cast<int>(config_.indexer_head_dim), mlx::core::float32);
+        std::swap(batch_, state.batch);
+        cache_.swap(state.kv);
+        offloaded_kv_.swap(state.offloaded_kv);
+        offloaded_pool_.swap(state.offloaded_pool);
+        index_tail_.swap(state.index_tail);
+        std::swap(index_tail_start_, state.index_start);
+        std::swap(index_position_, state.index_position);
+        std::swap(pooled_index_cache_, *state.pooled);
+        std::swap(index_resources_, state.attention_resources);
+    }
     const std::vector<array>& training_context() const { return training_context_; }
     void prepare_training(MlxMtpLora& lora) const {
         lora.prepare_linear(*query_.dense_weight_ref());
@@ -2617,6 +3071,17 @@ public:
         const array& positions_full,
         bool use_cache,
         int speculative_confirmed = 0) override {
+        return forward_projected(hidden, positions_current, positions_full, use_cache,
+            speculative_confirmed, input_projections_(hidden));
+    }
+    array forward_projected(
+        const array& hidden,
+        const array& positions_current,
+        const array& positions_full,
+        bool use_cache,
+        int speculative_confirmed,
+        std::vector<array> input_projections,
+        bool project_output = true) {
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
         if (speculative_confirmed < 0 ||
@@ -2626,7 +3091,6 @@ public:
             throw std::runtime_error(
                 "Qwen4 QSA speculative boundary disagrees");
         }
-        auto input_projections = input_projections_(hidden);
         if (input_projections.size() != (gate_ ? 5 : 4)) {
             throw std::logic_error(
                 "Qwen4 QSA projection group output mismatch");
@@ -2873,7 +3337,8 @@ public:
         if (tokens >= 32 && attended.ndim() == 4 &&
             attended.shape() == output_gate.shape() &&
             attended.dtype() == hidden.dtype() && output_gate.dtype() == hidden.dtype()) {
-            return output_(qwen4_qsa_prefill_output_gate(attended, output_gate));
+            auto gated = qwen4_qsa_prefill_output_gate(attended, output_gate);
+            return project_output ? output_(gated) : std::move(gated);
         }
         attended = mlx::core::reshape(
             attended,
@@ -2888,6 +3353,7 @@ public:
             mlx::core::sigmoid(
                 mlx::core::astype(output_gate, mlx::core::float32));
         auto output_input = mlx::core::astype(gated, hidden.dtype());
+        if (!project_output) return output_input;
         auto output = output_(output_input);
         if (auto* lora = MlxMtpLora::current()) output = lora->apply("attention.o", output_input, output);
         return output;
@@ -3222,6 +3688,74 @@ private:
 
 class Qwen4Layer {
 public:
+    using RouteCheckpoint = std::variant<Qwen4GdnRouteCheckpoint, int>;
+
+    std::optional<Qwen4CachedRoute> cached_route() const {
+        if (ple_) return std::nullopt;
+        const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get());
+        const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
+        return (gdn && gdn->can_defer_routes()) || (qsa && qsa->can_defer_routes())
+            ? moe_.cached_route() : std::nullopt;
+    }
+    RouteCheckpoint route_checkpoint() const {
+        if (const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get()))
+            return gdn->route_checkpoint();
+        return dynamic_cast<const Qwen4Qsa&>(*attention_).route_checkpoint();
+    }
+    void restore_route_checkpoint(const RouteCheckpoint& state) {
+        if (const auto* gdn = std::get_if<Qwen4GdnRouteCheckpoint>(&state))
+            dynamic_cast<Qwen4Gdn&>(*attention_).restore_route_checkpoint(*gdn);
+        else dynamic_cast<Qwen4Qsa&>(*attention_).trim_cache_to(std::get<int>(state));
+    }
+    void exchange_cache(Qwen4RequestLayerCache& cache) {
+        attention_->exchange_cache(cache);
+        if (ple_) ple_->exchange_cache(cache);
+    }
+
+    array decode_requests(array streams, const array& ids,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions,
+        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr,
+        int confirmed = 0) {
+        const int batch = streams.shape(0);
+        const int tokens = streams.shape(1);
+        std::vector<int> offsets(batch + 1);
+        for (int row = 0; row <= batch; ++row) offsets[row] = row * tokens;
+        auto result = forward_packed_requests(
+            mlx::core::reshape(streams, {1, batch * tokens, streams.shape(2)}),
+            mlx::core::reshape(ids, {1, batch * tokens}), caches, positions, offsets,
+            true, confirmed, nullptr, prefetched_ple);
+        return mlx::core::reshape(result, {batch, tokens, result.shape(2)});
+    }
+    array forward_packed_requests(array streams, const array& ids,
+        const std::vector<Qwen4RequestLayerCache*>& caches,
+        const std::vector<int>& positions, const std::vector<int>& offsets,
+        bool decode, int confirmed = 0, MlxSsdPrefetchedExpertLayer* prefetched_routed = nullptr,
+        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr) {
+        const int batch = static_cast<int>(caches.size());
+        bool uniform = true;
+        for (int row = 0; row < batch; ++row)
+            uniform = uniform && offsets[row + 1] - offsets[row] == offsets[1];
+        if (ple_) {
+            streams = streams + ple_->forward_requests(streams, ids, offsets, caches, confirmed, prefetched_ple);
+            detail::profile_eval("qwen4.ple", streams);
+        }
+        auto av = attention_gr_.pre(streams);
+        detail::profile_eval("qwen4.attention_mhc_pre", av.branch);
+        auto attention = [&] {
+            if (!decode || !uniform)
+                return attention_->forward_packed_requests(av.branch, caches, positions, offsets, confirmed);
+            const int tokens = offsets[1];
+            auto branches = mlx::core::reshape(av.branch, {batch, tokens, av.branch.shape(2)});
+            auto result = attention_->forward_requests(branches, caches, positions, confirmed);
+            return mlx::core::reshape(result, {1, batch * tokens, result.shape(2)});
+        }();
+        auto fv = ffn_gr_.pre_after(attention, av);
+        detail::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
+        auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode), fv);
+        detail::profile_eval("qwen4.ffn_mhc_post", result);
+        return result;
+    }
     void prepare_training(MlxMtpLora& lora) const {
         const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
         if (!qsa || ple_) throw std::invalid_argument("MTP LoRA requires a QSA predictor without PLE");
@@ -3300,13 +3834,14 @@ public:
         std::size_t expert_cache_layer_base = 0) {
         const auto prefix =
             "predictor.block." + std::to_string(index);
+        auto attention = Qwen4Qsa::load(model, config, prefix + ".attention", maximum);
+        attention->prepare_history_projections();
         return Qwen4Layer(
             GatedResidual::load(
                 model, config, prefix + ".attention.mhc.pre"),
             GatedResidual::load(
                 model, config, prefix + ".mlp.mhc.pre"),
-            Qwen4Qsa::load(
-                model, config, prefix + ".attention", maximum),
+            std::move(attention),
             Qwen4Moe::load(
                 model,
                 config,
@@ -3355,6 +3890,12 @@ public:
             : Qwen4NgramEmbedding::Prefetched{};
     }
 
+    Qwen4NgramEmbedding::Prefetched prefetch_ple_requests(const array& ids, const std::vector<int>& offsets,
+        const std::vector<Qwen4RequestLayerCache*>& caches) {
+        return ple_ ? ple_->prefetch_requests(ids, offsets, caches) : Qwen4NgramEmbedding::Prefetched{};
+    }
+
+
     array append_history(
         array hidden_streams,
         const array& token_ids,
@@ -3374,7 +3915,8 @@ public:
         bool use_cache,
         int speculative_confirmed = 0,
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
-        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr) {
+        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr,
+        Qwen4CachedRoute* deferred_route = nullptr) {
         auto* lora = MlxMtpLora::current();
         std::optional<array> training_root;
         if (lora && lora->collecting()) training_root = hidden_streams;
@@ -3404,7 +3946,7 @@ public:
             "qwen4.attention_mhc_post",
             ffn_values.residual);
         detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
-        branch = moe_(ffn_values.branch, prefetched);
+        branch = moe_(ffn_values.branch, prefetched, false, deferred_route);
         detail::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
         if (lora) {
@@ -3454,6 +3996,25 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    void prepare_inputs(const MlxEmbedding& embedding) {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hc_count * config_.hidden_size)}, mlx::core::float16);
+                    const auto ids = mlx::core::zeros(Shape{1, rows}, mlx::core::int32);
+                    preparation->add(fuse_inputs(hidden, ids, embedding, false).streams);
+                }
+            });
+        }
+    }
+    std::size_t layer_count() const noexcept { return layers_.size(); }
+    void exchange_cache(std::vector<Qwen4RequestLayerCache>& layers, int& position, int& batch) {
+        if (layers.size() != layers_.size()) throw std::invalid_argument("predictor request topology mismatch");
+        for (std::size_t index = 0; index < layers.size(); ++index) layers_[index].exchange_cache(layers[index]);
+        std::swap(position_, position);
+        std::swap(batch_, batch);
+    }
     void prepare_training(MlxMtpLora& lora) const {
         if (layers_.size() != 1) throw std::invalid_argument("MTP LoRA currently requires one recurrent predictor layer");
         layers_.front().prepare_training(lora);
@@ -3608,10 +4169,8 @@ public:
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
         const int start = use_cache ? position_ : 0;
-        auto current_positions = mlx::core::arange(
-            start, start + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, start + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(start + tokens);
+        auto current_positions = prompt_positions.current(full_positions, start, tokens);
         auto streams = layers_.at(0).forward(
             std::move(input.streams), input.ids,
             current_positions, full_positions, use_cache);
@@ -3626,16 +4185,30 @@ public:
         return {std::move(sample_hidden), std::move(streams)};
     }
 
+    Qwen4MtpForward forward_requests(const array& previous_hidden, const array& token_ids,
+        const MlxEmbedding& embedding, const std::vector<std::vector<Qwen4RequestLayerCache>*>& caches,
+        const std::vector<int>& positions) {
+        auto input = fuse_inputs(previous_hidden, token_ids, embedding, false);
+        auto streams = std::move(input.streams);
+        std::vector<Qwen4RequestLayerCache*> layers;
+        layers.reserve(caches.size());
+        for (std::size_t index = 0; index < layers_.size(); ++index) {
+            layers.clear();
+            for (auto* cache : caches) layers.push_back(&cache->at(index));
+            streams = layers_[index].decode_requests(std::move(streams), input.ids, layers, positions);
+        }
+        auto sampled = final_mixer_.mix(mlx::core::reshape(streams, {1, streams.shape(0), streams.shape(2)}));
+        return {std::move(sampled), std::move(streams)};
+    }
+
     array append_history(
         const array& previous_hidden,
         const array& token_ids,
         const MlxEmbedding& embedding) {
         auto input = fuse_inputs(previous_hidden, token_ids, embedding, true);
         const int tokens = token_ids.shape(1);
-        auto current_positions = mlx::core::arange(
-            position_, position_ + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, position_ + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(position_ + tokens);
+        auto current_positions = prompt_positions.current(full_positions, position_, tokens);
         auto anchor = layers_.at(0).append_history(
             std::move(input.streams), input.ids, current_positions, full_positions);
         position_ += tokens;
@@ -3645,6 +4218,8 @@ public:
     int cache_position() const noexcept {
         return position_;
     }
+
+    Qwen4PromptPositions prompt_positions;
 
     std::size_t cache_bytes() const noexcept {
         std::size_t bytes = 0;
@@ -3754,6 +4329,39 @@ private:
 };
 
 } // namespace
+
+struct MlxQwen4RequestCache {
+    const void* owner = nullptr;
+    int position = 0, batch = 0;
+    bool speculative_pending = false;
+    int draft_count = 0;
+    std::vector<Qwen4RequestLayerCache> layers;
+    std::vector<Qwen4RequestLayerCache> predictor_layers;
+    int predictor_position = 0, predictor_batch = 0, predictor_history_position = 0, folded_history = 0;
+    std::optional<array> last_hidden;
+    std::optional<array> verified_hidden;
+    std::optional<array> draft_hidden, draft_ids, draft_result;
+    std::vector<std::int32_t> verified_ids;
+    MlxMtpHistoryBuffer pending_history;
+    mfq::engine::mtp::PolicyState policy;
+    std::size_t bytes() const noexcept {
+        std::size_t result = 0;
+        const auto add_layers = [&](const auto& list) { for (const auto& layer : list) {
+            if (layer.kv) result += layer.kv->key_storage().nbytes() + layer.kv->value_storage().nbytes();
+            if (layer.offloaded_kv) result += layer.offloaded_kv->resident_bytes();
+            if (layer.pooled) result += layer.pooled->storage_bytes();
+            for (const auto* value : {&layer.convolution, &layer.recurrent, &layer.index_tail, &layer.ple_convolution})
+                if (*value) result += (*value)->nbytes();
+        }};
+        add_layers(layers);
+        add_layers(predictor_layers);
+        result += pending_history.bytes();
+        if (last_hidden) result += last_hidden->nbytes();
+        if (verified_hidden) result += verified_hidden->nbytes();
+        for (const auto* value : {&draft_hidden, &draft_ids, &draft_result}) if (*value) result += (*value)->nbytes();
+        return result;
+    }
+};
 
 std::pair<std::int32_t, array> qwen4_mtp_logits_from_state(
     const MfqContainer& model, const MfqContainer& predictor_source,
@@ -3930,6 +4538,36 @@ Qwen4Config Qwen4Config::from_json(std::string_view payload) {
     config.eos_token_id = eos.is_array()
         ? eos.at(0).get<std::int64_t>()
         : eos.is_null() ? 0 : eos.get<std::int64_t>();
+    if (outer.contains("vision_config") && !outer.at("vision_config").is_null()) {
+        const auto& vision = outer.at("vision_config");
+        if (vision.value("hidden_act", std::string("gelu_pytorch_tanh")) != "gelu_pytorch_tanh")
+            throw std::runtime_error("Qwen grid-ViT requires gelu_pytorch_tanh hidden_act");
+        GridVisionConfig v;
+        v.hidden_size = positive(vision, "hidden_size");
+        v.intermediate_size = positive(vision, "intermediate_size");
+        v.depth = positive(vision, "depth");
+        v.num_heads = positive(vision, "num_heads");
+        v.in_channels = vision.value("in_channels", 3);
+        v.patch_size = positive(vision, "patch_size");
+        v.temporal_patch_size = positive(vision, "temporal_patch_size");
+        v.spatial_merge_size = positive(vision, "spatial_merge_size");
+        v.out_hidden_size = positive(vision, "out_hidden_size");
+        v.num_position_embeddings = positive(vision, "num_position_embeddings");
+        v.rope_theta = vision.value("rope_parameters", json::object()).value(
+            "rope_theta", vision.value("rope_theta", 10000.0));
+        v.layer_norm_eps = vision.value("layer_norm_eps", 1e-6);
+        v.validate();
+        if (v.out_hidden_size != config.hidden_size)
+            throw std::runtime_error("Qwen4 vision merger width disagrees with text hidden size");
+        config.vision = v;
+        for (const auto* name : {"image_token_id", "video_token_id"}) {
+            if (!outer.contains(name) || outer.at(name).is_null()) continue;
+            const auto token = outer.at(name).get<std::int64_t>();
+            if (token < 0 || token >= config.vocab_size)
+                throw std::runtime_error("Qwen4 media token is out of range");
+            (std::string_view(name) == "image_token_id" ? config.image_token_id : config.video_token_id) = token;
+        }
+    }
     return config;
 }
 
@@ -3941,6 +4579,25 @@ Qwen4Config Qwen4Config::from_mfq(const MfqContainer& model) {
 }
 
 struct MlxQwen4CausalLm::Impl {
+    void exchange_request(MlxQwen4RequestCache& cache) {
+        if (cache.owner != this || cache.layers.size() != layers.size())
+            throw std::invalid_argument("Qwen4 request cache belongs to a different runtime");
+        for (std::size_t index = 0; index < layers.size(); ++index)
+            layers[index].exchange_cache(cache.layers[index]);
+        if (mtp) mtp->exchange_cache(cache.predictor_layers, cache.predictor_position, cache.predictor_batch);
+        last_cache_hidden.swap(cache.last_hidden);
+        std::swap(cache_position, cache.position);
+        std::swap(cache_batch, cache.batch);
+        std::swap(speculative_pending, cache.speculative_pending);
+    }
+    struct RequestScope {
+        Impl& runtime;
+        MlxQwen4RequestCache& cache;
+        RequestScope(Impl& runtime, MlxQwen4RequestCache& cache) : runtime(runtime), cache(cache) {
+            runtime.exchange_request(cache);
+        }
+        ~RequestScope() { runtime.exchange_request(cache); }
+    };
     static std::unique_ptr<Impl> load(
         const MfqContainer& model,
         int requested_context,
@@ -4083,6 +4740,16 @@ struct MlxQwen4CausalLm::Impl {
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache)));
         result->source = std::make_unique<MfqContainer>(model);
+        if (const auto* vision = graph.component("vision")) {
+            if (vision->implementation != "grid_vit" || !result->config.vision ||
+                !result->config.image_token_id || !result->config.video_token_id ||
+                result->config.image_token_id == result->config.video_token_id ||
+                result->config.rope_sections.empty())
+                throw std::runtime_error("model graph Vision component is incompatible with Qwen4");
+            result->vision.emplace(MlxGridVisionPromptComponent::load(
+                model, *result->config.vision, *result->config.image_token_id,
+                *result->config.video_token_id, vision->input_contract, vision->position_policy));
+        }
         result->mtp_base_key = std::move(mtp_identity);
         result->mtp_full_precision = full_precision_mtp;
         // Count backing payloads once at load time, not on every UI refresh.
@@ -4107,6 +4774,17 @@ struct MlxQwen4CausalLm::Impl {
                 }
             }
         }
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    const auto streams = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(result->config.hc_count * result->config.hidden_size)}, mlx::core::float16);
+                    const auto hidden = result->mixer.mix(streams);
+                    preparation->add(result->output ? (*result->output)(hidden) : result->embedding.project(hidden));
+                }
+            });
+            if (result->mtp) result->mtp->prepare_inputs(result->embedding);
+        }
         return result;
     }
 
@@ -4114,7 +4792,8 @@ struct MlxQwen4CausalLm::Impl {
         const array& token_ids,
         bool use_cache,
         bool last_token_only = false,
-        int speculative_confirmed = 0) {
+        int speculative_confirmed = 0,
+        const std::optional<array>& embeddings = std::nullopt) {
         if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
             token_ids.shape(1) <= 0) {
             throw std::runtime_error("Qwen4 token IDs must have [B,T] shape");
@@ -4138,14 +4817,15 @@ struct MlxQwen4CausalLm::Impl {
         auto ids = token_ids.dtype() == mlx::core::int32
             ? token_ids : mlx::core::astype(token_ids, mlx::core::int32);
         std::vector<Qwen4NgramEmbedding::Prefetched> ple_pipeline;
-        if (tokens <= 6 && !config.ple_layer_ids.empty()) {
+        if (!config.ple_layer_ids.empty()) {
             ple_pipeline.resize(layers.size());
             for (const auto layer : config.ple_layer_ids) {
                 const auto index = static_cast<std::size_t>(layer - 1);
                 ple_pipeline[index] = layers[index].prefetch_ple(ids, use_cache);
             }
         }
-        auto hidden = embedding(ids, mlx::core::float16);
+        auto hidden = embeddings ? mlx::core::astype(*embeddings, mlx::core::float16)
+                                 : embedding(ids, mlx::core::float16);
         auto streams = mlx::core::reshape(
             mlx::core::broadcast_to(
                 mlx::core::expand_dims(hidden, -2),
@@ -4160,10 +4840,8 @@ struct MlxQwen4CausalLm::Impl {
                 tokens,
                 static_cast<int>(config.hc_count * config.hidden_size),
             });
-        auto current_positions = mlx::core::arange(
-            start, start + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, start + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(start + tokens);
+        auto current_positions = prompt_positions.current(full_positions, start, tokens);
         const bool bounded_prefill = tokens > 1;
         const bool dispatch_decode = batch == 1 && tokens <= 6 && decode_async_enabled() &&
             !detail::component_profile_active();
@@ -4180,6 +4858,46 @@ struct MlxQwen4CausalLm::Impl {
             }
         }
         for (std::size_t index = 0; index < layers.size(); ++index) {
+            if (use_cache && batch == 1 && tokens == 1 && !speculative_confirmed &&
+                !MlxMtpLora::current() && !detail::component_profile_active()) {
+                std::vector<Qwen4CachedRoute> routes;
+                std::vector<Qwen4Layer::RouteCheckpoint> states;
+                for (auto next = index; next < layers.size() && next < index + 4; ++next) {
+                    auto route = layers[next].cached_route();
+                    if (!route) break;
+                    routes.push_back(std::move(*route));
+                    states.push_back(layers[next].route_checkpoint());
+                }
+                if (routes.size() > 1) {
+                    auto trial = streams;
+                    const auto restore = [&] {
+                        for (std::size_t offset = 0; offset < states.size(); ++offset)
+                            layers[index + offset].restore_route_checkpoint(states[offset]);
+                    };
+                    try {
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset)
+                            trial = layers[index + offset].forward(std::move(trial), ids,
+                                current_positions, full_positions, true, 0, nullptr, nullptr, &routes[offset]);
+                        mlx::core::async_eval({*routes.back().ids});
+                        mlx::core::async_eval({trial});
+                        std::vector<bool> hits;
+                        for (auto& route : routes) hits.push_back(route.all_resident());
+                        const bool all_hit = std::all_of(hits.begin(), hits.end(), [](bool hit) { return hit; });
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset)
+                            if (all_hit || !hits[offset]) routes[offset].resolve();
+                        if (all_hit) {
+                            streams = std::move(trial);
+                            index += routes.size() - 1;
+                            continue;
+                        }
+                        trial.eval();
+                    } catch (...) {
+                        restore();
+                        throw;
+                    }
+                    restore();
+                }
+            }
             auto* prefetched = routed_pipeline[index % 2].has_value()
                 ? &*routed_pipeline[index % 2]
                 : nullptr;
@@ -4260,12 +4978,12 @@ struct MlxQwen4CausalLm::Impl {
         speculative_pending = false;
     }
 
-    void reset(int batch) {
+    void reset(int batch, bool reset_predictor = true) {
         if (batch <= 0) {
             throw std::runtime_error("Qwen4 cache batch must be positive");
         }
         for (auto& layer : layers) layer.reset(batch);
-        if (mtp) mtp->reset(batch);
+        if (mtp && reset_predictor) mtp->reset(batch);
         cache_batch = batch;
         cache_position = 0;
         speculative_pending = false;
@@ -4315,6 +5033,8 @@ public:
     int maximum;
     MlxEmbedding embedding;
     std::optional<MlxLinear> output;
+    std::optional<MlxGridVisionPromptComponent> vision;
+    Qwen4PromptPositions prompt_positions;
     std::vector<Qwen4Layer> layers;
     GatedResidual mixer;
     std::optional<Qwen4Mtp> mtp;
@@ -4330,6 +5050,7 @@ public:
     bool stable_mtp_ready = false;
     std::size_t ple_payload_bytes = 0;
     std::size_t expert_payload_bytes = 0;
+    std::vector<std::weak_ptr<MlxQwen4RequestCache>> request_caches;
 };
 
 MlxQwen4CausalLm::MlxQwen4CausalLm(std::unique_ptr<Impl> impl)
@@ -4346,6 +5067,8 @@ MlxQwen4CausalLm MlxQwen4CausalLm::load(
     if (max_context <= 0) {
         throw std::invalid_argument("Qwen4 max_context must be positive");
     }
+    if (auto* preparation = MlxKernelPreparation::current(); preparation && !expert_cache_bytes)
+        preparation->use_model_paths();
     return MlxQwen4CausalLm(Impl::load(
         model, max_context, expert_cache_bytes));
 }
@@ -4354,6 +5077,452 @@ array MlxQwen4CausalLm::forward(
     const array& token_ids,
     bool use_cache) {
     return impl_->forward(token_ids, use_cache);
+}
+
+std::shared_ptr<MlxQwen4RequestCache> MlxQwen4CausalLm::make_request_cache() {
+    auto cache = std::make_shared<MlxQwen4RequestCache>();
+    cache->owner = impl_.get();
+    cache->layers.resize(impl_->layers.size());
+    if (impl_->mtp) cache->predictor_layers.resize(impl_->mtp->layer_count());
+    for (auto& layer : cache->layers)
+        layer.pooled.emplace(impl_->maximum, static_cast<int>(impl_->config.indexer_head_dim), mlx::core::float32);
+    std::erase_if(impl_->request_caches, [](const auto& entry) { return entry.expired(); });
+    impl_->request_caches.push_back(cache);
+    return cache;
+}
+
+void MlxQwen4CausalLm::adopt_request_cache(MlxQwen4RequestCache& cache) {
+    if (cache.position || cache.batch) throw std::invalid_argument("request cache must be empty before adoption");
+    impl_->exchange_request(cache);
+    cache.predictor_history_position = cache.predictor_position;
+    if (impl_->mtp) impl_->mtp->clear();
+    impl_->last_cache_hidden.reset();
+    impl_->stable_tokens.clear();
+    impl_->stable_mtp_ready = false;
+}
+
+array MlxQwen4CausalLm::prefill_request(MlxQwen4RequestCache& cache,
+    const std::vector<std::int64_t>& tokens, bool mtp) {
+    mlx_validate_token_set(tokens, static_cast<int>(impl_->config.vocab_size));
+    if (cache.speculative_pending || tokens.empty() ||
+        tokens.size() > static_cast<std::size_t>(impl_->maximum - cache.position))
+        throw std::invalid_argument("Qwen4 request exceeds its context capacity");
+    Impl::RequestScope scope(*impl_, cache);
+    if (impl_->cache_batch != 1) impl_->reset(1, false);
+    const int start = impl_->cache_position;
+    const array ids(tokens.begin(), Shape{1, static_cast<int>(tokens.size())}, mlx::core::int32);
+    if (!mtp) {
+        auto logits = impl_->forward(ids, true, true);
+        logits.eval();
+        return logits;
+    }
+    if (!impl_->mtp) throw std::invalid_argument("request model has no predictor");
+    auto result = impl_->forward_with_hidden(ids, true, true);
+    mlx_prime_mtp_chunk(result.second, ids, impl_->last_cache_hidden,
+        [&](const array& hidden, const array& shifted, int) {
+            return impl_->mtp->append_history(hidden, shifted, impl_->embedding);
+        }, start);
+    cache.predictor_history_position = impl_->mtp->cache_position();
+    result.first.eval();
+    return result.first;
+}
+
+std::vector<array> MlxQwen4CausalLm::prefill_requests(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::vector<std::int64_t>>& tokens,
+    const std::vector<bool>& mtp) {
+    if (caches.empty() || caches.size() != tokens.size() || caches.size() != mtp.size())
+        throw std::invalid_argument("Qwen4 prefill batch requires one token window per cache");
+    std::unordered_set<const MlxQwen4RequestCache*> unique;
+    std::vector<int> positions, offsets{0};
+    std::vector<std::int64_t> packed;
+    for (std::size_t row = 0; row < caches.size(); ++row) {
+        const auto& cache = caches[row];
+        if (!cache || cache->owner != impl_.get() || cache->batch < 0 || cache->batch > 1 ||
+            cache->position < 0 || cache->position > impl_->maximum || cache->speculative_pending || !unique.insert(cache.get()).second ||
+            tokens[row].empty() || tokens[row].size() > static_cast<std::size_t>(impl_->maximum - cache->position) ||
+            (mtp[row] && !impl_->mtp))
+            throw std::invalid_argument("invalid or duplicate Qwen4 prefill request cache");
+        mlx_validate_token_set(tokens[row], static_cast<int>(impl_->config.vocab_size));
+        positions.push_back(cache->position);
+        packed.insert(packed.end(), tokens[row].begin(), tokens[row].end());
+        if (packed.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Qwen4 prefill batch is too large");
+        offsets.push_back(static_cast<int>(packed.size()));
+    }
+    if (caches.size() == 1) return {prefill_request(*caches[0], tokens[0], mtp[0])};
+    const int count = static_cast<int>(packed.size());
+    const array ids(packed.begin(), Shape{1, count}, mlx::core::int32);
+    std::vector<Qwen4NgramEmbedding::Prefetched> ple_pipeline(impl_->layers.size());
+    for (const auto layer : impl_->config.ple_layer_ids) {
+        const auto index = static_cast<std::size_t>(layer - 1);
+        std::vector<Qwen4RequestLayerCache*> state;
+        for (const auto& cache : caches) state.push_back(&cache->layers[index]);
+        ple_pipeline[index] = impl_->layers[index].prefetch_ple_requests(ids, offsets, state);
+    }
+    auto hidden = impl_->embedding(ids, mlx::core::float16);
+    auto streams = mlx::core::reshape(mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
+        Shape{1, count, static_cast<int>(impl_->config.hc_count), static_cast<int>(impl_->config.hidden_size)}),
+        Shape{1, count, static_cast<int>(impl_->config.hc_count * impl_->config.hidden_size)});
+    std::array<std::optional<MlxSsdPrefetchedExpertLayer>, 2> routed;
+    if (!impl_->layers.empty()) {
+        routed[0] = impl_->layers[0].prefetch_routed(packed.size());
+        if (routed[0] && impl_->layers.size() > 1) routed[1] = impl_->layers[1].prefetch_routed(packed.size());
+    }
+    std::vector<Qwen4RequestLayerCache*> layer_caches;
+    layer_caches.reserve(caches.size());
+    for (std::size_t index = 0; index < impl_->layers.size(); ++index) {
+        layer_caches.clear();
+        for (const auto& cache : caches) layer_caches.push_back(&cache->layers[index]);
+        auto* prefetched = routed[index % 2] ? &*routed[index % 2] : nullptr;
+        streams = impl_->layers[index].forward_packed_requests(std::move(streams), ids,
+            layer_caches, positions, offsets, false, 0, prefetched, &ple_pipeline[index]);
+        if (prefetched) {
+            detail::eval_with_timing(streams);
+            routed[index % 2].reset();
+            if (index + 2 < impl_->layers.size())
+                routed[index % 2] = impl_->layers[index + 2].prefetch_routed(packed.size());
+        }
+    }
+    std::vector<array> last_hidden;
+    for (std::size_t row = 0; row < caches.size(); ++row)
+        last_hidden.push_back(mlx::core::slice(streams, {0, offsets[row + 1] - 1, 0},
+            {1, offsets[row + 1], streams.shape(2)}));
+    auto output_hidden = impl_->mixer.mix(mlx::core::concatenate(last_hidden, 1));
+    auto logits = impl_->output ? (*impl_->output)(output_hidden) : impl_->embedding.project(output_hidden);
+    for (std::size_t row = 0; row < caches.size(); ++row) {
+        auto& cache = *caches[row];
+        cache.position = positions[row] + static_cast<int>(tokens[row].size());
+        cache.batch = 1;
+        if (mtp[row]) {
+            Impl::RequestScope scope(*impl_, cache);
+            auto rows = mlx::core::slice(streams, {0, offsets[row], 0},
+                {1, offsets[row + 1], streams.shape(2)});
+            auto row_ids = mlx::core::slice(ids, {0, offsets[row]}, {1, offsets[row + 1]});
+            mlx_prime_mtp_chunk(rows, row_ids, impl_->last_cache_hidden,
+                [&](const array& value, const array& shifted, int) {
+                    return impl_->mtp->append_history(value, shifted, impl_->embedding);
+                }, positions[row]);
+            cache.predictor_history_position = impl_->mtp->cache_position();
+        }
+    }
+    logits.eval();
+    std::vector<array> result;
+    for (int row = 0; row < static_cast<int>(caches.size()); ++row)
+        result.push_back(mlx::core::slice(logits, {0, row, 0}, {1, row + 1, logits.shape(2)}));
+    return result;
+}
+
+int MlxQwen4CausalLm::request_cache_position(const MlxQwen4RequestCache& cache) const {
+    if (cache.owner != impl_.get()) throw std::invalid_argument("request cache belongs to another runtime");
+    return cache.position;
+}
+
+MlxMtpEngineCallbacks MlxQwen4CausalLm::request_mtp_callbacks(
+    const std::shared_ptr<MlxQwen4RequestCache>& cache, bool batched_drafts) {
+    if (!impl_->mtp || !cache || cache->owner != impl_.get() || !cache->last_hidden)
+        throw std::invalid_argument("MTP request prefill is incomplete");
+    MlxMtpEngineCallbacks callbacks;
+    callbacks.predictor = impl_->mtp->mtp_descriptor();
+    callbacks.policy_state = &cache->policy;
+    callbacks.target_cache_position = [cache] { return cache->position; };
+    callbacks.resolve_target = [this, cache](int accepted, int drafts) {
+        if (drafts) resolve_request(*cache, accepted);
+    };
+    callbacks.committed_target = [cache](const MlxMtpDraftContext& context) {
+        const int accepted = context.accepted_drafts;
+        cache->last_hidden = mlx::core::slice(*context.verified_hidden, {0, accepted, 0},
+            {1, accepted + 1, context.verified_hidden->shape(2)});
+        cache->verified_hidden = *context.verified_hidden;
+        cache->verified_ids.assign(context.next_token_ids.begin(), context.next_token_ids.end());
+    };
+    const auto history = [this, cache](const MlxMtpDraftContext& context) {
+        Impl::RequestScope scope(*impl_, *cache);
+        const int width = static_cast<int>(impl_->config.hc_count * impl_->config.hidden_size);
+        auto hidden = context.initial ? *impl_->last_cache_hidden : mlx_mtp_committed_hidden(context, 1, width);
+        std::vector<std::int32_t> ids = context.initial ? std::vector<std::int32_t>{context.pending_token}
+            : std::vector<std::int32_t>(context.next_token_ids.begin(), context.next_token_ids.end());
+        if (cache->folded_history) {
+            hidden = mlx::core::slice(hidden, {0, cache->folded_history, 0}, {1, hidden.shape(1), width});
+            ids.erase(ids.begin(), ids.begin() + cache->folded_history);
+            cache->folded_history = 0;
+        }
+        impl_->mtp->trim_cache_to(cache->predictor_history_position);
+        const auto fold = [&] {
+            if (cache->pending_history.empty()) return;
+            auto history = cache->pending_history.drain();
+            (void)impl_->mtp->append_history(history.hidden, history.token_ids, impl_->embedding);
+            cache->predictor_history_position += history.token_ids.shape(1);
+        };
+        if (!context.requested_depth) {
+            cache->pending_history.append(hidden, ids);
+            if (cache->pending_history.size() >= kMlxMtpHistoryChunkSize) {
+                if (context.time_sample) *context.time_sample = false;
+                fold();
+            }
+            return;
+        }
+        if (!cache->pending_history.empty() && context.time_sample) *context.time_sample = false;
+        fold();
+        const int committed = static_cast<int>(ids.size());
+        const array shifted(ids.begin(), Shape{1, committed}, mlx::core::int32);
+        if (committed > 1) (void)impl_->mtp->append_history(
+            mlx::core::slice(hidden, {0, 0, 0}, {1, committed - 1, width}),
+            mlx::core::slice(shifted, {0, 0}, {1, committed - 1}), impl_->embedding);
+        cache->draft_hidden = mlx::core::slice(hidden, {0, committed - 1, 0}, {1, committed, width});
+        cache->draft_ids = mlx::core::slice(shifted, {0, committed - 1}, {1, committed});
+        cache->predictor_history_position += committed;
+    };
+    callbacks.prepare_draft = [this, cache, history](const MlxMtpDraftContext& context,
+        const MlxMtpTokenSelector& select) {
+        history(context);
+        if (!context.requested_depth) return;
+        Impl::RequestScope scope(*impl_, *cache);
+        auto predictor = impl_->mtp->forward(*cache->draft_hidden, *cache->draft_ids, impl_->embedding, true);
+        for (int row = 0; row < context.requested_depth; ++row) {
+            auto logits = impl_->output ? (*impl_->output)(predictor.sample_hidden)
+                : impl_->embedding.project(predictor.sample_hidden);
+            auto token = select(mlx_last_token_logits(logits, static_cast<int>(impl_->config.vocab_size)));
+            if (row + 1 < context.requested_depth) predictor = impl_->mtp->forward(predictor.hidden_streams,
+                mlx::core::reshape(token, {1, 1}), impl_->embedding, true);
+        }
+    };
+    if (batched_drafts) {
+        callbacks.prepare_draft_history = history;
+        callbacks.draft_logits = [cache] {
+            if (!cache->draft_result) throw std::logic_error("MTP draft result is not ready");
+            auto result = std::move(*cache->draft_result);
+            cache->draft_result.reset();
+            return result;
+        };
+    }
+    return callbacks;
+}
+
+void MlxQwen4CausalLm::draft_request_heads(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::optional<array>>& previous_tokens) {
+    if (!impl_->mtp || caches.empty() || caches.size() != previous_tokens.size())
+        throw std::invalid_argument("invalid MTP draft batch");
+    std::vector<array> hidden, ids;
+    std::vector<int> positions;
+    std::vector<std::vector<Qwen4RequestLayerCache>*> layers;
+    std::unordered_set<MlxQwen4RequestCache*> unique;
+    for (std::size_t row = 0; row < caches.size(); ++row) {
+        if (!caches[row]) throw std::invalid_argument("null MTP draft cache");
+        auto& cache = *caches[row];
+        if (cache.owner != impl_.get() || cache.speculative_pending || !cache.draft_hidden ||
+            !cache.draft_ids || cache.draft_result || !unique.insert(&cache).second)
+            throw std::invalid_argument("invalid or duplicate MTP draft cache");
+        hidden.push_back(*cache.draft_hidden);
+        ids.push_back(previous_tokens[row] ? mlx::core::reshape(*previous_tokens[row], {1, 1}) : *cache.draft_ids);
+        positions.push_back(cache.predictor_position);
+        layers.push_back(&cache.predictor_layers);
+    }
+    auto predictor = [&] {
+        if (caches.size() == 1) {
+            Impl::RequestScope scope(*impl_, *caches.front());
+            return impl_->mtp->forward(hidden.front(), ids.front(), impl_->embedding, true);
+        }
+        return impl_->mtp->forward_requests(mlx::core::concatenate(hidden, 0),
+            mlx::core::concatenate(ids, 0), impl_->embedding, layers, positions);
+    }();
+    auto logits = impl_->output ? (*impl_->output)(predictor.sample_hidden)
+        : impl_->embedding.project(predictor.sample_hidden);
+    const int batch = static_cast<int>(caches.size()), width = predictor.hidden_streams.shape(2);
+    logits = mlx::core::reshape(logits, {batch, static_cast<int>(impl_->config.vocab_size)});
+    for (int row = 0; row < batch; ++row) {
+        auto& cache = *caches[row];
+        cache.draft_hidden = mlx::core::slice(predictor.hidden_streams, {row, 0, 0}, {row + 1, 1, width});
+        cache.draft_result = mlx::core::slice(logits, {row, 0}, {row + 1, logits.shape(1)});
+        if (batch > 1) {
+            cache.predictor_batch = 1;
+            ++cache.predictor_position;
+        }
+    }
+}
+
+array MlxQwen4CausalLm::decode_requests(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::int64_t>& tokens) {
+    return forward_requests(caches, tokens, 1, false).first;
+}
+
+std::pair<array, array> MlxQwen4CausalLm::forward_request_tokens(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::int64_t>& tokens) {
+    return forward_requests(caches, tokens, 1, false);
+}
+
+std::pair<array, array> MlxQwen4CausalLm::verify_requests(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::vector<std::int64_t>>& tokens) {
+    if (tokens.empty() || tokens.size() != caches.size() || tokens.front().size() < 2 ||
+        tokens.front().size() > kMlxMtpEngineMaximumDraftDepth + 1)
+        throw std::invalid_argument("Qwen4 verification requires equal draft windows");
+    const int rows = static_cast<int>(tokens.front().size());
+    std::vector<std::int64_t> grouped;
+    grouped.reserve(caches.size() * rows);
+    for (const auto& request : tokens) {
+        if (request.size() != static_cast<std::size_t>(rows))
+            throw std::invalid_argument("Qwen4 verification requires equal draft windows");
+        grouped.insert(grouped.end(), request.begin(), request.end());
+    }
+    return forward_requests(caches, grouped, rows, true);
+}
+
+void MlxQwen4CausalLm::resolve_request(MlxQwen4RequestCache& cache, int accepted_drafts) {
+    if (!cache.speculative_pending || cache.draft_count < 1 || accepted_drafts < 0 ||
+        accepted_drafts > cache.draft_count)
+        throw std::invalid_argument("Qwen4 request has no matching speculative transaction");
+    Impl::RequestScope scope(*impl_, cache);
+    if (accepted_drafts == cache.draft_count) impl_->commit_speculative();
+    else impl_->rollback_speculative(accepted_drafts, cache.draft_count);
+    cache.draft_count = 0;
+}
+
+std::pair<array, array> MlxQwen4CausalLm::forward_requests(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::int64_t>& tokens, int rows, bool speculative) {
+    if (caches.empty() || rows < 1 || tokens.size() != caches.size() * rows)
+        throw std::invalid_argument("Qwen4 batch requires equal token windows");
+    std::vector<int> offsets(caches.size() + 1);
+    for (std::size_t row = 0; row <= caches.size(); ++row) offsets[row] = static_cast<int>(row * rows);
+    auto result = forward_packed_requests(caches, tokens, offsets, speculative);
+    result.first = mlx::core::reshape(result.first, {static_cast<int>(caches.size()), rows, result.first.shape(2)});
+    result.second = mlx::core::reshape(result.second, {static_cast<int>(caches.size()), rows, result.second.shape(2)});
+    return result;
+}
+
+std::vector<std::pair<array, array>> MlxQwen4CausalLm::forward_request_windows(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::vector<std::int64_t>>& windows,
+    std::optional<array>* packed_logits) {
+    if (caches.empty() || windows.size() != caches.size())
+        throw std::invalid_argument("Qwen4 batch requires one decode window per cache");
+    std::vector<int> offsets{0};
+    std::vector<std::int64_t> tokens;
+    for (const auto& window : windows) {
+        if (window.empty() || window.size() > kMlxMtpEngineMaximumDraftDepth + 1 ||
+            tokens.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) - window.size())
+            throw std::invalid_argument("invalid Qwen4 decode window length");
+        tokens.insert(tokens.end(), window.begin(), window.end());
+        offsets.push_back(static_cast<int>(tokens.size()));
+    }
+    auto output = forward_packed_requests(caches, tokens, offsets, true);
+    if (packed_logits) *packed_logits = output.first;
+    std::vector<std::pair<array, array>> result;
+    result.reserve(caches.size());
+    for (std::size_t row = 0; row < caches.size(); ++row)
+        result.emplace_back(mlx::core::slice(output.first, {0, offsets[row], 0},
+            {1, offsets[row + 1], output.first.shape(2)}),
+            mlx::core::slice(output.second, {0, offsets[row], 0},
+            {1, offsets[row + 1], output.second.shape(2)}));
+    return result;
+}
+
+std::pair<array, array> MlxQwen4CausalLm::forward_packed_requests(
+    const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+    const std::vector<std::int64_t>& tokens, const std::vector<int>& offsets, bool speculative) {
+    mlx_validate_token_set(tokens, static_cast<int>(impl_->config.vocab_size));
+    std::unordered_set<const MlxQwen4RequestCache*> unique;
+    std::vector<int> positions;
+    const int rows = offsets[1];
+    bool uniform = true;
+    for (std::size_t row = 0; row < caches.size(); ++row) {
+        const int count = offsets[row + 1] - offsets[row];
+        uniform = uniform && count == rows;
+        const auto& cache = caches[row];
+        if (!cache || cache->owner != impl_.get() || cache->batch != 1 ||
+            cache->position < 1 || cache->position > impl_->maximum - count || cache->speculative_pending ||
+            !unique.insert(cache.get()).second)
+            throw std::invalid_argument("invalid or duplicate Qwen4 batch request cache");
+        positions.push_back(cache->position);
+    }
+    if (caches.size() == 1) {
+        Impl::RequestScope scope(*impl_, *caches.front());
+        auto result = impl_->forward_with_hidden(array(tokens.begin(), Shape{1, rows}, mlx::core::int32),
+            true, false, speculative && rows > 1 ? 1 : 0);
+        if (speculative && rows > 1) caches.front()->draft_count = rows - 1;
+        return result;
+    }
+    const int batch = static_cast<int>(caches.size());
+    const int count = static_cast<int>(tokens.size());
+    auto ids = array(tokens.begin(), Shape{1, count}, mlx::core::int32);
+    std::vector<Qwen4NgramEmbedding::Prefetched> ple_pipeline(impl_->layers.size());
+    for (const auto layer : impl_->config.ple_layer_ids) {
+        const auto index = static_cast<std::size_t>(layer - 1);
+        std::vector<Qwen4RequestLayerCache*> state;
+        for (const auto& cache : caches) state.push_back(&cache->layers[index]);
+        ple_pipeline[index] = impl_->layers[index].prefetch_ple_requests(ids, offsets, state);
+    }
+    auto hidden = impl_->embedding(ids, mlx::core::float16);
+    auto streams = mlx::core::reshape(mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
+        Shape{1, count, static_cast<int>(impl_->config.hc_count), static_cast<int>(impl_->config.hidden_size)}),
+        Shape{1, count, static_cast<int>(impl_->config.hc_count * impl_->config.hidden_size)});
+    std::vector<Qwen4RequestLayerCache*> layer_caches;
+    layer_caches.reserve(batch);
+    for (std::size_t index = 0; index < impl_->layers.size(); ++index) {
+        layer_caches.clear();
+        for (const auto& cache : caches) layer_caches.push_back(&cache->layers[index]);
+        streams = impl_->layers[index].forward_packed_requests(std::move(streams), ids, layer_caches, positions,
+            offsets, true, speculative && (!uniform || rows > 1) ? 1 : 0, nullptr, &ple_pipeline[index]);
+        if (index < 6 || index % static_cast<std::size_t>(decode_async_interval()) == 0)
+            mlx::core::async_eval({streams});
+    }
+    auto output_hidden = impl_->mixer.mix(streams);
+    detail::profile_eval("qwen4.final_mhc", output_hidden);
+    auto logits = impl_->output ? (*impl_->output)(output_hidden) : impl_->embedding.project(output_hidden);
+    detail::profile_eval("qwen4.output", logits);
+    for (std::size_t row = 0; row < caches.size(); ++row) {
+        const auto& cache = caches[row];
+        const int count = offsets[row + 1] - offsets[row];
+        cache->position += count;
+        cache->speculative_pending = speculative && count > 1;
+        cache->draft_count = cache->speculative_pending ? count - 1 : 0;
+    }
+    return {std::move(logits), std::move(streams)};
+}
+
+MlxQwen4TextSessionState MlxQwen4CausalLm::capture_request_cache(MlxQwen4RequestCache& cache,
+    const std::vector<std::int64_t>& tokens) {
+    Impl::RequestScope scope(*impl_, cache);
+    if (impl_->mtp && cache.verified_hidden && !impl_->speculative_pending &&
+        cache.predictor_history_position < impl_->cache_position - 1) {
+        impl_->mtp->trim_cache_to(cache.predictor_history_position);
+        if (!cache.pending_history.empty()) {
+            auto history = cache.pending_history.drain();
+            (void)impl_->mtp->append_history(history.hidden, history.token_ids, impl_->embedding);
+            cache.predictor_history_position += history.token_ids.shape(1);
+        }
+        const int count = impl_->cache_position - 1 - cache.predictor_history_position;
+        if (count > 0) {
+            if (count > static_cast<int>(cache.verified_ids.size()))
+                throw std::runtime_error("MTP request checkpoint history is incomplete");
+            const array shifted(cache.verified_ids.begin(), Shape{1, count}, mlx::core::int32);
+            auto anchor = impl_->mtp->append_history(mlx::core::slice(*cache.verified_hidden,
+                {0, 0, 0}, {1, count, cache.verified_hidden->shape(2)}), shifted, impl_->embedding);
+            anchor.eval();
+            cache.predictor_history_position += count;
+            cache.folded_history = count;
+        }
+    }
+    return capture_text_session_state(tokens);
+}
+
+void MlxQwen4CausalLm::restore_request_cache(MlxQwen4RequestCache& cache,
+    const MlxQwen4TextSessionState& state) {
+    Impl::RequestScope scope(*impl_, cache);
+    restore_text_session_state(state);
+    if (impl_->mtp) cache.predictor_history_position = impl_->mtp->cache_position();
+    cache.pending_history = {};
+    cache.verified_hidden.reset();
+    cache.draft_hidden.reset();
+    cache.draft_ids.reset();
+    cache.draft_result.reset();
+    cache.verified_ids.clear();
+    cache.folded_history = 0;
+    cache.draft_count = 0;
 }
 
 void MlxQwen4CausalLm::reset_cache(int batch) {
@@ -4378,6 +5547,7 @@ std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
     std::size_t bytes = 0;
     for (const auto& layer : impl_->layers) bytes += layer.cache_bytes();
     if (impl_->mtp) bytes += impl_->mtp->cache_bytes();
+    for (const auto& weak : impl_->request_caches) if (auto cache = weak.lock()) bytes += cache->bytes();
     if (kv_offload_store_) {
         const auto stats = kv_offload_store_->stats();
         bytes += stats.hot_bytes + stats.pending_bytes;
@@ -4391,7 +5561,10 @@ std::optional<QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
 }
 
 std::size_t MlxQwen4CausalLm::kv_cache_contexts() const noexcept {
-    return kv_cache_bytes() == 0 ? 0 : static_cast<std::size_t>(impl_->cache_batch);
+    std::size_t contexts = impl_->cache_position ? static_cast<std::size_t>(impl_->cache_batch) : 0;
+    for (const auto& weak : impl_->request_caches) if (auto cache = weak.lock())
+        if (cache->position) ++contexts;
+    return contexts;
 }
 
 std::size_t MlxQwen4CausalLm::dynamic_weight_bytes() const noexcept {
@@ -4416,15 +5589,15 @@ std::size_t MlxQwen4CausalLm::set_expert_cache_limit(std::size_t bytes) {
         impl_->mfe_offload_cache = std::move(cache);
     }
     auto resident = resident_full_expert_bytes();
-    impl_->mfe_offload_cache->set_cache_limit(bytes > resident ? bytes - resident : 0);
-    if (impl_->mtp && !impl_->mtp_full_precision && !impl_->last_mtp_stats.used)
-        impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
-    for (auto& layer : impl_->layers) {
-        if (resident <= bytes) break;
-        const auto released = layer.resident_routed_bytes();
-        if (released) { layer.use_offload(impl_->mfe_offload_cache); resident -= released; }
+    if (resident > bytes) {
+        for (auto& layer : impl_->layers) {
+            if (resident <= bytes) break;
+            const auto released = layer.resident_routed_bytes();
+            if (released) { layer.use_offload(impl_->mfe_offload_cache); resident -= released; }
+        }
+        if (resident > bytes && impl_->mtp && !impl_->mtp_full_precision)
+            impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
     }
-    if (impl_->mtp && !impl_->mtp_full_precision) impl_->mtp->offload_until(impl_->mfe_offload_cache, resident, bytes);
     impl_->mfe_offload_cache->set_cache_limit(bytes > resident ? bytes - resident : 0);
     const auto after = mlx::core::get_active_memory();
     return before > after ? before - after : 0;
@@ -4460,6 +5633,54 @@ std::int32_t MlxQwen4CausalLm::generate(
     std::optional<std::size_t> stable_prefix_tokens,
     int prefill_chunk_size,
     const MlxPrefixCacheHooks& prefix_cache) {
+    MlxPreparedPrompt prepared;
+    prepared.token_ids = prompt;
+    return generate_prepared_impl(prepared, sampling, max_tokens, callback,
+        prefill_callback, token_constraint, stable_prefix_tokens, prefill_chunk_size, prefix_cache);
+}
+
+bool MlxQwen4CausalLm::supports_multimodal() const noexcept {
+    return impl_->vision.has_value();
+}
+
+std::string_view MlxQwen4CausalLm::multimodal_input_contract() const noexcept {
+    return impl_->vision ? impl_->vision->input_contract() : std::string_view{};
+}
+
+MlxPreparedPrompt MlxQwen4CausalLm::prepare_multimodal_prompt(
+    const std::vector<std::int64_t>& prompt, const MlxGridMediaInput& media) const {
+    if (!impl_->vision)
+        throw std::invalid_argument("model graph does not provide an enabled Vision component");
+    if (prompt.empty() || prompt.size() > static_cast<std::size_t>(impl_->maximum))
+        throw std::invalid_argument("multimodal prompt length is invalid");
+    std::vector<std::int32_t> values;
+    values.reserve(prompt.size());
+    for (const auto token : prompt) {
+        if (token < 0 || token >= impl_->config.vocab_size)
+            throw std::invalid_argument("multimodal prompt token is out of range");
+        values.push_back(static_cast<std::int32_t>(token));
+    }
+    const array ids(values.begin(), Shape{1, static_cast<int>(values.size())}, mlx::core::int32);
+    return impl_->vision->prepare(prompt, impl_->embedding(ids, mlx::core::float16), media);
+}
+
+std::int32_t MlxQwen4CausalLm::generate_prepared(
+    const MlxPreparedPrompt& prompt, const MlxSamplingParams& sampling,
+    std::int32_t max_tokens, const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint) {
+    return generate_prepared_impl(prompt, sampling, max_tokens, callback,
+        prefill_callback, token_constraint, std::nullopt, 2048, {});
+}
+
+std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
+    const MlxPreparedPrompt& prepared, const MlxSamplingParams& sampling,
+    std::int32_t max_tokens, const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens, int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
+    const auto& prompt = prepared.token_ids;
     if (prompt.empty()) {
         throw std::invalid_argument("Qwen4 generation prompt cannot be empty");
     }
@@ -4470,6 +5691,16 @@ std::int32_t MlxQwen4CausalLm::generate(
     if (prompt.size() > static_cast<std::size_t>(impl_->maximum)) {
         throw std::invalid_argument("Qwen4 prompt exceeds context capacity");
     }
+    if (prepared.embeddings && prepared.embeddings->shape() !=
+            Shape{1, static_cast<int>(prompt.size()), static_cast<int>(impl_->config.hidden_size)})
+        throw std::invalid_argument("prepared prompt embeddings disagree with token geometry");
+    if (prepared.positions && (prepared.positions->shape() != Shape{3, static_cast<int>(prompt.size())} ||
+            prepared.positions->dtype() != mlx::core::int32))
+        throw std::invalid_argument("prepared prompt positions require int32 [3,T]");
+    if (static_cast<std::int64_t>(prompt.size()) + prepared.decode_position_delta < 0 ||
+        static_cast<std::int64_t>(prompt.size()) + prepared.decode_position_delta > impl_->maximum ||
+        (prepared.decode_position_delta != 0 && !prepared.positions))
+        throw std::invalid_argument("prepared prompt decode position is invalid");
     std::vector<std::int32_t> values;
     values.reserve(prompt.size());
     for (const auto token : prompt) {
@@ -4493,7 +5724,7 @@ std::int32_t MlxQwen4CausalLm::generate(
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
     std::size_t reused = 0;
-    if (stable_prefix_tokens && (!mtp_active || impl_->stable_mtp_ready) &&
+    if (!prepared.transformed() && stable_prefix_tokens && (!mtp_active || impl_->stable_mtp_ready) &&
         impl_->cache_batch == 1 && !impl_->stable_tokens.empty() &&
         impl_->cache_position == static_cast<int>(impl_->stable_tokens.size()) &&
         impl_->stable_tokens.size() <= *stable_prefix_tokens && impl_->stable_tokens.size() < prompt.size() &&
@@ -4502,6 +5733,17 @@ std::int32_t MlxQwen4CausalLm::generate(
     } else {
         reset_cache(1);
     }
+    impl_->prompt_positions = {prepared.positions, prepared.decode_position_delta};
+    if (impl_->mtp) impl_->mtp->prompt_positions = impl_->prompt_positions;
+    struct PositionReset {
+        Impl& runtime;
+        ~PositionReset() {
+            runtime.prompt_positions = {};
+            if (runtime.mtp) runtime.mtp->prompt_positions = {};
+            if (transformed) runtime.stable_tokens.clear();
+        }
+        bool transformed;
+    } position_reset{*impl_, prepared.transformed()};
     if (prefill_chunk_size <= 0) throw std::invalid_argument("Qwen4 prefill chunk size must be positive");
     const array prompt_ids(
         values.begin(), Shape{1, static_cast<int>(values.size())},
@@ -4529,7 +5771,12 @@ std::int32_t MlxQwen4CausalLm::generate(
                 offset + static_cast<std::size_t>(prefill_chunk_size)));
             auto ids = mlx::core::slice(prompt_ids, Shape{0, static_cast<int>(offset)},
                 Shape{1, static_cast<int>(end)});
-            auto prefill = impl_->forward_with_hidden(ids, true, true);
+            std::optional<array> embeddings;
+            if (prepared.embeddings)
+                embeddings = mlx::core::slice(*prepared.embeddings,
+                    {0, static_cast<int>(offset), 0},
+                    {1, static_cast<int>(end), static_cast<int>(impl_->config.hidden_size)});
+            auto prefill = impl_->forward_with_hidden(ids, true, true, 0, embeddings);
             last_logits = std::move(prefill.first);
             if (prefix_cache) {
                 if (mtp_active) {
@@ -4935,6 +6182,10 @@ bool MlxQwen4CausalLm::supports_mtp() const noexcept {
     return impl_->mtp.has_value();
 }
 
+bool MlxQwen4CausalLm::supports_batch_mtp() const noexcept {
+    return impl_->mtp.has_value() && impl_->mtp->layer_count() == 1 && !impl_->mtp_lora;
+}
+
 const MlxMtpGenerationStats&
 MlxQwen4CausalLm::last_mtp_stats() const noexcept {
     return impl_->last_mtp_stats;
@@ -4965,6 +6216,16 @@ MlxQwen4CausalLm::ssd_expert_cache_stats() const {
     stats.requests = stats.hits + stats.misses;
     stats.coalesced = reuse.load_waits;
     stats.packed_reuses = reuse.packed_hits;
+    stats.bytes_read = reuse.bytes_read;
+    stats.read_calls = reuse.read_calls;
+    stats.evictions = reuse.evictions;
+    stats.io_seconds = reuse.io_seconds;
+    stats.wait_seconds = reuse.wait_seconds;
+    stats.prepare_seconds = reuse.prepare_seconds;
+    stats.view_seconds = reuse.view_seconds;
+    stats.device_route_hits = reuse.cached_route_hits;
+    stats.device_route_misses = reuse.cached_route_misses;
+    stats.device_route_layers = reuse.cached_route_hits + reuse.cached_route_misses;
     stats.resident_experts =
         impl_->mfe_offload_cache->cached_expert_count();
     stats.resident_bytes =

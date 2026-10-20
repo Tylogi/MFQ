@@ -11,7 +11,6 @@ from pathlib import Path
 
 import psutil
 
-from mfq.quantize.workbench_candidates import WORKBENCH_CANDIDATES, CANDIDATE_GROUPS
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.protocol.quantization import (
     FitPayload, QuantizationDirectories, QuantizationFile, QuantizationFiles,
@@ -40,6 +39,12 @@ class QuantizationWorkbench:
         }
 
     def workspace(self):
+        try:
+            from mfq.quantize.workbench_candidates import WORKBENCH_CANDIDATES, CANDIDATE_GROUPS
+        except ModuleNotFoundError as error:
+            if error.name not in {'mfq.quantize', 'mfq.quantize.workbench_candidates'}:
+                raise
+            WORKBENCH_CANDIDATES, CANDIDATE_GROUPS = (), ()
         defaults = {'import_directory': str(self.tools.model_root), 'export_directory': str(self.tools.root / 'quantization' / 'outputs')}
         if self.settings_path.is_file():
             saved = QuantizationDirectories.model_validate_json(self.settings_path.read_text())
@@ -81,13 +86,19 @@ class QuantizationWorkbench:
                 break
         return QuantizationFiles(path=str(path), parent=str(path.parent) if path.parent != path else None, data=items)
 
-    def source(self, value):
-        from mfq.quantize.workbench import source_summary
+    def source(self, value, *, reference=False):
+        if reference:
+            from mfq.evaluation.source import source_summary
+        else:
+            from mfq.quantize.workbench import source_summary
         return QuantizationSource(**source_summary(self.resolve(value)))
 
     def loading_plan(self, request):
-        from mfq.calibration.loading import loading_plan
-        return loading_plan(self.resolve(request.path), **request.model_dump(exclude={'path'}))
+        if request.purpose == 'wt2':
+            from mfq.evaluation.source import loading_plan
+        else:
+            from mfq.calibration.loading import loading_plan
+        return loading_plan(self.resolve(request.path), **request.model_dump(exclude={'path', 'reference'}))
 
     def validate_recipe(self, payload):
         from mfq.quantize.workbench import RecipeValidationError, recipe_arguments, validate_recipe
@@ -151,6 +162,7 @@ class QuantizationWorkbench:
         return await self._record(context, output, 'imatrix', result)
 
     async def generate(self, context, payload):
+        from mfq.quantize.workbench_candidates import WORKBENCH_CANDIDATES
         request = RecipePayload.model_validate(payload)
         if len(set(request.candidates)) != len(request.candidates) or set(request.candidates) - set(WORKBENCH_CANDIDATES):
             raise failure('invalid_candidates', 'select distinct canonical NVQ/NINT/native-SQ candidates')

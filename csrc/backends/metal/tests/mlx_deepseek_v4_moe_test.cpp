@@ -1,6 +1,6 @@
-#include "mlx_deepseek_v4_moe.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_moe.h"
 
-#include "nvq_codebooks.generated.h"
+#include "generated/nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>

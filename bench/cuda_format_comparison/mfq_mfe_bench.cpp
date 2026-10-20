@@ -469,12 +469,83 @@ struct Replay {
         graph.capture_end();graph.replay();fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));
     }
 };
+static void shared_small_whole(std::vector<std::unique_ptr<Layer>>& layers) {
+    auto context=mfq::cuda::default_context(0);
+    const auto stream=mfq_current_cuda_stream();
+    context->begin_graph_pool(stream);
+    int checks=0,coverage=0;
+    for(int tokens:{1,2,3,4,5,6}) {
+        std::array<std::vector<std::unique_ptr<Call>>,2> calls;
+        for(int variant=0;variant<2;++variant) {
+            set_geometry("MFQ_MFE_SHARED_SMALL_WHOLE",variant?"1":"0");
+            for(auto& layer:layers) {
+                calls[variant].push_back(std::make_unique<Call>(*layer,true,tokens));
+                const auto& b=calls[variant].back()->fused->batch();
+                std::array<mfq::cuda::MfePackedProjection,3> views;
+                fb::check(cudaMemcpyAsync(views.data(),b.shared,sizeof(views),cudaMemcpyDeviceToHost,stream));
+                fb::check(cudaStreamSynchronize(stream));
+                if(tokens==1) {
+                    std::cout<<"SHARED_SMALL_COVERAGE layer="<<layer->index<<" variant="<<variant
+                        <<" gs="<<views[2].group_size<<" groups="<<views[2].groups
+                        <<" whole="<<views[2].nint_whole<<'\n';
+                    if(variant && views[2].group_size==24 && views[2].nint_whole)++coverage;
+                }
+            }
+        }
+        std::array<MfqCudaGraph,2> graphs;
+        context->begin_graph_warmup(stream);
+        for(auto& variant:calls)for(auto& call:variant)call->fused->run();
+        fb::check(cudaStreamSynchronize(stream));
+        for(int variant=0;variant<2;++variant) {
+            graphs[variant].capture_begin_shared();
+            for(int repeat=0;repeat<8;++repeat)for(auto& call:calls[variant])call->fused->run();
+            graphs[variant].capture_end();
+        }
+        for(int step=0;step<3;++step) {
+            for(size_t bank=0;bank<layers.size();++bank) {
+                auto values=fb::input(tokens,hidden);
+                for(auto& value:values)value*=float(step*step);
+                auto x=tb::tensor(values).reshape({tokens,hidden}).to(tb::kCUDA,tb::kFloat16);
+                std::vector<int32_t> selected(tokens*routes);
+                for(int i=0;i<tokens*routes;++i) {
+                    selected[i]=layers[bank]->selected[(i/(step==1?2:1)+step)%routes];
+                    if(step==2 && i%3==0)selected[i]=-1;
+                    if(step==2 && i%3==1)selected[i]=experts;
+                }
+                auto ids=tb::tensor(selected).reshape({tokens,routes}).to(tb::kCUDA);
+                for(auto& variant:calls){variant[bank]->x.copy_(x);variant[bank]->ids.copy_(ids);}
+            }
+            for(auto& graph:graphs)graph.replay();
+            for(size_t bank=0;bank<layers.size();++bank) {
+                auto a=calls[0][bank]->fused->output().cpu(),b=calls[1][bank]->fused->output().cpu();
+                if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() || std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes()))
+                    throw std::runtime_error("shared GS24 whole-group decoder changed MFE output bits");
+                ++checks;
+            }
+        }
+        if(tokens==3 || tokens==4 || std::getenv("MFQ_BENCH_SHARED_NUMERICAL_ONLY"))continue;
+        std::array<std::vector<double>,2> samples;
+        for(int repeat=0;repeat<2;++repeat)for(int offset=0;offset<2;++offset) {
+            const int variant=(repeat+offset)%2;
+            samples[variant].push_back(fb::median(fb::measure([&]{graphs[variant].replay();},stream,layers.size()*8)));
+        }
+        std::cout<<"SHARED_SMALL_AB M="<<tokens<<" old_us="<<fb::median(samples[0])
+            <<" new_us="<<fb::median(samples[1])<<" BYTE_EXACT\n"<<std::flush;
+    }
+    context->end_graph_pool(stream);set_geometry("MFQ_MFE_SHARED_SMALL_WHOLE",nullptr);
+    if(!coverage)throw std::runtime_error("shared-small probe exercised no GS24 whole-group projection");
+    std::cout<<"VERIFY_SHARED_SMALL_WHOLE checks="<<checks<<" layers="<<coverage<<" BYTE_EXACT PASS\n"<<std::flush;
+}
+
 int main(int argc,char** argv)try {
     if(argc!=3)throw std::runtime_error("usage: mfq-cuda-real-mfe-bench model-first-shard profile-label");
     auto context=mfq::cuda::default_context(0);auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
     auto model=mfq::open_model_source(argv[1]);
     std::vector<std::unique_ptr<Layer>> layers;
-    for(int layer:{0,8,16,24,32,40})layers.push_back(std::make_unique<Layer>(*model,layer));
+    const bool shared_small=std::getenv("MFQ_BENCH_SHARED_SMALL_WHOLE")!=nullptr;
+    for(int layer:shared_small?std::vector<int>{0,20,22,36,40,44}:std::vector<int>{0,8,16,24,32,40})
+        layers.push_back(std::make_unique<Layer>(*model,layer));
+    if(shared_small){shared_small_whole(layers);return 0;}
     if(std::getenv("MFQ_BENCH_E8_LARGE_ARENA")) {
         bool enlarged=false;for(auto& layer:layers)if(layer->enlarge_e8_arena()){enlarged=true;break;}
         if(!enlarged || !std::getenv("MFQ_BENCH_VERIFY_E8_NARROW"))

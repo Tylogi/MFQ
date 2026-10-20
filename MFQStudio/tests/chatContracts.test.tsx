@@ -79,7 +79,7 @@ it('清空先创建再删除，成功后才切换并清空历史', async () => {
   const { result } = await mountChat();
   let clearing!: Promise<void>;
   act(() => { clearing = result.current.chat.clearActiveConversation(); });
-  await waitFor(() => expect(sessionsApi.createSession).toHaveBeenCalledWith(session.model, session.mode));
+  await waitFor(() => expect(sessionsApi.createSession).toHaveBeenCalledWith(undefined, session.mode));
   expect(sessionsApi.deleteSession).not.toHaveBeenCalled();
   await act(async () => created.resolve(replacement));
   expect(sessionsApi.deleteSession).toHaveBeenCalledWith(session.id);

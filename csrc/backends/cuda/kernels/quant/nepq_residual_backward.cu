@@ -2,7 +2,7 @@
 // compiles nepq_residual.cu alone; the Python calibration extension adds this
 // unit and shares the record validation through nepq_residual_impl.cuh.
 #include <cuda.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

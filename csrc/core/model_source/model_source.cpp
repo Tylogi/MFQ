@@ -2,7 +2,7 @@
 
 #include "mfq/model_source/hf_model_source.h"
 #include "mfq/model_source/mfq_model_source.h"
-#include "mfq_legacy_model_graph.h"
+#include "compat/mfq_legacy_model_graph.h"
 
 #include <cstdlib>
 

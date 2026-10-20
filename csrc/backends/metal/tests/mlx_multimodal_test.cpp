@@ -1,4 +1,4 @@
-#include "mlx_multimodal.h"
+#include "runtime/mlx_multimodal.h"
 
 #include <cstdint>
 #include <iostream>

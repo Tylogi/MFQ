@@ -25,8 +25,8 @@ def fixture(tmp_path):
     pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', backend='metal', automatic_memory_budget=False)
     service = ServerService(SessionStore(tmp_path / 'server.sqlite3'), pool, runtime_manager=pool)
     instance = SimpleNamespace(id=uuid4(), artifact=model, context_size=32768, state=RuntimeInstanceState.READY,
-        qsa_kv_offload_supported=True, active_requests=0, queued_requests=0, control_leases=0, pinned=True, idle_ttl_seconds=300)
-    other = SimpleNamespace(id=uuid4(), artifact=SimpleNamespace(resource=SimpleNamespace(name='other')), state=RuntimeInstanceState.READY)
+        qsa_kv_offload_supported=True, active_requests=0, queued_requests=0, control_leases=0, pinned=True, idle_ttl_seconds=300, memory=None)
+    other = SimpleNamespace(id=uuid4(), artifact=SimpleNamespace(resource=SimpleNamespace(name='other')), state=RuntimeInstanceState.READY, memory=None)
     pool._instances = {instance.id: instance, other.id: other}
     previous = ModelLoadRequest(model=model.resource.name, context_size=32768)
     pool._load_requests[model.resource.name] = previous
@@ -43,7 +43,7 @@ def test_one_save_reloads_once_with_yarn_and_streaming_then_persists_together(tm
             assert service.store.runtime_context_policy() == {}
             assert pool.context_policy.model_overrides == {} and pool.context_policy.model_yarn_enabled == {}
             assert payload['context_size'] == target and payload['yarn_enabled'] is True
-            assert payload['qsa_kv_offload'] == {'enabled': True, 'budget_bytes': 128 << 10, 'target_context': target}
+            assert payload['qsa_kv_offload'] == {'enabled': True, 'budget_bytes': 128 << 10, 'ram_budget_bytes': None, 'target_context': target}
             assert payload['pin'] and payload['idle_ttl_seconds'] == 300
             await pool.configure_context_policy(RuntimeContextPolicy(max_context_size=65536))
             return {'instance_id': str(uuid4()), 'model': model.resource.name, 'context_size': target}
@@ -58,7 +58,7 @@ def test_one_save_reloads_once_with_yarn_and_streaming_then_persists_together(tm
         assert saved['max_context_size'] == 65536
         assert saved['model_overrides'] == {model.resource.name: target}
         assert saved['model_yarn_enabled'] == {model.resource.name: True}
-        assert saved['model_qsa_kv_offload'] == {model.resource.name: {'enabled': True, 'budget_bytes': 128 << 10}}
+        assert saved['model_qsa_kv_offload'] == {model.resource.name: {'enabled': True, 'budget_bytes': 128 << 10, 'ram_budget_bytes': None}}
         restored = RuntimeContextPolicy.model_validate(saved)
         assert restored.model_qsa_kv_offload[model.resource.name].enabled
         assert pool._instances[other.id] is other
@@ -86,6 +86,48 @@ def test_invalid_candidate_does_not_unload_or_save_any_setting(tmp_path, budget,
         await service.aclose()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('placement,allocation,preallocated', [('auto', 'preallocated', True),
+    ('auto_ssd', 'preallocated', True), ('auto_ssd', 'preallocated', False), ('vram', 'preallocated', True),
+    ('ram', 'preallocated', True), ('auto', 'dynamic', True), ('vram', 'dynamic', True)])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_kv_memory_policy_is_persisted_with_quantization_off(tmp_path, placement, allocation, preallocated, explicit):
+    model, pool, service, instance, _, _ = fixture(tmp_path)
+    pool.backend = 'cuda'
+    instance.kv_memory_supported = True
+    async def run():
+        memory = {'placement': placement, 'allocation': allocation, 'ram_preallocated': preallocated,
+            'gpu_budget_bytes': (1 << 30) if explicit else None, 'ram_budget_bytes': (1 << 30) if explicit else None}
+        from mfq.server.protocol.models import KvMemorySettings
+        memory = KvMemorySettings.model_validate(memory).model_dump()
+        pool.load = AsyncMock(return_value={'instance_id': str(uuid4()), 'model': model.resource.name, 'context_size': 32768})
+        await pool.configure_context(_TestJobContext(), {'instance_id': str(instance.id), 'context_size': 32768,
+            'kv_memory': memory})
+        request = pool.load.await_args.args[1]
+        assert request['kv_memory'] == memory
+        assert request['kv_quantization']['enabled'] is False
+        assert request['qsa_kv_offload']['enabled'] is False
+        assert service.store.runtime_context_policy()['model_kv_memory'][model.resource.name] == memory
+        pool._instances.clear()
+        await service.aclose()
+    asyncio.run(run())
+
+
+def test_kv_memory_launch_policy_and_metal_defaults(tmp_path):
+    model, pool, service, _, _, _ = fixture(tmp_path)
+    _, metal = pool._launch_configuration(model, ModelLoadRequest(model=model.resource.name), port=8105)
+    assert 'MFQ_KV_PLACEMENT' not in metal and 'MFQ_KV_ALLOCATION' not in metal
+    pool.backend = 'cuda'
+    for placement in ('auto', 'auto_ssd', 'vram', 'ram'):
+        request = ModelLoadRequest(model=model.resource.name, kv_memory={'placement': placement})
+        _, env = pool._launch_configuration(model, request, port=8105)
+        assert env['MFQ_KV_PLACEMENT'] == placement
+        assert env['MFQ_KV_ALLOCATION'] == 'preallocated'
+        assert env['MFQ_KV_TURBOQUANT_BITS'] == '0'
+        assert 'MFQ_QSA_KV_BUDGET_BYTES' not in env
+    pool._instances.clear()
+    asyncio.run(service.aclose())
 
 
 def test_failed_reload_recovers_previous_model_without_publishing_candidate_settings(tmp_path):

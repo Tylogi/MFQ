@@ -9,6 +9,8 @@ import { createBrowserRouter, createHashRouter, RouterProvider } from 'react-rou
 import App from './App';
 import { FailureView } from './app/FailurePage';
 import { isStudio } from './studio';
+import { SettingsProvider } from './features/settings/SettingsProvider';
+import { DesktopWindowFrame } from './app/DesktopWindowFrame';
 import './styles.css';
 
 interface AppErrorBoundaryState {
@@ -65,8 +67,12 @@ const router = createRouter([
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <AppErrorBoundary>
-      <RouterProvider router={router} />
-    </AppErrorBoundary>
+    <SettingsProvider>
+      <DesktopWindowFrame>
+        <AppErrorBoundary>
+          <RouterProvider router={router} />
+        </AppErrorBoundary>
+      </DesktopWindowFrame>
+    </SettingsProvider>
   </StrictMode>,
 );

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <limits>
+#include <utility>
 
 using namespace mfq::engine;
 
@@ -100,7 +101,14 @@ MfqScheduler::MfqScheduler(Engine& engine, Limits limits)
     : engine_(engine), limits_(limits), info_(engine.info()) {
     if (limits.events < 4 || limits.bytes < 4096 || !limits.requests || !limits.input_bytes)
         throw std::invalid_argument("scheduler requires positive input limits and at least 4 outbox events and 4096 bytes");
-    worker_ = std::thread([this] { loop(); });
+    std::promise<void> ready;
+    auto initialized = ready.get_future();
+    worker_ = std::thread([this, &ready] {
+        refresh_snapshot(true, false, true);
+        ready.set_value();
+        loop();
+    });
+    initialized.get();
 }
 MfqScheduler::~MfqScheduler() { shutdown(); }
 void MfqScheduler::shutdown() {
@@ -127,6 +135,38 @@ EngineInfo MfqScheduler::info() const {
 EngineStatus MfqScheduler::status() const {
     Status command;
     auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+MfqScheduler::Snapshot MfqScheduler::snapshot() const {
+    std::lock_guard lock(mutex_);
+    if (!stopping_ && Clock::now() - snapshot_.captured >= std::chrono::milliseconds(250)) {
+        snapshot_requested_ = true;
+        wake_->notify_one();
+    }
+    return snapshot_;
+}
+void MfqScheduler::refresh_snapshot(bool healthy, bool blocked, bool metrics) {
+    auto status = engine_.status();
+    status.healthy &= healthy;
+    if (blocked || !status.healthy) status.available = 0;
+    std::optional<Metrics> runtime, session;
+    if (metrics) {
+        try { runtime = std::get<Metrics>(engine_.control(RuntimeMetrics{})); } catch (...) {}
+        try { session = engine_.session({SessionCommand::Kind::metrics}).metrics; } catch (...) {}
+    }
+    std::lock_guard lock(mutex_);
+    snapshot_.status = status;
+    const auto merge = [](Metrics& target, const Metrics& updates) {
+        for (const auto& value : updates) {
+            auto found = std::find_if(target.begin(), target.end(), [&](const auto& existing) {
+                return existing.first == value.first;
+            });
+            if (found == target.end()) target.push_back(value);
+            else found->second = value.second;
+        }
+    };
+    if (runtime) merge(snapshot_.runtime, *runtime);
+    if (session) merge(snapshot_.session, *session);
+    if (runtime && session) snapshot_.captured = Clock::now();
 }
 std::shared_ptr<MfqScheduledRequest> MfqScheduler::submit(EngineRequest input) const {
     if (input.id.empty() || input.id.size() > 128)
@@ -310,6 +350,7 @@ void MfqScheduler::loop() noexcept {
                     auto result = engine_.control(std::move(value.request));
                     if (start_duplex) duplex_active = true;
                     if (stop_duplex) duplex_active = false;
+                    refresh_snapshot(healthy, duplex_active || stopping, true);
                     control_work |= stop_duplex || std::holds_alternative<ControlPending>(result);
                     if (std::holds_alternative<ControlPending>(result)) pending_control.emplace(std::move(value));
                     else value.reply.set_value(std::move(result));
@@ -327,7 +368,9 @@ void MfqScheduler::loop() noexcept {
                                 throw std::runtime_error("session operation conflicts with active generation");
                         }
                     }
-                    value.reply.set_value(engine_.session(value.request));
+                    auto result = engine_.session(value.request);
+                    refresh_snapshot(healthy, reload.has_value() || duplex_active || stopping, true);
+                    value.reply.set_value(std::move(result));
                 } else if constexpr (std::is_same_v<T, Status>) {
                     auto status = engine_.status();
                     status.healthy &= healthy;
@@ -468,6 +511,9 @@ void MfqScheduler::loop() noexcept {
             try { engine_.shutdown(); } catch (...) {}
             return;
         }
+        bool refresh;
+        { std::lock_guard lock(mutex_); refresh = std::exchange(snapshot_requested_, false); }
+        refresh_snapshot(healthy, reload.has_value() || duplex_active || stopping, !commands.empty() || refresh);
         if (!executable) {
             std::unique_lock lock(mutex_);
             if (mailbox_.empty() && !stopping_) {

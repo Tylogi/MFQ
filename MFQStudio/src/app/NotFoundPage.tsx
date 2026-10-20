@@ -2,6 +2,7 @@
 import { ArrowLeftIcon, HouseIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
+import mfqMark from '../assets/mfq-mark.svg';
 
 /** 在未知路由展示独立页面，不重定向或改写用户输入的地址。 */
 export function NotFoundPage() {
@@ -37,7 +38,7 @@ export function NotFoundPage() {
         </div>
       </div>
       <div className="failure-page-footer" aria-hidden="true">
-        <img src="/mfq-mark.svg" alt="" />
+        <img src={mfqMark} alt="" />
         <span>MFQ Studio</span>
       </div>
     </section>

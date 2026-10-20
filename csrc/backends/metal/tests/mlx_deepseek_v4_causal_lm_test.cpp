@@ -1,6 +1,6 @@
-#include "mlx_deepseek_v4_causal_lm.h"
+#include "models/deepseek_v4/mlx_deepseek_v4_causal_lm.h"
 #include "grammar_fixture.h"
-#include "mlx_transformer.h"
+#include "runtime/mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
 

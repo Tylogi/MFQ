@@ -98,12 +98,21 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
             Path(environment_root),
             source="MFQ_SERVER_WEB_ROOT",
         )
+    if getattr(sys, "frozen", False):
+        bundled_root = Path(sys.executable).resolve().parent.parent / "web-ui"
+        if bundled_root.is_dir():
+            return _validate_web_root(bundled_root, source="bundled")
     web_dir = Path(__file__).resolve().parents[2] / "MFQStudio"
     package = web_dir / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"
     if not package.is_file():
-        return None
+        if index.is_file():
+            return output
+        raise FileNotFoundError(
+            "Web UI assets were not found. Pass --web-root with a prebuilt frontend "
+            "or explicitly use --no-web-ui for an API-only server."
+        )
 
     inputs = [
         *(path for path in web_dir.iterdir() if path.is_file()),
@@ -118,11 +127,11 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
 
     npm = shutil.which("npm")
     if npm is None:
-        print(
-            "Web UI source was found but npm is unavailable; serving the API only",
-            file=sys.stderr,
+        raise RuntimeError(
+            "Web UI needs to be built but npm is unavailable. Install Node.js/npm, "
+            "pass --web-root with a prebuilt frontend, or explicitly use --no-web-ui "
+            "for an API-only server."
         )
-        return None
     print("Building MFQ Web UI...", flush=True)
     try:
         subprocess.run([npm, "ci"], cwd=web_dir, check=True)
@@ -173,7 +182,15 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
     if requested == "auto":
         if system == "Darwin" and machine in {"arm64", "aarch64"}:
             return "metal"
-        if system in {"Linux", "Windows"}:
+        if system == "Linux":
+            from mfq.commands.build import _cuda_compiler, _hip_compiler
+
+            if _cuda_compiler() is not None:
+                return "cuda"
+            if _hip_compiler() is not None:
+                return "hip"
+            return "cuda"
+        if system == "Windows":
             return "cuda"
         raise BuildError(f"no prebuilt MFQ runtime backend is supported on {system} {machine}")
     if requested == "metal":
@@ -184,6 +201,10 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
         if system not in {"Linux", "Windows"}:
             raise BuildError("the CUDA runtime is supported on Linux and Windows")
         return "cuda"
+    if requested == "hip":
+        if system != "Linux":
+            raise BuildError("the HIP runtime is supported on Linux")
+        return "hip"
     raise BuildError(f"unsupported inference backend: {requested}")
 
 
@@ -207,11 +228,27 @@ def _server_storage_paths(
 
 
 def _run(args: argparse.Namespace) -> int:
+    from mfq.server.api.network import network_auth_error
+    from mfq.server.instance import ServerAlreadyRunningError, ServerInstanceLock
+
+    if error := network_auth_error(args.host, os.environ.get(args.api_key_env, "")):
+        raise ValueError(error)
+    instance_id = getattr(args, "studio_instance_id", None)
+    studio_owned = bool(getattr(args, "exit_on_stdin_close", False))
+    if instance_id and not studio_owned:
+        raise ValueError("--studio-instance-id requires --exit-on-stdin-close")
+    try:
+        with ServerInstanceLock(args.data_dir, instance_id=instance_id, studio_owned=studio_owned) as instance:
+            return _run_locked(args, instance.identity)
+    except ServerAlreadyRunningError as error:
+        print(f"MFQ Server not started: {error}", file=sys.stderr)
+        return 1
+
+
+def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int:
     from mfq.server.api.network import install_system_proxy_environment, network_auth_error
 
     client_api_key = os.environ.get(args.api_key_env, "")
-    if error := network_auth_error(args.host, client_api_key):
-        raise ValueError(error)
     install_system_proxy_environment()
     import uvicorn
 
@@ -294,7 +331,7 @@ def _run(args: argparse.Namespace) -> int:
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
         max_instances=args.max_runtime_instances,
-        max_requests_per_instance=args.max_requests_per_runtime,
+        max_requests_per_instance=args.max_requests_per_runtime or (8 if selected_backend == "metal" else 1),
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
         max_runtime_memory_bytes=args.max_runtime_memory or None,
         automatic_memory_budget=(
@@ -356,17 +393,22 @@ def _run(args: argparse.Namespace) -> int:
     )
     api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
     if web_root is None:
-        print("Web UI assets were not found; serving the API only")
+        print("Web UI disabled by --no-web-ui; serving the API only")
     listener_settings = data_dir / "listener.json"
+    app = create_app(service, web_root=web_root, api_keys=api_keys, auth_settings_path=data_dir / "auth.json",
+        server_identity=identity)
+    if error := network_auth_error(args.host, "configured" if app.state.auth_policy.enabled else ""):
+        raise ValueError(error)
     RuntimeServer(uvicorn.Config(
-        create_app(service, web_root=web_root, api_keys=api_keys),
+        app,
         host=args.host,
         port=args.port if args.port is not None else saved_service_port(listener_settings),
         log_level=args.log_level,
         access_log=args.access_log,
+        timeout_graceful_shutdown=5 if args.exit_on_stdin_close else None,
     ), listener_settings, anthropic_port=(
         args.anthropic_port if args.anthropic_port is not None else saved_service_port(listener_settings, "anthropic")
-    )).run()
+    ), parent_input=getattr(sys.stdin, "buffer", sys.stdin) if args.exit_on_stdin_close else None).run()
     return 0
 
 
@@ -380,6 +422,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("--model", type=Path, help="optional MFQ model to load at startup")
+    parser.add_argument("--exit-on-stdin-close", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--studio-instance-id", help=argparse.SUPPRESS)
     parser.add_argument(
         "--running-executable",
         type=Path,
@@ -467,7 +511,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
-    parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=1)
+    parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=None)
     parser.add_argument(
         "--max-queued-requests-per-runtime",
         type=_nonnegative_int,
@@ -495,7 +539,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=True,
         help="emit one HTTP access-log line per request (default: enabled)",
     )
-    parser.add_argument("--backend", choices=("auto", "cuda", "metal"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "cuda", "hip", "metal"), default="auto")
     parser.add_argument(
         "--transport",
         type=str.lower,

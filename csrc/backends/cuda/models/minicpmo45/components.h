@@ -849,7 +849,7 @@ struct MiniCPMO45AudioEncoder {
 };
 #include <random>
 #include "policy.h"
-#include "sampling.h"
+#include "csrc/engine/requests/sampling.h"
 #include "models/common/full_block.h"
 #include "ops.h"
 

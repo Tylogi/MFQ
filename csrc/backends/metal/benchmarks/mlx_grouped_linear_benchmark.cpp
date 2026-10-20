@@ -1,6 +1,6 @@
-#include "mfq_container.h"
-#include "mlx_grouped_linear.h"
-#include "mlx_tensor.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_grouped_linear.h"
+#include "runtime/mlx_tensor.h"
 
 #include <algorithm>
 #include <chrono>

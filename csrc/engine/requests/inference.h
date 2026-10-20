@@ -9,10 +9,13 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
 namespace mfq::engine {
+
+std::unordered_set<std::int64_t> model_stop_token_ids(std::string_view config, std::int64_t vocabulary);
 
 struct InferenceRequest {
     bool chat = true;
@@ -22,6 +25,7 @@ struct InferenceRequest {
     std::unordered_set<std::int64_t> preserved_tokens;
     std::vector<std::int64_t> prompt;
     std::vector<std::string> stops;
+    std::unordered_set<std::int64_t> stop_token_ids;
     MfqSamplingParams sampling;
     MfqPromptCachePlan cache_plan;
     MfqTokenConstraintPtr token_constraint;

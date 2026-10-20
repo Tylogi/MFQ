@@ -5,7 +5,49 @@ import io
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
 from mfq.server.services.inference_benchmark import _failure
+
+
+class ScoringArray(np.ndarray):
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return np.asarray(self)
+
+    def to(self, device):
+        if device not in (None, 'cpu'):
+            raise ValueError('official scoring arrays are CPU-only')
+        return self
+
+    def squeeze(self, axis=None):
+        if axis is not None and self.shape[axis] != 1:
+            return self
+        return super().squeeze(axis)
+
+
+def _scoring_softmax(values, dim):
+    values = np.asarray(values, dtype=np.float32)
+    weights = np.exp(values - values.max(axis=dim, keepdims=True))
+    return (weights / weights.sum(axis=dim, keepdims=True)).view(ScoringArray)
+
+
+class ScoringArrayOps:
+    nn = SimpleNamespace(functional=SimpleNamespace(softmax=_scoring_softmax))
+
+    @staticmethod
+    def tensor(values):
+        return np.asarray(values, dtype=np.float32).view(ScoringArray)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def no_grad():
+        yield
 
 
 class NativeInput:
@@ -18,7 +60,7 @@ class NativeInput:
 
 class NativeLogProbs:
     def __init__(self, values):
-        self.values = values
+        self.values = np.asarray(values, dtype=np.float32)
 
     def squeeze(self, _axis):
         return self
@@ -63,7 +105,6 @@ async def mmlu_question(context, backend, question, scorer, examples):
         if k == 0:
             raise _failure("benchmark_context_exceeded", "MMLU question exceeds the official 2048-token limit even without demonstrations")
         k -= 1
-    torch = scorer["torch"]
     def tokenize(text, **_kwargs):
         if text in {"A", "B", "C", "D"}:
             return SimpleNamespace(input_ids=[ord(text) - 65])
@@ -74,7 +115,7 @@ async def mmlu_question(context, backend, question, scorer, examples):
         def _shift_right(self, ids):
             return ids
         def __call__(self, **_kwargs):
-            return SimpleNamespace(logits=torch.tensor([score["log_likelihood"] for score in result["scores"]]))
+            return SimpleNamespace(logits=np.asarray([score["log_likelihood"] for score in result["scores"]], dtype=np.float32))
     with contextlib.redirect_stdout(io.StringIO()):
         correct, _accuracy, probabilities = scorer["eval"](SimpleNamespace(ntrain=k), subject, Model(), tokenize, dev, test)
     predicted = chr(65 + int(probabilities[0].argmax()))
@@ -104,7 +145,6 @@ async def truthful_question(context, backend, question, scorer, _examples):
         prompt_tokens = result["prompt_tokens"]
         native.extend(result["scores"])
     lookup = dict(zip(full_prompts, native, strict=True))
-    torch = scorer["torch"]
     def tokenize(text, **_kwargs):
         if text == prompt:
             count = prompt_tokens
@@ -112,10 +152,10 @@ async def truthful_question(context, backend, question, scorer, _examples):
             count = prompt_tokens + len(lookup[text]["token_ids"])
         else:
             raise _failure("official_prompt_mismatch", "official TruthfulQA prompt differs from the scored text")
-        return NativeEncoding(input_ids=torch.zeros((1, count), dtype=torch.int64))
+        return NativeEncoding(input_ids=np.zeros((1, count), dtype=np.int64).view(ScoringArray))
     class Model:
         def __call__(self, ids):
-            return [NativeLogProbs(torch.tensor([0.] * (prompt_tokens - 1) + pending[0]["token_logprobs"] + [0.]))]
+            return [NativeLogProbs([0.] * (prompt_tokens - 1) + pending[0]["token_logprobs"] + [0.])]
     pending = []
     def tokenizer(text, **kwargs):
         if text in lookup:

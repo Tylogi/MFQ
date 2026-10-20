@@ -1,9 +1,9 @@
 #pragma once
 
-#include "step_sequence.h"
+#include "csrc/core/step_sequence.h"
 
 #include "models/cuda_model_plan.h"
-#include "models/common/block.h"
+#include "block.h"
 #include "resource_plan.h"
 #include "mfq/model_source/model_source.h"
 #include "common/causal_model.h"
@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -56,7 +57,7 @@ template <typename Model>
 Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_path,
     const std::string& config_path, std::int64_t context_size_override = 0,
     bool load_blocks = true, bool defer_moe_cache_finalize = false,
-    std::shared_ptr<const mfq::ModelSource> source = {});
+    std::shared_ptr<const mfq::ModelSource> source = {}, bool load_input_output = true);
 
 struct CausalResources {
     // The default family strategy: text only, plain execution paths. A family
@@ -70,6 +71,7 @@ struct CausalResources {
         bool batch, std::size_t devices, const MtpModule*) const;
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
+    std::function<void()> restore_decode_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     captured_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
@@ -185,6 +187,14 @@ template <typename Model> struct CudaCausalOps : Model, CudaCausalModel {
         return value.narrow(0, start, count);
     }
     static Tensor concat_positions(Tensor first, Tensor second) {
+        // Generated text advances all semantic axes equally after an image.
+        if (first.dim() > 1 && second.dim() == 1) {
+            auto shape = first.sizes().vec();
+            shape.back() = second.size(0);
+            std::vector<int64_t> view(shape.size(),1);
+            view.back() = second.size(0);
+            second = second.reshape(view).expand(shape);
+        }
         return mfq_tensor_backend::cat({first, second}, -1);
     }
     static int64_t rank(const Tensor &value) { return value.dim(); }

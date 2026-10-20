@@ -1,7 +1,7 @@
-#include "mfq_container.h"
-#include "mlx_moe_ops.h"
-#include "mlx_nint.h"
-#include "mlx_nint8_zero.h"
+#include "storage/mfq_container.h"
+#include "ops/mlx_moe_ops.h"
+#include "ops/mlx_nint.h"
+#include "ops/mlx_nint8_zero.h"
 
 #include <algorithm>
 #include <chrono>

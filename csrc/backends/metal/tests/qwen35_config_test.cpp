@@ -1,5 +1,5 @@
-#include "qwen35_model.h"
-#include "mlx_legacy_tensor_compat.h"
+#include "models/qwen35/qwen35_model.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
 
 #include <iostream>
 #include <stdexcept>

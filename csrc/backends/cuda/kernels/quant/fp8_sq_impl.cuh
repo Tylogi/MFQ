@@ -3,7 +3,7 @@
 // Shared by the FP8-SQ inference unit and the tool-only backward unit: the
 // blob layout both sides build and the metadata checks both sides run.
 
-#include "fp8_sq.h"
+#include "kernels/quant/fp8_sq.h"
 
 #include <cstddef>
 #include <cstdint>

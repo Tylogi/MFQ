@@ -1,6 +1,6 @@
-#include "mlx_grid_vision.h"
-#include "mlx_tensor_schema.h"
-#include "qwen35_model.h"
+#include "runtime/mlx_grid_vision.h"
+#include "storage/mlx_tensor_schema.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include <cmath>
 #include <cstdint>

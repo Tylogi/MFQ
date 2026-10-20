@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import struct
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -78,9 +80,16 @@ def test_checkpoint_metadata_preserves_expert_ids_and_encoded_budget(tmp_path: P
     assert result.attention_heads == 2
     assert result.kv_heads == 1
     assert result.cache_profile.max_context == 32768
-    assert result.cache_profile.fixed_bytes == 0
+    # Metal's rolling indexer tail has fixed storage; only pooled index rows
+    # grow with context. The CUDA full indexer is priced separately.
+    assert result.cache_profile.fixed_bytes == (4 + 5) * 4 * 2 + 2
+    assert [(item.name, item.bytes) for item in result.cache_profile.fixed_components] == [
+        ("indexer_tail", 74),
+    ]
     assert {item.group for item in result.cache_profile.components} == {"QSA"}
-    assert [item.bytes_per_row for item in result.cache_profile.components] == [32, 8, 16]
+    assert [(item.name, item.bytes_per_row) for item in result.cache_profile.components] == [
+        ("raw_kv", 32), ("indexer_pooled", 16),
+    ]
     assert not result.warnings
     assert len(result.experts) == (4 if fused else 2)
     first = next(item for item in result.experts if item.expert == 0 and item.projection == "gate")
@@ -107,6 +116,99 @@ def test_fused_gate_up_does_not_assume_identical_row_precision(tmp_path: Path) -
     assert result.advanced.hc_lowrank is None
     assert result.advanced.active_blocks is None
     assert result.advanced.expert_hidden_size == 2
+
+
+@pytest.mark.parametrize("source_names", [False, True])
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+def test_full_model_bpw_excludes_predictor_and_vision_only(tmp_path: Path, source_names: bool, dtype) -> None:
+    import json
+    path = tmp_path / "model.mfq"
+    predictor = "mtp.fc_hidden.weight" if source_names else "predictor.fusion.hidden.weight"
+    vision = "model.visual.patch_embed.proj.weight" if source_names else "vision.patch_embedding.weight"
+    save(path, FileHeader(model_arch="test"), {
+        MODEL_CONFIG_ASSET: json.dumps({"model_type": "qwen4_exp", "text_config": {
+            "model_type": "qwen4_exp_text", "num_hidden_layers": 1, "mtp_num_hidden_layers": 1}}).encode(),
+        "model.block.0.attention.query.weight": nint([4, 4], [4, 4]),
+        "model.embedding.weight": np.ones((8, 16), dtype=np.float16),
+        "model.output.weight": np.ones((8, 16), dtype=np.float16),
+        "model.block.0.position_embedding.ngram.shard.0.weight": np.ones((8, 16), dtype=np.float16),
+        predictor: np.ones((32, 16), dtype=dtype),
+        vision: np.ones((32, 16), dtype=dtype),
+    })
+    result = analyze_checkpoint(ModelCatalog._inspect(tmp_path, path))
+    main = [item for item in result.tensors if item.category not in {"predictor", "vision"}]
+    assert {item.category for item in main} == {"attention", "embedding", "lm_head", "ple"}
+    assert len(main) == 4
+    assert result.average_bpw == pytest.approx(8 * sum(item.stored_bytes for item in main) / sum(item.parameters for item in main))
+    assert result.average_bpw != pytest.approx(8 * result.stored_bytes / result.parameters)
+    assert result.parameters == sum(item.parameters for item in result.tensors)
+    assert result.stored_bytes == sum(item.stored_bytes for item in result.tensors)
+    assert {item.category for item in result.projections} >= {"predictor", "vision"}
+    assert all(item.average_bpw is not None for item in result.projections)
+    assert not result.warnings
+
+
+@pytest.mark.parametrize("name,excluded", [
+    ("predictor.block.0.mlp.experts.down.weight", True),
+    ("vision.block.0.attention.query.weight", True),
+    ("model.block.0.attention.key.weight", False),
+])
+def test_bpw_completeness_check_uses_only_main_weights(tmp_path: Path, name: str, excluded: bool) -> None:
+    path = tmp_path / "model.mfq"
+    value = replace(nint([4] * 4, [4] * 4), axis=2)
+    save(path, FileHeader(model_arch="test"), {
+        "model.block.0.attention.query.weight": np.ones((4, 16), dtype=np.float16),
+        name: value,
+    })
+    result = analyze_checkpoint(ModelCatalog._inspect(tmp_path, path))
+    main = next(item for item in result.tensors if item.name == "model.block.0.attention.query.weight")
+    if excluded:
+        assert result.average_bpw == pytest.approx(8 * main.stored_bytes / main.parameters)
+    else:
+        assert result.average_bpw is None
+    assert any(name in warning for warning in result.warnings)
+    assert next(item for item in result.tensors if item.name == name).bpw is None
+
+
+def test_auxiliary_only_checkpoint_has_no_full_model_bpw(tmp_path: Path) -> None:
+    path = tmp_path / "auxiliary.mfq"
+    save(path, FileHeader(model_arch="test"), {
+        "predictor.fusion.weight": np.ones((4, 16), dtype=np.float16),
+        "vision.patch_embedding.weight": np.ones((4, 16), dtype=np.float16),
+    })
+    result = analyze_checkpoint(ModelCatalog._inspect(tmp_path, path))
+    assert result.average_bpw is None
+    assert result.parameters > 0
+    assert all(item.average_bpw is not None for item in result.projections)
+
+
+def test_hf_full_model_bpw_excludes_mapped_predictor_and_vision(tmp_path: Path) -> None:
+    import json
+
+    config = {"model_type": "qwen4_exp", "text_config": {
+        "model_type": "qwen4_exp_text", "num_hidden_layers": 1, "mtp_num_hidden_layers": 1}}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": np.ones((4, 16), dtype=np.float16),
+        "mtp.fc_hidden.weight": np.ones((32, 16), dtype=np.float32),
+        "model.visual.patch_embed.proj.weight": np.ones((32, 16), dtype=np.float32),
+    }
+    header, payloads, offset = {}, [], 0
+    for name, tensor in tensors.items():
+        payload = tensor.tobytes()
+        header[name] = {"dtype": "F16" if tensor.dtype == np.float16 else "F32",
+            "shape": list(tensor.shape), "data_offsets": [offset, offset + len(payload)]}
+        payloads.append(payload)
+        offset += len(payload)
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    (tmp_path / "model.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(payloads))
+    result = analyze_checkpoint(ModelCatalog._inspect(tmp_path, tmp_path))
+    assert result.average_bpw == 16
+    assert result.average_bpw != pytest.approx(8 * result.stored_bytes / result.parameters)
+    assert {item.category for item in result.tensors} == {"embedding", "predictor", "vision"}
+    assert {item.category: item.average_bpw for item in result.projections} == {
+        "embedding": 16, "predictor": 32, "vision": 32}
 
 
 def test_advanced_qwen_details_distinguish_activations_and_sparse_budget(tmp_path: Path) -> None:

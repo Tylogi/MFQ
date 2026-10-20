@@ -138,11 +138,10 @@ it('历史推理默认折叠，流式推理默认展开且只显示当前会话'
   expect(screen.queryByText('Thinking')).not.toBeInTheDocument();
 });
 
-it('默认生成限制为 4096，设置界面允许最高 65536', () => {
-  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
-  const limit = screen.getAllByRole('spinbutton').find((input) => input.getAttribute('max') === '65536');
-  expect(limit).toHaveValue(4096);
-  expect(limit).toHaveAttribute('min', '1');
+it('默认生成限制保持 4096，设置页不再暴露生成参数', () => {
+  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ language: DEFAULT_SETTINGS.language, theme: DEFAULT_SETTINGS.theme }} setSettingsDraft={vi.fn()} actions={{ resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
+  expect(DEFAULT_SETTINGS.maxTokens).toBe(4096);
+  expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
 });
 
 it('聊天容器拥有垂直滚动，推理正文不引入独立限高滚动区', () => {

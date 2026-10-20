@@ -120,7 +120,7 @@ it('keeps inspected cache text and allows retry when maintenance races a clear r
   fireEvent.click(screen.getByRole('button', { name: 'View text' }));
   await screen.findByText('Original prompt and generated reply');
   fireEvent.click(screen.getByRole('button', { name: 'Clear all' }));
-  await waitFor(() => expect(toast.error).toHaveBeenCalledWith('runtime_busy: wait for inference and cache writes to finish before clearing cache'));
+  await waitFor(() => expect(toast.error).toHaveBeenCalledWith('The runtime is handling requests or settings. Try again shortly.'));
   expect(screen.getByRole('button', { name: 'Clear all' })).toBeEnabled();
   expect(screen.getByText('Original prompt and generated reply')).toBeInTheDocument();
   expect(api.refresh).not.toHaveBeenCalled();

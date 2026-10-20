@@ -2,6 +2,7 @@
 #include "ops_common.cuh"
 
 #include <limits>
+#include <cstdlib>
 
 namespace mfq::cuda {
 using namespace native_ops_detail;
@@ -126,16 +127,16 @@ void launch_row_mean(
     else launch.template operator()<256>();
 }
 
-template <typename Value, int Threads>
+template <typename Value, int Threads,bool Chunks=false>
 __global__ void argmax_last_contiguous_kernel(
     const Value* input,
     std::int64_t* output,
     std::int64_t rows,
-    std::int64_t columns) {
+    std::int64_t columns,float* chunk_values=nullptr,std::int64_t chunks=1) {
     __shared__ float values[Threads];
     __shared__ std::int64_t indices[Threads];
     constexpr std::int64_t invalid_index = 0x7fffffffffffffffLL;
-    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    const auto row = static_cast<std::int64_t>(Chunks?blockIdx.y:blockIdx.x);
     if (row >= rows) return;
     const auto* row_input = input + row * columns;
     // BF16 retains its existing comparison contract. FP16/FP32 match the
@@ -144,8 +145,10 @@ __global__ void argmax_last_contiguous_kernel(
     constexpr bool generic = !std::is_same_v<Value, __nv_bfloat16>;
     float best_value = generic ? std::numeric_limits<float>::lowest() : 0.0f;
     std::int64_t best_index = invalid_index;
-    for (std::int64_t column = threadIdx.x;
-         column < columns;
+    const std::int64_t begin=Chunks?std::int64_t(blockIdx.x)*4096:0;
+    const std::int64_t end=Chunks?min(begin+4096,columns):columns;
+    for (std::int64_t column = begin+threadIdx.x;
+         column < end;
          column += Threads) {
         const float value = static_cast<float>(load_number(row_input, column));
         if ((!generic && best_index == invalid_index) ||
@@ -173,7 +176,47 @@ __global__ void argmax_last_contiguous_kernel(
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) output[row] = indices[0] == invalid_index ? 0 : indices[0];
+    if (threadIdx.x == 0) {
+        if constexpr(Chunks) {
+            const auto at=row*chunks+blockIdx.x;
+            output[at]=indices[0];chunk_values[at]=values[0];
+        }else output[row] = indices[0] == invalid_index ? 0 : indices[0];
+    }
+}
+
+__global__ void argmax_chunks_finish_kernel(const float* values,const std::int64_t* indices,
+        std::int64_t* output,int chunks) {
+    constexpr std::int64_t invalid=0x7fffffffffffffffLL;
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x;
+    float best=-std::numeric_limits<float>::max();std::int64_t index=invalid;
+    for(int chunk=threadIdx.x;chunk<chunks;chunk+=256) {
+        const auto other=indices[size_t(row)*chunks+chunk];
+        const float value=values[size_t(row)*chunks+chunk];
+        if(other!=invalid && (index==invalid || value>best || (value==best && other<index)))
+            {best=value;index=other;}
+    }
+    #pragma unroll
+    for(int offset=16;offset>0;offset>>=1) {
+        const float value=__shfl_down_sync(0xffffffffu,best,offset);
+        const auto other=__shfl_down_sync(0xffffffffu,index,offset);
+        if(other!=invalid && (index==invalid || value>best || (value==best && other<index)))
+            {best=value;index=other;}
+    }
+    __shared__ float warp_values[8];__shared__ std::int64_t warp_indices[8];
+    if(lane==0){warp_values[warp]=best;warp_indices[warp]=index;}
+    __syncthreads();
+    if(warp==0) {
+        best=lane<8?warp_values[lane]:-std::numeric_limits<float>::max();
+        index=lane<8?warp_indices[lane]:invalid;
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1) {
+            const float value=__shfl_down_sync(0xffffffffu,best,offset);
+            const auto other=__shfl_down_sync(0xffffffffu,index,offset);
+            if(other!=invalid && (index==invalid || value>best || (value==best && other<index)))
+                {best=value;index=other;}
+        }
+        if(lane==0)output[row]=index==invalid?0:index;
+    }
 }
 
 ScalarType reduction_type(ScalarType input, int operation) {
@@ -257,6 +300,26 @@ Tensor reduce_cuda(
         }
         MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
         return output;
+    }
+    if (operation == 3 &&
+        (source.scalar_type()==kFloat16 || source.scalar_type()==kFloat32) &&
+        reduced>=16384 && reduced<=std::numeric_limits<int>::max() && outer>0 && outer<=65535 &&
+        source.is_contiguous() && selected+1==static_cast<std::size_t>(source.dim()) &&
+        [] {const char* setting=mfq::cuda::env_lookup("MFQ_NATIVE_ARGMAX_CHUNKS");return !setting || setting[0]!='0';}()) {
+        // Use the same comparison tree in independent vocabulary chunks.
+        const int chunks=int((reduced+4095)/4096);
+        auto values=empty({outer,chunks},source.options().dtype(kFloat32));
+        auto indices=empty({outer,chunks},source.options().dtype(kInt64));
+        const auto launch=[&]<typename Value>() {
+            argmax_last_contiguous_kernel<Value,256,true><<<dim3(chunks,unsigned(outer)),256,0,stream>>>(
+                static_cast<const Value*>(source.data_ptr()),indices.data_ptr<std::int64_t>(),outer,reduced,
+                values.data_ptr<float>(),chunks);
+        };
+        if(source.scalar_type()==kFloat16)launch.template operator()<__half>();
+        else launch.template operator()<float>();
+        argmax_chunks_finish_kernel<<<unsigned(outer),256,0,stream>>>(
+            values.data_ptr<float>(),indices.data_ptr<std::int64_t>(),output.data_ptr<std::int64_t>(),chunks);
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());return output;
     }
     if (operation == 3 &&
         (source.scalar_type() == kBFloat16 ||

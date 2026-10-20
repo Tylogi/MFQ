@@ -1,4 +1,5 @@
 #include "batch_state.h"
+#include "ops/execution/execution_options.h"
 #include "ops/execution/cuda_execution.h"
 #include "linear_attention.h"
 #include "ops.h"
@@ -79,9 +80,14 @@ Qwen35BatchStorage::Qwen35BatchStorage(Qwen35CausalLm& model, size_t slots, bool
             paged_layers_.push_back(full);
             geometry.push_back({full->cuda_device,
                 full->kv_heads > 0 ? full->kv_heads : model.num_key_value_heads(),
-                full->attention_head_dim > 0 ? full->attention_head_dim : model.head_dim()});
+                full->attention_head_dim > 0 ? full->attention_head_dim : model.head_dim(),
+                mfq_tensor_backend::kFloat16,full->kv_quantization});
         }
         paged_kv_ = std::make_unique<BatchPagedKvPool>(geometry, slots, model.max_position_embeddings());
+        if(runtime_options::kv_vram_preallocated()) {
+            for(auto* layer:paged_layers_)layer->state->cache={};
+            paged_kv_->preallocate_context();
+        }
     }
 }
 BatchStorageStats Qwen35BatchStorage::stats() const noexcept {

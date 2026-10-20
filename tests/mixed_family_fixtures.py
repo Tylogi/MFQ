@@ -20,12 +20,6 @@ from mfq.formats.nvq import (
 )
 from mfq.formats.nvq1_l import NVQ1_L_T8_S3, Nvq1LTensor
 from mfq.formats.nvq1_s import NVQ1_S, NVQ1_S_BOOTSTRAP_BANKS, Nvq1STensor
-from mfq.quantize.npq0_l import dequantize_npq0_l
-from mfq.quantize.npq0_s import dequantize_npq0_s
-from mfq.quantize.nvq1_l_quant import dequantize as dequantize_nvq1_l
-from mfq.quantize.nvq1_s_quant import dequantize as dequantize_nvq1_s
-from mfq.quantize.nvq_jsc import dequantize_nvq_jsc
-from mfq.quantize.nvq_quant import dequantize as dequantize_nvq
 
 
 FLAT_FAMILIES = (
@@ -155,15 +149,21 @@ def make_flat_family(
 
 def dequantize_flat_family(tensor) -> np.ndarray:
     if isinstance(tensor, NvqJscTensor):
+        from mfq.quantize.nvq_jsc import dequantize_nvq_jsc
         return dequantize_nvq_jsc(tensor)
     if isinstance(tensor, NvqTensor):
+        from mfq.quantize.nvq_quant import dequantize as dequantize_nvq
         return dequantize_nvq(tensor)
     if isinstance(tensor, Nvq1LTensor):
+        from mfq.quantize.nvq1_l_quant import dequantize as dequantize_nvq1_l
         return dequantize_nvq1_l(tensor)
     if isinstance(tensor, Nvq1STensor):
+        from mfq.quantize.nvq1_s_quant import dequantize as dequantize_nvq1_s
         return dequantize_nvq1_s(tensor)
     if isinstance(tensor, Npq0LTensor):
+        from mfq.quantize.npq0_l import dequantize_npq0_l
         return dequantize_npq0_l(tensor)
     if isinstance(tensor, Npq0STensor):
+        from mfq.quantize.npq0_s import dequantize_npq0_s
         return dequantize_npq0_s(tensor)
     raise TypeError(type(tensor))

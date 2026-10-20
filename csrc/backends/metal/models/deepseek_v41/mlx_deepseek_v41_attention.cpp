@@ -1,10 +1,11 @@
 #include "mlx_deepseek_v41_attention.h"
 
-#include "mlx_dsa.h"
-#include "mlx_detached_copy.h"
-#include "mlx_mx.h"
-#include "mlx_sparse_attention.h"
-#include "mlx_transformer.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_csa2.h"
+#include "runtime/mlx_detached_copy.h"
+#include "ops/mlx_mx.h"
+#include "ops/mlx_sparse_attention.h"
+#include "runtime/mlx_transformer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,61 +104,16 @@ array empty_topk(int batch, int tokens) {
     return mlx::core::zeros(Shape{batch, tokens, 0}, mlx::core::int32);
 }
 
-array normalize_topk(
-    const array& selected,
-    const array& valid,
-    int pool_length) {
-    auto sentinel = array(pool_length, mlx::core::int32);
-    auto ordered = mlx::core::sort(
-        mlx::core::where(valid, selected, sentinel), -1);
-    return mlx::core::where(
-        mlx::core::less(ordered, sentinel),
-        ordered,
-        array(-1, mlx::core::int32));
-}
-
 array topk_from_scores(
     const array& scores,
     int requested,
-    int pool_length,
-    const std::optional<array>& source_indices = std::nullopt,
-    const std::optional<array>& valid_counts = std::nullopt) {
+    const std::optional<array>& source_indices = std::nullopt) {
     const int width = scores.shape(-1);
     const int count = std::min(requested, width);
     if (count <= 0) {
         return empty_topk(scores.shape(0), scores.shape(1));
     }
-    array relative = [&]() -> array {
-        if (count == width) {
-            return mlx::core::broadcast_to(
-                mlx::core::reshape(
-                    positions(0, width), Shape{1, 1, width}),
-                scores.shape());
-        }
-        const bool use_deepselect = requested == 512 && count == 512 &&
-            mlx_deepselect_topk512_preferred(
-                width,
-                scores.shape(0) * scores.shape(1));
-        return use_deepselect
-            ? mlx_deepselect_topk512(scores, valid_counts)
-            : slice_axis(
-                  mlx::core::argpartition(scores, width - count, -1),
-                  -1,
-                  width - count,
-                  width);
-    }();
-    auto values = mlx::core::take_along_axis(scores, relative, -1);
-    auto selected = source_indices
-        ? mlx::core::take_along_axis(*source_indices, relative, -1)
-        : relative;
-    auto valid = mlx::core::logical_and(
-        mlx::core::greater(
-            values,
-            array(-std::numeric_limits<float>::infinity(), values.dtype())),
-        mlx::core::logical_and(
-            mlx::core::greater_equal(selected, array(0, mlx::core::int32)),
-            mlx::core::less(selected, array(pool_length, mlx::core::int32))));
-    return normalize_topk(selected, valid, pool_length);
+    return mlx_csa2_topk(scores, count, source_indices);
 }
 
 array all_visible_indices(
@@ -292,11 +248,22 @@ array index_scores(
     const array& keys,
     const array& weights,
     int ratio,
-    int pos0) {
+    int pos0,
+    const std::optional<array>& candidates = std::nullopt) {
     const int batch = query.shape(0);
     const int tokens = query.shape(1);
     const int heads = query.shape(2);
     const int pool_length = keys.shape(1);
+    if (keys.dtype() == mlx::core::uint8) {
+        return mlx_csa2_index_scores(query, keys, weights, pos0, ratio, candidates);
+    }
+    if (candidates) {
+        auto scores = index_scores(query, keys, weights, ratio, pos0);
+        auto safe = mlx::core::maximum(*candidates, array(0, mlx::core::int32));
+        auto selected = mlx::core::take_along_axis(scores, safe, -1);
+        return mlx::core::where(*candidates >= array(0, mlx::core::int32), selected,
+            array(-std::numeric_limits<float>::infinity(), selected.dtype()));
+    }
     if ((heads == 32 || heads == 64) && query.shape(3) == 128) {
         return tokens == 1
             ? mlx_dsa_indexer_scores_decode(
@@ -342,21 +309,6 @@ array index_scores(
         array(-std::numeric_limits<float>::infinity(), mlx::core::float32));
 }
 
-array filter_candidate_scores(
-    const array& scores,
-    const array& blocks,
-    int block_size,
-    int pool_length) {
-    auto candidates = candidate_positions(blocks, block_size, pool_length);
-    auto safe = mlx::core::maximum(candidates, array(0, mlx::core::int32));
-    auto selected = mlx::core::take_along_axis(scores, safe, -1);
-    selected = mlx::core::where(
-        mlx::core::greater_equal(candidates, array(0, mlx::core::int32)),
-        selected,
-        array(-std::numeric_limits<float>::infinity(), scores.dtype()));
-    return topk_from_scores(selected, 512, pool_length, candidates);
-}
-
 array apply_attention(
     const array& query,
     const array& local,
@@ -367,6 +319,10 @@ array apply_attention(
     int pos0,
     int ratio,
     int window) {
+    if (local.dtype() == mlx::core::uint8) {
+        return mlx_csa2_attention(query, local, pooled, pool_length, topk, sinks,
+            pos0, ratio == 0 ? 1 : ratio, window);
+    }
     const int batch = query.shape(0);
     const int tokens = query.shape(1);
     auto transposed = mlx::core::transpose(query, {0, 2, 1, 3});
@@ -471,16 +427,20 @@ MlxDeepseekV41AttentionState MlxDeepseekV41AttentionState::allocate(
     }
     const int window = checked_int(config.sliding_window, "sliding window");
     const int head_dim = checked_int(config.head_dim, "head dimension");
+    const bool packed = head_dim % 32 == 0 && config.index_head_dim % 32 == 0;
     MlxDeepseekV41AttentionState state{
-        mlx::core::zeros(Shape{batch, window, head_dim}, dtype)};
+        mlx::core::zeros(Shape{batch, window, packed ? head_dim + head_dim / 32 : head_dim},
+            packed ? mlx::core::uint8 : dtype)};
     if (config.is_kv_source(layer)) {
         const int ratio = static_cast<int>(config.compress_ratios[layer]);
         const int capacity = std::max(1, max_context / ratio);
         state.compressed_kv = mlx::core::zeros(
-            Shape{batch, capacity, head_dim}, dtype);
+            Shape{batch, capacity, packed ? head_dim / 2 + head_dim / 16 : head_dim},
+            packed ? mlx::core::uint8 : dtype);
         state.index_k = mlx::core::zeros(
-            Shape{batch, capacity, checked_int(config.index_head_dim, "index dimension")},
-            dtype);
+            Shape{batch, capacity, packed ? checked_int(config.index_head_dim, "index dimension") / 2 +
+                checked_int(config.index_head_dim, "index dimension") / 32 : checked_int(config.index_head_dim, "index dimension")},
+            packed ? mlx::core::uint8 : dtype);
         if (ratio > 1) {
             state.partial_kv = mlx::core::zeros(
                 Shape{batch, ratio, head_dim}, mlx::core::float32);
@@ -851,20 +811,36 @@ array MlxDeepseekV41Attention::forward(
     const array& input,
     MlxDeepseekV41AttentionState& state,
     MlxDeepseekV41SharedAttentionState& shared,
-    int pos0) const {
+    int pos0,
+    bool ced_replay,
+    const array* encoder_source) const {
     const int hidden = checked_int(config_.hidden, "hidden size");
     const int heads = checked_int(config_.n_heads, "head count");
     const int head_dim = checked_int(config_.head_dim, "head dimension");
     const int rotary = checked_int(config_.rope_head_dim, "rotary dimension");
     const int window = checked_int(config_.sliding_window, "sliding window");
+    const bool packed = state.local_kv.dtype() == mlx::core::uint8;
     if (input.ndim() != 3 || input.shape(0) <= 0 || input.shape(1) <= 0 ||
-        input.shape(2) != hidden || state.position != pos0 ||
+        input.shape(2) != hidden ||
+        (ced_replay ? state.position > pos0 : state.position != pos0) ||
         pos0 < 0 || pos0 + input.shape(1) > max_context_ ||
-        state.local_kv.shape() != Shape{input.shape(0), window, head_dim}) {
+        state.local_kv.shape() != Shape{input.shape(0), window, packed ? head_dim + head_dim / 32 : head_dim}) {
         throw std::invalid_argument("DeepSeek-V4.1 attention input/cache mismatch");
     }
     const int batch = input.shape(0);
     const int tokens = input.shape(1);
+    if (ced_replay && (tokens < window || state.speculation || ratio_ != 1 ||
+            layer_ < config_.n_layers / 2 ||
+            config_.is_kv_source(layer_) != (encoder_source != nullptr))) {
+        throw std::invalid_argument("invalid DeepSeek-V4.1 CED replay window");
+    }
+    if (encoder_source && (!ced_replay || !config_.is_kv_source(layer_) ||
+            encoder_source->ndim() != 3 || encoder_source->shape(0) != batch ||
+            encoder_source->shape(2) != hidden ||
+            state.position + encoder_source->shape(1) != pos0 + tokens ||
+            state.compressed_length != state.position)) {
+        throw std::invalid_argument("invalid DeepSeek-V4.1 CED encoder source");
+    }
     const float eps = static_cast<float>(config_.rms_eps);
     auto cosine = slice_axis(rope_.first, 0, pos0, pos0 + tokens);
     auto sine = slice_axis(rope_.second, 0, pos0, pos0 + tokens);
@@ -892,6 +868,9 @@ array MlxDeepseekV41Attention::forward(
         throw std::logic_error(
             "DeepSeek-V4.1 input projection group output mismatch");
     }
+    if (encoder_source) {
+        compressor_key_value = (*components_.compressor_key_value)(*encoder_source);
+    }
 
     auto q_rank = weighted_rms(
         query_a, components_.query_a_norm, eps);
@@ -903,6 +882,7 @@ array MlxDeepseekV41Attention::forward(
         rotary,
         cosine,
         sine);
+    if (packed) local_kv = mlx_csa2_pack(local_kv, 8, 32);
     if (state.speculation) {
         if (state.speculation->start_position != pos0 ||
             state.speculation->total_tokens != tokens ||
@@ -1030,14 +1010,15 @@ array MlxDeepseekV41Attention::forward(
                 eps);
             index_key = rope_tail(
                 index_key, rotary, group_cosine, group_sine);
-            index_key = mlx_mxfp4_sim(index_key);
+            index_key = packed ? mlx_csa2_pack(index_key, 4, 32) : mlx_mxfp4_sim(index_key);
             auto cache_rows = repeated_rows(batch, begin, count);
             *state.index_k = mlx_cache_write_inplace(
                 *state.index_k, index_key, cache_rows);
 
             auto compressed = rope_tail(
                 *latent, rotary, group_cosine, group_sine);
-            compressed = mlx_mxfp4_e4m3_scale_sim(compressed);
+            compressed = packed ? mlx_csa2_pack(compressed, 4, 16, true)
+                : mlx_mxfp4_e4m3_scale_sim(compressed);
             *state.compressed_kv = mlx_cache_write_inplace(
                 *state.compressed_kv, compressed, cache_rows);
             state.compressed_length += count;
@@ -1138,12 +1119,19 @@ array MlxDeepseekV41Attention::forward(
                             "DeepSeek-V4.1 Indexer score projection is unavailable");
                     }
                     const auto& weights = *index_score_projection;
+                    std::optional<array> candidates;
+                    if (layer_ > config_.candidate_source_layer) {
+                        if (!shared.candidate_blocks)
+                            throw std::runtime_error("DeepSeek-V4.1 hierarchical indexer has no candidates");
+                        candidates = candidate_positions(*shared.candidate_blocks, candidate_block_size, pool_length);
+                    }
                     auto scores = index_scores(
                         index_query,
                         pool_prefix(*shared.index_k, pool_length),
                         weights,
                         ratio_,
-                        pos0);
+                        pos0,
+                        candidates);
                     if (layer_ == config_.candidate_source_layer) {
                         shared.candidate_blocks = candidate_blocks_from_scores(
                             scores,
@@ -1154,51 +1142,15 @@ array MlxDeepseekV41Attention::forward(
                                 "candidate blocks"),
                             candidate_block_size);
                     }
-                    if (layer_ > config_.candidate_source_layer) {
-                        if (!shared.candidate_blocks) {
-                            throw std::runtime_error(
-                                "DeepSeek-V4.1 hierarchical indexer has no candidates");
-                        }
-                        auto candidates = candidate_positions(
-                            *shared.candidate_blocks,
-                            candidate_block_size,
-                            pool_length);
-                        auto safe = mlx::core::maximum(
-                            candidates, array(0, mlx::core::int32));
-                        auto candidate_scores = mlx::core::take_along_axis(
-                            scores, safe, -1);
-                        candidate_scores = mlx::core::where(
-                            mlx::core::greater_equal(
-                                candidates, array(0, mlx::core::int32)),
-                            candidate_scores,
-                            array(
-                                -std::numeric_limits<float>::infinity(),
-                                candidate_scores.dtype()));
-                        topk = topk_from_scores(
-                            candidate_scores,
-                            requested_topk,
-                            pool_length,
-                            candidates);
-                    } else {
-                        std::optional<array> valid_counts;
-                        if (mlx_deepselect_topk512_preferred(
-                                pool_length,
-                                batch * tokens)) {
-                            valid_counts = mlx::core::broadcast_to(
-                                mlx::core::reshape(
-                                    mlx::core::floor_divide(
-                                        positions(pos0, pos0 + tokens) +
-                                            array(1, mlx::core::int32),
-                                        array(ratio_, mlx::core::int32)),
-                                    Shape{1, tokens}),
-                                Shape{batch, tokens});
-                        }
+                    if (candidates) {
                         topk = topk_from_scores(
                             scores,
                             requested_topk,
-                            pool_length,
-                            std::nullopt,
-                            valid_counts);
+                            candidates);
+                    } else {
+                        topk = topk_from_scores(
+                            scores,
+                            requested_topk);
                     }
                 }
             }
@@ -1222,11 +1174,14 @@ array MlxDeepseekV41Attention::forward(
             state.local_kv, local_kv, rows);
         local_for_attention = state.local_kv;
     } else {
-        const int history = std::min(pos0, window);
-        auto history_values = mlx_circular_cache_history(
-            state.local_kv, pos0);
-        local_for_attention = mlx::core::concatenate(
-            {history_values, local_kv}, 1);
+        if (ced_replay) {
+            local_for_attention = local_kv;
+        } else {
+            auto history_values = mlx_circular_cache_history(
+                state.local_kv, pos0);
+            local_for_attention = mlx::core::concatenate(
+                {history_values, local_kv}, 1);
+        }
         const int recent = std::min(tokens, window);
         pending_local_values = slice_axis(
             local_kv, 1, tokens - recent, tokens);
@@ -1276,7 +1231,7 @@ array MlxDeepseekV41Attention::forward(
             tokens,
             groups * checked_int(config_.o_lora_rank, "output rank"),
         });
-    state.position += tokens;
+    state.position = pos0 + tokens;
     return components_.output_b(low_rank);
 }
 

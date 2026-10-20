@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from mfq.server.runtime.disk_budget import DiskBudget
+
 _HASH = re.compile(r"[0-9a-f]{64}")
 _BUCKET = re.compile(r"[0-9a-f]{2}")
 _HEADER = struct.Struct("<8sI32s32s32sIIQ32s")
@@ -127,9 +129,9 @@ def maintain_prefix_disk_budget(directory: Path, limit: int | None, *, evict: bo
     ancestor = directory
     while not ancestor.exists() and ancestor != ancestor.parent:
         ancestor = ancestor.parent
-    free = shutil.disk_usage(ancestor).free
-    capacity = (free + used) // 2 if limit is None else min(limit, (free + used) * 9 // 10)
-    capacity = min(capacity, max(0, free + used - (1 << 30)))
+    managed = max(0, shutil.disk_usage(ancestor).free + used - DiskBudget().reserved(ancestor))
+    capacity = managed // 2 if limit is None else min(limit, managed * 9 // 10)
+    capacity = min(capacity, max(0, managed - (1 << 30)))
     removed = 0
     released = 0
     if evict:

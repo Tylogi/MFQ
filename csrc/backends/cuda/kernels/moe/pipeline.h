@@ -26,6 +26,13 @@ void moe_plan_nvq_routes(const uint64_t* maps,int pools,int experts,const int32_
 cudaError_t moe_wire_launch_geometry(int* blocks,int* threads);
 void moe_scatter_wire(const void* wire,const uint32_t* cancelled,int blocks,int threads,cudaStream_t);
 void moe_scatter_wire_phase(const void* wire,const uint32_t* cancelled,int blocks,int threads,int phase,cudaStream_t);
+// A device snapshot's word 2 guards the wire copy: 0 valid, 1 cancelled,
+// 2 empty. The separate expert-cancellation flag remains boolean.
+void moe_scatter_wire_and_loan_phase(const void* wire,const void* loan,uint64_t capacity,
+    const uint32_t* cancelled,int blocks,int threads,int phase,cudaStream_t,bool device_snapshot=true);
+void wait_mapped_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,
+    const void* table,void* snapshot,uint64_t capacity,cudaStream_t,
+    const void* host_descriptors=nullptr,void* device_descriptors=nullptr,uint64_t descriptor_capacity=0);
 void moe_merge_results(const void* hot,const void* transfer,const void* cpu,const int32_t* ids,
     const int32_t* kind,void* output,int entries,int width,cudaStream_t);
 }

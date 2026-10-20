@@ -20,6 +20,8 @@ def config():
     return {'model_type': 'qwen4_exp_text', 'num_hidden_layers': 4,
         'layer_types': ['linear_attention'] * 3 + ['full_attention'],
         'max_position_embeddings': 262144, 'num_key_value_heads': 2, 'head_dim': 256,
+        'linear_num_key_heads': 2, 'linear_key_head_dim': 128, 'linear_num_value_heads': 4,
+        'linear_value_head_dim': 128, 'linear_conv_kernel_dim': 4,
         'indexer_head_dim': 128, 'indexer_compress_ratio': 4, 'indexer_budget': 2048, 'mtp_num_hidden_layers': 1}
 
 
@@ -97,6 +99,13 @@ def test_profile_route_returns_metadata_and_preserves_missing_model_errors(tmp_p
                 assert response.json()['components'][0]['layers'] == 2
                 assert response.json()['components'][0]['max_read_rows_per_token'] == 2048
                 assert response.json()['fixed_bytes'] == 2 * (9 * 128 * 2 + 2)
+                full = await client.get(f'/api/v1/models/{artifact.id}/cache-profile?include_recurrent=true')
+                assert full.status_code == 200
+                fixed = full.json()['fixed_components']
+                recurrent = next(item for item in fixed if item['name'] == 'recurrent_state')
+                assert recurrent['group'] == 'GDN'
+                assert recurrent['bytes'] == 3 * 4 * 4 * 128 * 128
+                assert full.json()['fixed_bytes'] > response.json()['fixed_bytes']
                 assert str(tmp_path) not in response.text
                 assert (await client.get(f'/api/v1/models/{"0" * 32}/cache-profile')).status_code == 404
         finally:

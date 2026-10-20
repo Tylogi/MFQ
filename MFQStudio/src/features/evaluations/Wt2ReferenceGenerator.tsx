@@ -29,15 +29,15 @@ export function Wt2ReferenceGenerator({ dataset, contextSize, chunks, available,
   async function inspect() {
     const current = ++version.current;
     setChecking(true); setError('');
-    try { const next = await quantizationApi.source(path); if (current === version.current) setSource(next); }
-    catch (cause) { if (current === version.current) setError(errorMessage(cause)); }
+    try { const next = await quantizationApi.source(path, true); if (current === version.current) setSource(next); }
+    catch (cause) { if (current === version.current) setError(errorMessage(cause, tr)); }
     finally { if (current === version.current) setChecking(false); }
   }
   const supported = source?.format === 'hf' && source.imatrix_supported;
   return <details className="evaluation-advanced wt2-reference-generator">
     <summary>{tr('从原始模型生成 WT2 logits', 'Generate WT2 logits from original model')}</summary>
     <div className="evaluation-fields evaluation-fields-pair">
-      <label className="evaluation-wide">{tr('原始模型目录', 'Original model directory')}<div className="qw-path-row"><input aria-label={tr('原始模型目录', 'Original model directory')} value={path} onChange={(event) => select(event.target.value)} placeholder="HF safetensors" /><button type="button" aria-label={tr('浏览原始模型', 'Browse original model')} disabled={checking} onClick={() => { void quantizationApi.workspace().then((workspace) => setPicker(workspace.import_directory)).catch((cause) => setError(errorMessage(cause))); }}><FolderOpenIcon size={16} /></button><button type="button" disabled={!path.trim() || checking} onClick={() => { void inspect(); }}>{tr('检查模型', 'Inspect model')}</button></div></label>
+      <label className="evaluation-wide">{tr('原始模型目录', 'Original model directory')}<div className="qw-path-row"><input aria-label={tr('原始模型目录', 'Original model directory')} value={path} onChange={(event) => select(event.target.value)} placeholder="HF safetensors" /><button type="button" aria-label={tr('浏览原始模型', 'Browse original model')} disabled={checking} onClick={() => { void quantizationApi.workspace().then((workspace) => setPicker(workspace.import_directory)).catch((cause) => setError(errorMessage(cause, tr))); }}><FolderOpenIcon size={16} /></button><button type="button" disabled={!path.trim() || checking} onClick={() => { void inspect(); }}>{tr('检查模型', 'Inspect model')}</button></div></label>
       <label className="evaluation-wide">{tr('参考 logits 输出路径', 'Reference logits output path')}<input value={output} onChange={(event) => setOutput(event.target.value)} placeholder={`${outputRoot}/evaluations/references/wt2.logits`} /></label>
     </div>
     {source && <p className="evaluation-note">{source.architecture} · {source.source_precisions?.join(' / ') || 'HF'} · {(source.parameters / 1e9).toFixed(2)}B</p>}

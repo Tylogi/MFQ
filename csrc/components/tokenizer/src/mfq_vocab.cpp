@@ -2905,6 +2905,44 @@ void mfq_text_vocab::impl::load(mfq_gguf_loader & ml, const mfq_gguf_keys & kv) 
                 MFQ_TEXT_LOG_WARN("%s: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list\n", __func__);
             }
         }
+
+        // Native HF tokenizer exports carry every configured EOS ID here.
+        // Apply these explicit IDs after text-derived compatibility heuristics.
+        const int eog_ids_idx = gguf_find_key(
+            ctx, kv(MFQ_GGUF_KEY_TOKENIZER_EOG_IDS).c_str());
+        if (eog_ids_idx != -1) {
+            if (gguf_get_kv_type(ctx, eog_ids_idx) != GGUF_TYPE_ARRAY) {
+                throw std::runtime_error(
+                    "tokenizer EOG IDs must be a GGUF array");
+            }
+            const gguf_type eog_ids_type = gguf_get_arr_type(ctx, eog_ids_idx);
+            if (eog_ids_type != GGUF_TYPE_UINT32 &&
+                    eog_ids_type != GGUF_TYPE_INT32) {
+                throw std::runtime_error(
+                    "tokenizer EOG IDs must contain 32-bit integers");
+            }
+            const size_t eog_ids_count = gguf_get_arr_n(ctx, eog_ids_idx);
+            const auto add_eog_id = [&](int64_t id) {
+                if (id < 0 || id >= static_cast<int64_t>(id_to_token.size())) {
+                    throw std::runtime_error(
+                        "tokenizer EOG ID is outside the vocabulary");
+                }
+                special_eog_ids.insert(static_cast<mfq_text_token>(id));
+            };
+            if (eog_ids_type == GGUF_TYPE_UINT32) {
+                const auto * ids = static_cast<const uint32_t *>(
+                    gguf_get_arr_data(ctx, eog_ids_idx));
+                for (size_t i = 0; i < eog_ids_count; ++i) {
+                    add_eog_id(ids[i]);
+                }
+            } else {
+                const auto * ids = static_cast<const int32_t *>(
+                    gguf_get_arr_data(ctx, eog_ids_idx));
+                for (size_t i = 0; i < eog_ids_count; ++i) {
+                    add_eog_id(ids[i]);
+                }
+            }
+        }
     }
 
     // build special tokens cache

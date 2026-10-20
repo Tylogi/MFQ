@@ -193,6 +193,25 @@ def test_stdio_runtime_client_cancels_timed_out_control_request() -> None:
     asyncio.run(run())
 
 
+def test_stdio_resident_budget_passes_independent_weight_ceiling_and_explicit_auto_reset():
+    async def run():
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return [{'v': 1, 'id': request['id'], 'type': 'result', 'data': {'status': 'ok'}}]
+        client = _client(handler)
+        await client.set_resident_memory_budget(8192)
+        await client.set_resident_memory_budget(8192, 4096)
+        await client.set_resident_memory_budget(8192, 0)
+        assert [(request['op'], request['params']) for request in requests] == [
+            ('memory.budget', {'target_bytes': 8192}),
+            ('memory.budget', {'target_bytes': 8192, 'weight_target_bytes': 4096}),
+            ('memory.budget', {'target_bytes': 8192, 'weight_target_bytes': 0}),
+        ]
+        await client.aclose()
+    asyncio.run(run())
+
+
 def test_stdio_runtime_client_fails_pending_requests_on_eof() -> None:
     async def run() -> None:
         client = _client(lambda _request: [])

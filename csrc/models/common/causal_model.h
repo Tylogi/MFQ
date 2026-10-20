@@ -104,7 +104,11 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     bool passes_attention_mask() const noexcept { return false; }
     bool force_cache_advance() const noexcept { return false; }
     bool uses_decode_sequence_length() const noexcept { return true; }
-    bool family_supports_speculation() const noexcept { return false; }
+    bool family_supports_speculation() const noexcept {
+        if constexpr(requires {Backend::joint_speculation_supported;})
+            return Backend::joint_speculation_supported;
+        return false;
+    }
     bool family_supports_suffix_speculation() const noexcept { return false; }
 
     int64_t vocab_size() const noexcept { return this->metadata.vocab_size; }

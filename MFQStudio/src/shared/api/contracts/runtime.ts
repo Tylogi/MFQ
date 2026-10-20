@@ -53,9 +53,12 @@ export interface RuntimeRequestMetrics {
 }
 
 export interface RuntimeStatus {
+  gpu_devices?: { id: string; name: string; memory_total_bytes?: number | null;
+    memory_available_bytes?: number | null; unified_memory?: boolean }[];
   memory_architecture?: 'unified' | 'discrete' | 'unknown';
   unified_memory?: boolean | null;
   host_memory_total_bytes?: number | null;
+  host_memory_available_bytes?: number | null;
   device_memory_total_bytes?: number | null;
   prefix_cache_hot_tier?: 'vram' | 'ram' | null;
   instance_id?: string;
@@ -120,6 +123,12 @@ export interface RuntimeStatus {
   prefix_cache_mode?: string;
   prefix_cache_total_hot_bytes?: number;
   prefix_cache_total_hot_max_bytes?: number;
+  prefix_cache_ram_bytes?: number;
+  prefix_cache_ram_max_bytes?: number;
+  prefix_cache_ram_blocks?: number;
+  prefix_cache_ram_hits?: number;
+  prefix_cache_total_ram_bytes?: number;
+  prefix_cache_total_ram_max_bytes?: number;
   prefix_cache_total_disk_bytes?: number;
   prefix_cache_total_disk_blocks?: number;
   prefix_cache_total_disk_max_bytes?: number;
@@ -154,13 +163,31 @@ export interface RuntimeListener {
   anthropic_port?: number | null;
 }
 
+export interface ServingStatistics {
+  scope: 'session' | 'alltime';
+  started_at: number;
+  totals: {
+    completed_requests: number; prompt_tokens: number; prefill_tokens: number;
+    completion_tokens: number; cached_tokens: number;
+    prefill_tps: number | null; decode_tps: number | null;
+    ttft_ms: number | null; cache_hit_rate: number | null;
+  };
+  activity: {
+    instance_id: string; model: string; state: string; active_requests: number;
+    queued_requests: number; sample_age_seconds: number | null;
+    requests: { id: string; phase: string; processed_tokens: number;
+      generated_tokens: number; prefill_tps: number; decode_tps: number;
+      elapsed_seconds: number; updated_at: number }[];
+  }[];
+}
+
 export interface RuntimeResources {
   sampled_at: number;
   interval_seconds: number | null;
   cpu_name?: string | null;
   cpu_cores?: number | null;
   cpu_utilization_percent: number | null;
-  gpus: { name: string; core_count?: number | null; utilization_percent: number | null;
+  gpus: { id?: string | null; name: string; core_count?: number | null; utilization_percent: number | null;
     memory_total_bytes?: number | null; memory_used_bytes?: number | null; memory_available_bytes?: number | null }[];
   memory_total_bytes?: number | null;
   memory_used_bytes?: number | null;
@@ -183,12 +210,14 @@ export interface RuntimeModel {
 }
 
 export interface RuntimeMemoryResources {
+  devices?: RuntimeDeviceMemory[];
   ram_experts?: boolean | null;
   ram_expert_bytes?: number | null;
   ram_kv?: boolean | null;
   ram_kv_bytes?: number | null;
   ram_kv_limit_bytes?: number | null;
   resident_weight_bytes: number | null;
+  resident_buffer_bytes?: number | null;
   wired_bytes?: number | null;
   wired_limit_bytes?: number | null;
   wired_available?: boolean | null;
@@ -197,6 +226,9 @@ export interface RuntimeMemoryResources {
   prefix_cache_blocks: number | null;
   prefix_cache_bytes?: number | null;
   prefix_cache_limit_bytes?: number | null;
+  prefix_cache_ram_bytes?: number | null;
+  prefix_cache_ram_limit_bytes?: number | null;
+  prefix_cache_ram_blocks?: number | null;
   ssd_experts: boolean | null;
   ssd_expert_bytes: number | null;
   ssd_ple: boolean | null;
@@ -210,6 +242,17 @@ export interface RuntimeMemoryResources {
   ssd_kv_written_bytes?: number | null;
   ssd_kv_reads?: number | null;
   ssd_kv_hits?: number | null;
+}
+
+export interface RuntimeDeviceMemory {
+  device_id: string;
+  resident_bytes?: number | null;
+  resident_weight_bytes?: number | null;
+  resident_buffer_bytes?: number | null;
+  kv_bytes?: number | null;
+  prefix_cache_bytes?: number | null;
+  memory_total_bytes?: number | null;
+  memory_available_bytes?: number | null;
 }
 
 export interface RuntimeInstance {
@@ -232,40 +275,13 @@ export interface RuntimeInstance {
   mtp_available?: boolean;
   qsa_kv_offload_supported?: boolean;
   kv_quantization_supported?: boolean;
+  kv_memory_supported?: boolean;
+  kv_memory?: { placement: 'auto' | 'auto_ssd' | 'vram' | 'ram'; allocation: 'preallocated' | 'dynamic' };
   kv_quantization?: { enabled: boolean; bits: 2 | 2.5 | 3 | 3.5 | 4 | 6 | 8; algorithm: 'turboquant' };
   qsa_kv_offload?: { enabled: boolean; budget_bytes: number; ram_budget_bytes?: number | null; target_context: number };
   error?: ApiErrorBody['error'] | null;
 }
 
-export interface RuntimeProfile {
-  id: string;
-  name: string;
-  load: {
-    model: string;
-    artifact_uri?: string | null;
-    device_ids: string[];
-    idle_ttl_seconds?: number | null;
-    pin: boolean;
-    context_size: number | null;
-    prefill_chunk_size: number;
-    moe_gpu_cache_gb?: number | null;
-    prefix_cache_max_sessions?: number | null;
-    prefix_cache_max_snapshots_per_session?: number | null;
-    prefix_cache_max_bytes?: number | null;
-    prefix_cache_enabled?: boolean;
-    prefix_cache_disk_bytes?: number | null;
-    prefix_cache_hot_bytes?: number | null;
-    prefix_cache_block_tokens?: number | null;
-    prefix_cache_pending_bytes?: number | null;
-    sampling_defaults?: SamplingParams | null;
-  };
-  artifact_id: string;
-  artifact_modified_at: string;
-  drifted: boolean;
-  drift_reason?: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 export interface RuntimeMetricSnapshot {
   sequence: number;

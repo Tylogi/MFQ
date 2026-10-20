@@ -4,7 +4,7 @@
 // record-layout checks both sides run before launching, and the warp constant
 // their launch geometry uses.
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 

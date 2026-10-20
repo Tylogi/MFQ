@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -18,6 +19,8 @@ from mfq.server.protocol.models import (
     DatasetList,
     DatasetResource,
     DeleteWorkspaceArtifactRequest,
+    DeleteModelRequest,
+    ModelDeletionPlan,
     EvaluationComparisonResource,
     EvaluationKind,
     EvaluationResultList,
@@ -25,6 +28,7 @@ from mfq.server.protocol.models import (
     HubModelInfo,
     HubModelSearchResult,
     HubReferenceRequest,
+    HubDownloadProbeRequest,
     ModelArtifactList,
     ModelCacheProfile,
     ModelDirectoryList,
@@ -39,6 +43,7 @@ from mfq.server.protocol.models import (
     ProbabilityScoreRequest,
     ProbabilityScoreResult,
     RegisterModelDirectoryRequest,
+    ConfigureDownloadDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
     UpdateRemoteNodeRequest,
@@ -47,6 +52,29 @@ from mfq.server.services.service import ServiceError
 
 hub_router = APIRouter()
 router = APIRouter()
+
+
+@hub_router.post('/api/v1/hub/download-sources/probe', responses=ERROR_RESPONSES, tags=['models'])
+async def probe_download_sources(service: ServiceDependency, body: HubDownloadProbeRequest) -> dict[str, Any]:
+    return await service.hub_catalog.probe_download_sources(body.sources)
+
+@hub_router.get("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
+async def download_directory(service: ServiceDependency) -> dict[str, str | int | bool | None]:
+    return await asyncio.to_thread(service.tool_handlers.download_directory_status)
+
+
+@hub_router.put("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
+async def configure_download_directory(service: ServiceDependency, body: ConfigureDownloadDirectoryRequest) -> dict[str, str | int | bool | None]:
+    from mfq.server.state.catalog import ModelDirectoryNotFoundError
+    try:
+        settings = service.tool_handlers.download_directories
+        directory = (service.catalog.directory_path(body.directory_id) if body.directory_id else None) if 'directory_id' in body.model_fields_set else settings.selected
+        await settings.configure(directory, evict_prefix_cache=body.evict_prefix_cache)
+        return await asyncio.to_thread(service.tool_handlers.download_directory_status)
+    except (ModelDirectoryNotFoundError, ValueError) as error:
+        raise ServiceError(400, "invalid_download_directory", str(error)) from error
+    except OSError:
+        raise ServiceError(500, "download_directory_save_failed", "could not save download directory") from None
 
 
 @hub_router.get(
@@ -182,10 +210,21 @@ async def model_artifact_directory(service: ServiceDependency, model_id: str) ->
     return await service.model_artifact_directory(model_id)
 
 
+@router.get("/api/v1/models/{model_id}/deletion", response_model=ModelDeletionPlan, responses=ERROR_RESPONSES, tags=["models"])
+async def model_deletion_plan(service: ServiceDependency, model_id: str) -> ModelDeletionPlan:
+    return await service.model_deletion_plan(model_id)
+
+
+@router.post("/api/v1/models/{model_id}/delete", responses=ERROR_RESPONSES, tags=["models"])
+async def delete_model_artifact(service: ServiceDependency, model_id: str, body: DeleteModelRequest) -> dict[str, int]:
+    return await service.delete_model_artifact(model_id, body.token)
+
+
 @router.get("/api/v1/models/{model_id}/cache-profile", response_model=ModelCacheProfile | None,
             responses=ERROR_RESPONSES, tags=["models"])
-async def model_cache_profile(service: ServiceDependency, model_id: str) -> ModelCacheProfile | None:
-    return await service.model_cache_profile(model_id)
+async def model_cache_profile(service: ServiceDependency, model_id: str,
+    include_recurrent: bool = False) -> ModelCacheProfile | None:
+    return await service.model_cache_profile(model_id, include_recurrent=include_recurrent)
 
 
 @router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,

@@ -1,5 +1,5 @@
-#include "mlx_tensor.h"
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_tensor.h"
+#include "runtime/mlx_staging_allocator.h"
 
 #include <cmath>
 #include <cstdint>

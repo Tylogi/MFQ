@@ -1,0 +1,355 @@
+{
+  "model": "Qwen3.8-Flash-Next",
+  "hardware": {
+    "device": "Apple M5 Max",
+    "gpu_cores": 40,
+    "memory_gb": 128,
+    "backend": "Metal"
+  },
+  "workload": {
+    "input_tokens": 4096,
+    "output_tokens": 128,
+    "batch_size": 1,
+    "sampling": "greedy",
+    "corpus_sha256": "f0b97fa3cc6b13fda04d41998d14cf358c38e3edd9e744257d37d1e5a065a248",
+    "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
+    "note": "The Strata, llama.cpp and oMLX protocols identify the 4K code continuation as the same workload used for MFQ. Their context limit is 16384; the MFQ table does not report its context limit."
+  },
+  "source": {
+    "repository": "ssh://git@fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity.git",
+    "revision": "f2f9b0fa00005740097b87bd2612a2b92d21bbe8",
+    "files": [
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/README.md",
+        "sha256": "aba9d1068f75ba6bdaac7372836a6e753e402e63f87a539565cb922d0f4c9f06"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md",
+        "sha256": "4591d78b64737b251cc257ecdbe14dcbc1d3aadc7cd5fee46e50c1f434d77d61"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md",
+        "sha256": "a660d8817dde0ce51915b900aa3a1cf0ee8002073c2a341d6e1f311dc615ccd3"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
+        "sha256": "71bbed21426c290f0eeba332a93546da9ee0bf7dc8eaf252a6699eb2784545d7"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md",
+        "sha256": "ec925baa4a53a8eefd62ede7b558cb4a6df5e5e65d036fdbd57e6266165f1dbc"
+      }
+    ],
+    "description": "Published benchmark tables from MFQ-Publicity; no new measurements. The full prompt is not copied into this snapshot."
+  },
+  "runtimes": [
+    {
+      "id": "mfq",
+      "label": "MFQ",
+      "version": null,
+      "measured_runs_per_mode": null,
+      "prefill_mode": "not specified in the published table",
+      "mtp_draft_setup": "not specified in the published table"
+    },
+    {
+      "id": "strata",
+      "label": "Strata",
+      "version": "v0.1.44.1",
+      "commit": "296b59d2",
+      "date": "2026-10-16",
+      "measured_runs_per_mode": 2,
+      "aggregate": "total tokens / total measured time",
+      "mtp_draft_setup": "Q2_0 draft experts; default CJK vocabulary shortlist; spec=2 (one draft token per round)",
+      "generation_timing": "127 intervals between the first and last of 128 output tokens",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "idle_seconds_before_run": 60
+    },
+    {
+      "id": "llamacpp",
+      "label": "llama.cpp",
+      "version": "f74e2fa6",
+      "commit": "f74e2fa6a31cc33ab4ee4ae516641cfe62df3924",
+      "date": "2026-10-16",
+      "measured_runs_per_mode": 1,
+      "mtp_draft_setup": "Self-contained Unsloth Q8_0 MTP head; one draft token per round",
+      "generation_timing": "127 intervals between the first and last of 128 output tokens",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "idle_seconds_before_run": 60
+    },
+    {
+      "id": "omlx",
+      "label": "oMLX",
+      "version": "0.7.1.dev2",
+      "libraries": {
+        "mlx": "0.32.4",
+        "mlx_lm": "0.31.4.dev132+g94cdcae13"
+      },
+      "measured_runs_per_mode": 1,
+      "mtp_draft_setup": "Each checkpoint's included draft head; default adaptive policy with maximum draft depth 3; controller can reduce or pause drafting; not fixed-single-draft results",
+      "prefill_timing": "4096 / wall-clock time to first producer-generated token, including first-token overhead",
+      "generation_timing": "127 intervals between the first and last producer-generated token timestamps",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "date": "2026-10-17",
+      "distribution": "Official macOS 26/27 DMG, including native NAX kernels",
+      "cooldown_seconds_by_tier": {
+        "oQ2.5e": 60,
+        "oQ3.5e": 60,
+        "oQ4e": 20
+      },
+      "cooldown_conditions": "Official 0.5-second GPU keep-warm tick remains active; oQ4e uses full-speed fans",
+      "prefill_setup": "4096-token prefill step with prefill speed priority",
+      "memory_setup": "Allocator buffer cache uses physical-memory limit; wired memory uses recommended working-set limit",
+      "power_mode": "High Power Mode enabled for battery and AC; all recorded prefill GPU-frequency samples 1620 MHz; P13 dominant in request-contained performance-state samples"
+    }
+  ],
+  "interpretation": [
+    "Rows are runtime/checkpoint configurations, with different quantization tiers; they are not matched-precision or matched-quality comparisons.",
+    "The chart uses the one published MFQ prefill value and MTP-off prefill values for Strata, llama.cpp and oMLX. Missing MFQ prefill mode values remain null. oMLX prefill includes first-token overhead, while the GGUF runtimes report engine prompt time.",
+    "MTP draft weights, head configurations and policies differ. oMLX uses default adaptive MTP with maximum draft depth 3; Strata and llama.cpp use one draft token per verification round; MFQ draft settings are not specified in this source.",
+    "Strata combines two measured runs per mode; llama.cpp and oMLX each report one. The source does not give uncertainty estimates or MFQ repeat counts.",
+    "Strata ordinary and MTP outputs match for all four configurations; llama.cpp UD-Q4_K_XL diverges from output token 80, while its three GSQ-RCO outputs match.",
+    "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result.",
+    "oMLX ordinary and adaptive-MTP output text matches within each tier; its throughput uses producer-generated token timestamps through the native streaming API, without HTTP transport or profiling.",
+    "Shaded comparison tiers: MFQ V3-XXS (81.952 GB), GSQ-RCO IQ3_S (83.618 GB) and Jundot oQ3.5e (approximately 93.856 GB). IQ3_S has a similar weight size to V3-XXS; oQ3.5e is larger. All sizes exclude the vision encoder and MTP head; highlighting does not imply matching size, quality or MTP setup."
+  ],
+  "measurements": [
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V1-M",
+      "reported_weight_residency_gib": 43.36,
+      "prefill_reported": 2538.5,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 71.6,
+      "generation_mtp": 101.2,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S2-L",
+      "reported_weight_residency_gib": 47.41,
+      "prefill_reported": 2538.9,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 71.0,
+      "generation_mtp": 97.9,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V3-XXS",
+      "reported_weight_residency_gib": 50.33,
+      "prefill_reported": 2527.6,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 70.8,
+      "generation_mtp": 105.4,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S3-L",
+      "reported_weight_residency_gib": 57.95,
+      "prefill_reported": 2565.6,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 68.1,
+      "generation_mtp": 98.2,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V4-XS",
+      "reported_weight_residency_gib": 61.48,
+      "prefill_reported": 2540.1,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 67.7,
+      "generation_mtp": 96.7,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S4-L",
+      "reported_weight_residency_gib": 78.25,
+      "prefill_reported": 2481.7,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 63.6,
+      "generation_mtp": 93.6,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "Q2_0",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1796.3,
+      "generation_no_mtp": 84.4,
+      "prefill_mtp": 1698.0,
+      "generation_mtp": 122.8,
+      "draft_acceptance_percent": 95.4,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "IQ3_XXS",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1487.5,
+      "generation_no_mtp": 76.2,
+      "prefill_mtp": 1401.4,
+      "generation_mtp": 105.7,
+      "draft_acceptance_percent": 85.5,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "IQ3_S",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1469.7,
+      "generation_no_mtp": 72.8,
+      "prefill_mtp": 1362.1,
+      "generation_mtp": 99.6,
+      "draft_acceptance_percent": 82.9,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "unsloth-ud",
+      "tier": "UD-Q4_K_XL",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1363.7,
+      "generation_no_mtp": 58.4,
+      "prefill_mtp": 1242.0,
+      "generation_mtp": 85.9,
+      "draft_acceptance_percent": 89.6,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "Q2_0",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1259.9,
+      "generation_no_mtp": 49.0,
+      "prefill_mtp": 1171.9,
+      "generation_mtp": 66.9,
+      "draft_acceptance_percent": 95.4,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "IQ3_XXS",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1208.5,
+      "generation_no_mtp": 46.5,
+      "prefill_mtp": 1112.6,
+      "generation_mtp": 62.9,
+      "draft_acceptance_percent": 96.9,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "IQ3_S",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1192.8,
+      "generation_no_mtp": 45.4,
+      "prefill_mtp": 1108.4,
+      "generation_mtp": 59.3,
+      "draft_acceptance_percent": 86.8,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "unsloth-ud",
+      "tier": "UD-Q4_K_XL",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1191.7,
+      "generation_no_mtp": 42.5,
+      "prefill_mtp": 1103.2,
+      "generation_mtp": 57.7,
+      "draft_acceptance_percent": 88.1,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ2.5e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ2.5e-mtp",
+        "revision": "ebfb10474baa3c1c78d38453ce0d5228febd32e9"
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 2630.2,
+      "generation_no_mtp": 51.6,
+      "prefill_mtp": 2405.2,
+      "generation_mtp": 94.3,
+      "draft_acceptance_percent": 88.0,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ3.5e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp",
+        "revision": "e8216051d1a75ec4a523ed8c6b0ed4a01667bcda",
+        "comparison_weight_size": {
+          "approximate_gb": 93.856,
+          "unit": "GB = 10^9 bytes",
+          "exclusions": [
+            "vision encoder",
+            "MTP head"
+          ],
+          "basis": "Sum of rounded model-card storage: language backbone 61.856 GB + N-gram embedding 32.000 GB",
+          "url": "https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp/raw/e8216051d1a75ec4a523ed8c6b0ed4a01667bcda/README.md",
+          "sha256": "f94a3dccb5d9a421d6a2a0f8ca2f18b9170275bde1fa00cb414b8a09e76b916d"
+        }
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 2647.4,
+      "generation_no_mtp": 61.5,
+      "prefill_mtp": 2575.4,
+      "generation_mtp": 111.0,
+      "draft_acceptance_percent": 92.6,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ4e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp",
+        "revision": null,
+        "weight_shards_bytes": 106294664646,
+        "note": "Previously downloaded checkpoint; source does not identify a repository revision."
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 2843.4,
+      "generation_no_mtp": 65.0,
+      "prefill_mtp": 2766.7,
+      "generation_mtp": 108.3,
+      "draft_acceptance_percent": 88.4,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
+    }
+  ]
+}

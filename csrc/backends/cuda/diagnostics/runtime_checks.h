@@ -5,7 +5,7 @@
 #include "generation_result.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/qwen4_exp/ops.h"
-#include "diagnostics/flash_next_mtp.h"
+#include "flash_next_mtp.h"
 #include "models/qwen35/mtp.h"
 #include "ops/quant/quant_linear.h"
 #include "storage/weights/loaders/weight.h"
@@ -13,7 +13,7 @@
 #include "storage/session/text_cache.h"
 #include "ops/execution/cuda_execution.h"
 #include "models/qwen35/linear_attention.h"
-#include "csrc/backends/cuda/kernels/deepseek_v41.h"
+#include "kernels/deepseek_v41.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -46,7 +46,8 @@ int run_qwen35_mtp_bench(
     int generated_tokens,
     int repetitions);
 int run_cuda_continuous_batching_check(
-    mfq::cuda::Qwen35CausalLm& model);
+    mfq::cuda::Qwen35CausalLm& model,int requests = 2);
+int run_cuda_continuous_batching_check(mfq::cuda::Qwen4CausalLm& model,int requests = 2);
 int run_cuda_engine_isolation_check(CudaEngineOptions options);
 
 template <typename Model>
@@ -1147,11 +1148,8 @@ static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
                     MFQ_RUNTIME_CHECK(greedy[row]==tokens.data_ptr<int64_t>()[row],"graph returned stale greedy tokens");
             }
             if(actions[i]<0)model.commit_speculative();else {
-                model.rollback_speculative();
-                if(actions[i]) {
-                    auto replay=qwen4_decode_graph_hidden(model,input.narrow(1,1,actions[i]),nullptr);
-                    MFQ_RUNTIME_CHECK(replay.has_value(),"MTP graph could not replay accepted draft tokens");
-                }
+                MFQ_RUNTIME_CHECK(model.speculative_prefix_retention,"MTP graph omitted prefix checkpoints");
+                model.rollback_speculative(actions[i]);
             }
             auto next=qwen4_decode_graph_hidden(model,ids_for(0),nullptr);
             MFQ_RUNTIME_CHECK(next.has_value(),"MTP graph did not resume after commit/rollback");
@@ -1181,8 +1179,14 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
     MFQ_RUNTIME_CHECK(!prompt.empty(),"MTP generation variants require explicit prompt IDs");
     MtpProfileEnvironment compact("MFQ_MFE_TOKEN_COMPACT_PLAN"),aligned("MFQ_MFE_TOKEN_ALIGNED_GU"),
         down("MFQ_GR_BATCH_SHARED_DOWN"),up("MFQ_GR_BATCH_SHARED_UP"),capacity("MFQ_MFE_TOKEN_GROUP_CAPACITY"),
-        exact_batch("MFQ_NINT_EXACT_BATCH");
-    struct Variant {const char* name;const char* compact;const char* aligned;const char* up;const char* capacity;const char* exact=nullptr;};
+        exact_batch("MFQ_NINT_EXACT_BATCH"),separated("MFQ_MFE_SEPARATE_HIDDEN_QUANT"),
+        direct_dma("MFQ_MOE_DIRECT_CACHE_DMA"),gdn_short("MFQ_GDN_SHORT_FUSION"),
+        gdn_inplace("MFQ_GDN_SHORT_INPLACE"),short_interval("MFQ_MOE_SHORT_DECODE_INTERVAL"),
+        q8_decode("MFQ_NINT_Q8_DECODE"),gr_integer("MFQ_GR_INT_DOT"),gr_up_integer("MFQ_GR_UP_INT_DOT"),
+        gr_pair("MFQ_GR_INT_PAIR_DOWN");
+    struct Variant {const char* name;const char* compact;const char* aligned;const char* up;const char* capacity;
+        const char* exact=nullptr;const char* separated=nullptr;const char* direct=nullptr;
+        const char* gdn=nullptr;const char* interval=nullptr;const char* q8=nullptr;const char* gr=nullptr;const char* gr_up=nullptr;const char* gr_pair=nullptr;};
     const Variant variants[]={
         {"baseline","0","0","0","2"},
         {"compact","1",nullptr,"0","2"},
@@ -1195,40 +1199,149 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
         {"nint_original","1",nullptr,"1","2","0"},
         {"nint_exact_batch","1",nullptr,"1","2","1"},
         {"nint_original_repeat","1",nullptr,"1","2","0"}};
+    const Variant short_capacity_variants[]={
+        {"short_capacity2","1",nullptr,nullptr,"2"},
+        {"short_capacity_auto","1",nullptr,nullptr,"auto"},
+        {"short_capacity2_repeat","1",nullptr,nullptr,"2"},
+        {"short_capacity_auto_repeat","1",nullptr,nullptr,"auto"}};
+    const Variant shared_capacity_variants[]={
+        {"routed2_shared2","1",nullptr,nullptr,"2"},
+        {"routed2_shared4","1",nullptr,nullptr,"shared4"},
+        {"routed2_shared8","1",nullptr,nullptr,"shared8"},
+        {"routed2_shared2_repeat","1",nullptr,nullptr,"2"}};
+    const Variant quant_variants[]={
+        {"inline_hidden_quant","1",nullptr,nullptr,"2",nullptr,"0"},
+        {"separate_hidden_quant","1",nullptr,nullptr,"2",nullptr,"1"},
+        {"inline_hidden_quant_repeat","1",nullptr,nullptr,"2",nullptr,"0"},
+        {"separate_hidden_quant_repeat","1",nullptr,nullptr,"2",nullptr,"1"}};
+    const Variant direct_variants[]={
+        {"wire_payload_dma","1",nullptr,nullptr,"2",nullptr,"1","0"},
+        {"direct_cache_dma","1",nullptr,nullptr,"2",nullptr,"1","1"},
+        {"wire_payload_dma_repeat","1",nullptr,nullptr,"2",nullptr,"1","0"},
+        {"direct_cache_dma_repeat","1",nullptr,nullptr,"2",nullptr,"1","1"}};
+    const Variant short_path_variants[]={
+        {"short_path_legacy","1",nullptr,nullptr,"2",nullptr,"1","0","0","0"},
+        {"short_path_fused","1",nullptr,nullptr,"2",nullptr,"1","0","1","1"},
+        {"short_path_legacy_repeat","1",nullptr,nullptr,"2",nullptr,"1","0","0","0"},
+        {"short_path_fused_repeat","1",nullptr,nullptr,"2",nullptr,"1","0","1","1"}};
+    const Variant dense_variants[]={
+        {"q8_chunk","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","0"},
+        {"q8_group","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2"},
+        {"q8_chunk_repeat","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","0"},
+        {"q8_group_repeat","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2"}};
+    const Variant gr_integer_variants[]={
+        {"gr_float","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2","0","0"},
+        {"gr_integer24","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2","3","0","0"},
+        {"gr_integer_best","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2",nullptr,nullptr},
+        {"gr_float_repeat","1",nullptr,nullptr,"2",nullptr,"1",nullptr,"1","1","2","0","0"}};
+    const auto* gr_option=mfq::cuda::env_lookup("MFQ_GR_INTEGER_VARIANTS");
+    const bool gr_only=gr_option && gr_option[0]=='1';
+    const auto* dense_option=mfq::cuda::env_lookup("MFQ_NINT_DENSE_VARIANTS");
+    const bool dense_only=dense_option && dense_option[0]=='1';
     const auto* option=mfq::cuda::env_lookup("MFQ_MTP_NINT_VARIANTS");
     const bool nint_only=option && option[0]=='1';
-    const auto* active=nint_only?nint_variants:variants;
-    const auto variant_count=nint_only?std::size(nint_variants):std::size(variants);
+    const auto* short_option=mfq::cuda::env_lookup("MFQ_MTP_SHORT_CAPACITY_VARIANTS");
+    const bool short_capacity=short_option && short_option[0]>='1' && short_option[0]<='5';
+    const auto* capacity_variants=short_option && short_option[0]=='5'?short_path_variants:
+        short_option && short_option[0]=='4'?direct_variants:
+        short_option && short_option[0]=='3'?quant_variants:
+        short_option && short_option[0]=='2'?shared_capacity_variants:short_capacity_variants;
+    const auto* active=gr_only?gr_integer_variants:dense_only?dense_variants:nint_only?nint_variants:short_capacity?capacity_variants:variants;
+    const auto variant_count=gr_only?std::size(gr_integer_variants):dense_only?std::size(dense_variants):nint_only?std::size(nint_variants):
+        short_capacity?std::size(short_capacity_variants):std::size(variants);
     const auto config=resolve_cuda_runtime_config({});
     std::vector<int64_t> expected;
     std::cout<<std::unitbuf;
+    const auto* decode_option=mfq::cuda::env_lookup("MFQ_SHORT_DECODE_VARIANTS");
+    const bool mtp_batch2=decode_option && std::strcmp(decode_option,"mtp-batch2")==0;
+    const bool batch2=decode_option && (std::strcmp(decode_option,"batch2")==0 || std::strcmp(decode_option,"all")==0 || mtp_batch2);
+    const auto modes=decode_option && (std::strcmp(decode_option,"both")==0 || std::strcmp(decode_option,"all")==0)?std::vector<bool>{false,true}:
+        mtp_batch2?std::vector<bool>{true}:batch2?std::vector<bool>{}:
+        decode_option && std::strcmp(decode_option,"ordinary")==0?std::vector<bool>{false}:std::vector<bool>{true};
+    for(bool enable_mtp:modes)
     for(std::size_t index=0;index<variant_count;++index) {
         const auto& variant=active[index];
         compact.set(variant.compact);aligned.set(variant.aligned);up.set(variant.up);
-        capacity.set(variant.capacity);down.set("0");exact_batch.set(variant.exact);
+        capacity.set(variant.capacity);down.set("0");exact_batch.set(variant.exact);separated.set(variant.separated);direct_dma.set(variant.direct);
+        gdn_short.set(variant.gdn);gdn_inplace.set(variant.gdn);short_interval.set(variant.interval);
+        q8_decode.set(variant.q8);gr_integer.set(variant.gr);gr_up_integer.set(variant.gr_up);gr_pair.set(variant.gr_pair);
         DecodeGraphCache graph(model.max_position_embeddings());
         TextSessionCache cache(config.session_cache,config.prefix_cache);
         // Use precisely the production generation dispatch. Resetting the
         // model on each request also invalidates kernels captured for an old
         // variant; neither draft depth nor acceptance is forced.
-        for(int repeat=0;repeat<(index==0 || nint_only && index==1?2:1);++repeat) {
+        for(int repeat=0;repeat<(index==0 || (nint_only || short_capacity) && index==1?2:1);++repeat) {
             mfq::engine::InferenceRequest request;request.prompt=prompt;
             request.sampling.max_tokens=1024;request.sampling.temperature=0.;
-            request.sampling.top_k=1;request.sampling.top_p=1.;request.sampling.enable_mtp=true;
+            request.sampling.top_k=1;request.sampling.top_p=1.;request.sampling.enable_mtp=enable_mtp;
             request.sampling.mtp_max_draft_tokens=5;
             mfq::engine::InferenceOutput output(request,nullptr,"mtp-operator-variants");
-            auto result=collect_generation(generate(model,graph,cache,config,request,output,&mtp));
+            auto result=collect_generation(generate(model,graph,cache,config,request,output,enable_mtp?&mtp:nullptr));
             mfq_cuda_synchronize();
             const auto decode_ms=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-result.first_token).count();
             MFQ_RUNTIME_CHECK(result.tokens.size()==1024 && decode_ms>0.,"MTP variant generation was incomplete");
             if(expected.empty())expected=result.tokens;
-            else MFQ_RUNTIME_CHECK(result.tokens==expected,"MTP generation variant changed output: ",variant.name);
-            nlohmann::json sample={{"variant",variant.name},{"repeat",repeat},{"tokens",result.tokens.size()},
-                {"decode_ms",decode_ms},{"decode_tps",1024.*1000./decode_ms},{"exact",true},
+            const bool exact=result.tokens==expected;
+            const auto* allow_difference=mfq::cuda::env_lookup("MFQ_BENCH_ALLOW_MTP_OUTPUT_DIFFERENCE");
+            MFQ_RUNTIME_CHECK(exact || (enable_mtp && allow_difference && allow_difference[0]=='1'),
+                "MTP generation variant changed output: ",variant.name);
+            nlohmann::json sample={{"variant",variant.name},{"repeat",repeat},{"tokens",result.tokens.size()},{"mtp",enable_mtp},
+                {"decode_ms",decode_ms},{"decode_tps",1023.*1000./decode_ms},{"exact",exact},
                 {"cycles",mtp.last_cycles},{"accepted",mtp.last_accepted},{"drafted",mtp.last_stats.drafted_tokens},
                 {"selected_depth",mtp.last_stats.selected_depth},{"depth_cycles",mtp.last_stats.depth_cycles}};
             std::cout<<"mtp_generation_variant "<<sample.dump()<<'\n';
+        }
+    }
+    if(batch2) {
+        namespace tb=mfq_tensor_backend;
+        std::array<std::vector<int64_t>,2> batch_expected;
+        const auto options=tb::TensorOptions().dtype(tb::kInt64);
+        const auto device=tb::Device(tb::kCUDA,model.execution->layer_placement.primary_device());
+        const auto prompt_tensor=tb::tensor(prompt,options).reshape({1,-1}).to(device);
+        for(std::size_t index=0;index<variant_count;++index) {
+            const auto& variant=active[index];
+            compact.set(variant.compact);aligned.set(variant.aligned);up.set(variant.up);capacity.set(variant.capacity);
+            down.set("0");exact_batch.set(variant.exact);separated.set(variant.separated);direct_dma.set(variant.direct);
+            gdn_short.set(variant.gdn);gdn_inplace.set(variant.gdn);short_interval.set(variant.interval);
+            q8_decode.set(variant.q8);gr_integer.set(variant.gr);gr_up_integer.set(variant.gr_up);gr_pair.set(variant.gr_pair);
+            for(int repeat=0;repeat<(index<2?2:1);++repeat) {
+                model.reset(1);
+                std::array<std::unique_ptr<mfq::cuda::Qwen4BatchRequestState>,2> states;
+                std::vector<mfq::cuda::Qwen4BatchRequestState*> requests;
+                std::vector<int64_t> next;
+                std::array<std::vector<int64_t>,2> generated;
+                for(int row=0;row<2;++row) {
+                    states[row]=std::make_unique<mfq::cuda::Qwen4BatchRequestState>(model);
+                    requests.push_back(states[row].get());
+                    auto hidden=states[row]->prefill(model,prompt_tensor);
+                    next.push_back(model.next_token_from_head(model.lm_head,model.last_hidden(std::move(hidden))).item<int64_t>());
+                    generated[row].push_back(next.back());
+                }
+                mfq::cuda::Qwen4BatchDecodeGraph graph(model);
+                mfq_cuda_synchronize();
+                const auto started=std::chrono::steady_clock::now();
+                for(int step=1;step<512;++step) {
+                    auto host_ids=tb::tensor(next,options).reshape({2,1});
+                    auto ids=host_ids.to(device);
+                    auto result=graph.run(requests,ids,host_ids,true);
+                    MFQ_RUNTIME_CHECK(result.has_value(),"short-batch variant must use a CUDA graph");
+                    auto host=result->cpu().contiguous();
+                    next.assign(host.data_ptr<int64_t>(),host.data_ptr<int64_t>()+2);
+                    for(int row=0;row<2;++row)generated[row].push_back(next[row]);
+                }
+                const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+                for(int row=0;row<2;++row) {
+                    MFQ_RUNTIME_CHECK(states[row]->position()==int64_t(prompt.size())+511,"short batch position changed");
+                    if(!expected.empty())MFQ_RUNTIME_CHECK(std::equal(generated[row].begin(),generated[row].end(),expected.begin()),
+                        "short batch changed the ordinary decode response");
+                    if(batch_expected[row].empty())batch_expected[row]=generated[row];
+                    else MFQ_RUNTIME_CHECK(batch_expected[row]==generated[row],"short batch variant changed output: ",variant.name);
+                }
+                nlohmann::json sample={{"variant",variant.name},{"repeat",repeat},{"tokens",1024},{"batch",2},
+                    {"mtp",false},{"decode_ms",ms},{"decode_tps",1022.*1000./ms},{"exact",true}};
+                std::cout<<"mtp_generation_variant "<<sample.dump()<<'\n';
+            }
         }
     }
     return 0;
@@ -1237,8 +1350,9 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
 static int run_qwen4_mtp_variant_profile(mfq::cuda::Qwen4CausalLm& model,const std::vector<int64_t>& prompt_ids) {
     namespace tb=mfq_tensor_backend;
     MtpProfileEnvironment compact("MFQ_MFE_TOKEN_COMPACT_PLAN"),aligned("MFQ_MFE_TOKEN_ALIGNED_GU"),
-      gr("MFQ_GR_BATCH_SHARED_DOWN"),capacity("MFQ_MFE_TOKEN_GROUP_CAPACITY");
-    struct Variant {const char* name;const char* compact;const char* aligned;const char* gr;const char* capacity;};
+      gr("MFQ_GR_BATCH_SHARED_DOWN"),capacity("MFQ_MFE_TOKEN_GROUP_CAPACITY"),
+      gdn("MFQ_GDN_SHORT_FUSION"),inplace("MFQ_GDN_SHORT_INPLACE");
+    struct Variant {const char* name;const char* compact;const char* aligned;const char* gr;const char* capacity;const char* gdn=nullptr;};
     const Variant variants[]={
         {"baseline","0","0","0","2"},
         {"compact","1","0","0","2"},
@@ -1247,11 +1361,22 @@ static int run_qwen4_mtp_variant_profile(mfq::cuda::Qwen4CausalLm& model,const s
         {"capacity4","1","1","1","4"},
         {"compact_shared_gr","1","0","1","2"},
         {"baseline_repeat","0","0","0","2"}};
+    const Variant short_variants[]={
+        {"short_legacy","1",nullptr,nullptr,"2","0"},
+        {"short_fused","1",nullptr,nullptr,"2","1"},
+        {"short_fused_repeat","1",nullptr,nullptr,"2","1"},
+        {"short_legacy_repeat","1",nullptr,nullptr,"2","0"}};
+    const auto* short_option=mfq::cuda::env_lookup("MFQ_MTP_PROFILE_VARIANTS");
+    const bool short_path=short_option && short_option[0]=='2';
+    const auto* active=short_path?short_variants:variants;
+    const auto count=short_path?std::size(short_variants):std::size(variants);
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
     const auto prompt=tb::tensor(prompt_ids.empty()?std::vector<int64_t>{1,2,3,4,5,6,7}:prompt_ids,options).reshape({1,-1});
     std::array<tb::Tensor,5> expected_hidden,expected_logits;
-    for(const auto& variant:variants)for(int tokens=2;tokens<=6;++tokens) {
+    for(std::size_t arm=0;arm<count;++arm)for(int tokens=2;tokens<=6;++tokens) {
+        const auto& variant=active[arm];
         compact.set(variant.compact);aligned.set(variant.aligned);gr.set(variant.gr);capacity.set(variant.capacity);
+        gdn.set(variant.gdn);inplace.set(variant.gdn);
         model.reset(1);model.execution->profiler.enabled=false;model.hidden_forward(prompt);
         std::vector<int64_t> values;for(int i=0;i<tokens;++i)values.push_back(3+i%5);
         const auto input=tb::tensor(values,options).reshape({1,tokens});
@@ -1268,7 +1393,7 @@ static int run_qwen4_mtp_variant_profile(mfq::cuda::Qwen4CausalLm& model,const s
         }
         const auto index=tokens-2;
         auto hidden_cpu=raw.cpu().contiguous(),logits_cpu=logits.cpu().contiguous();
-        if(variant.name==variants[0].name) {
+        if(arm==0) {
             expected_hidden[index]=hidden_cpu.clone();expected_logits[index]=logits_cpu.clone();
         }else {
             MFQ_RUNTIME_CHECK(std::memcmp(hidden_cpu.data_ptr(),expected_hidden[index].data_ptr(),
@@ -1283,7 +1408,7 @@ static int run_qwen4_mtp_variant_profile(mfq::cuda::Qwen4CausalLm& model,const s
 }
 
 static int run_qwen4_mtp_profile(mfq::cuda::Qwen4CausalLm& model,const std::vector<int64_t>& prompt_ids) {
-    if(const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_PROFILE_VARIANTS");variants && variants[0]=='1')
+    if(const auto* variants=mfq::cuda::env_lookup("MFQ_MTP_PROFILE_VARIANTS");variants && (variants[0]=='1' || variants[0]=='2'))
         return run_qwen4_mtp_variant_profile(model,prompt_ids);
     namespace tb=mfq_tensor_backend;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);

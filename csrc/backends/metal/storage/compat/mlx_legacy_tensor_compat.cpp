@@ -1,8 +1,8 @@
 #include "mlx_legacy_tensor_compat.h"
 
-#include "mfq_container.h"
-#include "mfq_legacy_model_graph.h"
-#include "mfq_legacy_tensor_names.h"
+#include "storage/mfq_container.h"
+#include "compat/mfq_legacy_model_graph.h"
+#include "compat/mfq_legacy_tensor_names.h"
 #include "mfq_model_graph.h"
 
 #include <stdexcept>

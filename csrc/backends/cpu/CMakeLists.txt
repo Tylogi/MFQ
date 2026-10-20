@@ -1,11 +1,15 @@
 # Thread primitives do not pull in expert scheduling or model loading.
 find_package(Threads REQUIRED)
-add_library(mfq-host-parallel STATIC native/host_parallel.cpp native/cpu_topology.cpp)
+add_library(mfq-host-parallel STATIC native/host_parallel.cpp native/cpu_topology.cpp native/host_copy.cpp)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
 target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
 set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(mfq::host-parallel ALIAS mfq-host-parallel)
+
+if(MSVC)
+    target_compile_options(mfq-host-parallel PRIVATE /EHsc)
+endif()
 
 add_library(mfq-cpu-execution STATIC execution/cpu_expert_pool.cpp)
 target_include_directories(mfq-cpu-execution PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/execution/include)

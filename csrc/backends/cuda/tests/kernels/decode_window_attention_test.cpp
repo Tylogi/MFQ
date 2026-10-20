@@ -2,7 +2,10 @@
 #include "models/qwen4_exp/model.h"
 #include "ops/decode_window.h"
 #include "native/context.h"
+#include "mfq/runtime.h"
 #include "ops/execution/cuda_execution.h"
+#include "csrc/tests/quant/nint_row_fixture.h"
+#include "ops/quant/nint.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -15,6 +18,98 @@ using tb::Tensor;
 using namespace mfq::cuda;
 using namespace mfq::cuda::qwen4_exp;
 namespace {
+void ple_prefix_context_case() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::vector<std::shared_ptr<mfq::NintRows>> tables={
+        std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size())};
+    const std::vector<int64_t> multipliers={1237,8713,16381},offsets={0,100,200,300},vocab(4,97);
+    const tb::Device device{tb::kCUDA,0};int cases=0;
+    for(int tokens:{2,3,4,6,8})for(bool eos:{false,true}) {
+        auto pipeline=std::make_shared<NintRowPipeline>(tables);
+        NgramEmbedding embedding(std::vector<Embedding>(1),529,160,3,2,999,
+            multipliers,offsets,vocab,pipeline);
+        NgramEmbedding::Context context{1,{17,eos?999:31}};embedding.restore(context);
+        std::vector<int64_t> ids(tokens);for(int i=0;i<tokens;++i)ids[i]=i==1?999:43+i;
+        const auto host=tb::tensor(ids).reshape({1,tokens});
+        embedding.prefetch(host.narrow(1,0,1),true);
+        if(embedding.context().batch!=context.batch || embedding.context().tokens!=context.tokens)
+            throw std::runtime_error("early PLE advanced the committed ngram context");
+        for(int prefix=2;prefix<tokens;++prefix)embedding.prefetch(host.narrow(1,0,prefix),true);
+        if(embedding.context().tokens!=context.tokens)
+            throw std::runtime_error("draft PLE prefix advanced the committed ngram context");
+        const auto hashes=mfq::models::qwen4_exp::ngram_hashes(ids.data(),1,tokens,3,2,999,
+            multipliers,offsets,vocab,context,true);
+        const auto accepted=embedding.prefix_context(host,1);
+        auto stage=embedding.graph_stage(1,tokens,device);
+        embedding.upload_graph(host,*stage);stage->decode();
+        auto actual=stage->output().cpu().contiguous();
+        auto expected=nint_sharded_embedding_lookup(tables,hashes.ids,{1,tokens,4},device).cpu().contiguous();
+        if(embedding.context().tokens!=hashes.next.tokens || actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("early PLE changed window rows or final ngram context");
+        // A rejected suffix restores the committed context before the next hint.
+        embedding.restore(accepted);embedding.prefetch(host.narrow(1,1,1),true);
+        if(embedding.context().tokens!=accepted.tokens)
+            throw std::runtime_error("PLE hint changed a restored context");
+        ++cases;
+    }
+    std::cout<<"MFQ PLE early-prefix ngram context and EOS exact PASS cases="<<cases<<'\n';
+}
+void ple_hash_lifecycle_case() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::vector<std::shared_ptr<mfq::NintRows>> tables={
+        std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size())};
+    const std::vector<int64_t> multipliers={1237,8713,16381},offsets={0,100,200,300},vocab(4,97);
+    const tb::Device device{tb::kCUDA,0};int cases=0;
+    for(int batch:{1,2})for(int tokens:{1,2,4,8,9}) {
+        auto pipeline=std::make_shared<NintRowPipeline>(tables);
+        NgramEmbedding embedding(std::vector<Embedding>(1),529,160,3,2,999,
+            multipliers,offsets,vocab,pipeline);
+        NgramEmbedding::Context expected_context{batch,std::vector<int64_t>(batch*2,17)};
+        embedding.restore(expected_context);
+        std::vector<int64_t> ids(batch*tokens);
+        for(std::size_t i=0;i<ids.size();++i)ids[i]=43+int64_t(i);
+        auto host=tb::tensor(ids).reshape({batch,tokens});
+        auto stage=embedding.graph_stage(batch,tokens,device);
+        const auto hashes=[&](const std::vector<int64_t>& values,bool cache) {
+            return mfq::models::qwen4_exp::ngram_hashes(values.data(),batch,tokens,3,2,999,
+                multipliers,offsets,vocab,expected_context,cache);
+        };
+        for(int step=0;step<7;++step) {
+            embedding.prefetch(host,true);embedding.prefetch(host,true);
+            if(step==2) {
+                expected_context={batch,std::vector<int64_t>(batch*2,999)};
+                embedding.restore(expected_context);
+            }else if(step==3) {
+                ids[0]=999;host.data_ptr<int64_t>()[0]=999;
+            }else if(step==4) {
+                embedding.reset();expected_context={};
+            }else if(step==5 || step==6) {
+                auto alternate=ids;for(auto& id:alternate)id+=13;
+                const bool commit=step==5;const auto expected=hashes(alternate,commit);
+                const auto alternate_host=tb::tensor(alternate).reshape({batch,tokens});
+                auto actual=embedding.forward(alternate_host.to(device),commit,nullptr,alternate_host).cpu().contiguous();
+                auto reference=nint_sharded_embedding_lookup(tables,expected.ids,{batch,tokens,4},device)
+                    .reshape({batch,tokens,640}).cpu().contiguous();
+                if(std::memcmp(actual.data_ptr(),reference.data_ptr(),actual.numel()*actual.element_size()))
+                    throw std::runtime_error("PLE eager/cache hash lifecycle output differs");
+                if(commit)expected_context=expected.next;
+            }
+            if(embedding.context().batch!=expected_context.batch || embedding.context().tokens!=expected_context.tokens)
+                throw std::runtime_error("PLE hash lifecycle mutated committed context before upload");
+            const auto expected=hashes(ids,true);
+            embedding.upload_graph(host,*stage);stage->decode();
+            auto actual=stage->output().cpu().contiguous();
+            auto reference=nint_sharded_embedding_lookup(tables,expected.ids,{batch,tokens,4},device).cpu().contiguous();
+            if(actual.sizes()!=reference.sizes() ||
+               std::memcmp(actual.data_ptr(),reference.data_ptr(),actual.numel()*actual.element_size()) ||
+               embedding.context().batch!=expected.next.batch || embedding.context().tokens!=expected.next.tokens)
+                throw std::runtime_error("PLE hash reuse retained stale token IDs or context");
+            expected_context=expected.next;++cases;
+        }
+    }
+    std::cout<<"MFQ PLE hash lifecycle exact PASS cases="<<cases<<" commit/reset/restore/mutation/eager/stateless/batch/long-window\n";
+}
 class GdnTileScope {
     std::string previous_;
     bool present_;
@@ -115,6 +210,10 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     int64_t capacity=std::min(maximum,16);
     const auto allocation_before=default_context()->memory_stats().allocated;
     actual.prepare_graph(history,capacity);
+    if(actual.resident_cache_tensors()[0].defined() || actual.resident_cache_tensors()[1].defined())
+        throw std::runtime_error("QSA graph retained duplicate legacy KV storage");
+    if(actual.growth_bytes(1)!=0)
+        throw std::runtime_error("QSA growth ignored the active graph KV storage");
     if(default_context()->memory_stats().allocated>allocation_before+(1<<20))
         throw std::runtime_error("small QSA graph allocated KV for the context ceiling");
     std::map<int,std::unique_ptr<Cell>> cells;
@@ -144,6 +243,34 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     equal(actual.forward(execution,inputs.narrow(1,16,1),pos,history,true),
         oracle.forward(execution,inputs.narrow(1,16,1),pos,history,true),"QSA graph to ordinary cache");
 }
+void quota_recovery_case() {
+    auto input=tb::full({16},0.5,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32));
+    Tensor output;
+    bool rejected=false;
+    {
+        DecodeWindow failed(mfq_current_cuda_stream());
+        int calls=0;
+        try {
+            failed.capture([&] {
+                if(++calls==3)throw MfqResourceExhausted("CUDA VRAM limit exceeded: injected during graph recording");
+                output=input+1;
+            },[]{},[&]{output={};});
+        } catch(const MfqResourceExhausted& error) {
+            rejected=std::string(error.what()).starts_with("CUDA VRAM limit exceeded:");
+        }
+        if(!rejected || failed.valid())throw std::runtime_error("graph recording lost the recoverable quota error");
+    }
+    {
+        DecodeWindow healthy(mfq_current_cuda_stream());
+        healthy.capture([&]{output=input+2;},[]{},[&]{output={};});
+        healthy.run();
+        auto actual=output.to(tb::kCPU);
+        for(int i=0;i<16;++i)if(actual.data_ptr<float>()[i]!=2.5f)
+            throw std::runtime_error("a quota rejection damaged subsequent graph execution");
+    }
+    std::cout<<"decode_window_quota type_preserved=PASS subsequent_capture=PASS output=PASS\n";
+}
+
 void layer_profile_case() {
     auto input=data({1,1,2560},29);auto output=tb::empty_like(input);
     DecodeWindow window(mfq_current_cuda_stream(),true);
@@ -158,6 +285,30 @@ void layer_profile_case() {
         throw std::runtime_error("GPU profile phase order changed in capture");
     for(const auto& phase:phases)if(phase.samples!=3 || phase.min_ns<0 || phase.max_ns<phase.min_ns || phase.total_ns<phase.max_ns)
         throw std::runtime_error("GPU profile lost captured replay timing events");
+}
+void layer_profile_invalid_case() {
+#ifdef _WIN32
+    if(_putenv_s("MFQ_TRACE_LAYER_TIMINGS_CLOCK","1"))throw std::runtime_error("profile clock option");
+#else
+    if(setenv("MFQ_TRACE_LAYER_TIMINGS_CLOCK","1",1))throw std::runtime_error("profile clock option");
+#endif
+    auto input=data({1,1,2560},29),output=tb::empty_like(input);
+    DecodeWindow window(mfq_current_cuda_stream(),true);
+    window.capture([&] {
+        window.mark(-1,"begin");window.mark(0,"copy_begin");
+        output.copy_(input);window.mark(0,"copy_end");
+        // Overwrite the first timestamp after the later phases.
+        window.mark(-1,"begin");
+    },[]{});
+    for(int replay=0;replay<3;++replay) {
+        input.copy_(data({1,1,2560},replay+30));window.run();
+        equal(output,input,"invalid profile must preserve completed output",0);
+    }
+    const auto phases=window.gpu_phases();
+    if(phases.size()!=2 || !window.valid())throw std::runtime_error("invalid diagnostic damaged graph");
+    for(const auto& phase:phases)if(phase.samples || phase.total_ns)
+        throw std::runtime_error("invalid replay partly incremented phase totals");
+    std::cout<<"Invalid GPU clock samples discarded; three changing outputs and graph reuse PASS\n";
 }
 void grouped_norm_case() {
     constexpr int hidden=2560,streams=4;
@@ -283,6 +434,67 @@ void gdn_case(bool model_shape = false) {
             throw std::runtime_error("GDN graph changed recurrent addresses");
         position+=t;
     }
+    std::cout<<"GDN model_shape="<<model_shape<<" changing_graph="<<lengths.size()
+        <<" capture restore and persistent conv/recurrent addresses PASS\n";
+}
+
+void gdn_prefix_checkpoint_case() {
+    CudaExecutionContext execution;
+    const auto bits=[](const Tensor& a,const Tensor& b,const char* label) {
+        auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
+           std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size()))
+            throw std::runtime_error(std::string(label)+" changed bytes");
+    };
+    const auto option=[](const char* value) {
+#ifdef _WIN32
+        _putenv_s("MFQ_MTP_GDN_FUSED_CHECKPOINT",value);
+#else
+        setenv("MFQ_MTP_GDN_FUSED_CHECKPOINT",value,1);
+#endif
+    };
+    int checked=0;
+    for(int width:{32,128})for(int tokens:{2,3,4,6})for(int confirmed:{1,tokens-1}) {
+        const int hidden=32,nk=width==128?16:1,nv=nk*3,channels=(2*nk+nv)*width;
+        auto gpu=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+        GdnWeights weights{linear(hidden,channels,11),linear(hidden,nv*width,12),linear(hidden,nv,13),linear(hidden,nv,14),
+            linear(nv*width,hidden,15),data({channels,4},16),tb::zeros({nv},gpu),tb::zeros({nv},gpu),tb::ones({width},gpu)};
+        auto separate=weights;
+        weights.input_projection=[separate](CudaExecutionContext& e,const Tensor& x) {
+            return std::vector<Tensor>{separate.qkv(e,x),separate.gate(e,x),separate.alpha(e,x),separate.beta(e,x)};
+        };
+        Gdn actual(weights,nk,nv,width,4,1e-6,false),reference(weights,nk,nv,width,4,1e-6,false);
+        auto history=data({1,3,hidden},17,.4f),input=data({1,tokens,hidden},18,.3f);
+        actual.forward_chunk(execution,history,true);
+        reference.restore_session(actual.conv_state(),*actual.graph_state()[1]);
+        auto initial_conv=actual.conv_state().clone(),initial_state=actual.graph_state()[1]->clone();
+        std::vector<Tensor> conv,state,expected_conv,expected_state;
+        for(int i=0;i<tokens-confirmed;++i) {
+            conv.push_back(tb::empty_like(initial_conv));state.push_back(tb::empty_like(initial_state));
+            expected_conv.push_back(tb::empty_like(initial_conv));expected_state.push_back(tb::empty_like(initial_state));
+        }
+        option("0");
+        auto expected=reference.forward_graph(execution,input,confirmed,expected_conv,expected_state).clone();
+        option("1");
+        Tensor output;
+        DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{output=actual.forward_graph(execution,input,confirmed,conv,state);},[&]{
+            actual.graph_state()[0]->copy_(initial_conv);actual.graph_state()[1]->copy_(initial_state);
+        },[&]{output={};});
+        window.run();bits(output,expected,"GDN fused checkpoint output");
+        bits(actual.conv_state(),reference.conv_state(),"GDN final convolution");
+        bits(*actual.graph_state()[1],*reference.graph_state()[1],"GDN final recurrent state");
+        for(int i=0;i<tokens-confirmed;++i) {
+            bits(conv[i],expected_conv[i],"GDN prefix convolution");
+            bits(state[i],expected_state[i],"GDN prefix recurrence");
+            actual.bind_graph_checkpoint(conv,state,confirmed);actual.rollback(confirmed+i);
+            bits(actual.conv_state(),expected_conv[i],"GDN rejected-prefix convolution");
+            bits(*actual.graph_state()[1],expected_state[i],"GDN rejected-prefix recurrence");
+            ++checked;
+        }
+    }
+    option("");
+    std::cout<<"GDN fused prefix checkpoint bytes/graph/rejection checks="<<checked<<" PASS\n";
 }
 
 void gdn_preparation_case() {
@@ -326,6 +538,96 @@ void gdn_preparation_case() {
     std::cout<<"GDN combined preparation ordinary="<<ordinary<<" changing_graph="<<changing
         <<" all5outputs/state bytes exact, Half/Float strided gates, batch1/2, layouts2, widths32/64/128/256 PASS\n";
 }
+void gdn_short_preparation_case() {
+    int ordinary=0,changing=0;
+    const auto bits=[](const Tensor& a,const Tensor& b) {
+        auto x=a.contiguous().cpu(),y=b.contiguous().cpu();
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
+            std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size()))
+            throw std::runtime_error("short GDN preparation changed tensor bytes");
+    };
+    for(int width:{32,64,128,256})for(int tokens:{2,3,4,5,6})for(int combination=0;combination<4;++combination) {
+        const int batch=1+(combination&1),nk=width==128?16:2,nv=3*nk;
+        const int channels=(2*nk+nv)*width,taps=combination&1?7:4;
+        const auto dtype=combination&2?tb::kFloat32:tb::kFloat16;
+        auto qkv=data({batch,tokens,channels},421,.31f);
+        auto conv=data({batch,taps-1,channels},422,.14f).to(tb::kFloat32);
+        auto weight=data(combination&1?std::vector<int64_t>{taps,channels}:std::vector<int64_t>{channels,1,taps},423,.29f).to(tb::kFloat32);
+        auto alpha=data({batch,tokens,nv},424,18.f).to(dtype),beta=data({batch,tokens,nv},425,18.f).to(dtype);
+        auto dt=data({nv},426,.9f).to(tb::kFloat32),log=data({nv},427,.3f).to(tb::kFloat32);
+        const auto fused=[&] {return linear_conv_qkv_gate_short_cuda(conv,qkv,weight,alpha,beta,dt,log,nk,nv,width,1e-6);};
+        const auto check=[&](const std::vector<Tensor>& result) {
+            auto reference=linear_conv_qkv_prefill_cuda(conv,qkv.narrow(-1,0,2*nk*width).contiguous(),
+                qkv.narrow(-1,2*nk*width,nv*width).contiguous(),weight,tb::empty({0},conv.options()),nk,nv,width,width,1e-6);
+            auto gates=linear_gate_beta_cuda(alpha.to(tb::kFloat32),beta.to(tb::kFloat32),dt,log,true);
+            reference.push_back(gates[0]);reference.push_back(gates[1]);
+            for(int index=0;index<6;++index)bits(result[index],reference[index]);
+            if(width<=128) {
+                auto initial=data({batch,nv,width,width},431,.08f).to(tb::kFloat32);
+                auto baseline=gdn_transposed_cuda(reference[0],reference[1],reference[2],reference[4],reference[5],initial);
+                auto inplace=initial.clone();
+                auto actual=gdn_inplace_transposed_cuda(result[0],result[1],result[2],result[4],result[5],inplace);
+                if(actual[1].data_ptr()!=inplace.data_ptr())throw std::runtime_error("short GDN replaced inplace state");
+                bits(actual[0],baseline[0]);bits(actual[1],baseline[1]);
+            }
+        };
+        check(fused());++ordinary;
+        std::vector<Tensor> result;DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{result=fused();},[]{},[&]{result.clear();});
+        for(int step=0;step<3;++step) {
+            qkv.copy_(data(qkv.sizes().vec(),432+step,step==0?0.f:.11f*step));
+            conv.copy_(data(conv.sizes().vec(),436+step,.09f*step).to(tb::kFloat32));
+            alpha.copy_(data(alpha.sizes().vec(),439+step,35.f*step).to(dtype));
+            beta.copy_(data(beta.sizes().vec(),442+step,35.f*step).to(dtype));
+            window.run();check(result);++changing;
+        }
+    }
+    std::cout<<"short_gdn_preparation ordinary="<<ordinary<<" changing_graph="<<changing
+        <<" 6 outputs/state and inplace recurrence exact; 2-6 tokens, model heads16/48, batch1/2, Half/Float, layouts2 PASS\n";
+}
+void gdn_short_preparation_benchmark() {
+    constexpr int nk=16,nv=48,width=128,taps=4,channels=(2*nk+nv)*width,replays=512;
+    const auto stream=mfq_current_cuda_stream();
+    for(int tokens:{2,3,4,5,6}) {
+        auto qkv=data({1,tokens,channels},451,.3f),gate=data({1,tokens,nv*width},452,.3f);
+        auto alpha=data({1,tokens,nv},453,.5f),beta=data({1,tokens,nv},454,.5f);
+        auto conv=data({1,taps-1,channels},455,.1f).to(tb::kFloat32);
+        auto state=data({1,nv,width,width},456,.1f).to(tb::kFloat32);
+        auto weight=data({channels,1,taps},457,.1f).to(tb::kFloat32);
+        auto dt=data({nv},458,.3f).to(tb::kFloat32),log=data({nv},459,.3f).to(tb::kFloat32);
+        auto norm=data({width},460,1.3f).to(tb::kFloat32);
+        const auto initial_conv=conv.clone(),initial_state=state.clone();
+        Tensor output;
+        const auto compute=[&](int mode) {
+            std::vector<Tensor> prepared;
+            if(mode&1)prepared=linear_conv_qkv_gate_short_cuda(conv,qkv,weight,alpha,beta,dt,log,nk,nv,width,1e-6);
+            else {
+                prepared=linear_conv_qkv_prefill_cuda(conv,qkv.narrow(-1,0,2*nk*width).contiguous(),
+                    qkv.narrow(-1,2*nk*width,nv*width).contiguous(),weight,tb::empty({0},conv.options()),nk,nv,width,width,1e-6);
+                auto gates=linear_gate_beta_cuda(alpha.to(tb::kFloat32),beta.to(tb::kFloat32),dt,log,true);
+                prepared.push_back(gates[0]);prepared.push_back(gates[1]);
+            }
+            auto recurrence=mode&2?gdn_inplace_transposed_cuda(prepared[0],prepared[1],prepared[2],prepared[4],prepared[5],state)
+                :gdn_transposed_cuda(prepared[0],prepared[1],prepared[2],prepared[4],prepared[5],state);
+            output=gdn_rms_norm_gate_cuda(recurrence[0],gate,norm,1e-6,false,true);
+            conv.copy_(prepared[3]);
+            if(!(mode&2))state.copy_(recurrence[1]);
+        };
+        for(int mode:{0,1,2,3,3,2,1,0}) {
+            conv.copy_(initial_conv);state.copy_(initial_state);
+            {GraphWarmupScope warmup(default_context(mfq_current_cuda_device()),stream);compute(mode);}
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));output=Tensor{};
+            Graph graph;graph.capture_begin_shared();compute(mode);graph.capture_end();
+            for(int i=0;i<64;++i)graph.replay();
+            Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(stream);
+            for(int i=0;i<replays;++i)graph.replay();
+            end.record(stream);end.synchronize();float elapsed=0;
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed,begin.get(),end.get()));
+            std::cout<<"gdn_short_path tokens="<<tokens<<" fusion="<<bool(mode&1)<<" inplace="<<bool(mode&2)
+                <<" us="<<1000.f*elapsed/replays<<" includes=prepare,recurrence,norm,cache_commit graph=1\n";
+        }
+    }
+}
 void gdn_prefill_case() {
     int cases=0;
     for(int width:{32,64,128})for(bool model_shape:{false,true}) {
@@ -350,7 +652,7 @@ void gdn_prefill_case() {
     }
     std::cout<<"GDN fused prefill cases="<<cases<<" widths32/64/128, model heads16/48, continued state and prefill/decode transition PASS\n";
 }
-void gdn_core_case(bool inplace=false) {
+void gdn_core_case(bool inplace=false,int head_ratio=3) {
     int ordinary=0,changing=0;
     const auto bits=[](const Tensor& a,const Tensor& b,const char* label) {
         auto x=a.contiguous().cpu(),y=b.contiguous().cpu();
@@ -359,7 +661,7 @@ void gdn_core_case(bool inplace=false) {
             throw std::runtime_error(std::string(label)+" dtype/shape/bytes differ");
     };
     for(int width:{32,64,128})for(int combination=0;combination<32;++combination) {
-        const int batch=1+(combination&1),nk=combination&2?16:2,nv=nk*3,taps=combination&16?7:4;
+        const int batch=1+(combination&1),nk=head_ratio>=24?1:combination&2?16:2,nv=nk*head_ratio,taps=combination&16?7:4;
         const int channels=(2*nk+nv)*width;
         const auto dtype=combination&8?tb::kFloat32:tb::kFloat16;
         const bool half=combination&1,silu=combination&2,transposed=combination&4;
@@ -384,10 +686,18 @@ void gdn_core_case(bool inplace=false) {
         };
         const auto fused=[&] {
             auto input_state=inplace?state.clone():state;
-            auto result=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv,input_state,weight,bias,a,norm,
+            auto input_conv=inplace?conv.clone():conv;
+            auto result=gdn_decode_core_cuda(qkv,gate,alpha,beta,input_conv,input_state,weight,bias,a,norm,
                 nk,nv,width,1e-6,eps,silu,half,transposed,workspace,inplace);
             if(inplace && result[2].data_ptr()!=input_state.data_ptr())
                 throw std::runtime_error("GDN inplace state storage was replaced");
+            const auto* conv_option=mfq::cuda::env_lookup("MFQ_GDN_INPLACE_CONV");
+            const auto* tile_option=mfq::cuda::env_lookup("MFQ_GDN_DECODE_TILES");
+            const bool conv_default=batch==1 && nk==16 && nv==48 && width==128 && taps==4 && transposed;
+            const bool conv_alias=inplace && (conv_option?conv_option[0]!='0':conv_default) && head_ratio<=24 &&
+                (!tile_option || tile_option[0]!='1');
+            if((result[1].data_ptr()==input_conv.data_ptr())!=conv_alias)
+                throw std::runtime_error("GDN convolution inplace/fallback storage differs");
             return result;
         };
         const auto check=[&](const std::vector<Tensor>& result) {
@@ -405,10 +715,161 @@ void gdn_core_case(bool inplace=false) {
             window.run();check(result);++changing;
         }
     }
-    std::cout<<"GDN complete core inplace="<<inplace<<" ordinary="<<ordinary<<" changing_graph="<<changing
+    std::cout<<"GDN complete core inplace="<<inplace<<" head_ratio="<<head_ratio<<" ordinary="<<ordinary<<" changing_graph="<<changing
         <<" output/conv/FP32state bytes exact; reused counters reset; widths32/64/128, batch1/2, layouts2, strided Half/Float gates PASS\n";
 }
-void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) {
+void gdn_independent_state_case() {
+    int cases=0,replays=0;
+    const auto bits=[](const Tensor& actual,const Tensor& expected) {
+        auto a=actual.contiguous().cpu(),b=expected.contiguous().cpu();
+        if(a.sizes()!=b.sizes() || a.scalar_type()!=b.scalar_type() ||
+            std::memcmp(a.data_ptr(),b.data_ptr(),a.numel()*a.element_size()))
+            throw std::runtime_error("independent GDN graph output/state bytes differ");
+    };
+    for(int width:{32,64,128})for(int batch:{2,4,6,8,16,32})for(bool float_gate:{false,true}) {
+        constexpr int nk=2,nv=6;
+        const int taps=width==64?7:4,channels=(2*nk+nv)*width;
+        const auto dtype=float_gate?tb::kFloat32:tb::kFloat16;
+        auto qkv=data({batch,1,channels},180,.4f);
+        auto gate=data({batch,1,nv*width},181,.5f).to(dtype);
+        auto alpha=data({batch,1,nv},182,.3f).to(dtype),beta=data({batch,1,nv},183,.2f).to(dtype);
+        auto weight=data({channels,1,taps},184,.19f).to(tb::kFloat32);
+        auto bias=data({nv},185,1.3f).to(tb::kFloat32),a=data({nv},186,.3f).to(tb::kFloat32);
+        auto norm=data({width},187,1.3f).to(tb::kFloat32);
+        std::vector<Tensor> conv,state,counters,expected_conv,expected_state,expected_counters;
+        for(int row=0;row<batch;++row) {
+            expected_conv.push_back(data({1,taps-1,channels},190+row,.3f).to(tb::kFloat32));
+            expected_state.push_back(data({1,nv,width,width},230+row,.17f).to(tb::kFloat32));
+            conv.push_back(expected_conv.back().clone());state.push_back(expected_state.back().clone());
+            counters.push_back(tb::zeros({1,nv,width+1},conv.back().options()));
+            expected_counters.push_back(tb::zeros_like(counters.back()));
+        }
+        auto host=tb::empty({batch,3},state[0].options().device(tb::kCPU).dtype(tb::kInt64));
+        auto addresses=host.to(state[0].device());
+        const auto set_order=[&](bool reversed) {
+            for(int row=0;row<batch;++row) {
+                const int owner=reversed?batch-1-row:row;
+                host.data_ptr<int64_t>()[3*row]=reinterpret_cast<int64_t>(conv[owner].data_ptr());
+                host.data_ptr<int64_t>()[3*row+1]=reinterpret_cast<int64_t>(state[owner].data_ptr());
+                host.data_ptr<int64_t>()[3*row+2]=reinterpret_cast<int64_t>(counters[owner].data_ptr());
+            }
+            addresses.copy_(host);
+        };
+        set_order(false);
+        Tensor output;
+        DecodeWindow window(mfq_current_cuda_stream());
+        const bool silu=float_gate,half=width!=64,transposed=width!=32;
+        window.capture([&] {
+            auto result=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv[0],state[0],weight,bias,a,norm,
+                nk,nv,width,1e-6,.013456789123,silu,half,transposed,counters[0],true,addresses);
+            if(result[2].data_ptr()!=state[0].data_ptr())throw std::runtime_error("independent GDN replaced row-zero state");
+            output=result[0];
+        },[&] {
+            for(int row=0;row<batch;++row) {
+                conv[row].copy_(expected_conv[row]);state[row].copy_(expected_state[row]);counters[row].fill_(0);
+            }
+        },[&]{output={};});
+        for(int step=0;step<3;++step) {
+            const bool reversed=step==1;set_order(reversed);
+            qkv.copy_(data(qkv.sizes().vec(),270+step,step==0?0.f:step==1?.7f:8.f));
+            gate.copy_(data(gate.sizes().vec(),274+step,.8f).to(dtype));
+            alpha.copy_(data(alpha.sizes().vec(),278+step,88.f).to(dtype));
+            beta.copy_(data(beta.sizes().vec(),282+step,88.f).to(dtype));
+            std::vector<Tensor> expected_output;
+            for(int row=0;row<batch;++row) {
+                const int owner=reversed?batch-1-row:row;
+                auto r=gdn_decode_core_cuda(qkv.narrow(0,row,1),gate.narrow(0,row,1),
+                    alpha.narrow(0,row,1),beta.narrow(0,row,1),expected_conv[owner],expected_state[owner],
+                    weight,bias,a,norm,nk,nv,width,1e-6,.013456789123,silu,half,transposed,expected_counters[owner],true);
+                expected_conv[owner].copy_(r[1]);expected_output.push_back(r[0]);
+            }
+            window.run();bits(output,tb::cat(expected_output,0));
+            bits(tb::cat(conv,0),tb::cat(expected_conv,0));bits(tb::cat(state,0),tb::cat(expected_state,0));
+            for(int row=0;row<batch;++row)bits(counters[row].select(-1,width),
+                expected_counters[row].select(-1,width));
+            ++replays;
+        }
+        ++cases;
+    }
+    std::cout<<"GDN independent state cases="<<cases<<" changing_graph="<<replays
+        <<" rows2/4/6/8/16/32, Half/Float gates, widths32/64/128, changing state addresses and zeroed counters EXACT PASS\n";
+}
+
+void gdn_batch_core_benchmark(int max_batch=32) {
+    constexpr int nk=16,nv=48,width=128,channels=(2*nk+nv)*width,taps=4,replays=256;
+    const auto stream=mfq_current_cuda_stream();
+    auto context=default_context(mfq_current_cuda_device());
+    GdnTileScope setting(4);
+    for(int batch:{2,4,6,8,16,32}) {
+        if(batch>max_batch)continue;
+        auto qkv=data({batch,1,channels},151,.4f),gate=data({batch,1,nv*width},152,.5f);
+        auto alpha=data({batch,1,nv},153,.5f),beta=data({batch,1,nv},154,.5f);
+        auto conv=data({batch,taps-1,channels},155,.3f).to(tb::kFloat32);
+        auto state=data({batch,nv,width,width},156,.17f).to(tb::kFloat32);
+        auto weight=data({channels,1,taps},157,.19f).to(tb::kFloat32);
+        auto bias=data({nv},158,1.3f).to(tb::kFloat32),a=data({nv},159,.3f).to(tb::kFloat32);
+        auto norm=data({width},160,1.3f).to(tb::kFloat32);
+        auto workspace=tb::zeros({batch,nv,width+1},conv.options());
+        const auto initial_state=state.clone(),initial_conv=conv.clone();
+        auto host=tb::empty({batch,3},state.options().device(tb::kCPU).dtype(tb::kInt64));
+        for(int row=0;row<batch;++row) {
+            host.data_ptr<int64_t>()[3*row]=reinterpret_cast<int64_t>(conv.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+1]=reinterpret_cast<int64_t>(state.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+2]=reinterpret_cast<int64_t>(workspace.narrow(0,row,1).data_ptr());
+        }
+        auto addresses=host.to(state.device());
+        std::vector<Tensor> outputs;
+        const auto compute=[&](int mode) {
+            outputs.clear();
+            if(mode==2) {
+                auto r=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv.narrow(0,0,1),state.narrow(0,0,1),
+                    weight,bias,a,norm,nk,nv,width,1e-6,1e-6,false,true,true,
+                    workspace.narrow(0,0,1),true,addresses);
+                outputs.push_back(r[0]);
+            } else if(mode==1) {
+                auto r=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,a,norm,
+                    nk,nv,width,1e-6,1e-6,false,true,true,workspace,true);
+                // Independent requests still own separate convolution rows.
+                for(int row=0;row<batch;++row)conv.narrow(0,row,1).copy_(r[1].narrow(0,row,1));
+                outputs.push_back(r[0]);
+            } else for(int row=0;row<batch;++row) {
+                auto r=gdn_decode_core_cuda(qkv.narrow(0,row,1),gate.narrow(0,row,1),
+                    alpha.narrow(0,row,1),beta.narrow(0,row,1),conv.narrow(0,row,1),state.narrow(0,row,1),
+                    weight,bias,a,norm,nk,nv,width,1e-6,1e-6,false,true,true,workspace.narrow(0,row,1),true);
+                conv.narrow(0,row,1).copy_(r[1]);outputs.push_back(r[0]);
+            }
+        };
+        compute(false);auto expected=tb::cat(outputs,0).to(tb::kCPU).contiguous();
+        const auto expected_state=state.to(tb::kCPU).contiguous(),expected_conv=conv.to(tb::kCPU).contiguous();
+        state.copy_(initial_state);conv.copy_(initial_conv);compute(1);
+        const auto check=[&](const Tensor& actual,const Tensor& reference) {
+            auto host=actual.to(tb::kCPU).contiguous();
+            if(host.sizes()!=reference.sizes() || std::memcmp(host.data_ptr(),reference.data_ptr(),host.numel()*host.element_size()))
+                throw std::runtime_error("batched GDN core differs from independent recurrence");
+        };
+        check(outputs[0],expected);check(state,expected_state);check(conv,expected_conv);
+        state.copy_(initial_state);conv.copy_(initial_conv);compute(2);
+        check(outputs[0],expected);check(state,expected_state);check(conv,expected_conv);
+        const auto measure=[&](int mode) {
+            state.copy_(initial_state);conv.copy_(initial_conv);
+            {GraphWarmupScope warmup(context,stream);compute(mode);}
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));outputs.clear();
+            Graph graph;graph.capture_begin_shared();compute(mode);graph.capture_end();
+            for(int i=0;i<16;++i)graph.replay();
+            Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(stream);
+            for(int i=0;i<replays;++i)graph.replay();
+            end.record(stream);end.synchronize();
+            float elapsed_ms=0;
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,begin.get(),end.get()));
+            return 1000.f*elapsed_ms/replays;
+        };
+        const auto serial_us=measure(0),batch_us=measure(1),independent_us=measure(2);
+        std::cout<<"GDN independent_batch rows="<<batch<<" serial_us="<<serial_us
+            <<" batch_us="<<batch_us<<" independent_us="<<independent_us<<" state/conv/output=EXACT\n";
+    }
+}
+
+void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false,bool compare_reductions=false,bool compare_conv=false,bool compare_broadcast=false) {
     constexpr int nk=16,nv=48,width=128,channels=(2*nk+nv)*width,taps=4,replays=1024;
     auto qkv=data({1,1,channels},151,.4f),gate=data({1,1,nv*width},152,.5f);
     auto alpha=data({1,1,nv},153,.5f),beta=data({1,1,nv},154,.5f);
@@ -420,13 +881,39 @@ void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) 
     auto workspace=tb::zeros({1,nv,width+1},conv.options());
     const auto initial_state=state.clone(),initial_conv=conv.clone();
     const auto stream=mfq_current_cuda_stream();
-    const std::vector<int> tile_cases=(compare_geometry || compare_inplace)?std::vector<int>{4,4,4,4,4,4}:std::vector<int>{4,2,1,1,2,4};
+    const std::vector<int> tile_cases=(compare_geometry || compare_inplace || compare_reductions || compare_conv || compare_broadcast)?std::vector<int>{4,4,4,4,4,4}:std::vector<int>{4,2,1,1,2,4};
     int arm=0;
     for(int tiles:tile_cases) {
         const char* fixed_setting=mfq::cuda::env_lookup("MFQ_GDN_FIXED_GEOMETRY");
         const bool fixed=compare_geometry?arm%3==1:(!fixed_setting || fixed_setting[0]!='0');
-        const bool inplace=compare_inplace && arm%3==1;
-        if(compare_inplace){state.copy_(initial_state);conv.copy_(initial_conv);}
+        const bool inplace=compare_broadcast || compare_conv || (compare_inplace && arm%3==1);
+        const bool inplace_conv=compare_broadcast || (compare_conv && arm%3==1);
+        const bool broadcast=compare_broadcast && arm%3==1;
+        const char* broadcast_candidate=mfq::cuda::env_lookup("MFQ_GDN_BROADCAST_PROBE_MODE");
+        const char* broadcast_baseline=mfq::cuda::env_lookup("MFQ_GDN_BROADCAST_PROBE_BASELINE");
+        if(compare_broadcast) {
+#ifdef _WIN32
+            _putenv_s("MFQ_GDN_BROADCAST_NORMALIZATION",broadcast?(broadcast_candidate?broadcast_candidate:"1"):(broadcast_baseline?broadcast_baseline:"0"));
+#else
+            setenv("MFQ_GDN_BROADCAST_NORMALIZATION",broadcast?(broadcast_candidate?broadcast_candidate:"1"):(broadcast_baseline?broadcast_baseline:"0"),1);
+#endif
+        }
+        const bool reductions=compare_reductions?arm%3==1:true;
+        if(compare_reductions) {
+#ifdef _WIN32
+            _putenv_s("MFQ_GDN_WARP_REDUCTIONS",reductions?"1":"0");
+#else
+            setenv("MFQ_GDN_WARP_REDUCTIONS",reductions?"1":"0",1);
+#endif
+        }
+        if(compare_inplace || compare_conv || compare_broadcast){state.copy_(initial_state);conv.copy_(initial_conv);}
+        if(compare_conv) {
+#ifdef _WIN32
+            _putenv_s("MFQ_GDN_INPLACE_CONV",inplace_conv?"1":"0");
+#else
+            setenv("MFQ_GDN_INPLACE_CONV",inplace_conv?"1":"0",1);
+#endif
+        }
         if(compare_geometry) {
             mfq::cuda::env_set("MFQ_GDN_FIXED_GEOMETRY",fixed?"1":"0");
         }
@@ -434,8 +921,8 @@ void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) 
         GdnTileScope setting(tiles);std::vector<Tensor> result;
         const auto compute=[&]{result=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv,state,weight,bias,a,norm,
             nk,nv,width,1e-6,1e-6,false,true,true,workspace,inplace);
-            if(compare_inplace) {
-                conv.copy_(result[1]);
+            if(compare_inplace || compare_conv || compare_broadcast) {
+                if(conv.data_ptr()!=result[1].data_ptr())conv.copy_(result[1]);
                 if(!inplace)state.copy_(result[2]);
             }
         };
@@ -457,6 +944,10 @@ void gdn_core_benchmark(bool compare_geometry=false,bool compare_inplace=false) 
         const double state_bytes=double(state.numel()*state.element_size())*2;
         std::cout<<"gdn_core_bench tiles="<<tiles<<" batch=1 key_heads="<<nk<<" value_heads="<<nv
             <<" width="<<width<<" transposed_state=1 fixed_geometry="<<fixed<<" inplace_state="<<inplace<<" us="<<microseconds
+            <<" warp_reductions="<<reductions
+            <<" inplace_conv="<<inplace_conv
+            <<" broadcast_norm="<<broadcast
+            <<" broadcast_mode="<<(broadcast?(broadcast_candidate?broadcast_candidate:"1"):(broadcast_baseline?broadcast_baseline:"0"))
             <<" state_effective_GBps="<<state_bytes/(microseconds*1000)<<" replays="<<replays
             <<" benchmark_mode=queued_graph\n";
     }
@@ -671,39 +1162,100 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 #include "qsa_prefill_test.h"
 #include "qsa_prefill_scores_test.h"
 #include "qsa_kv_offload_test.h"
+#include "kv_quantization_test.h"
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
 int main(int argc,char** argv)try {
-    const auto stream=mfq_current_cuda_stream();auto context=default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);
-    if(argc==2 && std::string(argv[1])=="--gdn-core-check") {
+    auto context=default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    if(argc==2 && std::string(argv[1])=="--layer-profile-check")layer_profile_case();
+    else if(argc==2 && std::string(argv[1])=="--layer-profile-drop-check")layer_profile_invalid_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-core-check") {
         for(int tiles:{4,2,1}) {
             GdnTileScope setting(tiles);std::cout<<"gdn_decode_tiles="<<tiles<<'\n';gdn_core_case();
         }
     } else if(argc==2 && std::string(argv[1])=="--gdn-inplace-check") {
         for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_core_case(true);}
     } else if(argc==2 && std::string(argv[1])=="--gdn-core-bench")gdn_core_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--gdn-reduction-bench")gdn_core_benchmark(false,false,true);
     else if(argc==2 && std::string(argv[1])=="--gdn-fixed-bench")gdn_core_benchmark(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-inplace-bench")gdn_core_benchmark(false,true);
     else if(argc==2 && std::string(argv[1])=="--gdn-preparation-check")gdn_preparation_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-conv-inplace-bench")gdn_core_benchmark(false,false,false,true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-broadcast-bench")gdn_core_benchmark(false,false,false,false,true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-broadcast-check") {
+        const char* candidate=mfq::cuda::env_lookup("MFQ_GDN_BROADCAST_PROBE_MODE");
+#ifdef _WIN32
+        _putenv_s("MFQ_GDN_BROADCAST_NORMALIZATION",candidate?candidate:"1");
+#else
+        setenv("MFQ_GDN_BROADCAST_NORMALIZATION",candidate?candidate:"1",1);
+#endif
+        for(int ratio:{1,2,3,4}) {GdnTileScope setting(4);gdn_core_case(true,ratio);}
+        gdn_independent_state_case();
+    }
+    else if(argc==2 && std::string(argv[1])=="--gdn-model-graph-check") {gdn_case();gdn_case(true);}
+    else if(argc==2 && std::string(argv[1])=="--gdn-conv-inplace-check") {
+#ifdef _WIN32
+        _putenv_s("MFQ_GDN_INPLACE_CONV","1");
+#else
+        setenv("MFQ_GDN_INPLACE_CONV","1",1);
+#endif
+        for(int tiles:{4,2,1})for(int ratio:{1,2,3,4,24,25}) {
+            GdnTileScope setting(tiles);gdn_core_case(true,ratio);
+        }
+    }
+    else if(argc==2 && std::string(argv[1])=="--gdn-batch-bench")gdn_batch_core_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--gdn-broadcast-batch-bench") {
+        const char* candidate=mfq::cuda::env_lookup("MFQ_GDN_BROADCAST_PROBE_MODE");
+        const char* baseline=mfq::cuda::env_lookup("MFQ_GDN_BROADCAST_PROBE_BASELINE");
+        for(int arm=0;arm<3;++arm) {
+#ifdef _WIN32
+            _putenv_s("MFQ_GDN_BROADCAST_NORMALIZATION",arm==1?(candidate?candidate:"1"):(baseline?baseline:"0"));
+#else
+            setenv("MFQ_GDN_BROADCAST_NORMALIZATION",arm==1?(candidate?candidate:"1"):(baseline?baseline:"0"),1);
+#endif
+            std::cout<<"gdn_broadcast_batch_arm="<<arm<<'\n';gdn_batch_core_benchmark(2);
+        }
+    }
+    else if(argc==2 && std::string(argv[1])=="--gdn-independent-check") {
+        for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
+    }
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefix-checkpoint-check")gdn_prefix_checkpoint_case();
+    else if(argc==2 && std::string(argv[1])=="--ple-prefix-context-check")ple_prefix_context_case();
+    else if(argc==2 && std::string(argv[1])=="--ple-hash-lifecycle-check")ple_hash_lifecycle_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-short-check")gdn_short_preparation_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-check")gdn_prefill_staged_case(false);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-bench")gdn_prefill_staged_case(true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-graph-check")gdn_prefill_staged_graph_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-default-check")gdn_prefill_pipeline_case(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-check")gdn_prefill_pipeline_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-decay-check")gdn_prefill_pipeline_case(false,true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-bench")gdn_prefill_columns_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--gdn-short-columns-bench")gdn_short_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-scalar-history-chain-check")qsa_scalar_history_chain_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-pool-write-check")qsa_live_pool_write_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-stream-graph-check")qsa_streamed_graph_case();
+    else if(argc==2 && std::string(argv[1])=="--turboquant-kv-check")kv_quantization_case();
+    else if(argc==2 && std::string(argv[1])=="--turboquant-qsa-check") {qsa_case(8,4,40);qsa_case(256,24,64);qsa_case(128,6,64,64);qsa_kv_offload_case();}
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-check")qsa_sparse_gate_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-bench")qsa_sparse_gate_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-query-bench")qsa_sparse_gate_benchmark(true);
     else if(argc==2 && std::string(argv[1])=="--qsa-select-check")qsa_selection_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-select-bench")qsa_selection_benchmark();
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
+    else if(argc==2 && std::string(argv[1])=="--quota-recovery-check")quota_recovery_case();
     else if(argc==1) {
         layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");
-    MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));std::cout.flush();context->end_graph_pool(stream);
     if(argc==1)std::cout<<"MFQ window QSA/GDN changing-position, rollback and fixed-state checks PASS\n";
     else if(std::string(argv[1])=="--gdn-core-check" || std::string(argv[1])=="--gdn-inplace-check")std::cout<<"MFQ GDN tile 4/2/1 exact checks PASS\n";
     else if(std::string(argv[1])=="--gdn-preparation-check")std::cout<<"MFQ GDN preparation gate/beta exact checks PASS\n";
@@ -712,4 +1264,5 @@ int main(int argc,char** argv)try {
     else if(std::string(argv[1])=="--qsa-select-check")std::cout<<"MFQ QSA token selection exact checks PASS\n";
     else if(std::string(argv[1])=="--segmented-sort-check")std::cout<<"MFQ segmented sort graph checks PASS\n";
     else std::cout<<"MFQ attention benchmark completed\n";
+    std::cout.flush();
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

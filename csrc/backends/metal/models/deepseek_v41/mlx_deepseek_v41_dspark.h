@@ -3,8 +3,8 @@
 #include "deepseek_v41_model.h"
 #include "mlx_deepseek_v41_mhc.h"
 #include "mlx_deepseek_v41_moe.h"
-#include "mlx_mtp.h"
-#include "mlx_tensor.h"
+#include "runtime/mlx_mtp.h"
+#include "runtime/mlx_tensor.h"
 
 #include <cstddef>
 #include <memory>
@@ -75,7 +75,8 @@ public:
     void append_context(
         const mlx::core::array& target_hidden,
         MlxDeepseekV41DSparkState& state,
-        int start_position) const;
+        int start_position,
+        bool replay_window = false) const;
 
     MlxDeepseekV41DSparkDraft draft(
         const mlx::core::array& anchor_ids,
@@ -99,6 +100,11 @@ public:
         return MlxMtpPredictorDescriptor::dspark_block(block_size());
     }
     std::size_t stage_count() const noexcept;
+    std::size_t resident_routed_bytes() const noexcept;
+    void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const;
+    void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache);
+    void offload_until(const std::shared_ptr<MlxMfeOffloadCache>& cache,
+        std::size_t& resident, std::size_t budget);
 
 private:
     std::optional<MlxDeepseekV41DSparkDraft> draft_impl(

@@ -1,5 +1,5 @@
-#include "mfq_container.h"
-#include "mlx_tensor.h"
+#include "storage/mfq_container.h"
+#include "runtime/mlx_tensor.h"
 
 #include <algorithm>
 #include <chrono>

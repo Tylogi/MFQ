@@ -26,6 +26,7 @@ from mfq.server.state.catalog import ModelCatalog
 from mfq.server.runtime.hf_tokenizer import (
     DEEPSEEK_V4_CHAT_TEMPLATE,
     DEEPSEEK_V41_CHAT_TEMPLATE,
+    HfTokenizerError,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
@@ -388,6 +389,15 @@ def test_native_hf_source_view_is_not_metal_specific(tmp_path: Path) -> None:
     ).is_file()
 
 
+@pytest.mark.parametrize('eos_ids', [[-1, 4], [4, 99]])
+def test_hf_tokenizer_rejects_out_of_range_eos_ids(tmp_path, eos_ids):
+    model = tmp_path / 'invalid-eos'
+    _hf_fixture(model)
+    (model / 'generation_config.json').write_text(json.dumps({'eos_token_id': eos_ids}))
+    with pytest.raises(HfTokenizerError, match='outside the tokenizer vocabulary'):
+        ensure_hf_tokenizer_gguf(model, tmp_path / 'cache')
+
+
 def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -411,12 +421,77 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     ]
     assert reader.get_field("tokenizer.ggml.bos_token_id").contents() == 3
     assert reader.get_field("tokenizer.ggml.eos_token_id").contents() == 4
+    assert reader.get_field("tokenizer.ggml.eog_token_ids") is None
 
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
     arguments = native_tokenizer_arguments(model, "metal")
     assert arguments[0] == "--tokenizer"
     assert Path(arguments[1]).is_file()
     assert native_tokenizer_arguments(model, "cuda") == arguments
+    assert native_tokenizer_arguments(model, "hip") == arguments
+
+
+@pytest.mark.parametrize(
+    ("model_type", "tokenizer_pre"),
+    [("qwen3_5", "qwen35"), ("gemma4", "gemma4")],
+)
+def test_single_eos_hf_exports_keep_standard_gguf_metadata(
+    tmp_path: Path,
+    model_type: str,
+    tokenizer_pre: str,
+) -> None:
+    model = tmp_path / f"{model_type}-Test"
+    _hf_fixture(model, model_type=model_type)
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert reader.get_field("tokenizer.ggml.pre").contents() == tokenizer_pre
+    assert reader.get_field("tokenizer.ggml.eos_token_id").contents() == 4
+    assert reader.get_field("tokenizer.ggml.eog_token_ids") is None
+
+
+def test_hf_tokenizer_exports_union_of_multi_eos_metadata(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "GLM-Multi-EOS-Test"
+    _hf_fixture(model, model_type="glm5_next")
+    config_path = model / "config.json"
+    config = json.loads(config_path.read_text())
+    config["eos_token_id"] = [5, 6]
+    config["text_config"]["eos_token_id"] = [6, 7]
+    config["text_config"]["vocab_size"] = 8
+    config_path.write_text(json.dumps(config))
+    generation_path = model / "generation_config.json"
+    generation = json.loads(generation_path.read_text())
+    generation["eos_token_id"] = [5, 5]
+    generation_path.write_text(json.dumps(generation))
+    tokenizer_path = model / "tokenizer.json"
+    tokenizer_json = json.loads(tokenizer_path.read_text())
+    tokenizer_json["added_tokens"].extend(
+        {
+            "id": token_id,
+            "content": token,
+            "special": True,
+        }
+        for token_id, token in (
+            (5, "<|user|>"),
+            (6, "<|observation|>"),
+            (7, "<|extra_eog|>"),
+        )
+    )
+    tokenizer_path.write_text(json.dumps(tokenizer_json))
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert reader.get_field("tokenizer.ggml.eos_token_id").contents() == 4
+    assert reader.get_field("tokenizer.ggml.eog_token_ids").contents() == [
+        5,
+        6,
+        7,
+        4,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -573,6 +648,7 @@ def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     arguments = native_tokenizer_arguments(model, "metal")
     assert arguments == ["--tokenizer", str(tokenizer)]
     assert native_tokenizer_arguments(model, "cuda") == arguments
+    assert native_tokenizer_arguments(model, "hip") == arguments
 
 
 def test_minicpmo_native_runtime_materializes_exact_resampler_asset(

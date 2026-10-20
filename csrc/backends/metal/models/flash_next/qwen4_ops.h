@@ -2,7 +2,7 @@
 
 // Qwen4-Exp model semantics implemented with native MLX/Metal primitives.
 
-#include "mlx_tensor.h"
+#include "runtime/mlx_tensor.h"
 
 #include <optional>
 #include <mlx/mlx.h>

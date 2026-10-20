@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 
 #include <cstdint>
 #include <vector>
@@ -74,3 +74,8 @@ mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
     mfq_tensor_backend::Tensor sinks,
     mfq_tensor_backend::Tensor meta,
     double scale);
+
+mfq_tensor_backend::Tensor dsv4_indexer_candidate_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights, mfq_tensor_backend::Tensor candidates,
+    int64_t query_offset, int64_t ratio);

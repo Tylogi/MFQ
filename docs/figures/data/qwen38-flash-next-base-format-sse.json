@@ -1,0 +1,89 @@
+{
+  "model": "Qwen3.8-Flash-Next",
+  "evaluation": {
+    "layer": 0,
+    "experts": 512,
+    "projections": [
+      "Gate",
+      "Up",
+      "Down"
+    ],
+    "matrices": 1536,
+    "metric": "reconstruction_sse",
+    "aggregation": "Equally weighted mean of per-matrix SSE",
+    "lower_is_better": true,
+    "bpw": "Actual bits per weight as reported in the supplied table",
+    "reduction_formula": "100 * (1 - mfq_sse / gguf_sse)",
+    "note": "Each row compares the listed formats at their reported actual bpw. The bpw values are similar, not identical. This is a layer-0 reconstruction comparison, not a whole-model KLD or Top-1 measurement."
+  },
+  "source": {
+    "type": "user-supplied table image",
+    "image_sha256": "6b4aec2312fa5e0f9ed17d5e208ee12f75ad61696fee260e26f81a45c81a4c16",
+    "description": "Transcribed from the comparison table supplied by the user for the README figure. No new measurements; displayed precision is preserved."
+  },
+  "measurements": [
+    {
+      "mfq_format": "NVQ2J",
+      "mfq_bpw": 2.0535,
+      "gguf_format": "IQ2_XXS",
+      "gguf_bpw": 2.0625,
+      "mfq_sse": 25.6356,
+      "gguf_sse": 34.2542,
+      "sse_reduction_percent": 25.16
+    },
+    {
+      "mfq_format": "NVQ3J",
+      "mfq_bpw": 3.0498,
+      "gguf_format": "IQ3_XXS",
+      "gguf_bpw": 3.0625,
+      "mfq_sse": 7.52099,
+      "gguf_sse": 9.46618,
+      "sse_reduction_percent": 20.55
+    },
+    {
+      "mfq_format": "NVQ3J-L",
+      "mfq_bpw": 3.5535,
+      "gguf_format": "IQ3_S",
+      "gguf_bpw": 3.4375,
+      "mfq_sse": 4.39932,
+      "gguf_sse": 5.54164,
+      "sse_reduction_percent": 20.61
+    },
+    {
+      "mfq_format": "NINT4 GS24/k6",
+      "mfq_bpw": 4.5285,
+      "gguf_format": "Q4_K",
+      "gguf_bpw": 4.5,
+      "mfq_sse": 1.35714,
+      "gguf_sse": 1.51948,
+      "sse_reduction_percent": 10.68
+    },
+    {
+      "mfq_format": "NINT4 GS24/k6",
+      "mfq_bpw": 4.5285,
+      "gguf_format": "IQ4_NL",
+      "gguf_bpw": 4.5,
+      "mfq_sse": 1.35714,
+      "gguf_sse": 1.68599,
+      "sse_reduction_percent": 19.5
+    },
+    {
+      "mfq_format": "NINT5 GS28/k7",
+      "mfq_bpw": 5.5489,
+      "gguf_format": "Q5_K",
+      "gguf_bpw": 5.5,
+      "mfq_sse": 0.355366,
+      "gguf_sse": 0.380979,
+      "sse_reduction_percent": 6.72
+    },
+    {
+      "mfq_format": "NINT6 GS24/k7",
+      "mfq_bpw": 6.6184,
+      "gguf_format": "Q6_K",
+      "gguf_bpw": 6.5625,
+      "mfq_sse": 0.089583,
+      "gguf_sse": 0.0933589,
+      "sse_reduction_percent": 4.04
+    }
+  ]
+}

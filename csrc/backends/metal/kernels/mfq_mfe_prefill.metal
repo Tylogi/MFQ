@@ -3,6 +3,31 @@
 
 using namespace metal;
 
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+#define MFQ_GROUPED_PAGE_BINDINGS \
+    const device uchar* nint_q = expert_streams[expert].nint_q; \
+    const device uchar* nint_sub_scale = expert_streams[expert].nint_sub_scale; \
+    const device uchar* nint_sub_min = expert_streams[expert].nint_sub_min; \
+    const device float* nint_anchor_scale = expert_streams[expert].nint_anchor_scale; \
+    const device float* nint_anchor_min = expert_streams[expert].nint_anchor_min; \
+    const device int8_t* q8_q = expert_streams[expert].q8_q; \
+    const device half* q8_scales = expert_streams[expert].q8_scales; \
+    const device uchar* vq_indices = expert_streams[expert].vq_indices; \
+    const device uchar* vq_state = expert_streams[expert].vq_state; \
+    const device uchar* vq_aux = expert_streams[expert].vq_aux; \
+    const device float* vq_anchors = expert_streams[expert].vq_anchors; \
+    const device int8_t* vq_codebooks = expert_streams[expert].vq_codebooks; \
+    const device float* vq_scales = expert_streams[expert].vq_scales; \
+    const device uchar* vq_state_to_bank = expert_streams[expert].vq_state_to_codebank; \
+    const device uchar* vq_banks = expert_streams[expert].vq_banks; \
+    const device float* vq_parameters = expert_streams[expert].vq_parameters; \
+    const device float* vq_residual_codebooks = expert_streams[expert].vq_residual_codebooks; \
+    const device short* vq_residual_first = expert_streams[expert].vq_residual_first; \
+    const device short* vq_residual_second = expert_streams[expert].vq_residual_second; \
+    const device uchar* mx_values = expert_streams[expert].mx_values; \
+    const device uchar* mx_scales = expert_streams[expert].mx_scales;
+#endif
+
 #ifndef MFQ_GROUPED_FAMILY_MASK
 #define MFQ_GROUPED_FAMILY_MASK 127
 #endif
@@ -1583,6 +1608,9 @@ template <int BM, bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
     const device float* nint_anchor_min [[buffer(26)]],
     const device int8_t* q8_q [[buffer(27)]],
     const device half* q8_scales [[buffer(28)]],
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    const device MfqExpertStreams* expert_streams [[buffer(29)]],
+#endif
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -1647,6 +1675,10 @@ template <int BM, bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                 && row_count <= (MFQ_GROUPED_MMQ_BM > 80 ? 80 : MID_BM))) return;
     }
 
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    {
+    MFQ_GROUPED_PAGE_BINDINGS
+#endif
     const device int* base_descriptor =
         descriptors + expert * params.projections * descriptor_size;
     if ((MFQ_GROUPED_FAMILY_MASK & (1 << uint(base_descriptor[0]))) == 0) return;
@@ -1989,6 +2021,9 @@ template <int BM, bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
             short2(valid_n, short(row_count)));
         }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    }
+#endif
 }
 
 #define instantiate_mfq_grouped_mmq(name, bm, fused, residual) \
@@ -2079,6 +2114,9 @@ template <
     const device float* nint_anchor_min [[buffer(26)]],
     const device int8_t* q8_q [[buffer(27)]],
     const device half* q8_scales [[buffer(28)]],
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    const device MfqExpertStreams* expert_streams [[buffer(29)]],
+#endif
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint thread_id [[thread_index_in_threadgroup]],
@@ -2115,6 +2153,10 @@ template <
         return;
     }
 
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    {
+    MFQ_GROUPED_PAGE_BINDINGS
+#endif
     const device int* base_descriptor = descriptors
         + expert * params.projections * params.descriptor_size;
     if ((MFQ_GROUPED_FAMILY_MASK & (1 << uint(base_descriptor[0]))) == 0) {
@@ -2773,6 +2815,9 @@ template <
             output_width,
             short2(simd_n, simd_m));
     }
+#ifdef MFQ_GROUPED_INDIRECT_PAGES
+    }
+#endif
 }
 
 #define instantiate_mfq_grouped_mfe_nax( \

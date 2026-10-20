@@ -3,7 +3,7 @@
 // nepq_hadamard_input_cuda in nepq.cu; the Python calibration extension adds
 // this unit.
 #include <cuda.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

@@ -1,4 +1,5 @@
 import { beforeEach, expect, it, vi } from 'vitest';
+import { version } from '../../../package.json';
 import { browserUpdateStatus, cachedBrowserStatus, compareVersions, releaseCatalog, setBrowserAutomatic } from './releases';
 
 beforeEach(() => { localStorage.clear(); });
@@ -38,7 +39,7 @@ it('automatic checks can be disabled without disabling manual checks', async () 
 
 it('a corrupt cache cannot hide the running build identity', () => {
   localStorage.setItem('mfq-studio-release-cache', '{broken');
-  expect(cachedBrowserStatus().current_version).toContain('0.3.2');
+  expect(cachedBrowserStatus().current_version).toContain(version);
   localStorage.setItem('mfq-studio-release-cache', JSON.stringify({ releases: [null, {}, { tag: 'nightly' }] }));
   expect(cachedBrowserStatus().releases).toEqual([]);
 });

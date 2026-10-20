@@ -2,7 +2,7 @@
 
 #include "step.h"
 #include "ops/execution/cuda_execution.h"
-#include "engine/decode_graph.h"
+#include "decode_graph.h"
 #include "models/common/mtp.h"
 #include "cuda_runtime_config.h"
 

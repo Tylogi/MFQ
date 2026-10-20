@@ -1,6 +1,6 @@
 #pragma once
 #include "native/env.h"
-#include "ffn.h"
+#include "kernels/mfe/ffn.h"
 #include <climits>
 #include <cstdlib>
 
@@ -32,12 +32,6 @@ inline bool mfe_nvq_dense_narrow_eligible(const MfePackedProjection& d,bool allo
 inline bool mfe_nvq_dense_narrow_selected(const MfePackedProjection& d) {
     const auto* value=mfq::cuda::env_lookup("MFQ_MFE_NVQ_DENSE_NARROW");
     if(!value || value[0]!='1' || value[1])return false;
-    // Candidate policy follows the paired projection results. The remaining
-    // legal shapes retain the existing wide reader until separately measured.
-    const bool shape=(d.input_width==640 && d.output_rows==2560 &&
-            (d.e8_dense_groups || d.format==11)) ||
-        (d.input_width==2560 && d.output_rows==640 &&
-            (d.format==5 || d.format==14 || d.format==11));
-    return shape && mfe_nvq_dense_narrow_eligible(d);
+    return mfe_nvq_dense_narrow_eligible(d);
 }
 }

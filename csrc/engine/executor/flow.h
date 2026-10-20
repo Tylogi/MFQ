@@ -121,6 +121,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         mtp->last_stats.available = true;
     }
     ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
+    if constexpr(requires { ops.prepare_request(request); })ops.prepare_request(request);
     typename Ops::Restore restored;
     if (caching && (!use_mtp || mtp->supports_session_state())) {
         auto restore = restore_session_steps(session_cache, model, use_mtp ? mtp : nullptr,
@@ -139,12 +140,15 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
     std::vector<int64_t> history = prompt;
     Hidden last_target_hidden;
     std::size_t last_snapshot = 0;
+    bool initial_snapshot_attempted = false;
     const auto snapshot = [&]() -> Generation {
         const auto position = model.cache_pos;
         if (!caching || output.result.cancelled || position <= 0 ||
             static_cast<std::size_t>(position) > history.size() ||
             static_cast<std::size_t>(position) == last_snapshot)
             co_return;
+        if constexpr(requires { ops.prepare_snapshot(); })
+            if(!ops.prepare_snapshot())co_return;
         std::vector<int64_t> tokens(history.begin(), history.begin() + position);
         auto capture = capture_session_steps(model, tokens);
         while (!output.result.cancelled) {
@@ -182,9 +186,30 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             auto save = optional_session_steps(snapshot());
             while (auto saved = save.next()) co_yield std::move(saved);
         }
-        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr)
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
+            progress && progress->session_boundary && use_mtp && caching && !initial_snapshot_attempted) {
+            initial_snapshot_attempted = true;
+            auto save = optional_session_steps(snapshot());
+            while (auto saved = save.next()) co_yield std::move(saved);
+        }
+        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr) {
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
+            // Compatibility with speculative producers lacking an explicit
+            // pre-token prompt boundary event.
+            if (use_mtp && caching && !initial_snapshot_attempted) {
+                initial_snapshot_attempted = true;
+                auto save=optional_session_steps(snapshot());
+                while(auto saved=save.next())co_yield std::move(saved);
+            }
+        }
         co_yield std::move(step);
+    }
+    // Flush parser-held text before a final session snapshot can copy or evict
+    // a large cache. The executor's terminal finish remains idempotent and
+    // still reports cleanup/cache completion after this final text event.
+    if(caching) {
+        auto tail=output.finish();
+        if(!tail.diffs.empty())co_yield std::move(tail);
     }
     auto save = optional_session_steps(snapshot());
     while (auto saved = save.next()) co_yield std::move(saved);

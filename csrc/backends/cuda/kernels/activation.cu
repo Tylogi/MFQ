@@ -12,12 +12,23 @@
 #include <type_traits>
 
 #include "glu.cuh"
-#include "kernels/kernels.h"
+#include "kernels.h"
 
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.
 // Ordinary tanhf is rewritten to the lower-accuracy tanh.approx instruction.
 extern "C" __device__ float __nv_tanhf(float);
+
+__global__ void clipped_silu_mul_kernel(const half* gate,const half* up,half* output,
+        int64_t count,float limit) {
+    const auto i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count) {
+        const float g=fminf(__half2float(gate[i]),limit);
+        const float u=fminf(fmaxf(__half2float(up[i]),-limit),limit);
+        output[i]=__float2half_rn((g/(1.0f+expf(-g)))*u);
+    }
+}
+
 
 template <typename T>
 __device__ __forceinline__ float activation_as_float(T value) {
@@ -164,6 +175,17 @@ __global__ void linear_gate_beta_kernel(
 }
 
 namespace mfq::cuda::kernels {
+
+void clipped_silu_mul(const TensorView& gate, const TensorView& up,
+    const TensorView& output, double limit, cudaStream_t stream) {
+    if (!gate.is_contiguous() || !up.is_contiguous() || !output.is_contiguous() ||
+        gate.numel() != up.numel() || gate.numel() != output.numel() ||
+        gate.scalar_type != ScalarType::float16 || up.scalar_type != ScalarType::float16 ||
+        output.scalar_type != ScalarType::float16 || !(limit > 0))
+        throw std::invalid_argument("native clipped_silu_mul tensor mismatch");
+    if (gate.numel()) clipped_silu_mul_kernel<<<unsigned((gate.numel()+255)/256),256,0,stream>>>(
+        gate.data_as<half>(), up.data_as<half>(), output.data_as<half>(), gate.numel(), float(limit));
+}
 
 void silu_mul(
     const TensorView& gate,

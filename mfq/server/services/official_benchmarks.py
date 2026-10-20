@@ -132,8 +132,7 @@ def benchmark_readiness(root: Path | None) -> dict[str, dict[str, Any]]:
                     verified_artifact(directory, "validation.parquet", MMLU_PRO_VALIDATION[1])
                 if dataset_id == "mmlu-test":
                     verified_artifact(directory, "dev.parquet", MMLU_DEV[1])
-                if (profile.protocol.endswith("likelihood") and importlib.util.find_spec("torch") is None) or (
-                    dataset_id in {"gpqa-diamond", "mmlu-test", "truthfulqa-mc1"} and importlib.util.find_spec("pandas") is None):
+                if dataset_id in {"gpqa-diamond", "mmlu-test", "truthfulqa-mc1"} and importlib.util.find_spec("pandas") is None:
                     reason = "official_dependencies_missing"
                 elif dataset_id in {"aime-2025", "livecodebench-v6"}:
                     from mfq.server.services.scoring_sandbox import sandbox_available
@@ -222,8 +221,9 @@ def load_choice_scorer(root: Path, dataset_id: str) -> dict[str, Any]:
 
         import numpy as np
         import pandas as pd
-        import torch
-        namespace.update(np=np, pd=pd, torch=torch, warnings=warnings)
+
+        from mfq.server.services.probability_benchmark import ScoringArrayOps
+        namespace.update(np=np, pd=pd, torch=ScoringArrayOps, warnings=warnings)
         if dataset_id == "mmlu-test":
             namespace["choices"] = ["A", "B", "C", "D"]
             return official_definitions(sources["evaluate_flan.py"], {"format_subject", "format_example", "gen_prompt", "eval"}, namespace)

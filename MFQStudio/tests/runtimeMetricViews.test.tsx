@@ -29,12 +29,18 @@ vi.mock('../src/app/RuntimeProvider', () => ({
 vi.mock('../src/features/settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
 }));
+vi.mock('../src/features/runtime/useServingStatistics', () => ({
+  useServingStatistics: () => ({ error: null, data: { scope: 'session', started_at: 1, activity: [],
+    totals: { completed_requests: 2, prompt_tokens: 40, prefill_tokens: 40,
+      completion_tokens: 10, cached_tokens: 0, prefill_tps: 999, decode_tps: 10,
+      ttft_ms: 200, cache_hit_rate: 0 } } }),
+}));
 
-it('概览预填充卡片展示运行时速度与耗时，而非 TTFT 或媒体准备总时间', () => {
-  render(<MemoryRouter><OverviewPage /></MemoryRouter>);
+it('概览预填充卡片展示累计统计，而非最后请求的 TTFT 或媒体准备总时间', () => {
+  render(<TooltipProvider><MemoryRouter><OverviewPage /></MemoryRouter></TooltipProvider>);
   const prefill = screen.getByText('Prefill').closest('.metric-tile');
   expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
-  expect(screen.getByText('50 ms · Prompt processing')).toBeInTheDocument();
+  expect(screen.getByText('Prompt processing')).toBeInTheDocument();
   expect(prefill).not.toHaveTextContent('200 tok/s');
 });
 

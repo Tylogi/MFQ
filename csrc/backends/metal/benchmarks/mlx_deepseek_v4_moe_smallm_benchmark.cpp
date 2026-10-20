@@ -1,5 +1,5 @@
-#include "mlx_moe_ops.h"
-#include "mlx_ssd_expert_arena.h"
+#include "ops/mlx_moe_ops.h"
+#include "runtime/mlx_ssd_expert_arena.h"
 
 #include <algorithm>
 #include <array>

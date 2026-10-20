@@ -59,7 +59,14 @@ set_target_properties(mfq-tokenizer PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 if(MSVC)
-    target_compile_options(mfq-tokenizer PRIVATE /utf-8 /EHsc)
+    # Public chat/Jinja headers contain UTF-8 literals, so consumers must use
+    # the same encoding even when the Windows system code page is not UTF-8.
+    target_compile_options(mfq-tokenizer
+        PUBLIC
+            "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+        PRIVATE /EHsc
+    )
 endif()
 
 if(BUILD_TESTING)

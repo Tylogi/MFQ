@@ -49,8 +49,8 @@ for (const language of ['zh-CN', 'en'] as const) {
       if (route.request().method() === 'PUT') {
         const body = route.request().postDataJSON();
         writes.push(body);
-        if (body.port === 8090) {
-          return route.fulfill({ status: 409, json: { error: { code: 'listener_change_failed', message: 'port in use' } } });
+        if (body.port === 8093) {
+          return route.fulfill({ status: 409, json: { error: { code: 'listener_port_in_use', message: 'the requested port is already in use' } } });
         }
         anthropicPort = body.port;
       }
@@ -74,7 +74,13 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(oai).toHaveValue('8090');
     await anthropic.fill('8090');
     await anthropic.blur();
-    await expect(panel.getByRole('alert')).toContainText('port in use');
+    await expect(panel.getByRole('alert')).toContainText(language === 'en' ? 'cannot share a port' : '不能使用同一个端口');
+    await expect(anthropic).toHaveValue('8092');
+    expect(writes).toHaveLength(1);
+    await anthropic.fill('8093');
+    await anthropic.blur();
+    await expect(panel.getByRole('alert')).toContainText(language === 'en' ? 'Port is already in use' : '端口已被其它服务占用');
+    await expect(anthropic).toHaveValue('8092');
     await expect(panel.getByText('http://127.0.0.1:8092/v1/messages')).toBeVisible();
     await anthropic.fill('65536');
     await anthropic.blur();

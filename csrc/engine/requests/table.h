@@ -92,6 +92,7 @@ class RequestExecutor {
             input.prompt = std::move(request.diagnostic_input->tokens);
             input.sampling = request.input.sampling;
             input.cache_plan = request.input.cache_plan;
+            input.stop_token_ids = info.stop_token_ids;
         } else {
             if (!text)
                 throw std::invalid_argument("text input requires a tokenizer");

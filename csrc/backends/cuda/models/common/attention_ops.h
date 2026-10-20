@@ -26,13 +26,15 @@ inline Tensor rms_norm(const Tensor& value, const Tensor& weight, double eps) {
 
 class SequenceCache {
 public:
-    SequenceCache(int64_t maximum, int64_t width)
-        : maximum_(maximum), width_(width) {
+    SequenceCache(int64_t maximum, int64_t width, tb::ScalarType dtype = tb::kFloat16)
+        : maximum_(maximum), width_(width), dtype_(dtype) {
         MFQ_RUNTIME_CHECK(maximum > 0 && width > 0, "invalid sequence cache dimensions");
     }
     void reset() { values_ = Tensor(); position_ = 0; }
     int64_t position() const { return position_; }
     const Tensor& storage() const { return values_; }
+    // Graph KV owns the values while this cache still tracks their position.
+    void release_storage() { values_=Tensor(); }
     void replace_storage(Tensor values) {
         MFQ_RUNTIME_CHECK(values.dim()==3 && values.size(1)>=position_ && values.size(1)<=maximum_ &&
             values.size(2)==width_,"replacement sequence cache geometry mismatch");
@@ -51,7 +53,7 @@ public:
             value.size(1)<=values_.size(1)-position_ &&
             value.size(0)==values_.size(0) && value.size(2)==width_ && positions.dim()==1 &&
             positions.size(0)==value.size(1), "fixed sequence cache append geometry mismatch");
-        values_.index_copy_(1,positions.to(tb::kInt64),value.to(tb::kFloat16));
+        values_.index_copy_(1,positions.to(tb::kInt64),value.to(dtype_));
         return values_;
     }
     void advance_fixed(int64_t tokens) {
@@ -72,16 +74,17 @@ public:
         if (!values_.defined() || required > values_.size(1)) {
             int64_t capacity = values_.defined() ? values_.size(1) : std::min<int64_t>(16, maximum_);
             while (capacity < required) capacity = std::min(maximum_, capacity > maximum_ / 2 ? maximum_ : capacity * 2);
-            auto expanded = tb::zeros({value.size(0), capacity, width_}, value.options().dtype(tb::kFloat16));
+            auto expanded = tb::zeros({value.size(0), capacity, width_}, value.options().dtype(dtype_));
             if (position_) expanded.narrow(1, 0, position_).copy_(values_.narrow(1, 0, position_));
             values_ = std::move(expanded);
         }
-        values_.narrow(1, position_, value.size(1)).copy_(value.to(tb::kFloat16));
+        values_.narrow(1, position_, value.size(1)).copy_(value.to(dtype_));
         position_ = required;
         return values_.narrow(1, 0, position_);
     }
 private:
     int64_t maximum_, width_, position_ = 0;
+    tb::ScalarType dtype_;
     Tensor values_;
 };
 

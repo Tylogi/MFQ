@@ -15,7 +15,8 @@ if TYPE_CHECKING:
     from mfq.server.state.catalog import DiscoveredModel
 
 
-def checkpoint_cache_profile(artifact: DiscoveredModel) -> ModelCacheProfile | None:
+def checkpoint_cache_profile(artifact: DiscoveredModel, *, cuda: bool = False,
+    include_recurrent: bool = False) -> ModelCacheProfile | None:
     if not artifact.resource.complete:
         raise ValueError('checkpoint shards are incomplete')
     if artifact.resource.format == 'mfq':
@@ -46,10 +47,11 @@ def checkpoint_cache_profile(artifact: DiscoveredModel) -> ModelCacheProfile | N
     predictor_layers = text.get('mtp_num_hidden_layers', 1) if isinstance(text, dict) and has_predictor else 0
     if type(predictor_layers) is not int or predictor_layers < 0:
         return None
-    return cache_profile(config, include_recurrent=False, predictor_layers=predictor_layers)
+    return cache_profile(config, include_recurrent=include_recurrent, predictor_layers=predictor_layers, cuda=cuda)
 
 
-def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, predictor_layers: int = 0) -> ModelCacheProfile | None:
+def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, predictor_layers: int = 0,
+    cuda: bool = False) -> ModelCacheProfile | None:
     text = config.get('text_config', config)
     if not isinstance(text, dict):
         return None
@@ -129,7 +131,14 @@ def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, pre
                 index, ratio = integer('indexer_head_dim'), integer('indexer_compress_ratio')
                 if min(index, ratio) <= 0:
                     return None
-                if full:
+                if full and cuda:
+                    components.extend([
+                        ModelCacheComponent(group='QSA', name='indexer_key', subgroup='indexer', layers=full,
+                            bytes_per_row=full * index * 2),
+                        ModelCacheComponent(group='QSA', name='indexer_pooled', subgroup='indexer', layers=full,
+                            bytes_per_row=full * index * 2, tokens_per_row=ratio),
+                    ])
+                elif full:
                     state('QSA', 'indexer_tail', full, full * ((ratio + 5) * index * 2 + 2))
                     components.extend([
                         ModelCacheComponent(group='QSA', name='indexer_pooled', subgroup='indexer', layers=full,

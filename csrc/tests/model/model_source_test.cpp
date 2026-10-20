@@ -2,6 +2,8 @@
 #include "mfq/model_source/hf_model_source.h"
 #include "mfq/model_source/hf_safetensors_source.h"
 #include "mfq/model_source/mfq_model_source.h"
+#include "mfq/mapped_tensor_pages.h"
+#include "mfq/mapped_prefetch_scope.h"
 
 #include <algorithm>
 #include <array>
@@ -177,6 +179,8 @@ int main() {
         const mfq::ModelSource& generic_hf = hf_source;
         require(!generic_hf.mapped_tensor_reader("model.token_embedding.weight"),
                 "unmapped source must advertise an empty mapped reader");
+        require(!generic_hf.mapped_tensor_batch_reader("model.token_embedding.weight"),
+                "unmapped source must advertise an empty mapped batch reader");
         const auto opened_mfq = mfq::open_model_source(mfq_path);
         const auto opened_hf = mfq::open_model_source(hf_path);
 
@@ -194,6 +198,20 @@ int main() {
         catch (const std::out_of_range&) { range_rejected = true; }
         require(range_rejected, "retained reader accepted out-of-range bytes");
         retained = {}; // Close the independently owned file before cleanup.
+
+        for(auto mode:{mfq::FileReadMode::Buffered,mfq::FileReadMode::Direct}) {
+            auto batch=[&] {
+                mfq::MfqModelSource temporary(legacy_gguf_path,mode);
+                return temporary.tensor_batch_reader("model.token_embedding.weight");
+            }();
+            require(bool(batch),"retained source is missing its batch reader");
+            std::vector<std::byte> actual(14);
+            batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3}});
+            require_bytes(actual);
+            bool rejected=false;
+            try{batch({{13,actual.data(),2}});}catch(const std::out_of_range&){rejected=true;}
+            require(rejected,"batched reader accepted bytes beyond the canonical tensor");
+        }
 
         {
             auto mapped=[&] {
@@ -227,6 +245,70 @@ int main() {
                 std::vector<std::byte> expected(count),actual(count);
                 ordinary(offset,expected.data(),count);mapped(offset,actual.data(),count);
                 require(actual==expected,"mapped tensor crossing page/granularity boundary differs");
+            }
+            require(mfq::release_mapped_tensor_pages()>0,"mapped source trim did not retain any live reader");
+            std::vector<std::byte> expected(8197),actual(8197);
+            ordinary(65521,expected.data(),expected.size());mapped(65521,actual.data(),actual.size());
+            require(actual==expected,"mapped reader changed after releasing clean source pages");
+        }
+
+        {
+            auto batch=[&] {
+                mfq::MfqModelSource temporary(legacy_gguf_path);
+                return temporary.mapped_tensor_batch_reader("model.token_embedding.weight");
+            }();
+            require(bool(batch),"retained mapped batch reader missing");
+            std::vector<std::byte> actual(14);
+            {
+                mfq::MappedPrefetchScope prefetch(true);
+                batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3},{14,nullptr,0}});
+            }
+            require_bytes(actual);batch({});
+            for(const auto bad:std::vector<mfq::ReadSpan>{{13,actual.data(),2},{UINT64_MAX,actual.data(),0},{0,nullptr,1}}) {
+                std::fill(actual.begin(),actual.end(),std::byte{0x7f});
+                bool rejected=false;
+                try{batch({{0,actual.data(),1},bad});}catch(const std::exception&){rejected=true;}
+                require(rejected && std::all_of(actual.begin(),actual.end(),[](auto x){return x==std::byte{0x7f};}),
+                        "mapped batch must reject all bad ranges before writing");
+            }
+            std::vector<std::future<void>> readers;
+            for(int worker=0;worker<8;++worker)readers.push_back(std::async(std::launch::async,[batch] {
+                mfq::MappedPrefetchScope transient(false,true);
+                for(int i=0;i<32;++i) {
+                    std::vector<std::byte> bytes(14);
+                    batch({{7,bytes.data()+7,7},{0,bytes.data(),7}});require_bytes(bytes);
+                }
+            }));
+            for(auto& worker:readers)worker.get();
+            auto large_batch=[&] {
+                mfq::MfqModelSource temporary(root/"mapped-large.mfq");
+                return temporary.mapped_tensor_batch_reader("model.token_embedding.weight");
+            }();
+            mfq::MfqModelSource large(root/"mapped-large.mfq");
+            const auto expected=large.read("model.token_embedding.weight");
+            constexpr size_t count=4357,width=67;
+            std::vector<std::byte> received(count*width);
+            std::vector<mfq::ReadSpan> spans;
+            for(size_t i=0;i<count;++i)spans.push_back({(i*4093)%(expected.size()-width+1),received.data()+i*width,width});
+            {
+                mfq::MappedPrefetchScope transient(true,true);
+                large_batch(spans);
+            }
+            require(mfq::release_mapped_tensor_pages()>0,"mapped batch trim lost its independent owner");
+            std::fill(received.begin(),received.end(),std::byte{0});large_batch(spans);
+            for(const auto& span:spans)require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
+                    "mapped batch across pages/prefetch chunks differs");
+            auto sparse=std::vector<mfq::ReadSpan>(spans.begin(),spans.begin()+64);
+            std::reverse(sparse.begin(),sparse.end());
+            sparse.push_back(sparse.front());
+            sparse.push_back({0,nullptr,0});
+            for(int repeat=0;repeat<2;++repeat) {
+                std::fill(received.begin(),received.end(),std::byte{0});
+                mfq::MappedPrefetchScope transient(false,true);
+                large_batch(sparse);
+                for(const auto& span:sparse)if(span.size)
+                    require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
+                            "sparse mapped page release changed reread data");
             }
         }
 

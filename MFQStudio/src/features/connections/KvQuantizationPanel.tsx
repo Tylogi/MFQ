@@ -32,8 +32,8 @@ export function KvQuantizationPanel({ supported, disabled, settings, onChange }:
     </div>
     <div id={contentId} className="qsa-kv-body" hidden={!expanded}>
       <p className="qsa-kv-description">{supported
-        ? tr('使用 TurboQuant 压缩原始 K/V 的 RAM 与 SSD 占用。对于稀疏注意力而言，Indexer Cache 保持原精度；对于混合模型而言，线性注意力的递推状态不参与量化。',
-          'TurboQuant reduces RAM and SSD storage for raw K/V. For sparse attention, the Indexer Cache retains its original precision; for hybrid models, linear-attention recurrent states are not quantized.')
+        ? tr('使用 TurboQuant 压缩原始 K/V 的显存、RAM 与 SSD 占用。对于稀疏注意力而言，Indexer Cache 保持原精度；对于混合模型而言，线性注意力的递推状态不参与量化。',
+          'TurboQuant reduces VRAM, RAM and SSD storage for raw K/V. For sparse attention, the Indexer Cache retains its original precision; for hybrid models, linear-attention recurrent states are not quantized.')
         : tr('当前模型或计算后端暂不支持 KV 量化。', 'KV quantization is not currently supported by this model or backend.')}</p>
       <div className="qsa-kv-fields qsa-kv-model-settings-fields">
         <label className="qsa-kv-field"><span>{tr('量化档位', 'Quantization level')}</span>

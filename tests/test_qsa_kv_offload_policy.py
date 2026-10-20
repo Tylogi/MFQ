@@ -54,7 +54,7 @@ def test_yarn_extended_streaming_context_uses_the_enabled_model_limit(tmp_path, 
         model_yarn_enabled={model.resource.name: True})
     expected = 13 * (128 * (9 * 2 + (678920 // 4) * 4) + 2)
     assert asyncio.run(pool._validate_qsa_kv_policy(model, policy)) == expected
-    instance = SimpleNamespace(id=uuid4(), artifact=model, qsa_kv_offload_supported=True, context_size=678920)
+    instance = SimpleNamespace(id=uuid4(), artifact=model, qsa_kv_offload_supported=True, context_size=678920,memory=None)
     pool._instances[instance.id] = instance
     pool._load_requests[model.resource.name] = ModelLoadRequest(model=model.resource.name, context_size=678920)
     info = asyncio.run(pool.qsa_kv_offload_info(instance.id))

@@ -1,6 +1,9 @@
+#include "native/env.h"
 #include "pipeline.h"
 #include <cuda_fp16.h>
 #include <cuda/atomic>
+#include <cstdlib>
+#include <algorithm>
 
 namespace mfq::cuda {
 namespace {
@@ -102,7 +105,7 @@ __global__ void classify_resident(const std::uint64_t* pointers,int gate_maps,in
     }
     kinds[expert]=complete?1:0;
 }
-__global__ void scatter_wire(const std::uint8_t* wire,const std::uint32_t* cancelled,int phase) {
+__device__ __forceinline__ void scatter_wire_body(const std::uint8_t* wire,const std::uint32_t* cancelled,int phase) {
     if(*reinterpret_cast<const volatile std::uint32_t*>(cancelled))return;
     const auto* header=reinterpret_cast<const std::uint64_t*>(wire);
     const auto count=header[0];if(!count)return;
@@ -139,9 +142,11 @@ __global__ void snapshot_mapped(const uint64_t* source,const uint32_t* cancelled
     __shared__ uint32_t abort;
     if(!threadIdx.x) {
         count=source[0];
+        const bool empty_packet=count==~uint64_t(0);
+        if(empty_packet)count=0;
         abort=*reinterpret_cast<const volatile uint32_t*>(cancelled) || count>capacity;
         destination[0]=abort?0:count;
-        destination[1]=source[1];destination[2]=abort;destination[3]=0;
+        destination[1]=source[1];destination[2]=abort?1u:empty_packet?2u:0u;destination[3]=!abort && empty_packet;
     }
     __syncthreads();
     if(abort)return;
@@ -184,6 +189,125 @@ __global__ void copy_mapped(const uint64_t* header,const uint32_t* cancelled) {
                 words[0]=value.x;words[1]=value.y;words[2]=value.z;words[3]=value.w;
             }
         } else for(uint64_t byte=0;byte<16 && within+byte<field.bytes;++byte)output[byte]=input[byte];
+    }
+}
+__global__ void await_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,
+        const uint64_t* table,uint64_t* snapshot,uint64_t capacity,
+        const uint64_t* host_descriptors,uint64_t* device_descriptors,uint64_t descriptor_capacity) {
+    __shared__ uint64_t count;
+    __shared__ uint64_t descriptor_words;
+    __shared__ uint32_t abort;
+    if(!threadIdx.x) {
+        while(!*reinterpret_cast<const volatile uint32_t*>(ready) &&
+                !*reinterpret_cast<const volatile uint32_t*>(host_abort))__nanosleep(64);
+        __threadfence_system();
+        abort=*reinterpret_cast<const volatile uint32_t*>(host_abort);
+        count=abort?0:table[0];
+        const bool empty_packet=count==~uint64_t(0);
+        if(empty_packet)count=0;
+        abort|=count>capacity;
+        descriptor_words=abort || !host_descriptors?0:table[2];
+        abort|=descriptor_words>descriptor_capacity;
+        *device_abort=abort;snapshot[0]=abort?0:count;snapshot[1]=abort?0:table[1];
+        snapshot[2]=abort?1u:empty_packet?2u:0u;snapshot[3]=!abort && empty_packet;
+    }
+    __syncthreads();if(abort)return;
+    for(uint64_t word=threadIdx.x;word<count*4;word+=blockDim.x)snapshot[4+word]=table[4+word];
+    // This wait follows GU arithmetic and hidden quantization. Replacing the
+    // views here cannot race their reads, and Down sees its final addresses
+    // only after the host's independent Down-ready publication.
+    for(uint64_t vector=threadIdx.x;vector<descriptor_words/2;vector+=blockDim.x)
+        reinterpret_cast<uint4*>(device_descriptors)[vector]=reinterpret_cast<const uint4*>(host_descriptors)[vector];
+    if(!threadIdx.x && (descriptor_words&1))device_descriptors[descriptor_words-1]=host_descriptors[descriptor_words-1];
+}
+__global__ void scatter_wire(const std::uint8_t* wire,const std::uint32_t* cancelled,int phase) {
+    scatter_wire_body(wire,cancelled,phase);
+}
+template<bool DeviceSnapshot>
+__global__ void scatter_wire_and_loan(const uint8_t* wire,const uint64_t* loan,uint64_t capacity,
+        const uint32_t* cancelled,int phase) {
+    // The existing cancel load also suppresses stale wire for an empty plan.
+    // Snapshot word 2 is a copy-only guard (abort=1, empty=2); the independent
+    // expert cancellation flag retains its original 0/1 meaning. Nonempty
+    // packets need neither another control load nor a new CTA barrier.
+    scatter_wire_body(wire,DeviceSnapshot?reinterpret_cast<const uint32_t*>(loan+2):cancelled,phase);
+    __shared__ uint64_t count;
+    __shared__ uint32_t abort;
+    __shared__ MoeMappedCopyDescriptor field;
+    if(!threadIdx.x) {
+        abort=*reinterpret_cast<const volatile uint32_t*>(cancelled);
+        count=abort?0:loan[0];abort|=count>capacity;
+    }
+    __syncthreads();if(abort)return;
+    if(!count)return;
+    // The CPU's phase-ready publication protects this immutable table until
+    // the next layer publishes routes. Read each descriptor once per CTA,
+    // without a separate device snapshot and copy kernel.
+    const auto* fields=reinterpret_cast<const uint64_t*>(loan+4);
+    for(uint64_t index=blockIdx.x%count;index<count;index+=gridDim.x) {
+        if(threadIdx.x<4)reinterpret_cast<uint64_t*>(&field)[threadIdx.x]=fields[index*4+threadIdx.x];
+        __syncthreads();
+        const auto stripes=count>gridDim.x?uint64_t(1):(gridDim.x-1-index)/count+1;
+        const auto start=uint64_t(blockIdx.x)/count*blockDim.x*16;
+        const auto stride=stripes*blockDim.x*16;
+        for(auto within=start+uint64_t(threadIdx.x)*16;within<field.bytes;within+=stride) {
+            auto* output=reinterpret_cast<uint8_t*>(field.destination)+within;
+            const auto* input=reinterpret_cast<const uint8_t*>(field.source)+within;
+            const auto address=reinterpret_cast<uint64_t>(output);
+            if(field.bytes-within>=16 && !(reinterpret_cast<uint64_t>(input)&15) && !(address&3)) {
+                const auto value=*reinterpret_cast<const uint4*>(input);
+                if(!(address&15))*reinterpret_cast<uint4*>(output)=value;
+                else if(!(address&7)) {
+                    auto* words=reinterpret_cast<uint2*>(output);words[0]=make_uint2(value.x,value.y);words[1]=make_uint2(value.z,value.w);
+                }else {
+                    auto* words=reinterpret_cast<uint32_t*>(output);words[0]=value.x;words[1]=value.y;words[2]=value.z;words[3]=value.w;
+                }
+            }else for(uint64_t byte=0;byte<16 && within+byte<field.bytes;++byte)output[byte]=input[byte];
+        }
+        __syncthreads();
+    }
+}
+__global__ void copy_mapped_ranges(const uint64_t* header,const uint32_t* cancelled) {
+    __shared__ uint32_t abort;
+    __shared__ uint64_t count,total;
+    if(!threadIdx.x) {
+        abort=*reinterpret_cast<const volatile uint32_t*>(cancelled);
+        count=header[0];total=header[1];
+    }
+    __syncthreads();if(abort || !count)return;
+    const auto* fields=reinterpret_cast<const MoeMappedCopyDescriptor*>(header+4);
+    // Assign contiguous byte ranges to CTAs. Each field is looked up once,
+    // and its pointers stay in registers throughout the copy loop. Descriptor
+    // offsets are 16-byte aligned by both the expert and KV producers.
+    const auto tile_bytes=uint64_t(blockDim.x)*16;
+    const auto range_bytes=(total+tile_bytes*gridDim.x-1)/(tile_bytes*gridDim.x)*tile_bytes;
+    const auto begin=uint64_t(blockIdx.x)*range_bytes;
+    const auto end=begin+range_bytes<total?begin+range_bytes:total;
+    if(begin>=end)return;
+    uint64_t low=0,high=count;
+    while(low<high) {const auto middle=(low+high)/2;
+        if(fields[middle].offset<=begin)low=middle+1;else high=middle;}
+    for(auto index=low?low-1:0;index<count;++index) {
+        const auto field=fields[index];if(field.offset>=end)break;
+        const auto first=field.offset>begin?field.offset:begin;
+        const auto limit=field.offset+field.bytes<end?field.offset+field.bytes:end;
+        for(auto offset=first+uint64_t(threadIdx.x)*16;offset<limit;offset+=tile_bytes) {
+                const auto within=offset-field.offset;
+                auto* output=reinterpret_cast<uint8_t*>(field.destination)+within;
+                const auto* input=reinterpret_cast<const uint8_t*>(field.source)+within;
+                const auto address=reinterpret_cast<uint64_t>(output);
+                if(field.bytes-within>=16 && (reinterpret_cast<uint64_t>(input)&15)==0 && (address&3)==0) {
+                    const auto value=*reinterpret_cast<const uint4*>(input);
+                    if((address&15)==0)*reinterpret_cast<uint4*>(output)=value;
+                    else if((address&7)==0) {
+                        auto* words=reinterpret_cast<uint2*>(output);
+                        words[0]=make_uint2(value.x,value.y);words[1]=make_uint2(value.z,value.w);
+                    }else {
+                        auto* words=reinterpret_cast<uint32_t*>(output);
+                        words[0]=value.x;words[1]=value.y;words[2]=value.z;words[3]=value.w;
+                    }
+                }else for(uint64_t byte=0;byte<16 && within+byte<field.bytes;++byte)output[byte]=input[byte];
+        }
     }
 }
 __global__ void plan_nvq_routes(const std::uint64_t* pointers,int pools,int experts,
@@ -230,7 +354,8 @@ __global__ void scatter_expert_results(const __half* resident, const __half* sta
 }
 void moe_publish_routes(const void* input, const std::int32_t* ids, float* host_input,
         std::int32_t* host_ids, std::uint32_t* ready, int n, int k, cudaStream_t stream) {
-    export_routes<<<1, 256, 0, stream>>>(static_cast<const __half*>(input), ids,
+    const int threads=n?256:k<=32?32:k<=64?64:k<=128?128:256;
+    export_routes<<<1, threads, 0, stream>>>(static_cast<const __half*>(input), ids,
         host_input, host_ids, ready, n, k);
 }
 void wait_mapped_flag(const std::uint32_t* flag, cudaStream_t stream) {
@@ -274,10 +399,26 @@ void moe_snapshot_mapped(const void* table,const uint32_t* cancelled,void* snaps
         static_cast<uint64_t*>(snapshot),capacity);
 }
 void moe_copy_mapped(const void* table,const uint32_t* cancelled,int blocks,int threads,cudaStream_t stream) {
-    copy_mapped<<<blocks,threads,0,stream>>>(static_cast<const uint64_t*>(table),cancelled);
+    const auto* option=mfq::cuda::env_lookup("MFQ_MOE_COPY_RANGES");
+    if(option && option[0]=='1')copy_mapped_ranges<<<blocks,std::min(threads,256),0,stream>>>(static_cast<const uint64_t*>(table),cancelled);
+    else copy_mapped<<<blocks,threads,0,stream>>>(static_cast<const uint64_t*>(table),cancelled);
 }
 void moe_scatter_wire_phase(const void* wire,const std::uint32_t* cancelled,int blocks,int threads,int phase,cudaStream_t stream) {
     scatter_wire<<<blocks,threads,0,stream>>>(static_cast<const std::uint8_t*>(wire),cancelled,phase);
+}
+void moe_scatter_wire_and_loan_phase(const void* wire,const void* loan,uint64_t capacity,
+        const uint32_t* cancelled,int blocks,int threads,int phase,cudaStream_t stream,bool device_snapshot) {
+    if(device_snapshot)scatter_wire_and_loan<true><<<blocks,std::min(threads,256),0,stream>>>(static_cast<const uint8_t*>(wire),
+        static_cast<const uint64_t*>(loan),capacity,cancelled,phase);
+    else scatter_wire_and_loan<false><<<blocks,std::min(threads,256),0,stream>>>(static_cast<const uint8_t*>(wire),
+        static_cast<const uint64_t*>(loan),capacity,cancelled,phase);
+}
+void wait_mapped_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,
+        const void* table,void* snapshot,uint64_t capacity,cudaStream_t stream,
+        const void* host_descriptors,void* device_descriptors,uint64_t descriptor_capacity) {
+    await_plan_snapshot<<<1,capacity<=256?32:128,0,stream>>>(ready,host_abort,device_abort,static_cast<const uint64_t*>(table),
+        static_cast<uint64_t*>(snapshot),capacity,static_cast<const uint64_t*>(host_descriptors),
+        static_cast<uint64_t*>(device_descriptors),descriptor_capacity);
 }
 void moe_scatter_wire(const void* wire,const std::uint32_t* cancelled,int blocks,int threads,cudaStream_t stream) {
     scatter_wire<<<blocks,threads,0,stream>>>(static_cast<const std::uint8_t*>(wire),cancelled,0);

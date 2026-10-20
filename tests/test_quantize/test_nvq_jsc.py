@@ -9,6 +9,7 @@ from mfq.formats.nvq import (
     NVQ2_E8_4096,
     NVQ3_D4,
     NVQ3_D4_512,
+    NVQ3_D4_1024,
 )
 from mfq.quantize.nvq_jsc import (
     NvqJscConfig,
@@ -31,6 +32,96 @@ def test_initial_raw_codebooks_are_deterministic_and_valid() -> None:
     assert int(first.max()) <= 127
     assert not np.any(np.all(first == 0, axis=-1))
     assert not np.array_equal(first[0], first[1])
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS required")
+@pytest.mark.parametrize("spec", [NVQ3_D4, NVQ3_D4_512, NVQ3_D4_1024])
+@pytest.mark.parametrize("valid_width", [24, 50])
+def test_nvq3j_metal_training_assignment_matches_exhaustive(spec, valid_width):
+    from mfq.quantize import nvq_jsc as jsc
+
+    config = NvqJscConfig(banks=2, spec=spec, learned_scale_lut=False)
+    tables = initial_jsc_tables(config)
+    generator = torch.Generator().manual_seed(53)
+    value = torch.rand((3, valid_width), generator=generator) * 0.05
+    importance = np.linspace(0.25, 1.75, valid_width, dtype=np.float32)
+    importance[::11] = 0
+    padded, weight, ng = jsc._pad_weight(value, 24, importance)
+    anchor = torch.tensor([0.00031, 0.00047, 0.00069])
+    books = torch.from_numpy(tables.codebooks)
+    alpha = torch.from_numpy(tables.scale_lut)
+    banks = torch.from_numpy(tables.bank_for_state).long()
+    xgroup = padded.reshape(-1, 24)
+    wgroup = weight.reshape_as(xgroup)
+    expected_error = []
+    for state in range(16):
+        book = books[banks[state]].float()
+        scale = anchor.repeat_interleave(ng) * alpha[state]
+        vectors = xgroup.reshape(-1, 6, 4)
+        objective = wgroup.reshape_as(vectors)
+        error = (
+            objective[:, :, None, :]
+            * (vectors[:, :, None, :] - scale[:, None, None, None] * book).square()
+        ).sum(-1)
+        expected_error.append(error.min(-1).values.sum(-1))
+    expected = torch.stack(expected_error).min(0).values
+    state, bank, indices, error = jsc._assign_groups(
+        xgroup.to("mps"), wgroup.to("mps"), books.to("mps"),
+        anchor.to("mps"), alpha.to("mps"), banks.to("mps"),
+        out=3, ng=ng, valid_last=valid_width - (ng - 1) * 24, config=config,
+    )
+    torch.testing.assert_close(error.cpu(), expected, rtol=1e-5, atol=1e-9)
+    assert torch.equal(bank.cpu(), banks[state.cpu()])
+    assert indices.shape == (3 * ng, 6)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS required")
+@pytest.mark.parametrize("spec", [NVQ3_D4, NVQ3_D4_512, NVQ3_D4_1024])
+def test_nvq3j_metal_training_reuses_fused_assignment(monkeypatch, spec):
+    from mfq.quantize.metal import nvq_jsc as metal
+
+    original = metal.nvq3j_assign
+    calls = []
+
+    def checked(*args):
+        calls.append(tuple(args[0].shape))
+        return original(*args)
+
+    monkeypatch.setattr(metal, "nvq3j_assign", checked)
+    tensor, history = train_nvq_jsc(
+        torch.linspace(-0.05, 0.06, 3 * 50).reshape(3, 50),
+        config=NvqJscConfig(banks=2, spec=spec, iterations=1,
+                            assignment_refine_steps=2, search_steps=3,
+                            learned_scale_lut=False),
+        device="mps",
+    )
+    assert calls == [(3, 72)] * 6
+    assert len(history) == 2
+    assert np.isfinite(dequantize_nvq_jsc(tensor)).all()
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS required")
+def test_nvq3j_metal_unbalanced_state_banks_keep_generic_assignment(monkeypatch):
+    from mfq.quantize import nvq_jsc as jsc
+    from mfq.quantize.metal import nvq_jsc as metal
+
+    def unexpected(*args):
+        pytest.fail("unbalanced state banks cannot use the eight-state Metal kernel")
+
+    monkeypatch.setattr(metal, "nvq3j_assign", unexpected)
+    config = NvqJscConfig(banks=2, spec=NVQ3_D4, learned_scale_lut=False,
+                          iterations=0, search_steps=3)
+    tables = initial_jsc_tables(config)
+    banks = np.array([0] * 9 + [1] * 7, dtype=np.uint8)
+    value = torch.linspace(0.0, 0.05, 24, device="mps").reshape(1, 24)
+    state, bank, _, error = jsc._assign_groups(
+        value, torch.ones_like(value), torch.tensor(tables.codebooks, device="mps"),
+        torch.tensor([0.001], device="mps"), torch.tensor(tables.scale_lut, device="mps"),
+        torch.tensor(banks, device="mps").long(), out=1, ng=1, valid_last=24,
+        config=config,
+    )
+    assert np.array_equal(bank.cpu().numpy(), banks[state.cpu().numpy()])
+    assert torch.isfinite(error).all()
 
 
 @pytest.mark.parametrize("spec", [NVQ2_E8_1024, NVQ2_E8_4096])
@@ -538,3 +629,37 @@ def test_nvq3j_weighted_fixed_quantizer_uses_native_assignment(
 
     assert calls == [((8, 72), (8, 72))]
     assert np.isfinite(dequantize_nvq_jsc(tensor)).all()
+
+
+@pytest.mark.parametrize('missing', ['triton', 'mfq.quantize.cuda.nvq_sse'])
+def test_optional_cuda_sse_only_ignores_missing_triton(monkeypatch, missing):
+    import builtins
+    from mfq.quantize.nvq_jsc import _load_cuda_row_sse
+
+    original = builtins.__import__
+
+    def import_module(name, *args, **kwargs):
+        if name == 'mfq.quantize.cuda.nvq_sse':
+            raise ModuleNotFoundError('missing dependency', name=missing)
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', import_module)
+    if missing == 'triton':
+        assert _load_cuda_row_sse() is None
+    else:
+        with pytest.raises(ModuleNotFoundError):
+            _load_cuda_row_sse()
+
+
+def test_fixed_quantizer_does_not_build_autograd_graph():
+    weight = torch.randn((2, 24), generator=torch.Generator().manual_seed(801),
+                         requires_grad=True)
+    tables = initial_jsc_tables(NvqJscConfig(iterations=0))
+    error = quantize_nvq_jsc_fixed(
+        weight, tables, assignment_refine_steps=0, search_steps=3,
+        device='cpu', row_sse_only=True,
+    )
+    assert torch.isfinite(error).all()
+    assert not error.requires_grad
+    assert error.grad_fn is None
+    assert weight.grad is None

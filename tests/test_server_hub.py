@@ -19,7 +19,6 @@ from mfq.server.protocol.models import (
     OfficialModelSource,
 )
 from mfq.server.services.hub import (
-    _OFFICIAL_MODELS,
     HubCatalog,
     HubError,
     _model_configuration_status,
@@ -35,14 +34,15 @@ _DISCOVER_OFFICIAL = HubCatalog._discover_official
 
 
 def test_official_model_descriptions_use_exact_generations_and_model_capabilities():
-    specs = {item.name: item for item in _OFFICIAL_MODELS}
+    catalog = HubCatalog()
+    for version in ("3.6", "3.8"):
+        catalog._discovered_sources.add(('modelscope', f'Tylogi/Qwen{version}-27B-MFQ'))
+    specs = {item.name: item for item in catalog._official_specs()}
     for version in ("3.6", "3.8"):
         spec = specs[f"Qwen{version}-27B"]
-        assert spec.family == f"Qwen{version}"
-        assert f"Qwen{version} 系列的 27B 稠密模型" in spec.description_zh
-        assert "图像与视频理解" in spec.description_zh
+        assert spec.family == f"Qwen{version}-27B"
+        assert f"Qwen{version}-27B" in spec.description_zh
         assert "27B 稠密 MFQ 版本" not in spec.description_zh
-    catalog = HubCatalog()
     catalog._discovered_sources.add(("modelscope", "Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ"))
     flash = next(item for item in catalog._official_specs() if "Flash-Next" in item.name)
     assert "高性能、快速" in flash.description_zh
@@ -69,21 +69,21 @@ def test_new_author_repositories_appear_once_and_survive_offline_restart(tmp_pat
                        HubModelFile(name='S4-L/model-00002-of-00002.mfq', byte_size=1024)])
         monkeypatch.setattr(catalog, '_discover_official', discover)
         monkeypatch.setattr(catalog, '_fetch_info', fetch)
-        assert len((await catalog.official()).data) == 4
+        assert not (await catalog.official()).data
         await catalog._refresh_task
         result = await catalog.official()
-        assert len(result.data) == 5
+        assert len(result.data) == 1
         new = next(item for item in result.data if 'Flash-Next' in item.name)
         assert {source.provider for source in new.sources} == {'huggingface', 'modelscope'}
         assert len(new.variants) == 1 and new.variants[0].byte_size == 2048
         restored = HubCatalog(cache_path=tmp_path / 'official.json')
-        assert len((await restored.official()).data) == 5
+        assert len((await restored.official()).data) == 1
         async def offline(*args): raise HubError('offline')
         monkeypatch.setattr(restored, '_discover_official', offline)
         monkeypatch.setattr(restored, '_fetch_info', offline)
         await restored.official(refresh=True)
         await restored._refresh_task
-        assert len((await restored.official()).data) == 5
+        assert len((await restored.official()).data) == 1
         await catalog.aclose()
         await restored.aclose()
     asyncio.run(run())
@@ -118,6 +118,9 @@ def test_official_refresh_is_incremental_coalesced_and_cancelable(monkeypatch) -
         calls = []
         canceled = []
 
+        async def discover(provider):
+            return ['Tylogi/Model-A-MFQ', 'Tylogi/Model-B-MFQ']
+
         async def fetch(provider, repo_id, revision, profile):
             calls.append((provider, repo_id))
             if provider == "huggingface":
@@ -132,16 +135,17 @@ def test_official_refresh_is_incremental_coalesced_and_cancelable(monkeypatch) -
             )
 
         monkeypatch.setattr(catalog, "_fetch_info", fetch)
+        monkeypatch.setattr(catalog, "_discover_official", discover)
         first = await asyncio.wait_for(catalog.official(), timeout=0.5)
-        assert first.refreshing and len(first.data) == 4
+        assert first.refreshing and not first.data
         await started.wait()
         await asyncio.sleep(0)
         partial = await catalog.official(refresh=True)
-        assert partial.refreshing and len(calls) == 5
-        available = next(item for item in partial.data if item.id == "qwen3-8-27b")
+        assert partial.refreshing and len(calls) == 4
+        available = partial.data[0]
         assert available.variants and available.selected_source.available
         cached = await catalog.info("modelscope", available.selected_source.repo_id, "master")
-        assert cached.files[0].byte_size == 42 and len(calls) == 5
+        assert cached.files[0].byte_size == 42 and len(calls) == 4
         await catalog.aclose()
         assert len(canceled) == 2 and catalog._refresh_task.done()
 
@@ -153,6 +157,9 @@ def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatc
         path = tmp_path / "hub-official.json"
         catalog = HubCatalog(cache_path=path)
 
+        async def discover(provider):
+            return ['Tylogi/Model-A-MFQ']
+
         async def fetch(provider, repo_id, revision, profile):
             return HubModelInfo(
                 provider=provider, repo_id=repo_id, revision="master",
@@ -161,12 +168,13 @@ def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatc
             )
 
         monkeypatch.setattr(catalog, "_fetch_info", fetch)
+        monkeypatch.setattr(catalog, "_discover_official", discover)
         await catalog.official()
         await catalog._refresh_task
         assert path.exists()
         restored = HubCatalog(cache_path=path)
         assert not (await restored.official()).refreshing
-        assert len(restored._official_cache) == 5
+        assert len(restored._official_cache) == 2
         restored_model = next(iter(restored._official_cache.values()))
         assert restored_model.files[0].weight_bytes_by_dtype == {'NINT': 20, 'BF16': 10}
         assert _model_variants(restored_model.files, system_profile())[0].estimated_resident_weight_bytes == 32
@@ -176,6 +184,7 @@ def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatc
             raise HubError("offline")
 
         monkeypatch.setattr(restored, "_fetch_info", offline)
+        monkeypatch.setattr(restored, "_discover_official", offline)
         pending = await restored.official(refresh=True)
         assert pending.refreshing and all(item.variants for item in pending.data)
         await restored._refresh_task
@@ -608,7 +617,9 @@ def test_mfq_variants_keep_subdirectories_and_use_the_quantization_suffix() -> N
 
 def test_streamable_official_model_uses_each_tiers_full_residency_size() -> None:
     gib = 1 << 30
-    spec = next(item for item in _OFFICIAL_MODELS if item.id == "deepseek-v4-flash-0731")
+    catalog = HubCatalog()
+    catalog._discovered_sources.add(('huggingface', 'Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ'))
+    spec = catalog._official_specs()[0]
     sizes = (78 * gib, 88 * gib, 98 * gib)
     files = []
     for precision, size in zip(("V2-S", "V2-M", "V2-L"), sizes, strict=True):
@@ -620,7 +631,6 @@ def test_streamable_official_model_uses_each_tiers_full_residency_size() -> None
             )
         )
     source = spec.sources[0]
-    catalog = HubCatalog()
     catalog._official_cache[(source.provider, source.repo_id)] = HubModelInfo(
         provider=source.provider,
         repo_id=source.repo_id,

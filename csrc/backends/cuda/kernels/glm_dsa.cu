@@ -1,5 +1,6 @@
+#include <math_constants.h>
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -76,6 +77,30 @@ __device__ __forceinline__ float glm_warp_sum(float value) {
         value += __shfl_down_sync(0xffffffffu, value, offset);
     }
     return value;
+}
+
+template<typename T>
+__global__ void dsv4_tail_rope_kernel(const T* x,const int64_t* positions,
+        const float* cosine,const float* sine,T* output,int64_t pairs,int heads,int tokens,int width,
+        int rotary_dim,int table_stride,int64_t batch_stride,int64_t head_stride,int64_t token_stride) {
+    for(int64_t pair=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;pair<pairs;
+            pair+=int64_t(gridDim.x)*blockDim.x) {
+        const int column=int(pair%(width/2))*2;
+        auto row=pair/(width/2);
+        const int token=int(row%tokens);row/=tokens;
+        const int head=int(row%heads),batch=int(row/heads);
+        const auto source=int64_t(batch)*batch_stride+int64_t(head)*head_stride+
+            int64_t(token)*token_stride+column;
+        const float a=glm_load(x[source]),b=glm_load(x[source+1]);
+        if(column>=width-rotary_dim) {
+            const auto index=positions[token]*table_stride+(column-width+rotary_dim)/2;
+            const float c=cosine[index],s=sine[index];
+            output[pair*2]=glm_store<T>(a*c-b*s);
+            output[pair*2+1]=glm_store<T>(b*c+a*s);
+        } else {
+            output[pair*2]=glm_store<T>(a);output[pair*2+1]=glm_store<T>(b);
+        }
+    }
 }
 
 __global__ void glm_indexer_layer_norm_kernel(
@@ -214,7 +239,7 @@ __global__ void glm_indexer_scores_kernel(
                 ? query_offset + query : visible_k - M + query;
             out[(static_cast<int64_t>(batch) * M + query) * K + key] =
                 key < visible_k && key <= absolute_query
-                    ? sum * weight_scale : -INFINITY;
+                    ? sum * weight_scale : -CUDART_INF_F;
         }
     }
 #else
@@ -278,6 +303,34 @@ mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
     MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_interleaved_rope launch failed: ",
                 cudaGetErrorString(status));
     return out;
+}
+
+mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
+    mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cosine,mfq_tensor_backend::Tensor sine,int64_t rotary_dim) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.dim()==4 && x.stride(3)==1 && x.numel()>0 &&
+        (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32) &&
+        positions.device()==x.device() && positions.scalar_type()==tb::kInt64 && positions.is_contiguous() &&
+        positions.numel()==x.size(2) && cosine.device()==x.device() && sine.device()==x.device() &&
+        cosine.scalar_type()==tb::kFloat32 && sine.scalar_type()==tb::kFloat32 &&
+        cosine.is_contiguous() && sine.is_contiguous() && cosine.dim()==2 && sine.sizes()==cosine.sizes() &&
+        x.size(3)%2==0 && rotary_dim>0 && rotary_dim<=x.size(3) && rotary_dim%2==0 &&
+        cosine.size(1)>=rotary_dim/2,"DeepSeek tail RoPE geometry or dtype mismatch");
+    auto output=tb::empty(x.sizes(),x.options());
+    const auto pairs=x.numel()/2;
+    const auto blocks=unsigned(std::min<int64_t>(65535,(pairs+255)/256));
+#define MFQ_TAIL_ROPE(TYPE, PTR) \
+    dsv4_tail_rope_kernel<TYPE><<<blocks,256,0,mfq_current_cuda_stream()>>>( \
+        reinterpret_cast<const TYPE*>(x.data_ptr<PTR>()),positions.data_ptr<int64_t>(), \
+        cosine.data_ptr<float>(),sine.data_ptr<float>(),reinterpret_cast<TYPE*>(output.data_ptr<PTR>()), \
+        pairs,int(x.size(1)),int(x.size(2)),int(x.size(3)),int(rotary_dim),int(cosine.size(1)), \
+        x.stride(0),x.stride(1),x.stride(2))
+    if(x.scalar_type()==tb::kFloat16) {MFQ_TAIL_ROPE(half,mfq_half);}
+    else {MFQ_TAIL_ROPE(float,float);}
+#undef MFQ_TAIL_ROPE
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }
 
 mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(

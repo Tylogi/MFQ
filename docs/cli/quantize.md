@@ -95,7 +95,55 @@ uv run mfq quantize model-hf model-EW.mfq \
 ```
 
 A scheme may contain per-tensor or per-expert decisions. Allocation is covered
-in the [Expert-Wise joint budget solver](../ew-joint-solver.md).
+in the [Expert-Wise joint budget solver](../quantization/ew-joint-solver.md).
+
+## AlphaQ quantization
+
+On an HF source, `--target-bpw` runs the calibration-free AlphaQ allocator
+over the whole file, including PLE tables, native weights, headers, and
+assets:
+
+```shell
+uv run mfq quantize model-hf model-alphaq.mfq --target-bpw 3.0
+```
+
+`--alphaq-dense` selects how non-routed tensors join the budget (`auto` uses
+the evaluated UD recipe for Qwen3.8 Flash Next, otherwise joint allocation).
+`--alphaq-profiles` narrows the candidate set, `--alphaq-router` and
+`--alphaq-router-cache` control MoE router importance, `--devices` pins CUDA
+indices for parallel statistics and training, and `--alphaq-cache` selects a
+reusable statistics and trained-tables directory. The allocation method is
+documented in [AlphaQ](../quantization/alphaq.md).
+
+`--ud-tier IQ1_S` selects a registered model's pinned nonexpert recipe and
+exact UD main-text byte ceiling; it cannot combine with `--target-bpw`.
+Select `--alphaq-allocator natscale` for [NatScale](../quantization/natscale.md).
+Its sensitivity defaults to `uniform`, tau to 1.0 and errors to `measured`;
+run `mfq calibrate natscale-errors` first. `--natscale-error analytic` selects
+the explicit bit-decay ablation. NatScale requires recipe dense mode.
+In these whole-file workflows, `--alphaq-vision {native,NINT8,exclude}` and
+`--alphaq-mtp {quantize,exclude}` default to native vision and quantized MTP
+when present, with both payloads reported outside the main-text ceiling.
+
+## Format and scope options
+
+| Option | Meaning |
+|---|---|
+| `--nvq3-jsc`, `--nvq3-jsc-512`, `--nvq3-to-nint3`, `--iq2-s-to-nint2`, `--npq0-l` | Opt eligible tensors into the named packed format. |
+| `--nint-data-free` | Allocate per-neuron NINT profiles from reconstruction SSE without calibration data. |
+| `--nvq-calibration {auto,none,gain,group24}` | NVQ codebook calibration source. |
+| `--dense-dtype {f16,f32}` | HF dtype for recipe tensors left unquantized. |
+| `--ple-dtype {recipe,native,NINT4,NINT8}` | AlphaQ PLE lookup precision; `recipe` defaults to native when no recipe is available. |
+| `--text-only` | Omit non-language tensors. |
+| `--exclude-mtp` | Omit recipe-only MTP blocks. |
+| `--tokenizer GGUF`, `--model-config JSON` | Override tokenizer/chat-template metadata and the model config source. |
+| `--tensor-overrides JSON` | Map exact GGUF tensor names to final MFQ dtypes. |
+| `--temp-dir PATH` | HF intermediate tensor workspace. |
+| `--reuse-unweighted-from MFQ` | GGUF: reuse raw blobs for tensors without an imatrix binding. |
+
+NVQ search and codebook training knobs (`--nvq-*`, `--npq0-l-*`,
+`--nvq3-jsc-banks`, `--nvq3-jsc-learned-scale`) trade quality against speed;
+the defaults are calibrated, and `uv run mfq quantize --help` lists every one.
 
 ## Add an MTP head
 
@@ -151,6 +199,6 @@ numbered shards as one model family.
 
 [`mfq calibrate`](calibrate.md) creates reusable activation imatrices.
 `--sampling-profile` embeds a versioned
-[runtime sampling profile](../runtime-sampling-profiles.md).
+[runtime sampling profile](../runtime/sampling-profiles.md).
 
 Full options: `uv run mfq quantize --help`.

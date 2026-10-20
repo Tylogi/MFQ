@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -56,6 +56,7 @@ class AlphaQTensorStatistics:
     shape: tuple[int, int, int]
     alpha: tuple[float, ...]
     variance: tuple[float, ...]
+    column_energy: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if len(self.shape) != 3 or any(size <= 0 for size in self.shape):
@@ -68,6 +69,11 @@ class AlphaQTensorStatistics:
             raise ValueError("AlphaQ alpha values must be finite and >= 1")
         if any(not math.isfinite(v) or v < 0 for v in self.variance):
             raise ValueError("AlphaQ variances must be finite and nonnegative")
+        if self.column_energy is not None and (
+            np.shape(self.column_energy) != (self.shape[0], self.shape[2])
+            or not np.isfinite(self.column_energy).all() or (self.column_energy < 0).any()
+        ):
+            raise ValueError('column energies must be finite nonnegative [experts, columns]')
 
 
 def alphaq_weight_statistics(weights: Any, *, backend: str = "auto") -> tuple[np.ndarray, np.ndarray]:

@@ -1,7 +1,7 @@
-#include "mlx_dsa.h"
-#include "mlx_sparse_attention.h"
+#include "ops/mlx_dsa.h"
+#include "ops/mlx_sparse_attention.h"
 
-#include "mlx_detached_copy.h"
+#include "runtime/mlx_detached_copy.h"
 
 #include <algorithm>
 #include <cmath>

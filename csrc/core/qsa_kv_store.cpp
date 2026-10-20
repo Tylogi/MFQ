@@ -1,4 +1,5 @@
 #include "mfq/qsa_kv_store.h"
+#include "mfq/disk_budget.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -108,7 +109,7 @@ struct QsaKvStore::Impl {
     explicit Impl(QsaKvStoreConfig value) : config(std::move(value)) {
         if (config.buffer_bytes < 4096 || config.budget_bytes < config.buffer_bytes)
             throw std::invalid_argument("QSA KV budget is smaller than its required I/O buffer");
-        auto directory = config.directory.empty() ? std::filesystem::temp_directory_path()
+        directory = config.directory.empty() ? std::filesystem::temp_directory_path()
             : std::filesystem::path(config.directory);
         std::filesystem::create_directories(directory);
         fd = open_temporary(directory);
@@ -189,6 +190,8 @@ struct QsaKvStore::Impl {
             }
             std::exception_ptr failure;
             try {
+                DiskWriteGuard space_guard(directory, block->bytes);
+                if (!space_guard.allowed()) throw std::runtime_error("SSD space is reserved for downloads; QSA KV cannot grow");
                 std::size_t done = 0;
                 while (done < block->bytes) {
                     const auto written = write_file(fd, block->pending->data() + done,
@@ -216,6 +219,7 @@ struct QsaKvStore::Impl {
         std::weak_ptr<Block> block;
     };
     QsaKvStoreConfig config;
+    std::filesystem::path directory;
     int fd = -1;
     mutable std::recursive_mutex mutex;
     std::condition_variable_any changed;

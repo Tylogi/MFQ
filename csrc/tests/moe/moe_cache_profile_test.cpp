@@ -1,4 +1,6 @@
 #include "profile.h"
+#include "profile_path.h"
+#include <chrono>
 
 #include <cmath>
 #include <filesystem>
@@ -132,6 +134,31 @@ void test_validates_model_dimensions() {
         "unknown layer was accepted");
 }
 
+void test_checkpoint_profile_selection() {
+    const auto root=std::filesystem::temp_directory_path()/
+        ("mfq-profile-selection-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(root);
+    const auto model=root/"checkpoint.mfq",sidecar=root/"checkpoint.mfq.moe-cache-profile.json";
+    const auto directory_profile=root/"moe-cache-profile.json";
+    struct Cleanup {
+        std::filesystem::path root,sidecar,directory_profile;
+        ~Cleanup(){std::error_code e;std::filesystem::remove(sidecar,e);
+            std::filesystem::remove(directory_profile,e);std::filesystem::remove(root,e);}
+    } cleanup{root,sidecar,directory_profile};
+    require(mfq::resolve_moe_cache_profile_path({},model.string()).empty(),"missing profile changed placement");
+    std::ofstream(sidecar)<<"{}";
+    require(mfq::resolve_moe_cache_profile_path({},model.string())==sidecar.string(),"checkpoint sidecar not selected");
+    require(mfq::resolve_moe_cache_profile_path("explicit.json",model.string(),false)=="explicit.json",
+        "explicit profile lost precedence");
+    require(mfq::resolve_moe_cache_profile_path({},model.string(),false).empty(),"auto profile opt-out ignored");
+    std::ofstream(directory_profile)<<"{}";
+    require(mfq::resolve_moe_cache_profile_path({},(root/"other.mfq").string()).empty(),
+        "another checkpoint inherited a directory profile");
+    require(mfq::resolve_moe_cache_profile_path({},root.string())==directory_profile.string(),
+        "directory model did not select its own profile");
+    require(mfq::resolve_moe_cache_profile_path({},{}).empty(),"empty model selected working directory profile");
+}
+
 void test_rejects_malformed_profiles() {
     const auto duplicate = write_profile(
         "mfq-moe-profile-duplicate.json",
@@ -172,7 +199,8 @@ int main() {
         test_orders_frequency_globally_and_ranking_deterministically();
         test_validates_model_dimensions();
         test_rejects_malformed_profiles();
-        std::cout << "moe_cache_profile_tests=4 passed=4\n";
+        test_checkpoint_profile_selection();
+        std::cout << "moe_cache_profile_tests=5 passed=5\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr

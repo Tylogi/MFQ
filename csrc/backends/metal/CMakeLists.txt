@@ -221,7 +221,14 @@ string(REPLACE
     ""
     MFQ_SPARSE_BLOCK_GQA_SOURCE
     "${MFQ_SPARSE_BLOCK_GQA_SOURCE}")
+set(_MFQ_CSA2_PREFILL_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_csa2_prefill.metal")
+file(READ "${_MFQ_CSA2_PREFILL_METAL}" MFQ_CSA2_PREFILL_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\"" ""
+    MFQ_CSA2_PREFILL_SOURCE "${MFQ_CSA2_PREFILL_SOURCE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_MFQ_CSA2_PREFILL_METAL}"
     "${_MFQ_MFE_PREFILL_METAL}"
     "${_MFQ_NINT_PREFILL_METAL}"
     "${_MFQ_DSA_SPARSE_PREFILL_METAL}"
@@ -242,7 +249,7 @@ add_library(mfq-metal-runtime STATIC
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp
-    storage/mlx_mxfp8_row_store.cpp
+    storage/mlx_quantized_row_store.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
@@ -253,6 +260,8 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
+    runtime/mlx_kernel_cache.cpp
+    runtime/mlx_builtin_kernels.cpp
     runtime/mlx_inference_warmup.cpp
     runtime/mlx_ssd_expert_arena.cpp
     runtime/mlx_ssd_expert_cache.cpp
@@ -271,6 +280,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_nint_rows.cpp
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
+    ops/mlx_csa2.cpp
     ops/mlx_vq.cpp
     models/deepseek_v4/deepseek_v4_model.cpp
     models/deepseek_v4/mlx_deepseek_v4_attention.cpp
@@ -383,6 +393,38 @@ set_target_properties(mfq-decode-metal PROPERTIES
 # links from copying the same runtime files at once.
 set(_MFQ_METAL_RUNTIME_BUNDLE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/lib")
+option(MFQ_BUILD_PRECOMPILED_METAL "Build bundled MFQ Metal libraries" OFF)
+add_executable(mfq-metal-source-export
+    apps/mfq_metal_source_export.cpp runtime/mlx_builtin_kernels.cpp)
+target_include_directories(mfq-metal-source-export PRIVATE
+    "${MFQ_METAL_ROOT}/runtime" "${MFQ_METAL_ROOT}/ops" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(mfq-metal-source-export PRIVATE cxx_std_20)
+if(MFQ_BUILD_PRECOMPILED_METAL)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    execute_process(COMMAND xcrun --find metal OUTPUT_VARIABLE _MFQ_METAL_COMPILER
+        RESULT_VARIABLE _MFQ_METAL_COMPILER_RESULT OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND xcrun --find metallib OUTPUT_VARIABLE _MFQ_METALLIB_COMPILER
+        RESULT_VARIABLE _MFQ_METALLIB_COMPILER_RESULT OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND xcrun --sdk macosx --show-sdk-path OUTPUT_VARIABLE _MFQ_METAL_SDK
+        RESULT_VARIABLE _MFQ_METAL_SDK_RESULT OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _MFQ_METAL_COMPILER_RESULT EQUAL 0 OR NOT _MFQ_METALLIB_COMPILER_RESULT EQUAL 0
+            OR NOT _MFQ_METAL_SDK_RESULT EQUAL 0)
+        message(FATAL_ERROR "Precompiled Metal libraries require the Xcode Metal Toolchain (metal and metallib)")
+    endif()
+    set(_MFQ_AOT_ROOT "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/mfq-metal")
+    add_custom_command(OUTPUT "${_MFQ_AOT_ROOT}/manifest.json"
+        COMMAND $<TARGET_FILE:mfq-metal-source-export> "${CMAKE_CURRENT_BINARY_DIR}/metal-sources"
+        COMMAND "${Python3_EXECUTABLE}" "${MFQ_REPOSITORY_ROOT}/packaging/compile_metal_libraries.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/metal-sources" "${_MFQ_AOT_ROOT}"
+            --metal "${_MFQ_METAL_COMPILER}" --metallib "${_MFQ_METALLIB_COMPILER}" --sdk "${_MFQ_METAL_SDK}"
+        DEPENDS mfq-metal-source-export "${MFQ_REPOSITORY_ROOT}/packaging/compile_metal_libraries.py"
+        VERBATIM)
+    add_custom_target(mfq-metal-precompiled DEPENDS "${_MFQ_AOT_ROOT}/manifest.json")
+    add_dependencies(mfq-decode-metal mfq-metal-precompiled)
+    if(TARGET mfq-perplexity)
+        add_dependencies(mfq-perplexity mfq-metal-precompiled)
+    endif()
+endif()
 set(_MFQ_METAL_RUNTIME_BUNDLE_STAMP
     "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/.mfq-runtime-bundle.stamp")
 add_custom_command(
@@ -437,6 +479,9 @@ add_custom_target(mfq-metal-runtime-bundle
 add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
 if(TARGET mfq-perplexity)
     add_dependencies(mfq-perplexity mfq-metal-runtime-bundle)
+    if(TARGET mfq-metal-precompiled)
+        add_dependencies(mfq-perplexity mfq-metal-precompiled)
+    endif()
 endif()
 
 add_executable(mfq-metal-container-test
@@ -758,20 +803,20 @@ add_executable(mfq-metal-hf-safetensors-store-test
     tests/hf_safetensors_store_test.cpp
 )
 
-add_executable(mfq-metal-mxfp8-row-store-test
-    tests/mlx_mxfp8_row_store_test.cpp
+add_executable(mfq-metal-quantized-row-store-test
+    tests/mlx_quantized_row_store_test.cpp
 )
-target_link_libraries(mfq-metal-mxfp8-row-store-test PRIVATE
+target_link_libraries(mfq-metal-quantized-row-store-test PRIVATE
     mfq-metal-runtime
 )
 target_compile_features(
-    mfq-metal-mxfp8-row-store-test PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mxfp8-row-store-test PROPERTIES
+    mfq-metal-quantized-row-store-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-quantized-row-store-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(
-    NAME mfq-metal-mxfp8-row-store-test
-    COMMAND mfq-metal-mxfp8-row-store-test
+    NAME mfq-metal-quantized-row-store-test
+    COMMAND mfq-metal-quantized-row-store-test
 )
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
     ${MFQ_METAL_ROOT}/storage
@@ -1140,6 +1185,7 @@ add_test(
 add_executable(mfq-metal-qwen4-config-test
     tests/qwen4_config_test.cpp
 )
+
 target_link_libraries(mfq-metal-qwen4-config-test PRIVATE
     mfq-metal-runtime
 )
@@ -1152,6 +1198,11 @@ add_test(
     NAME mfq-metal-qwen4-config-test
     COMMAND mfq-metal-qwen4-config-test
 )
+
+add_executable(mfq-metal-qwen4-batching-test tests/mlx_qwen4_batching_test.cpp)
+target_link_libraries(mfq-metal-qwen4-batching-test PRIVATE mfq-metal-runtime mfq-engine)
+target_compile_features(mfq-metal-qwen4-batching-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-qwen4-batching-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 
 add_executable(mfq-metal-sparse-attention-test
     tests/mlx_sparse_attention_test.cpp

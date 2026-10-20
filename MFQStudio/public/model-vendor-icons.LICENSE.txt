@@ -1,4 +1,4 @@
-Qwen, DeepSeek and Z.ai vector paths adapted from LobeHub Icons:
+Qwen, DeepSeek, Z.ai and Gemma vector paths adapted from LobeHub Icons:
 https://github.com/lobehub/lobe-icons
 
 MIT License
@@ -22,3 +22,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+MiniCPM vector path adapted from the official MiniCPM-o demo favicon:
+https://github.com/OpenBMB/MiniCPM-V/blob/main/web_demos/minicpm-o_2.6/web_server/public/favicon.svg
+Source: OpenBMB MiniCPM-V contributors
+License: Apache-2.0 (MFQ repository LICENSE)
+Adaptation: coordinates normalized to 24 units; colors removed for outline display.

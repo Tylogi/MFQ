@@ -1,7 +1,6 @@
 /** 组合应用级 Provider 与业务路由，页面状态和请求由对应领域拥有。 */
 import { lazy, Suspense } from 'react';
 import { Route, Routes } from 'react-router';
-import { SettingsProvider } from './features/settings/SettingsProvider';
 import { StudioUpdateProvider } from './features/settings/UpdateManager';
 import { RuntimeProvider } from './app/RuntimeProvider';
 import { ChatProvider } from './features/chat/ChatProvider';
@@ -42,11 +41,6 @@ const EvaluationsPage = lazy(() =>
     default: module.EvaluationsPage,
   })),
 );
-const QuantizationPage = lazy(() =>
-  import('./features/jobs/QuantizationPage').then((module) => ({
-    default: module.QuantizationPage,
-  })),
-);
 const AnalysisPage = lazy(() =>
   import('./features/analysis/AnalysisPage').then((module) => ({ default: module.AnalysisPage })),
 );
@@ -60,7 +54,6 @@ const VersionsPage = lazy(() =>
 /** 挂载共享服务与独立业务页面，未知地址显示 404。 */
 export default function App() {
   return (
-    <SettingsProvider>
       <StudioUpdateProvider>
         <RuntimeProvider>
           <ChatProvider>
@@ -80,7 +73,6 @@ export default function App() {
                     <Route path="analysis" element={<AnalysisPage />} />
                     <Route path="model-hub" element={<ModelHubPage />} />
                     <Route path="evaluations" element={<EvaluationsPage />} />
-                    <Route path="quantization" element={<QuantizationPage />} />
                   </Route>
                   <Route path="*" element={<NotFoundPage />} />
                 </Route>
@@ -89,6 +81,5 @@ export default function App() {
           </ChatProvider>
         </RuntimeProvider>
       </StudioUpdateProvider>
-    </SettingsProvider>
   );
 }

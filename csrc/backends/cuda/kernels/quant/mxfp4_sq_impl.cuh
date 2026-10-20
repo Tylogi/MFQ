@@ -3,7 +3,7 @@
 // Shared by the MXFP4-SQ inference unit and the tool-only backward unit: the
 // frozen palettes, the packed bit reader they feed, and the blob validation.
 
-#include "mxfp4_sq.h"
+#include "kernels/quant/mxfp4_sq.h"
 
 #include <cstddef>
 #include <cstdint>

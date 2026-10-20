@@ -53,6 +53,7 @@ struct FullBlock : Block {
     QuantLinear o;
     FFN ffn;
     std::shared_ptr<FullAttentionState> state = std::make_shared<FullAttentionState>();
+    mfq::cuda::KvQuantization kv_quantization;
 
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 
@@ -60,6 +61,7 @@ struct FullBlock : Block {
         const mfq::models::CausalLmMetadata&, bool batch) const override;
     bool supports_speculation() const noexcept override { return !sliding; }
     void reset(int64_t batch) override;
+    void preallocate_kv();
     mfq_tensor_backend::Tensor forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,

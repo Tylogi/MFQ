@@ -1,9 +1,9 @@
 #include "mlx_deepseek_v41_causal_lm.h"
 
-#include "mlx_eval_timing.h"
-#include "mlx_legacy_tensor_compat.h"
-#include "mlx_transformer.h"
-#include "mfe_expert_store.h"
+#include "runtime/mlx_eval_timing.h"
+#include "storage/compat/mlx_legacy_tensor_compat.h"
+#include "runtime/mlx_transformer.h"
+#include "storage/mfe_expert_store.h"
 
 #include <algorithm>
 #include <array>
@@ -140,7 +140,9 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     MlxDeepseekV41LayerState& state,
     MlxDeepseekV41SharedAttentionState& shared_attention,
     int pos0,
-    MlxSsdPrefetchedExpertLayer* prefetched) const {
+    MlxSsdPrefetchedExpertLayer* prefetched,
+    bool ced_replay,
+    MlxMfeCachedRoute* deferred_route) const {
     if (hidden.ndim() != 4 || hidden.shape(2) != config_.hc_mult ||
         hidden.shape(3) != config_.hidden) {
         throw std::invalid_argument(
@@ -161,14 +163,34 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     }
     auto attention_input = mlx::core::mean(value, 2);
 
-    const auto attention_residual = value;
+    auto attention_residual = value;
     auto attention_mix = attention_mhc_.collapse(
         attention_residual, previous_pre);
+    std::optional<array> encoder_source;
+    if (ced_replay && index_ == config_.n_layers / 2) {
+        const int tokens = value.shape(1);
+        const int tail = static_cast<int>(config_.sliding_window);
+        const int begin = tokens - tail;
+        if (begin <= 0 || image_mask || engram_) {
+            throw std::invalid_argument("invalid DeepSeek-V4.1 CED boundary replay");
+        }
+        encoder_source = attention_mix.branch;
+        attention_mix.branch = slice_tokens(attention_mix.branch, begin, tokens);
+        attention_mix.next_pre = slice_tokens(attention_mix.next_pre, begin, tokens);
+        attention_mix.expansion.pre = slice_tokens(attention_mix.expansion.pre, begin, tokens);
+        attention_mix.expansion.post = slice_tokens(attention_mix.expansion.post, begin, tokens);
+        attention_mix.expansion.combination = slice_tokens(attention_mix.expansion.combination, begin, tokens);
+        attention_residual = slice_tokens(attention_residual, begin, tokens);
+        attention_input = slice_tokens(attention_input, begin, tokens);
+        pos0 += begin;
+    }
     auto attention_branch = attention_.forward(
         attention_mix.branch,
         state.attention,
         shared_attention,
-        pos0);
+        pos0,
+        ced_replay,
+        encoder_source ? &*encoder_source : nullptr);
     value = attention_mhc_.expand(
         attention_branch,
         attention_residual,
@@ -178,7 +200,7 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     auto ffn_mix = ffn_mhc_.collapse(
         ffn_residual, attention_mix.next_pre);
     auto ffn_branches = moe_.forward(
-        ffn_mix.branch, image_mask, prefetched);
+        ffn_mix.branch, image_mask, prefetched, deferred_route);
     value = ffn_mhc_.expand_sum(
         ffn_branches.routed,
         ffn_branches.shared,
@@ -191,10 +213,26 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     };
 }
 
-std::optional<MlxMxfp8RowStoreStats>
+void MlxDeepseekV41Layer::append_ced_encoder_context(
+    const array& hidden, const array& previous_pre,
+    MlxDeepseekV41LayerState& state, int pos0) const {
+    if (index_ != config_.n_layers / 2 || hidden.shape(1) <= config_.sliding_window)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 deferred Decoder boundary");
+    auto mixed = attention_mhc_.collapse(hidden, previous_pre);
+    const auto& source = mixed.branch;
+    const int begin = source.shape(1) - static_cast<int>(config_.sliding_window);
+    auto local = state.attention.local_kv;
+    MlxDeepseekV41SharedAttentionState shared;
+    (void)attention_.forward(slice_tokens(source, begin, source.shape(1)),
+        state.attention, shared, pos0 + begin, true, &source);
+    state.attention.local_kv = std::move(local);
+    detail::eval_with_timing({*state.attention.compressed_kv, *state.attention.index_k});
+}
+
+std::optional<MlxQuantizedRowStoreStats>
 MlxDeepseekV41Layer::engram_ssd_stats() const {
     return engram_
-        ? std::optional<MlxMxfp8RowStoreStats>(engram_->ssd_stats())
+        ? std::optional<MlxQuantizedRowStoreStats>(engram_->ssd_stats())
         : std::nullopt;
 }
 
@@ -340,7 +378,8 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         std::move(ssd_expert_cache),
         std::move(mfe_offload_cache),
         std::move(vision),
-        std::move(dspark));
+        std::move(dspark),
+        std::make_shared<MfqContainer>(model));
 }
 
 MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
@@ -354,7 +393,8 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
     std::optional<MlxDeepseekV41Vision> vision,
-    std::optional<MlxDeepseekV41DSpark> dspark)
+    std::optional<MlxDeepseekV41DSpark> dspark,
+    std::shared_ptr<MfqContainer> source)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -363,6 +403,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
       engram_hash_(std::move(engram_hash)),
       ssd_expert_cache_(std::move(ssd_expert_cache)),
       mfe_offload_cache_(std::move(mfe_offload_cache)),
+      source_(std::move(source)),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
       max_context_(max_context) {
@@ -483,6 +524,90 @@ MlxDeepseekV41CausalLm::expert_cache_limit_bytes() const noexcept {
         : 0;
 }
 
+std::size_t MlxDeepseekV41CausalLm::resident_full_expert_bytes() const noexcept {
+    std::size_t bytes = dspark_ ? dspark_->resident_routed_bytes() : 0;
+    for (const auto& layer : layers_) bytes += layer.resident_routed_bytes();
+    return bytes;
+}
+
+std::size_t MlxDeepseekV41CausalLm::dynamic_weight_bytes() const noexcept {
+    return mfe_offload_cache_ ? mfe_offload_cache_->resident_packed_bytes() : 0;
+}
+
+std::size_t MlxDeepseekV41CausalLm::reclaimable_expert_bytes() const noexcept {
+    return ssd_expert_cache_ ? ssd_expert_cache_->cache_limit_bytes()
+        : resident_full_expert_bytes() + dynamic_weight_bytes();
+}
+
+std::size_t MlxDeepseekV41CausalLm::ssd_expert_payload_bytes() const noexcept {
+    if (mfe_offload_cache_) return mfe_offload_cache_->backing_payload_bytes();
+    if (!ssd_expert_cache_ || !source_) return 0;
+    std::size_t bytes = 0;
+    for (const auto& [name, record] : source_->records()) {
+        if (name.find(".experts.") != std::string::npos && record.dtype == "MFE") {
+            bytes += record.nbytes;
+        }
+    }
+    return bytes;
+}
+
+std::size_t MlxDeepseekV41CausalLm::set_expert_cache_limit(std::size_t bytes) {
+    const auto before = mlx::core::get_active_memory();
+    if (!mfe_offload_cache_) {
+        if (!ssd_expert_cache_ && resident_full_expert_bytes() <= bytes) return 0;
+        if (!source_) throw std::runtime_error("DeepSeek-V4.1 expert backing is unavailable");
+        auto cache = std::make_shared<MlxMfeOffloadCache>(*source_, bytes);
+        for (const auto& layer : layers_) layer.validate_offload(cache);
+        if (dspark_) dspark_->validate_offload(cache);
+        if (ssd_expert_cache_) {
+            ssd_expert_cache_->release_deferred();
+            for (auto& layer : layers_) layer.use_offload(cache);
+            if (dspark_) dspark_->use_offload(cache);
+            ssd_expert_cache_.reset();
+        }
+        mfe_offload_cache_ = std::move(cache);
+        update_expert_prefill_priority();
+    }
+    auto resident = resident_full_expert_bytes();
+    if (ced_prefill_active_ && dspark_) {
+        dspark_->offload_until(mfe_offload_cache_, resident, bytes);
+    }
+    const auto first = ced_prefill_active_ ? layers_.size() / 2 : 0;
+    for (std::size_t offset = 0; offset < layers_.size(); ++offset) {
+        if (resident <= bytes) break;
+        auto& layer = layers_[(first + offset) % layers_.size()];
+        const auto released = layer.resident_routed_bytes();
+        if (released) {
+            layer.use_offload(mfe_offload_cache_);
+            resident -= released;
+        }
+    }
+    if (resident > bytes && dspark_) {
+        dspark_->offload_until(mfe_offload_cache_, resident, bytes);
+    }
+    mfe_offload_cache_->set_cache_limit(bytes > resident ? bytes - resident : 0);
+    const auto after = mlx::core::get_active_memory();
+    return before > after ? before - after : 0;
+}
+
+void MlxDeepseekV41CausalLm::update_expert_prefill_priority() {
+    if (!mfe_offload_cache_) return;
+    std::vector<std::string> names;
+    if (ced_prefill_active_ && source_) {
+        const auto encoder_layers = layers_.size() / 2;
+        names.reserve(encoder_layers * 3);
+        for (std::size_t layer = 0; layer < encoder_layers; ++layer) {
+            const auto prefix = "model.block." + std::to_string(layer) + ".mlp.experts.";
+            if (source_->contains(prefix + "gate.weight")) {
+                names.push_back(prefix + "gate.weight");
+                names.push_back(prefix + "up.weight");
+            } else names.push_back(prefix + "gate_up.weight");
+            names.push_back(prefix + "down.weight");
+        }
+    }
+    mfe_offload_cache_->set_prefill_priority(names);
+}
+
 int MlxDeepseekV41CausalLm::preferred_prefill_chunk_size(
     int portable_default) const noexcept {
     if (portable_default <= 0 || layers_.empty()) return portable_default;
@@ -506,14 +631,31 @@ MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
         return std::nullopt;
     }
     MlxSsdExpertCacheStats stats;
+    const auto reuse = mfe_offload_cache_->reuse_stats();
+    stats.loads = reuse.expert_loads;
+    stats.misses = reuse.expert_loads;
+    stats.hits = reuse.expert_hits;
+    stats.requests = stats.hits + stats.misses;
+    stats.coalesced = reuse.load_waits;
+    stats.packed_reuses = reuse.packed_hits;
+    stats.bytes_read = reuse.bytes_read;
+    stats.read_calls = reuse.read_calls;
+    stats.evictions = reuse.evictions;
+    stats.io_seconds = reuse.io_seconds;
+    stats.wait_seconds = reuse.wait_seconds;
+    stats.prepare_seconds = reuse.prepare_seconds;
+    stats.view_seconds = reuse.view_seconds;
+    stats.device_route_hits = reuse.cached_route_hits;
+    stats.device_route_misses = reuse.cached_route_misses;
+    stats.device_route_layers = reuse.cached_route_hits + reuse.cached_route_misses;
     stats.resident_experts = mfe_offload_cache_->cached_expert_count();
     stats.resident_bytes = mfe_offload_cache_->resident_packed_bytes();
     return stats;
 }
 
-std::optional<MlxMxfp8RowStoreStats>
+std::optional<MlxQuantizedRowStoreStats>
 MlxDeepseekV41CausalLm::engram_ssd_stats() const {
-    std::optional<MlxMxfp8RowStoreStats> result;
+    std::optional<MlxQuantizedRowStoreStats> result;
     for (const auto& layer : layers_) {
         const auto current = layer.engram_ssd_stats();
         if (!current) continue;
@@ -554,10 +696,35 @@ array MlxDeepseekV41CausalLm::forward_impl(
     const std::optional<array>& input_embeddings,
     array* dspark_hidden,
     bool update_dspark,
-    bool skip_lm_head) {
+    bool skip_lm_head,
+    bool ced_prefill,
+    bool defer_ced_decoder) {
     auto token_ids = normalized_ids(raw_token_ids);
     const int batch = token_ids.shape(0);
     const int tokens = token_ids.shape(1);
+    const bool replay_decoder = ced_prefill && !image_mask &&
+        speculative_cache_start_ < 0 && tokens > config_.sliding_window &&
+        supports_ced_prefill();
+    const int decoder_begin = static_cast<int>(config_.n_layers / 2);
+    const bool encoder_only = defer_ced_decoder && replay_decoder && skip_lm_head;
+    const auto layer_count = encoder_only ? static_cast<std::size_t>(decoder_begin) : layers_.size();
+    const int replay_offset = replay_decoder
+        ? tokens - static_cast<int>(config_.sliding_window) : 0;
+    struct PrefillPriorityScope {
+        bool& active;
+        std::shared_ptr<MlxMfeOffloadCache>& cache;
+        bool enabled;
+        ~PrefillPriorityScope() {
+            if (enabled) {
+                active = false;
+                if (cache) cache->set_prefill_priority({});
+            }
+        }
+    } prefill_priority{ced_prefill_active_, mfe_offload_cache_, replay_decoder};
+    if (replay_decoder) {
+        ced_prefill_active_ = true;
+        update_expert_prefill_priority();
+    }
     if (!reuse_cache) reset_cache(batch);
     if (cache_batch_ != batch || states_.size() != layers_.size()) {
         throw std::runtime_error(
@@ -587,7 +754,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
         cache_position_,
         participation,
         true);
-    if (tokens > 1 && !ssd_expert_cache_ && !mfe_offload_cache_) {
+    if (hashes.layers > 0) {
         hashes.prefetched_rows.resize(
             static_cast<std::size_t>(hashes.layers));
         for (const auto& layer : layers_) {
@@ -627,7 +794,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
             routed_pipeline[1] = layers_[1].prefetch_routed(routed_rows);
         }
     }
-    const auto capture_target = [this](
+    const auto capture_target = [this, replay_decoder](
         std::size_t index,
         const array& attention_input,
         std::vector<std::optional<array>>& targets) {
@@ -637,7 +804,12 @@ array MlxDeepseekV41CausalLm::forward_impl(
              ++target) {
             if (config_.dspark_target_layer_ids[target] ==
                 static_cast<std::int64_t>(index)) {
-                targets[target] = attention_input;
+                targets[target] = replay_decoder &&
+                        attention_input.shape(1) > config_.sliding_window
+                    ? slice_tokens(attention_input,
+                          attention_input.shape(1) - static_cast<int>(config_.sliding_window),
+                          attention_input.shape(1))
+                    : attention_input;
             }
         }
     };
@@ -645,7 +817,95 @@ array MlxDeepseekV41CausalLm::forward_impl(
         !image_mask.has_value() && speculative_cache_start_ < 0 &&
         mlx_ssd_route_transactions_enabled();
     if (!route_transaction) {
-        for (std::size_t index = 0; index < layers_.size(); ++index) {
+        for (std::size_t index = 0; index < layer_count; ++index) {
+            if (mfe_offload_cache_ && batch == 1 && tokens == 1 && cache_position_ > 0 &&
+                !image_mask && speculative_cache_start_ < 0 && !detail::component_profile_active()) {
+                std::vector<MlxMfeCachedRoute> routes;
+                for (auto next = index; next < layers_.size() && next < index + 4; ++next) {
+                    auto route = layers_[next].cached_route();
+                    if (!route) break;
+                    routes.push_back(std::move(*route));
+                }
+                if (routes.size() > 1) {
+                    const auto restore = [&](std::size_t first = 0) {
+                        std::vector<array> restored;
+                        for (std::size_t offset = first; offset < routes.size(); ++offset) {
+                            auto& state = states_[index + offset];
+                            if (!state.attention.speculation) continue;
+                            auto values = layers_[index + offset].rollback_route_replay(state);
+                            restored.insert(restored.end(), std::make_move_iterator(values.begin()),
+                                std::make_move_iterator(values.end()));
+                        }
+                        detail::eval_with_timing(std::move(restored));
+                    };
+                    auto trial_hidden = hidden;
+                    auto trial_pre = previous_pre;
+                    auto trial_shared = shared_attention;
+                    auto trial_targets = target_hiddens;
+                    struct Prefix {
+                        array hidden;
+                        array pre;
+                        MlxDeepseekV41SharedAttentionState shared;
+                        std::vector<std::optional<array>> targets;
+                    };
+                    std::vector<Prefix> prefixes;
+                    prefixes.reserve(routes.size());
+                    try {
+                        std::vector<array> backups;
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset) {
+                            auto values = layers_[index + offset].begin_route_replay(
+                                states_[index + offset], tokens);
+                            backups.insert(backups.end(), std::make_move_iterator(values.begin()),
+                                std::make_move_iterator(values.end()));
+                        }
+                        mlx::core::async_eval(std::move(backups));
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset) {
+                            auto result = layers_[index + offset].forward(trial_hidden, trial_pre,
+                                &hashes, image_mask, states_[index + offset], trial_shared,
+                                cache_position_, nullptr, false, &routes[offset]);
+                            trial_hidden = std::move(result.hidden);
+                            trial_pre = std::move(result.next_pre);
+                            capture_target(index + offset, result.attention_input, trial_targets);
+                            prefixes.push_back({trial_hidden, trial_pre, trial_shared, trial_targets});
+                        }
+                        mlx::core::async_eval({*routes.back().ids});
+                        mlx::core::async_eval({trial_hidden});
+                        std::size_t completed = 0;
+                        while (completed < routes.size() && routes[completed].all_resident()) {
+                            routes[completed].resolve();
+                            ++completed;
+                        }
+                        if (completed == routes.size()) {
+                            for (std::size_t offset = 0; offset < routes.size(); ++offset)
+                                layers_[index + offset].commit_route_replay(states_[index + offset]);
+                            hidden = std::move(trial_hidden);
+                            previous_pre = std::move(trial_pre);
+                            shared_attention = std::move(trial_shared);
+                            target_hiddens = std::move(trial_targets);
+                            index += routes.size() - 1;
+                            continue;
+                        }
+                        routes[completed].resolve();
+                        detail::eval_with_timing(trial_hidden);
+                        restore(completed);
+                        if (completed > 0) {
+                            for (std::size_t offset = 0; offset < completed; ++offset)
+                                layers_[index + offset].commit_route_replay(states_[index + offset]);
+                            auto& prefix = prefixes[completed - 1];
+                            hidden = std::move(prefix.hidden);
+                            previous_pre = std::move(prefix.pre);
+                            shared_attention = std::move(prefix.shared);
+                            target_hiddens = std::move(prefix.targets);
+                            index += completed - 1;
+                            continue;
+                        }
+                    } catch (...) {
+                        try { detail::eval_with_timing(trial_hidden); } catch (...) {}
+                        try { restore(); } catch (...) {}
+                        throw;
+                    }
+                }
+            }
             auto* prefetched = routed_pipeline[index % 2].has_value()
                 ? &*routed_pipeline[index % 2]
                 : nullptr;
@@ -656,15 +916,19 @@ array MlxDeepseekV41CausalLm::forward_impl(
                 image_mask,
                 states_[index],
                 shared_attention,
-                cache_position_,
-                prefetched);
+                cache_position_ + (replay_decoder && index > decoder_begin ? replay_offset : 0),
+                prefetched,
+                replay_decoder && index >= decoder_begin);
             hidden = std::move(result.hidden);
             previous_pre = std::move(result.next_pre);
             if (prefetched != nullptr) {
                 routed_pipeline[index % 2].reset();
-                if (index + 2 < layers_.size()) {
+                if (index + 2 < layer_count) {
                     routed_pipeline[index % 2] =
-                        layers_[index + 2].prefetch_routed(routed_rows);
+                        layers_[index + 2].prefetch_routed(
+                            replay_decoder && index + 2 >= decoder_begin
+                                ? static_cast<std::size_t>(batch) * config_.sliding_window
+                                : routed_rows);
                 }
             }
             capture_target(index, result.attention_input, target_hiddens);
@@ -824,6 +1088,13 @@ array MlxDeepseekV41CausalLm::forward_impl(
             group_begin = group_end;
         }
     }
+    if (encoder_only) {
+        layers_[decoder_begin].append_ced_encoder_context(
+            hidden, previous_pre, states_[decoder_begin], cache_position_);
+        cache_position_ += tokens;
+        return mlx::core::zeros(
+            Shape{batch, 0, static_cast<int>(config_.vocab)}, mlx::core::float32);
+    }
     auto collapsed = mlx::core::sum(
         mlx::core::expand_dims(
             mlx::core::astype(previous_pre, mlx::core::float32), -1) *
@@ -849,7 +1120,8 @@ array MlxDeepseekV41CausalLm::forward_impl(
         dspark_->append_context(
             automatic_dspark_hidden,
             *dspark_state_,
-            cache_position_);
+            cache_position_ + replay_offset,
+            replay_decoder);
     }
     cache_position_ += tokens;
     if (skip_lm_head) {
@@ -958,6 +1230,17 @@ array MlxDeepseekV41CausalLm::forward(
     return forward_impl(token_ids, std::nullopt, use_cache);
 }
 
+bool MlxDeepseekV41CausalLm::supports_ced_prefill() const noexcept {
+    const int midpoint = static_cast<int>(config_.n_layers / 2);
+    if (midpoint <= 0 || config_.n_layers % 2 ||
+        !config_.is_kv_source(midpoint) || !config_.is_index_source(midpoint)) return false;
+    for (int layer = midpoint; layer < config_.n_layers; ++layer) {
+        if (config_.compress_ratios[layer] != 1 || config_.has_engram(layer) ||
+            (layer > midpoint && config_.is_kv_source(layer))) return false;
+    }
+    return true;
+}
+
 array MlxDeepseekV41CausalLm::prefill(
     const array& raw_token_ids,
     int chunk_size,
@@ -981,6 +1264,7 @@ array MlxDeepseekV41CausalLm::prefill(
             (tokens + chunk_size - 1) / chunk_size));
     }
     std::optional<array> last;
+    const int final_tokens = tokens - ((tokens - 1) / chunk_size) * chunk_size;
     for (int begin = 0; begin < tokens; begin += chunk_size) {
         const int end = std::min(tokens, begin + chunk_size);
         auto logits = forward_impl(
@@ -990,7 +1274,9 @@ array MlxDeepseekV41CausalLm::prefill(
             std::nullopt,
             nullptr,
             true,
-            !full_logits && end < tokens);
+            !full_logits && end < tokens,
+            !full_logits,
+            !full_logits && end < tokens && final_tokens > config_.sliding_window);
         if (full_logits) chunks.push_back(std::move(logits));
         else last = std::move(logits);
     }
@@ -1231,7 +1517,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
         ++generated;
         const bool delivered = !callback || callback(token);
         if (!delivered ||
-            mlx_token_in_set(config_.eos_token_ids, token) ||
+            (!sampling.warmup && mlx_token_in_set(config_.eos_token_ids, token)) ||
             generated == limit) {
             break;
         }
@@ -1422,6 +1708,9 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
         } else {
             const auto prefill_range = [&](std::size_t begin, std::size_t end) {
                 std::optional<array> last;
+                const auto length = end - begin;
+                const auto chunk = static_cast<std::size_t>(prefill_chunk_size);
+                const auto final_tokens = length ? length - ((length - 1) / chunk) * chunk : 0;
                 for (std::size_t offset = begin; offset < end;
                      offset += static_cast<std::size_t>(prefill_chunk_size)) {
                     const auto stop = std::min(
@@ -1437,7 +1726,9 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
                         std::nullopt,
                         nullptr,
                         true,
-                        stop < end);
+                        stop < end,
+                        true,
+                        stop < end && final_tokens > config_.sliding_window);
                 }
                 if (!last) {
                     throw std::runtime_error(

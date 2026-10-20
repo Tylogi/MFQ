@@ -6,10 +6,11 @@ using namespace mfq::engine;
 
 MlxEngine::MlxEngine(std::unique_ptr<MlxEngineModel> model,
     std::unique_ptr<TextProcessor> text, EngineInfo info)
-    : model_(std::move(model)), text_(std::move(text)), info_(std::move(info)) {
+    : model_(std::move(model)), text_(std::move(text)), info_(std::move(info)),
+      requests_(model_ ? model_->request_capacity() : 1) {
     if (!model_ || !text_) throw std::invalid_argument("Metal engine requires model and tokenizer");
     info_.backend = "metal";
-    info_.max_requests = 1;
+    info_.max_requests = model_->request_capacity();
     info_.chat = text_->chat_template_capabilities();
 }
 MlxEngine::~MlxEngine() { try { shutdown(); } catch (...) {} }
@@ -23,11 +24,12 @@ Admission MlxEngine::admit(EngineRequest&& request) {
 void MlxEngine::cancel(const RequestId& id) { requests_.cancel(id); }
 EngineStepResult MlxEngine::step(const std::vector<RequestId>& eligible) {
     auto result = requests_.step(eligible, *this);
-    if (result.has_work && result.events.empty())
+    if (result.has_work && result.events.empty() && result.advanced.empty())
         result.wake_at = Clock::now() + std::chrono::milliseconds(1);
     return result;
 }
-Generation MlxEngine::generate(const RequestId&, ExecutionRequest& request) {
+Generation MlxEngine::generate(const RequestId& id, ExecutionRequest& request) {
+    if (request.batched) return model_->generate_batch(id, request.input, request.output);
     return consume_mlx_generation([this, &request](MlxGenerationJob& job) {
         model_->generate(request.input, job);
     }, request.output);

@@ -18,7 +18,6 @@ describe('Studio 页面路由', () => {
     ['/settings', 'dashboard', 'settings'],
     ['/model-hub', 'lab', 'models'],
     ['/evaluations', 'lab', 'evaluations'],
-    ['/quantization', 'lab', 'quantization'],
     ['/analysis', 'lab', 'analysis'],
     ['/chat', 'chat', 'overview'],
     ['/applications', 'applications', 'overview'],
@@ -42,6 +41,8 @@ describe('Studio 页面路由', () => {
     expect(isStudioPath('/chat/')).toBe(true);
     expect(isStudioPath('/applications/')).toBe(true);
     expect(isStudioPath('/missing')).toBe(false);
+    expect(isStudioPath('/quantization')).toBe(false);
+    expect(isStudioPath('/quantization/')).toBe(false);
     expect(isStudioPath('/chat/extra')).toBe(false);
   });
 });

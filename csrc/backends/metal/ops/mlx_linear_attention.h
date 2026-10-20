@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <vector>
 
 #include <mlx/mlx.h>
 
@@ -21,7 +22,23 @@ struct MlxGatedDeltaDecodeResult {
     mlx::core::array output;
     mlx::core::array convolution_state;
     mlx::core::array recurrent_state;
+    std::optional<mlx::core::array> gate;
+    std::optional<mlx::core::array> beta;
 };
+
+struct MlxGatedDeltaDecodeInput {
+    mlx::core::array qk, value, output_gate, alpha, beta;
+    mlx::core::array convolution_state, recurrent_state;
+};
+
+std::vector<MlxGatedDeltaDecodeResult> gated_delta_decode_steps(
+    const std::vector<MlxGatedDeltaDecodeInput>& requests,
+    const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight,
+    int key_heads, int value_heads, int dimension,
+    float convolution_eps, float norm_eps, bool output_gate_silu = false);
 
 // Projected inputs are [B,T,H]; outputs are FP32 [B,H,T]. The caller
 // precomputes decay_scale = -exp(a_log), preserving the model's storage

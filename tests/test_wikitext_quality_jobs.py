@@ -59,7 +59,8 @@ def test_wt2_reference_contract_and_top1(tmp_path, case, monkeypatch):
 
 @pytest.mark.parametrize('layerwise', [None, False, True])
 @pytest.mark.parametrize('tampered', [False, True])
-def test_reference_generation_keeps_official_dataset_and_loading_contract(tmp_path, monkeypatch, layerwise, tampered):
+@pytest.mark.parametrize('backend', ['metal', 'cuda'])
+def test_reference_generation_keeps_official_dataset_and_loading_contract(tmp_path, monkeypatch, layerwise, tampered, backend):
     async def run():
         corpus = tmp_path / 'wt2.parquet'
         pq.write_table(pa.Table.from_pylist([{'text': 'official corpus\n'}]), corpus)
@@ -69,8 +70,11 @@ def test_reference_generation_keeps_official_dataset_and_loading_contract(tmp_pa
         store = SessionStore(tmp_path / 'db.sqlite3')
         dataset = store.create_dataset(CreateDatasetRequest(name='WT2', kind='wikitext2', artifact_uri='workspace://wt2.parquet'), sha256=digest, byte_size=corpus.stat().st_size)
         context = JobContext(store, store.create_job('reference.wikitext2', {}).id, asyncio.Event())
-        tools = ToolJobHandlers(ModelCatalog([tmp_path]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None, None))
-        monkeypatch.setattr(tools.quantization_workbench, 'source', lambda path: SimpleNamespace(path=str(tmp_path / 'source'), format='hf', imatrix_supported=True))
+        tools = ToolJobHandlers(ModelCatalog([tmp_path]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, Path(sys.executable), None))
+        def source(path, *, reference=False):
+            assert reference
+            return SimpleNamespace(path=str(tmp_path / 'source'), format='hf', imatrix_supported=True)
+        monkeypatch.setattr(tools.quantization_workbench, 'source', source)
         output = tmp_path / 'refs' / 'output.logits'
         manifest = output.with_name(output.name + '.manifest.json')
         calls = []
@@ -78,13 +82,14 @@ def test_reference_generation_keeps_official_dataset_and_loading_contract(tmp_pa
             calls.append(argv)
             assert argv[:4] == [sys.executable, '-m', 'mfq.cli', 'wt2-reference']
             assert ('--resident' in argv) is (layerwise is False)
+            assert ('--runtime' in argv) is (backend == 'cuda')
             assert '--render-mode' not in argv
             output.parent.mkdir()
             output.write_bytes(b'reference')
             manifest.write_text('{}')
             return [json.dumps({'event': 'wt2_reference_saved', 'output': str(output), 'manifest': str(manifest), 'context_size': 512, 'chunks': 8, 'parallel': 1})]
         monkeypatch.setattr(tools, '_run', execute)
-        payload = {'model': str(tmp_path / 'source'), 'dataset_id': str(dataset.id), 'output': str(output)}
+        payload = {'model': str(tmp_path / 'source'), 'dataset_id': str(dataset.id), 'output': str(output), 'backend': backend}
         if layerwise is not None:
             payload['layerwise'] = layerwise
         if tampered:

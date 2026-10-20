@@ -1,7 +1,7 @@
 #include "mlx_grouped_linear.h"
-#include "mlx_kernel_prepare.h"
+#include "runtime/mlx_kernel_prepare.h"
 #include "mlx_nvq_decode.h"
-#include "mlx_staging_allocator.h"
+#include "runtime/mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -1012,6 +1012,10 @@ struct NintProjectionConfig {
     std::vector<int> output_widths;
     bool swiglu;
     float limit;
+
+    int outputs_per_simd(int width) const {
+        return rows == 1 && input_width > width ? 1 : 2;
+    }
 };
 
 class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
@@ -1021,7 +1025,8 @@ public:
         NintProjectionConfig config)
         : UnaryPrimitive(stream), config_(std::move(config)),
           kernel_name_(config_.swiglu
-              ? "mfq_nint_projection" : "mfq_nint_projection_common") {
+              ? "mfq_nint_projection" : config_.rows <= 6
+                  ? "mfq_nint_projection_common_rowq" : "mfq_nint_projection_common") {
         kernel_name_ += config_.dtype == mlx::core::float32 ? "_f32" : "_f16";
         for (int value : {
                  config_.rows, config_.group_size, config_.groups,
@@ -1031,13 +1036,17 @@ public:
         for (int width : config_.output_widths) {
             kernel_name_ += "_" + std::to_string(width);
         }
+        if (!config_.swiglu && config_.rows > 1 &&
+            std::any_of(config_.output_widths.begin(), config_.output_widths.end(),
+                [&](int width) { return config_.input_width > width; }))
+            kernel_name_ += "_multirow";
     }
 
     std::string preparation_key() const override { return kernel_name_; }
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1065,7 +1074,7 @@ public:
         int output_groups = 0;
         for (int width : config_.output_widths) {
             const int outputs_per_group =
-                !config_.swiglu && config_.input_width > width ? 8 : 16;
+                config_.swiglu ? 16 : 8 * config_.outputs_per_simd(width);
             const int groups = (width + outputs_per_group - 1) / outputs_per_group;
             output_groups = config_.swiglu
                 ? std::max(output_groups, groups) : output_groups + groups;
@@ -1175,7 +1184,7 @@ private:
              projection < config_.output_widths.size(); ++projection) {
             const auto suffix = std::to_string(projection);
             const int width = config_.output_widths[projection];
-            const int outputs_per_group = config_.input_width > width ? 8 : 16;
+            const int outputs_per_group = 8 * config_.outputs_per_simd(width);
             const int tiles = (width + outputs_per_group - 1) / outputs_per_group;
             source += "if (dispatch_position.x >= " + std::to_string(tile_offset)
                 + "u && dispatch_position.x < " + std::to_string(tile_offset + tiles) + "u) {\n"
@@ -1189,10 +1198,11 @@ private:
                 "const auto expert_map = expert_ids;\n"
                 "#define OUT " + std::to_string(width) + "\n"
                 "#define LOGICAL_OUT OUT\n"
-                "#define OPS_PER_SIMD " + std::to_string(config_.input_width > width ? 1 : 2) + "\n"
+                "#define OPS_PER_SIMD " + std::to_string(config_.outputs_per_simd(width)) + "\n"
                 "#define MFQ_NINT_STORE_OUTPUT(index, value) "
                 "y[row * uint(TOTAL_OUT) + " + std::to_string(offset) + "u + output] = T(value)\n";
-            source += detail::nint_matmul_metal_body();
+            source += config_.rows <= 6 ? detail::nint_matmul_metal_row_q_body()
+                : detail::nint_matmul_metal_body();
             source +=
                 "#undef MFQ_NINT_STORE_OUTPUT\n#undef OPS_PER_SIMD\n"
                 "#undef LOGICAL_OUT\n#undef OUT\n}\n";
@@ -2948,7 +2958,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(

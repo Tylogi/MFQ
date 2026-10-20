@@ -1,6 +1,6 @@
-#include "mlx_nint.h"
-#include "mlx_nint_rows.h"
-#include "mlx_qwen4_causal_lm.h"
+#include "ops/mlx_nint.h"
+#include "ops/mlx_nint_rows.h"
+#include "models/flash_next/mlx_qwen4_causal_lm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -345,9 +345,9 @@ void test_qwen_ple_graph(const char* fp8_path, const char* nint_path) {
     };
     compare({1, 2, 7, 3, 4, 1}, 1, false);
     fp8.reset_cache(); nint.reset_cache();
+    compare({1, 2, 7}, 1, true);
     require(nint.kv_cache_bytes() > 0 && nint.kv_cache_contexts() == 1,
         "Qwen context cache allocations not reported");
-    compare({1, 2, 7}, 1, true);
     compare({3}, 1, true);
     compare({4, 1}, 1, true);
     fp8.reset_cache(2); nint.reset_cache(2);
@@ -361,6 +361,17 @@ void test_qwen_ple_graph(const char* fp8_path, const char* nint_path) {
     nint.clear_cache();
     require(nint.kv_cache_bytes() == 0 && nint.kv_cache_contexts() == 0,
         "cleared Qwen context resources not reported as zero");
+    const std::vector<std::int32_t> prompt{1, 2, 7, 3, 4, 1, 5, 6, 7, 2, 3, 4, 5, 1, 2, 6, 3};
+    fp8.clear_cache();
+    compare(prompt, 1, false);
+    fp8.reset_cache(); nint.reset_cache();
+    compare(prompt, 1, true);
+    compare({7, 4, 1}, 1, true);
+    auto batched_prompt = prompt;
+    batched_prompt.insert(batched_prompt.end(), prompt.rbegin(), prompt.rend());
+    fp8.reset_cache(2); nint.reset_cache(2);
+    compare(batched_prompt, 2, true);
+    compare({3, 7}, 2, true);
     std::cout << "matched FP8/NINTv2 PLE graph prefill, decode, EOS and batch logits passed\n";
 }
 

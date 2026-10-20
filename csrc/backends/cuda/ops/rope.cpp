@@ -20,7 +20,7 @@ RopeCache::RopeCache(
         int64_t frequency_dim,
         int64_t active_pairs,
         mfq_tensor_backend::Device device,
-        bool official_reciprocal_frequencies)
+        bool official_reciprocal_frequencies, mfq::models::YarnScaling yarn)
     : rotary_dim(dim) {
     int64_t half = rotary_dim / 2;
     const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
@@ -57,6 +57,11 @@ RopeCache::RopeCache(
 #endif
         freq.copy_(official_freq);
     }
+    if(yarn.enabled()) {
+        std::vector<float> values(static_cast<std::size_t>(half));
+        for(int pair=0;pair<half;++pair)values[pair]=float(yarn.frequency(pair,denominator,base));
+        freq.copy_(mfq_tensor_backend::tensor(values).to(device));
+    }
     if (active_pairs < half) {
         auto pair = mfq_tensor_backend::arange(half, opts);
         freq = mfq_tensor_backend::where(pair < active_pairs, freq, mfq_tensor_backend::zeros_like(freq));
@@ -64,6 +69,7 @@ RopeCache::RopeCache(
     auto ang = pos.unsqueeze(1) * freq.unsqueeze(0);
     cos = mfq_tensor_backend::cos(ang).contiguous();
     sin = mfq_tensor_backend::sin(ang).contiguous();
+    if(yarn.enabled()) { cos=cos*yarn.attention_factor();sin=sin*yarn.attention_factor(); }
     sections = mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU));
     empty_sections = sections;
 }
@@ -264,9 +270,9 @@ using Tensor = tb::Tensor;
 
 RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
                                std::vector<int64_t> sections, bool interleaved,
-                               std::optional<bool> fused)
+                               std::optional<bool> fused,mfq::models::YarnScaling yarn)
     : dimension_(dimension), maximum_(maximum), base_(base), sections_(std::move(sections)),
-      interleaved_(interleaved) {
+      interleaved_(interleaved),yarn_(yarn) {
     const auto configured = runtime_options::rotary_fusion();
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     constexpr bool default_fused = true;
@@ -274,6 +280,7 @@ RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base
     constexpr bool default_fused = false;
 #endif
     fused_ = fused.value_or(configured.value_or(default_fused));
+    if(yarn_.enabled())fused_=false;
     MFQ_RUNTIME_CHECK(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
                           std::isfinite(base) && base > 0,
                       "invalid rotary configuration");
@@ -294,6 +301,11 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& valu
         auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
         next.frequencies = tb::pow(tb::full({pairs}, base_, value.options().dtype(tb::kFloat32)),
             -(pair.to(tb::kFloat32) * 2) / double(dimension_));
+        if(yarn_.enabled()) {
+            std::vector<float> frequencies(static_cast<std::size_t>(pairs));
+            for(int j=0;j<pairs;++j)frequencies[j]=float(yarn_.frequency(j,dimension_,base_));
+            next.frequencies=tb::tensor(frequencies).to(value.device());
+        }
         std::vector<int32_t> selected(static_cast<size_t>(pairs), 0);
         for (int64_t j = 0; j < pairs; ++j) if (!sections_.empty()) {
             if (interleaved_) {
@@ -307,6 +319,17 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& valu
         cached = std::move(next);
     }
     return cached;
+}
+
+bool RotaryEmbedding::pool_normalized_into(const Tensor& index,const Tensor& weight,const Tensor& positions,
+        const Tensor& cache_positions,const Tensor& output,int64_t pool,int64_t maximum,double eps) const {
+    if(!fused_ || index.dim()!=3 || index.size(0)!=1 || index.size(2)>256 || index.size(2)<dimension_ ||
+        cache_positions.numel()>32 || (index.scalar_type()!=tb::kFloat16 && index.scalar_type()!=tb::kFloat32) ||
+        (positions.scalar_type()!=tb::kInt32 && positions.scalar_type()!=tb::kInt64))return false;
+    const auto prepared=prepare_parameters(index);
+    qsa_pool_rotary_cache_cuda(index,weight.to(tb::kFloat32).contiguous(),positions.contiguous(),cache_positions,
+        prepared.frequencies,prepared.axes,output,pool,maximum,maximum_,eps);
+    return true;
 }
 
 Tensor RotaryEmbedding::forward_normalized(const Tensor& value, const Tensor& weight,
@@ -362,6 +385,9 @@ mfq_tensor_backend::Tensor RotaryEmbedding::forward(const Tensor &value, const T
     auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
     auto frequencies = tb::pow(tb::full({pairs}, base_, f.options()),
                                -(pair.to(tb::kFloat32) * 2) / double(dimension_));
+    if(yarn_.enabled()) {
+        frequencies=prepare_parameters(value).frequencies;
+    }
     auto axis_ids = tb::zeros({pairs}, pair.options());
     if (!sections_.empty()) {
         if (interleaved_) {
@@ -396,6 +422,7 @@ mfq_tensor_backend::Tensor RotaryEmbedding::forward(const Tensor &value, const T
     }
     cosine = cosine.unsqueeze(1);
     sine = sine.unsqueeze(1);
+    if(yarn_.enabled()) { cosine=cosine*yarn_.attention_factor();sine=sine*yarn_.attention_factor(); }
     auto first = f.narrow(-1, 0, pairs), second = f.narrow(-1, pairs, pairs);
     return tb::cat({first * cosine - second * sine, second * cosine + first * sine,
                     f.narrow(-1, dimension_, f.size(-1) - dimension_)},

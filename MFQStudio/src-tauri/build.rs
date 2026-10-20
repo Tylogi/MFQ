@@ -4,6 +4,8 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+const MACOS_ICON_SCALE: f64 = 0.83;
+
 fn inside_background(x: f64, y: f64, inset: f64) -> bool {
     let half = 20.0 - inset;
     let radius = 9.375 - inset * 0.5;
@@ -55,8 +57,9 @@ fn sample(x: f64, y: f64) -> [u8; 4] {
     [244, 244, 240, 255]
 }
 
-fn render(size: u32) -> Vec<u8> {
+fn render(size: u32, scale: f64) -> Vec<u8> {
     const SAMPLES: u32 = 4;
+    let inset = 20.0 * (1.0 - scale);
     let mut pixels = Vec::with_capacity((size * size * 4) as usize);
     for py in 0..size {
         for px in 0..size {
@@ -64,8 +67,8 @@ fn render(size: u32) -> Vec<u8> {
             let mut premultiplied = [0_u32; 3];
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
-                    let x = (px as f64 + (sx as f64 + 0.5) / SAMPLES as f64) * 40.0 / size as f64;
-                    let y = (py as f64 + (sy as f64 + 0.5) / SAMPLES as f64) * 40.0 / size as f64;
+                    let x = ((px as f64 + (sx as f64 + 0.5) / SAMPLES as f64) * 40.0 / size as f64 - inset) / scale;
+                    let y = ((py as f64 + (sy as f64 + 0.5) / SAMPLES as f64) * 40.0 / size as f64 - inset) / scale;
                     let value = sample(x, y);
                     alpha += value[3] as u32;
                     for channel in 0..3 {
@@ -83,8 +86,8 @@ fn render(size: u32) -> Vec<u8> {
     pixels
 }
 
-fn write_png(path: &Path, size: u32) {
-    let image = IcnsImage::from_data(PixelFormat::RGBA, size, size, render(size))
+fn write_png(path: &Path, size: u32, scale: f64) {
+    let image = IcnsImage::from_data(PixelFormat::RGBA, size, size, render(size, scale))
         .expect("invalid generated icon pixels");
     image
         .write_png(BufWriter::new(
@@ -95,13 +98,24 @@ fn write_png(path: &Path, size: u32) {
 
 fn write_icons(directory: &Path) {
     fs::create_dir_all(directory).expect("failed to create icon directory");
-    write_png(&directory.join("32x32.png"), 32);
-    write_png(&directory.join("128x128.png"), 128);
-    write_png(&directory.join("256x256.png"), 256);
+    let png_scale = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        MACOS_ICON_SCALE
+    } else {
+        1.0
+    };
+    write_png(&directory.join("32x32.png"), 32, png_scale);
+    write_png(&directory.join("128x128.png"), 128, png_scale);
+    write_png(&directory.join("256x256.png"), 256, png_scale);
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        fs::write(output.join("window-icon.rgba"), render(256, 1.0))
+            .expect("failed to write high-resolution Windows window icon");
+    }
 
     let mut ico = IconDir::new(ResourceType::Icon);
     for size in [16, 24, 32, 48, 64, 128, 256] {
-        let image = IconImage::from_rgba_data(size, size, render(size));
+        let image = IconImage::from_rgba_data(size, size, render(size, 1.0));
         ico.add_entry(IconDirEntry::encode_as_png(&image).expect("failed to encode ICO frame"));
     }
     ico.write(File::create(directory.join("icon.ico")).expect("failed to create ICO"))
@@ -109,7 +123,7 @@ fn write_icons(directory: &Path) {
 
     let mut family = IconFamily::new();
     for size in [16, 32, 64, 128, 256, 512, 1024] {
-        let image = IcnsImage::from_data(PixelFormat::RGBA, size, size, render(size))
+        let image = IcnsImage::from_data(PixelFormat::RGBA, size, size, render(size, MACOS_ICON_SCALE))
             .expect("invalid generated ICNS pixels");
         family
             .add_icon(&image)
@@ -123,6 +137,12 @@ fn write_icons(directory: &Path) {
 }
 
 fn main() {
+    let server_version_path = Path::new("../../mfq/_version.py");
+    println!("cargo:rerun-if-changed={}", server_version_path.display());
+    let server_source = fs::read_to_string(server_version_path).expect("missing MFQ server version");
+    let server_version = server_source.lines().find_map(|line| line.strip_prefix("__version__ = "))
+        .expect("missing MFQ server version declaration").trim_matches('"');
+    println!("cargo:rustc-env=MFQ_SERVER_VERSION={server_version}");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=../src");
     println!("cargo:rerun-if-changed=../package.json");

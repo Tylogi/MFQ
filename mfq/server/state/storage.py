@@ -64,6 +64,7 @@ from mfq.server.protocol.models import (
     UpdateRuntimeProfileRequest,
     UpdateSessionRequest,
 )
+from mfq.server.services.serving_stats import request_values, summarize
 
 SCHEMA_VERSION = 19
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
@@ -418,6 +419,16 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS runtime_metrics_captured
                     ON runtime_metrics(captured_at DESC);
 
+                CREATE TABLE IF NOT EXISTS serving_requests (
+                    instance TEXT NOT NULL, request_id TEXT NOT NULL, model TEXT,
+                    completed_at REAL NOT NULL, prompt_tokens INTEGER NOT NULL,
+                    prefill_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
+                    cached_tokens INTEGER NOT NULL, prefill_ms REAL NOT NULL,
+                    decode_ms REAL NOT NULL, ttft_ms REAL NOT NULL, decode_tokens INTEGER NOT NULL,
+                    PRIMARY KEY(instance, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS serving_requests_completed ON serving_requests(completed_at);
+
                 CREATE TABLE IF NOT EXISTS runtime_logs (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     instance_id TEXT,
@@ -496,6 +507,11 @@ class SessionStore:
                 raise StorageError(
                     f"unsupported database schema {existing['value']}; expected {SCHEMA_VERSION}"
                 )
+            if connection.execute("SELECT 1 FROM schema_meta WHERE key = 'serving_history_imported'").fetchone() is None:
+                for row in connection.execute("SELECT instance_id, model, values_json, captured_at FROM runtime_metrics ORDER BY sequence").fetchall():
+                    self._record_serving_request(connection, json.loads(row["values_json"]),
+                        row["instance_id"], row["model"], datetime.fromisoformat(row["captured_at"]).timestamp())
+                connection.execute("INSERT INTO schema_meta(key, value) VALUES ('serving_history_imported', '1')")
 
     def put_media(
         self,
@@ -2055,6 +2071,33 @@ class SessionStore:
             ).fetchall()
         return [UUID(row["id"]) for row in rows]
 
+    def active_download_jobs(self) -> list[JobResource]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE archived_at IS NULL AND kind IN (?, ?) AND status IN (?, ?, ?) ORDER BY created_at",
+                ('download.huggingface', 'download.modelscope', JobStatus.QUEUED.value, JobStatus.RUNNING.value, JobStatus.CANCELLING.value),
+            ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def requeue_job(self, job_id: UUID, *, now: datetime | None = None) -> JobResource:
+        resumed_at = now or _utcnow()
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM jobs WHERE id = ? AND archived_at IS NULL', (str(job_id),)).fetchone()
+            if row is None:
+                raise JobNotFoundError(str(job_id))
+            if row['status'] in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}:
+                return self._job_from_row(row)
+            if row['status'] not in {JobStatus.FAILED.value, JobStatus.CANCELLED.value, JobStatus.INTERRUPTED.value}:
+                raise InvalidJobStateError(f"cannot resume job in state {row['status']}")
+            connection.execute(
+                'UPDATE jobs SET status = ?, cancel_requested = 0, error_json = NULL, result_json = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?',
+                (JobStatus.QUEUED.value, _timestamp(resumed_at), str(job_id)),
+            )
+            self._append_job_event(connection, job_id, JobEventType.STATE, JobEventLevel.INFO,
+                message=JobStatus.QUEUED.value, data={'status': JobStatus.QUEUED.value, 'reason': 'resumed'}, now=resumed_at)
+        return self.get_job(job_id)
+
     def claim_job(self, job_id: UUID, *, now: datetime | None = None) -> JobResource:
         started_at = now or _utcnow()
         with self._connection() as connection:
@@ -2416,11 +2459,17 @@ class SessionStore:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                "SELECT id FROM jobs WHERE status IN (?, ?)",
+                "SELECT id, kind, status, cancel_requested FROM jobs WHERE status IN (?, ?)",
                 (JobStatus.RUNNING.value, JobStatus.CANCELLING.value),
             ).fetchall()
             for row in rows:
                 job_id = UUID(row["id"])
+                if row['kind'] in {'download.huggingface', 'download.modelscope'} and not row['cancel_requested']:
+                    connection.execute('UPDATE jobs SET status = ?, error_json = NULL, updated_at = ?, completed_at = NULL WHERE id = ?',
+                        (JobStatus.QUEUED.value, _timestamp(recovered_at), str(job_id)))
+                    self._append_job_event(connection, job_id, JobEventType.STATE, JobEventLevel.INFO,
+                        message=JobStatus.QUEUED.value, data={'status': JobStatus.QUEUED.value, 'reason': 'service_restarted'}, now=recovered_at)
+                    continue
                 connection.execute(
                     """
                     UPDATE jobs SET status = ?, error_json = ?, updated_at = ?, completed_at = ?
@@ -2460,6 +2509,8 @@ class SessionStore:
         captured_at = now or _utcnow()
         encoded = json.dumps(values, separators=(",", ":"), sort_keys=True)
         with self._connection() as connection:
+            self._record_serving_request(connection, values,
+                str(instance_id) if instance_id is not None else None, model, captured_at.timestamp())
             cursor = connection.execute(
                 """
                 INSERT INTO runtime_metrics(instance_id, model, values_json, captured_at)
@@ -2485,6 +2536,30 @@ class SessionStore:
             values=values,
             captured_at=captured_at,
         )
+
+    @staticmethod
+    def _record_serving_request(connection: sqlite3.Connection, values: dict[str, Any],
+        instance: str | None, model: str | None, captured: float) -> None:
+        record = request_values(values, instance, model, captured)
+        if record is not None:
+            connection.execute("INSERT OR IGNORE INTO serving_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", record)
+
+    def serving_statistics(self, since: float | None = None, model: str | None = None) -> dict[str, Any]:
+        clauses, parameters = [], []
+        if since is not None:
+            clauses.append("completed_at >= ?")
+            parameters.append(since)
+        if model is not None:
+            clauses.append("model = ?")
+            parameters.append(model)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        fields = ("prompt_tokens", "prefill_tokens", "completion_tokens", "cached_tokens",
+            "prefill_ms", "decode_ms", "ttft_ms", "decode_tokens")
+        with self._connection() as connection:
+            row = connection.execute("SELECT COUNT(*) AS completed_requests, " +
+                ", ".join(f"COALESCE(SUM({name}), 0) AS {name}" for name in fields) +
+                " FROM serving_requests" + where, parameters).fetchone()
+        return summarize(dict(row))
 
     def list_runtime_metrics(
         self,

@@ -1,23 +1,25 @@
+#include "native/env.h"
 // RMSNorm / L2 Norm (ggml norm.cu: ggml_rms_norm / ggml_l2_norm).
 // One block normalizes one row (last dim D). fp32. x viewed as [N, D] (caller flattens).
 
 #include <cuda_runtime.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <limits>
 #include <vector>
+#include <cstdlib>
 
 #include "reduce.cuh"
 
 constexpr int NORM_BD = 256;
 
-template<class Gate,class Output,int Threads>
+template<class Gate,class Output,int Threads,bool WarpTail=false>
 __global__ void gdn_rms_norm_gate_kernel(const float* attended,const Gate* projection,
     const float* weight,Output* output,int heads,int tokens,int width,double eps,
-    bool silu_gate,bool double_sigmoid) {
+    bool silu_gate,bool double_sigmoid,int64_t gate_batch_stride,int64_t gate_token_stride) {
     const int64_t row=blockIdx.x,base=row*width;
     const int64_t batch=row/(int64_t(heads)*tokens),head=(row/tokens)%heads,token=row%tokens;
     const int64_t destination=((batch*tokens+token)*heads+head)*width;
@@ -25,15 +27,32 @@ __global__ void gdn_rms_norm_gate_kernel(const float* attended,const Gate* proje
     for(int column=threadIdx.x;column<width;column+=Threads)
         sum=__fadd_rn(sum,__fmul_rn(attended[base+column],attended[base+column]));
     __shared__ float partial[Threads];partial[threadIdx.x]=sum;__syncthreads();
-    for(int stride=Threads/2;stride>0;stride/=2) {
-        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+    if constexpr(WarpTail) {
+        for(int stride=Threads/2;stride>=32;stride/=2) {
+            if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+            __syncthreads();
+        }
+        if(threadIdx.x<32) {
+            float value=partial[threadIdx.x];
+            #pragma unroll
+            for(int stride=16;stride>0;stride/=2) {
+                const float other=__shfl_down_sync(0xffffffffu,value,stride);
+                if(threadIdx.x<stride)value=__fadd_rn(value,other);
+            }
+            if(threadIdx.x==0)partial[0]=value;
+        }
         __syncthreads();
+    }else {
+        for(int stride=Threads/2;stride>0;stride/=2) {
+            if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
+            __syncthreads();
+        }
     }
     const float mean=__fdiv_rn(partial[0],static_cast<float>(width));
     const float variance=static_cast<float>(static_cast<double>(mean)+eps);
     const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(variance));
     for(int column=threadIdx.x;column<width;column+=Threads) {
-        const float z=static_cast<float>(projection[destination+column]);
+        const float z=static_cast<float>(projection[batch*gate_batch_stride+token*gate_token_stride+head*width+column]);
         const float sigmoid=double_sigmoid
             ? static_cast<float>(1.0/(1.0+::exp(-static_cast<double>(z))))
             : __fdiv_rn(1.0f,__fadd_rn(1.0f,::expf(-z)));
@@ -481,22 +500,29 @@ mfq_tensor_backend::Tensor gdn_rms_norm_gate_cuda(mfq_tensor_backend::Tensor att
     MFQ_RUNTIME_CHECK(heads<=std::numeric_limits<int>::max() && tokens<=std::numeric_limits<int>::max() &&
         width<=std::numeric_limits<int>::max() && rows<=std::numeric_limits<int>::max(),
         "gdn_rms_norm_gate: geometry exceeds CUDA launch bounds");
-    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.device()==attended.device() && gate.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.device()==attended.device() &&
         gate.dim()==3 && gate.size(0)==batch && gate.size(1)==tokens && gate.size(2)==heads*width &&
+        gate.stride(2)==1 && gate.stride(1)>=heads*width &&
+        (batch==1 || gate.stride(0)>=tokens*gate.stride(1)) &&
         (gate.scalar_type()==tb::kFloat16 || gate.scalar_type()==tb::kFloat32),
-        "gdn_rms_norm_gate: expected contiguous CUDA f16/f32 [batch,tokens,heads*width] gate");
+        "gdn_rms_norm_gate: expected row-strided CUDA f16/f32 [batch,tokens,heads*width] gate");
     MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.device()==attended.device() && weight.is_contiguous() &&
         weight.scalar_type()==tb::kFloat32 && weight.dim()==1 && weight.numel()==width,
         "gdn_rms_norm_gate: expected CUDA f32 width-vector weight");
     MfqCudaGuard guard(attended.device());
     auto output=tb::empty({batch,tokens,heads*width},attended.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
-    const bool double_sigmoid=gate.scalar_type()==tb::kFloat32 &&
-        !gate.reshape({batch,tokens,heads,width}).permute({0,2,1,3}).is_contiguous();
+    // Match the arithmetic selected after the old mandatory contiguous copy.
+    const bool double_sigmoid=gate.scalar_type()==tb::kFloat32 && tokens>1 && heads>1;
+    const auto* warp_setting=mfq::cuda::env_lookup("MFQ_GDN_NORM_WARP_REDUCTION");
+    const bool warp_tail=warp_setting?warp_setting[0]=='1':width==128 && tokens>=2 && tokens<=8;
     const auto launch=[&]<class Gate,class Output,int Threads>() {
-        gdn_rms_norm_gate_kernel<Gate,Output,Threads><<<static_cast<unsigned int>(rows),Threads,0,mfq_current_cuda_stream()>>>(
+        const auto select=[&](auto tail) {
+        gdn_rms_norm_gate_kernel<Gate,Output,Threads,decltype(tail)::value><<<static_cast<unsigned int>(rows),Threads,0,mfq_current_cuda_stream()>>>(
             attended.data_ptr<float>(),gate.data_ptr<Gate>(),weight.data_ptr<float>(),output.data_ptr<Output>(),
             static_cast<int>(heads),static_cast<int>(tokens),static_cast<int>(width),eps,
-            silu_gate,double_sigmoid);
+            silu_gate,double_sigmoid,gate.stride(0),gate.stride(1));
+        };
+        if(warp_tail)select(std::true_type{});else select(std::false_type{});
     };
     const auto dispatch_width=[&]<class Gate,class Output>() {
         if(width<=32)launch.template operator()<Gate,Output,32>();

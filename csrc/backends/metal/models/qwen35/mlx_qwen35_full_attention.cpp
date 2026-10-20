@@ -1,5 +1,5 @@
 #include "mlx_qwen35_full_attention.h"
-#include "mlx_eval_timing.h"
+#include "runtime/mlx_eval_timing.h"
 
 #include <cmath>
 #include <limits>

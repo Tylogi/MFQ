@@ -1,5 +1,5 @@
-#include "mlx_qwen35_causal_lm.h"
-#include "qwen35_model.h"
+#include "models/qwen35/mlx_qwen35_causal_lm.h"
+#include "models/qwen35/qwen35_model.h"
 
 #include <algorithm>
 #include <chrono>

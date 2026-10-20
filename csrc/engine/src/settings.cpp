@@ -104,6 +104,8 @@ RuntimeConfig resolve_runtime_config(std::int64_t prefill_chunk_size) {
         "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES", prefix.disk_bytes);
     prefix.hot_bytes = environment_uint64(
         "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES", prefix.hot_bytes);
+    prefix.ram_bytes = environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_RAM_BYTES", prefix.ram_bytes);
     prefix.pending_writes = checked_size(environment_uint64(
         "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES", prefix.pending_writes),
         "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES");

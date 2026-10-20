@@ -1,7 +1,7 @@
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_resource_telemetry.h"
 
-#include "mfe_expert_store.h"
+#include "storage/mfe_expert_store.h"
 #include "mlx_eval_timing.h"
 
 #include <algorithm>

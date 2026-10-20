@@ -1,4 +1,4 @@
-#include "ops/execution/graph_registry.h"
+#include "graph_registry.h"
 #include "native/context.h"
 #include <chrono>
 #include <thread>
@@ -8,25 +8,23 @@ struct CapturedGraph::Impl {
     Graph graph;
     Event completion;
     StreamHandle stream;
-    Impl(void* native, const std::function<void()>& body) {
+    explicit Impl(void* native) {
         int device = 0;
         MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
         stream = StreamHandle(device, static_cast<cudaStream_t>(native));
         StreamGuard selected(stream);
-        try {
-            graph.capture_begin_shared();
-            body();
-            MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
-            graph.capture_end();
-            if (!graph.nodes()) throw Error("CUDA graph body produced no work");
-        } catch (...) {
-            graph.reset();
-            throw;
-        }
+        graph.capture_begin_shared();
     }
 };
 CapturedGraph::CapturedGraph(void* stream, const std::function<void()>& body)
-    : impl_(std::make_unique<Impl>(stream, body)) {}
+    : CapturedGraph(stream) { body(); finish(); }
+CapturedGraph::CapturedGraph(void* stream) : impl_(std::make_unique<Impl>(stream)) {}
+void CapturedGraph::finish() {
+    StreamGuard selected(impl_->stream);
+    MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+    impl_->graph.capture_end();
+    if (!impl_->graph.nodes()) throw Error("CUDA graph body produced no work");
+}
 CapturedGraph::~CapturedGraph() = default;
 CapturedGraph::CapturedGraph(CapturedGraph&&) noexcept = default;
 CapturedGraph& CapturedGraph::operator=(CapturedGraph&&) noexcept = default;
@@ -60,6 +58,13 @@ bool GraphRegistry::record(std::uint64_t identity, int tokens,
         ++captures_;
         return true;
     } catch (const std::exception& failure) { error = failure.what(); return false; }
+}
+void GraphRegistry::begin(std::uint64_t identity,int tokens) {
+    if(find(identity,tokens))throw Error("CUDA graph segment already exists");
+    graphs_.emplace(std::make_pair(identity,tokens),CapturedGraph(stream_));
+}
+void GraphRegistry::end(std::uint64_t identity,int tokens) {
+    graphs_.at({identity,tokens}).finish();++captures_;
 }
 const CapturedGraph* GraphRegistry::find(std::uint64_t identity, int tokens) const {
     const auto found = graphs_.find({identity, tokens});

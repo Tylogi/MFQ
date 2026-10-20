@@ -3,7 +3,7 @@
 // general path reuses the inference dequant entry points, so the format decode
 // stays one implementation.
 #include <cuda_fp16.h>
-#include "csrc/backends/cuda/native/tensor/backend.h"
+#include "native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -551,7 +551,7 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return result;
     }
-    if (!mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
+    if (!mxfp4 && mxfp8_column_shift(values,scales)==7 && mxfp8_row_shift(values,scales)==7 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
         const int output_groups = (outputs + 127) / 128;
         if (rows == 1 && output_groups <= 8) {
             launch_mxfp8_backward_block_reduce<1>(
