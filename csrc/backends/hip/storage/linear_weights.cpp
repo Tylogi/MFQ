@@ -1,3 +1,4 @@
+#include "tensor_parallel.h"
 #include "hip/hip_runtime.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"

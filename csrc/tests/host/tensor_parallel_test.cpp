@@ -1,4 +1,5 @@
 #include "tensor_parallel.h"
+#include "parallel_launch.h"
 
 #include <iostream>
 #include <stdexcept>

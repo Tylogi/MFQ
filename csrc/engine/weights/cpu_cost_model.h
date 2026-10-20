@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <future>
 #include <stdexcept>
 
 namespace mfq {
@@ -44,5 +45,18 @@ public:
     std::uint64_t samples()const noexcept {return samples_;}
     std::uint64_t queries()const noexcept {return queries_;}
     std::uint64_t ready_queries()const noexcept {return ready_queries_;}
+};
+// Weight-side observations and the outstanding measurement keep their leases
+// until collection or teardown; only Executor code updates routing costs.
+struct MoeCpuCalibrationState {
+    std::future<double> pending;
+    MoeCpuCostModel::Key key{};
+    std::uint64_t jobs_total=0,observations_total=0;
+    double elapsed_ns=0;
+    bool busy() const noexcept {return pending.valid();}
+    void wait() {if(busy())pending.wait();}
+    std::uint64_t jobs() const noexcept {return jobs_total;}
+    std::uint64_t observations() const noexcept {return observations_total;}
+    double work_ns() const noexcept {return elapsed_ns;}
 };
 } // namespace mfq

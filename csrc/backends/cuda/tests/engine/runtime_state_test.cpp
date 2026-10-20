@@ -1,11 +1,11 @@
 #include "kernels/norm_ops.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "engine/cuda_runtime_config.h"
 #include "engine/batch_execution.h"
 #include "ops/execution/cuda_sampling.h"
 #include "diagnostics/generation_result.h"
 #include "storage/session/text_cache.h"
-#include "csrc/core/mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
 #include "models/minicpmo45/components.h"
@@ -797,15 +797,15 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         ("mfq-runtime-state-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
     {
-        mfq::cache::PagedPrefixCacheConfig config;
+        mfq::cache::PrefixBlockStoreConfig config;
         config.cache_dir = directory;
         config.compatibility_key = "runtime-state-test";
         config.block_size_tokens = 2;
         auto paged = std::make_shared<mfq::cache::PagedPrefixCache>(config);
         TextSessionCache mixed({}, {}, paged);
         mixed.store("cold", text);
-        paged->flush();
-        paged->trim_hot(0);
+        paged->blocks.flush();
+        paged->blocks.trim_hot(0);
         {
             auto cold = mixed.restore_steps(model, nullptr, session, prompt, 2, key);
             auto step = cold.next();
@@ -844,10 +844,10 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         check(mixed.restore_best(model, nullptr, "source", {1, 2, 3}, 2).tokens == 0,
               "clear retained paged snapshot");
         // Offline fixture cleanup waits for durable removal explicitly.
-        paged->clear();
+        paged->blocks.clear();
     }
     {
-        mfq::cache::PagedPrefixCacheConfig config;
+        mfq::cache::PrefixBlockStoreConfig config;
         config.cache_dir = directory / "vram-ssd";
         config.compatibility_key = "vram-ssd-prefix-test";
         config.block_size_tokens = 2;
@@ -860,7 +860,7 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
             for (const auto& entry : cache.metrics()) if (entry.first == name) return entry.second;
             throw std::runtime_error(std::string("missing prefix metric ") + name);
         };
-        cache.store("", text);paged->flush();
+        cache.store("", text);paged->blocks.flush();
         check(metric("prefix_cache_hot_bytes") == text.bytes && metric("prefix_cache_ram_bytes") == 0,
               "discrete prefix cache must retain native GPU snapshots without a RAM hot layer");
         check(cache.restore_best(model, nullptr, "", {1,2,3}, 2).tokens == 2 && metric("prefix_cache_hot_hits") == 1,

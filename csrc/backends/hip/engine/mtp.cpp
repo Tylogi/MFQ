@@ -1,7 +1,7 @@
 #include "generation.h"
 #include "speculative_sequence.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "hip_sampling.h"
 #include "generation_policy.h"
 #include "inference.h"

@@ -5,7 +5,7 @@
 #include "../../hip/include/hip_model_plan.h"
 #include "request.h"
 #include "../../hip/core/block.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 #include <cstdint>
 #include <memory>

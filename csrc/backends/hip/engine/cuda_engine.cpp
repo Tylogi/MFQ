@@ -1,6 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "hip_runtime_config.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "generation.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"

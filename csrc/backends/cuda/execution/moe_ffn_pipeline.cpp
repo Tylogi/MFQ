@@ -1,9 +1,11 @@
+#include "dispatch_plan.h"
+#include "cpu_calibration.h"
 #include "resource_error.h"
 #include "native/env.h"
 #include "ops/execution/execution_options.h"
-#include "ffn_pipeline.h"
+#include "moe_ffn_pipeline.h"
 #include "mfq/host_copy.h"
-#include "cached_source_internal.h"
+#include "storage/weights/moe/cached_source_internal.h"
 #include "ops/quant/cpu_projection_rows.h"
 #include "mfq/moe/cpu_expert_pool.h"
 #include "ops/execution/graph_registry.h"
@@ -13,7 +15,7 @@
 #include "kernels/shared_gate.h"
 #include "ops/decode_window.h"
 #include "kernels/cache/dma_copy_batch.h"
-#include "native_dma_batch.h"
+#include "storage/weights/moe/native_dma_batch.h"
 #include "native/context.h"
 #include "request.h"
 #include "ops/moe/mfe_ffn_runtime.h"
@@ -138,11 +140,10 @@ CpuProjectionRows rows_plan(const MixedMoePool& p,bool up_half=false) {
     return p.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(p.nint) : make_cpu_projection_rows(p.nvq);
 }
 
-std::function<mfq::MoeCpuCalibration::Observation()> cpu_calibration_work(
-        mfq::MoeCpuCostModel::Key key,std::array<MoeHostExpertCache::Lease,3> leases,
-        std::vector<float> input,int width,int intermediate,int count,double preparation_ns,bool combined=false,double swiglu_limit=0) {
-    return [key,leases=std::move(leases),input=std::move(input),width,intermediate,count,preparation_ns,combined,swiglu_limit]() {
-        const auto started=std::chrono::steady_clock::now();
+std::function<void()> cpu_calibration_work(
+        std::array<MoeHostExpertCache::Lease,3> leases,
+        std::vector<float> input,int width,int intermediate,int count,bool combined=false,double swiglu_limit=0) {
+    return [leases=std::move(leases),input=std::move(input),width,intermediate,count,combined,swiglu_limit]() {
         const std::array<CpuProjectionRows,3> rows{
             rows_plan(leases[0]->weights),rows_plan(leases[1]->weights,combined),rows_plan(leases[2]->weights)};
         std::vector<float> gate(size_t(count)*intermediate),up(gate.size()),hidden(gate.size()),
@@ -166,9 +167,6 @@ std::function<mfq::MoeCpuCalibration::Observation()> cpu_calibration_work(
         mfq::cpu::expert_pool().rows(width,[&](int64_t begin,int64_t end) {
             rows[2].run(hidden.data(),count,intermediate,output.data(),width,int(begin),int(end));
         });
-        const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now()-started).count();
-        return mfq::MoeCpuCalibration::Observation{key,preparation_ns+double(ns)};
     };
 }
 
@@ -2259,7 +2257,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     }
     void plan(Cell& cell) {
         const bool must_drain=!cell.in_window || !cache_->pipeline_dispatch_replay_.empty();
-        const bool calibration_busy=cache_->pipeline_cpu_calibration_.collect(cache_->pipeline_cpu_cost_,must_drain);
+        const bool calibration_busy=mfq::collect_moe_cpu_calibration(cache_->pipeline_cpu_calibration_,cache_->pipeline_cpu_cost_,must_drain);
         const bool shadow=cell.in_window && cache_->pipeline_shared_cpu_cost_ &&
             cache_->pipeline_cpu_transfer_budget_ && mfq::cuda::runtime_options::background_calibration() && cache_->pipeline_dispatch_replay_.empty();
         cell.calibration_expert=-1;
@@ -3998,9 +3996,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     (found->positions[row]/cell.routes)*width_,width_*sizeof(float));
             const auto preparation_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-prepared).count();
-            auto work=cpu_calibration_work(cpu_cost_key(*found),std::move(leases),std::move(input),
-                width_,ff_,int(found->positions.size()),double(preparation_ns),combined_gate_up_,swiglu_limit_);
-            cache_->pipeline_cpu_calibration_.start(std::move(work));
+            auto work=cpu_calibration_work(std::move(leases),std::move(input),
+                width_,ff_,int(found->positions.size()),combined_gate_up_,swiglu_limit_);
+            mfq::start_moe_cpu_calibration(cache_->pipeline_cpu_calibration_,cpu_cost_key(*found),std::move(work),double(preparation_ns));
         }
         time(stats.pipeline_cpu_ns,[&]{cpu(cell,ssd_reads.get());});
         trace_serve(cell,"complete");
@@ -4033,7 +4031,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     void observe_gpu(Cell& cell) {
         // Window finish runs after the complete GPU graph. Join at most its
         // final background sample before any RAM lease can be exchanged.
-        if(cell.in_window)cache_->pipeline_cpu_calibration_.collect(cache_->pipeline_cpu_cost_,true);
+        if(cell.in_window)mfq::collect_moe_cpu_calibration(cache_->pipeline_cpu_calibration_,cache_->pipeline_cpu_cost_,true);
         if(cell.skip_gpu_timing)return;
         float hot=0,transfer=0;
         MFQ_CUDA_CHECK(cudaEventElapsedTime(&hot,cell.timing.points[0],cell.timing.points[1]));
@@ -4477,4 +4475,10 @@ MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>
     return [runtime](CudaExecutionContext& execution,const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights){
         return runtime->forward(execution,input,ids,weights);
     };
+}
+
+void prepare_moe_cpu_calibration_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
+    prepare_moe_cpu_budget_comparison(cache,replay,true);
+    mfq::reset_moe_cpu_calibration(cache->pipeline_cpu_calibration_,cache->pipeline_cpu_cost_);
+    cache->pipeline_cpu_cost_={};
 }

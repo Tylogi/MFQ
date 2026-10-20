@@ -1,7 +1,7 @@
 #include "native/env.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/weights/moe/cached_source_internal.h"
-#include "storage/weights/moe/ffn_pipeline.h"
+#include "execution/moe_ffn_pipeline.h"
 #include "storage/weights/moe/quant_range_source.h"
 #include "storage/weights/moe/moe_pinned_expert_arena.h"
 #include "storage/weights/loaders/weight.h"

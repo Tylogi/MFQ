@@ -1,3 +1,4 @@
+#include "tensor_parallel.h"
 #include "kernels/qwen4_exp.h"
 #include "native/weight_memory.h"
 #include "ops/gated_residual.h"

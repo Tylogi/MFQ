@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "step_sequence.h"
 #include <future>
 #include <thread>
@@ -47,7 +47,7 @@ template <class Backend> class SessionCache {
     ~SessionCache() {
         // Disk tasks own only the cache. Model/state teardown never waits for persistence.
         if (paged_cache_) {
-            try { std::thread([cache = paged_cache_] { cache->flush(); }).detach(); }
+            try { std::thread([cache = paged_cache_] { cache->blocks.flush(); }).detach(); }
             catch (...) {} // Thread creation failure falls back to ordinary cache destruction.
         }
     }
@@ -278,7 +278,7 @@ template <class Backend> class SessionCache {
         paged_bindings_.clear();
         if (!paged_cache_ || clearing()) return snapshots;
         const auto blocks = paged_cache_->metrics().disk_blocks;
-        std::packaged_task<size_t()> task([cache = paged_cache_] { return cache->clear(); });
+        std::packaged_task<size_t()> task([cache = paged_cache_] { return cache->blocks.clear(); });
         clearing_ = task.get_future();
         std::thread(std::move(task)).detach();
         return snapshots + blocks;
@@ -287,7 +287,7 @@ template <class Backend> class SessionCache {
     uint64_t trim_hot(uint64_t target_bytes) {
         if (native_hot_snapshots_) return snapshots_.trim(target_bytes);
         if (!paged_cache_ || clearing()) return 0;
-        const auto released = paged_cache_->trim_hot(target_bytes);
+        const auto released = paged_cache_->blocks.trim_hot(target_bytes);
         if (released > 0)
             Backend::release_host_cache();
         return released;
@@ -300,7 +300,7 @@ template <class Backend> class SessionCache {
         }
         if (!paged_cache_) return 0;
         paged_hot_budget_ = max_bytes;
-        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        const auto released = paged_cache_->blocks.set_hot_limit(max_bytes);
         if (released > 0) Backend::release_host_cache();
         return released;
     }
@@ -308,25 +308,25 @@ template <class Backend> class SessionCache {
     uint64_t set_disk_limit(uint64_t max_bytes) {
         if (!paged_cache_) return 0;
         paged_disk_budget_ = max_bytes;
-        return paged_cache_->set_disk_limit(max_bytes);
+        return paged_cache_->blocks.set_disk_limit(max_bytes);
     }
 
     uint64_t set_ram_limit(uint64_t max_bytes) {
         if (!paged_cache_ || !native_hot_snapshots_) return 0;
         paged_ram_budget_ = max_bytes;
-        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        const auto released = paged_cache_->blocks.set_hot_limit(max_bytes);
         if (released) Backend::release_host_cache();
         return released;
     }
 
     void reserve_ram(uint64_t bytes) {
-        if (paged_cache_ && native_hot_snapshots_ && paged_cache_->reserve_ram(bytes))
+        if (paged_cache_ && native_hot_snapshots_ && paged_cache_->blocks.reserve_ram(bytes))
             Backend::release_host_cache();
     }
 
     uint64_t refresh_disk_index() {
         if (!paged_cache_) return 0;
-        const auto removed = paged_cache_->refresh_disk_index();
+        const auto removed = paged_cache_->blocks.refresh_disk_index();
         if (removed > 0) Backend::release_host_cache();
         return removed;
     }
@@ -361,7 +361,7 @@ template <class Backend> class SessionCache {
             while (read_.valid() && read_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
                 co_yield mfq::StepState::waiting;
             std::packaged_task<std::vector<mfq::cache::PagedPrefixPayload>()> task(
-                [cache = paged_cache_, block] { return cache->load_prefix({block}); });
+                [cache = paged_cache_, block] { return cache->blocks.load_prefix({block}); });
             read_ = task.get_future();
             std::thread(std::move(task)).detach();
             while (read_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
@@ -445,7 +445,7 @@ template <class Backend> class SessionCache {
         if (invalid && epoch == epoch_) {
             std::packaged_task<std::vector<mfq::cache::PagedPrefixPayload>()> task(
                 [cache = paged_cache_, block = match.blocks.back()] {
-                    cache->invalidate(block);
+                    cache->blocks.invalidate(block);
                     return std::vector<mfq::cache::PagedPrefixPayload>{};
                 });
             read_ = task.get_future();

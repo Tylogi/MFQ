@@ -3,7 +3,7 @@
 
 #include "../../hip/include/mfq_hip_moe_ops.h"
 #include "../../hip/storage/moe_expert_cache_internal.h"
-#include "mfq/moe_dispatch_plan.h"
+#include "dispatch_plan.h"
 
 struct MoeCachedCohort {
     int index = -1;

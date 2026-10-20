@@ -38,7 +38,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 CSRC = REPO / "csrc"
-SHARED = ("core", "formats", "model_source", "scheduler", "transport", "engine", "models", "components/io")
+SHARED = ("core", "formats", "model_source", "scheduler", "transport", "engine", "models", "components/io", "backends/cpu/storage")
 BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/")
 # Family stems anywhere in an identifier: Qwen35, qwen3_5 and is_qwen35 all hit.
 FAMILY_TOKEN = re.compile(
@@ -79,19 +79,24 @@ def check_tree(csrc):
         under_io = relative.startswith("components/io/")
         under_formats = module == "formats"
         under_source = module == "model_source"
+        under_host_storage = relative.startswith("backends/cpu/storage/")
         exempt = relative in FAMILY_EXCEPTIONS
         for lineno, line in code_lines(path):
             if BACKEND_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: shared layer names a backend: {line.strip()}")
             if module == "engine" and not under_model and not exempt and FAMILY_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: generic engine code names a model family: {line.strip()}")
-        if not (under_model or under_io or under_formats or under_source):
+        if not (under_model or under_io or under_formats or under_source or under_host_storage):
             continue
         for lineno, raw in includes(path):
             hits = resolve(raw, path, roots)
             if not hits:
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
+            if under_host_storage:
+                if target.startswith(("core/", "engine/", "models/", "model_source/")):
+                    failures.append(f"{relative}:{lineno}: host storage reaches logical execution: {raw}")
+                continue
             if under_source:
                 if (path.endswith(".h") and not relative.startswith("model_source/compat/") and
                         target.startswith("model_source/compat/")):
@@ -127,6 +132,10 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("host bytes may not own logical sequence rules", {
+        "backends/cpu/storage/qsa_blocks.cpp": '#include "qsa_sequence.h"\n',
+        "engine/state/qsa_sequence.h": "struct Sequence {};\n",
+    }, "host storage reaches logical execution"),
     ("public source headers may not expose private aliases", {
         "model_source/source.h": '#include "compat/aliases.h"\n',
         "model_source/compat/aliases.h": "struct Aliases {};\n",

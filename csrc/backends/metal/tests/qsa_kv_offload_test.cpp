@@ -36,12 +36,12 @@ void near(const array& left, const array& right, float tolerance = 0.002f) {
 }
 
 void test_dynamic_store() {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = 32768;
     config.buffer_bytes = 8192;
     config.target_index_bytes = 100000;
-    auto store = std::make_shared<QsaKvStore>(config);
-    std::vector<QsaKvStore::BlockPtr> index, raw;
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
+    std::vector<mfq::cache::QsaKvStore::BlockPtr> index, raw;
     for (int i = 0; i < 4; ++i) index.push_back(store->write(std::vector<std::uint8_t>(4096, i), 2));
     require(store->stats().disk_bytes == 0 && store->stats().hot_bytes == 16384,
         "future indexer reserve prevented full residency below budget");
@@ -60,11 +60,11 @@ void test_dynamic_store() {
 }
 
 void test_snapshot_rollback() {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = 16384;
     config.buffer_bytes = 8192;
-    auto store = std::make_shared<QsaKvStore>(config);
-    QsaKvSequence sequence(store, 32, 4);
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
+    mfq::cache::QsaKvSequence sequence(store, 32, 4);
     std::vector<std::uint8_t> original(1000 * 32);
     for (std::size_t i = 0; i < original.size(); ++i) original[i] = i % 251;
     sequence.append(original.data(), 1000);
@@ -84,11 +84,11 @@ void test_snapshot_rollback() {
 }
 
 void test_store_telemetry() {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = 32768;
     config.buffer_bytes = 8192;
-    auto store = std::make_shared<QsaKvStore>(config);
-    std::vector<QsaKvStore::BlockPtr> blocks;
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
+    std::vector<mfq::cache::QsaKvStore::BlockPtr> blocks;
     for (int i = 0; i < 8; ++i) blocks.push_back(store->write(std::vector<std::uint8_t>(4096, i), 1));
     store->flush();
     auto before = store->stats();
@@ -111,14 +111,14 @@ void test_store_telemetry() {
 }
 
 void test_shared_resident_guard() {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = 16384;
     config.buffer_bytes = 8192;
     config.reserve = [](std::size_t bytes) {
         require(bytes == 4096, "shared resident guard received the wrong allocation size");
         throw std::runtime_error("shared budget exhausted");
     };
-    auto store = std::make_shared<QsaKvStore>(config);
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
     bool rejected = false;
     try { (void)store->write(std::vector<std::uint8_t>(4096)); }
     catch (const std::runtime_error&) { rejected = true; }
@@ -126,8 +126,8 @@ void test_shared_resident_guard() {
         "KV allocation bypassed the shared resident guard");
     bool fail = false;
     config.reserve = [&](std::size_t) { if (fail) throw std::runtime_error("shared budget exhausted"); };
-    auto guarded_store = std::make_shared<QsaKvStore>(config);
-    QsaKvSequence sequence(guarded_store, 1024, 4);
+    auto guarded_store = std::make_shared<mfq::cache::QsaKvStore>(config);
+    mfq::cache::QsaKvSequence sequence(guarded_store, 1024, 4);
     std::vector<std::uint8_t> original(3072, 43), extra(2048, 71), restored(3072);
     sequence.append(original.data(), 3);
     fail = true;
@@ -143,10 +143,10 @@ void test_shared_resident_guard() {
 }
 
 void test_attention(int queries, int length, int budget, Dtype dtype) {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = 256 * 1024;
     config.buffer_bytes = 64 * 1024;
-    auto store = std::make_shared<QsaKvStore>(config);
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
     MlxQsaKvOffload cache(store, 2, 256, 4096, 4);
     auto key = values({1, 2, length, 256}, 53, dtype);
     auto value = values({1, 2, length, 256}, 71, dtype);
@@ -172,10 +172,10 @@ void test_attention(int queries, int length, int budget, Dtype dtype) {
 }
 
 void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = budget;
     config.buffer_bytes = buffer;
-    auto store = std::make_shared<QsaKvStore>(config);
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
     MlxQsaIndexOffload cache(store, 32, float32, 2);
     auto keys = values({1, 1024, 32}, 43, float32);
     auto query = values({1, 6, 4, 32}, 29);
@@ -198,9 +198,9 @@ void test_indexer(std::size_t budget = 32768, std::size_t buffer = 8192) {
 
 void test_quantized_attention(double bits, int queries, std::size_t buffer) {
     setenv("MFQ_KV_TURBOQUANT_BITS", std::to_string(bits).c_str(), 1);
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.buffer_bytes = std::max<std::size_t>(buffer, 16384); config.budget_bytes = config.buffer_bytes * 2;
-    auto store = std::make_shared<QsaKvStore>(config);
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(config);
     MlxQsaKvOffload offloaded(store, 2, 256, 128, 4);
     MlxKvCache resident(1, 2, 128, 256, 4, float16, true);
     auto key = values({1, 2, 39, 256}, 53), value = values({1, 2, 39, 256}, 71);

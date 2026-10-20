@@ -82,10 +82,10 @@ ControlResult control(ControlRequest request);
 - CUDA 绑定在 `csrc/backends/cuda/models/`：`common/causal_model_ops.h` 的 `CudaCausalOps<Model> : Model, CudaCausalModel`与 `attention_ops.h`；`qwen35/ops.h` 实例化 `CausalLm<CudaCausalOps<Qwen35Model>>`。另有 `ForwardOps` 与 `CudaSessionCodec`。
 - **这套共享目前只覆盖 CUDA 侧**：Metal 有自己的 family 实现（`backends/metal/models/` 下的 `mlx_*`），不实例化这些模板，也不接 `EngineInstance`。见 [bugs.md B28](bugs.md)。
 - Engine 模块目录：`csrc/engine/{include,model,src,requests,batch,state,weights,executor,text}`。`include/` 是唯一 PUBLIC include 目录，core/prefix/tokenizer 的实现依赖均为 PRIVATE；其余模块目录在 `engine/CMakeLists.txt` 里是 PRIVATE，只有 `backends/` 与 `tests/` 把它们加进 include path。
-- 资源持有：`CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，由 `CudaExecutionContext` 持有（`ops/execution/cuda_execution.h`）；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用。公共 StateStore/WeightStore 尚未拥有这些资源（[B34](bugs.md)）。
+- 资源持有：`CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，由 `CudaExecutionContext` 持有（`execution/cuda_execution.h`）；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用。公共 StateStore/WeightStore 尚未拥有这些资源（[B34](bugs.md)）。
 - 连续批处理：共享 `ContinuousBatch` 在 `engine/executor/driver.h`，由 `backends/cuda/engine/batch_execution.*` 驱动；当前由 family policy 与 `batch_executor_t<Model>` 选择实现，包含 Qwen35 与单独的 Qwen4/Flash-Next batch 绑定；Qwen35 请求状态仍专用绑定，尚未收敛到目标共享 Executor（[B32](bugs.md)）。
 - host parallel、拓扑、亲和性和 host copy 位于 `backends/cpu/native/`，专家调度位于 `backends/cpu/execution/`；CUDA native 的线程原语依赖不引入 CPU 专家调度。
-- `csrc/core/` 仍存在，是 `mfq-core` INTERFACE 聚合 target（`csrc/core/CMakeLists.txt`），目前保留 KV 磁盘存储与专家放置策略；schema、范围解码、模型输入及视觉几何已拆出。
+- prefix 的匹配与请求计数、QSA 的 sequence/snapshot 已归 `engine/state/`；RAM/SSD 队列、文件校验与回收归 `backends/cpu/storage/`，由 State 组合持有。MoE 成本/放置与分片归 `engine/weights/`，异步观测推进归 `engine/executor/`；CPU worker 只测量并返回耗时，保留输入租约直至工作结束。`csrc/core/` 目前只剩待 K4 删除的 CMake 聚合入口。
 
 ## 4. CUDA 与 Metal 的实际差别
 

@@ -9,7 +9,7 @@
 #include "model.h"
 #include "mtp.h"
 #include "storage/weights/loaders/weight.h"
-#include "storage/weights/moe/ffn_pipeline.h"
+#include "execution/moe_ffn_pipeline.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/weights/nint_row_pipeline.h"
 #include "ops/decode_window.h"

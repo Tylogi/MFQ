@@ -1,7 +1,7 @@
 #include "ops/execution/execution_options.h"
 #include "rope.h"
 
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "kernels/attention/ops.h"
 
 #include <algorithm>

@@ -3,7 +3,7 @@
 #include "kernels/norm_ops.h"
 #include "kernels/quant_ops.h"
 #include "vq.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "ops/format.h"
 #include "generated/nvq_codebooks.generated.h"
 #include "csrc/backends/cpu/ops/quant_dot.h"

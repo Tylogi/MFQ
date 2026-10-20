@@ -65,7 +65,15 @@ FORBIDDEN = {
 DEVICE_FORBIDDEN = ("executor/", "state/", "weights/", "src/",
                     "requests/table.h", "requests/inference.h")
 STORAGE_FORBIDDEN = ("executor/", "requests/table.h", "requests/inference.h")
-DEVICE_DIRS = ("ops", "kernels", "native", "device", "execution")
+DEVICE_DIRS = ("ops", "kernels", "native", "device")
+EXECUTION_FORBIDDEN = ("executor/driver.h", "executor/flow.h", "state/", "src/",
+                       "requests/table.h", "requests/inference.h")
+# Shared rules consume these explicit host contracts, without device execution.
+HOST_CONTRACTS = {
+    ("executor", "backends/cpu/execution/include/mfq/moe/cpu_measurement.h"),
+    ("state", "backends/cpu/storage/prefix_blocks.h"),
+    ("state", "backends/cpu/storage/qsa_blocks.h"),
+}
 BACKEND_EXCEPTIONS = {
     ("backends/cuda/storage/session/text_cache.cpp", "src/settings.h"),
 }
@@ -106,6 +114,8 @@ class Graph:
         if len(parts) < 3 or parts[0] != "backends":
             return ()
         kind = parts[2]
+        if kind == "execution":
+            return EXECUTION_FORBIDDEN
         if kind in DEVICE_DIRS:
             return DEVICE_FORBIDDEN
         if kind == "storage":
@@ -136,7 +146,7 @@ class Graph:
                     violations.append((src, lineno, raw,
                         "public engine contract reaches an implementation header"))
                 if not engine_relative.startswith("engine" + os.sep):
-                    if from_engine and engine_relative.startswith("backends" + os.sep):
+                    if from_engine and engine_relative.startswith("backends" + os.sep) and (self.module(src), engine_relative) not in HOST_CONTRACTS:
                         violations.append((src, lineno, raw,
                             "engine may not include a backend header"))
                     continue
@@ -173,6 +183,20 @@ def check_tree(csrc, bench=None):
 
 # Small positive and negative trees: a rule that never fires is not a rule.
 FIXTURES = [
+    ("Executor may submit host measurements", {
+        "engine/executor/calibration.h": '#include "mfq/moe/cpu_measurement.h"\n',
+        "backends/cpu/execution/include/mfq/moe/cpu_measurement.h": "void measure();\n",
+        "backends/cuda/execution/adapter.cpp": '#include "calibration.h"\n',
+    }, None),
+    ("physical execution may not drive requests", {
+        "backends/cuda/execution/work.cpp": '#include "driver.h"\n',
+        "engine/executor/driver.h": "struct Driver {};\n",
+    }, "backend device implementation may not include executor/driver.h"),
+    ("state may consume byte storage", {
+        "engine/state/prefix.h": '#include "prefix_blocks.h"\n',
+        "backends/cpu/storage/prefix_blocks.h": "struct Blocks {};\n",
+        "backends/cuda/storage/codec.cpp": '#include "prefix.h"\n',
+    }, None),
     ("public contracts may compose other public values", {
         "engine/include/engine.h": '#include "request.h"\n',
         "engine/include/request.h": "struct Request {};\n",

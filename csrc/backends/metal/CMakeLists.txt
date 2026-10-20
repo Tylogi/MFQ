@@ -360,7 +360,7 @@ target_link_libraries(mfq-decode-metal PRIVATE
 )
 target_compile_features(mfq-decode-metal PRIVATE cxx_std_20)
 
-if(TARGET mfq-paged-prefix-cache)
+if(TARGET mfq-prefix-blocks)
     target_sources(mfq-decode-metal PRIVATE
         runtime/mlx_paged_session_codec.cpp
     )
@@ -371,7 +371,7 @@ if(TARGET mfq-paged-prefix-cache)
     )
     target_link_libraries(mfq-metal-paged-session-codec-test PRIVATE
         mfq-metal-runtime
-        mfq-paged-prefix-cache
+        mfq-prefix-blocks
     )
     target_compile_features(
         mfq-metal-paged-session-codec-test PRIVATE cxx_std_20)

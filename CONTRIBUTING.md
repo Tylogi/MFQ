@@ -24,8 +24,11 @@ Anything that can be shared by more than one model architecture **must not**
 be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
-- Remaining runtime values, placement rules and state storage still pass through
-  transitional `mfq-core`; K2–K4 remove that aggregation. Schemas and row readers
+- Runtime placement and cost rules live in `engine/weights/`, task collection
+  in `engine/executor/`, and logical prefix/QSA state in `engine/state/`.
+  Host byte storage, disk reservations and encoded-row leases belong to
+  `backends/cpu/storage/`; measured CPU work belongs to CPU execution.
+  Only the transitional `mfq-core` target remains for K4. Schemas and row readers
   already belong to `formats/`, model input to `model_source/`, and vision
   geometry to `engine/model/common/vision/`. Do not add new code to `core/`.
 - `mfq-model-graph` parses only persisted schema. `mfq-model-source` opens inputs,
@@ -69,7 +72,8 @@ architecture-named entry point.
   `csrc/backends/cuda/kernels`; `mfq/kernels/cuda/` holds only the Python
   wrappers, `mfq_cuda.cpp` and the `_ext.py` manifest, which compiles a subset
   of those same native sources. There is no pending kernel move.
-- CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
+- CUDA `native/` owns tensors and contexts, `execution/` owns runtime context
+  and expert task submission, `storage/` owns weight materialization
   and physical cache storage, and `engine/` is the sole composition root for
   family selection, runtime components, batching and CUDA Graphs.
   `models/<family>/` supplies native operator/state bindings, with reusable

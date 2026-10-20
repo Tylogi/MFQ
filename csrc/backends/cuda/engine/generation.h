@@ -1,7 +1,7 @@
 #pragma once
 
 #include "step.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "decode_graph.h"
 #include "models/common/mtp.h"
 #include "cuda_runtime_config.h"

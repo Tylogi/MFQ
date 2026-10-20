@@ -9,7 +9,7 @@
 #include "kernels/mfe/ffn_shared.h"
 #include "kernels/mfe/nvq_dense_bounds.h"
 #include "kernels/quant/nint_route_hint.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>

@@ -11,8 +11,7 @@ I/O lives in `components/io/`. That end state is defined in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — remaining placement rules and state storage.
-  The transitional `mfq-core` aggregation is removed by K3/K4 in
+- `core/` — only the transitional `mfq-core` aggregation remains for K4 in
   [docs/plan.md](../docs/plan.md);
 - `model_source/` — input discovery, metadata normalization and bounded reads,
   built as `mfq-model-source`. Headers sit beside implementations; old graph/name
@@ -54,12 +53,22 @@ has landed.
   independently of model sources and Engine; its only library dependency is
   `mfq-host-parallel`. `mfq-model-source` exposes the reader value contracts
   through its public link to `mfq-io`;
-- `backends/cpu/` — host thread primitives, CPU expert execution and host math;
+- `engine/state/` owns prefix identity/matching and QSA sequence/snapshot rules;
+  a prefix cache composes its host byte store. `engine/weights/` owns MoE cost,
+  placement and pure shard planning; `engine/executor/` starts/collects measured
+  CPU jobs and plans rank submission order. Operators consume the public
+  dispatch/slice values, rather than loading these policies;
+- `backends/cpu/` — host thread primitives, CPU expert execution and host math.
+  `storage/` owns RAM/SSD byte stores, disk reservation guards and the immutable
+  encoded-row cache shared by CUDA/HIP. `mfq-prefix-blocks` and
+  `mfq-qsa-kv-store` contain no Engine policy; CPU execution measures work while
+  captured inputs retain their leases;
   `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`, which no longer publishes
   the old core include directory;
 - `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests. `native/` implements
-  Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains
+  Tensor/context primitives in the `mfq-cuda-native` target. `execution/` owns
+  the runtime context and expert submission pipeline. `ops/` contains
   device operators, including RoPE; operators consume loaded weights.
   `storage/` owns weight/source primitives, KV storage, paged payload I/O and
   cache storage; it does not select model families.

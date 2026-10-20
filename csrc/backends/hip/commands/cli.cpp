@@ -1,6 +1,6 @@
 #include "cli.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 #include <algorithm>
 #include <charconv>

@@ -2705,11 +2705,6 @@ void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>& ca
     // measured policy naturally and retain the first baseline for final replay.
     if(cache->pipeline_comparison_cpu_policy_)cache->pipeline_dispatch_replay_.clear();
 }
-void prepare_moe_cpu_calibration_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
-    prepare_moe_cpu_budget_comparison(cache,replay,true);
-    cache->pipeline_cpu_calibration_.reset(cache->pipeline_cpu_cost_);
-    cache->pipeline_cpu_cost_={};
-}
 std::size_t finish_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache) {
     if(!cache || !cache->pipeline_dispatch_capture_required_ || cache->pipeline_dispatch_records_.empty())
         throw std::logic_error("MFQ pipeline comparison did not capture dispatch records");

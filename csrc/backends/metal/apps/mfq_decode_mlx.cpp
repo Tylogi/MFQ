@@ -15,7 +15,7 @@
 #include "nlohmann/json.hpp"
 
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "transport.h"
 #include "runtime/mlx_paged_session_codec.h"
 #include "runtime/mlx_server_components.h"
@@ -923,7 +923,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
             throw std::runtime_error(
                 "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
         }
-        mfq::cache::PagedPrefixCacheConfig config;
+        mfq::cache::PrefixBlockStoreConfig config;
         config.reserve_memory = [](std::size_t bytes) { mfq::metal::MlxResidentBudgetScope::reserve(bytes); };
         config.cache_dir = default_prefix_cache_directory();
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();

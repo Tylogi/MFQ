@@ -488,7 +488,7 @@ cuda/csrc/
 | `include/mfq/moe/cpu_calibration.h` | 异步任务推进归 `engine/executor/`；CPU 测量工作归 `backends/cpu/execution/`；观测结果回写 weights 成本模型。这是推理期间的在线测量，不是离线量化校准 |
 | `mfq_paged_prefix_cache.*` | prefix 身份、匹配、失效与预算归 `engine/state/`；文件、字节缓存和读写队列归 `backends/cpu/storage/`。后端 session codec 不另建 prefix 策略 |
 | `qsa_kv_store.cpp`、`include/mfq/qsa_kv_store.h` | RAM/SSD 字节块存储归 `backends/cpu/storage/`；sequence/snapshot 的逻辑状态归 `engine/state/`；QSA 设备布局仍归本后端 |
-| `include/mfq/quant/nint_row_cache.h` | `backends/cuda/storage/weights/`；当前实际消费者是 CUDA 行读取路径及其测试，逻辑预算/lease 与 WeightStore 对齐 |
+| `include/mfq/quant/nint_row_cache.h` | `backends/cpu/storage/`；实际消费者包括 CUDA/HIP 行读取路径，物理编码行租约共用 `backends/cpu/storage/` 的实现，逻辑预算/lease 与 WeightStore 对齐 |
 | `grid_vision.h/.cpp` | `engine/model/common/vision/`；模型配置、patch 几何和 canonical tensor roles 保留一份，model-graph target 不再夹带视觉模型算法 |
 
 线程、拓扑、亲和性与 host copy 原语已归 `backends/cpu/native/`，CPU 专家调度已归 `backends/cpu/execution/`；CUDA native 仅依赖 host 原语，不经它引入专家调度。

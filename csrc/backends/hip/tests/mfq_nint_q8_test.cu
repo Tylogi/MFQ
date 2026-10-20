@@ -1,5 +1,5 @@
 #include "mfq_cuda_quant_ops.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "nint.h"
 
 #include <cuda_runtime_api.h>

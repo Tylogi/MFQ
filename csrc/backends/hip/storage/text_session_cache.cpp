@@ -15,7 +15,7 @@
 #include "models/qwen4_exp/ops.h"
 #include "storage/session_state.h"
 #include "core/mtp.h"
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "paged_session_bindings.h"
 #include "session_cache.h"
 
@@ -69,7 +69,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
         !supports_paged_text_session_state) {
         return {};
     }
-    mfq::cache::PagedPrefixCacheConfig cache;
+    mfq::cache::PrefixBlockStoreConfig cache;
     cache.cache_dir = config.directory;
     if (!source.source_paths().empty()) cache.model_path = source.source_paths().front();
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);

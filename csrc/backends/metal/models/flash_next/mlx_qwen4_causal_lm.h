@@ -203,7 +203,7 @@ public:
     std::size_t resident_full_expert_bytes() const noexcept;
     // Telemetry reads metadata only: no evaluation, copies, or device sync.
     std::size_t kv_cache_bytes() const noexcept;
-    std::optional<QsaKvStoreStats> qsa_kv_offload_stats() const;
+    std::optional<mfq::cache::QsaKvStoreStats> qsa_kv_offload_stats() const;
     std::size_t kv_cache_contexts() const noexcept;
     std::size_t dynamic_weight_bytes() const noexcept;
     std::size_t ssd_ple_payload_bytes() const noexcept;
@@ -244,7 +244,7 @@ private:
     struct Impl;
     explicit MlxQwen4CausalLm(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
-    std::shared_ptr<QsaKvStore> kv_offload_store_;
+    std::shared_ptr<mfq::cache::QsaKvStore> kv_offload_store_;
 };
 
 } // namespace mfq::metal

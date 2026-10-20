@@ -4,7 +4,7 @@
 #include "models/cuda_model_plan.h"
 #include "request.h"
 #include "models/common/block.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 
 #include <cstdint>
 #include <memory>

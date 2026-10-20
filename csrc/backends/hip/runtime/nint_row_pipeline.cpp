@@ -1,6 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "nint_row_pipeline.h"
-#include "mfq/nint_row_cache.h"
+#include "nint_row_cache.h"
 #include "mfq_hip_quant_ops.h"
 #include "mfq/host_parallel.h"
 #include "mfq_hip_context.h"

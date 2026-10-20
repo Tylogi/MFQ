@@ -15,7 +15,7 @@ CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 RUNTIME = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
     for name in (
-        "ops/execution/cuda_execution.h",
+        "execution/cuda_execution.h",
         "ops/execution/cuda_execution.cpp",
         "engine/generation.h",
         "engine/generation.cpp",

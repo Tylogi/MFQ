@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 
 #include <atomic>
 #include <cstddef>

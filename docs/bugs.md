@@ -195,7 +195,7 @@
 ### B34：`CudaStores` 只是字段包装，Store 所有权未收口
 
 - 状态：待处理，即 plan §1.4 的 R4；实际 Store 随阶段 2 的 Qwen 与阶段 3 的 DeepSeek 落地，不能提前标完成。
-- 位置：[`backends/cuda/ops/execution/cuda_execution.h`](../csrc/backends/cuda/ops/execution/cuda_execution.h) 中 `CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，`CudaStores stores;` 仍由 `CudaExecutionContext` 持有。
+- 位置：[`backends/cuda/execution/cuda_execution.h`](../csrc/backends/cuda/execution/cuda_execution.h) 中 `CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，`CudaStores stores;` 仍由 `CudaExecutionContext` 持有。
 - 影响：没有公共 StateStore/WeightStore，状态修改权限与回收条件没有单一所有者。
 - 关闭条件：见 plan §1.4 R4 的验收——从加载、执行到取消/reload 都能定位唯一管理者；延迟 I/O/设备完成时仍被使用的页、slot、权重和任务资源不能提前复用；失败预留可回收、过期 generation 不能提交。仅把成员移进另一结构体不算完成。
 

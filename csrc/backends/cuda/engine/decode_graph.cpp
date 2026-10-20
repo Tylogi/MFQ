@@ -1,5 +1,5 @@
 #include "decode_graph.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 
 #include <algorithm>
 

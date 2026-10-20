@@ -3,7 +3,7 @@
 #include "ops/decode_window.h"
 #include "ops/quant/nint.h"
 #include "kernels/moe/pipeline.h"
-#include "mfq/quant/nint_row_cache.h"
+#include "nint_row_cache.h"
 #include "../../../../tests/quant/nint_row_fixture.h"
 #include <atomic>
 #include <cstring>

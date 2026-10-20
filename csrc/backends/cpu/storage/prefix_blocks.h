@@ -1,4 +1,5 @@
 #pragma once
+#include "cache_block.h"
 
 #include <array>
 #include <cstddef>
@@ -13,15 +14,11 @@
 
 namespace mfq::cache {
 
-using BlockHash = std::array<std::uint8_t, 32>;
 using PagedPrefixPayload =
     std::shared_ptr<const std::vector<std::uint8_t>>;
 
-BlockHash sha256(const void* data, std::size_t size);
-BlockHash sha256(std::string_view value);
-std::string block_hash_hex(const BlockHash& hash);
 
-struct PagedPrefixCacheConfig {
+struct PrefixBlockStoreConfig {
     std::filesystem::path cache_dir;
     std::string compatibility_key;
     std::size_t block_size_tokens = 256;
@@ -45,16 +42,8 @@ struct PagedPrefixCacheConfig {
     std::uint64_t min_free_ram_bytes = 512ULL << 20;
 };
 
-struct PrefixMatch {
-    std::size_t matched_tokens = 0;
-    std::vector<BlockHash> blocks;
-};
-
-struct PagedPrefixCacheMetrics {
+struct PrefixBlockStoreMetrics {
     std::uint64_t blocks = 0;
-    std::uint64_t queries = 0;
-    std::uint64_t hits = 0;
-    std::uint64_t hit_tokens = 0;
     std::uint64_t disk_hits = 0;
     std::uint64_t hot_hits = 0;
     std::uint64_t writes = 0;
@@ -76,49 +65,22 @@ struct PagedPrefixCacheMetrics {
     std::uint64_t low_disk_space_skips = 0;
 };
 
-class PagedPrefixCache {
+class PrefixBlockStore {
 public:
-    explicit PagedPrefixCache(PagedPrefixCacheConfig config);
-    ~PagedPrefixCache();
+    explicit PrefixBlockStore(PrefixBlockStoreConfig config);
+    ~PrefixBlockStore();
 
-    PagedPrefixCache(const PagedPrefixCache&) = delete;
-    PagedPrefixCache& operator=(const PagedPrefixCache&) = delete;
+    PrefixBlockStore(const PrefixBlockStore&) = delete;
+    PrefixBlockStore& operator=(const PrefixBlockStore&) = delete;
 
     std::size_t block_size_tokens() const noexcept;
     const BlockHash& compatibility_hash() const noexcept;
 
-    BlockHash block_hash(
-        const BlockHash& parent,
-        const std::int64_t* token_ids,
-        std::size_t token_count,
-        std::string_view extra_key = {}) const;
-
-    PrefixMatch match(
-        const std::vector<std::int64_t>& token_ids,
-        std::string_view extra_key = {},
-        bool record_query = true);
-
-    // Record the effective prefix actually restored by a higher-level codec.
-    // Hybrid caches may need to back off from a structurally matched KV chain
-    // to the newest block carrying an exact recurrent-state checkpoint.
-    void record_match(std::size_t matched_tokens);
-
-    BlockHash store(
-        const BlockHash& parent,
-        const std::int64_t* token_ids,
-        std::size_t token_count,
-        std::shared_ptr<const std::vector<std::uint8_t>> payload,
-        std::string_view extra_key = {});
-
-    // Atomically refresh the payload associated with an existing token-block
-    // hash. This is used to add an exact recurrent-state checkpoint when a
-    // previously stored KV block later becomes a stable prompt boundary.
-    BlockHash replace(
-        const BlockHash& parent,
-        const std::int64_t* token_ids,
-        std::size_t token_count,
-        std::shared_ptr<const std::vector<std::uint8_t>> payload,
-        std::string_view extra_key = {});
+    BlockHash store(const BlockHash& hash,const BlockHash& parent,
+        const std::int64_t* tokens,std::size_t count,PagedPrefixPayload payload,
+        std::string_view extra_key={},bool replace_existing=false);
+    bool contains(const BlockHash& hash,const BlockHash& parent,std::size_t count);
+    std::vector<std::size_t> tail_lengths(const BlockHash& parent,std::size_t maximum) const;
 
     std::optional<std::vector<std::uint8_t>> load(const BlockHash& hash);
 
@@ -145,7 +107,7 @@ public:
     std::size_t refresh_disk_index();
     void flush();
     std::size_t clear();
-    PagedPrefixCacheMetrics metrics() const;
+    PrefixBlockStoreMetrics metrics() const;
 
 private:
     class Implementation;

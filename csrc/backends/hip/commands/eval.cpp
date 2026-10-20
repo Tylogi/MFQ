@@ -1,7 +1,7 @@
 #include "cli.h"
 #include "storage/model_loader.h"
 #include "eval/kl.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>

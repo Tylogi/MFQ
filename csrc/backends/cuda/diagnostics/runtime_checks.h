@@ -11,7 +11,7 @@
 #include "storage/weights/loaders/weight.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/session/text_cache.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "models/qwen35/linear_attention.h"
 #include "kernels/deepseek_v41.h"
 #include "nlohmann/json.hpp"

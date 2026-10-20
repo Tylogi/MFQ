@@ -3,7 +3,7 @@
 #include "models/qwen4_exp/ops.h"
 #include "driver.h"
 #include "ops/execution/cuda_sampling.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 namespace mfq::cuda {
 struct FlashNextBatchRequest : mfq::engine::BatchRequest {
     using BatchRequest::BatchRequest;

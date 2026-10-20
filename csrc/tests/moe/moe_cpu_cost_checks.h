@@ -1,53 +1,58 @@
 #pragma once
-#include "mfq/moe/cpu_cost_model.h"
-#include "mfq/moe/cpu_calibration.h"
+#include "cpu_cost_model.h"
+#include "cpu_calibration.h"
 #include <memory>
 #include <string>
 
 
 inline int cpu_calibration_checks() {
-    using Observation=mfq::MoeCpuCalibration::Observation;
-    mfq::MoeCpuCostModel model;mfq::MoeCpuCalibration state;
+    mfq::MoeCpuCostModel model;mfq::MoeCpuCalibrationState state;
     const mfq::MoeCpuCostModel::Key key{1,2,3,1};
-    std::promise<Observation> promise;
-    auto result=std::make_shared<std::future<Observation>>(promise.get_future());
-    state.start([result]{return result->get();});
-    if(!state.collect(model,false) || model.observations(key))
+    std::promise<void> promise;
+    auto ready=promise.get_future().share();
+    mfq::start_moe_cpu_calibration(state,key,[ready]{ready.wait();},1000);
+    if(!mfq::collect_moe_cpu_calibration(state,model,false) || model.observations(key))
         throw std::runtime_error("pending CPU calibration blocked or altered costs");
     bool rejected=false;
-    try {state.start([]{return Observation{};});}catch(const std::logic_error&){rejected=true;}
-    promise.set_value({key,1000});
+    try {mfq::start_moe_cpu_calibration(state,key,[]{});}catch(const std::logic_error&){rejected=true;}
+    promise.set_value();
     if(!rejected)throw std::runtime_error("CPU calibration accepted concurrent work");
-    state.collect(model,true);
+    mfq::collect_moe_cpu_calibration(state,model,true);
     if(state.busy() || model.observations(key)!=1 || state.jobs()!=1 || state.observations()!=1)
         throw std::runtime_error("CPU calibration lost its completed observation");
-    for(double value:{1200.,1100.}) {
-        state.start([key,value]{return Observation{key,value};});state.collect(model,true);
+    for(int sample=0;sample<2;++sample) {
+        mfq::start_moe_cpu_calibration(state,key,[]{},1000);
+        mfq::collect_moe_cpu_calibration(state,model,true);
     }
-    if(model.estimate(key)!=1100 || state.observations()!=3)
-        throw std::runtime_error("CPU background median differs from measured work");
-    state.start([]()->Observation {throw std::runtime_error("required calibration error");});
+    const auto measured=model.estimate(key);
+    if(measured<1000 || state.observations()!=3 || state.work_ns()<3000)
+        throw std::runtime_error("CPU background measurement lost preparation time");
+    mfq::start_moe_cpu_calibration(state,key,[]{throw std::runtime_error("required calibration error");});
     rejected=false;
-    try {state.collect(model,true);}catch(const std::runtime_error& error) {
+    try {mfq::collect_moe_cpu_calibration(state,model,true);}catch(const std::runtime_error& error) {
         rejected=std::string(error.what())=="required calibration error";
     }
     if(!rejected || state.busy())throw std::runtime_error("CPU worker error was swallowed");
-    state.start([key]{return Observation{key,-1};});rejected=false;
-    try {state.collect(model,true);}catch(const std::invalid_argument&){rejected=true;}
+    std::promise<double> invalid;state.pending=invalid.get_future();invalid.set_value(-1);
+    rejected=false;
+    try {mfq::collect_moe_cpu_calibration(state,model,true);}catch(const std::invalid_argument&){rejected=true;}
     if(!rejected || model.observations(key)!=3)
         throw std::runtime_error("invalid background timing corrupted CPU costs");
+    rejected=false;
+    try {mfq::start_moe_cpu_calibration(state,key,[]{},-1);}catch(const std::invalid_argument&){rejected=true;}
+    if(!rejected || state.busy())throw std::runtime_error("invalid CPU measurement preparation accepted");
     std::weak_ptr<int> weak;
     {
-        mfq::MoeCpuCalibration lifetime;
+        mfq::MoeCpuCalibrationState lifetime;
         auto owner=std::make_shared<int>(7);weak=owner;
-        lifetime.start([owner,key]{return Observation{key,double(*owner)};});
+        mfq::start_moe_cpu_calibration(lifetime,key,[owner]{if(*owner!=7)throw std::runtime_error("lost lease");});
         owner.reset();
     }
     if(!weak.expired())throw std::runtime_error("CPU calibration retained inputs after cleanup");
-    state.reset(model);
-    if(state.jobs() || state.observations() || state.work_ns() || model.estimate(key)!=1100)
+    mfq::reset_moe_cpu_calibration(state,model);
+    if(state.jobs() || state.observations() || state.work_ns() || model.estimate(key)!=measured)
         throw std::runtime_error("CPU diagnostic reset changed observed costs");
-    return 8;
+    return 9;
 }
 
 inline int cpu_cost_checks() {

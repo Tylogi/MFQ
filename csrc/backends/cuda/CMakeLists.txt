@@ -333,6 +333,8 @@ find_package(OpenMP QUIET)
 
 function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/include
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -407,7 +409,7 @@ set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/activation.cpp
     ${MFQ_CUDA_ROOT}/ops/embedding.cpp
-    ${MFQ_CUDA_ROOT}/ops/execution/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/execution/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/quant/fp8_sq.cpp
@@ -423,14 +425,14 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-ops)
-target_include_directories(mfq-cuda-ops PRIVATE ${PROJECT_SOURCE_DIR}/engine/model)
+target_include_directories(mfq-cuda-ops PRIVATE ${PROJECT_SOURCE_DIR}/engine/model ${PROJECT_SOURCE_DIR}/engine/weights)
 target_compile_definitions(mfq-cuda-ops PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/weights/moe/expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/storage/weights/moe/ffn_pipeline.cpp
+    ${MFQ_CUDA_ROOT}/execution/moe_ffn_pipeline.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/moe/weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/loaders/mx.cpp
     ${MFQ_CUDA_ROOT}/storage/weights/loaders/sq.cpp

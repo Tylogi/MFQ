@@ -134,6 +134,8 @@ find_package(OpenMP QUIET)
 
 function(mfq_configure_hip_backend_target target)
     target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/include
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_HIP_ROOT}
         ${MFQ_HIP_ROOT}/include
@@ -188,7 +190,7 @@ set(MFQ_HIP_TRANSFORMER_SOURCES
 )
 
 set(MFQ_HIP_RUNTIME_OP_SOURCES
-    ${MFQ_HIP_ROOT}/ops/cuda_execution.cpp
+    ${MFQ_HIP_ROOT}/execution/runtime_context.cpp
     ${MFQ_HIP_ROOT}/ops/format.cpp
     ${MFQ_HIP_ROOT}/ops/gated_residual.cpp
     ${MFQ_HIP_ROOT}/ops/fp8_sq.cpp
@@ -197,7 +199,7 @@ set(MFQ_HIP_RUNTIME_OP_SOURCES
     ${MFQ_HIP_ROOT}/ops/moe.cpp
     ${MFQ_HIP_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_HIP_ROOT}/ops/nint.cpp
-    ${MFQ_HIP_ROOT}/ops/quant_linear.cpp
+    ${MFQ_HIP_ROOT}/storage/linear_weights.cpp
     ${MFQ_HIP_ROOT}/ops/vq.cpp
 )
 
@@ -211,7 +213,7 @@ set(MFQ_HIP_LOADING_SOURCES
     ${MFQ_HIP_ROOT}/storage/load_options.cpp
     ${MFQ_HIP_ROOT}/storage/model_loader.cpp
     ${MFQ_HIP_ROOT}/storage/moe_expert_cache.cpp
-    ${MFQ_HIP_ROOT}/storage/moe_ffn_pipeline.cpp
+    ${MFQ_HIP_ROOT}/execution/moe_ffn_pipeline.cpp
     ${MFQ_HIP_ROOT}/storage/moe_quant_range_source.cpp
     ${MFQ_HIP_ROOT}/runtime/moe_host_expert_cache.cpp
     ${MFQ_HIP_ROOT}/runtime/graph_registry.cpp

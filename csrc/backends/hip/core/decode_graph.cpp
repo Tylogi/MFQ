@@ -1,6 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "core/decode_graph.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 #include <algorithm>
 

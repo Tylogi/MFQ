@@ -2,7 +2,7 @@
 #include "mfq_hip_sampling_ops.h"
 #include "hip_batching.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "core/decode_graph.h"
 #include "core/full_block.h"
 #include "models/qwen35/ops.h"

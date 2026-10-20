@@ -9,7 +9,7 @@
 #include "../../../engine/model/common/vision/grid_vision.h"
 #include "request.h"
 #include "../../hip/include/mfq_hip_attention_ops.h"
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 
 #include <algorithm>
 #include <cmath>

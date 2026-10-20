@@ -370,10 +370,10 @@ int main() {
         flash_restored.layers[1].ple_context == gdn.ple_context &&
         flash_restored.mtp_layers.size() == 1 && flash_restored.mtp_layers[0].position == 5,
         "Flash-Next QSA/GDN/PLE/MTP checkpoint did not round trip");
-    QsaKvStoreConfig offload_config;
+    mfq::cache::QsaKvStoreConfig offload_config;
     offload_config.budget_bytes = 16384;
     offload_config.buffer_bytes = 8192;
-    auto offload_store = std::make_shared<QsaKvStore>(offload_config);
+    auto offload_store = std::make_shared<mfq::cache::QsaKvStore>(offload_config);
     mlx_set_qsa_kv_offload_store(offload_store);
     const auto offloaded = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
         {flash_first, flash_last}, flash.tokens, 4);

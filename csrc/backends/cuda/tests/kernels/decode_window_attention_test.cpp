@@ -4,7 +4,7 @@
 #include "ops/decode_window.h"
 #include "native/context.h"
 #include "request.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "csrc/tests/quant/nint_row_fixture.h"
 #include "ops/quant/nint.h"
 #include <algorithm>

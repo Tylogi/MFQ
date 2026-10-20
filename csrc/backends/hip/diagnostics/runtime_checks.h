@@ -8,7 +8,7 @@
 #include "models/qwen35/mtp.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "models/qwen35/linear_attention.h"
 #include "mfq/kernels/hip/deepseek_v41.h"
 #include "nlohmann/json.hpp"

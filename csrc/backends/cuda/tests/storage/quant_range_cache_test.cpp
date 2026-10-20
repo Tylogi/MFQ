@@ -2,7 +2,7 @@
 #include "storage/weights/loaders/weight.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/weights/moe/quant_range_source.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 
 #include <algorithm>
 #include <chrono>

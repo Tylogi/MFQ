@@ -1,4 +1,5 @@
 #pragma once
+#include "moe_dispatch.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -8,25 +9,6 @@
 #include <vector>
 
 namespace mfq {
-enum class MoeDispatchKind { Cpu = -1, GpuResident = 0, GpuTransfer = 1 };
-struct MoeDispatchGroup {
-    std::int32_t expert = -1;
-    MoeDispatchKind kind = MoeDispatchKind::Cpu;
-    std::vector<std::size_t> positions;
-};
-struct MoeDispatchPlan {
-    std::vector<MoeDispatchGroup> groups;
-    std::vector<MoeDispatchKind> kinds;
-};
-struct MoeDispatchCost {
-    double cpu_ns=0;
-    std::uint64_t transfer_bytes=0;
-    bool cpu_eligible=true;
-};
-struct MoeDispatchRates {
-    double pcie_gbps=0,stage_ns_per_byte=0,gpu_ns=0;
-    bool cpu_transfer_budget=false;
-};
 // Without a measured per-expert GPU saving, CPU work must repay its own
 // avoided host staging and PCIe transfer time before using the GPU window.
 inline bool moe_cpu_repays_transfer(const MoeDispatchCost& cost,MoeDispatchRates rates) {
@@ -88,10 +70,6 @@ void assign_moe_transfer_quota(MoeDispatchPlan& plan, std::size_t quota,
     for (const auto& group : plan.groups)
         for (const auto position : group.positions) plan.kinds[position] = group.kind;
 }
-
-struct MoeDispatchWorkspace {
-    std::vector<std::size_t> group_for;
-};
 
 // Reuse the per-group position buffers for the common fixed top-k decode.
 // Group order, reverse cold quota and complete-input validation match the

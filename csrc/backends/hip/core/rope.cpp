@@ -2,7 +2,7 @@
 #include "../runtime/execution_options.h"
 #include "rope.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "mfq_hip_attention_ops.h"
 
 #include <algorithm>

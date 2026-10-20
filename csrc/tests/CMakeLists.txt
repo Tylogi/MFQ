@@ -85,7 +85,8 @@ add_executable(mfq-host-memory-copy-test host/host_memory_copy_test.cpp)
 target_link_libraries(mfq-host-memory-copy-test PRIVATE mfq-cpu-ops)
 add_test(NAME mfq-host-memory-copy-test COMMAND mfq-host-memory-copy-test)
 mfq_add_core_test(mfq-moe-dispatch-plan-test moe/moe_dispatch_plan_test.cpp)
-target_include_directories(mfq-moe-dispatch-plan-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
+target_link_libraries(mfq-moe-dispatch-plan-test PRIVATE mfq-cpu-execution)
+target_include_directories(mfq-moe-dispatch-plan-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS} ${PROJECT_SOURCE_DIR}/engine/include)
 add_executable(mfq-moe-residency-bench ${PROJECT_SOURCE_DIR}/../bench/moe_residency_bench.cpp)
 target_link_libraries(mfq-moe-residency-bench PRIVATE mfq-engine)
 target_include_directories(mfq-moe-residency-bench PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
@@ -134,6 +135,7 @@ target_include_directories(mfq-moe-cache-policy-test PRIVATE ${MFQ_ENGINE_PRIVAT
 target_compile_features(mfq-moe-cache-policy-test PRIVATE cxx_std_17)
 add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test host/tensor_parallel_test.cpp)
+target_include_directories(mfq-tensor-parallel-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS} ${PROJECT_SOURCE_DIR}/engine/include)
 
 add_executable(mfq-cuda-model-plan-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/engine/model_plan_test.cpp
@@ -184,14 +186,14 @@ if(MSVC)
 endif()
 add_test(NAME mfq-moe-cache-profile-test COMMAND mfq-moe-cache-profile-test)
 
-if(TARGET mfq-paged-prefix-cache)
+if(TARGET mfq-prefix-blocks)
     add_executable(mfq-paged-prefix-cache-test
         engine/mfq_paged_prefix_cache_test.cpp
     )
     target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
         mfq-engine
-        mfq-paged-prefix-cache
+        mfq-prefix-blocks
     )
     target_compile_features(mfq-paged-prefix-cache-test PRIVATE cxx_std_17)
     add_test(NAME mfq-paged-prefix-cache-test COMMAND mfq-paged-prefix-cache-test)
@@ -209,3 +211,8 @@ if(TARGET mfq-runtime-communication)
     target_compile_features(mfq-runtime-profile-test PRIVATE cxx_std_17)
     add_test(NAME mfq-runtime-profile-test COMMAND mfq-runtime-profile-test)
 endif()
+
+add_executable(mfq-qsa-sequence-test engine/qsa_sequence_test.cpp)
+target_link_libraries(mfq-qsa-sequence-test PRIVATE mfq-engine mfq-qsa-kv-store)
+target_include_directories(mfq-qsa-sequence-test PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS})
+add_test(NAME mfq-qsa-sequence-test COMMAND mfq-qsa-sequence-test)
