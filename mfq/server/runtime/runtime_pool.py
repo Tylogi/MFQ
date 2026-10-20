@@ -139,6 +139,16 @@ _WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
+# WDDM shares the GPU with the desktop compositor and pages overcommitted
+# allocations into host memory instead of failing them. A worker that fills
+# the device makes the whole desktop unstable, so leave a fifth of it free.
+_WINDOWS_VRAM_RESERVE_BYTES = 4 << 30
+_WINDOWS_VRAM_RESERVE_FRACTION = 5
+
+
+def _wddm_host() -> bool:
+    """Whether CUDA devices are driven through the Windows display driver model."""
+    return os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -3729,7 +3739,19 @@ class RuntimePool:
         capacity = self._cuda_discrete_device_capacity(request)
         if not capacity:
             return None
-        return max(1, capacity - max(1 << 30, capacity // 16))
+        configured = self.runtime_environment.get(
+            "MFQ_CUDA_VRAM_LIMIT_GIB", os.environ.get("MFQ_CUDA_VRAM_LIMIT_GIB")
+        )
+        if configured:
+            try:
+                return max(1, min(capacity, int(float(configured) * (1 << 30))))
+            except ValueError:
+                pass
+        if _wddm_host():
+            reserve = max(_WINDOWS_VRAM_RESERVE_BYTES, capacity // _WINDOWS_VRAM_RESERVE_FRACTION)
+        else:
+            reserve = max(1 << 30, capacity // 16)
+        return max(1, capacity - reserve)
 
     def _apply_automatic_expert_residency(
         self,
