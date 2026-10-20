@@ -32,13 +32,20 @@ void exercise_large_batches(const std::filesystem::path& base) {
     mfq::FileRangeReader reader(path,mfq::FileReadMode::Direct);
     const std::array<std::size_t,3> offsets{3,37,7*mib+5};
     const std::array<std::size_t,3> sizes{17,11*mib+17,9*mib+33};
+#if defined(_WIN32) || defined(__linux__)
+    const auto staging_limit=std::max<std::size_t>(8*mib,reader.alignment());
+#else
+    const auto staging_limit=*std::max_element(sizes.begin(),sizes.end())+2*reader.alignment();
+#endif
     std::array<std::vector<std::byte>,3> output;
     std::vector<mfq::ReadSpan> spans;
     for(std::size_t i=0;i<sizes.size();++i) {
         output[i].resize(sizes[i]+2);
         spans.push_back({offsets[i],output[i].data()+1,sizes[i]});
     }
+#if defined(_WIN32) || defined(__linux__)
     std::uint64_t allocations=0;
+#endif
     for(int round=0;round<2;++round) {
         for(auto& field:output)std::fill(field.begin(),field.end(),std::byte{0x5a});
         reader.read_batch(spans);
@@ -49,11 +56,16 @@ void exercise_large_batches(const std::filesystem::path& base) {
                 "large batch wave changed field bytes");
         }
         const auto stats=reader.stats();
-        require(!stats.staging_bytes && stats.staging_peak_bytes<=std::max<std::size_t>(8*mib,reader.alignment()),
+        require(!stats.staging_bytes && stats.staging_peak_bytes<=staging_limit,
             "large batch exceeded reusable staging capacity");
+#if defined(_WIN32) || defined(__linux__)
         if(!round)allocations=stats.staging_allocations;
         else require(stats.staging_allocations==allocations,
             "large batch discarded its staging arena between reads");
+#else
+        require(stats.staging_cached_bytes<=8*mib,
+            "fallback batch retained oversized staging storage");
+#endif
     }
 }
 void exercise_coalesced_staging(const std::filesystem::path& base) {
