@@ -11,6 +11,7 @@
 #include "models/qwen4_exp/ops.h"
 #include "core/mtp.h"
 #include "core/grid_vision_component.h"
+#include "models/nemotron_h/radio_vision.h"
 #include "cuda_runtime_config.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
@@ -29,6 +30,8 @@ struct RuntimeComponents {
     std::optional<
         mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent>
         grid_vision;
+    std::optional<mfq::cuda::nemotron_h::CudaRadioPromptComponent>
+        radio_vision;
     std::unique_ptr<MtpModule> mtp;
     Model* language_override = nullptr;
     std::unique_ptr<mfq::cuda::minicpmo45::Components> composite;

@@ -535,10 +535,11 @@ def test_native_rejects_inconsistent_config(tmp_path, error):
     assert "nemotron_h_check " not in process.stdout
 
 
-def test_native_rejects_declared_vision_component(tmp_path):
+def test_native_rejects_a_vision_component_without_its_data_contract(tmp_path):
     config, weights = model_fixture(("mamba", "moe", "attention"))
-    # The component inventory only needs one tensor under its root; the
-    # adapter must still refuse to load a graph it cannot execute.
+    # The adapter resolves vision by the declared implementation and input
+    # contract, so an incomplete declaration (no `radio_cpe.v1`) must fail
+    # instead of loading a tower it cannot feed.
     weights["vision.patch_embedding.weight"] = np.ones((4, 4), np.float32)
     path = tmp_path / "components.mfq"
     write_nemotron_fixture(
@@ -547,7 +548,7 @@ def test_native_rejects_declared_vision_component(tmp_path):
                                implementation="radio", policy="optional"),))
     process = run_fixture(path)
     assert process.returncode != 0
-    assert "not implemented" in process.stderr
+    assert "radio/radio_cpe.v1" in process.stderr
     assert "nemotron_h_check " not in process.stdout
 
 

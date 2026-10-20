@@ -19,6 +19,10 @@ inline constexpr std::string_view kMfqGridVisionInputContract =
     "grid_vision.v1";
 inline constexpr std::string_view kMfqGridMropePositionPolicy =
     "grid_mrope";
+// Cropped-position-embedding towers (RADIO) take normalized row-major patches
+// and expose no multimodal position policy.
+inline constexpr std::string_view kMfqRadioCpeInputContract =
+    "radio_cpe.v1";
 
 struct MfqGraphTopology {
     std::int64_t text_layers = 0;

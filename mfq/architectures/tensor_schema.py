@@ -35,6 +35,9 @@ CANONICAL_TENSOR_SCHEMA_VERSION = 1
 CANONICAL_TENSOR_NAMESPACE = "mfq.tensor"
 GRID_VISION_INPUT_CONTRACT = "grid_vision.v1"
 GRID_MROPE_POSITION_POLICY = "grid_mrope"
+# Cropped-position-embedding vision towers (RADIO) take normalized row-major
+# patches and reserve one template token per pixel-shuffled patch group.
+RADIO_CPE_INPUT_CONTRACT = "radio_cpe.v1"
 
 
 class TensorComponent(str, Enum):
@@ -2530,7 +2533,7 @@ register_tensor_schema(
                 TensorComponent.VISION,
                 "vision",
                 "radio",
-                input_contract="radio_cpe.v1",
+                input_contract=RADIO_CPE_INPUT_CONTRACT,
                 capabilities=("vision",),
             ),
             GraphComponentSpec(
@@ -2550,6 +2553,7 @@ __all__ = [
     "GraphTopology",
     "GraphComponentSpec",
     "GRID_MROPE_POSITION_POLICY",
+    "RADIO_CPE_INPUT_CONTRACT",
     "GRID_VISION_INPUT_CONTRACT",
     "ModelGraphSpec",
     "TensorComponent",

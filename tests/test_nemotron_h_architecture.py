@@ -728,13 +728,15 @@ def test_graph_spec_separates_radio_vision_from_the_text_backbone() -> None:
     assert "mtp." not in encoded
 
 
-def test_capabilities_register_the_family_without_advertising_media() -> None:
+def test_capabilities_register_images_but_no_video_or_audio() -> None:
+    """The RADIO tower is wired; the checkpoint declares no video/audio ids."""
+
     for model_type in ("nemotron_h", "nemotron_h_text", "nemotron_h_omni"):
         profile = capabilities_for_architecture(model_type)
         assert profile.architecture_family == "nemotron_h"
         assert profile.features.model_dump() == {
             "text": True,
-            "image_input": False,
+            "image_input": True,
             "video_input": False,
             "audio_input": False,
             "audio_output": False,

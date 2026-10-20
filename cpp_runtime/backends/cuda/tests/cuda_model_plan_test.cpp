@@ -176,6 +176,8 @@ int main() {
         const auto nemotron_plan = cuda_model_plan(nemotron);
         const auto nemotron_state = cuda_component_state(
             nemotron, nemotron_plan, true, true);
+        // A `radio` implementation without the cropped-position data contract
+        // is not executable: the adapter resolves vision from the contract.
         require(
             nemotron_plan.vision == CudaVisionAdapter::none &&
                 nemotron_plan.predictor == CudaPredictorAdapter::nemotron_h &&
@@ -183,6 +185,40 @@ int main() {
                 nemotron_state.mtp_declared && nemotron_state.mtp_supported &&
                 nemotron_state.mtp_enabled,
             "Nemotron-H optional component selection mismatch");
+        auto nemotron_vision = nemotron;
+        nemotron_vision.components.at(1).input_contract =
+            mfq::kMfqRadioCpeInputContract;
+        const auto nemotron_vision_plan = cuda_model_plan(nemotron_vision);
+        require(
+            nemotron_vision_plan.vision == CudaVisionAdapter::radio &&
+                nemotron_vision_plan.backbone == CudaBackbone::nemotron_h,
+            "Nemotron-H RADIO adapter was not selected from its data contract");
+        require_capabilities(
+            cuda_runtime_capabilities(
+                nemotron_vision, nemotron_vision_plan,
+                cuda_component_state(nemotron_vision, nemotron_vision_plan, true, true),
+                true, false),
+            {true, true, false, false, false, false, true},
+            "Nemotron-H RADIO media capabilities mismatch");
+        // The same component on another backbone stays unselected: the adapter
+        // list is per backend, not per contract string alone.
+        auto radio_on_qwen = nemotron_vision;
+        radio_on_qwen.backbone = "qwen3_5";
+        require(
+            cuda_model_plan(radio_on_qwen).vision == CudaVisionAdapter::radio,
+            "RADIO data contract was not resolved independently of the backbone");
+        auto radio_with_position_policy = nemotron_vision;
+        radio_with_position_policy.components.at(1).position_policy = "grid_mrope";
+        require(
+            cuda_model_plan(radio_with_position_policy).vision ==
+                CudaVisionAdapter::none,
+            "RADIO adapter accepted a multimodal position policy");
+        auto radio_with_other_contract = nemotron_vision;
+        radio_with_other_contract.components.at(1).input_contract = "other.v1";
+        require(
+            cuda_model_plan(radio_with_other_contract).vision ==
+                CudaVisionAdapter::none,
+            "RADIO adapter accepted an unknown patch contract");
         const auto nemotron_text = graph_with("nemotron_h");
         require(
             cuda_model_plan(nemotron_text).predictor ==
