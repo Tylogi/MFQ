@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from mfq.architectures.hf_config import text_section
 from mfq.formats.assets import (
     ASSET_MANIFEST_KEY, RuntimeAsset, hf_runtime_assets, model_config_asset,
     model_graph_asset, runtime_asset_manifest,
@@ -42,7 +43,7 @@ def runtime_metadata(root: Path, plans, *, imatrix, imatrix_sha256: str, policy:
 
     config = q.load_hf_model_config(root)
     config = json.loads(json.dumps(config))
-    text = config.get('text_config', config)
+    text = text_section(config)
     mtp = any(p.name.startswith('predictor.') for p in plans)
     if not mtp:
         if 'num_nextn_predict_layers' in text:

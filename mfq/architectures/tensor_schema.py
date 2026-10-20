@@ -189,6 +189,7 @@ SourceShapeValidator = Callable[
     [Mapping[str, object], Mapping[str, tuple[int, ...]]],
     None,
 ]
+RecipeNameMapper = Callable[[str], str | None]
 SourceAssetBuilder = Callable[
     [Path, Mapping[str, object]],
     Sequence["RuntimeAsset"],
@@ -227,6 +228,14 @@ class TensorSchemaRegistration:
     # Optional import-boundary check between the declared geometry and the
     # checkpoint payload, keyed by source tensor name.
     source_shape_validator: SourceShapeValidator | None = None
+    # Canonical name -> llama.cpp/GGUF recipe alias.  A recipe file is a GGUF
+    # artifact, so its tensor spellings are architecture specific; families
+    # register their own mapper instead of the recipe consumer testing a model
+    # name.
+    recipe_name_mapper: RecipeNameMapper | None = None
+    # Families whose routed-expert banks follow the recipe's routed alias
+    # (``ffn_*_exps``) unless calibration selects another precision.
+    recipe_expert_defaults: bool = False
 
     def __post_init__(self) -> None:
         if not self.backbone:
@@ -490,7 +499,42 @@ def map_source_tensor_name(
         raise KeyError(
             f"{registration.architecture} source tensor has no canonical mapping: {source_name}"
         )
+    if mapped is not None and mapped.recipe_name is None:
+        mapped = _with_registered_recipe_name(registration, mapped)
     return mapped
+
+
+def _with_registered_recipe_name(
+    registration: TensorSchemaRegistration,
+    mapped: TensorNameMapping,
+) -> TensorNameMapping:
+    """Fill a missing recipe alias from the registered GGUF spelling table."""
+
+    if registration.recipe_name_mapper is None:
+        return mapped
+    recipe_name = registration.recipe_name_mapper(mapped.canonical_name)
+    if recipe_name is None:
+        return mapped
+    return TensorNameMapping(mapped.canonical_name, mapped.component, recipe_name)
+
+
+def recipe_name_mapper_for_config(
+    config: Mapping[str, object],
+) -> RecipeNameMapper | None:
+    """Return the registered GGUF recipe-name mapper for a model config."""
+
+    registration = tensor_schema_for_config(config)
+    return None if registration is None else registration.recipe_name_mapper
+
+
+def canonical_recipe_name(
+    canonical_name: str,
+    config: Mapping[str, object],
+) -> str | None:
+    """Resolve one canonical tensor to the registered GGUF recipe alias."""
+
+    mapper = recipe_name_mapper_for_config(config)
+    return None if mapper is None else mapper(canonical_name)
 
 
 def model_block(layer: int, suffix: str) -> str:
@@ -2161,6 +2205,63 @@ def _nemotron_h_source_mapper(
     )
 
 
+# llama.cpp spells every Nemotron-H block ``blk.N.attn_norm`` plus its mixer, so
+# the canonical block leaf alone determines the GGUF recipe name.
+_NEMOTRON_RECIPE_ROOTS = {
+    "model.token_embedding.weight": "token_embd.weight",
+    "model.output_norm.weight": "output_norm.weight",
+    "model.output.weight": "output.weight",
+}
+
+_NEMOTRON_RECIPE_SUFFIXES = {
+    "attention.norm.weight": "attn_norm.weight",
+    "linear_attention.a": "ssm_a",
+    "linear_attention.d": "ssm_d",
+    "linear_attention.conv.weight": "ssm_conv1d.weight",
+    "linear_attention.conv.bias": "ssm_conv1d.bias",
+    "linear_attention.dt_bias": "ssm_dt.bias",
+    "linear_attention.in_projection.weight": "ssm_in.weight",
+    "linear_attention.norm.weight": "ssm_norm.weight",
+    "linear_attention.output.weight": "ssm_out.weight",
+    "attention.query.weight": "attn_q.weight",
+    "attention.key.weight": "attn_k.weight",
+    "attention.value.weight": "attn_v.weight",
+    "attention.output.weight": "attn_output.weight",
+    "mlp.router.weight": "ffn_gate_inp.weight",
+    "mlp.router.bias": "exp_probs_b.bias",
+    "mlp.latent.down.weight": "ffn_latent_down.weight",
+    "mlp.latent.up.weight": "ffn_latent_up.weight",
+    "mlp.shared_expert.up.weight": "ffn_up_shexp.weight",
+    "mlp.shared_expert.down.weight": "ffn_down_shexp.weight",
+    "mlp.experts.up.weight": "ffn_up_exps.weight",
+    "mlp.experts.down.weight": "ffn_down_exps.weight",
+    "mlp.up.weight": "ffn_up.weight",
+    "mlp.down.weight": "ffn_down.weight",
+}
+
+
+def nemotron_h_recipe_name(canonical_name: str) -> str | None:
+    """Nemotron-H GGUF recipe aliases for the main text blocks only.
+
+    The GGUF conversion folds the whole MTP head into one trailing block with
+    ``nextn.*`` roots, so the predictor graph (one pre-normed mixer per stage)
+    has no one-to-one recipe name; MTP keeps its own precision policy instead.
+    ``mlp.experts.E.{up,down}.weight`` are per-expert views that the importer
+    banks into ``ffn_{up,down}_exps``, so only the bank name has an alias.
+    """
+
+    root = _NEMOTRON_RECIPE_ROOTS.get(canonical_name)
+    if root is not None:
+        return root
+    match = _NEMOTRON_CANONICAL_BLOCK_RE.match(canonical_name)
+    if match is None or match.group(1) != "model":
+        return None
+    if _NEMOTRON_CANONICAL_EXPERT_RE.match(match.group(3)) is not None:
+        return None
+    alias = _NEMOTRON_RECIPE_SUFFIXES.get(match.group(3))
+    return f"blk.{match.group(2)}.{alias}" if alias is not None else None
+
+
 def _nemotron_h_block_shape(
     contract: NemotronHConfig,
     mixer: str,
@@ -2388,6 +2489,8 @@ register_tensor_schema(
         architecture="qwen4_exp",
         aliases=("qwen4_exp_text",),
         source_mapper=_qwen4_source_mapper,
+        recipe_name_mapper=qwen4_recipe_name,
+        recipe_expert_defaults=True,
     )
 )
 
@@ -2528,6 +2631,8 @@ register_tensor_schema(
             ".mlp.router.bias",
         ),
         source_shape_validator=_nemotron_h_source_shape_validator,
+        recipe_name_mapper=nemotron_h_recipe_name,
+        recipe_expert_defaults=True,
         component_specs=(
             GraphComponentSpec(
                 TensorComponent.VISION,
@@ -2559,12 +2664,16 @@ __all__ = [
     "TensorComponent",
     "TensorNameMapping",
     "TensorSchemaRegistration",
+    "canonical_recipe_name",
     "canonical_source_tensor_map",
     "graph_spec_for_plan",
     "graph_spec_for_source_names",
     "map_source_tensor_name",
     "model_block",
+    "nemotron_h_recipe_name",
     "predictor_block",
+    "qwen4_recipe_name",
+    "recipe_name_mapper_for_config",
     "register_tensor_schema",
     "source_runtime_assets",
     "tensor_schema_for_config",

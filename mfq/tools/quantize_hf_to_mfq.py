@@ -39,7 +39,6 @@ from mfq.architectures.tensor_schema import (
     TensorComponent,
     graph_spec_for_plan,
     map_source_tensor_name,
-    qwen4_recipe_name,
     source_runtime_assets,
     tensor_schema_for_config,
     topology_from_config,
@@ -1147,6 +1146,7 @@ _RECIPE_SPECS = {
 # converter.  The source container changes; the requested MFQ dtype does not.
 _RECIPE_TARGETS = {
     "IQ1_M": "NVQ1-L",
+    "IQ1_S": "NVQ1-S",
     "IQ2_S": "NVQ2J-XL",
     "IQ2_XS": "NVQ2J-L",
     "IQ2_XXS": "NVQ2J",
@@ -1154,6 +1154,8 @@ _RECIPE_TARGETS = {
     "IQ3_XXS": "NVQ3J",
     "IQ4_NL": "NINT4",
     "IQ4_XS": "NINT4",
+    # ggml Q2_0 (id 42) is a 2-bit block type; it shares NINT2 with Q2_K.
+    "Q2_0": "NINT2",
     "Q2_K": "NINT2",
     "Q3_K": "NINT3",
     "Q4_0": "NINT4",
@@ -1931,8 +1933,9 @@ def _hf_imatrix_names(item: TensorPlan) -> tuple[str, ...]:
     append(_hf_to_gguf_name(item.name))
     if item.source_name is not None and item.transform is None:
         append(_hf_to_gguf_name(item.source_name))
+    # The recipe alias comes from the architecture's registered GGUF spelling,
+    # so a llama.cpp imatrix matches even without a recipe file.
     append(item.gguf_name)
-    append(qwen4_recipe_name(item.name))
     # Accept imatrix artifacts produced in an HF namespace as well as the
     # canonical llama.cpp GGUF namespace.
     append(item.name)
@@ -3069,7 +3072,6 @@ def _calibration_target(selection) -> str:
 
 
 _FLASH_NEXT_TEXT_TYPES = frozenset({"qwen4_exp_text", "glm5_next_text"})
-_NEMOTRON_TEXT_TYPES = frozenset({"nemotron_h", "nemotron_h_text"})
 _CANONICAL_SEPARATE_EXPERT_RE = re.compile(
     r"^((?:model|vision)\.block\.\d+\.mlp\.experts|"
     r"predictor\.(?:block|stage)\.\d+\.mlp\.experts)\."
@@ -3525,6 +3527,16 @@ def _plan(
     float32_weight_roles = (
         canonical_schema.float32_weight_roles if canonical_schema is not None else ()
     )
+    recipe_name_mapper = (
+        canonical_schema.recipe_name_mapper if canonical_schema is not None else None
+    )
+    recipe_expert_defaults = bool(
+        canonical_schema is not None and canonical_schema.recipe_expert_defaults
+    )
+
+    def recipe_alias(canonical_name: str) -> str | None:
+        return recipe_name_mapper(canonical_name) if recipe_name_mapper is not None else None
+
     model_config = text_section(raw_config)
     if not isinstance(model_config, dict):
         raise ValueError("HF text_config must be an object")
@@ -3537,7 +3549,6 @@ def _plan(
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
     is_deepseek_v41 = model_config.get("model_type") == "deepseek_v41_text"
-    is_nemotron_h = model_config.get("model_type") in _NEMOTRON_TEXT_TYPES
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
@@ -3551,11 +3562,6 @@ def _plan(
         raise ValueError(
             "DeepSeek-V4.1 has no GGUF recipe mapping; use an MFQ standard "
             "preset or a calibration scheme"
-        )
-    if is_nemotron_h and recipe_types is not None:
-        raise ValueError(
-            "Nemotron-H has no GGUF recipe mapping; use the native HF "
-            "conversion policy or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
     preserved_ple_scale_names: set[str] = set()
@@ -3610,7 +3616,7 @@ def _plan(
                     shape = (experts, rows // 2 if packed_gate else rows, columns)
                     separate_expert_plans.append(TensorPlan(
                         target_name, metadata.shard, shape, metadata.dtype, "MFE",
-                        gguf_name=qwen4_recipe_name(target_name), source_name=source_name,
+                        gguf_name=recipe_alias(target_name), source_name=source_name,
                         expert_shape=shape,
                         expert_precisions=_glm_expert_precisions(
                             target_name, shape, calibration_scheme,
@@ -3704,9 +3710,17 @@ def _plan(
                 # complete head even when an older GGUF recipe omitted it;
                 # protected fusion/norm tensors remain at source precision.
                 pass
-            elif gguf_name is None or gguf_name not in recipe_types:
-                if model_config.get("model_type") == "qwen4_exp_text":
-                    raise ValueError(f"Qwen4-Exp tensor is absent from GGUF recipe: {name} ({gguf_name})")
+            elif (
+                (gguf_name is None or gguf_name not in recipe_types)
+                # A registered UD recipe pins the main text only; MTP keeps its
+                # own precision policy and is reported outside the ceiling.
+                and descriptor.scope is not TensorScope.PREDICTOR
+            ):
+                if recipe_name_mapper is not None:
+                    raise ValueError(
+                        f"{canonical_schema.architecture} tensor is absent from "
+                        f"GGUF recipe: {name} ({gguf_name})"
+                    )
                 if is_minicpmo45:
                     raise ValueError(
                         "MiniCPM-o 4.5 language tensor is absent from the "
@@ -3759,13 +3773,9 @@ def _plan(
                 canonical_mapping.canonical_name if canonical_mapping is not None else name
             )
             gguf_name = (
-                (
-                    canonical_mapping.recipe_name
-                    if canonical_mapping is not None
-                    else _hf_to_gguf_name(name, mtp_layer_index=mtp_layer_index)
-                )
-                if recipe_types is not None
-                else None
+                canonical_mapping.recipe_name
+                if canonical_mapping is not None
+                else _hf_to_gguf_name(name, mtp_layer_index=mtp_layer_index)
             )
             gguf_type = (
                 recipe_types.get(gguf_name)
@@ -3830,7 +3840,12 @@ def _plan(
                         if source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
                         else dense_dtype
                     )
-                elif name.startswith("mtp.") and gguf_type is None:
+                elif (
+                    name.startswith("mtp.")
+                    or descriptor.scope is TensorScope.PREDICTOR
+                ) and gguf_type is None:
+                    # An MTP head without a recipe entry keeps the family
+                    # default integer precision instead of dense storage.
                     target = default_nint_dtype if len(shape) in (2, 3) else dense_dtype
                 else:
                     target, anchor_gguf_name, anchor_type = _target_for_recipe_name(
@@ -4052,14 +4067,22 @@ def _plan(
                 _spec_for_target(default_nint_dtype, NintSpec()),
             )
         )
-    if model_config.get("model_type") == "qwen4_exp_text" and recipe_types is not None:
+    if recipe_expert_defaults and recipe_types is not None:
+        # Separately stored experts are banked before export, so the family's
+        # routed recipe alias supplies their default precision until the
+        # calibration scheme overrides it.
+        aliased: set[str] = set()
         for item in separate_expert_plans:
-            alias = qwen4_recipe_name(item.name)
+            alias = recipe_alias(item.name)
             if alias is None:
                 continue  # Predictor scope is handled by exclude_mtp/preservation.
             recipe_type = recipe_types.get(alias)
             if recipe_type is None:
-                raise ValueError(f"Qwen4-Exp expert tensor is absent from GGUF recipe: {alias}")
+                raise ValueError(
+                    f"{canonical_schema.architecture} expert tensor is absent from "
+                    f"GGUF recipe: {alias}"
+                )
+            aliased.add(item.name)
             if calibration_scheme is None or (
                 item.name not in calibration_scheme.expert_selections
                 and item.name not in calibration_scheme.selections
@@ -4069,7 +4092,7 @@ def _plan(
                              if target.startswith("NINT") else ExpertPrecision(target))
                 item = replace(item, expert_precisions=(precision,) * item.expert_shape[0])
             out.append(replace(item, gguf_name=alias, gguf_type=recipe_type))
-        out.extend(item for item in separate_expert_plans if qwen4_recipe_name(item.name) is None)
+        out.extend(item for item in separate_expert_plans if item.name not in aliased)
     else:
         out.extend(separate_expert_plans)
     if exclude_mtp:

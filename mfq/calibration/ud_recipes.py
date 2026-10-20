@@ -3,12 +3,13 @@ from decimal import Decimal
 from pathlib import Path
 
 from mfq._alphaq_profiles import UD_MODELS, UD_TIERS
+from mfq.architectures.hf_config import text_section
 
 __all__ = ['UD_MODELS', 'UD_TIERS', 'registered_model', 'automatic_recipe']
 
 
 def registered_model(config):
-    text = config.get('text_config', config)
+    text = text_section(config)
     model = UD_MODELS.get(text.get('model_type'))
     if model is None or any(text.get(k) != v for k, v in model['config'].items()):
         return None
