@@ -1,6 +1,6 @@
 # CUDA 重构基线（阶段 0）
 
-日期：2026-10-15。对应 [refactor.md 阶段 0](../../docs/refactor.md#阶段-0固定基线与切换条件) 与 [plan.md §1](../../docs/plan.md)；已知缺陷账本见 [bugs.md](../../docs/bugs.md)。
+日期：2026-10-15。对应 [refactor.md 阶段 0](../../docs/refactor.md#阶段-0固定基线与切换条件) 与 [plan.md §1](../../docs/plan.md)；已知缺陷账本见 [bugs.md](../../docs/bugs.md)。全阶段的测试契约（跑哪些入口、需要什么环境、怎么算通过）唯一维护在 [plan.md §4 全阶段测试与验收](../../docs/plan.md#4-全阶段测试与验收)；本文件只保存测量记录与历史口径，不另立测试清单。
 本文件只记录"当前实际跑到什么结果"，不记录目标。重构过程中每完成一个阶段，就在对应行追加新链的结果，旧链结果保留到该 family 删除为止。
 
 对照基线 commit：`4bce8b5c cuda: name the family operations for what they do, not for the seam`。
@@ -68,11 +68,20 @@
 
 ## 重跑方法
 
-采集脚本已入库：`scripts/stage0-matrix.sh <build-dir> <out-dir>`。它串行跑上面全部格子，每格写入 `$OUT/results.tsv`：格名、状态（`pass` / `fail` / `missing-env` / `untested`）、退出码、主机 RSS、完整命令和关键输出，同时保留完整日志。GPU 采样（`gpu.before`/`gpu.samples`/`gpu.peak`）是整轮峰值差值，不是逐格；只有 `long_decode_rss` 有主机 RSS，其余格留空。尾延迟、logits 基线、随机采样分布三行以 `untested` 写入，不假装采集过。任一格 `fail` 则脚本退出非 0；`missing-env` 不算失败但会出现在汇总计数里。已用假 `mfq-diagnostics`（固定退出 7）验证：11 格全部记为 `fail`，脚本退出 1。权重与输入用 `MFQ_MODEL`/`MFQ_IDS` 覆盖，默认就是上表的 0.8B 与 12 token trace。
+采集脚本已入库：`sh scripts/stage0-matrix.sh <build-dir> <out-dir>`。它串行跑上面全部格子，每格写入 `$OUT/results.tsv`：格名、状态（`pass` / `fail` / `missing-env` / `untested`）、退出码、主机 RSS、完整命令和关键输出，同时保留完整日志。GPU 采样（`gpu.before`/`gpu.samples`/`gpu.peak`）是整轮峰值差值，不是逐格；只有 `long_decode_rss` 有主机 RSS，其余格留空。尾延迟、logits 基线、随机采样分布三行以 `untested` 写入，不假装采集过。权重与输入用 `MFQ_MODEL`/`MFQ_IDS` 覆盖，默认就是上表的 0.8B 与 12 token trace。
 
-## 旧构建的串行对照
+2026-10-16 起脚本的口径（fixture 测试见「G0 采集脚本可信度」）：
 
-不保留任何旧构建产物，只保留复现方法。脚本在 `refactor/cuda` 上，旧版单独编到 `build-base`，切回分支后用同一份脚本分别指向两个构建目录：
+- 输出目录必须是新建的或空的。非空时在跑任何工具之前退出 3，两轮结果不会被混进同一份 `results.tsv`。
+- 退出码：`0` = 所有格子 `pass`；`1` = 至少一格 `fail`；`2` = 没有 `fail` 但存在 `untested` 或 `missing-env`，即本轮不完整、不算验收；`3` = 开跑前被拒（输出目录非空、缺 `mfq-diagnostics`）。固定的三行 `untested` 意味着脚本现在不可能返回 `0`，这是刻意的：缺证据的运行不能报全绿。
+- `$OUT/provenance.txt` 记录采集脚本自身与本次真正请求的原生可执行文件及 `CMakeCache.txt` 的 SHA256、采集脚本所在仓库的 git revision 与 dirty 文件数、`CMakeCache.txt` 里存在的配置 key（本机同时有 `CMAKE_CUDA_ARCHITECTURES=75` 与 `MFQ_CUDA_ARCHITECTURES=86`，两者都是配置项，不矛盾）、完整调用命令与 `MFQ_*` 取值。HEAD 加 dirty 计数不能识别改过的脚本，所以脚本自己的哈希单独记。缓存 key 不能证明实际编译出的 arch；二进制自己的源码 revision 记 `unknown`，`MFQ_BUILD_REVISION` 只是调用方声明，脚本会原样标注 `caller-declared, not verified`。
+- `nvidia-smi` 采样进程只由本脚本启动，正常退出与收到 `INT`/`TERM` 时由 trap 终止并 reap。每次查询先单独取 stdout 与退出码再判定：退出码必须为 0，输出必须是恰好一个非空整数（空输出、多行、嵌换行、非数字都算无效），通过才写一条采样数字，否则写一条 `invalid-query` 标记行；原始查询输出不会当成可信值追加进采样。基线读数同样逐条校验。只要测量有效性丢了（基线无效、查询非 0、采样里混有 `invalid-query`、没有采样），`gpu.peak` 就写 `unavailable` 并附原因。单卡假设已写明：一次读数多行（多卡）不合并、不比较。基线之后的最大值低于基线时，保留观测到的 before/peak 数字，但 `gpu_delta_mib=unavailable`，原因是运行期间整卡占用变了且无法归因到本进程；不钳到 0，也不写负增量。
+- 只有 `CUDA allocation failed` 与 `CUDA VRAM leaves no workspace` 这两个已知外部显存失败记 `missing-env`；`cannot load`、`not found` 这类应用错误按真实退出码记 `fail`，前置缺失（模型目录、tokenizer、execution-scope 可执行文件）在调用前单独判定并写精确原因。
+- chunked prefill 现在是第 12 格：`MFQ_TOKENIZER` 指向 tokenizer-only GGUF，缺参数就是 `missing-env`，不再靠猜。
+
+## 旧构建的串行对照（历史操作记录，不是当前指令）
+
+不保留任何旧构建产物，只保留复现方法。**下面这段是当时那一轮的操作记录**：当时在 `refactor/cuda` 分支上、工作树干净，当时的 HEAD 是 `97a58dc7`：
 
 ```bash
 git checkout 4bce8b5c
@@ -80,11 +89,17 @@ cmake -S csrc -B build-base -DMFQ_CUDA_ARCHITECTURES=86 -DMFQ_BUILD_METAL_RUNTIM
       -DMFQ_BUILD_RUNTIME_COMMUNICATION=ON -DBUILD_TESTING=ON
 cmake --build build-base -j 12      # 退出 0
 git checkout refactor/cuda          # 脚本回到工作树，旧构建目录不动
-sh scripts/stage0-matrix.sh build-base /tmp/s0-base   # 旧版结果
-sh scripts/stage0-matrix.sh build    /tmp/s0-head    # 新版结果
+sh scripts/stage0-matrix.sh build-base "$(mktemp -d /tmp/s0-base.XXXXXX)"   # 旧版结果
+sh scripts/stage0-matrix.sh build    "$(mktemp -d /tmp/s0-head.XXXXXX)"   # 新版结果
 ```
 
-`build-base` 对应 `4bce8b5c`，`build` 对应当前 HEAD；两个结果目录里的 `results.tsv` 就是对照物。旧提交里没有采集脚本，所以不能先 checkout 再跑脚本。
+保留 `-j 12` 只作为当时的调用记录，不构成对编译并发的建议（口径见 plan.md §4.4）。
+
+脚本不往非空目录里写，所以每次重跑选一个新目录（`mktemp -d`），旧结果目录留着不覆盖。
+
+当时的对照口径：`build-base` 对应 `4bce8b5c`，`build` 对应**当时**的 HEAD `97a58dc7`；两个结果目录里的 `results.tsv` 就是对照物。旧提交里没有采集脚本，所以不能先 checkout 再跑脚本。
+
+今天不能照抄这段：当前工作树有未提交的采集脚本改动与未跟踪的测试文件，`git checkout` 会打断这些工作。现在要重建对照，应在**隔离的干净源码与构建目录**里按固定 ref 各配一份（另建 clone 或 `git worktree add` 到工作区外），不改当前脏工作树；`build-base` 目前不存在。当前 `build` 里的二进制在重新构建并记录身份之前，源码 revision 按 `unknown` 处理，不能当作某个 ref 的产物。下面的对照表与数值保持历史口径不变。
 
 | 项 | 基线 `4bce8b5c` | HEAD `97a58dc7` |
 | --- | --- | --- |
@@ -152,21 +167,47 @@ Metal 共 55 个 CTest 全部要求 macOS/MLX，本机一个都跑不了：除�
 | `flash_next` | 未测（`mlx_qwen4_causal_lm.cpp`） | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
 | `minicpmo45` | 未测 | 未测 | 同上不支持 | 同上 | 同上 | 同上不支持 | 同上 | 未测 |
 
-### chunked prefill 为什么记缺环境
+### chunked prefill 为什么仍记缺环境
 
-`mfq-cuda-execution-scope-test` 的模型分支（`prefill_chunk_size=8`、两个 engine）只在 `argc == 3` 时执行，需要 `<model> <tokenizer-gguf>`。CTest 注册命令不带参数，所以 CTest 通过不能证明该格验证过。本机没有任何带 tokenizer 元数据的 GGUF：手动传 `tokenizer.json` 报 `cannot load tokenizer metadata from GGUF`。测试现在缺参数时会打印 `model_branch=skipped chunked_prefill needs <model> <tokenizer-gguf>`，日志里能直接看出该分支没跑。补齐条件：拿到一个 tokenizer GGUF 后跑
+`mfq-cuda-execution-scope-test` 的模型分支（`prefill_chunk_size=8`、两个 engine）只在 `argc == 3` 时执行，需要 `<model> <tokenizer-gguf>`。CTest 注册命令不带参数，所以 CTest 通过不能证明该格验证过。原先记缺环境的理由是「本机没有任何带 tokenizer 元数据的 GGUF」；这个前置在 2026-10-16 已经补齐（见下节），但真实模型执行仍未跑，所以该格继续按缺环境单列；[bugs.md B02](../../docs/bugs.md) 的记录纠错已修复，不等于该格已验收。
+
+当前卡点是显存而不是参数：该分支要同时驻留两个 Engine，采集时 GPU 被外部进程占用 44831/49140 MiB、空闲约 3.6GB，`--check-engine-isolation` 在同一占用下已经报 `CUDA allocation failed`。GPU 空闲后跑：
 
 ```bash
-build/cuda/mfq-cuda-execution-scope-test ~/models/Qwen/Qwen3.5-0.8B <tokenizer.gguf>
+# 先重建 tokenizer（仅 CPU，不读权重；产物不入库，新 checkout 上重跑即可）
+.venv/bin/python -c 'from mfq.server.runtime.hf_tokenizer import ensure_hf_tokenizer_gguf as e; print(e("~/models/Qwen/Qwen3.5-0.8B", "build/stage0/tokenizers"))'
+
+# 每次采集选一个新输出目录，不覆盖旧日志
+OUT=$(mktemp -d /tmp/s0-head.XXXXXX)
+MFQ_TOKENIZER=build/stage0/tokenizers/Qwen3.5-0.8B-293bd68f584541786961.tokenizer.gguf \
+  sh scripts/stage0-matrix.sh build "$OUT"
+# 或直接单跑该格
+build/cuda/mfq-cuda-execution-scope-test ~/models/Qwen/Qwen3.5-0.8B \
+  build/stage0/tokenizers/Qwen3.5-0.8B-293bd68f584541786961.tokenizer.gguf
 ```
+
+采集脚本现在会把「退出 0 但打印 `model_branch=skipped`」记成 `fail` 而不是 `pass`：零退出只说明没跑模型分支，不说明 chunked prefill 验证过。
 
 矩阵里故意缺三项，不要当成已采集：
 
 | 项 | 状态 | 原因 |
 | --- | --- | --- |
-| 尾延迟 | 未采集 | 现有 CLI 不输出分位延迟，只有 `total_ms/decode_ms` 样本；要补得先有并发压测入口 |
-| logits 基线 | 未采集 | `mfq-eval-kl` 需要参考 logits 产物，本机没有；目前只有 token 序列和 attention 的 `rel/max_abs` |
-| 随机采样分布 | 未采集 | `mfq-diagnostics` 固定 greedy（`temperature=0, top_k=1`）；`mixed_seed_replay=1` 只证明同种子可复现，不证明接受/拒绝分布正确 |
+| 尾延迟 | 未采集 | `--bench-qwen35-mtp` 只打印每样本 `ttft_ms/decode_ms`；9 个混合长度样本、无并发入口，算不出有代表性的 p95/p99，也不写假分位数 |
+| logits 基线 | 未采集 | 采集脚本目前没有采；`mfq-diagnostics --dump-block-trace DIR` 从 `4bce8b5c` 起就能写 `logits.f32`/`trace_meta.jsonl`，所以缺的是采集，不是参考产物（旧原因串已作废） |
+| 随机采样分布 | 未采集 | `mfq-diagnostics` 固定 greedy（`temperature=0, top_k=1`）；`mixed_seed_replay=1` 只证明同种子可复现，不证明接受/拒绝分布正确。CPU 的 `sample_top_k_top_p` 是宿主参考实现（MiniCPM 消费），补不上 CUDA 采样分布基线 |
+
+## G0 采集脚本可信度与 tokenizer 前置（2026-10-16，仅宿主侧）
+
+本节只记录采集脚本与前置产物本身，不含任何 CUDA 数值或性能验收；上面所有历史计数不变。
+
+- 采集脚本改动：输出目录非空拒绝（退出 3）、`provenance.txt` 产物身份（含脚本自身的 SHA256）、采样进程在退出与收到信号时被终止并 reap、每条 GPU 读数按退出码与格式逐条校验（无效则 `unavailable`，单卡假设）、`missing-env` 只认两个已知显存失败、退出码 `0/1/2/3` 区分完整/失败/不完整/拒绝、新增 `chunked_prefill` 格（`MFQ_TOKENIZER`）。CLI 与 `results.tsv` 列形状不变。
+- tokenizer 前置：用生产转换器 `mfq/server/runtime/hf_tokenizer.py:ensure_hf_tokenizer_gguf(~/models/Qwen/Qwen3.5-0.8B, build/stage0/tokenizers)` 生成 tokenizer-only GGUF，不读权重张量、不改模型目录。可复制的生成命令见上节「chunked prefill 为什么仍记缺环境」；产物在 `build/` 下不入库，新 checkout 上重跑该命令即可重建。
+  - 产物：`build/stage0/tokenizers/Qwen3.5-0.8B-293bd68f584541786961.tokenizer.gguf`（10,941,280 字节，SHA256 `b819a45aa4d81d5f61ab4c8854469172ceea05130f9eb4b9a53b6bdb3cb9438b`），源文件摘要与校验口径记在同目录上层 `build/stage0/tokenizer-provenance.txt`；两者都在 `.gitignore` 的 `build/` 下，不入库。
+  - 已校验：`GGUF.tensor_count=0`、`general.name=Qwen3.5-0.8B`、`tokenizer.ggml.pre=qwen35`、248320 个 token 槽位里每个 `tokenizer.json` vocab id 与 26 个 added token id 都对得上、`tokenizer.chat_template` 与 `chat_template.jinja` 逐字相同、`eos=248046`、`pad=248044`。这些只证明产物来自该模型目录，不证明 CUDA 端能用。
+  - 未校验：没有用 `mfq-cuda-execution-scope-test` 加载过它（本轮不跑 GPU）。
+- 脚本 fixture 测试：`tests/test_stage0_matrix.py`，22 项，全部用假 `mfq-diagnostics`/`mfq-cuda-execution-scope-test`/`nvidia-smi`，不碰 GPU、不碰真实模型。覆盖成功调用与真实参数、缺 tokenizer/缺 execution-scope 二进制/缺模型目录、应用错误不被误判为 `missing-env`、显存失败仍记 `missing-env`、`model_branch=skipped` 不算 pass、非空输出目录拒绝且不覆盖上一轮、GPU 遥测的七种失效（基线后的最大值低于基线、基线读数合法但查询退出码非 0、合法与非法采样混在一起、基线无效且一次读数多行即多卡、基线合法但某次查询成功却输出为空、基线合法但每次查询输出两行、查询输出是数字但退出码非 0），后三项用故意放慢的假命令保证采样真的发生；另有 `nvidia-smi` 缺失时不忙轮询（受限 PATH 只提供脚本实际用到的外部命令，并断言没有 `dirname`/`basename`/`uniq` 这类 not found 且 `collector_script` 路径与哈希正确）、收到 `SIGTERM` 后采样进程被终止并 reap、provenance 里脚本/二进制/缓存哈希与 revision 口径。
+- 实测：`.venv/bin/python -m pytest tests/test_stage0_matrix.py -q` → 22 passed；`.venv/bin/python -m pytest tests/test_hf_native_models.py -q -k "tokenizer or template or fingerprint"` → 10 passed（纯宿主 fixture，不含原生/GPU 用例）。
+- 未接受：真实 CUDA 数值与性能基线、chunked prefill 的真实模型执行（B02 的记录纠错已修复，但该格本身仍未验收）、尾延迟与 logits 采集（B14 仍开放）。原生硬件不可用 = 未验收，不是测试通过。
 
 ## 消费者清单
 
@@ -238,11 +279,14 @@ Python 侧不 include 任何 engine 私有头，但 `mfq/kernels/cuda/_ext.py:52
 - Metal 有 55 个 CTest 用例，但 `backends/metal/CMakeLists.txt` 要求 `MFQ_MLX_ROOT` 下有 `libmlx.dylib`/`mlx.metallib` 和 Apple 框架，根 CMake 直接 `MFQ_BUILD_METAL_RUNTIME requires macOS`。本机一个都跑不了，全部记未测。
 - 结论：阶段 4 用 `qwen35` 做第二后端验证（Metal 有 full/GDN 两套 attention 实现，decode app 支持该 backbone）。交错 batch 与 CUDA Graph 两格在 Metal 没有对应机制，不能拿 CUDA 结果代替，也不能因为 Metal 缺这两格就说公共契约不成立。
 
-## 阶段 0 退出条件核对
+## 阶段 0 退出条件核对（历史口径：2026-10-15/16 那一轮）
 
-- 基线可复现：命令、固定输入、采集脚本均已入库；CTest 80/82 与两个失败已定位到源码行。
-- 旧构建可串行对照：基线 commit 的重编方法 + 上面两张对照表，不保留任何旧产物；阶段 2 每完成一段就在同一组命令上重跑。
-- 缺口可跟踪：缺权重 family 6 个、缺环境 4 项（双 Engine、Flash-Next、DeepSeek-V4 真实权重、expert streaming 工作区）、Metal 全部 11 格未测，均在矩阵里单列。
+本节记录的是当时那一轮核对的证据口径，不是当前状态，也不是全阶段测试清单；测试契约见 [plan.md §4](../../docs/plan.md#4-全阶段测试与验收)。下面的计数、数值与已知缺陷状态保持不变，只把「当时成立」与「现在需要重做」分开。
+
+- 当时的记录口径：命令、固定输入、采集脚本均已入库；CTest 80/82 与两个失败已定位到源码行。
+- 可复现性现在并不完整，与上一条分开看：`build-base` 已不在工作区，旧链对照要先按「旧构建的串行对照」一节重建；`build` 里当前二进制的源码 revision 未验证——`provenance.txt` 记的是产物哈希，二进制源码 revision 记 `unknown`，`MFQ_BUILD_REVISION` 只是调用方声明；本轮没有新的真实 GPU 运行。所以「基线可复现」当下只在方法层成立，产物层不成立。
+- 旧构建可串行对照（方法层）：基线 commit 的重编方法 + 上面两张对照表已记录，不保留任何旧产物；阶段 2 每完成一段就在同一组命令上重跑。
+- 缺口可跟踪：缺权重 family 6 个、缺环境 4 项（双 Engine、Flash-Next、DeepSeek-V4 真实权重、expert streaming 工作区）、Metal 全部 11 格未测，均在矩阵里单列。这些缺口作为验收门槛由 plan.md §4 在各阶段按改动消费，不是阶段 0 永久欠下的清单。
 - 未删除任何运行路径：本阶段只新增脚本与本文件，并撤销一个改名回归。
 - 表填完只代表记录完成：上表里只有 CUDA × qwen35 一列是真跑过的，其余列不得当成已验收。
 

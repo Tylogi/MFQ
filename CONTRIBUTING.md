@@ -96,6 +96,10 @@ for old paths or expose implementation directories through a PUBLIC include.
 `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` removes communication modules and the
 serving executable; it does not disable backend, tokenizer, cache, diagnostics
 or evaluation targets. Only serving applications link backend and transport.
+`MFQ_BUILD_CUDA_RUNTIME` is the matching backend switch: only it enables the
+CUDA language, finds the CUDA Toolkit, and adds the CUDA targets, tests and
+benchmarks, so the common engine and its CPU tests configure, build and run
+without invoking a CUDA compiler or linking a CUDA library.
 
 Inside `backends/cuda`, a cross-directory include is written as
 `"<dir>/<name>"` (`#include "ops/moe/moe.h"`, never `"moe.h"` or `"../ops/moe/moe.h"`);
@@ -172,9 +176,19 @@ Before submitting a runtime or quantization change:
 4. Test changed behavior and protect critical ownership rules under `tests/`.
    Source-boundary checks and compilation do not establish numerical accuracy
    or performance; use real model weights for those claims.
-5. Run the focused native tests, the Python suite, and the full CTest suite when
-   the change touches shared runtime behavior. For build-boundary changes,
-   also build and test with `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`.
+5. Per commit, run the focused checks for what you changed: the affected native
+   test targets and the affected Python suites. Run the full native CTest suite
+   and the broader relevant Python integration only at a stage exit or when the
+   change touches shared runtime dependencies. The authoritative test contract -
+   which entry points cover which behavior, what environment they need, and what
+   counts as a pass - is
+   [plan.md §4 全阶段测试与验收](../docs/plan.md#4-全阶段测试与验收); build scope
+   follows its §1.5 G4 table, so a tool cold build stays conditional. Build a
+   target before running `ctest` against it, and treat a CTest skip
+   (`SKIP_RETURN_CODE 77`) or a `model_branch=skipped` line as not verified. For
+   build-boundary changes, also build and test with
+   `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`, and with both `MFQ_BUILD_CUDA_RUNTIME`
+   and `MFQ_BUILD_METAL_RUNTIME` off when the change touches the common engine.
 6. Do not publish generated files, local paths, credentials, model weights, or
    disposable benchmark artifacts.
 
