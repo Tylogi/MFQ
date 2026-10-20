@@ -3,6 +3,7 @@
 #include "storage/weight_loader.h"
 #include "runtime/execution_options.h"
 #include "storage/moe_expert_cache.h"
+#include "core/vision_ops.h"
 #include "models/common/grid_vision_model.h"
 #include <array>
 
@@ -27,43 +28,13 @@ using Tensor = mfq_tensor_backend::Tensor;
 
 namespace detail {
 
-template<class Visitor> void visit_linear(QuantLinear& w,Visitor visit) {
-    MFQ_RUNTIME_CHECK(!w.tensor_parallel(),"streamed vision weights require one CUDA device");
-    auto& n=w.nint;auto& v=w.nvq;
-    for(auto* tensor:{&w.dense,&n.q_packed,&n.row_q_bits,&n.row_q_bit_offsets,&n.q8_zero_scale,
-            &n.sub_scale,&n.sub_min,&n.neuron_scale,&n.neuron_min,&n.route_metadata,
-            &v.indices_packed,&v.aux_packed,&v.sub_scale_packed,&v.neuron_scale,&v.codebook,
-            &v.integer_codebook,&v.decode_records,&w.mxfp4.weight.values,&w.mxfp4.weight.scales,
-            &w.mxfp8.weight.values,&w.mxfp8.weight.scales,&w.mxfp4_sq.weight.blob,
-            &w.mxfp4_sq.weight.row_q,&w.mxfp4_sq.weight.row_symbol_byte_offsets,&w.mxfp4_sq.weight.row_auxiliary,
-            &w.fp8_sq.weight.blob,&w.fp8_sq.weight.row_q,&w.fp8_sq.weight.row_symbol_byte_offsets})
-        if(tensor->defined())visit(*tensor);
-    n.workspaces.clear();v.workspaces.clear();
-}
-
-template<class Weights> Weights to_cuda(Weights weights) {
-    weights.visit_tensors([](Tensor& t){t=t.to(mfq_tensor_backend::kCUDA);});
-    return weights;
-}
-template<class Weights> std::size_t weight_bytes(Weights weights) {
-    std::size_t bytes=0;
-    weights.visit_tensors([&](Tensor& t){bytes+=t.nbytes();});
-    return bytes;
-}
-
-// Finish each loan before yielding to the scheduler. Another request can then
-// decode using the restored experts, including if image preparation is cancelled.
-template<class Forward> Tensor vision_workspace(CudaExecutionContext& execution,std::size_t bytes,Forward forward) {
-    MoePrefillWorkspaceLoan loan(execution.moe_expert_cache);
-    const bool borrowed=loan.begin(bytes)!=0;
-    auto result=forward();
-    if(borrowed) {
-        loan.suspend();
-        result=result.clone();
-        loan.finish();
-    }
-    return result;
-}
+using vision_ops::Affine;
+using vision_ops::VisionAttention;
+using vision_ops::gelu_tanh;
+using vision_ops::to_cuda;
+using vision_ops::visit_linear;
+using vision_ops::vision_workspace;
+using vision_ops::weight_bytes;
 
 inline Tensor required_vector(CudaExecutionContext &execution, const mfq::ModelSource &model,
                               GridVisionTensorRole role, int64_t width, size_t block = 0) {
@@ -74,34 +45,6 @@ inline Tensor required_vector(CudaExecutionContext &execution, const mfq::ModelS
     }
     return value;
 }
-
-struct Affine {
-    QuantLinear linear;
-    Tensor bias;
-    template<class Visitor> void visit_tensors(Visitor visit) {
-        visit_linear(linear,visit);if(bias.defined())visit(bias);
-    }
-
-    static Affine load(CudaExecutionContext &execution, const mfq::ModelSource &model,
-                       GridVisionTensorRole weight, GridVisionTensorRole bias_role,
-                       size_t block = 0) {
-        const auto weight_name = grid_vision_canonical_name(weight, block);
-        const auto bias_name = grid_vision_canonical_name(bias_role, block);
-        Affine result{load_quant_linear(execution, model, weight_name), {}};
-        if (has_tensor(model, bias_name)) {
-            result.bias = load_dense_gpu(execution, model, bias_name);
-            if (result.bias.dim() != 1 || result.bias.size(0) != result.linear.out()) {
-                throw std::runtime_error("grid-ViT affine bias shape mismatch: " + bias_name);
-            }
-        }
-        return result;
-    }
-
-    Tensor operator()(CudaExecutionContext &execution, Tensor input) const {
-        auto output = linear.forward(execution, std::move(input));
-        return bias.defined() ? output + bias.to(output.scalar_type()) : output;
-    }
-};
 
 struct LayerNorm {
     Tensor weight;
@@ -127,106 +70,6 @@ struct LayerNorm {
     }
 };
 
-inline Tensor apply_axial_rope(const Tensor &input, const std::vector<int32_t> &positions,
-                               double theta) {
-    if (input.dim() != 3 || input.size(0) <= 0 || input.size(2) <= 0 || input.size(2) % 4 != 0 ||
-        positions.size() != static_cast<size_t>(input.size(0) * 2)) {
-        throw std::runtime_error("grid-ViT axial RoPE geometry mismatch");
-    }
-    const int64_t tokens = input.size(0);
-    const int64_t head_dim = input.size(2);
-    const int64_t half = head_dim / 2;
-    const int64_t frequencies = half / 2;
-    std::vector<float> cosine(static_cast<size_t>(tokens * head_dim));
-    std::vector<float> sine(cosine.size());
-    for (int64_t token = 0; token < tokens; ++token) {
-        for (int axis = 0; axis < 2; ++axis) {
-            const float position =
-                static_cast<float>(positions[static_cast<size_t>(token * 2 + axis)]);
-            for (int64_t index = 0; index < frequencies; ++index) {
-                const float inverse =
-                    std::pow(static_cast<float>(theta),
-                             -static_cast<float>(2 * index) / static_cast<float>(half));
-                const float angle = position * inverse;
-                const int64_t column = axis * frequencies + index;
-                for (int repeat = 0; repeat < 2; ++repeat) {
-                    const auto offset =
-                        static_cast<size_t>(token * head_dim + repeat * half + column);
-                    cosine[offset] = std::cos(angle);
-                    sine[offset] = std::sin(angle);
-                }
-            }
-        }
-    }
-    const auto cpu = mfq_tensor_backend::TensorOptions()
-                         .dtype(mfq_tensor_backend::kFloat32)
-                         .device(mfq_tensor_backend::kCPU);
-    auto cos =
-        mfq_tensor_backend::tensor(cosine, cpu).reshape({tokens, 1, head_dim}).to(input.device());
-    auto sin =
-        mfq_tensor_backend::tensor(sine, cpu).reshape({tokens, 1, head_dim}).to(input.device());
-    auto source = input.to(mfq_tensor_backend::kFloat32);
-    auto first = source.narrow(-1, 0, half);
-    auto second = source.narrow(-1, half, half);
-    auto rotated = mfq_tensor_backend::cat({-second, first}, -1);
-    return (source * cos + rotated * sin).to(input.scalar_type()).contiguous();
-}
-
-inline Tensor segmented_attention(const Tensor &query, const Tensor &key, const Tensor &value,
-                                  const std::vector<int32_t> &lengths) {
-    std::vector<Tensor> outputs;
-    outputs.reserve(lengths.size());
-    int64_t offset = 0;
-    for (const int32_t length : lengths) {
-        if (length <= 0 || offset + length > query.size(0)) {
-            throw std::runtime_error("grid-ViT attention segment is invalid");
-        }
-        const auto segment = [offset, length](const Tensor &value) {
-            return value.narrow(0, offset, length).transpose(0, 1).unsqueeze(0).contiguous();
-        };
-        auto attended = attention_cuda(segment(query).to(mfq_tensor_backend::kFloat16),
-                                       segment(key).to(mfq_tensor_backend::kFloat16),
-                                       segment(value).to(mfq_tensor_backend::kFloat16),
-                                       1.0 / std::sqrt(static_cast<double>(query.size(2))), false);
-        outputs.push_back(attended.index({0}).transpose(0, 1).contiguous());
-        offset += length;
-    }
-    if (outputs.empty() || offset != query.size(0)) {
-        throw std::runtime_error("grid-ViT attention segments do not cover every patch");
-    }
-    return outputs.size() == 1 ? outputs.front() : mfq_tensor_backend::cat(outputs, 0);
-}
-
-struct VisionAttention {
-    Affine qkv;
-    Affine output;
-    int64_t hidden = 0;
-    int64_t heads = 0;
-    int64_t head_dim = 0;
-    double theta = 10'000.0;
-
-    Tensor operator()(CudaExecutionContext &execution, const Tensor &input,
-                      const GridVisionLayout &layout) const {
-        const int64_t tokens = input.size(0);
-        return mfq::models::grid_vision::attention(
-            input, [&](Tensor value) { return qkv(execution, std::move(value)); },
-            [&](Tensor value) {
-                auto projected = value.reshape({tokens, 3, heads, head_dim});
-                return std::array<Tensor, 3>{projected.select(1, 0), projected.select(1, 1),
-                                             projected.select(1, 2)};
-            },
-            [&](Tensor value) { return apply_axial_rope(value, layout.positions, theta); },
-            [&](Tensor q, Tensor k, Tensor v) {
-                return segmented_attention(q, k, v, layout.segment_lengths);
-            },
-            [&](Tensor value) { return output(execution, value.reshape({tokens, hidden})); });
-    }
-};
-
-inline Tensor gelu_tanh(const Tensor &input) {
-    return mfq_tensor_backend::gelu(input,"tanh");
-}
-
 struct VisionBlock {
     LayerNorm norm1;
     VisionAttention attention;
@@ -243,7 +86,10 @@ struct VisionBlock {
                       const GridVisionLayout &layout) const {
         return mfq::models::pre_norm_layer(
             input, [&](const Tensor &x, int stage) { return stage == 0 ? norm1(x) : norm2(x); },
-            [&](Tensor x) { return attention(execution, x, layout); },
+            [&](Tensor x) {
+                return attention(
+                    execution, x, layout.positions, layout.segment_lengths);
+            },
             [&](Tensor x) {
                 return mfq::models::mlp(
                     std::move(x), [&](Tensor value) { return mlp_up(execution, std::move(value)); },
@@ -256,6 +102,8 @@ struct VisionBlock {
 };
 
 } // namespace detail
+
+using detail::Affine;
 
 class CudaGridVisionEncoder {
   public:
@@ -289,12 +137,16 @@ class CudaGridVisionEncoder {
                                         GridVisionTensorRole::block_norm1_bias, hidden,
                                         config.layer_norm_eps, index),
                 {
-                    detail::Affine::load(execution, model,
-                                         GridVisionTensorRole::block_attention_qkv_weight,
-                                         GridVisionTensorRole::block_attention_qkv_bias, index),
-                    detail::Affine::load(execution, model,
-                                         GridVisionTensorRole::block_attention_output_weight,
-                                         GridVisionTensorRole::block_attention_output_bias, index),
+                    Affine::load(execution, model,
+                                grid_vision_canonical_name(
+                                    GridVisionTensorRole::block_attention_qkv_weight, index),
+                                grid_vision_canonical_name(
+                                    GridVisionTensorRole::block_attention_qkv_bias, index)),
+                    Affine::load(execution, model,
+                                grid_vision_canonical_name(
+                                    GridVisionTensorRole::block_attention_output_weight, index),
+                                grid_vision_canonical_name(
+                                    GridVisionTensorRole::block_attention_output_bias, index)),
                     hidden,
                     config.num_heads,
                     config.head_dim(),
@@ -303,10 +155,16 @@ class CudaGridVisionEncoder {
                 detail::LayerNorm::load(execution, model, GridVisionTensorRole::block_norm2_weight,
                                         GridVisionTensorRole::block_norm2_bias, hidden,
                                         config.layer_norm_eps, index),
-                detail::Affine::load(execution, model, GridVisionTensorRole::block_mlp_up_weight,
-                                     GridVisionTensorRole::block_mlp_up_bias, index),
-                detail::Affine::load(execution, model, GridVisionTensorRole::block_mlp_down_weight,
-                                     GridVisionTensorRole::block_mlp_down_bias, index),
+                Affine::load(execution, model,
+                            grid_vision_canonical_name(
+                                GridVisionTensorRole::block_mlp_up_weight, index),
+                            grid_vision_canonical_name(
+                                GridVisionTensorRole::block_mlp_up_bias, index)),
+                Affine::load(execution, model,
+                            grid_vision_canonical_name(
+                                GridVisionTensorRole::block_mlp_down_weight, index),
+                            grid_vision_canonical_name(
+                                GridVisionTensorRole::block_mlp_down_bias, index)),
             };
             if (block.attention.qkv.linear.neuron_len() != hidden ||
                 block.attention.qkv.linear.out() != 3 * hidden ||
@@ -429,11 +287,17 @@ class CudaGridVisionPromptComponent {
             execution, model, GridVisionTensorRole::merger_norm_weight,
             GridVisionTensorRole::merger_norm_bias, vision.hidden_size, vision.layer_norm_eps);
         auto merger_up =
-            detail::Affine::load(execution, model, GridVisionTensorRole::merger_mlp_up_weight,
-                                 GridVisionTensorRole::merger_mlp_up_bias);
+            Affine::load(execution, model,
+                        grid_vision_canonical_name(
+                            GridVisionTensorRole::merger_mlp_up_weight),
+                        grid_vision_canonical_name(
+                            GridVisionTensorRole::merger_mlp_up_bias));
         auto merger_down =
-            detail::Affine::load(execution, model, GridVisionTensorRole::merger_mlp_down_weight,
-                                 GridVisionTensorRole::merger_mlp_down_bias);
+            Affine::load(execution, model,
+                        grid_vision_canonical_name(
+                            GridVisionTensorRole::merger_mlp_down_weight),
+                        grid_vision_canonical_name(
+                            GridVisionTensorRole::merger_mlp_down_bias));
         if (merger_up.linear.neuron_len() != unit * vision.hidden_size ||
             merger_down.linear.neuron_len() != merger_up.linear.out() ||
             merger_down.linear.out() != vision.out_hidden_size) {
@@ -551,7 +415,7 @@ class CudaGridVisionPromptComponent {
                     .to(mfq_tensor_backend::kInt64);
             });
         co_yield CudaPreparedPrompt{token_ids, std::move(prepared.embeddings), std::move(prepared.positions),
-                prepared.decode_delta, std::move(cache_key)};
+                mfq_tensor_backend::Tensor(), prepared.decode_delta, std::move(cache_key)};
     }
 
     const std::string &input_contract() const noexcept { return input_contract_; }

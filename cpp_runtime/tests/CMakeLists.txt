@@ -182,3 +182,7 @@ if(TARGET mfq-runtime-communication)
     target_compile_features(mfq-runtime-profile-test PRIVATE cxx_std_17)
     add_test(NAME mfq-runtime-profile-test COMMAND mfq-runtime-profile-test)
 endif()
+
+add_executable(mfq-deepseek-v41-vision-layout-test deepseek_v41_vision_layout_test.cpp)
+target_link_libraries(mfq-deepseek-v41-vision-layout-test PRIVATE mfq-models)
+add_test(NAME mfq-deepseek-v41-vision-layout-test COMMAND mfq-deepseek-v41-vision-layout-test)

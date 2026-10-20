@@ -1,4 +1,5 @@
 add_library(mfq-models STATIC
+    common/axial_patch_vision.cpp
     common/model_config.cpp
     deepseek_v4/config.cpp
     deepseek_v41/config.cpp
