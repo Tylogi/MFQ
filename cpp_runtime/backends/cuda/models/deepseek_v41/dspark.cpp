@@ -293,8 +293,9 @@ struct DeepseekV41Dspark final : MtpModule {
             config.hidden * static_cast<std::int64_t>(config.dspark_target_layer_ids.size());
         MFQ_RUNTIME_CHECK(target_hidden.dim() == 3 && target_hidden.size(0) == batch &&
                               target_hidden.size(1) > 0 && target_hidden.size(2) == target_width &&
-                              start_position == position && position >= 0 &&
-                              position + target_hidden.size(1) <= maximum_context &&
+                              start_position >= position && position >= 0 &&
+                              (start_position==position || target_hidden.size(1)>=config.sliding_window) &&
+                              start_position + target_hidden.size(1) <= maximum_context &&
                               rings.size() == stages.size(),
                           "invalid DeepSeek-V4.1 DSpark context append");
         const auto tokens = target_hidden.size(1);
@@ -308,8 +309,9 @@ struct DeepseekV41Dspark final : MtpModule {
         auto slots = positions.remainder(static_cast<double>(config.sliding_window))
                          .to(mfq_tensor_backend::kInt64)
                          .contiguous();
+        auto next_position=start_position;
         mfq::models::deepseek_v41::dspark_context(
-            position, tokens, stages.size(),
+            next_position, tokens, stages.size(),
             [&] {
                 auto floating = target_hidden.to(mfq_tensor_backend::kFloat32);
                 auto scale = (floating.abs().amax(-1, true) / 64.0).clamp_min(1.0);
@@ -331,6 +333,7 @@ struct DeepseekV41Dspark final : MtpModule {
                 return key_value;
             },
             [&](size_t index, Tensor key_value) { rings[index].index_copy_(1, slots, key_value); });
+        position=next_position;
     }
 
     Tensor attention(const Tensor &input, Block &stage, const Tensor &ring) {
@@ -528,6 +531,17 @@ void run_dspark_self_check() {
     bool rejected=false;try{predictor.restore_session_state(broken);}catch(const CudaSessionStateError&){rejected=true;}
     MFQ_RUNTIME_CHECK(rejected && predictor.cache_position()==258 && predictor.rings.front().equal(advanced),
                       "DeepSeek-V4.1 DSpark accepted an incompatible session ring");
+    auto tail=history.narrow(1,129,128).contiguous();
+    predictor.append_target_context(tail,400);
+    auto skipped=predictor.rings.front().clone();
+    predictor.reset();predictor.seed_target_context(tail,528);
+    MFQ_RUNTIME_CHECK(predictor.cache_position()==528 && predictor.rings.front().equal(skipped),
+                      "DeepSeek-V4.1 DSpark restored suffix tail changed absolute ring positions");
+    rejected=false;
+    try{predictor.append_target_context(history.narrow(1,0,1),600);}
+    catch(const std::runtime_error&){rejected=true;}
+    MFQ_RUNTIME_CHECK(rejected && predictor.cache_position()==528,
+                      "DeepSeek-V4.1 DSpark skipped live history without a full replacement window");
 
     auto plan =
         dspark_full_attention_plan(1, 2, 33, mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA));

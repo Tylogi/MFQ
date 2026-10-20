@@ -44,7 +44,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
     require_execution(
         reused_tokens == 0 || (mtp.supports_session_state() && ops.defined(restored_last_hidden) &&
                                   model.cache_pos == static_cast<int64_t>(reused_tokens) &&
-                                  mtp.cache_position() == static_cast<int64_t>(reused_tokens) - 1),
+                                  mtp.cache_position() == static_cast<int64_t>(reused_tokens) -
+                                      (mtp.blockwise_drafting()?0:1)),
         "restored MTP session boundary is incompatible");
     mtp.last_stats = {};
     mtp.last_stats.available = true;
@@ -200,12 +201,14 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             !token_constraint || initial_constraint, "MTP token constraint clone is incomplete");
         int32_t pending = ops.sample_constrained(logits, counts, initial_constraint);
 
-        require_execution(reused_tokens == 0 || !mtp.blockwise_drafting(),
-            "blockwise MTP session restore is unsupported");
         if (mtp.blockwise_drafting()) {
-            if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
-                mtp.seed_target_context(raw, ops.size(input_ids, 1));
-            else mtp.append_target_context(raw, 0);
+            if(reused_tokens)
+                mtp.append_target_context(raw,ops.size(input_ids,1)-ops.size(raw,1));
+            else {
+                if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
+                    mtp.seed_target_context(raw, ops.size(input_ids, 1));
+                else mtp.append_target_context(raw, 0);
+            }
         }
 
         if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {

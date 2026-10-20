@@ -31,17 +31,27 @@ struct Predictor {
     bool legacy = false;
     bool bootstrap = false;
     bool split = false;
+    bool blockwise = false;
+    std::vector<std::pair<int64_t,int64_t>> context_appends;
     int maximum_draft_depth() const { return 3; }
     bool dspark_policy() const { return legacy; }
-    bool blockwise_drafting() const { return false; }
+    bool blockwise_drafting() const { return blockwise; }
     bool supports_session_state() const { return true; }
-    bool teacher_forced_prompt_prime() const { return true; }
+    bool teacher_forced_prompt_prime() const { return !blockwise; }
     bool target_bootstrap_decode() const { return bootstrap; }
     bool split_target_verification() const { return split; }
     bool retains_partial_target_prefix() const { return true; }
     int64_t cache_position() const { return position; }
     void trim_cache_to(int64_t value) { position = value; }
-    void append_target_context(Tensor, int64_t) { throw std::logic_error("not blockwise"); }
+    void append_target_context(Tensor value, int64_t start) {
+        if(!blockwise || start<position || (start>position && value.shape.at(1)<2))
+            throw std::logic_error("invalid blockwise context append");
+        context_appends.emplace_back(start,value.shape.at(1));position=start+value.shape.at(1);
+    }
+    void seed_target_context(Tensor value,int64_t tokens) {
+        if(!blockwise || position || value.shape.at(1)>tokens)throw std::logic_error("invalid context seed");
+        position=tokens-value.shape.at(1);append_target_context(value,position);
+    }
     Tensor draft_block(int, Tensor, int) { throw std::logic_error("not blockwise"); }
     Tensor draft_next(Tensor, Tensor) { throw std::logic_error("not blockwise"); }
 };
@@ -744,6 +754,36 @@ void run_prepared_default_positions() {
     assert(rejected);
 }
 
+void run_restored_blockwise_context() {
+    for(int reused:{0,4})for(bool tail_only:{false,true}) {
+        Model model;model.cache_pos=reused;
+        Predictor predictor;predictor.blockwise=true;predictor.position=reused;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        struct TailOps:Ops {
+            bool tail_only=false;
+            Prefill prefill(PrefillChunk chunk) {
+                auto result=Ops::prefill(chunk);
+                if(tail_only)result.raw.shape[1]=2;
+                return result;
+            }
+        };
+        InferenceOutput output(request,nullptr,"restored-blockwise-context");
+        auto generation=speculative_sequence(TailOps{{model,predictor},tail_only},request,output,
+            16,reused,Tensor{{1,1,1}},nullptr);
+        while(generation.next()){}
+        assert(output.result.completion_tokens==1 && predictor.position==10);
+        const auto expected_start=tail_only?8:reused;
+        assert(predictor.context_appends.size()==1 && predictor.context_appends.front().first==expected_start);
+    }
+    Model model;model.cache_pos=4;Predictor predictor;predictor.blockwise=true;predictor.position=3;
+    InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+    InferenceOutput output(request,nullptr,"invalid-blockwise-context");
+    auto generation=speculative_sequence(Ops{model,predictor},request,output,16,4,Tensor{{1,1,1}},nullptr);
+    bool rejected=false;try{(void)generation.next();}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected && predictor.context_appends.empty() && model.cache_pos==4);
+}
+
 int main() try {
     for (const bool dspark : {false, true}) {
         Model model;
@@ -766,6 +806,7 @@ int main() try {
         assert(model.speculative_start < 0 && model.cache_pos == 3);
     }
     run_prepared_default_positions();
+    run_restored_blockwise_context();
     run(false);
     run(false,true);
     run(false,true,true);
