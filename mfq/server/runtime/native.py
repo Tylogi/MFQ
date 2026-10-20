@@ -37,6 +37,12 @@ class NativeRuntimeError(RuntimeError):
 _NATIVE_DEFAULT_PREFILL_CHUNK_SIZE = 2048
 
 
+# Plain dense expert banks (for example an unquantized MTP head) are resident
+# on the device and run on the dense routed path, outside the RAM expert
+# pipeline, so they neither qualify nor disqualify a model for it.
+_RESIDENT_DENSE_EXPERT_DTYPES = frozenset({"BF16", "F16", "F32"})
+
+
 def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
     """Inspect expert headers without decoding or copying their weight payloads."""
     found = False
@@ -44,6 +50,8 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
         with open_mmap(model) as store:
             for name, record in store.records.items():
                 if weight_role(name) != "experts":
+                    continue
+                if record.dtype in _RESIDENT_DENSE_EXPERT_DTYPES:
                     continue
                 if record.dtype == "NINT":
                     view = store.blob_view(record)
