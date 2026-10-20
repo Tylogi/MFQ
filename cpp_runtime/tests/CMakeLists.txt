@@ -1,6 +1,6 @@
 # Backend-independent native tests. Keep assert checks in Release too.
 if(MSVC)
-    add_compile_options(/UNDEBUG)
+    add_compile_options(/UNDEBUG $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 else()
     add_compile_options(-UNDEBUG)
 endif()
