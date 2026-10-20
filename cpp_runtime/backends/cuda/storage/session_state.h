@@ -16,6 +16,7 @@
 
 struct Dsv4PoolState;
 struct FullBlock;
+namespace mfq::models::deepseek_v41 { struct EngramHashSnapshot; }
 
 struct FullBlockSessionState {
     mfq_tensor_backend::Tensor k;
@@ -43,6 +44,7 @@ enum class TextSessionStateKind : int {
     DeepseekV4,
     GlmDsa,
     Qwen4,
+    DeepseekV41,
 };
 
 struct Dsv4PoolSessionState {
@@ -62,6 +64,11 @@ struct Dsv4BlockSessionState {
     mfq_tensor_backend::Tensor local_cache;
     Dsv4PoolSessionState compressor;
     Dsv4PoolSessionState indexer_compressor;
+};
+
+struct DeepseekV41BlockSessionState {
+    mfq_tensor_backend::Tensor local_kv, compressed_kv, index_k, partial_kv, partial_score;
+    int64_t compressed_length = 0, partial_length = 0;
 };
 
 struct GlmDsaBlockSessionState {
@@ -98,6 +105,7 @@ struct MtpSessionState {
     std::vector<Qwen4BlockSessionState> qwen4_blocks;
     std::vector<mfq_tensor_backend::Tensor> qwen4_positions;
     std::vector<int64_t> qwen4_lengths;
+    std::vector<mfq_tensor_backend::Tensor> deepseek_v41_rings;
     int64_t cache_pos = 0;
     size_t bytes = 0;
 };
@@ -108,13 +116,15 @@ using TextSessionPayload = std::variant<
     std::vector<HybridBlockSessionState>,
     std::vector<Dsv4BlockSessionState>,
     std::vector<GlmDsaBlockSessionState>,
-    std::vector<Qwen4BlockSessionState>>;
+    std::vector<Qwen4BlockSessionState>,
+    std::vector<DeepseekV41BlockSessionState>>;
 
 struct TextSessionState {
     std::vector<int64_t> tokens;
     std::string input_key;
     TextSessionPayload payload;
     mfq_tensor_backend::Tensor qwen4_positions;
+    std::shared_ptr<const mfq::models::deepseek_v41::EngramHashSnapshot> deepseek_v41_engram;
     std::optional<MtpSessionState> mtp;
     int64_t cache_pos = 0;
     int64_t decode_position_delta = 0;

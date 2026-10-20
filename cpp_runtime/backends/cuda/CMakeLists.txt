@@ -346,6 +346,7 @@ endfunction()
 set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/session.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/engram.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/prefill.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp

@@ -207,6 +207,9 @@ std::map<int, std::size_t> TextSessionCache::device_hot_bytes() const {
                         full(block.full_attention); tensor(block.convolution_state); tensor(block.recurrent_state);
                     } else if constexpr (std::is_same_v<Block, Dsv4BlockSessionState>) {
                         tensor(block.local_cache); pool(block.compressor); pool(block.indexer_compressor);
+                    } else if constexpr (std::is_same_v<Block, DeepseekV41BlockSessionState>) {
+                        tensor(block.local_kv); tensor(block.compressed_kv); tensor(block.index_k);
+                        tensor(block.partial_kv); tensor(block.partial_score);
                     } else { tensor(block.kv_cache); tensor(block.index_cache); }
                 }
         }, state.payload);
@@ -214,6 +217,7 @@ std::map<int, std::size_t> TextSessionCache::device_hot_bytes() const {
             tensor(state.mtp->last_target_hidden);
             for (const auto& block : state.mtp->blocks) full(block);
             for (const auto& block : state.mtp->qwen4_blocks) qwen(block);
+            for (const auto& ring : state.mtp->deepseek_v41_rings) tensor(ring);
             for (const auto& value : state.mtp->qwen4_positions) tensor(value);
         }
     });

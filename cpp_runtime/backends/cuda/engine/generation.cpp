@@ -458,13 +458,31 @@ template <class Model> struct CudaGenerationContext {
     }
     bool prepare_snapshot() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm> || std::is_same_v<Model,DeepseekV41CausalLm>) {
             // Retire prefill buffers before copying KV/recurrent state. Evict
             // old hot entries before allocating the incoming checkpoint.
             release_moe_prefill_buffers(model.execution->moe_expert_cache);
             // A prefix stores occupied rows, not the full preallocated context
             // or graph-owned speculative checkpoints.
-            const auto incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            std::size_t incoming=0;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            else {
+                incoming=256; // Rolling Engram history and scalar metadata.
+                const auto prefix_bytes=[](const auto& tensor,int64_t rows) -> std::size_t {
+                    return tensor.defined()?std::size_t(tensor.size(0))*rows*tensor.size(2)*tensor.element_size():0;
+                };
+                for(const auto& item:model.blocks) {
+                    const auto& state=dynamic_cast<const deepseek_v41_runtime::Block&>(*item).state;
+                    incoming+=session_tensor_bytes(state.local_kv)+session_tensor_bytes(state.partial_kv)+
+                        session_tensor_bytes(state.partial_score)+prefix_bytes(state.compressed_kv,state.compressed_length)+
+                        prefix_bytes(state.index_k,state.compressed_length);
+                }
+                if(mtp) {
+                    const auto& c=model.config;
+                    incoming+=std::size_t(c.sliding_window)*sizeof(mfq_half)*
+                        (c.n_mtp_layers*c.head_dim+c.hidden*c.dspark_target_layer_ids.size());
+                }
+            }
             std::size_t hot=0,limit=0;
             for(const auto& metric:cache.metrics()) {
                 if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
@@ -474,7 +492,7 @@ template <class Model> struct CudaGenerationContext {
             if(hot>target)cache.trim_hot(target);
             // Transposing graph KV can temporarily hold a contiguous copy in
             // addition to the checkpoint. Include that peak and metadata.
-            const auto needed=incoming*2+(std::size_t(64)<<20);
+            const auto needed=incoming*(std::is_same_v<Model,Qwen4CausalLm>?2:1)+(std::size_t(64)<<20);
             reserve_workspace(needed);
             const auto available=mfq::cuda::default_context(mfq_current_cuda_device())->available_memory();
             if(available<needed) {

@@ -1,4 +1,5 @@
 #include "models/deepseek_v41/ops.h"
+#include "storage/session_state.h"
 #include "mfq_cuda_moe_ops.h"
 #include <iostream>
 
@@ -128,6 +129,53 @@ void check_positions(const DeepseekV41CausalLm& model,int64_t expected) {
                                 "CED duplicated or lost global KV rows");
     }
 }
+
+void check_session_snapshots() {
+    CudaExecutionContext execution;
+    int cases=0;
+    for(int ratio:{1,2,16})for(int length:{3,257}) {
+        auto model=make_model(execution,ratio);
+        deepseek_v41_prefill_hidden(model,ids(length),64);
+        std::vector<int64_t> tokens(length);
+        for(int i=0;i<length;++i)tokens[i]=i%8;
+        auto saved=model.capture_text_session_state(tokens);
+        require(saved.kind()==TextSessionStateKind::DeepseekV41 && saved.bytes>0,
+                "DeepSeek-V4.1 session support or byte accounting is missing");
+        auto expected=model.hidden_forward(ids(3));
+        const auto expected_hashes=model.shared->engram_hashes.values;
+        model.reset(1);model.hidden_forward(ids(11));
+        model.restore_text_session_state(saved);check_positions(model,length);
+        auto actual=model.hidden_forward(ids(3));
+        require(actual.equal(expected) && model.shared->engram_hashes.values==expected_hashes,
+                "DeepSeek-V4.1 restored attention or Engram changed continuation");
+        model.restore_text_session_state(saved);
+        require(model.hidden_forward(ids(3)).equal(expected),"session restore modified its immutable snapshot");
+        auto broken=saved;
+        auto& layer=std::get<std::vector<DeepseekV41BlockSessionState>>(broken.payload).front();
+        layer.local_kv=layer.local_kv.narrow(1,0,127);
+        bool rejected=false;
+        try{model.restore_text_session_state(broken);}catch(const CudaSessionStateError&){rejected=true;}
+        require(rejected && model.cache_pos==length+3,"invalid session geometry changed the active model");
+        auto hash=*saved.deepseek_v41_engram;
+        model.shared->engram_hash->restore(hash);
+        hash.context.push_back(0);
+        rejected=false;
+        try{model.shared->engram_hash->restore(hash);}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected && model.shared->engram_hash->snapshot().position==length,
+                "invalid Engram snapshot changed rolling history");
+        ++cases;
+    }
+    mfq::models::deepseek_v41::EngramHashState hash(8,3,2,0,{1},{36},{5,7,11,13},{0,5,12,23},{3,5,7},{0,1,2,3,4,5,6,7});
+    const std::array<int64_t,3> prefix{1,2,3};const std::array<uint8_t,3> image{0,1,0};
+    hash.forward(prefix.data(),1,3,0,image.data());
+    auto saved=hash.snapshot();const std::array<int64_t,2> suffix{4,5};
+    auto expected=hash.forward(suffix.data(),1,2,3);
+    hash.restore(saved);
+    auto actual=hash.forward(suffix.data(),1,2,3);
+    require(expected.values==actual.values && saved.context.front()==mfq::models::deepseek_v41::kDeadToken,
+            "Engram session lost an image-span ngram boundary");
+    std::cout<<"session_snapshot_cases="<<cases<<" compressor/ring/Engram/immutable/rejection PASS\n";
+}
 void check_exact_short() {
     CudaExecutionContext execution;
     auto model=make_model(execution);
@@ -220,7 +268,8 @@ int main(int argc,char** argv) try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
     if(argc==2 && std::string(argv[1])=="--modality-routing-check"){check_modality_routing();return 0;}
-    check_modality_routing();check_tail_rope();check_exact_short();check_long_and_cancel();check_retained_prefix();run_dspark_self_check();
+    if(argc==2 && std::string(argv[1])=="--session-check"){check_session_snapshots();run_dspark_self_check();return 0;}
+    check_modality_routing();check_tail_rope();check_exact_short();check_long_and_cancel();check_retained_prefix();check_session_snapshots();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;

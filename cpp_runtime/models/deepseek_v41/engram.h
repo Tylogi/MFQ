@@ -11,6 +11,11 @@
 
 namespace mfq::models::deepseek_v41 {
 inline constexpr int64_t kDeadToken = -1;
+struct EngramHashSnapshot {
+    int batch = 0;
+    std::int64_t position = 0;
+    std::vector<std::int64_t> context;
+};
 struct EngramHashBatch {
     int batch = 0;
     int tokens = 0;
@@ -57,6 +62,23 @@ class EngramHashState {
         speculative_context_.reset();
         speculative_position_ = -1;
         speculative_tokens_.clear();
+    }
+
+    EngramHashSnapshot snapshot() const {
+        if(batch_<=0 || position_<0 || speculative_context_)
+            throw std::runtime_error("Engram session history is not committed");
+        return {batch_,position_,context_};
+    }
+
+    void restore(const EngramHashSnapshot& state) {
+        if(state.batch<=0 || state.position<0 ||
+                state.context.size()!=std::size_t(state.batch)*std::size_t(max_ngram_size_-1) ||
+                std::any_of(state.context.begin(),state.context.end(),[&](auto value) {
+                    return value<kDeadToken || value>=vocabulary_;
+                }))throw std::invalid_argument("Engram session history is incompatible");
+        auto context=state.context;
+        commit_speculative();
+        batch_=state.batch;position_=state.position;context_.swap(context);
     }
 
     void begin_speculative() {

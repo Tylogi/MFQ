@@ -947,7 +947,13 @@ struct DeepseekV41Model : CausalResources {
     void adapter_rollback_speculative(int64_t keep);
 };
 
-extern template struct CudaSessionCodec<DeepseekV41Model>;
+template <> struct CudaSessionCodec<DeepseekV41Model> {
+    using Model = DeepseekV41CausalLm;
+    static TextSessionStateKind kind(const Model& model);
+    static bool supports_paged(const Model& model);
+    static TextSessionState capture(const Model& model,const std::vector<int64_t>& tokens);
+    static void restore(Model& model,const TextSessionState& state);
+};
 
 mfq_tensor_backend::Tensor deepseek_v41_prefill_hidden(
     DeepseekV41CausalLm& model, mfq_tensor_backend::Tensor ids, std::int64_t compute_chunk,

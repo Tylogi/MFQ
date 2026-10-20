@@ -262,12 +262,6 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t position) {
 
 } // namespace mfq::cuda
 
-namespace mfq::cuda {
-
-template struct CudaSessionCodec<DeepseekV41Model>;
-
-} // namespace mfq::cuda
-
 namespace mfq::models {
 template struct deepseek_v41::CausalLm<cuda::CudaCausalOps<cuda::DeepseekV41Model>>;
 } // namespace mfq::models
