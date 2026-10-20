@@ -229,8 +229,10 @@ class HfSafetensorIndex:
                     start = 0 if row_start is None else int(row_start)
                     end = self.shape(name)[0] if row_end is None else int(row_end)
                     value = reader.get_slice(name)[start:end]
-        if dtype is not None or str(device) != "cpu":
-            value = value.to(device=device, dtype=dtype or value.dtype)
+        # safetensors returns views of a private (copy-on-write) file mapping.
+        # Windows charges commit for the whole shard while any view is alive,
+        # so held row slices (embedding lookups) exhausted commit; own the bytes.
+        value = value.to(device=device, dtype=dtype or value.dtype, copy=not self.direct_io)
         return value.contiguous()
 
     def layer_state(
@@ -257,7 +259,8 @@ class HfSafetensorIndex:
             else:
                 with safe_open(str(self.root / shard), framework="pt", device="cpu") as reader:
                     for name in sorted(names):
-                        yield name[len(prefix) :], reader.get_tensor(name)
+                        # Copy out of the shard mapping (see tensor()).
+                        yield name[len(prefix) :], reader.get_tensor(name).clone()
 
 
 def qwen35_head_weight_name(index: HfSafetensorIndex) -> str:
