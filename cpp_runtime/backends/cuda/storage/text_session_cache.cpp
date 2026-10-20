@@ -46,7 +46,8 @@ static std::string cuda_prefix_cache_compatibility_key(
     const mfq::ModelSource &source, int64_t max_position_embeddings) {
     std::ostringstream key;
     key << "mfq-cuda-prefix-v1\n"
-        << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" : "cuda-full-attention-kv-v1") << '\n'
+        << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" :
+            source.architecture()=="deepseek_v41" ? "cuda-deepseek-v41-session-v1" : "cuda-full-attention-kv-v1") << '\n'
         << "context=" << max_position_embeddings << '\n'
         << "architecture=" << source.architecture() << '\n';
     const auto quantization=mfq::cuda::cuda_kv_quantization_tag();
@@ -122,14 +123,23 @@ struct CudaSessionOps {
         const Payloads &payloads, const std::vector<int64_t> &tokens, size_t block_size) {
         if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='2')
             return decode_cuda_qwen4_paged_session(payloads,tokens,block_size);
+        if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='3')
+            return decode_cuda_deepseek_v41_paged_session(payloads,tokens,block_size);
         return decode_cuda_paged_session(payloads, tokens, block_size);
     }
     static auto encode(const Snapshot &state, size_t block_size, size_t index) {
         if(state.kind()==TextSessionStateKind::Qwen4)return encode_cuda_qwen4_paged_block(state,block_size,index);
+        if(state.kind()==TextSessionStateKind::DeepseekV41)return encode_cuda_deepseek_v41_paged_block(state,block_size,index);
         return encode_cuda_paged_block(state, block_size, index);
     }
-    static bool paged_mtp(const Snapshot& state) { return state.kind()==TextSessionStateKind::Qwen4; }
-    static bool partial_blocks(const Snapshot& state) { return state.kind()==TextSessionStateKind::Qwen4; }
+    static bool paged_mtp(const Snapshot& state) {
+        return state.kind()==TextSessionStateKind::Qwen4 || state.kind()==TextSessionStateKind::DeepseekV41;
+    }
+    static bool partial_blocks(const Snapshot& state) { return paged_mtp(state); }
+    static bool paged_media(const Snapshot& state) { return state.kind()==TextSessionStateKind::DeepseekV41; }
+    static bool checkpoint_needs_update(const CudaPagedPayload& payload,const Snapshot& state) {
+        return cuda_paged_checkpoint_needs_update(payload,state);
+    }
     static size_t decodable_blocks(const std::vector<CudaPagedPayload>& payloads) { return cuda_paged_decodable_blocks(payloads); }
     static size_t token_count(const CudaPagedPayload& payload) { return cuda_paged_payload_tokens(payload); }
     static void release_host_cache() { mfq_release_host_allocator_cache(); }
@@ -430,7 +440,8 @@ size_t cuda_paged_payload_tokens(const CudaPagedPayload& payload) {
     if(!payload)throw CudaSessionStateError("null CUDA prefix block");
     CudaPagedReader reader(*payload);std::array<uint8_t,8> magic{};reader.raw(magic.data(),magic.size(),"magic");
     constexpr std::array<uint8_t,8> full_magic{'M','F','Q','C','U','D','1',0};
-    if((magic!=qwen4_magic && magic!=full_magic) || reader.scalar<uint32_t>("version")!=1)
+    constexpr std::array<uint8_t,8> deepseek_magic{'M','F','Q','C','U','D','3',0};
+    if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic) || reader.scalar<uint32_t>("version")!=1)
         throw CudaSessionStateError("invalid CUDA prefix block header");
     (void)reader.scalar<uint32_t>("start");return reader.scalar<uint32_t>("count");
 }
@@ -439,6 +450,10 @@ size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>& payloads
         const auto& payload=payloads[count-1];
         (void)cuda_paged_payload_tokens(payload);
         if((*payload)[6]=='1')return count;
+        if((*payload)[6]=='3') {
+            if(cuda_deepseek_v41_paged_exact(payload))return count;
+            continue;
+        }
         CudaPagedReader reader(*payload);if(read_qwen4_header(reader).exact)return count;
     }
     return 0;

@@ -238,6 +238,11 @@ CudaPagedPayload encode_cuda_qwen4_paged_block(const TextSessionState&,size_t,si
 TextSessionState decode_cuda_qwen4_paged_session(const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t);
 size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>&);
 size_t cuda_paged_payload_tokens(const CudaPagedPayload&);
+CudaPagedPayload encode_cuda_deepseek_v41_paged_block(const TextSessionState&,size_t,size_t);
+TextSessionState decode_cuda_deepseek_v41_paged_session(
+    const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t);
+bool cuda_paged_checkpoint_needs_update(const CudaPagedPayload&,const TextSessionState&);
+bool cuda_deepseek_v41_paged_exact(const CudaPagedPayload&);
 
 bool session_tensor_layout_matches(
     const mfq_tensor_backend::Tensor& target,

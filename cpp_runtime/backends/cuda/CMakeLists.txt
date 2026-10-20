@@ -418,6 +418,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/deepseek_v41_paged_session.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp

@@ -45,7 +45,9 @@ TextSessionStateKind CudaSessionCodec<DeepseekV41Model>::kind(const Model& model
         })?TextSessionStateKind::DeepseekV41:TextSessionStateKind::Unsupported;
 }
 
-bool CudaSessionCodec<DeepseekV41Model>::supports_paged(const Model&) {return false;}
+bool CudaSessionCodec<DeepseekV41Model>::supports_paged(const Model& model) {
+    return kind(model)==TextSessionStateKind::DeepseekV41;
+}
 
 TextSessionState CudaSessionCodec<DeepseekV41Model>::capture(const Model& model,
         const std::vector<int64_t>& tokens) {

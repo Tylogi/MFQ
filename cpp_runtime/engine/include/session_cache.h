@@ -50,8 +50,9 @@ template <class Backend> class SessionCache {
         const std::string &input_key = {}) {
         if (!supported_)
             return {};
-        if (paged_cache_ && !native_hot_snapshots_ && mtp == nullptr && input_key.empty()) {
-            return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp);
+        if (paged_cache_ && !native_hot_snapshots_) {
+            auto restored=restore_paged(model,requested_session,prompt,maximum_prefix_tokens,mtp,input_key);
+            if(restored.tokens)return restored;
         }
         if (!model.supports_text_session_state())
             return {};
@@ -62,8 +63,8 @@ template <class Backend> class SessionCache {
                    (mtp == nullptr || (mtp->supports_session_state() && state.mtp.has_value()));
         });
         if (!match) {
-            if (paged_cache_ && native_hot_snapshots_ && input_key.empty())
-                return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp);
+            if (paged_cache_ && native_hot_snapshots_)
+                return restore_paged(model, requested_session, prompt, maximum_prefix_tokens, mtp, input_key);
             return {};
         }
         try {
@@ -98,7 +99,9 @@ template <class Backend> class SessionCache {
             return;
         bool paged_mtp=false;
         if constexpr(requires { Backend::paged_mtp(state); })paged_mtp=Backend::paged_mtp(state);
-        if (paged_cache_ && state.input_key.empty() && (!state.mtp.has_value() || paged_mtp)) {
+        bool paged_media=state.input_key.empty();
+        if constexpr(requires { Backend::paged_media(state); })paged_media|=Backend::paged_media(state);
+        if (paged_cache_ && paged_media && (!state.mtp.has_value() || paged_mtp)) {
             store_paged(session_id, state);
             if (!native_hot_snapshots_) return;
         }
@@ -280,7 +283,8 @@ template <class Backend> class SessionCache {
   private:
     template <typename Model>
     Restore restore_paged(Model &model, const std::string &requested_session,
-        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens, Predictor* mtp) {
+        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens, Predictor* mtp,
+        const std::string& input_key = {}) {
         if (snapshots_.max_sessions() == 0 || !model.supports_paged_text_session_state() ||
             prompt.size() < 2) {
             return {};
@@ -288,7 +292,7 @@ template <class Backend> class SessionCache {
         const auto limit = std::min(maximum_prefix_tokens, prompt.size() - 1);
         std::vector<int64_t> candidate(
             prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(limit));
-        auto match = paged_cache_->match(candidate, {}, false);
+        auto match = paged_cache_->match(candidate, input_key, false);
         if (match.matched_tokens == 0) {
             paged_cache_->record_match(0);
             return {};
@@ -336,6 +340,7 @@ template <class Backend> class SessionCache {
                 prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(match.matched_tokens));
             auto state =
                 Backend::decode(payloads, matched_tokens, paged_cache_->block_size_tokens());
+            state.input_key=input_key;
             if(mtp && (!mtp->supports_session_state() || !state.mtp)) {
                 paged_cache_->record_match(0);return {};
             }
@@ -382,13 +387,15 @@ template <class Backend> class SessionCache {
         if (full_blocks == 0)
             return;
 
-        auto existing = paged_cache_->match(state.tokens, {}, false);
+        auto existing = paged_cache_->match(state.tokens, state.input_key, false);
         // A shorter tail cannot become the parent of a subsequent full block.
-        existing.blocks.resize(std::min(existing.blocks.size(),existing.matched_tokens/block_size));
+        if(existing.matched_tokens!=state.tokens.size())
+            existing.blocks.resize(std::min(existing.blocks.size(),existing.matched_tokens/block_size));
         if (existing.blocks.size() > full_blocks) {
             throw std::runtime_error("paged prefix match exceeds the session state");
         }
         auto blocks = std::move(existing.blocks);
+        const bool final_already_stored=blocks.size()==full_blocks;
         mfq::cache::BlockHash parent{};
         if (!blocks.empty())
             parent = blocks.back();
@@ -397,8 +404,21 @@ template <class Backend> class SessionCache {
             const auto count=std::min(block_size,state.tokens.size()-token_offset);
             auto payload = Backend::encode(state, block_size, index);
             parent = paged_cache_->store(
-                parent, state.tokens.data() + token_offset, count, std::move(payload));
+                parent, state.tokens.data() + token_offset, count, std::move(payload),state.input_key);
             blocks.push_back(parent);
+        }
+        if constexpr(requires { Backend::checkpoint_needs_update(mfq::cache::PagedPrefixPayload{},state); }) {
+            if(final_already_stored) {
+                auto final=paged_cache_->load_prefix({blocks.back()});
+                if(final.empty() || Backend::checkpoint_needs_update(final.front(),state)) {
+                    const auto index=full_blocks-1,offset=index*block_size;
+                    const auto previous=index?blocks[index-1]:mfq::cache::BlockHash{};
+                    const auto refreshed=paged_cache_->replace(previous,state.tokens.data()+offset,
+                        std::min(block_size,state.tokens.size()-offset),
+                        Backend::encode(state,block_size,index),state.input_key);
+                    if(refreshed!=blocks[index])throw std::runtime_error("prefix checkpoint changed block identity");
+                }
+            }
         }
         if (!session_id.empty()) {
             paged_bindings_.bind(session_id, std::move(blocks), partial?state.tokens.size():full_blocks * block_size);

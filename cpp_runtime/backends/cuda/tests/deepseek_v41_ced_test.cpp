@@ -1,6 +1,11 @@
 #include "models/deepseek_v41/ops.h"
 #include "storage/session_state.h"
+#include "storage/text_session_cache.h"
+#include "runtime_config.h"
+#include "mfq_paged_prefix_cache.h"
 #include "mfq_cuda_moe_ops.h"
+#include <chrono>
+#include <filesystem>
 #include <iostream>
 
 namespace {
@@ -176,6 +181,88 @@ void check_session_snapshots() {
             "Engram session lost an image-span ngram boundary");
     std::cout<<"session_snapshot_cases="<<cases<<" compressor/ring/Engram/immutable/rejection PASS\n";
 }
+void check_paged_sessions() {
+    using mfq::cuda::internal::TextSessionCache;
+    CudaExecutionContext execution;
+    const auto directory=std::filesystem::temp_directory_path()/
+        ("mfq-v41-prefix-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    int cases=0;
+    for(int ratio:{1,2,16})for(int length:{3,128,257}) {
+        auto model=make_model(execution,ratio);
+        deepseek_v41_prefill_hidden(model,ids(length),64);
+        std::vector<int64_t> tokens(length);for(int i=0;i<length;++i)tokens[i]=i%8;
+        auto saved=model.capture_text_session_state(tokens);
+        auto expected=model.hidden_forward(ids(3));
+        const auto hashes=model.shared->engram_hashes.values;
+        for(size_t block:{64,128}) {
+            std::vector<CudaPagedPayload> payloads;
+            for(size_t i=0;i<(tokens.size()-1)/block+1;++i)
+                payloads.push_back(encode_cuda_deepseek_v41_paged_block(saved,block,i));
+            auto decoded=decode_cuda_deepseek_v41_paged_session(payloads,tokens,block);
+            require(decoded.bytes==saved.bytes,"paged DeepSeek-V4.1 byte accounting changed");
+            model.restore_text_session_state(decoded);
+            require(model.hidden_forward(ids(3)).equal(expected) && model.shared->engram_hashes.values==hashes,
+                "paged DeepSeek-V4.1 changed continuation or Engram history");
+            auto truncated=std::make_shared<std::vector<uint8_t>>(*payloads.back());truncated->pop_back();
+            auto broken=payloads;broken.back()=truncated;bool rejected=false;
+            try{decode_cuda_deepseek_v41_paged_session(broken,tokens,block);}catch(const CudaSessionStateError&){rejected=true;}
+            require(rejected,"truncated DeepSeek-V4.1 prefix was accepted");
+            payloads.pop_back();
+            require(cuda_paged_decodable_blocks(payloads)==0,"compressed KV without a local/Engram checkpoint was restored");
+        }
+        // Real tier transitions, including complete RAM eviction with SSD disabled.
+        for(int storage:{0,1,2,3}) {
+            mfq::cache::PagedPrefixCacheConfig config;
+            config.cache_dir=directory/(std::to_string(ratio)+"-"+std::to_string(length)+"-"+std::to_string(storage));
+            config.compatibility_key="cuda-v41-prefix-test";config.block_size_tokens=64;
+            config.spill_hot_on_eviction=true;config.max_hot_bytes=32ULL<<20;
+            config.max_disk_bytes=(storage&1)?64ULL<<20:0;
+            auto paged=std::make_shared<mfq::cache::PagedPrefixCache>(config);
+            mfq::engine::PrefixCacheConfig prefix;prefix.hot_bytes=0;prefix.ram_bytes=config.max_hot_bytes;
+            TextSessionCache cache({},prefix,paged,true,0,true);
+            auto state=saved;
+            if(storage>=2)state.input_key="image-A";
+            cache.store("",state);
+            auto prompt=tokens;prompt.push_back(7);
+            require(cache.restore_best(model,nullptr,"",prompt,tokens.size(),state.input_key).tokens==tokens.size(),
+                "DeepSeek-V4.1 RAM prefix restore failed");
+            require(model.hidden_forward(ids(3)).equal(expected),"RAM prefix changed continuation");
+            TextSessionCache unified({},prefix,paged,true,0,false);
+            require(unified.restore_best(model,nullptr,"",prompt,tokens.size(),state.input_key).tokens==tokens.size(),
+                "unified CUDA prefix lookup missed a paged checkpoint");
+            require(cache.restore_best(model,nullptr,"",prompt,tokens.size(),"different-image").tokens==0,
+                "DeepSeek-V4.1 prefix crossed image identities");
+            auto& mtp=state.mtp.emplace();mtp.cache_pos=length;
+            mtp.last_target_hidden=tb::ones({1,1,128},fp32({1}).options().dtype(tb::kFloat16));
+            mtp.deepseek_v41_rings={tb::ones({1,128,512},mtp.last_target_hidden.options())};
+            mtp.bytes=session_tensor_bytes(mtp.last_target_hidden)+session_tensor_bytes(mtp.deepseek_v41_rings.front());
+            state.bytes+=mtp.bytes;
+            cache.store("",state);
+            const auto match=paged->match(tokens,state.input_key,false);
+            auto payloads=paged->load_prefix(match.blocks);
+            require(!payloads.empty() && !cuda_paged_checkpoint_needs_update(payloads.back(),state),
+                "existing prefix was not upgraded with DSpark state");
+            auto decoded=decode_cuda_deepseek_v41_paged_session(payloads,tokens,64);
+            require(decoded.mtp && decoded.mtp->cache_pos==length &&
+                decoded.mtp->last_target_hidden.equal(mtp.last_target_hidden) &&
+                decoded.mtp->deepseek_v41_rings.front().equal(mtp.deepseek_v41_rings.front()),
+                "paged DSpark state changed");
+            cache.set_ram_limit(0);paged->flush();
+            require(cache.restore_best(model,nullptr,"",prompt,tokens.size(),state.input_key).tokens==
+                ((storage&1)?tokens.size():0),"RAM eviction did not spill or discard DeepSeek-V4.1 prefix");
+            if(storage&1) {
+                require(model.hidden_forward(ids(3)).equal(expected),"SSD prefix changed continuation");
+                config.max_hot_bytes=0;
+                auto reopened=std::make_shared<mfq::cache::PagedPrefixCache>(config);
+                TextSessionCache restored({},prefix,reopened,true,0,true);
+                require(restored.restore_best(model,nullptr,"",prompt,tokens.size(),state.input_key).tokens==tokens.size(),
+                    "persisted DeepSeek-V4.1 prefix was not reusable after reopening");
+            }
+        }
+        ++cases;
+    }
+    std::cout<<"paged_session_cases="<<cases<<" compression/ring/Engram/RAM/SSD/media/MTP-upgrade/corruption PASS\n";
+}
 void check_exact_short() {
     CudaExecutionContext execution;
     auto model=make_model(execution);
@@ -301,9 +388,10 @@ int main(int argc,char** argv) try {
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
     if(argc==2 && std::string(argv[1])=="--modality-routing-check"){check_modality_routing();return 0;}
     if(argc==2 && std::string(argv[1])=="--session-check"){check_session_snapshots();run_dspark_self_check();return 0;}
+    if(argc==2 && std::string(argv[1])=="--paged-session-check"){check_paged_sessions();run_dspark_self_check();return 0;}
     if(argc==2 && std::string(argv[1])=="--short-prefill-check"){check_short_prefill_tiles();return 0;}
     if(argc==2 && std::string(argv[1])=="--short-prefill-four-check"){check_short_prefill_tiles(4);return 0;}
-    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_short_prefill_tiles(4);check_long_and_cancel();check_retained_prefix();check_session_snapshots();run_dspark_self_check();
+    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_short_prefill_tiles(4);check_long_and_cancel();check_retained_prefix();check_session_snapshots();check_paged_sessions();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;
