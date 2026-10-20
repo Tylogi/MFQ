@@ -107,6 +107,26 @@ def test_cuda_ram_pipeline_rejects_dense_expert_pools(tmp_path):
     assert not supports_cuda_ram_expert_pipeline(path)
 
 
+def test_cuda_ram_pipeline_ignores_resident_dense_banks(tmp_path):
+    # A model whose MTP head keeps dense BF16 experts still streams its
+    # quantized backbone experts; the dense head runs on the device.
+    path = tmp_path / "mixed.mfq"
+    experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
+    dense = np.zeros((2, 3, 96), dtype=np.float16)
+    save(path, FileHeader(version=2, model_arch="qwen4_exp"), {
+        "model.block.0.mlp.experts.gate.weight": experts,
+        "predictor.block.1.mlp.experts.up.weight": dense,
+    })
+    assert supports_cuda_ram_expert_pipeline(path)
+
+
+def test_cuda_ram_pipeline_needs_a_quantized_expert_bank(tmp_path):
+    path = tmp_path / "dense-only.mfq"
+    save(path, FileHeader(version=2, model_arch="qwen4_exp"),
+         {"model.block.0.mlp.experts.gate.weight": np.zeros((2, 3, 96), dtype=np.float16)})
+    assert not supports_cuda_ram_expert_pipeline(path)
+
+
 def test_cuda_ssd_experts_respect_explicit_ram_cache_limit(tmp_path, monkeypatch):
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, 52 * GIB))
