@@ -132,6 +132,10 @@ void write_floats(
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 1) {
+        std::cerr << "Run tests/test_cuda_deepseek_v41_axial_vision_native.py with the native fixture bridge.\n";
+        return 77;
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         return 77;
