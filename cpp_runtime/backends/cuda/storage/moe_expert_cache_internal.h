@@ -576,6 +576,8 @@ public:
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
     void copy_ssd_experts(const std::vector<SsdExpertCopy>& requests);
     std::future<void> queue_ssd_expert_copies(std::vector<SsdExpertCopy> requests);
+    std::array<std::future<void>,2> queue_ssd_prefill_phases(
+        std::array<std::vector<SsdExpertCopy>,2> requests);
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
     bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }

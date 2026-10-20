@@ -22,6 +22,7 @@
 #include <atomic>
 #include <functional>
 #include <future>
+#include <atomic>
 #include <exception>
 #include <chrono>
 #include <cmath>
@@ -655,7 +656,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             int begin=0,rows=0;
             int route_offset=0,mma_tile_m=8,wide_tile_m=8;
             std::array<std::vector<Upload>,3> uploads;
-            std::future<void> pending;
+            std::array<std::future<void>,2> pending;
+            std::size_t down_host_offset=0;
         };
         std::vector<Group> work(groups);stats.pipeline_prefill_groups+=groups;
         struct DrainFailedReads {
@@ -663,7 +665,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             std::vector<Group>& work;
             int exceptions=std::uncaught_exceptions();
             ~DrainFailedReads(){
-                for(auto& group:work)if(group.pending.valid())group.pending.wait();
+                for(auto& group:work)for(auto& phase:group.pending)if(phase.valid())phase.wait();
                 if(std::uncaught_exceptions()>exceptions)(void)cudaStreamSynchronize(stream);
             }
         } drain{cache_->weight_stream_,work};
@@ -836,6 +838,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 }
             }
             for(int p=0;p<3;++p)for(std::size_t c=0;c<sources_[p]->cohorts_.size();++c) {
+                if(p==2 && c==0)work[g].down_host_offset=offset;
                 std::vector<Upload*> uploads;
                 for(auto& upload:work[g].uploads[p])if(upload.cohort==int(c))uploads.push_back(&upload);
                 if(uploads.empty())continue;
@@ -856,11 +859,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     offset+=uploads.size()*bytes;
                 }
             }
-            std::vector<MoeExpertCache::SsdExpertCopy> requests;
+            std::array<std::vector<MoeExpertCache::SsdExpertCopy>,2> requests;
             for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
-                requests.push_back({sources_[p]->quant_source_.get(),upload.expert,upload.fields});
-            if(requests.empty())return;
-            work[g].pending=cache_->queue_ssd_expert_copies(std::move(requests));
+                requests[p==2?1:0].push_back({sources_[p]->quant_source_.get(),upload.expert,upload.fields});
+            if(requests[0].empty() && requests[1].empty())return;
+            work[g].pending=cache_->queue_ssd_prefill_phases(std::move(requests));
         };
         const auto retire_cpu_group=[&](int g) {
             const auto wait_started=Clock::now();
@@ -868,19 +871,22 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             buffer_wait_ns+=elapsed(wait_started);
             for(auto& uploads:work[g].uploads)for(auto& upload:uploads)upload.fields.clear();
         };
-        const auto stage_group=[&](int g) {
+        const auto stage_group=[&](int g,int phase=-1) {
             const auto started=Clock::now();auto& buffer=stream.buffers[g%2];
             std::size_t host_offset=0;
             if(cache_->ssd_experts()) {
                 const auto wait_started=Clock::now();
-                if(g>=2)buffer.down_ready.synchronize();
+                if(g>=2 && phase!=1)buffer.down_ready.synchronize();
                 buffer_wait_ns+=elapsed(wait_started);
                 const auto read_started=Clock::now();
-                if(work[g].pending.valid())work[g].pending.get();
+                if(work[g].pending.at(phase).valid())work[g].pending.at(phase).get();
                 read_join_ns+=elapsed(read_started);
             }
-            if(g>=2)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
-            for(int p=0;p<3;++p) {
+            if(g>=2 && phase!=1)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
+            const int first_projection=phase==1?2:0,last_projection=phase==0?2:3;
+            // Down follows the GU portion of the same pinned packet.
+            if(phase==1)host_offset=work[g].down_host_offset;
+            for(int p=first_projection;p<last_projection;++p) {
                 if(cache_->ssd_experts())upload_prefill_nvq_metadata(buffer,p);
                 const auto& uploads=work[g].uploads[p];auto& source=*sources_[p];
                 for(std::size_t c=0;c<source.cohorts_.size();++c) {
@@ -956,20 +962,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         }
                     }
                 }
-                if(p==1)buffer.gu_ready.record(cache_->weight_stream_);
             }
-            buffer.down_ready.record(cache_->weight_stream_);
+            if(phase!=1)buffer.gu_ready.record(cache_->weight_stream_);
+            if(phase!=0)buffer.down_ready.record(cache_->weight_stream_);
             stats.pipeline_fetch_ns+=elapsed(started);
         };
         if(cache_->ssd_experts()) {
             if(groups)queue_group(0);
             if(groups>1)queue_group(1);
         }
-        if(groups)stage_group(0);
+        if(groups)stage_group(0,cache_->ssd_experts()?0:-1);
         if(groups>1 && !cache_->ssd_experts())stage_group(1);
         for(int g=0;g<groups;++g) {
-            if(cache_->ssd_experts() && g)stage_group(g);
+            if(cache_->ssd_experts() && g)stage_group(g,0);
             const auto submit_started=Clock::now();
+            std::uint64_t transfer_submit_ns=0;
             auto& buffer=stream.buffers[g%2];const auto& group=work[g];
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,buffer.gu_ready.get(),0));
             MFQ_CUDA_CHECK(cudaMemcpyAsync(buffer.maps.data_ptr(),maps+g*map_stride,
@@ -1007,11 +1014,18 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto up=combined_gate_up_ ? gate.narrow(-1,ff_,ff_).contiguous() : projection(1,x);
             if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
             auto hidden=activation(gate,up,execution.config.moe_ffn_fused_activation);
+            if(cache_->ssd_experts()) {
+                const auto transfer_started=Clock::now();
+                stage_group(g,1);
+                transfer_submit_ns=elapsed(transfer_started);
+                static std::atomic_flag reported=ATOMIC_FLAG_INIT;
+                if(!reported.test_and_set())std::cerr<<"moe_ssd_prefill_read_overlap enabled=1 phases=gate_up,down packets=2\n";
+            }
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,buffer.down_ready.get(),0));
             auto down=projection(2,hidden).reshape({group.rows,width_});
             parts.index_copy_(0,pair_device.narrow(0,group.begin,group.rows),down);
             buffer.used.record(stream_);
-            compute_submit_ns+=elapsed(submit_started);
+            compute_submit_ns+=elapsed(submit_started)-transfer_submit_ns;
             if(g+2<groups) {
                 if(cache_->ssd_experts()) {
                     // Retire the H2D source while its GPU copy is in use.

@@ -835,6 +835,24 @@ std::future<void> MoeExpertCache::queue_ssd_expert_copies(std::vector<SsdExpertC
     return ssd_prefill_reader_->submit([this,requests=std::move(requests)]{copy_ssd_experts(requests);});
 }
 
+std::array<std::future<void>,2> MoeExpertCache::queue_ssd_prefill_phases(
+        std::array<std::vector<SsdExpertCopy>,2> requests) {
+    if(!ssd_prefill_reader_)throw std::logic_error("SSD prefill read queue is not initialized");
+    auto gate_up=std::make_shared<std::promise<void>>();
+    auto ready=gate_up->get_future();
+    auto complete=ssd_prefill_reader_->submit([this,requests=std::move(requests),gate_up] {
+        try {
+            copy_ssd_experts(requests[0]);
+            gate_up->set_value();
+        } catch(...) {
+            gate_up->set_exception(std::current_exception());
+            throw;
+        }
+        copy_ssd_experts(requests[1]);
+    });
+    return {std::move(ready),std::move(complete)};
+}
+
 void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests) {
     if(requests.empty())return;
     if(!ssd_read_pool_)throw std::logic_error("SSD expert copy pool is not initialized");
