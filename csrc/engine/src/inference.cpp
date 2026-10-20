@@ -49,7 +49,7 @@ std::unordered_set<std::int64_t> model_stop_token_ids(std::string_view config, s
     return result;
 }
 
-void InferenceMetrics::mark_prefill(const MfqPrefillTiming& timing) {
+void InferenceMetrics::mark_prefill(const mfq::PrefillTiming& timing) {
     prefill_tokens = timing.prompt_tokens;
     prefill_ms = timing.llm_ms;
     multimodal_ms = timing.multimodal_ms;

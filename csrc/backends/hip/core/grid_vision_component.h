@@ -7,7 +7,7 @@
 
 #include "core/causal_model.h"
 #include "../../../engine/model/common/vision/grid_vision.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "../../hip/include/mfq_hip_attention_ops.h"
 #include "mfq_paged_prefix_cache.h"
 

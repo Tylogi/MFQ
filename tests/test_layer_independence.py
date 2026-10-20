@@ -51,6 +51,8 @@ MODEL_FORBIDDEN = ("executor/", "requests/", "batch/", "text/", "src/")
 FAMILY_EXCEPTIONS = (
     # ReasoningFormat values are wire-visible protocol names, not a model chain.
     "engine/include/engine.h",
+    # Processor values preserve the existing media-input protocol names.
+    "engine/include/request.h",
     # Media preprocessing and chat-placeholder geometry still dispatch per
     # family; that belongs to the family, and moving it is the open item.
     "engine/src/processor.cpp",

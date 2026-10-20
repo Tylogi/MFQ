@@ -1,3 +1,4 @@
+#include "resource_error.h"
 #include "table.h"
 
 namespace mfq::engine {

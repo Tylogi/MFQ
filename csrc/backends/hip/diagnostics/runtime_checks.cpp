@@ -37,7 +37,7 @@ int run_qwen35_mtp_bench(
     const auto runtime_config = resolve_cuda_runtime_config({});
     TextSessionCache session_cache(
         runtime_config.session_cache, runtime_config.prefix_cache);
-    MfqSamplingParams params;
+    mfq::SamplingParams params;
     params.max_tokens = generated_tokens;
     params.temperature = 0.;
     params.top_k = 1;
@@ -71,7 +71,7 @@ int run_qwen35_mtp_bench(
         for (int repeat = -1; repeat < repetitions; ++repeat) {
             std::vector<int64_t> output;
             output.reserve(generated_tokens);
-            MfqPrefillTiming prefill;
+            mfq::PrefillTiming prefill;
             Clock::time_point first_token;
             mfq_hip_synchronize();
             // Capture only the actual request; its independent oracle, full
@@ -129,14 +129,14 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
     auto config = runtime_config;
     config.generation.prefill_chunk_size = 64;
     config.continuous_batch.max_sequences = 4;
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = 20; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
     std::vector<int64_t> first_prompt(193), second_prompt(17);
     for (size_t i = 0; i < first_prompt.size(); ++i) first_prompt[i] = 101 + (i * 37) % 900;
     for (size_t i = 0; i < second_prompt.size(); ++i) second_prompt[i] = 113 + (i * 53) % 880;
     DecodeGraphCache graph(model.max_position_embeddings());
     TextSessionCache cache(config.session_cache, config.prefix_cache);
-    auto serial = [&](const std::vector<int64_t>& prompt, MfqPromptCachePlan plan = {}) {
+    auto serial = [&](const std::vector<int64_t>& prompt, mfq::PromptCachePlan plan = {}) {
         InferenceRequest request; request.prompt = prompt; request.sampling = sampling; request.cache_plan = std::move(plan);
         InferenceOutput output(request, nullptr, "serial");
         return collect_generation(generate(model, graph, cache, config, request, output)).tokens;
@@ -234,7 +234,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             << " captures=" << captures << " replays=" << replays
             << " prefill_cancel=1 slot_reuse=1\n";
     }
-    MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};
+    mfq::PromptCachePlan plan{"batch-check", first_prompt.size() - 1};
     MFQ_RUNTIME_CHECK(serial(first_prompt, plan) == first_reference &&
         serial(first_prompt, plan) == first_reference, "session restore differs from serial oracle");
     std::cout << "continuous_batching_check PASS requests=2 paused_ticks=4 cancellation=1 session_reuse=1\n";
@@ -277,7 +277,7 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     if (first_error) std::rethrow_exception(first_error);
     if (second_error) std::rethrow_exception(second_error);
 
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = 2;
     sampling.temperature = 0.0;
     sampling.top_k = 1;

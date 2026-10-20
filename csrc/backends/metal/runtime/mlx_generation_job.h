@@ -15,7 +15,7 @@ namespace mfq::metal {
 // and timing values cross into the scheduler; no response writer runs there.
 class MlxGenerationJob {
 public:
-    using Event = std::variant<std::int64_t, MfqPrefillTiming>;
+    using Event = std::variant<std::int64_t, mfq::PrefillTiming>;
     using Work = std::function<void(MlxGenerationJob&)>;
     explicit MlxGenerationJob(Work work);
     ~MlxGenerationJob();
@@ -23,7 +23,7 @@ public:
     MlxGenerationJob& operator=(const MlxGenerationJob&) = delete;
 
     bool token(std::int64_t token);
-    void prefill(MfqPrefillTiming timing);
+    void prefill(mfq::PrefillTiming timing);
     bool cancelled() const;
     void cancel();
     std::optional<Event> take();

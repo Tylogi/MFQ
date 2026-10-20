@@ -8,7 +8,7 @@
 #include "storage/weights/moe/expert_cache.h"
 #include <array>
 #include "common/vision/grid_vision.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "kernels/attention/ops.h"
 #include "csrc/core/mfq_paged_prefix_cache.h"
 #include <algorithm>

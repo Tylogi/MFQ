@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/core/step_sequence.h"
+#include "step_sequence.h"
 
 #include "models/common/causal_model_ops.h"
 #include "storage/session/state.h"

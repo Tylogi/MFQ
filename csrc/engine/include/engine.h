@@ -1,6 +1,8 @@
 #pragma once
 
-#include "mfq/runtime.h"
+#include "resource_error.h"
+
+#include "request.h"
 
 #include <array>
 #include <chrono>
@@ -39,8 +41,6 @@ struct GenerationStats {
 } // namespace mfq::engine::mtp
 
 namespace mfq::engine {
-
-struct ResourceExhausted : std::runtime_error { using std::runtime_error::runtime_error; };
 
 enum class InferenceInputErrorCode {
     Invalid,
@@ -114,8 +114,8 @@ struct InferenceInput {
     std::string prompt;
     std::optional<ChatInput> chat_input;
     std::vector<std::string> stops;
-    MfqSamplingParams sampling;
-    MfqPromptCachePlan cache_plan;
+    mfq::SamplingParams sampling;
+    mfq::PromptCachePlan cache_plan;
     std::optional<MfqMultimodalInput> media;
     bool prefix_cache_enabled = true;
     std::optional<std::size_t> benchmark_prompt_tokens;
@@ -140,7 +140,7 @@ struct InferenceMetrics {
     bool saw_prefill = false;
     mtp::GenerationStats mtp;
 
-    void mark_prefill(const MfqPrefillTiming& timing);
+    void mark_prefill(const mfq::PrefillTiming& timing);
     void mark_token();
 };
 
@@ -186,7 +186,7 @@ struct EngineRequest {
 };
 
 struct PrefillProgress {
-    MfqPrefillTiming timing;
+    mfq::PrefillTiming timing;
     // Prompt state is ready for caching before decode timing starts.
     bool session_boundary = false;
 };

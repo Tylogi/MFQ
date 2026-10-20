@@ -67,7 +67,7 @@ struct Ops {
     Tensor input_ids, counts;
     bool penalties = false;
     Sampler sampler_;
-    void initialize(const std::vector<int64_t>& prompt, const MfqSamplingParams&) {
+    void initialize(const std::vector<int64_t>& prompt, const mfq::SamplingParams&) {
         input_ids = ids_for(prompt);
     }
     Sampler& sampler() { return sampler_; }
@@ -129,13 +129,13 @@ struct Ops {
     static int32_t sample_constrained(Tensor logits, Tensor counts, const MfqTokenConstraintPtr&) {
         return sample_normal(logits, counts);
     }
-    static std::vector<float> probabilities(Tensor logits, Tensor, const MfqSamplingParams&) {
+    static std::vector<float> probabilities(Tensor logits, Tensor, const mfq::SamplingParams&) {
         return logits.proposal ? std::vector<float>{0, 1, 0} : std::vector<float>{1, 0, 0};
     }
     static mtp::CompactDistribution compact_probabilities(Tensor logits, Tensor counts,
-        const MfqSamplingParams& sampling) { return {{0, 1, 2}, probabilities(logits, counts, sampling)}; }
+        const mfq::SamplingParams& sampling) { return {{0, 1, 2}, probabilities(logits, counts, sampling)}; }
     static std::vector<mtp::CompactDistribution> compact_probability_rows(Tensor logits,
-        const MfqSamplingParams& sampling) {
+        const mfq::SamplingParams& sampling) {
         return std::vector<mtp::CompactDistribution>(size(logits, 0), compact_probabilities(logits, {}, sampling));
     }
 };
@@ -379,7 +379,7 @@ void run_batched_greedy(bool penalties) {
     struct BatchedOps : Ops {
         int* batches;
         bool use_penalties;
-        void initialize(const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling) {
+        void initialize(const std::vector<int64_t>& prompt, const mfq::SamplingParams& sampling) {
             Ops::initialize(prompt, sampling);
             this->penalties = use_penalties;
         }

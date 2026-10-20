@@ -152,6 +152,38 @@ def test_target_check_rejects_transitive_expert_dependency() -> None:
         _check_native_targets(graph + '\n"n8" -> "n5";\n"n5" -> "n3";', False)
 
 
+def _check_cuda_native_sources(csrc: Path) -> None:
+    native = csrc / "backends/cuda/native"
+    units = list(sources(str(native)))
+    assert units, "CUDA native sources missing"
+    for unit in units:
+        reached, _ = closure(unit, str(csrc))
+        escaped = [path for path in reached if not (
+            Path(path).is_relative_to(native) or
+            Path(path).is_relative_to(csrc / "backends/cpu/native") or
+            Path(path) == csrc / "engine/include/resource_error.h")]
+        assert not escaped, f"{unit} reaches non-native sources: {escaped}"
+
+
+def test_cuda_native_contract_closure() -> None:
+    _check_cuda_native_sources(CSRC)
+
+
+def test_cuda_native_check_rejects_request_include(tmp_path: Path) -> None:
+    native = tmp_path / "backends/cuda/native"
+    native.mkdir(parents=True)
+    (native / "context.cu").write_text('#include "resource_error.h"\n')
+    public = tmp_path / "engine/include"
+    public.mkdir(parents=True)
+    error = public / "resource_error.h"
+    error.write_text("#pragma once\n")
+    _check_cuda_native_sources(tmp_path)
+    (public / "request.h").write_text("struct Request {};\n")
+    error.write_text('#include "request.h"\n')
+    with pytest.raises(AssertionError, match="reaches non-native sources"):
+        _check_cuda_native_sources(tmp_path)
+
+
 def _check_native_sources(csrc: Path) -> None:
     native = csrc / "backends/cpu/native"
     units = list(sources(str(native)))

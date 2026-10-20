@@ -7,7 +7,7 @@
 #include "models/qwen35/mlx_qwen35_causal_lm.h"
 
 #include "model_graph/model_graph.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "mlx_generation_job.h"
 
 #include <memory>
@@ -28,7 +28,7 @@ struct MlxDuplexComponent {
 };
 struct MlxEngineComponents {
     std::function<std::int32_t(const std::vector<std::int64_t>&,
-        const MfqMultimodalInput&, const MfqSamplingParams&,
+        const MfqMultimodalInput&, const mfq::SamplingParams&,
         MlxGenerationJob&, const MfqTokenConstraintPtr&)> multimodal_generate;
     MlxDuplexComponent duplex;
     bool mtp_available = false;

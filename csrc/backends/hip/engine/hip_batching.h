@@ -31,7 +31,7 @@ class QwenBatchOperations {
     struct Sample {
         Tensor next;
         int64_t token = 0;
-        MfqPrefillTiming timing;
+        mfq::PrefillTiming timing;
     };
     struct Decoded {
         Tensor logits, greedy_tokens;

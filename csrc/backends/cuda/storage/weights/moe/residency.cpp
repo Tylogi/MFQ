@@ -1,3 +1,4 @@
+#include "resource_error.h"
 #include "native/env.h"
 #include "residency.h"
 #include "ops/decode_window.h"
@@ -8,7 +9,7 @@
 #include "ranker.h"
 #include "native_dma_batch.h"
 #include "mfq/cpu_topology.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "native/resident_allocations.h"
 #include <algorithm>
 #include <array>

@@ -26,8 +26,8 @@ struct InferenceRequest {
     std::vector<std::int64_t> prompt;
     std::vector<std::string> stops;
     std::unordered_set<std::int64_t> stop_token_ids;
-    MfqSamplingParams sampling;
-    MfqPromptCachePlan cache_plan;
+    mfq::SamplingParams sampling;
+    mfq::PromptCachePlan cache_plan;
     MfqTokenConstraintPtr token_constraint;
     std::optional<MfqMultimodalInput> vision;
 };

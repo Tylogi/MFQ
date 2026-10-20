@@ -8,7 +8,6 @@
 #include "ops/decode_window.h"
 #include "storage/weights/moe/native_dma_batch.h"
 #include "native/context.h"
-#include "mfq/runtime.h"
 #include "ops/quant/nint_prefill_cache.h"
 #include "ops/moe/mfe_ffn_runtime.h"
 #include "models/common/ffn.h"

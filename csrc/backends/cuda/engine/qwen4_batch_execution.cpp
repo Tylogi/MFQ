@@ -1,3 +1,4 @@
+#include "resource_error.h"
 #include "qwen4_batch_execution.h"
 #include "engine/batch_execution.h"
 #include "storage/weights/moe/expert_cache.h"

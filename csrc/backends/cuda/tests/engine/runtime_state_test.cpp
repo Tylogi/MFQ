@@ -99,7 +99,7 @@ static void check_sampling_storage() {
               std::memcmp(host.data_ptr(), expected.data_ptr(), host.nbytes()) == 0,
               "sampling counts were not reset from the prompt");
     }
-    MfqSamplingParams params;
+    mfq::SamplingParams params;
     params.temperature = 0.8; params.top_k = 4; params.top_p = 0.9;
     params.seed = 73; params.repetition_penalty = 1.2;
     Sampler first(params), second(params);
@@ -136,7 +136,7 @@ static void check_batch_buffers_and_sampling() {
     catch (const std::exception&) { rejected = true; }
     check(rejected, "negative physical batch was accepted");
 
-    MfqSamplingParams params;
+    mfq::SamplingParams params;
     params.temperature = .8; params.top_k = 4; params.seed = 73; params.repetition_penalty = 1.2;
     Sampler first(params), first_reference(params);
     params.seed = 91;
@@ -1011,7 +1011,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     options.prefill_chunk_size = 8;
     auto engine = load_cuda_engine(options);
     using namespace mfq::engine;
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = 32; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
     const auto reference = mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling);
     check(reference.size() == 32, "batched generation length");

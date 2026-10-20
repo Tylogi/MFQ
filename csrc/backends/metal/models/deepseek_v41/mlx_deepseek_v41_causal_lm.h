@@ -11,7 +11,7 @@
 #include "runtime/mlx_tensor.h"
 #include "runtime/mlx_transformer.h"
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -63,7 +63,7 @@ template <class Model> struct CudaMtpOps {
                           ? 3
                           : 1) {}
   void initialize(const std::vector<int64_t> &prompt,
-                  const MfqSamplingParams &sampling) {
+                  const mfq::SamplingParams &sampling) {
     input_ids = ids_for(prompt);
     sampler_.emplace(sampling);
     penalties = sampler().has_penalties();
@@ -165,7 +165,7 @@ template <class Model> struct CudaMtpOps {
             .template item<int64_t>());
   }
   std::vector<float> probabilities(Tensor logits, Tensor token_counts,
-                                   const MfqSamplingParams &parameters) {
+                                   const mfq::SamplingParams &parameters) {
     logits = logits.contiguous().reshape({1, -1});
     if (penalties) {
       logits = logits.clone();
@@ -180,7 +180,7 @@ template <class Model> struct CudaMtpOps {
   }
   mfq::engine::mtp::CompactDistribution
   compact_probabilities(Tensor logits, Tensor token_counts,
-                        const MfqSamplingParams &parameters) {
+                        const mfq::SamplingParams &parameters) {
     MFQ_RUNTIME_CHECK(parameters.top_k > 0 && parameters.top_k <= 64 &&
                           parameters.temperature > 0.0,
                       "compact CUDA MTP sampling requires top-k 1-64");
@@ -208,7 +208,7 @@ template <class Model> struct CudaMtpOps {
         parameters.top_p);
   }
   std::vector<mfq::engine::mtp::CompactDistribution>
-  compact_probability_rows(Tensor logits, const MfqSamplingParams &parameters) {
+  compact_probability_rows(Tensor logits, const mfq::SamplingParams &parameters) {
     MFQ_RUNTIME_CHECK(!penalties && logits.dim() == 2 && parameters.top_k > 0 &&
                           parameters.top_k <= 64 &&
                           parameters.temperature > 0.0,

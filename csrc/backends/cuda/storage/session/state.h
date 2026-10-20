@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/core/step_sequence.h"
+#include "step_sequence.h"
 
 #include "native/tensor/backend.h"
 

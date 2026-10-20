@@ -313,7 +313,7 @@ for (std::size_t i = 0; i < layers.size(); ++i)
 return head.run(final_norm.run(hidden, run), batch.outputs, run);
 ```
 
-实际 `forward_steps` 复用现有 [StepSequence](../csrc/core/step_sequence.h)（终态归 `engine/include/`），将可能等待的完整算子通过 `next()` 和 `co_yield` 逐步推进；普通非阻塞 norm/Linear 调用保持直接。每次 Executor::poll 只推进有界工作，serving 不使用会循环耗尽任务的 `finish_steps`。需要等待的 CPU/offload 路径也必须让出控制权；不为此引入通用任务调度器。
+实际 `forward_steps` 复用现有 [StepSequence](../csrc/engine/include/step_sequence.h)（已归 `engine/include/`），将可能等待的完整算子通过 `next()` 和 `co_yield` 逐步推进；普通非阻塞 norm/Linear 调用保持直接。每次 Executor::poll 只推进有界工作，serving 不使用会循环耗尽任务的 `finish_steps`。需要等待的 CPU/offload 路径也必须让出控制权；不为此引入通用任务调度器。
 
 例如 MoE 路由结果就绪后才能确定要读取的专家，顺序是提交 routing、等待其 event、提交 SSD 读取、等待 I/O、提交 H2D/专家计算。等待发生在 forward 内，不能全部假设在 launch 前完成。MoE 在必要位置 yield，父层和 family 逐级传播 waiting；算子保留自己的计算进度，InFlightBatch 保证其 frame、activation 和外部资源的生命周期。现有 StepSequence 析构会直接销毁 frame，取消路径必须先完成前述 drain，不能直接丢弃任务。
 

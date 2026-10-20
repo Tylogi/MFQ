@@ -1772,15 +1772,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1804,15 +1804,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1835,15 +1835,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1867,15 +1867,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1898,15 +1898,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -2031,8 +2031,8 @@ public:
         const auto& token_constraint = request.token_constraint;
         const std::function<bool(std::int64_t)> callback =
             [&job](std::int64_t token) { return job.token(token); };
-        const std::function<void(MfqPrefillTiming)> on_prefill =
-            [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+        const std::function<void(mfq::PrefillTiming)> on_prefill =
+            [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
         job.mtp.available = runtime_components.mtp_available;
         try {
             if (request.vision) {

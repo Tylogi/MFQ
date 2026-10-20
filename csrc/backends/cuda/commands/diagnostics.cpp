@@ -45,7 +45,7 @@ inline int generate_diagnostic_tokens(CudaLoadOptions options,
     const auto start = Clock::now();
     auto engine = load_cuda_engine(std::move(engine_options));
     const auto loaded = Clock::now();
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = tokens;
     sampling.temperature = 0;
     sampling.top_k = 1;

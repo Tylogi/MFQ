@@ -11,7 +11,7 @@ I/O lives in `components/io/`. That end state is defined in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — remaining request/value contracts, placement rules and state storage.
+- `core/` — remaining placement rules and state storage.
   The transitional `mfq-core` aggregation is removed by K2–K4 in
   [docs/plan.md](../docs/plan.md);
 - `model_source/` — input discovery, metadata normalization and bounded reads,
@@ -40,6 +40,9 @@ has landed.
 - `engine/model/common/vision/` — shared grid vision configuration, geometry,
   positions and canonical tensor roles, compiled by `mfq-engine`. Two old model
   headers still consume this implementation until their K2 migration;
+- `engine/include/` — public request/media values, the sole `SamplingParams`,
+  grammar cursor, resource errors and `StepSequence`. Native allocation errors
+  no longer require a core include path;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;

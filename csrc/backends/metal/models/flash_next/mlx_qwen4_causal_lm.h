@@ -11,7 +11,7 @@
 #include "runtime/mlx_qsa_kv_offload.h"
 #include "runtime/mlx_grid_vision.h"
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 
 #include <cstddef>
 #include <cstdint>

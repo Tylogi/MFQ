@@ -63,7 +63,7 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     result["target_raw"]=json_tensor(raw);result["target_normalized"]=json_tensor(normalized);
     // Exercise the production runtime generation path, target rollback and
     // step output limits. The two architectures retain distinct head equations.
-    MfqSamplingParams sampling;sampling.max_tokens=12;sampling.temperature=0;sampling.top_k=1;
+    mfq::SamplingParams sampling;sampling.max_tokens=12;sampling.temperature=0;sampling.top_k=1;
     std::vector<int64_t> prompt{1,2,3,4,5,6,7},expected,generated;
     model.reset(1);auto current=ids;
     for (int i=0;i<sampling.max_tokens;++i) {

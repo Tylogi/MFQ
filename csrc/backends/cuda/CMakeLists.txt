@@ -46,8 +46,7 @@ target_include_directories(mfq-cuda-native PUBLIC
     ${MFQ_CUDA_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-# shortcut: allocation errors still live in core, remove this private path when K2 moves them.
-target_include_directories(mfq-cuda-native PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
+target_include_directories(mfq-cuda-native PUBLIC ${PROJECT_SOURCE_DIR}/engine/include)
 target_link_libraries(mfq-cuda-native PUBLIC
     CUDA::cudart CUDA::cublas mfq-host-parallel)
 if(WIN32)

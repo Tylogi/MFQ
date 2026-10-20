@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 #include "storage/mfq_container.h"
 #include "runtime/mlx_sampling.h"
 #include "runtime/mlx_transformer.h"

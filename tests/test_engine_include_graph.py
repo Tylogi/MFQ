@@ -138,6 +138,9 @@ class Graph:
                 if not target.endswith(".h"):
                     continue
                 engine_relative = rel(target, self.csrc)
+                if rel(src, self.csrc).startswith("engine/include/") and not engine_relative.startswith("engine/include/"):
+                    violations.append((src, lineno, raw,
+                        "public engine contract reaches an implementation header"))
                 if not engine_relative.startswith("engine" + os.sep):
                     if from_engine and engine_relative.startswith("backends" + os.sep):
                         violations.append((src, lineno, raw,
@@ -177,6 +180,18 @@ def check_tree(csrc, bench=None):
 
 # Small positive and negative trees: a rule that never fires is not a rule.
 FIXTURES = [
+    ("public contracts may compose other public values", {
+        "engine/include/engine.h": '#include "request.h"\n',
+        "engine/include/request.h": "struct Request {};\n",
+    }, None),
+    ("public contracts may not expose core", {
+        "engine/include/engine.h": '#include "mfq/state.h"\n',
+        "core/include/mfq/state.h": "struct State {};\n",
+    }, "public engine contract reaches an implementation header"),
+    ("public contracts may not expose engine implementation", {
+        "engine/include/engine.h": '#include "table.h"\n',
+        "engine/requests/table.h": "struct Table {};\n",
+    }, "public engine contract reaches an implementation header"),
     ("unlisted old model consumer may not include shared model internals", {
         "models/other/config.h": '#include "common/vision/grid_vision.h"\n',
         "engine/model/common/vision/grid_vision.h": "struct Geometry {};\n",

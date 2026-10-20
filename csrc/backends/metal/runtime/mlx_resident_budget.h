@@ -1,9 +1,10 @@
 #pragma once
 
+#include "resource_error.h"
+
 #include <cstddef>
 #include <functional>
 #include <limits>
-#include "mfq/runtime.h"
 #include <utility>
 
 namespace mfq::metal {

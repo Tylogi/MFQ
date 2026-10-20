@@ -1,42 +1,25 @@
 #pragma once
 
+#include "sampling_params.h"
 #include "token_constraint.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
-class MfqResourceExhausted : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
-struct MfqSamplingParams {
-    int32_t max_tokens = 4096;
-    double temperature = 1.0;
-    int32_t top_k = 100;
-    double top_p = 0.95;
-    double presence_penalty = 0.0;
-    double frequency_penalty = 0.0;
-    double repetition_penalty = 1.0;
-    bool enable_thinking = true;
-    bool enable_vision = true;
-    bool enable_mtp = true;
-    int32_t mtp_max_draft_tokens = 3;
-    uint64_t seed = 0;
-};
+namespace mfq {
 
 // Describes the portion of a rendered prompt whose KV state is stable across
 // requests. A runtime may retain this exact token prefix after generation and
 // reuse it only when the next request starts with the same token sequence.
-struct MfqPromptCachePlan {
+struct PromptCachePlan {
     std::string session_id;
     size_t stable_prefix_tokens = 0;
     bool cache_output_tokens = false;
 };
+
+} // namespace mfq
 
 enum class MfqMultimodalProcessor {
     minicpmo,
@@ -72,9 +55,6 @@ struct MfqMultimodalInput {
     std::vector<int64_t> audio_lengths;
     std::vector<int64_t> audio_bounds;
 };
-
-// Source compatibility for out-of-tree MiniCPM-o integrations.
-using MfqVisionInput = MfqMultimodalInput;
 
 struct MfqDuplexSessionParams {
     std::vector<int64_t> system_prefix;
@@ -120,7 +100,9 @@ struct MfqDuplexStepResult {
     double inference_ms = 0.0;
 };
 
-struct MfqPrefillTiming {
+namespace mfq {
+
+struct PrefillTiming {
     size_t prompt_tokens = 0;
     // Language-model prompt evaluation only.
     double llm_ms = 0.0;
@@ -129,3 +111,5 @@ struct MfqPrefillTiming {
     // Complete model-side prefill wall time.
     double model_ms = 0.0;
 };
+
+} // namespace mfq

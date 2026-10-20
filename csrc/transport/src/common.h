@@ -124,9 +124,9 @@ double number_field(
     const json & body,
     const char * name,
     double fallback);
-MfqSamplingParams default_sampling_params(
+mfq::SamplingParams default_sampling_params(
     const MfqRuntimeTransportConfig & config);
-json sampling_params_json(const MfqSamplingParams & sampling);
+json sampling_params_json(const mfq::SamplingParams & sampling);
 json model_capability_profile_json(
     const mfq::engine::ModelCapabilities& capabilities);
 json duplex_profile_json(const MfqDuplexSamplingProfile & value);
@@ -140,7 +140,7 @@ json likelihood_result_json(const mfq::engine::LikelihoodResult& result);
 RequestInput parse_input(
     const json & body,
     bool chat,
-    const MfqSamplingParams & defaults);
+    const mfq::SamplingParams & defaults);
 RequestMetricValues request_metric_values(
     const CompletionResult & result,
     const RequestMetrics & metrics);
@@ -200,7 +200,7 @@ private:
     RuntimeRequestMetrics& metrics_store_;
     std::string id_, response_id_, model_;
     std::int64_t created_;
-    MfqSamplingParams sampling_;
+    mfq::SamplingParams sampling_;
     CompletionResult result_;
     std::shared_ptr<MfqScheduledRequest> request_;
     bool stream_ = false, include_usage_ = false;

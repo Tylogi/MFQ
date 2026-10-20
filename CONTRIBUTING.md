@@ -49,6 +49,10 @@ architecture-named entry point.
 - Cross-backend request execution, tokenization, sampling semantics, physical
   batch policy, session/cache lifecycle, metrics and MTP acceptance/commit rules
   belong in `csrc/engine/`.
+- Engine request/media values, sampling parameters, grammar cursor and
+  `StepSequence` live in `csrc/engine/include/`. Sampling has one definition in
+  `sampling_params.h`; device sampling adapters include that narrow contract.
+  Native allocators include `resource_error.h` directly without core.
 - Shared model configurations and forward definitions live today in
   `csrc/models/<family>/`, with shared layer compositions in
   `csrc/models/common/`. Family equations, positions and topology are defined

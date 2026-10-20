@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/core/step_sequence.h"
+#include "step_sequence.h"
 #include "storage/session/state.h"
 #include "kernels/attention/ops.h"
 #include "kernels/cache/ops.h"

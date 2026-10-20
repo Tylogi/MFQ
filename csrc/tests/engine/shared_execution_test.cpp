@@ -1,3 +1,4 @@
+#include "resource_error.h"
 #include "driver.h"
 #include "table.h"
 #include "policy.h"
