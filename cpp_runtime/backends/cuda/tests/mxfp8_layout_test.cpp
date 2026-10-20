@@ -23,9 +23,23 @@ void verify(const tb::Tensor& value,const std::vector<float>& expected) {
     for(std::size_t i=0;i<expected.size();++i)
         if(!std::isfinite(actual.data_ptr<float>()[i]) ||
             std::abs(actual.data_ptr<float>()[i]-expected[i])>2e-4f+1e-3f*std::abs(expected[i]))
-            throw std::runtime_error("MXFP8 independent oracle mismatch at "+std::to_string(i));
+            throw std::runtime_error("MXFP8 independent oracle mismatch at "+std::to_string(i)+
+                " actual="+std::to_string(actual.data_ptr<float>()[i])+" expected="+std::to_string(expected[i]));
 }
-void check(int block_rows,int block_columns,int outputs,int width,int groups=1,bool shifted=false) {
+template <typename Project>
+void verify_token_rows(const tb::Tensor& value,const tb::Tensor& input,Project project) {
+    const auto actual=value.cpu().contiguous();
+    const auto row_bytes=std::size_t(actual.size(1))*actual.element_size();
+    for(int64_t row=0;row<input.size(0);++row) {
+        const auto single=project(input.narrow(0,row,1)).cpu().contiguous();
+        if(std::memcmp(static_cast<const std::byte*>(actual.data_ptr())+row*row_bytes,
+                single.data_ptr(),row_bytes))
+            throw std::runtime_error("MXFP8 multi-token summation differs from single-token projection rows="+
+                std::to_string(input.size(0))+" width="+std::to_string(input.size(-1)));
+    }
+}
+void check(int block_rows,int block_columns,int outputs,int width,int groups=1,
+        bool shifted=false,bool shifted_input=false) {
     std::vector<uint8_t> blob{'M','X','T','1',1,8,0,0};
     const int scale_rows=(outputs+block_rows-1)/block_rows,scale_columns=width/block_columns;
     for(uint64_t d:{uint64_t(outputs),uint64_t(width),uint64_t(outputs),uint64_t(width),
@@ -51,7 +65,7 @@ void check(int block_rows,int block_columns,int outputs,int width,int groups=1,b
     verify(mxfp8_dequant_cuda(weight.values,weight.scales),dense);
     verify(mxfp8_cpu_reference(weight),dense);
     CudaProfiler profiler;
-    for(int m:{1,6,17,129}) {
+    for(int m:{1,2,3,4,5,6,7,8,17,31,32,33,63,64,65,129}) {
         std::vector<float> input(std::size_t(m)*groups*width),expected(std::size_t(m)*outputs);
         for(std::size_t i=0;i<input.size();++i)input[i]=float(int(i*13%17)-8)/32;
         const int per=outputs/groups;
@@ -61,14 +75,24 @@ void check(int block_rows,int block_columns,int outputs,int width,int groups=1,b
             expected[std::size_t(row)*outputs+n]=float(sum);
         }
         auto x=tb::tensor(input).reshape({m,groups,width}).to(tb::kFloat16).to(tb::kCUDA);
+        if(shifted_input) {
+            auto backing=tb::empty({x.numel()+1},x.options());
+            auto shifted_x=backing.narrow(0,1,x.numel()).reshape(x.sizes().vec());
+            shifted_x.copy_(x);x=std::move(shifted_x);
+        }
         if(groups==1) {
             x=x.reshape({m,width});
             verify(mxfp8_matmul(profiler,weight,x),expected);
-            verify(mxfp8_matmul_f32(profiler,weight,x),expected);
+            const auto precise=mxfp8_matmul_f32(profiler,weight,x);
+            verify(precise,expected);
+            if(m<=8)verify_token_rows(precise,x,[&](const auto& row){return mxfp8_matmul_f32(profiler,weight,row);});
             verify(mxfp8_matmul(profiler,to_device_mxfp8(cpu,false),x.to(tb::kCPU)),expected);
         } else {
             verify(mxfp8_groupwise_matmul(profiler,weight,x,groups),expected);
-            verify(mxfp8_groupwise_matmul_f32(profiler,weight,x,groups),expected);
+            const auto precise=mxfp8_groupwise_matmul_f32(profiler,weight,x,groups);
+            verify(precise,expected);
+            if(m<=8)verify_token_rows(precise,x,[&](const auto& row){return mxfp8_groupwise_matmul_f32(profiler,weight,row,groups);});
+            if(m>8)verify(mxfp8_groupwise_matmul(profiler,to_device_mxfp8(cpu,false),x.to(tb::kCPU),groups),expected);
         }
     }
     auto input_slice=slice_mxfp8_cpu(cpu,TensorParallelAxis::Input,block_columns,width);
@@ -193,7 +217,77 @@ void benchmark_prefill(bool only_ffn=false) {
         MFQ_CUDA_CHECK(cudaEventDestroy(start));MFQ_CUDA_CHECK(cudaEventDestroy(stop));
     }
 }
+enum class Mxfp8BenchPath { PackedSimt, PackedTensorCore };
+enum class Mxfp8BenchBatch { Decode, Draft, Prefill };
+void benchmark_native_mxfp8(Mxfp8BenchPath path,Mxfp8BenchBatch batch=Mxfp8BenchBatch::Decode) {
+    const bool prefill=batch==Mxfp8BenchBatch::Prefill;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
+    for(const auto shape:{std::array<int,3>{1280,32768,1}, {5120,2304,1},
+            {2304,5120,1}, {5120,512,1}, {5120,1280,1},
+            {4096,8192,8}, {8192,5120,1}, {15360,5120,1}}) {
+        const auto [width,outputs,groups]=shape;
+        if(path==Mxfp8BenchPath::PackedTensorCore && groups!=1 && !prefill)continue;
+        std::array<float,256> decoded{};
+        for(int code=0;code<256;++code)decoded[code]=decode(uint8_t(code));
+        std::vector<uint8_t> bytes(std::size_t(outputs)*width);
+        std::vector<float> sums(outputs);
+        for(int n=0;n<outputs;++n) {
+            double sum=0;
+            for(int k=0;k<width;++k) {
+                const auto i=std::size_t(n)*width+k;
+                const auto code=uint8_t((i*37+n*13)%127|(((i*29+n)&1)<<7));
+                bytes[i]=code;sum+=decoded[code]*.03125;
+            }
+            sums[n]=float(sum);
+        }
+        auto values=tb::tensor(bytes).reshape({outputs,width}).to(tb::kCUDA);
+        auto scales=tb::full({(outputs+31)/32,width/32},127,options);
+        Mxfp8Weight weight;weight.values=values;weight.scales=scales;
+        weight.out=outputs;weight.neuron_len=width;
+        CudaProfiler profiler;
+        const std::vector<int> row_counts=prefill?std::vector<int>{128,1024,4080}:
+            batch==Mxfp8BenchBatch::Draft?std::vector<int>{2,3,4,5,6,8}:std::vector<int>{1,2,4,8};
+        const int repeats=prefill?3:40;
+        for(const int rows:row_counts) {
+            auto input=tb::full({rows,groups,width},.03125,options.dtype(tb::kFloat16));
+            const auto run=[&] {
+                if(path==Mxfp8BenchPath::PackedTensorCore) {
+                    if(groups!=1)return mxfp8_groupwise_matmul(profiler,weight,input,groups);
+                    return mxfp8_matmul_f16_cuda(values,scales,input.reshape({rows,width}));
+                }
+                return groups==1 ? mxfp8_small_m_cuda(values,scales,input.reshape({rows,width}))
+                    : mxfp8_groupwise_small_m_cuda(values,scales,input,groups);
+            };
+            for(int i=0;i<(prefill?1:5);++i)run();
+            cudaEvent_t start,stop;
+            MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+            MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
+            for(int i=0;i<repeats;++i)run();
+            MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));
+            MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+            float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
+            if(prefill) {
+                const auto result=run();
+                verify(result.select(0,0),sums);verify(result.select(0,rows-1),sums);
+            }else {
+                std::vector<float> expected;
+                expected.reserve(std::size_t(rows)*outputs);
+                for(int row=0;row<rows;++row)expected.insert(expected.end(),sums.begin(),sums.end());
+                verify(run(),expected);
+            }
+            std::cout<<(prefill?"mxfp8_prefill":"mxfp8_decode")<<" rows="<<rows<<" width="<<width<<" outputs="<<outputs
+                <<" groups="<<groups<<" scale_block=32 path="
+                <<(path==Mxfp8BenchPath::PackedTensorCore?"tensor_core":"packed_simt")
+                <<" ms="<<ms/repeats<<std::endl;
+            MFQ_CUDA_CHECK(cudaEventDestroy(start));MFQ_CUDA_CHECK(cudaEventDestroy(stop));
+        }
+    }
+}
 int main(int argc,char** argv) try {
+    if(argc==2 && std::string(argv[1])=="--bench-decode") {benchmark_native_mxfp8(Mxfp8BenchPath::PackedSimt);return 0;}
+    if(argc==2 && std::string(argv[1])=="--bench-decode-tc") {benchmark_native_mxfp8(Mxfp8BenchPath::PackedTensorCore);return 0;}
+    if(argc==2 && std::string(argv[1])=="--bench-native-prefill") {benchmark_native_mxfp8(Mxfp8BenchPath::PackedTensorCore,Mxfp8BenchBatch::Prefill);return 0;}
+    if(argc==2 && std::string(argv[1])=="--bench-mtp") {benchmark_native_mxfp8(Mxfp8BenchPath::PackedSimt,Mxfp8BenchBatch::Draft);return 0;}
     if(argc==2 && std::string(argv[1])=="--bench-mxfp4") {benchmark_mxfp4_prefill();return 0;}
     if(argc==2 && std::string(argv[1])=="--mxfp4-only") {
         for(bool routed:{false,true})for(const auto shape:{std::array<int,3>{1,19,32},
@@ -208,8 +302,13 @@ int main(int argc,char** argv) try {
     check(32,32,65,96,1,true);
     check(1,32,65,96,1,true);
     check(1,32,65,96);
+    check(128,128,137,2048);
+    check(32,32,65,160);
+    check(128,128,137,256,1,false,true);
     check(32,32,96,96,3);
     check(1,32,96,96,3);
+    check(128,128,384,256,3);
+    check(32,32,288,160,3,true);
     check_mxfp4_routes(129,65,96,false);
     check_mxfp4_routes(129,65,96,true);
     return 0;

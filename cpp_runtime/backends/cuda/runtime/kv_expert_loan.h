@@ -32,7 +32,9 @@ public:
         std::lock_guard lock(mutex_);reuse_learning_=enabled;
     }
     using Key=std::array<int64_t,3>; // source, expert, field
-    struct ReuseStats {uint64_t promotions=0,protected_hits=0,probation_evictions=0;std::size_t protected_pages=0;bool enabled=false;};
+    struct ReuseStats {uint64_t promotions=0,protected_hits=0,probation_evictions=0,forecast_eviction_skips=0,protected_trims=0;
+        uint64_t protected_accesses=0,accepted_row_promotions=0;
+        std::size_t protected_pages=0,capacity_pages=0,protected_limit_pages=0;bool enabled=false;};
     void set_reuse_priority(bool enabled) {
         std::lock_guard<std::mutex> lock(mutex_);if(reuse_priority_==enabled)return;
         reuse_priority_=enabled;reuse_pages_=0;reuse_heads_={};reuse_tails_={};
@@ -44,6 +46,7 @@ public:
     }
     ReuseStats reuse_stats() const {
         std::lock_guard<std::mutex> lock(mutex_);auto result=reuse_stats_;result.protected_pages=reuse_pages_;
+        result.capacity_pages=reuse_capacity_pages_;result.protected_limit_pages=reuse_capacity_pages_/2;
         result.enabled=reuse_priority_;return result;
     }
     class ExchangeReadGuard {
@@ -152,7 +155,7 @@ public:
     }
     void next_packet(const std::array<int64_t,3>& sources={},const int32_t* ids=nullptr,int rows=0,int routes=0,int experts=0) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if(++packet_==0){for(auto& e:lru_)e.packet=0;packet_=1;}
+        if(++packet_==0){for(auto& e:lru_){e.packet=0;e.forecast_packet=0;e.last_use_packet=0;}packet_=1;}
         // The next route publication fences readers of the previous packet,
         // exactly as for ordinary LRU eviction. Retirement itself never frees
         // an address that an already submitted graph can still be reading.
@@ -172,10 +175,12 @@ public:
     }
     // Pin every known member of this packet before an allocation can evict a
     // later routed projection. Actual pin() calls still update LRU recency.
-    void protect_packet_fields(const std::vector<Key>& keys) {
+    std::size_t protect_packet_fields(const std::vector<Key>& keys,bool forecast=false) {
         std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t protected_fields=0;
         for(const auto& key:keys)if(auto found=entries_.find(key);found!=entries_.end())
-            found->second->packet=packet_;
+            {found->second->packet=packet_;if(forecast)found->second->forecast_packet=packet_;++protected_fields;}
+        return protected_fields;
     }
     using ProjectionFill=std::function<void(void*,const std::array<std::size_t,8>&)>;
     using ProjectionObserver=std::function<void(int64_t,const void*,const std::array<std::size_t,8>&)>;
@@ -312,7 +317,9 @@ private:
     }
     struct Region {mfq_tensor_backend::Tensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
     struct Entry {Key key;std::size_t region,first,pages,bytes;uint64_t packet=0;bool retired=false,published=false;
-        uint64_t order=0,prior_order=0,epoch=0;uint32_t used_rows=0;bool reused=false,reuse_eligible=false,reuse_linked=false;
+        uint64_t forecast_packet=0;
+        uint64_t order=0,prior_order=0,epoch=0,last_use_packet=0,prior_use_packet=0;
+        uint32_t used_rows=0;bool reused=false,reuse_eligible=false,reuse_linked=false;
         Entry* reuse_prev=nullptr;Entry* reuse_next=nullptr;
         std::unique_ptr<ProjectionLayout> projection;std::size_t exchange_pins=0;};
     void disable_speculative() {
@@ -320,9 +327,14 @@ private:
     }
     void note_access(Entry& entry,bool fresh=false) {
         if(!reuse_learning_)return;
-        const bool reused=!fresh && entry.packet!=packet_;
+        // Eviction protection is not a weight access. In particular, packet
+        // preflight must not hide a later genuine hit from reuse learning.
+        const bool reused=!fresh && entry.last_use_packet && entry.last_use_packet!=packet_;
+        if(reuse_priority_ && reused && entry.packet==packet_ && !reuse_stats_.protected_accesses++)
+            std::fprintf(stderr,"moe_kv_real_reuse scope=first_protected_hit enabled=1\n");
         if(reuse_priority_ && entry.reused)++reuse_stats_.protected_hits;
         if(!speculative_rows_) {
+            entry.last_use_packet=packet_;
             if(reuse_priority_ && reused){set_reused(entry,true);trim_reused(&entry);}
             return;
         }
@@ -335,23 +347,40 @@ private:
                 try {speculative_keys_.push_back(entry.key);}
                 catch(const std::bad_alloc&){disable_speculative();return;}
                 entry.epoch=speculative_epoch_;entry.prior_order=fresh?0:entry.order;entry.used_rows=0;
+                entry.prior_use_packet=fresh?0:entry.last_use_packet;
                 entry.reuse_eligible=reused;
             }
             entry.used_rows|=mask;
         }else if(reuse_priority_ && reused){set_reused(entry,true);trim_reused(&entry);}
-        entry.order=++access_order_;
+        entry.last_use_packet=packet_;entry.order=++access_order_;
     }
     void finish_speculative(int rows,bool cancelled) {
         const uint32_t accepted=rows==32?UINT32_MAX:(uint32_t(1)<<rows)-1;
-        bool reordered=false;uint64_t hits=0,insertions=0;
+        const auto token_stride=access_order_+1;
+        bool reordered=false,token_ordered=false;uint64_t hits=0,insertions=0;
         for(const auto& key:speculative_keys_)if(auto found=entries_.find(key);found!=entries_.end()) {
             auto& entry=*found->second;if(entry.epoch!=speculative_epoch_)continue;
             entry.epoch=0;
-            if(entry.used_rows&accepted) {
-                if(reuse_priority_ && entry.reuse_eligible)set_reused(entry,true);
+            const auto used=entry.used_rows&accepted;
+            if(used) {
+                const bool repeated_rows=(used&(used-1))!=0;
+                if(reuse_priority_ && (entry.reuse_eligible || repeated_rows)) {
+                    if(!entry.reused && !entry.reuse_eligible && repeated_rows && !reuse_stats_.accepted_row_promotions++)
+                        std::fprintf(stderr,"moe_kv_accepted_row_reuse scope=first_promotion enabled=1\n");
+                    set_reused(entry,true);
+                }
+                if(rows>1) {
+                    // Batched GPU consumption runs layer by layer. Match the
+                    // accepted token chronology used by RAM learning instead
+                    // of letting read completion order rank the next token's
+                    // expert cache. Rejected later rows never affect this rank.
+                    unsigned last_row=0;for(auto mask=used>>1;mask;mask>>=1)++last_row;
+                    entry.order=(last_row+1)*token_stride+entry.order;
+                    reordered=token_ordered=true;
+                }
                 ++speculative_stats_.kept;continue;
             }
-            entry.order=entry.prior_order;reordered=true;
+            entry.order=entry.prior_order;entry.last_use_packet=entry.prior_use_packet;reordered=true;
             if(entry.prior_order)++hits;else ++insertions;
         }
         // Rejected hits recover their pre-window recency. New rejected entries
@@ -359,6 +388,10 @@ private:
         // ordinary packet boundary remains the sole eviction/read fence.
         if(reordered)lru_.sort([](const Entry& a,const Entry& b){return a.order>b.order;});
         if(reuse_priority_){rebuild_reuse_queues();trim_reused();}
+        if(token_ordered && !token_order_reported_) {
+            token_order_reported_=true;
+            std::fprintf(stderr,"moe_kv_token_order scope=first_committed_window enabled=1 rows=%d\n",rows);
+        }
         ++speculative_stats_.windows;speculative_stats_.reverted_hits+=hits;
         speculative_stats_.cold_insertions+=insertions;speculative_stats_.cancels+=cancelled;
         if(reordered && !speculative_reported_) {
@@ -399,14 +432,20 @@ private:
         if(std::none_of(regions_.begin(),regions_.end(),[&](const Region& r){return r.end>=r.begin && r.end-r.begin>=pages;}))return nullptr;
         auto room=find(pages);
         if(room.first==regions_.size() && exchange_freezes_)return nullptr;
+        const auto replaceable=[&](Entry& entry) {
+            if(entry.exchange_pins)return false;
+            if(entry.packet!=packet_)return true;
+            if(entry.forecast_packet==packet_)++reuse_stats_.forecast_eviction_skips;
+            return false;
+        };
         while(room.first==regions_.size()) {
             auto candidate=lru_.end();
             if(reuse_priority_) {
                 for(int queue=0;queue<2 && candidate==lru_.end();++queue)
                     for(auto* entry=reuse_tails_[queue];entry;entry=entry->reuse_prev)
-                        if(entry->packet!=packet_ && !entry->exchange_pins){candidate=entries_.at(entry->key);break;}
+                        if(replaceable(*entry)){candidate=entries_.at(entry->key);break;}
             }else for(auto it=lru_.end();it!=lru_.begin();) {
-                --it;if(it->packet!=packet_ && !it->exchange_pins){candidate=it;break;}
+                --it;if(replaceable(*it)){candidate=it;break;}
             }
             if(candidate==lru_.end())break;
             if(reuse_priority_ && !candidate->reused)++reuse_stats_.probation_evictions;
@@ -501,16 +540,23 @@ private:
         }
     }
     void trim_reused(Entry* recent=nullptr) {
-        // Keep a probationary quarter for new routes. Repeated experts survive
-        // long one-use scans without reserving VRAM for any particular source.
-        const auto limit=reuse_capacity_pages_-reuse_capacity_pages_/4;
+        // A quarter can be smaller than one token's streamed working set.
+        // Reserve half for new routes so they can survive until their next
+        // use; the other half still protects recurring experts from scans.
+        const auto limit=reuse_capacity_pages_/2;
+        const auto demote=[&](Entry& entry) {
+            set_reused(entry,false);
+            if(!reuse_stats_.protected_trims++)std::fprintf(stderr,
+                "moe_kv_reuse_budget scope=first_trim enabled=1 protected_fraction=0.5 capacity_pages=%zu\n",
+                reuse_capacity_pages_);
+        };
         while(reuse_pages_>limit) {
             auto* entry=reuse_tails_[1];
             if(entry && entry==recent)entry=entry->reuse_prev;
             if(!entry)break;
-            set_reused(*entry,false);
+            demote(*entry);
         }
-        if(reuse_pages_>limit && recent)set_reused(*recent,false);
+        if(reuse_pages_>limit && recent)demote(*recent);
     }
     void revoke() {
         bool revoked=false;
@@ -523,10 +569,28 @@ private:
             MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(current_stream().stream(),released_.get(),0));
         }
     }
-    std::pair<std::size_t,std::size_t> find(std::size_t pages) const {
-        for(std::size_t i=0;i<regions_.size();++i)if(regions_[i].largest_free>=pages)
-            for(const auto& [begin,size]:regions_[i].free)if(size>=pages)return {i,begin};
-        return {regions_.size(),0};
+    std::pair<std::size_t,std::size_t> find(std::size_t pages) {
+        // Keep large holes available for large projections. Choosing the first
+        // fitting address can evict live entries even when an exact fit exists
+        // in another borrowed region. All addresses remain fixed after pinning.
+        std::pair<std::size_t,std::size_t> best{regions_.size(),0};
+        std::size_t first_size=0,best_size=std::numeric_limits<std::size_t>::max();
+        for(std::size_t i=0;i<regions_.size();++i) {
+            if(regions_[i].largest_free<pages)continue;
+            for(const auto& [begin,size]:regions_[i].free) {
+                if(size<pages || size>=best_size)continue;
+                if(!first_size)first_size=size;
+                best={i,begin};best_size=size;
+                if(size==pages)break;
+            }
+            if(best_size==pages)break;
+        }
+        if(best_size<first_size && !best_fit_reported_) {
+            best_fit_reported_=true;
+            std::fprintf(stderr,"moe_kv_best_fit scope=first_tighter_fit enabled=1 requested_pages=%zu first_fit_pages=%zu selected_pages=%zu\n",
+                pages,first_size,best_size);
+        }
+        return best;
     }
     void* pointer(const Entry& e) const {return static_cast<uint8_t*>(regions_[e.region].owner.data_ptr())+e.first*page;}
     void notify_projection(const Entry& entry,bool valid,bool reuse_change=false) {
@@ -573,12 +637,12 @@ private:
     std::array<Entry*,2> reuse_heads_{},reuse_tails_{};
     std::size_t reuse_pages_=0,reuse_capacity_pages_=0;
     ReuseStats reuse_stats_;
-    bool speculative_reported_=false;
+    bool speculative_reported_=false,token_order_reported_=false;
     std::size_t bytes_=0,hits_=0,retired_bytes_=0;
     double lookup_us_=0;
     int64_t high_water_=0;
     cudaStream_t copy_stream_=nullptr;
-    bool initialization_waited_=false;
+    bool initialization_waited_=false,best_fit_reported_=false;
     Event initialized_,released_;
 };
 }

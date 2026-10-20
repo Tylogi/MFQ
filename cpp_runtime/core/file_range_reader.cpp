@@ -1,5 +1,6 @@
 #include "mfq/file_range_reader.h"
 #include "mfq/host_parallel.h"
+#include "mfq/host_copy.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +35,27 @@
 #endif
 
 namespace mfq {
+namespace {
+std::size_t direct_chunk_limit(std::size_t alignment) {
+    return std::max<std::size_t>(1,(1u<<20)/alignment)*alignment;
+}
+void report_direct_chunking(std::size_t bytes,std::size_t limit) {
+    if(bytes<=limit)return;
+    static std::atomic<bool> reported{false};
+    if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+        "model_direct_read_chunks scope=first_large_range enabled=1 max_request_bytes=%zu logical_bytes=%zu\n",
+        limit,bytes);
+}
+void copy_read_buffer(void* destination,const void* source,std::size_t bytes) {
+    // Large packed fields are normally consumed by a later DMA. Avoid
+    // write-allocating medium fields while preserving independent I/O workers.
+    copy_host_range({destination,source,bytes});
+    static std::atomic<bool> reported{false};
+    if(bytes>=(256u<<10) && bytes<(2u<<20) && !reported.load(std::memory_order_relaxed) &&
+            !reported.exchange(true,std::memory_order_relaxed))
+        std::fprintf(stderr,"model_read_copy scope=first_medium_bounce enabled=1 strategy=host_copy bytes=%zu\n",bytes);
+}
+}
 
 FileReadMode model_file_read_mode() {
     const char* value = std::getenv("MFQ_MODEL_FILE_IO");
@@ -71,9 +93,9 @@ struct FileRangeReader::Impl {
 #endif
     }
     struct StagingPool {
-        static constexpr std::size_t budget=64u<<20,maximum_slab=8u<<20;
+        static constexpr std::size_t budget=128u<<20,maximum_slab=8u<<20;
         std::mutex mutex;
-        std::array<Slab,16> slabs{};
+        std::array<Slab,32> slabs{};
         std::size_t idle=0;
         std::uint64_t order=0;
         void erase(Slab& slab) noexcept {
@@ -113,7 +135,8 @@ struct FileRangeReader::Impl {
         if(result.data) {
             static std::atomic<bool> reported{false};
             if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
-                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse shared=1 max_idle_bytes=67108864 bytes=%zu\n",result.bytes);
+                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse shared=1 max_idle_bytes=%zu bytes=%zu\n",
+                    StagingPool::budget,result.bytes);
         }
         if(!result.data) {
             // Sector-aligned size classes reuse ordinary expert images across
@@ -275,7 +298,7 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
             const auto actual = impl_->transfer(aligned_offset, bounce ? buffer.data : destination, transfer_bytes);
             impl_->physical.fetch_add(actual, std::memory_order_relaxed);
             if (actual < span) throw std::runtime_error("model file was truncated during range read");
-            if (bounce) std::memcpy(destination, static_cast<std::byte*>(buffer.data) + prefix, copy_bytes);
+            if (bounce) copy_read_buffer(destination, static_cast<std::byte*>(buffer.data) + prefix, copy_bytes);
             destination += copy_bytes;
             offset += copy_bytes;
             size -= copy_bytes;
@@ -448,6 +471,7 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         std::byte* destination = nullptr;
         std::size_t prefix = 0, bytes = 0, allocation = 0, storage_offset = 0;
         bool submitted = false, finished = false;
+        bool aligned_target = false;
         explicit Request(const Impl& value) : owner(value) {}
         ~Request() {
             if (submitted && !finished) {
@@ -463,7 +487,10 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     std::size_t count=0;
     try {
         const auto alignment = impl_->alignment;
-        const auto limit = std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment;
+        // Keep several native reads outstanding even when only one cold
+        // projection is needed. Each bounded wave still owns one staging arena.
+        const auto limit = std::min(std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment,
+            direct_chunk_limit(alignment));
         std::size_t span_index = 0, span_offset = 0;
         while (span_index < spans.size()) {
             std::size_t batch_bytes=0;
@@ -475,14 +502,19 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
                 const auto offset = span.offset + span_offset;
                 const auto base = offset / alignment * alignment;
+                report_direct_chunking(span.size-span_offset,limit);
                 auto* request=&requests[count].emplace(*impl_);
                 request->prefix = static_cast<std::size_t>(offset - base);
                 request->bytes = std::min(span.size - span_offset, limit - request->prefix);
                 const auto required = request->prefix + request->bytes;
                 request->allocation = required + (alignment - required % alignment) % alignment;
                 request->destination = span.destination + span_offset;
-                if(request->allocation>SIZE_MAX-batch_bytes)throw std::overflow_error("direct read staging size overflow");
-                request->storage_offset=batch_bytes;batch_bytes+=request->allocation;
+                request->aligned_target=!request->prefix && request->bytes==request->allocation &&
+                    reinterpret_cast<std::uintptr_t>(request->destination)%alignment==0;
+                if(!request->aligned_target) {
+                    if(request->allocation>SIZE_MAX-batch_bytes)throw std::overflow_error("direct read staging size overflow");
+                    request->storage_offset=batch_bytes;batch_bytes+=request->allocation;
+                }
                 request->native.Offset = static_cast<DWORD>(base);
                 request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
                 request->native.hEvent = events.at(count);
@@ -490,14 +522,21 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 ++count;
             }
             storage.ensure(batch_bytes);
+            static std::atomic<bool> aligned_reported{false};
+            if(!aligned_reported.load(std::memory_order_relaxed)) {
+                std::size_t direct=0;for(std::size_t i=0;i<count;++i)direct+=requests[i]->aligned_target;
+                if(direct && !aligned_reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"model_direct_batch_target enabled=1 requests=%zu direct_requests=%zu staging_bytes=%zu\n",count,direct,batch_bytes);
+            }
             static std::atomic<bool> reported{false};
-            if(count>1 && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+            if(count>1 && batch_bytes && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
                 std::fprintf(stderr,"model_direct_staging_batch enabled=1 requests=%zu bytes=%zu arena_allocations=1\n",count,batch_bytes);
             // Keep every IO request in this bounded batch outstanding before
             // waiting for completion. Ordinary expert field batches fit here.
             for (std::size_t i=0;i<count;++i) {
                 auto& request=requests[i];
-                request->storage=static_cast<std::byte*>(storage.data)+request->storage_offset;
+                request->storage=request->aligned_target?request->destination:
+                    static_cast<std::byte*>(storage.data)+request->storage_offset;
                 impl_->calls.fetch_add(1, std::memory_order_relaxed);
                 const auto ok = ReadFile(impl_->handle, request->storage,
                     static_cast<DWORD>(request->allocation), nullptr, &request->native);
@@ -518,7 +557,7 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             }
             for (std::size_t i=0;i<count;++i) {
                 auto& request=requests[i];
-                std::memcpy(request->destination,
+                if(!request->aligned_target)copy_read_buffer(request->destination,
                     static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
                 impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
             }
@@ -548,37 +587,52 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             slab=owner.borrow_staging(bytes);
         }
     } storage(*impl_);
-    struct Part {std::uint64_t offset;std::size_t prefix,bytes,allocation,staging;std::byte* destination;};
+    struct Part {std::uint64_t offset;std::size_t prefix,bytes,allocation,staging;std::byte* destination;bool aligned_target;};
     std::size_t index=0,consumed=0;
     try {
         while(index<spans.size()) {
-            std::array<Part,64> parts{};std::size_t count=0,bytes=0;
+            std::array<Part,64> parts{};std::size_t count=0,bytes=0,staging_bytes=0;
             const auto alignment=impl_->alignment;
             const auto wave_limit=std::max<std::size_t>(8u<<20,alignment);
+            const auto request_limit=direct_chunk_limit(alignment);
             while(count<parts.size() && index<spans.size()) {
                 const auto& span=spans[index];
                 if(consumed==span.size){++index;consumed=0;continue;}
                 const auto offset=span.offset+consumed,base=offset/alignment*alignment;
                 const auto prefix=std::size_t(offset-base);
-                const auto copy=std::min(span.size-consumed,wave_limit-prefix);
+                report_direct_chunking(span.size-consumed,request_limit);
+                const auto copy=std::min(span.size-consumed,request_limit-prefix);
                 const auto allocation=(prefix+copy+alignment-1)/alignment*alignment;
                 if(count && allocation>wave_limit-bytes)break;
-                parts[count++]={base,prefix,copy,allocation,bytes,span.destination+consumed};
+                auto* destination=span.destination+consumed;
+                const bool direct=!prefix && copy==allocation &&
+                    reinterpret_cast<std::uintptr_t>(destination)%alignment==0;
+                parts[count++]={base,prefix,copy,allocation,staging_bytes,destination,direct};
+                if(!direct)staging_bytes+=allocation;
                 bytes+=allocation;consumed+=copy;
             }
             if(!count)continue;
-            storage.ensure(bytes);
+            storage.ensure(staging_bytes);
+            static std::atomic<bool> aligned_reported{false};
+            if(!aligned_reported.load(std::memory_order_relaxed)) {
+                std::size_t direct=0;for(std::size_t i=0;i<count;++i)direct+=parts[i].aligned_target;
+                if(direct && !aligned_reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"model_direct_batch_target enabled=1 requests=%zu direct_requests=%zu staging_bytes=%zu\n",count,direct,staging_bytes);
+            }
+            const auto target=[&](const Part& part) {
+                return part.aligned_target?part.destination:static_cast<std::byte*>(storage.slab.data)+part.staging;
+            };
             std::array<iocb,64> native{};std::array<iocb*,64> requests{};
             std::array<std::int64_t,64> results{};
             for(std::size_t i=0;i<count;++i) {
                 const auto& part=parts[i];auto& request=native[i];requests[i]=&request;
                 request.aio_data=i;request.aio_lio_opcode=IOCB_CMD_PREAD;request.aio_fildes=impl_->handle;
-                request.aio_buf=reinterpret_cast<std::uintptr_t>(static_cast<std::byte*>(storage.slab.data)+part.staging);
+                request.aio_buf=reinterpret_cast<std::uintptr_t>(target(part));
                 request.aio_nbytes=part.allocation;request.aio_offset=part.offset;
             }
             if(!queue.read(requests,count,results)) {
                 for(std::size_t i=0;i<count;++i)results[i]=impl_->transfer(parts[i].offset,
-                    static_cast<std::byte*>(storage.slab.data)+parts[i].staging,parts[i].allocation);
+                    target(parts[i]),parts[i].allocation);
             }
             impl_->calls.fetch_add(count,std::memory_order_relaxed);
             for(std::size_t i=0;i<count;++i) {
@@ -589,7 +643,7 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             }
             for(std::size_t i=0;i<count;++i) {
                 const auto& part=parts[i];
-                std::memcpy(part.destination,static_cast<std::byte*>(storage.slab.data)+part.staging+part.prefix,part.bytes);
+                if(!part.aligned_target)copy_read_buffer(part.destination,target(part)+part.prefix,part.bytes);
                 impl_->logical.fetch_add(part.bytes,std::memory_order_relaxed);
             }
         }
@@ -599,6 +653,103 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
 #else
     for(const auto& span:spans)read(span.offset,span.destination,span.size);
 #endif
+}
+
+void FileRangeReader::read_coalesced(const std::vector<ReadSpan>& spans) const {
+    struct Interval {std::uint64_t first,last;};
+    const auto alignment=impl_->alignment;
+    std::vector<Interval> intervals;intervals.reserve(spans.size());
+    std::size_t logical_bytes=0;
+    for(const auto& span:spans) {
+        if(span.offset>impl_->size || span.size>impl_->size-span.offset)
+            throw std::out_of_range("batched range exceeds model shard");
+        if(!span.size)continue;
+        if(!span.destination)throw std::invalid_argument("batched range destination is null");
+        if(span.size>SIZE_MAX-logical_bytes)throw std::overflow_error("batched logical byte count overflow");
+        logical_bytes+=span.size;
+        const auto last=span.offset+span.size;
+        const auto remainder=(alignment-last%alignment)%alignment;
+        intervals.push_back({span.offset/alignment*alignment,
+            last+std::min<std::uint64_t>(remainder,impl_->size-last)});
+    }
+    if(intervals.empty())return;
+    std::sort(intervals.begin(),intervals.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+    std::vector<Interval> merged;merged.reserve(intervals.size());
+    for(const auto interval:intervals) {
+        if(!merged.empty() && interval.first<=merged.back().last)
+            merged.back().last=std::max(merged.back().last,interval.last);
+        else merged.push_back(interval);
+    }
+    if(alignment>1 && merged.size()>64) {
+        std::vector<Interval> coalesced;coalesced.reserve(merged.size());
+        std::uint64_t useful=0;
+        for(const auto interval:merged) {
+            const auto count=interval.last-interval.first;
+            if(!coalesced.empty()) {
+                auto& previous=coalesced.back();const auto cover=interval.last-previous.first;
+                if(cover<=65536 && cover<=2*(useful+count)) {
+                    previous.last=interval.last;useful+=count;continue;
+                }
+            }
+            coalesced.push_back(interval);useful=count;
+        }
+        merged=std::move(coalesced);
+    }
+    if(merged.size()==intervals.size()) {
+        if(alignment>1 && spans.size()>1) {
+            auto ordered=spans;
+            std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b){return a.offset<b.offset;});
+            read_batch(ordered);
+        }else read_batch(spans);
+        return;
+    }
+    std::size_t bytes=0,physical_bytes=0;
+    const auto allocated=[alignment](std::size_t count) {
+        const auto padding=(alignment-count%alignment)%alignment;
+        if(padding>SIZE_MAX-count)throw std::overflow_error("coalesced range alignment overflow");
+        return count+padding;
+    };
+    for(const auto interval:merged) {
+        const auto count=interval.last-interval.first;
+        if(count>SIZE_MAX-physical_bytes)throw std::overflow_error("coalesced range size overflow");
+        physical_bytes+=std::size_t(count);
+        const auto capacity=allocated(std::size_t(count));
+        if(capacity>SIZE_MAX-bytes)throw std::overflow_error("coalesced storage size overflow");
+        bytes+=capacity;
+    }
+    struct Buffer {
+        const Impl& owner;Impl::Slab slab;
+        ~Buffer(){owner.return_staging(slab);}
+    } storage{*impl_,impl_->borrow_staging(bytes)};
+    std::vector<ReadSpan> reads;reads.reserve(merged.size());
+    std::vector<ReadSpan> operations;operations.reserve(merged.size()+1);
+    std::size_t offset=0;
+    for(const auto interval:merged) {
+        const auto count=std::size_t(interval.last-interval.first);
+        auto* destination=static_cast<std::byte*>(storage.slab.data)+offset;
+        reads.push_back({interval.first,destination,count});
+        // A shard's unaligned EOF needs a bounce for its final sector only,
+        // not another full coalesced payload. The prefix can be filled in place.
+        const auto prefix=count/alignment*alignment;
+        if(prefix)operations.push_back({interval.first,destination,prefix});
+        if(prefix<count)operations.push_back({interval.first+prefix,destination+prefix,count-prefix});
+        offset+=allocated(count);
+    }
+    read_batch(operations);
+    for(const auto& span:spans)if(span.size) {
+        const auto found=std::upper_bound(merged.begin(),merged.end(),span.offset,
+            [](std::uint64_t at,const Interval& interval){return at<interval.first;});
+        const auto index=std::size_t(found-merged.begin()-1);
+        copy_read_buffer(span.destination,reads[index].destination+span.offset-merged[index].first,span.size);
+    }
+    // read_batch counted the merged ranges; report the original requested
+    // bytes, including repeated/overlapping reads, without resetting peers.
+    if(logical_bytes>=physical_bytes)impl_->logical.fetch_add(logical_bytes-physical_bytes,std::memory_order_relaxed);
+    else impl_->logical.fetch_sub(physical_bytes-logical_bytes,std::memory_order_relaxed);
+    static std::atomic<bool> reported{false};
+    if(bytes>=(1u<<20) && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+        std::fprintf(stderr,"model_coalesced_read scope=first_large_read enabled=1 ranges=%zu groups=%zu aligned_storage_bytes=%zu\n",
+            spans.size(),merged.size(),storage.slab.bytes);
 }
 
 } // namespace mfq

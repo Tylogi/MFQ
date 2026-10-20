@@ -58,8 +58,7 @@ template <class Model> struct CudaWeightLoader {
         const auto mapped=mfq::cuda::runtime_options::embedding_mapped();
         const bool mapped_control=mapped && *mapped==2;
         const bool use_mapped=mapped ? *mapped==1 || mapped_control :
-            model.execution->config.moe_pipeline && model.execution->config.moe_preload_all &&
-            model.execution->config.moe_ram_pcie;
+            model.execution->config.moe_pipeline && model.execution->config.moe_ram_pcie;
         const auto& dtype=require_tensor(source,name).dtype;
         const bool nint=dtype=="NINT";
         if(use_mapped && model.has_independent_output_weights(*this) &&
@@ -426,12 +425,17 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
+    if ((result.plan.vision != mfq::cuda::CudaVisionAdapter::none &&
+         result.plan.vision != mfq::cuda::CudaVisionAdapter::deepseek_v41) ||
             (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
              result.plan.predictor !=
                  mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark)) {
         throw std::runtime_error(
             "unsupported DeepSeek-V4.1 CUDA component adapter");
+    }
+    if(result.plan.vision==mfq::cuda::CudaVisionAdapter::deepseek_v41) {
+        result.deepseek_vision.emplace(mfq::cuda::deepseek_v41_runtime::Vision::load(model.source,model.shared->config));
+        result.vision_available=true;
     }
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;

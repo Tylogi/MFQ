@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         int32_t * __restrict__ ids,
         float * __restrict__ weights,
         int rows,
-        int experts,
+        int experts,int bias_stride,
         int top_k,
         bool use_sigmoid,
         bool use_sqrt_softplus,
@@ -178,6 +178,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
+    if(bias)bias+=static_cast<size_t>(row)*bias_stride;
     float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
@@ -304,7 +305,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
         int32_t * __restrict__ ids,
         float * __restrict__ weights,
         int rows,
-        int experts,
+        int experts,int bias_stride,
         int top_k,
         bool use_sigmoid,
         bool use_sqrt_softplus,
@@ -319,6 +320,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
+    if(bias)bias+=static_cast<size_t>(row)*bias_stride;
     float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
@@ -1870,12 +1872,16 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     MFQ_RUNTIME_CHECK(!(use_sigmoid && use_sqrt_softplus),
         "sigmoid and sqrt-softplus routing are mutually exclusive");
     const float * bias_ptr = nullptr;
+    int bias_stride=0;
     if (bias.has_value()) {
         auto & value = bias.value();
         MFQ_RUNTIME_CHECK(value.is_cuda() && value.is_contiguous() && value.scalar_type() == mfq_tensor_backend::kFloat32 &&
-            value.numel() == experts, "bias must be contiguous CUDA float32 [experts]");
+            (value.numel()==experts ||
+             (value.dim()==2 && value.size(0)==rows && value.size(1)==experts)),
+            "bias must be contiguous CUDA float32 [experts] or [tokens, experts]");
         check_same_device(logits, value, "bias");
         bias_ptr = value.data_ptr<float>();
+        bias_stride=value.numel()==experts?0:experts;
     }
 
     auto ids = mfq_tensor_backend::empty({rows, top_k}, logits.options().dtype(mfq_tensor_backend::kInt32));
@@ -1937,13 +1943,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
         moe_topk_cached_kernel<mfq_half><<<grid, block, 0, stream>>>(
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
-            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            rows, experts,bias_stride, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
         moe_topk_cached_kernel<float><<<grid, block, 0, stream>>>(
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
-            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            rows, experts,bias_stride, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     }
@@ -1951,13 +1957,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
         moe_topk_kernel<mfq_half><<<grid, block, 0, stream>>>(
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
-            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            rows, experts,bias_stride, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
         moe_topk_kernel<float><<<grid, block, 0, stream>>>(
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
-            rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
+            rows, experts,bias_stride, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     }

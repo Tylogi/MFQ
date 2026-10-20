@@ -231,7 +231,8 @@ class EngramHashState : public mfq::models::deepseek_v41::EngramHashState {
             std::move(offsets), std::move(multipliers), std::move(token_map)));
     }
 
-    EngramHashBatch forward(const EngramTensor &token_ids, std::int64_t pos0) {
+    EngramHashBatch forward(const EngramTensor &token_ids, std::int64_t pos0,
+                            const std::uint8_t* image_mask = nullptr) {
         if (token_ids.dim() != 2 || token_ids.size(0) <= 0 || token_ids.size(1) <= 0 || pos0 < 0 ||
             token_ids.size(0) > std::numeric_limits<int>::max() ||
             token_ids.size(1) > std::numeric_limits<int>::max()) {
@@ -242,7 +243,7 @@ class EngramHashState : public mfq::models::deepseek_v41::EngramHashState {
         const int tokens = static_cast<int>(token_ids.size(1));
         auto host_ids =
             token_ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
-        return HashState::forward(host_ids.data_ptr<int64_t>(), batch, tokens, pos0);
+        return HashState::forward(host_ids.data_ptr<int64_t>(), batch, tokens, pos0,image_mask);
     }
 
     static void self_check() {
@@ -343,13 +344,30 @@ class Engram {
 
     int64_t layer_id() const { return config_.engram_layer_ids[hash_layer_]; }
 
-    void prefetch(const EngramHashBatch& hashes) const {
+    void prefetch(const EngramHashBatch& hashes,const std::vector<int64_t>* text_rows=nullptr) const {
+        if(text_rows) {
+            if(text_rows->empty())return;
+            const auto selected=select_hash_rows(hashes,*text_rows);
+            table_->prefetch(selected.layer_data(hash_layer_),std::size_t(selected.tokens)*selected.columns);
+            return;
+        }
         table_->prefetch(hashes.layer_data(hash_layer_),
             std::size_t(hashes.batch) * hashes.tokens * hashes.columns);
     }
 
     EngramTensor forward(CudaExecutionContext &execution, const EngramTensor &hidden,
-                         const EngramHashBatch &hashes) const {
+                         const EngramHashBatch &hashes,const EngramTensor& text_rows={},
+                         const std::vector<int64_t>* host_rows=nullptr) const {
+        if(text_rows.defined()) {
+            if(!text_rows.numel())return hidden;
+            MFQ_RUNTIME_CHECK(host_rows && host_rows->size()==std::size_t(text_rows.numel()),
+                              "DeepSeek-V4.1 Engram image participation is incomplete");
+            auto flat=hidden.reshape({1,-1,config_.hc_mult,config_.hidden});
+            auto selected=forward(execution,flat.index_select(1,text_rows).contiguous(),
+                                  select_hash_rows(hashes,*host_rows));
+            auto result=flat.clone();result.index_copy_(1,text_rows,selected);
+            return result.reshape(hidden.sizes());
+        }
         const auto batch = hashes.batch;
         const auto tokens = hashes.tokens;
         if (hidden.dim() != 4 || hidden.size(0) != batch || hidden.size(1) != tokens ||
@@ -372,6 +390,20 @@ class Engram {
     }
 
   private:
+    EngramHashBatch select_hash_rows(const EngramHashBatch& hashes,const std::vector<int64_t>& rows) const {
+        EngramHashBatch selected;
+        selected.layers=hashes.layers;selected.columns=hashes.columns;
+        selected.batch=1;selected.tokens=int(rows.size());
+        selected.values.assign(std::size_t(hashes.layers)*rows.size()*hashes.columns,0);
+        const auto* source=hashes.layer_data(hash_layer_);
+        auto* target=selected.values.data()+std::size_t(hash_layer_)*rows.size()*hashes.columns;
+        for(const auto row:rows) {
+            MFQ_RUNTIME_CHECK(row>=0 && row<int64_t(hashes.batch)*hashes.tokens,
+                              "DeepSeek-V4.1 Engram text row is out of range");
+            std::copy_n(source+row*hashes.columns,hashes.columns,target);target+=hashes.columns;
+        }
+        return selected;
+    }
     Engram(EngramConfig config, int hash_layer, std::shared_ptr<EngramTable> table,
            QuantLinear projection, EngramTensor query_key_weight)
         : config_(std::move(config)), hash_layer_(hash_layer), table_(std::move(table)),

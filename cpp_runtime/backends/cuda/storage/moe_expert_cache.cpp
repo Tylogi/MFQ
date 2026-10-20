@@ -601,7 +601,13 @@ void MoeExpertCache::initialize_ssd_residency() {
             std::size_t bundle=0;for(const auto& [layer,bytes]:layer_bytes)bundle=std::max(bundle,bytes);
             const auto groups=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE")?
                 std::clamp(mfq::cuda::runtime_options::moe_prefill_group_size(),1,96):64;
-            const auto transient=bundle*std::max(2*groups,moe_decode_transfer_slots(8,10))+(std::size_t(256)<<20);
+            // Backup/upload storage survives across phases. Prefill and
+            // decode packets are released at their reader fences and share
+            // the remaining headroom instead of consuming it together.
+            const auto exchange=2*std::min(host_experts_->stats().budget_bytes/4,
+                moe_ssd_residency_stage_limit_bytes);
+            const auto transient=bundle*std::max(2*groups,moe_decode_transfer_slots(8,10))+
+                exchange+(std::size_t(256)<<20);
             const auto reserve=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(
                 std::int64_t(std::max(std::size_t(1)<<30,transient))));
             pinned=std::min(pinned,*available>reserve?*available-reserve:0);
@@ -644,9 +650,11 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::prepare_ssd_expe
         std::vector<SsdExpertRequest> requests,bool background,bool prediction) {
     auto reads=std::make_unique<SsdExpertReads>();reads->requests=std::move(requests);
     reads->leases.resize(reads->requests.size());
+    reads->request_bytes.resize(reads->requests.size());
     std::uint64_t hits=0;
     for(std::size_t i=0;i<reads->requests.size();++i) {
         const auto& [source,expert]=reads->requests[i];
+        reads->request_bytes[i]=source->expert_field_bytes(expert);
         if(const auto& cache=source->host_cache())reads->leases[i]=cache->try_find(source->host_key(expert),!background,!prediction);
         if(reads->leases[i])++hits;
         else {if(reads->missing.empty())reads->missing.reserve(reads->requests.size());reads->missing.push_back(i);}
@@ -657,6 +665,8 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::prepare_ssd_expe
 
 void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,bool background) {
     if(reads.missing.empty())return;
+    std::optional<SsdReadPriority::Demand> demand;
+    if(!background && !reads.demand)demand.emplace(ssd_read_priority_);
     auto* pool=background?ssd_background_read_pool_.get():ssd_read_pool_.get();
     if(!pool)throw std::logic_error("SSD expert read pool is not initialized");
     // An adaptive batch must not hold the demand executor's dispatch mutex
@@ -673,13 +683,36 @@ void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostPar
             const mfq::MappedPrefetchScope copied(false,true);
             for(auto i=begin;i<end;++i) {
                 const auto index=reads.missing[i];
+                // A not-yet-started forecast owns no source flight. Demand
+                // can read that projection itself while this worker waits.
+                if(!touch) {
+                    const auto canceled=[&]{return reads.prediction_canceled(std::size_t(i));};
+                    if(ssd_read_priority_.wait_for_idle(canceled) &&
+                            !ssd_prediction_io_deferrals_.fetch_add(1,std::memory_order_relaxed))
+                        std::fprintf(stderr,"moe_ssd_forecast_idle_io scope=first_deferred_request enabled=1 policy=demand_first\n");
+                    // Claim and cancellation compete before acquire_expert
+                    // creates a source flight. Started reads finish normally.
+                    if(!reads.start_prediction(std::size_t(i)))continue;
+                }
                 reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second,touch);
                 if(reads.publish_progress)reads.publish_read(index);
             }
         });
 }
 
-void MoeExpertCache::observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests) {
+void MoeExpertCache::observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests,
+        const std::array<MoeQuantRangeSource*,3>& current_sources) {
+    std::size_t canceled=0,bytes=0;
+    for(auto* batch:{ssd_previous_prediction_.get(),ssd_prediction_reads_.get()})if(batch) {
+        const auto skipped=batch->cancel_unused_predictions(requests,current_sources);
+        canceled+=skipped.first;bytes+=skipped.second;
+    }
+    if(canceled) {
+        ssd_read_priority_.notify_canceled();
+        if(!ssd_prediction_canceled_jobs_)std::fprintf(stderr,
+            "moe_ssd_forecast_cancel scope=first_layer enabled=1 jobs=%zu bytes=%zu stage=before_source_flight\n",canceled,bytes);
+        ssd_prediction_canceled_jobs_+=canceled;ssd_prediction_canceled_bytes_+=bytes;
+    }
     for(const auto& request:requests)for(const auto* batch:{ssd_previous_prediction_.get(),ssd_prediction_reads_.get()}) {
         if(!batch)continue;
         if(std::none_of(batch->missing.begin(),batch->missing.end(),
@@ -720,6 +753,11 @@ void MoeExpertCache::queue_ssd_prediction(std::vector<SsdExpertRequest> requests
     std::erase_if(reads->missing,[&](std::size_t i){return !selected_expert(i);});
     for(std::size_t i=0;i<reads->leases.size();++i)if(!selected_expert(i))reads->leases[i].reset();
     if(reads->missing.empty())return;
+    // Finish the higher-ranked expert's GU pair before launching the next
+    // expert. Two readers retain parallel field I/O and leave demand a chance
+    // to interrupt between predictions, without pausing an active source read.
+    reads->prioritize_prediction_experts(selected);
+    reads->initialize_predictions();
     if(!ssd_prediction_reader_)ssd_prediction_reader_=std::make_shared<MoeSsdPrefillReader>();
     if(!ssd_prediction_pool_)ssd_prediction_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     std::uint64_t bytes=0;
@@ -727,12 +765,12 @@ void MoeExpertCache::queue_ssd_prediction(std::vector<SsdExpertRequest> requests
     ssd_prediction_jobs_+=reads->missing.size();ssd_prediction_bytes_+=bytes;
     auto* pending=reads.get();
     reads->ready=ssd_prediction_reader_->submit([this,pending] {
-        execute_ssd_expert_reads(*pending,*ssd_prediction_pool_,std::min(4,config_.moe_ssd_io_workers),false);
+        execute_ssd_expert_reads(*pending,*ssd_prediction_pool_,std::min(2,config_.moe_ssd_io_workers),false);
     });
     ssd_prediction_reads_=std::move(reads);
     if(++ssd_prediction_batches_==1)std::fprintf(stderr,
-        "moe_ssd_router_prefetch scope=first_batch enabled=1 jobs=%zu bytes=%llu bounded_batches=2\n",
-        pending->missing.size(),static_cast<unsigned long long>(bytes));
+        "moe_ssd_router_prefetch scope=first_batch enabled=1 jobs=%zu bytes=%llu bounded_batches=2 order=expert_first readers=%d\n",
+        pending->missing.size(),static_cast<unsigned long long>(bytes),std::min(2,config_.moe_ssd_io_workers));
 }
 
 std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert_reads(
@@ -747,9 +785,22 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert
         (i<gate_up_requests?reads->gate_up_ready:reads->down_ready).push_back(i);
     for(const auto index:reads->missing)
         ++(index<gate_up_requests?reads->gate_up_remaining:reads->down_remaining);
+    if(reads->prioritize_missing()) {
+        static std::atomic_flag reported=ATOMIC_FLAG_INIT;
+        if(!reported.test_and_set(std::memory_order_relaxed))std::fprintf(stderr,
+            "moe_ssd_read_order scope=first_reordered_batch enabled=1 strategy=largest_first gate_up_first=1 jobs=%zu\n",
+            reads->missing.size());
+    }
     if(!reads->missing.empty()) {
         if(!ssd_prefill_reader_)throw std::logic_error("SSD expert read queue is not initialized");
+        // Register before queueing so a predictor cannot win the worker wakeup
+        // race. The counter is released on completion, failure or queue rejection.
+        reads->demand.emplace(ssd_read_priority_);
         reads->ready=ssd_prefill_reader_->submit([this,pending=reads.get()] {
+            struct FinishDemand {
+                SsdExpertReads& reads;
+                ~FinishDemand(){reads.demand.reset();}
+            } finish{*pending};
             try{execute_ssd_expert_reads(*pending);}
             catch(...) {
                 {std::lock_guard lock(pending->mutex);pending->failed=std::current_exception();}
@@ -2372,7 +2423,8 @@ bool moe_expert_cache_ssd_experts(const std::shared_ptr<MoeExpertCache>& cache) 
     return cache && cache->ssd_experts();
 }
 bool moe_expert_cache_ssd_router_prefetch(const std::shared_ptr<MoeExpertCache>& cache) {
-    return cache && cache->ssd_experts() && cache->ssd_router_prefetch();
+    return cache && cache->ssd_experts() && cache->reuse_learning() &&
+        mfq::cuda::runtime_options::router_lookahead_override().value_or(cache->ssd_router_prefetch());
 }
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? std::size_t(cache->budget_bytes()) : 0;
@@ -2454,7 +2506,8 @@ void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
 void release_moe_prefill_buffers(MoeExpertCache* cache) {
     if(!cache)return;
     if(!cache->pipeline_prefill_copy_pending_ && cache->pipeline_prefill_release_.empty() &&
-            !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_)return;
+            !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_ &&
+            !cache->pipeline_prefill_host_ring_.defined() && !cache->pipeline_prefill_metadata_host_.defined())return;
     cudaStreamCaptureStatus capture;
     const auto stream=mfq_current_cuda_stream();
     MFQ_CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
@@ -2468,6 +2521,8 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     for(auto i=cache->pipeline_stages_.begin();i!=cache->pipeline_stages_.end();)
         if(i->first.starts_with("prefill:"))i=cache->pipeline_stages_.erase(i);else ++i;
     cache->pipeline_prefill_activations_.reset();
+    cache->pipeline_prefill_host_ring_={};cache->pipeline_prefill_host_stride_=0;
+    cache->pipeline_prefill_metadata_host_={};cache->pipeline_prefill_metadata_stride_=0;
     cache->pipeline_prefill_ring_={};
     cache->pipeline_prefill_group_capacity_=0;
     cache->pipeline_prefill_predictor_=false;
@@ -2600,6 +2655,8 @@ bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& ca
     for(const auto& batch:cache->pipeline_dma_batches_)if(batch)return false;
     cache->finish_pipeline_exchanges();
     MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    cache->ssd_pending_forecast_={};
+    cache->ssd_forecast_gpu_fields_.clear();
     release_moe_prefill_buffers(cache);
     for(const auto& held:cache->pipeline_transfer_slots_)
         if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
@@ -2607,6 +2664,9 @@ bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& ca
     const auto returned=tensor_nbytes(cache->pipeline_direct_cache_storage_);
     cache->release_direct_transfer_cache();
     cache->pipeline_wire_gpu_={};
+    // All retained graphs use indirect device descriptors and no captured
+    // DMA batches. Their next host serve reads this storage from the cache.
+    cache->pipeline_host_stage_={};cache->pipeline_host_stage_alias_=nullptr;
     cache->transfer_ready_recorded_=false;
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     context->reclaim_idle_memory();
@@ -2619,8 +2679,11 @@ bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& ca
 
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     if(!cache)return;
+    cache->ssd_pending_prediction_.clear();
+    cache->ssd_forecast_gpu_fields_.clear();
     cache->finish_pipeline_exchanges();
     MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    cache->ssd_pending_forecast_={};
     release_moe_prefill_buffers(cache);
     for(const auto& held:cache->pipeline_transfer_slots_)
         if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
@@ -2638,6 +2701,7 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     cache->pipeline_stages_.clear();
     cache->release_direct_transfer_cache();
     cache->pipeline_wire_gpu_={};cache->pipeline_prefetch_wire_gpu_={};
+    cache->pipeline_host_stage_={};cache->pipeline_host_stage_alias_=nullptr;
     cache->pipeline_prefetch_host_stage_={};
     cache->pipeline_prefetched_keys_.clear();cache->transfer_ready_recorded_=false;
 }

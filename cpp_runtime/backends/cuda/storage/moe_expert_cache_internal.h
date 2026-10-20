@@ -374,17 +374,93 @@ public:
     struct SsdPlacementStats {std::size_t experts=0,bytes=0,batches=0,peak=0;};
     void prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& experts,SsdPlacementStats& stats);
     using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
+    struct SsdReadPriority {
+        std::mutex mutex;
+        std::condition_variable idle;
+        std::size_t pending=0,waiting=0;
+        struct Demand {
+            SsdReadPriority& priority;
+            explicit Demand(SsdReadPriority& value):priority(value) {
+                std::lock_guard lock(priority.mutex);++priority.pending;
+            }
+            Demand(const Demand&)=delete;
+            Demand& operator=(const Demand&)=delete;
+            ~Demand() {
+                {std::lock_guard lock(priority.mutex);--priority.pending;}
+                priority.idle.notify_all();
+            }
+        };
+        bool wait_for_idle(const std::function<bool()>& canceled={}) {
+            const auto ready=[&]{return !pending || (canceled && canceled());};
+            std::unique_lock lock(mutex);if(ready())return false;
+            ++waiting;idle.wait(lock,ready);--waiting;return true;
+        }
+        void notify_canceled() {
+            // Pair notification with the wait mutex even though cancellation
+            // itself is atomic, so it cannot fall between the predicate and wait.
+            std::lock_guard lock(mutex);idle.notify_all();
+        }
+    };
     struct SsdExpertReads {
         std::vector<SsdExpertRequest> requests;
+        std::vector<std::size_t> request_bytes;
+        static constexpr std::size_t early_down_budget=16u<<20;
         std::vector<MoeHostExpertCache::Lease> leases;
         std::vector<std::size_t> missing;
         std::future<void> ready;
+        std::optional<SsdReadPriority::Demand> demand;
         std::mutex mutex;
         std::condition_variable changed;
         std::size_t gate_up_requests=0,gate_up_remaining=0,down_remaining=0;
         std::vector<std::size_t> gate_up_ready,down_ready;
         bool publish_progress=false;
         std::exception_ptr failed;
+        std::unique_ptr<std::atomic<uint8_t>[]> prediction_states;
+        void initialize_predictions() {
+            prediction_states=std::make_unique<std::atomic<uint8_t>[]>(missing.size());
+        }
+        bool prediction_canceled(std::size_t index) const {
+            return prediction_states[index].load(std::memory_order_acquire)==2;
+        }
+        bool start_prediction(std::size_t index) {
+            uint8_t queued=0;
+            return prediction_states[index].compare_exchange_strong(queued,1,std::memory_order_acq_rel);
+        }
+        std::pair<std::size_t,std::size_t> cancel_unused_predictions(
+                const std::vector<SsdExpertRequest>& demand,
+                const std::array<MoeQuantRangeSource*,3>& current_sources) {
+            if(!prediction_states || std::none_of(requests.begin(),requests.end(),[&](const auto& request) {
+                return std::find(current_sources.begin(),current_sources.end(),request.first)!=current_sources.end();
+            }))return {};
+            std::size_t jobs=0,bytes=0;
+            for(std::size_t i=0;i<missing.size();++i) {
+                const auto index=missing[i];
+                if(std::find(demand.begin(),demand.end(),requests[index])!=demand.end())continue;
+                uint8_t queued=0;
+                if(prediction_states[i].compare_exchange_strong(queued,2,std::memory_order_acq_rel)) {
+                    ++jobs;bytes+=request_bytes[index];
+                }
+            }
+            return {jobs,bytes};
+        }
+        void prioritize_prediction_experts(const std::vector<int>& experts) {
+            const auto rank=[&](std::size_t index) {
+                return std::find(experts.begin(),experts.end(),requests[index].second)-experts.begin();
+            };
+            std::stable_sort(missing.begin(),missing.end(),[&](auto a,auto b){return rank(a)<rank(b);});
+        }
+        bool prioritize_missing() {
+            // Start the largest reads first to reduce the final-worker tail.
+            // GU keeps priority over Down; ready and RAM-hit indices stay fixed.
+            const auto earlier=[&](std::size_t a,std::size_t b) {
+                const bool gu_a=a<gate_up_requests,gu_b=b<gate_up_requests;
+                if(gu_a!=gu_b)return gu_a;
+                if(request_bytes[a]!=request_bytes[b])return request_bytes[a]>request_bytes[b];
+                return a<b;
+            };
+            if(std::is_sorted(missing.begin(),missing.end(),earlier))return false;
+            std::sort(missing.begin(),missing.end(),earlier);return true;
+        }
         ~SsdExpertReads(){if(ready.valid())ready.wait();}
         void wait(){if(ready.valid())ready.get();}
         void publish_read(std::size_t index) {
@@ -396,13 +472,55 @@ public:
             }
             changed.notify_one();
         }
-        bool next_projection_batch(std::vector<std::size_t>& batch,bool down) {
+        bool next_projection_batch(std::vector<std::size_t>& batch,bool down,
+                const std::function<bool()>& progress={},bool include_ready_down=false,
+                const std::function<bool()>& down_idle={}) {
             std::unique_lock lock(mutex);
             auto& queue=down?down_ready:gate_up_ready;
             const auto& remaining=down?down_remaining:gate_up_remaining;
-            changed.wait(lock,[&]{return !queue.empty() || !remaining || failed;});
-            if(failed)std::rethrow_exception(failed);
-            batch.clear();batch.swap(queue);
+            const bool allow_down=include_ready_down && !down;
+            const auto ready=[&]{return !queue.empty() || !remaining || failed ||
+                (allow_down && !down_ready.empty());};
+            for(;;) {
+                if(failed)std::rethrow_exception(failed);
+                if(!queue.empty() || !remaining)break;
+                bool pending=false;
+                if(allow_down && !down_ready.empty()) {
+                    bool idle=true;
+                    if(down_idle) {
+                        lock.unlock();idle=down_idle();lock.lock();
+                    }
+                    if(failed)std::rethrow_exception(failed);
+                    // GU may arrive while checking the transfer event.
+                    if(!queue.empty() || !remaining)continue;
+                    if(idle && !down_ready.empty()) {
+                        // One idle-stream quantum may contain several small
+                        // projections. Bound bytes ahead of a later GU arrival;
+                        // a single oversized projection must still make progress.
+                        std::size_t count=0,bytes=0;
+                        do {
+                            const auto size=request_bytes.at(down_ready[count]);
+                            if(count && size>early_down_budget-bytes)break;
+                            bytes+=size;++count;
+                        }while(count<down_ready.size() && bytes<early_down_budget);
+                        batch.assign(down_ready.begin(),down_ready.begin()+count);
+                        down_ready.erase(down_ready.begin(),down_ready.begin()+count);
+                        return true;
+                    }
+                    pending=!idle;
+                }
+                // A pending DMA completion has no condition-variable signal.
+                // Poll it without holding the file-read publication mutex.
+                // Keep the producer responsive to either completion instead
+                // of sleeping for an OS timer tick between GPU event polls.
+                if(progress) {
+                    lock.unlock();const bool active=progress();lock.lock();
+                    pending=active || pending;
+                }
+                if(!pending)changed.wait(lock,ready);
+            }
+            batch.clear();
+            batch.swap(queue);
             return !batch.empty();
         }
     };
@@ -410,7 +528,8 @@ public:
     void execute_ssd_expert_reads(SsdExpertReads& reads,bool background=false);
     void execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch=true);
     void queue_ssd_prediction(std::vector<SsdExpertRequest> requests);
-    void observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests);
+    void observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests,
+        const std::array<MoeQuantRangeSource*,3>& current_sources);
     void observe_ssd_read_wait(std::uint64_t ns) {
         if(!pipeline_reuse_learning_)return;
         ssd_prediction_wait_ns_=(ssd_prediction_wait_ns_*15+ns)/16;
@@ -920,11 +1039,18 @@ public:
             {"ssd_reuse_hits",double(kv_reuse.protected_hits)},
             {"ssd_probation_evictions",double(kv_reuse.probation_evictions)},
             {"ssd_protected_cache_bytes",double(kv_reuse.protected_pages*mfq::cuda::KvExpertLoan::page)},
+            {"ssd_reuse_capacity_bytes",double(kv_reuse.capacity_pages*mfq::cuda::KvExpertLoan::page)},
+            {"ssd_reuse_protected_limit_bytes",double(kv_reuse.protected_limit_pages*mfq::cuda::KvExpertLoan::page)},
+            {"ssd_reuse_protected_trims",double(kv_reuse.protected_trims)},
+            {"ssd_reuse_protected_accesses",double(kv_reuse.protected_accesses)},
+            {"ssd_reuse_accepted_row_promotions",double(kv_reuse.accepted_row_promotions)},
             {"ssd_decode_read_wait_ms",double(stats_.pipeline_window_ssd_read_ns)/1e6},
             {"ssd_expert_read_wait_ms",double(stats_.pipeline_ssd_read_ns)/1e6},
             {"expert_route_wait_ms",double(stats_.pipeline_route_wait_ns)/1e6},
             {"expert_plan_ms",double(stats_.pipeline_plan_ns)/1e6},
             {"expert_host_fetch_ms",double(stats_.pipeline_fetch_ns)/1e6},
+            {"expert_host_copy_ms",double(stats_.pipeline_host_copy_ns)/1e6},
+            {"expert_transfer_cache_prepare_ms",kv_expert_loan_?kv_expert_loan_->lookup_us()/1e3:0.0},
             {"expert_graph_captures",double(stats_.pipeline_graph_captures)},
             {"expert_target_multi_route_positions",double(stats_.pipeline_multi_route_positions[0])},
             {"expert_target_multi_unique_routes",double(stats_.pipeline_multi_unique_routes[0])},
@@ -948,6 +1074,7 @@ public:
             {"ram_expert_speculative_windows",double(host.speculative_windows)},
             {"ram_expert_speculative_accepted_keys",double(host.speculative_accepted_keys)},
             {"ram_expert_speculative_cancels",double(host.speculative_cancels)},
+            {"ram_expert_reuse_clock_rotations",double(host.reuse_clock_rotations)},
             {"ram_expert_ghost_entries",double(host.ghost_entries)},
             {"ram_expert_ghost_promotions",double(host.ghost_promotions)},
             {"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
@@ -970,6 +1097,8 @@ public:
             {"ssd_down_io_overlap_bytes",double(stats_.pipeline_ssd_down_overlap_bytes)},
             {"ssd_down_staged_upload_bytes",double(stats_.pipeline_ssd_down_staged_bytes)},
             {"ssd_down_upload_batches",double(stats_.pipeline_ssd_down_upload_batches)},
+            {"ssd_down_early_max_batch",double(stats_.pipeline_ssd_down_early_max_batch)},
+            {"ssd_down_early_max_bytes",double(stats_.pipeline_ssd_down_early_max_bytes)},
             {"ssd_gu_compute_overlap_serves",double(stats_.pipeline_ssd_gu_compute_serves)},
             {"ssd_gate_up_read_wait_ms",double(stats_.pipeline_ssd_gate_up_wait_ns)/1e6},
             {"ssd_down_read_wait_ms",double(stats_.pipeline_ssd_down_wait_ns)/1e6},
@@ -980,12 +1109,19 @@ public:
             {"ssd_router_prefetch_used_bytes",double(host.prediction_used_bytes)},
             {"ssd_router_prefetch_started_jobs",double(host.prediction_started_jobs)},
             {"ssd_router_prefetch_started_bytes",double(host.prediction_started_bytes)},
+            {"ssd_ram_prediction_first_uses",double(host.prediction_first_uses)},
             {"ssd_router_prefetch_matched_jobs",double(ssd_prediction_matched_)},
             {"ssd_router_prefetch_ready_jobs",double(ssd_prediction_ready_)},
+            {"ssd_router_prefetch_canceled_jobs",double(ssd_prediction_canceled_jobs_)},
+            {"ssd_router_prefetch_canceled_bytes",double(ssd_prediction_canceled_bytes_)},
             {"ssd_router_predicted_routes",double(ssd_predicted_routes_)},
             {"ssd_router_prediction_hits",double(ssd_prediction_hits_)},
             {"ssd_router_prefetch_busy_skips",double(ssd_prediction_busy_skips_)},
+            {"ssd_router_prefetch_io_deferrals",double(ssd_prediction_io_deferrals_.load())},
             {"ssd_router_prefetch_io_wait_us",double(ssd_prediction_wait_ns_)/1000},
+            {"ssd_router_prefetch_route_wait_ms",double(ssd_prediction_route_wait_ns_)/1e6},
+            {"ssd_router_gpu_protected_fields",double(ssd_prediction_gpu_protected_fields_)},
+            {"ssd_router_gpu_eviction_skips",double(kv_reuse.forecast_eviction_skips)},
             {"ssd_router_prefetch_suggested",double(ssd_prediction_auto_)},
             {"ssd_router_prefetch_switches",double(ssd_prediction_switches_)},
             {"ssd_router_prefetch_quality_rejections",double(ssd_prediction_quality_rejections_)},
@@ -1156,20 +1292,28 @@ private:
     bool complete_residency_=false;
     bool ssd_experts_=false;
     std::size_t ssd_expert_total_bytes_=0;
+    SsdReadPriority ssd_read_priority_;
     std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
     std::unique_ptr<mfq::HostParallelPool> ssd_background_read_pool_;
     std::shared_ptr<MoeSsdPrefillReader> ssd_prefill_reader_;
     std::unique_ptr<mfq::HostParallelPool> ssd_prediction_pool_;
     std::shared_ptr<MoeSsdPrefillReader> ssd_prediction_reader_;
     std::unique_ptr<SsdExpertReads> ssd_prediction_reads_,ssd_previous_prediction_;
+    std::vector<SsdExpertRequest> ssd_pending_prediction_;
+    std::function<void()> ssd_pending_forecast_;
+    std::vector<mfq::cuda::KvExpertLoan::Key> ssd_forecast_gpu_fields_;
+    std::uint64_t ssd_prediction_gpu_protected_fields_=0;
     std::uint64_t ssd_prediction_batches_=0,ssd_prediction_jobs_=0,ssd_prediction_bytes_=0,ssd_prediction_busy_skips_=0;
     std::uint64_t ssd_prediction_wait_ns_=0,ssd_prediction_switches_=0;
     std::uint64_t ssd_predicted_routes_=0,ssd_prediction_hits_=0;
     std::uint64_t ssd_prediction_matched_=0,ssd_prediction_ready_=0;
+    std::uint64_t ssd_prediction_canceled_jobs_=0,ssd_prediction_canceled_bytes_=0;
     std::uint64_t ssd_prediction_observations_=0,ssd_prediction_cooldown_=0,ssd_prediction_quality_rejections_=0;
     std::uint64_t ssd_prediction_probe_started_=0,ssd_prediction_probe_used_=0;
     bool ssd_prediction_auto_=false;
+    std::uint64_t ssd_prediction_route_wait_ns_=0;
     std::atomic<std::uint64_t> ssd_ram_read_fast_hits_{0},ssd_scheduled_read_jobs_{0};
+    std::atomic<std::uint64_t> ssd_prediction_io_deferrals_{0};
     bool pipeline_residency_suspended_=false;
     bool pipeline_reuse_learning_=true;
     CudaExecutionConfig config_;

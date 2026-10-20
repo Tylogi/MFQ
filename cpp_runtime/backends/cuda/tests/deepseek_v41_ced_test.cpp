@@ -1,4 +1,5 @@
 #include "models/deepseek_v41/ops.h"
+#include "mfq_cuda_moe_ops.h"
 #include <iostream>
 
 namespace {
@@ -38,6 +39,34 @@ void check_tail_rope() {
         ++cases;
     }
     std::cout<<"tail_rope_cases="<<cases<<" FP16/FP32 strided/large-grid exact PASS\n";
+}
+
+void check_modality_routing() {
+    int cases=0;
+    for(auto dtype:{tb::kFloat16,tb::kFloat32})for(int experts:{384,641})for(int rows:{2,5}) {
+        auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+        auto logits=(tb::arange(int64_t(rows)*experts,options)*.001).reshape({rows,experts}).to(dtype).contiguous();
+        std::vector<float> biases(rows*experts,0.f);
+        for(int row=0;row<rows;++row)biases[row*experts+(row*53+7)%experts]=1000.f;
+        auto bias=tb::tensor(biases,options).reshape({rows,experts});
+        auto batch=moe_topk_cuda(logits,6,false,true,true,false,bias,1e-20,1.0);
+        auto shared_bias=bias.narrow(0,0,1).contiguous();
+        auto shared=moe_topk_cuda(logits,6,false,true,true,false,shared_bias,1e-20,1.0);
+        auto flat_bias=moe_topk_cuda(logits,6,false,true,true,false,shared_bias.reshape({experts}),1e-20,1.0);
+        require((shared[0].to(tb::kFloat32)-flat_bias[0].to(tb::kFloat32)).abs().max().item<float>()==0 &&
+            (shared[1]-flat_bias[1]).abs().max().item<float>()<1e-6,
+            "per-token routing removed the existing shared correction bias broadcast");
+        for(int row=0;row<rows;++row) {
+            auto expected=moe_topk_cuda(logits.narrow(0,row,1).contiguous(),6,false,true,true,false,
+                bias.narrow(0,row,1).reshape({experts}),1e-20,1.0);
+            require((batch[0].narrow(0,row,1).to(tb::kFloat32)-expected[0].to(tb::kFloat32)).abs().max().item<float>()==0,
+                    "per-token vision bias selected another token's experts");
+            require((batch[1].narrow(0,row,1)-expected[1]).abs().max().item<float>()<1e-6,
+                    "vision correction bias changed unbiased routing weights");
+        }
+        ++cases;
+    }
+    std::cout<<"modality_router_cases="<<cases<<" cached/generic FP16/FP32 PASS\n";
 }
 
 DeepseekV41CausalLm make_model(CudaExecutionContext& execution,int ratio=2) {
@@ -187,10 +216,11 @@ void check_retained_prefix() {
     std::cout<<"retained_prefix_cases="<<cases<<" suffix/joint compressor/ring/Engram/decode PASS\n";
 }
 }
-int main() try {
+int main(int argc,char** argv) try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
-    check_tail_rope();check_exact_short();check_long_and_cancel();check_retained_prefix();run_dspark_self_check();
+    if(argc==2 && std::string(argv[1])=="--modality-routing-check"){check_modality_routing();return 0;}
+    check_modality_routing();check_tail_rope();check_exact_short();check_long_and_cancel();check_retained_prefix();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;

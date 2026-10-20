@@ -526,7 +526,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         // keep adaptation batches within this fixed workspace thereafter.
         const auto memory=s.memory_probe();
         auto capacity=std::min<std::uint64_t>({cache->host_experts_->stats().budget_bytes/4,
-            std::uint64_t(256)<<20,memory.available_bytes/8});
+            std::uint64_t(moe_ssd_residency_stage_limit_bytes),memory.available_bytes/8});
         if(cache->config_.moe_host_physical_bytes)
             capacity=std::min(capacity,memory.resident_bytes>=cache->config_.moe_host_physical_bytes?std::uint64_t(0):
                 (cache->config_.moe_host_physical_bytes-memory.resident_bytes)/8);

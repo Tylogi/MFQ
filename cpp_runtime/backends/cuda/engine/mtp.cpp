@@ -205,7 +205,7 @@ template <class Model> struct CudaMtpOps {
              int64_t compute_chunk, InferenceOutput* output)
       : model(model), mtp(mtp), prepared(prepared), target(model),
         transformed_prompt(prepared && prepared->transformed()),
-        position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
+        position_axes(transformed_prompt && prepared->positions.defined() && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
                           : 1), prefill_compute_chunk(compute_chunk), output(output) {
@@ -262,9 +262,9 @@ template <class Model> struct CudaMtpOps {
     projected_target_compact={};
     projected_target_greedy.clear();
     target_transfer_bytes = 0;
+    const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt) {
-        const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
         bool initialized=false;
         const auto host_ids = known_ids_device.defined() &&
             ids.data_ptr() == known_ids_device.data_ptr() && ids.sizes() == known_ids_device.sizes()
@@ -279,8 +279,10 @@ template <class Model> struct CudaMtpOps {
         }
       }
     }
-    return model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
-                                mfq_nullopt, raw, confirmed);
+    auto hidden=model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
+                                     mfq_nullopt, raw, confirmed);
+    target_transfer_bytes=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
+    return hidden;
   }
   Tensor target_suffix(Tensor ids, Tensor *raw) {
     projected_target_hidden = {}; projected_target_logits = {};
@@ -302,6 +304,7 @@ template <class Model> struct CudaMtpOps {
     };
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+    CudaImageMaskScope image_scope(model,prepared,chunk.offset,chunk.count);
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt && model.reuse_decode_graphs && model.graph_registry && chunk.count<=128) {
         // Reuse bounded routed windows for short prompts as well as continuations.
@@ -356,8 +359,8 @@ template <class Model> struct CudaMtpOps {
                   ids,
                   prepared->embeddings.narrow(1, chunk.offset, chunk.count)
                       .contiguous(),
-                  prepared->positions.narrow(-1, chunk.offset, chunk.count)
-                      .contiguous(),
+                  prepared->positions.defined()?MfqOptional<Tensor>(
+                      prepared->positions.narrow(-1,chunk.offset,chunk.count).contiguous()):mfq_nullopt,
                   mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt, &raw)
             : target_forward(ids, &raw);
     if(host_history)raw=raw.to(mfq_tensor_backend::kCPU);

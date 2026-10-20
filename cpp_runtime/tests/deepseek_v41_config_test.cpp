@@ -148,6 +148,26 @@ void check_retained_engram_history() {
     }
 }
 
+void check_image_engram_history() {
+    using mfq::models::deepseek_v41::EngramHashState;
+    const auto make=[] {return EngramHashState(8,3,2,0,{1},{36},{5,7,11,13},
+        {0,5,12,23},{3,5,7},{0,1,2,3,4,5,6,7});};
+    const std::vector<int64_t> ids{1,2,3,4,5,6,7};
+    const std::vector<uint8_t> mask{0,0,1,1,1,0,0};
+    auto full=make(),chunked=make(),fresh=make();
+    auto hashes=full.forward(ids.data(),1,int(ids.size()),0,mask.data());
+    auto first=chunked.forward(ids.data(),1,4,0,mask.data());
+    auto last=chunked.forward(ids.data()+4,1,3,4,mask.data()+4);
+    auto combined=first.values;combined.insert(combined.end(),last.values.begin(),last.values.end());
+    require(combined==hashes.values,"image Engram history changed across a prefill boundary");
+    const auto suffix=fresh.forward(ids.data()+5,1,2,0);
+    require(std::equal(suffix.values.begin(),suffix.values.end(),hashes.values.begin()+5*hashes.columns),
+            "image span did not terminate the text ngram history");
+    const int64_t next=2;
+    require(full.forward(&next,1,1,7).values==chunked.forward(&next,1,1,7).values,
+            "decode after an image changed Engram history");
+}
+
 void check_dspark_requested_head() {
     for(int width:{1,2,5})for(int stages:{1,3}) {
         auto run=[&](int requested) {
@@ -186,6 +206,7 @@ void check_dspark_requested_head() {
 int main() {
     try {
         check_retained_engram_history();
+        check_image_engram_history();
         const auto config = Config::from_json(valid_config);
         require(config.causal_encoder_layers == 2, "CED split changed");
         require(config.compress_ratios.size() == 7, "compression schedule changed");

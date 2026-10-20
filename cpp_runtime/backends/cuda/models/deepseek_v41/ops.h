@@ -41,14 +41,33 @@ struct SharedState {
     std::unique_ptr<EngramHashState> engram_hash;
     EngramHashBatch engram_hashes;
     std::vector<Engram*> engram_prefetch;
+    std::vector<const FFN*> router_prefetch;
     std::vector<Tensor> dspark_target_hiddens;
     bool capture_dspark_targets = false;
+    Tensor image_mask, text_rows, routing_mask;
+    std::vector<int64_t> text_row_ids;
     std::int64_t compressed_length = 0;
     std::int64_t ratio = 0;
     std::int64_t cache_position = -1;
     std::int64_t batch = 0;
     std::int64_t tokens = 0;
     std::int64_t next_layer = 0;
+
+    void set_image_mask(Tensor mask) {
+        if(!mask.defined()) {image_mask={};text_rows={};routing_mask={};text_row_ids.clear();return;}
+        MFQ_RUNTIME_CHECK(mask.is_cpu() && mask.dim()==2 && mask.is_contiguous() &&
+                          mask.scalar_type()==mfq_tensor_backend::kUInt8,
+                          "DeepSeek-V4.1 image mask must be contiguous CPU uint8 [B,T]");
+        std::vector<int64_t> images;text_row_ids.clear();
+        const auto* flags=mask.data_ptr<uint8_t>();
+        for(int64_t i=0;i<mask.numel();++i)(flags[i]?images:text_row_ids).push_back(i);
+        if(images.empty()){set_image_mask({});return;}
+        auto options=mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+            .dtype(mfq_tensor_backend::kInt64);
+        auto text=mfq_tensor_backend::tensor(text_row_ids,options);
+        auto routing=mask.reshape({-1,1}).to(mfq_tensor_backend::kCUDA).to(mfq_tensor_backend::kBool);
+        image_mask=std::move(mask);text_rows=std::move(text);routing_mask=std::move(routing);
+    }
 
     void begin_forward(bool capture, std::size_t target_count) {
         capture_dspark_targets = capture;
@@ -143,7 +162,10 @@ struct SharedState {
                                   token_ids.size(0) == current_batch &&
                                   token_ids.size(1) == current_tokens,
                               "DeepSeek-V4.1 Engram token state is unavailable");
-            engram_hashes = engram_hash->forward(token_ids, current_position);
+            MFQ_RUNTIME_CHECK(!image_mask.defined() || image_mask.sizes()==token_ids.sizes(),
+                              "DeepSeek-V4.1 image participation shape mismatch");
+            engram_hashes = engram_hash->forward(token_ids, current_position,
+                image_mask.defined()?image_mask.data_ptr<uint8_t>():nullptr);
         }
         MFQ_RUNTIME_CHECK(layer == next_layer && layer >= 0 && layer < layer_count &&
                               current_batch == batch && current_tokens == tokens &&
@@ -157,7 +179,7 @@ struct SharedState {
         int issued=0;
         for(const auto* memory:engram_prefetch) {
             if(memory->layer_id()<layer || memory->layer_id()>=prefetch_end)continue;
-            memory->prefetch(engram_hashes);
+            memory->prefetch(engram_hashes,image_mask.defined()?&text_row_ids:nullptr);
             if(++issued==2)break;
         }
         ++next_layer;
@@ -352,6 +374,7 @@ struct Block final : ::Block {
     QuantLinear index_key;
     QuantLinear index_score;
     FFN mlp;
+    Tensor vision_router_bias;
     Dsv4RopeTable rope;
     std::unique_ptr<Engram> engram;
     Tensor speculative_local_slots;
@@ -815,7 +838,8 @@ struct Block final : ::Block {
             std::move(hidden), bool(engram), shared->previous_pre,
             [&](Tensor value) {
                 return profiler.measure("deepseek_v41.engram", [&] {
-                    return engram->forward(execution, value, shared->engram_hashes);
+                    return engram->forward(execution, value, shared->engram_hashes,
+                                          shared->text_rows,&shared->text_row_ids);
                 });
             },
             [&](const Tensor &value) { shared->capture_dspark_target(layer, config, value); },
@@ -841,6 +865,15 @@ struct Block final : ::Block {
             },
             [&](Tensor value) {
                 return profiler.measure("deepseek_v41.mlp", [&] {
+                    if(shared->image_mask.defined()) {
+                        MFQ_RUNTIME_CHECK(vision_router_bias.defined(),"DeepSeek-V4.1 visual router bias is missing");
+                        auto bias=mfq_tensor_backend::where(shared->routing_mask,vision_router_bias,mlp.moe_router_bias).contiguous();
+                        return mlp.forward_with_router_bias(execution,value.reshape({-1,config.hidden}),
+                            current_ids,bias).reshape({batch,tokens,config.hidden});
+                    }
+                    if(layer+1<static_cast<int64_t>(shared->router_prefetch.size()))
+                        if(const auto* next=shared->router_prefetch[layer+1])
+                            next->prefetch_moe(execution,value,current_ids);
                     return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
                         .reshape({batch, tokens, config.hidden});
                 });
@@ -899,6 +932,8 @@ struct DeepseekV41Model : CausalResources {
                                               const std::string &type);
 
     void adapter_begin_forward(bool capture_raw_hidden);
+    bool adapter_supports_prepared_prompt() const noexcept {return true;}
+    void adapter_set_image_mask(mfq_tensor_backend::Tensor mask) {shared->set_image_mask(std::move(mask));}
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;
     mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,

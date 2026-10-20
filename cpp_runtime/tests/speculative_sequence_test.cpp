@@ -50,7 +50,7 @@ struct Prepared {
     std::vector<int64_t> token_ids;
     Tensor embeddings, positions;
     int decode_position_delta = 0;
-    bool transformed() const { return false; }
+    bool transformed() const { return !embeddings.shape.empty() || !positions.shape.empty() || decode_position_delta!=0; }
 };
 
 struct Sampler {
@@ -178,6 +178,29 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
+}
+
+void run_dspark_draft_cost() {
+    struct DelayedDraftOps : Ops {
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            return Ops::predictor_step(hidden,ids,positions);
+        }
+    };
+    Model model;Predictor predictor;predictor.legacy=true;
+    InferenceRequest request;
+    request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=10;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"dspark-draft-cost");
+    auto generation=speculative_sequence(DelayedDraftOps{{model,predictor}},
+        request,output,512,0,Tensor{},nullptr);
+    std::vector<int64_t> tokens;
+    while(auto step=generation.next())if(step.value)
+        if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+            tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+    if(tokens!=std::vector<int64_t>(10,0) || output.metrics.mtp.head_ms<75.0 ||
+            output.metrics.mtp.measured_depth_ms[3]<75.0)
+        throw std::runtime_error("DSpark depth selection omitted completed draft work from its cycle cost");
 }
 
 void run_chunked_prompt_history(bool streaming, int reused) {
@@ -691,6 +714,36 @@ void batch_policy_observations() {
 }
 }
 
+void run_prepared_default_positions() {
+    for(bool positioned:{false,true}) {
+        Model model;Predictor predictor;
+        InferenceRequest request;request.prompt={1,1,1};request.sampling.max_tokens=8;
+        Prepared prepared;prepared.token_ids=request.prompt;prepared.embeddings={{1,3,1}};
+        if(positioned)prepared.positions={{3}};
+        int calls=0;
+        struct ImageOps:Ops {
+            bool positioned=false;int* calls=nullptr;
+            Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+                assert(defined(positions)==positioned);++*calls;
+                return Ops::predictor_step(hidden,ids,positions);
+            }
+        };
+        ImageOps ops{{model,predictor},positioned,&calls};ops.prepared=&prepared;
+        InferenceOutput output(request,nullptr,"prepared-default-positions");
+        auto generation=speculative_sequence(std::move(ops),request,output,2,0,Tensor{},nullptr);
+        while(generation.next()){}
+        assert(output.result.completion_tokens==8 && calls>0);
+    }
+    Model model;Predictor predictor;InferenceRequest request;request.prompt={1,1,1};
+    Prepared bad;bad.token_ids=request.prompt;bad.embeddings={{1,3,1}};bad.decode_position_delta=1;
+    Ops ops{model,predictor};ops.prepared=&bad;
+    InferenceOutput output(request,nullptr,"missing-shifted-positions");
+    auto generation=speculative_sequence(ops,request,output,2,0,Tensor{},nullptr);
+    bool rejected=false;
+    try{(void)generation.next();}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected);
+}
+
 int main() try {
     for (const bool dspark : {false, true}) {
         Model model;
@@ -712,10 +765,12 @@ int main() try {
         assert(output.result.finish_reason == "stop" && output.result.completion_tokens == 1);
         assert(model.speculative_start < 0 && model.cache_pos == 3);
     }
+    run_prepared_default_positions();
     run(false);
     run(false,true);
     run(false,true,true);
     run(true);
+    run_dspark_draft_cost();
     for(bool streaming:{false,true})for(int reused:{0,4})run_chunked_prompt_history(streaming,reused);
     run_prompt_snapshot_boundary();
     run_bootstrap_publication();

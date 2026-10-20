@@ -223,7 +223,8 @@ int main() {
         assert(engine.advances[0] == 0);
         engine.resume = true;
         drain(handle);
-        scheduler.control(RuntimeMetrics{});
+        // A terminal response must already expose post-cleanup resources.
+        // Reading status must not require a later blocking control command.
         assert(scheduler.snapshot().runtime == Metrics({{"released", 1}}));
     }
     {

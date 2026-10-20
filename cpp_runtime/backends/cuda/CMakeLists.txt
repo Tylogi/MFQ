@@ -154,7 +154,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
 )
 target_link_libraries(mfq-cuda-native-kernels
     PUBLIC mfq-cuda-core CUDA::cuda_driver
-    PRIVATE mfq-core mfq-ggml-internal-headers
+    PRIVATE mfq-core mfq-ggml-internal-headers mfq-ggml
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
@@ -349,6 +349,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/engram.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/prefill.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/vision.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_memory.cpp
@@ -694,8 +695,15 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-deepseek-v41-engram-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     add_test(NAME mfq-deepseek-v41-engram-test COMMAND mfq-deepseek-v41-engram-test)
     set_tests_properties(mfq-deepseek-v41-engram-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-deepseek-v41-vision-test ${MFQ_CUDA_ROOT}/tests/deepseek_v41_vision_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-vision-test)
+    target_link_libraries(mfq-deepseek-v41-vision-test PRIVATE mfq-cuda-runtime)
+    target_compile_definitions(mfq-deepseek-v41-vision-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    add_test(NAME mfq-deepseek-v41-vision-test COMMAND mfq-deepseek-v41-vision-test)
+    set_tests_properties(mfq-deepseek-v41-vision-test PROPERTIES SKIP_RETURN_CODE 77)
     if(MSVC)
         target_compile_options(mfq-deepseek-v41-engram-test PRIVATE /EHsc)
+        target_compile_options(mfq-deepseek-v41-vision-test PRIVATE /EHsc)
         target_compile_options(mfq-deepseek-v41-ced-test PRIVATE /EHsc)
     endif()
     add_executable(mfq-deepseek-v41-indexer-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_deepseek_v41_indexer_bench.cpp)

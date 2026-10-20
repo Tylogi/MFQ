@@ -208,15 +208,19 @@ int main() {
                 "Flash-Next predictor declaration was confused with loaded weights");
         }
 
-        const auto deepseek_v41 = graph_with(
+        auto deepseek_v41 = graph_with(
             "deepseek_v41", "deepseek_v41_vision", "deepseek_v41_dspark");
+        require(cuda_model_plan(deepseek_v41).vision==CudaVisionAdapter::none,
+                "DeepSeek-V4.1 accepted a foreign image input contract");
+        deepseek_v41.components.at(1).input_contract="deepseek_v41_vision.v1";
+        deepseek_v41.components.at(1).position_policy="deepseek_v41_positions";
         const auto deepseek_v41_plan = cuda_model_plan(deepseek_v41);
         require(
             cuda_backbone(deepseek_v41.backbone) ==
                 CudaBackbone::deepseek_v41,
             "DeepSeek-V4.1 text adapter was not selected");
         require(
-            deepseek_v41_plan.vision == CudaVisionAdapter::none &&
+            deepseek_v41_plan.vision == CudaVisionAdapter::deepseek_v41 &&
                 deepseek_v41_plan.predictor ==
                     CudaPredictorAdapter::deepseek_v41_dspark,
             "DeepSeek-V4.1 optional component selection mismatch");
@@ -225,14 +229,17 @@ int main() {
         require(
             deepseek_v41_state.mtp_supported &&
                 deepseek_v41_state.mtp_enabled &&
-                !deepseek_v41_state.vision_supported,
+                deepseek_v41_state.vision_supported && !deepseek_v41_state.vision_available,
             "DeepSeek-V4.1 DSpark availability state mismatch");
         require_capabilities(
             cuda_runtime_capabilities(
                 deepseek_v41, deepseek_v41_plan,
                 deepseek_v41_state, false, false),
             {true, false, false, false, false, false, true},
-            "DeepSeek-V4.1 inferred an unimplemented Vision adapter");
+            "DeepSeek-V4.1 advertised Vision before loading its component");
+        const auto vision_state=cuda_component_state(deepseek_v41,deepseek_v41_plan,true,true);
+        require_capabilities(cuda_runtime_capabilities(deepseek_v41,deepseek_v41_plan,vision_state,true,false),
+            {true,true,false,false,false,false,true},"DeepSeek-V4.1 loaded Vision/MTP capabilities differ");
 
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;

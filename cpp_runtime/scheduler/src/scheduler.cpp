@@ -346,6 +346,13 @@ void MfqScheduler::loop() noexcept {
             executable |= !eligible.empty();
             if (executable) {
                 auto result = engine_.step(eligible);
+                // Teardown has completed when the engine becomes idle. Publish
+                // its final resource snapshot before the terminal response;
+                // otherwise a short request can leave prefill usage visible.
+                if (!result.has_work && std::any_of(result.events.begin(), result.events.end(),
+                        [](const auto& event) { return terminal(event.data); }))
+                    refresh_snapshot(healthy && result.status.healthy,
+                        reload.has_value() || duplex_active || stopping, true);
                 for (auto& event : result.events) {
                     auto found = requests_.find(event.id);
                     if (found != requests_.end()) publish(found->second, std::move(event));

@@ -103,7 +103,8 @@ class EngramHashState {
         return next.forward(ids,batch,tokens,pos0);
     }
 
-    EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0) {
+    EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0,
+                           const std::uint8_t* image_mask = nullptr) {
         if (!ids || batch <= 0 || tokens <= 0 || pos0 < 0)
             throw std::invalid_argument("invalid Engram hash input");
         if (pos0 == 0)
@@ -118,7 +119,8 @@ class EngramHashState {
             if (token < 0 || token >= static_cast<std::int64_t>(parameters_->token_map.size())) {
                 throw std::out_of_range("DeepSeek-V4.1 Engram token ID is outside the vocabulary");
             }
-            compressed[index] = parameters_->token_map[static_cast<std::size_t>(token)];
+            compressed[index] = image_mask && image_mask[index] ? kDeadToken :
+                parameters_->token_map[static_cast<std::size_t>(token)];
         }
 
         if(speculative_context_) {

@@ -101,6 +101,7 @@ template <typename Model> struct CudaGenerationOps {
             prefill_finished=true;
         };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+        CudaImageMaskScope image_scope(model,prepared,chunk.offset,chunk.count);
         Tensor hidden;
         bool layer_major=false,short_windows=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
@@ -148,7 +149,8 @@ template <typename Model> struct CudaGenerationOps {
                     std::size_t(chunk.count)*model.hidden_size()*model.hc_mult()*sizeof(float)*4)>0;
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
-                prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
+                prepared->positions.defined()?MfqOptional<Tensor>(
+                    prepared->positions.narrow(-1,chunk.offset,chunk.count).contiguous()):mfq_nullopt,
                 mfq_nullopt,
                 nullptr,
                 mfq_nullopt,
@@ -370,16 +372,28 @@ template <class Model> struct CudaGenerationContext {
     std::string request_id;
 
     bool batched() const { return batching != nullptr; }
-    void trace_expert_cache(const char* boundary) {
-        // Request boundaries only: these existing counters need no events or
-        // extra per-token synchronization. Diagnostic output drains exchanges.
+    void trace_expert_cache(const char* boundary, bool drain = true) {
+        // Request/first-token boundaries only: existing counters need no
+        // events or per-token synchronization. Full summaries drain exchanges.
         static const bool enabled=[] {
             const char* value=std::getenv("MFQ_TRACE_MOE_SUMMARY");
             return value && value[0] && value[0]!='0';
         }();
         if (!enabled || batching || std::uncaught_exceptions()) return;
         std::cerr << "moe_request_cache_stats boundary=" << boundary << '\n';
-        print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+        if(drain)print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+        // The first-token snapshot must not wait for exchanges or introduce
+        // CUDA synchronization. Subtract it from the end snapshot to isolate
+        // steady decode I/O from the much larger prefill scan.
+        std::cerr << "moe_phase_metrics boundary=" << boundary;
+        for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+            if(name=="ssd_expert_read_wait_ms" || name=="expert_route_wait_ms" ||
+               name=="expert_host_fetch_ms" || name=="expert_host_copy_ms" || name=="expert_transfer_cache_prepare_ms" || name=="ssd_expert_bytes_read" ||
+               name=="ssd_expert_read_count" || name=="ram_expert_cache_hits" ||
+               name=="ram_expert_cache_misses" || name=="ram_expert_pcie_read_bytes" ||
+               name=="expert_logical_transfer_bytes")std::cerr << ' ' << name << '=' << value;
+        }
+        std::cerr << '\n';
         if(model.source) {
             const auto io=model.source->file_read_stats();
             std::cerr<<"runtime_model_io_stats boundary="<<boundary<<" calls="<<io.calls

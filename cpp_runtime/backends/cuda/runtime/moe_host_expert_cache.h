@@ -29,12 +29,14 @@ struct MoeHostExpertCacheStats {
     bool reuse_priority=false;
     std::size_t reuse_protected_bytes=0;
     std::uint64_t reuse_promotions=0;
+    std::uint64_t reuse_clock_rotations=0;
     std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
     std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
     std::uint64_t device_reuse_promotions=0;
     std::uint64_t speculative_windows=0,speculative_accepted_keys=0,speculative_cancels=0;
     std::uint64_t prediction_used_jobs=0,prediction_used_bytes=0;
     std::uint64_t prediction_started_jobs=0,prediction_started_bytes=0;
+    std::uint64_t prediction_first_uses=0;
     std::size_t ghost_entries=0,ghost_bytes=0;
     std::uint64_t ghost_promotions=0;
 };

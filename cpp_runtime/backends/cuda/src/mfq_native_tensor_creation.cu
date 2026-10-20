@@ -216,6 +216,9 @@ Tensor where(
     const Tensor& yes_source,
     const Tensor& no_source) {
     auto shape = broadcast_shape(yes_source, no_source);
+    // The condition can introduce token or batch axes absent from both
+    // alternatives. Expanding is a view; no candidate data is materialized.
+    shape=broadcast_shape(yes_source.expand(shape),condition_source);
     auto type = promote(yes_source.scalar_type(), no_source.scalar_type());
     auto yes = yes_source.to(yes_source.device(), type);
     auto no = no_source.to(yes.device(), type);

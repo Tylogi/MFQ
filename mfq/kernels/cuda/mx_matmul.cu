@@ -12,6 +12,7 @@
 
 #include "packed_backward.cuh"
 #include "mx_float_decode.cuh"
+#include "mxfp8_grouped_gemm.h"
 
 namespace {
 
@@ -146,11 +147,72 @@ __global__ void mxfp8_small_m_kernel(
     }
 }
 
+inline constexpr int mxfp8_values_per_lane=8;
+
+// Keep the same reduction groups for single-token decode and verification.
+// Packed loads still share each decoded weight across every token in a tile.
+template <int TILE_M, typename Output>
+__global__ void mxfp8_packed_small_m_kernel(
+        const std::uint8_t* __restrict__ values,
+        const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ x, Output* __restrict__ y,
+        int rows,int outputs,int width,int groups,int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
+    __shared__ float codebook[256];
+    codebook[threadIdx.x]=decode_e4m3fn(std::uint8_t(threadIdx.x));
+    __syncthreads();
+    const int lane=int(threadIdx.x)&31;
+    const int output=int(blockIdx.x)*8+(int(threadIdx.x)>>5);
+    if(output>=outputs)return;
+    const int group=output/outputs_per_group;
+    const auto* weights=reinterpret_cast<const std::uint32_t*>(values+std::size_t(output)*width);
+    const auto* scale_row=scales+std::size_t(output>>scale_row_shift)*(width>>scale_column_shift);
+    float accum[TILE_M]{};
+    constexpr int packed_values=mxfp8_values_per_lane;
+    for(int column=lane*packed_values;column<width;column+=32*packed_values) {
+        float decoded[packed_values];
+#pragma unroll
+        for(int word=0;word<packed_values/4;++word) {
+            const auto packed=weights[column/4+word];
+#pragma unroll
+            for(int element=0;element<4;++element)
+                decoded[word*4+element]=codebook[std::uint8_t(packed>>(element*8))];
+        }
+        const float scale=decode_e8m0(scale_row[column>>scale_column_shift]);
+#pragma unroll
+        for(int row=0;row<TILE_M;++row)if(row<rows) {
+            const auto* activation=x+(std::size_t(row)*groups+group)*width+column;
+            float partial=0;
+#pragma unroll
+            for(int pair=0;pair<packed_values/2;++pair) {
+                const auto a=__half22float2(*reinterpret_cast<const __half2*>(activation+pair*2));
+                partial=fmaf(a.y,decoded[pair*2+1],fmaf(a.x,decoded[pair*2],partial));
+            }
+            accum[row]=fmaf(partial,scale,accum[row]);
+        }
+    }
+#pragma unroll
+    for(int row=0;row<TILE_M;++row) {
+        const auto total=warp_sum(accum[row]);
+        if(lane==0 && row<rows) {
+            if constexpr(std::is_same_v<Output,float>)y[std::size_t(row)*outputs+output]=total;
+            else y[std::size_t(row)*outputs+output]=__float2half_rn(total);
+        }
+    }
+}
+
 int mxfp8_column_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
     return values.size(1)/scales.size(1)==128?7:5;
 }
 int mxfp8_row_shift(const mfq_tensor_backend::Tensor& values,const mfq_tensor_backend::Tensor& scales) {
     return scales.size(0)==values.size(0)?0:mxfp8_column_shift(values,scales);
+}
+
+void record_mxfp8_packed_dispatch(int rows,int width,int outputs,int tile,int packed_values) {
+    static std::atomic<unsigned> recorded{0};
+    if(!(recorded.fetch_or(1u<<rows,std::memory_order_relaxed)&(1u<<rows)))
+        std::fprintf(stderr,"mxfp8_packed_small_m scope=first_launch enabled=1 decode=shared_table values_per_lane=%d rows=%d tile_m=%d width=%d outputs=%d\n",
+            packed_values,rows,tile,width,outputs);
 }
 
 template <int TILE_M, typename Output>
@@ -165,6 +227,19 @@ void launch_mxfp8_small_m(
     constexpr int threads = 256;
     constexpr int warps = threads / 32;
     const int outputs = int(values.size(0));
+    if((reinterpret_cast<std::uintptr_t>(values.data_ptr())&3u)==0 &&
+       (reinterpret_cast<std::uintptr_t>(x.data_ptr())&3u)==0) {
+        record_mxfp8_packed_dispatch(int(x.size(0)),int(values.size(1)),outputs,
+            TILE_M,mxfp8_values_per_lane);
+        mxfp8_packed_small_m_kernel<TILE_M,Output><<<
+            (outputs+warps-1)/warps,threads,0,stream>>>(
+                values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                reinterpret_cast<Output*>(y.data_ptr()),int(x.size(0)),outputs,
+                int(values.size(1)),groups,outputs_per_group,
+                mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
+        return;
+    }
 #define MFQ_LAUNCH_MXFP8_OPW_CACHE(OPW, CACHE) \
     do { \
         const int outputs_per_block = warps * (OPW); \
@@ -251,10 +326,12 @@ __global__ void mxfp8_embedding_kernel(
 
 // Packed formats share one decoded Tensor Core tile. Padding rotates shared
 // banks; output fragments reuse weight storage after the last reader barrier.
-struct alignas(16) PackedPrefillStorage {
+template<int Rows>
+struct alignas(16) PackedPrefillTile {
+    static_assert(Rows>=16 && Rows%16==0);
     static constexpr int k=64,stride=k+8;
-    __align__(16) __half activation[16*stride];
-    __align__(16) unsigned char weights[64*stride*sizeof(__half)];
+    __align__(16) __half activation[Rows*stride];
+    __align__(16) unsigned char weights[std::max(64*stride*sizeof(__half),Rows*64*sizeof(float))];
     __device__ __forceinline__ __half* decoded() {return reinterpret_cast<__half*>(weights);}
     __device__ __forceinline__ float* result() {return reinterpret_cast<float*>(weights);}
     template<class Accumulator>
@@ -265,42 +342,56 @@ struct alignas(16) PackedPrefillStorage {
         for(int sub=0;sub<k;sub+=16) {
             wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
             wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-            wmma::load_matrix_sync(af,activation+sub,stride);
-            wmma::load_matrix_sync(bf,decoded()+warp*16*stride+sub,stride);
+            wmma::load_matrix_sync(af,activation+(warp/4)*16*stride+sub,stride);
+            wmma::load_matrix_sync(bf,decoded()+(warp%4)*16*stride+sub,stride);
             wmma::mma_sync(acc,af,bf,acc);
         }
         __syncthreads();
     }
 };
+using PackedPrefillStorage=PackedPrefillTile<16>;
+// Four token tiles reuse each decoded weight tile without expanding weights.
+inline constexpr int mxfp8_prefill_rows=64;
+inline constexpr int mxfp8_prefill_threads=mxfp8_prefill_rows/16*128;
+using Mxfp8PrefillStorage=PackedPrefillTile<mxfp8_prefill_rows>;
 
 template <typename Output>
-__global__ void __launch_bounds__(128) mxfp8_matmul_kernel(
+__global__ void __launch_bounds__(mxfp8_prefill_threads) mxfp8_matmul_kernel(
         const std::uint8_t* __restrict__ values,const std::uint8_t* __restrict__ scales,
         const __half* __restrict__ input,Output* __restrict__ output,
-        int rows,int outputs,int width,int scale_row_shift,int scale_column_shift) {
+        int rows,int outputs,int width,int scale_row_shift,int scale_column_shift,
+        int groups,int outputs_per_group) {
     using namespace nvcuda;
-    __shared__ PackedPrefillStorage tile;
-    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    __shared__ Mxfp8PrefillStorage tile;
+    __shared__ float codebook[256];
+    for(int i=threadIdx.x;i<256;i+=mxfp8_prefill_threads)
+        codebook[i]=decode_e4m3fn(std::uint8_t(i));
+    __syncthreads();
+    constexpr int tile_k=Mxfp8PrefillStorage::k,stride=Mxfp8PrefillStorage::stride;
     auto* a=tile.activation;auto* b=tile.decoded();auto* c=tile.result();
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
-    const int first_row=blockIdx.y*16,first_output=blockIdx.x*64;
+    const int blocks_per_group=(outputs_per_group-1)/64+1;
+    const int group=int(blockIdx.x)/blocks_per_group;
+    const int first_row=blockIdx.y*mxfp8_prefill_rows;
+    const int first_output=group*outputs_per_group+(int(blockIdx.x)%blocks_per_group)*64;
+    const int output_end=(group+1)*outputs_per_group;
     const int scale_columns=width>>scale_column_shift;
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
     wmma::fill_fragment(acc,0.0f);
     for(int k=0;k<width;k+=tile_k) {
-        for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+        for(int i=threadIdx.x;i<mxfp8_prefill_rows*tile_k;i+=mxfp8_prefill_threads) {
             const int row=first_row+i/tile_k,column=k+i%tile_k;
             a[(i/tile_k)*stride+i%tile_k]=row<rows && column<width?
-                input[std::size_t(row)*width+column]:__float2half_rn(0);
+                input[(std::size_t(row)*groups+group)*width+column]:__float2half_rn(0);
         }
-        for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+        for(int i=threadIdx.x;i<64*(tile_k/2);i+=mxfp8_prefill_threads) {
             const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
             float lo=0,hi=0;
-            if(neuron<outputs && column<width) {
+            if(neuron<output_end && column<width) {
                 const auto offset=std::size_t(neuron)*width+column;
                 const float scale=decode_e8m0(scales[std::size_t(neuron>>scale_row_shift)*scale_columns+(column>>scale_column_shift)]);
-                lo=decode_e4m3fn(values[offset])*scale;
-                hi=decode_e4m3fn(values[offset+1])*scale;
+                lo=codebook[values[offset]]*scale;
+                hi=codebook[values[offset+1]]*scale;
             }
             reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
         }
@@ -309,8 +400,8 @@ __global__ void __launch_bounds__(128) mxfp8_matmul_kernel(
     wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
     __syncwarp();
     for(int i=lane;i<16*16;i+=32) {
-        const int row=first_row+i/16,neuron=first_output+warp*16+i%16;
-        if(row<rows && neuron<outputs) {
+        const int row=first_row+(warp/4)*16+i/16,neuron=first_output+(warp%4)*16+i%16;
+        if(row<rows && neuron<output_end) {
             if constexpr(std::is_same_v<Output,float>)output[std::size_t(row)*outputs+neuron]=c[warp*16*16+i];
             else output[std::size_t(row)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
         }
@@ -439,11 +530,11 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
     auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
-    mxfp8_matmul_kernel<__half><<<dim3((outputs+63)/64,(rows+15)/16),128,0,mfq_current_cuda_stream()>>>(
+    mxfp8_matmul_kernel<__half><<<dim3((outputs+63)/64,(rows+mxfp8_prefill_rows-1)/mxfp8_prefill_rows),mxfp8_prefill_threads,0,mfq_current_cuda_stream()>>>(
         values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
         reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
         reinterpret_cast<__half*>(result.data_ptr<mfq_half>()),rows,outputs,width,
-        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales),1,outputs);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
@@ -493,12 +584,55 @@ mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
     const int N = int(values.size(0));
     auto y = mfq_tensor_backend::empty(
         {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
-    mxfp8_matmul_kernel<float><<<dim3((N+63)/64,(M+15)/16),128,0,mfq_current_cuda_stream()>>>(
+    mxfp8_matmul_kernel<float><<<dim3((N+63)/64,(M+mxfp8_prefill_rows-1)/mxfp8_prefill_rows),mxfp8_prefill_threads,0,mfq_current_cuda_stream()>>>(
         values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
         reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),y.data_ptr<float>(),M,N,int(x.size(1)),
-        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales));
+        mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales),1,N);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
+}
+
+namespace {
+template <typename Output>
+mfq_tensor_backend::Tensor mxfp8_groupwise_gemm(
+        mfq_tensor_backend::Tensor values,mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input,int64_t groups) {
+    validate_mxfp8(values,scales);
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        input.is_contiguous() && input.dim()==3 && groups>0 && input.size(1)==groups &&
+        values.size(0)%groups==0 && input.size(2)==values.size(1) && input.size(0)>0 &&
+        input.size(0)<=std::numeric_limits<int>::max() && values.size(0)<=std::numeric_limits<int>::max() &&
+        values.size(1)<=std::numeric_limits<int>::max() && input.device()==values.device() &&
+        scales.device()==values.device(),"invalid grouped MXFP8 GEMM geometry");
+    const int rows=int(input.size(0)),outputs=int(values.size(0)),width=int(values.size(1));
+    const int per_group=int(values.size(0)/groups);
+    auto options=input.options();
+    if constexpr(std::is_same_v<Output,float>)options=options.dtype(mfq_tensor_backend::kFloat32);
+    auto result=mfq_tensor_backend::empty({rows,outputs},options);
+    mxfp8_matmul_kernel<Output><<<dim3(unsigned(((per_group-1)/64+1)*groups),unsigned((rows+mxfp8_prefill_rows-1)/mxfp8_prefill_rows)),
+        mxfp8_prefill_threads,0,mfq_current_cuda_stream()>>>(
+            values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<Output*>(result.data_ptr()),rows,outputs,width,
+            mxfp8_row_shift(values,scales),mxfp8_column_shift(values,scales),int(groups),per_group);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    static std::atomic_flag recorded=ATOMIC_FLAG_INIT;
+    if(!recorded.test_and_set(std::memory_order_relaxed))
+        std::fprintf(stderr,"mxfp8_grouped_gemm scope=first_launch enabled=1 decode=shared_table groups=%lld rows=%d width=%d outputs=%d tile_m=%d threads=%d\n",
+            static_cast<long long>(groups),rows,width,outputs,mxfp8_prefill_rows,mxfp8_prefill_threads);
+    return result;
+}
+}
+
+mfq_tensor_backend::Tensor mxfp8_groupwise_gemm_f16_cuda(
+        mfq_tensor_backend::Tensor values,mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input,int64_t groups) {
+    return mxfp8_groupwise_gemm<__half>(values,scales,input,groups);
+}
+mfq_tensor_backend::Tensor mxfp8_groupwise_gemm_f32_cuda(
+        mfq_tensor_backend::Tensor values,mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input,int64_t groups) {
+    return mxfp8_groupwise_gemm<float>(values,scales,input,groups);
 }
 
 mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_cuda(

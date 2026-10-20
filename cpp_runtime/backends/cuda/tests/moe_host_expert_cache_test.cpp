@@ -34,6 +34,74 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    for(int access:{0,1,2}) {
+        MoeHostExpertCache cache(256);cache.enable_reuse_priority();
+        auto predicted=cache.acquire(key(0),64,[]{return weight(64,1);},true,false);
+        const auto consume=[&] {
+            if(access==0)return cache.find(key(0));
+            if(access==1)return cache.try_find(key(0));
+            return cache.acquire(key(0),64,[]{throw std::runtime_error("predicted RAM image was reread");return weight(64,0);});
+        };
+        bytes_equal(consume(),1);
+        check(!cache.stats().reuse_promotions && !cache.stats().reuse_protected_bytes,
+            "first real use of a managed prediction was counted as expert reuse");
+        bytes_equal(consume(),1);
+        check(cache.stats().reuse_promotions==1 && cache.stats().prediction_used_jobs==1 &&
+            cache.stats().managed_bytes==64 && !cache.stats().transient_bytes,
+            "second real use of a prediction did not promote its existing RAM image exactly once");
+        bytes_equal(predicted,1);
+    }
+    for(bool before_window:{false,true})for(int accepted:{0,1,2}) {
+        MoeHostExpertCache cache(256);cache.enable_reuse_priority();
+        MoeHostExpertCache::Lease predicted;
+        const auto load=[&]{return cache.acquire(key(0),64,[]{return weight(64,1);},true,false);};
+        if(before_window)predicted=load();
+        cache.begin_speculative_learning();
+        if(!before_window)predicted=load();
+        bytes_equal(cache.find(key(0)),1);bytes_equal(cache.find(key(0)),1);
+        cache.commit_speculative_learning(std::vector<mfq::MoeCacheKey>(accepted,key(0)));
+        check(cache.stats().reuse_promotions==unsigned(accepted==2),
+            "forecast admission or rejected verification counted as an accepted token use");
+        if(!accepted) {
+            bytes_equal(cache.find(key(0)),1);
+            check(!cache.stats().reuse_promotions,"rejected forecast use advanced later RAM reuse learning");
+        }
+        bytes_equal(cache.find(key(0)),1);
+        check(cache.stats().reuse_promotions==1 && cache.stats().prediction_first_uses==1,
+            "accepted forecast uses did not learn exactly one admission and one reuse");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.acquire(key(0),64,[]{return weight(64,1);},true,false);
+        cache.begin_speculative_learning();cache.find(key(0));cache.discard_speculative_learning();
+        cache.acquire(key(1),64,[]{return weight(64,2);});cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(!cache.contains(key(0)),"rejected-forecast fixture did not evict its unused image");
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        check(!cache.stats().ghost_promotions,"a rejected forecast created false refault history");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        for(int expert:{0,1,2,3})cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
+        cache.acquire(key(0),64,[]{return weight(64,1);},true,false);bytes_equal(cache.find(key(0)),1);
+        check(cache.stats().ghost_promotions==1 && cache.stats().reuse_promotions==1,
+            "forecast confirmation discarded a real earlier use remembered by eviction history");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(0)},true);
+        cache.set_device_cache_hints(hints);hints->publish(0,true);
+        cache.acquire(key(0),64,[]{return weight(64,1);},true,false);
+        check(cache.stats().device_reuse_promotions==1 && !cache.stats().prediction_used_jobs,
+            "unconsumed RAM prediction hid already confirmed GPU reuse");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        cache.acquire(key(0),64,[]{return weight(64,1);},true,false);
+        cache.set_reuse_learning(false);cache.find(key(0));cache.set_reuse_learning(true);
+        cache.find(key(0));check(!cache.stats().reuse_promotions,"synthetic forecast use trained RAM reuse");
+        cache.find(key(0));check(cache.stats().reuse_promotions==1,"real reuse after warmup was not learned");
+    }
     {
         MoeHostExpertCache cache(192);cache.enable_reuse_priority();
         cache.acquire(key(0,0),64,[]{return weight(64,1);});
@@ -65,6 +133,20 @@ int main() try {
             "repeatedly evicted unique experts could not displace a GPU-only RAM backup");
         check(cache.stats().ghost_promotions==2 && cache.stats().managed_bytes==256 &&
             cache.stats().ghost_bytes<=256,"ghost reuse changed the payload budget or counted the wrong histories");
+    }
+    {
+        MoeHostExpertCache cache(256);cache.enable_reuse_priority();
+        for(int e=0;e<4;++e)cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        for(int e:{0,1,2,0,0,0,1,2})cache.find(key(e));
+        cache.acquire(key(4),64,[]{return weight(64,5);});cache.find(key(4));
+        cache.acquire(key(5),64,[]{return weight(64,6);});
+        check(cache.contains(key(0)) && !cache.contains(key(4)) && cache.stats().reuse_clock_rotations>=3,
+              "a lightly reused scan displaced a frequent RAM expert");
+        for(int e=6;e<30;++e) {
+            cache.acquire(key(e),64,[e]{return weight(64,e+1);});cache.find(key(e));
+        }
+        check(!cache.contains(key(0)) && cache.stats().managed_peak_bytes<=256,
+              "frequency credits kept an obsolete RAM expert indefinitely or exceeded the budget");
     }
     for(bool accepted:{false,true}) {
         MoeHostExpertCache cache(192);cache.enable_reuse_priority();
@@ -355,7 +437,7 @@ int main() try {
         for(int expert=34;expert<50;++expert) {
             cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
             bytes_equal(cache.find(key(expert)),expert+1);
-            check(cache.stats().reuse_protected_bytes<=384,"RAM reuse protection exceeded its byte quota");
+            check(cache.stats().reuse_protected_bytes<=461,"RAM reuse protection exceeded its byte quota");
         }
         cache.acquire(key(0,-2),64,[]{return weight(64,9);});
         bytes_equal(cache.find(key(0,-2)),9);
