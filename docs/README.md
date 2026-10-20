@@ -45,6 +45,8 @@ through the inference API.
 ## Develop MFQ
 
 - [Architecture and contribution rules](../CONTRIBUTING.md)
+- [C++ server target architecture](backend-architecture.md)
+- [C++ server migration plan](backend-plan.md)
 - [Repository README](../README.md)
 
 Runtime support is checkpoint- and backend-dependent. Use the support matrix

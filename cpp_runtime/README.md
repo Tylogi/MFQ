@@ -11,6 +11,7 @@ by model family:
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
   causal traversal, attention, MLP, MoE, recurrence, and shared layer compositions;
 - `transport/` — private stdio/HTTP protocol adapters;
+- `apps/` and `server/` — native public server entry and initial HTTP/lifecycle support;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
@@ -31,8 +32,8 @@ by model family:
 
 A native `Runtime` composes a protocol `Transport`, a backend-neutral
 `Scheduler`, and one concrete `Engine`. `Engine` is the only compute-backend
-polymorphic boundary. Python owns runtime process lifecycle and the public
-server API.
+polymorphic boundary. Python still owns the product's runtime process lifecycle
+and full public API. The separate `mfq-server` target starts the native server migration.
 
 The mandatory ownership and canonicalization rules are defined in the
 repository [development rules](../CONTRIBUTING.md). In particular, reusable
@@ -78,3 +79,36 @@ Qwen3.8-Flash-Next uses `qwen4_exp`.
 build output directory remains unchanged. Integrated upstream-derived
 code retains its original licensing as documented in the repository `NOTICE`
 and `LICENSES/` directory.
+
+## Native server bootstrap
+
+Build the initial server without GPU backends or the private inference transport:
+
+```sh
+cmake -S cpp_runtime -B build/native-server \
+  -DMFQ_BUILD_SERVER=ON -DMFQ_BUILD_CUDA_RUNTIME=OFF \
+  -DMFQ_BUILD_HIP_RUNTIME=OFF -DMFQ_BUILD_METAL_RUNTIME=OFF \
+  -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native-server --target mfq-server -j
+ctest --test-dir build/native-server -R '^mfq-server-test$' --output-on-failure
+build/native-server/server/mfq-server --data-dir .mfq --port 8090
+```
+
+The native process needs no Python. The process test uses the Python standard
+library and runs when CMake finds an interpreter. Version metadata comes from
+`mfq/_version.py`, read as text at configure time.
+
+The initial routes are `/health` and `/health/identity`. Optional `--web-root PATH`
+serves an existing frontend build, including browser navigation fallback; unknown
+API paths remain errors. Without this flag, static serving is disabled. Only
+`127.0.0.1` and `::1` may bind until authentication is migrated. Port `0` selects
+an available port; the startup JSON line reports the actual listener port.
+
+The data directory selects the same instance lock and workspace identity as the
+Python service. It cannot be served by both implementations at once. Existing
+databases are untouched. `--exit-on-stdin-close` exits when the parent closes its
+input pipe; `--studio-instance-id UUID` requires that lifecycle flag. SIGINT and
+SIGTERM also stop the server. Lock files remain on disk and unlock on process exit.
+
+Authentication, SQLite, management and inference APIs, and the Studio/release
+switch are pending. This target is not yet a replacement for `mfq serve`.

@@ -8,6 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+option(MFQ_BUILD_SERVER "Build the native public server" OFF)
+
 option(
     MFQ_BUILD_METAL_RUNTIME
     "Build the native MLX/Metal runtime on Apple Silicon"
@@ -74,7 +76,7 @@ if(MFQ_BUILD_RUNTIME_COMMUNICATION OR MFQ_BUILD_METAL_RUNTIME)
     add_subdirectory(components/tokenizer)
 endif()
 
-if(MFQ_BUILD_RUNTIME_COMMUNICATION)
+if(MFQ_BUILD_RUNTIME_COMMUNICATION OR MFQ_BUILD_SERVER)
     add_subdirectory(components/http)
 endif()
 
@@ -83,6 +85,10 @@ add_subdirectory(scheduler)
 
 if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(transport)
+endif()
+
+if(MFQ_BUILD_SERVER)
+    add_subdirectory(server)
 endif()
 
 if(MFQ_BUILD_METAL_RUNTIME)

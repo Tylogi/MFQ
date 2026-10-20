@@ -98,7 +98,7 @@ target_link_libraries(mfq-core INTERFACE
     mfq-qsa-kv-store
 )
 
-if(MFQ_BUILD_RUNTIME_COMMUNICATION)
+if(MFQ_BUILD_RUNTIME_COMMUNICATION OR MFQ_BUILD_SERVER)
     find_package(Threads REQUIRED)
 
     add_library(mfq-paged-prefix-cache STATIC
