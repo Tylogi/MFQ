@@ -443,7 +443,9 @@ template <class Model> struct CudaGenerationContext {
             moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
     }
     int64_t prefill_chunk(std::size_t tokens) const {
-        return short_streamed_prefill(tokens)?std::min<int64_t>(8,config.generation.prefill_chunk_size):
+        // Reuse ordinary/MTP widths before allocating wider temporary graphs
+        // whose activation storage would displace persistent expert images.
+        return short_streamed_prefill(tokens)?std::min<int64_t>(4,config.generation.prefill_chunk_size):
             config.generation.prefill_chunk_size;
     }
     void prepare_prefill_workspace(std::size_t tokens) {

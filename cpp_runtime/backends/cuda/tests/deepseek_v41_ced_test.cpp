@@ -190,7 +190,7 @@ void check_exact_short() {
     check_positions(model,17);
     model.hidden_forward(ids(1));check_positions(model,18);
 }
-void check_short_prefill_tiles() {
+void check_short_prefill_tiles(int tile_tokens=8) {
     CudaExecutionContext execution;
     int cases=0;
     for(int ratio:{2,16})for(int context:{127,128,129})for(int tokens:{9,15,32,128}) {
@@ -198,12 +198,12 @@ void check_short_prefill_tiles() {
         auto prompt=ids(context),suffix=ids(tokens);
         reference.hidden_forward(prompt);candidate.hidden_forward(prompt);
         std::vector<tb::Tensor> hidden,raw,expected,expected_raw;
-        for(int offset=0;offset<tokens;offset+=8) {
-            auto tile=suffix.narrow(1,offset,std::min(8,tokens-offset));
+        for(int offset=0;offset<tokens;offset+=tile_tokens) {
+            auto tile=suffix.narrow(1,offset,std::min(tile_tokens,tokens-offset));
             tb::Tensor wanted_raw,tile_raw;
             expected.push_back(reference.hidden_forward(tile,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&wanted_raw));
             expected_raw.push_back(std::move(wanted_raw));
-            hidden.push_back(deepseek_v41_prefill_hidden(candidate,tile,8,{},&tile_raw));
+            hidden.push_back(deepseek_v41_prefill_hidden(candidate,tile,tile_tokens,{},&tile_raw));
             raw.push_back(std::move(tile_raw));
         }
         const auto same=[](const tb::Tensor& actual,const tb::Tensor& wanted) {
@@ -219,7 +219,8 @@ void check_short_prefill_tiles() {
             "retained short-prefill tiles changed Engram history");
         ++cases;
     }
-    std::cout<<"short_prefill_tile_cases="<<cases<<" ring/compressor/Engram/DSpark/decode PASS\n";
+    std::cout<<"short_prefill_tile_cases="<<cases<<" tile_tokens="<<tile_tokens
+        <<" ring/compressor/Engram/DSpark/decode PASS\n";
 }
 void check_long_and_cancel() {
     CudaExecutionContext execution;
@@ -301,7 +302,8 @@ int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--modality-routing-check"){check_modality_routing();return 0;}
     if(argc==2 && std::string(argv[1])=="--session-check"){check_session_snapshots();run_dspark_self_check();return 0;}
     if(argc==2 && std::string(argv[1])=="--short-prefill-check"){check_short_prefill_tiles();return 0;}
-    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_long_and_cancel();check_retained_prefix();check_session_snapshots();run_dspark_self_check();
+    if(argc==2 && std::string(argv[1])=="--short-prefill-four-check"){check_short_prefill_tiles(4);return 0;}
+    check_modality_routing();check_tail_rope();check_exact_short();check_short_prefill_tiles();check_short_prefill_tiles(4);check_long_and_cancel();check_retained_prefix();check_session_snapshots();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;
