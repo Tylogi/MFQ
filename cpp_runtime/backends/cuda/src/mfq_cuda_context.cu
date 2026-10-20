@@ -1250,9 +1250,11 @@ HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
     }
     const auto flags = mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
     const auto allocation=cudaHostAlloc(&data_,bytes_,flags);
-    if(allocation==cudaErrorMemoryAllocation) {
+    if(pinned_allocation_rejected(allocation)) {
         (void)cudaGetLastError();
-        throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes_));
+        data_=nullptr;
+        throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes_)+
+            " error="+cudaGetErrorName(allocation));
     }
     MFQ_NATIVE_CUDA_CHECK(allocation);
 }
