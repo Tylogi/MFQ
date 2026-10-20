@@ -290,6 +290,16 @@ private:
     StreamHandle stream_;
 };
 
+// cudaHostAlloc reports an exhausted pinned-memory limit as
+// cudaErrorMemoryAllocation on Linux, but WDDM can reject a large mapped
+// allocation with a mapping error instead ("resource already mapped").
+// Callers that retry smaller sizes or fall back to pageable memory treat all
+// of these as recoverable resource exhaustion.
+inline bool pinned_allocation_rejected(cudaError_t status) noexcept {
+    return status == cudaErrorMemoryAllocation || status == cudaErrorAlreadyMapped ||
+           status == cudaErrorMapBufferObjectFailed;
+}
+
 class HostBuffer final {
 public:
     explicit HostBuffer(std::size_t bytes, bool mapped = false);

@@ -67,10 +67,11 @@ struct Mapped {
     std::shared_ptr<Mapped> shared_owner;
     explicit Mapped(std::size_t n):bytes(n) {
         const auto allocation=cudaHostAlloc(&host,n,cudaHostAllocMapped);
-        if(allocation==cudaErrorMemoryAllocation) {
+        if(mfq::cuda::pinned_allocation_rejected(allocation)) {
             (void)cudaGetLastError();
             throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(n)+
-                " host_allocated="+std::to_string(mfq::cuda::tensor_host_bytes.load()));
+                " host_allocated="+std::to_string(mfq::cuda::tensor_host_bytes.load())+
+                " error="+cudaGetErrorName(allocation));
         }
         MFQ_CUDA_CHECK(allocation);
         const auto status=cudaHostGetDevicePointer(&device,host,0);
