@@ -37,6 +37,9 @@ struct MlxSsdExpertCacheStats {
     std::uint64_t device_route_layers = 0;
     std::uint64_t device_route_hits = 0;
     std::uint64_t device_route_misses = 0;
+    std::uint64_t overlapped_read_batches = 0;
+    std::uint64_t overlapped_read_submissions = 0;
+    std::uint64_t parallel_body_read_batches = 0;
     double io_seconds = 0.0;
     double wait_seconds = 0.0;
     double prefill_wait_seconds = 0.0;

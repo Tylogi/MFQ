@@ -32,7 +32,9 @@ public:
     std::size_t nbytes() const noexcept;
     const mlx::core::array& ring(std::size_t stage) const;
 
-    MlxDeepseekV41DSparkState snapshot() const;
+    MlxDeepseekV41DSparkState snapshot(bool copy_arrays = true) const;
+    static MlxDeepseekV41DSparkState from_snapshot(
+        std::vector<mlx::core::array> rings, int position);
     void restore_snapshot(MlxDeepseekV41DSparkState snapshot);
 
 private:

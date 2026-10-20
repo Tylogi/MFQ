@@ -532,9 +532,13 @@ InferenceRequest TextProcessor::prepare(
         work.cache_plan.cache_output_tokens = false;
     }
     if (input.media) {
+        const auto suffix_tokens = work.prompt.size() - std::min(
+            work.cache_plan.stable_prefix_tokens, work.prompt.size());
         prepare_media(
             *impl_->tokenizer, impl_->tokenizer->vocab_size(),
             work.prompt, *input.media);
+        if (work.cache_plan.stable_prefix_tokens > 0)
+            work.cache_plan.stable_prefix_tokens = work.prompt.size() - suffix_tokens;
         work.vision = std::move(input.media);
     }
     if (max_context > 0 &&

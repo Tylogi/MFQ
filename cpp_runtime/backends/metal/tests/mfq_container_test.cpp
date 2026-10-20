@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -222,6 +223,63 @@ void test_basic_container(
             (void)model.read_range("weight", 3, 2);
         },
         "out-of-bounds record range was accepted");
+}
+
+void test_scatter_ranges(const std::filesystem::path& root) {
+    const auto path = root / "scatter.mfq";
+    std::string payload((std::size_t{33} << 20) + 257, '\0');
+    for (std::size_t index = 0; index < payload.size(); ++index)
+        payload[index] = static_cast<char>(index * 13 % 251);
+    write_mfq(path, 2, "unit-test", {}, {{"weight", "BLOB", payload}});
+    mfq::metal::MfqContainer model(path);
+    model.install_legacy_aliases({{"alias", "weight"}});
+    std::vector<std::byte> bytes(payload.size() + 2, std::byte{0xa5});
+    std::vector<std::span<std::byte>> spans(1);
+    std::size_t cursor = 1;
+    for (int index = 0; index < 2051; ++index) {
+        spans.push_back(std::span(bytes).subspan(cursor, 9));
+        spans.push_back({});
+        cursor += 9;
+    }
+    spans.push_back(std::span(bytes).subspan(cursor, bytes.size() - cursor - 1));
+    spans.push_back({});
+    model.readv_range("alias", 0, spans);
+    require(bytes.front() == std::byte{0xa5} && bytes.back() == std::byte{0xa5},
+        "scatter read crossed its destination boundaries");
+    require(std::memcmp(bytes.data() + 1, payload.data(), payload.size()) == 0,
+        "scatter read changed bytes across vector or 32-MiB boundaries");
+    model.readv_range("weight", payload.size(), {});
+    const std::array<std::span<std::byte>, 2> empty{};
+    model.readv_range("weight", payload.size(), empty);
+    const std::array<std::span<std::byte>, 2> invalid{
+        std::span(bytes).first(1), std::span(bytes).first(1)};
+    bytes[0] = std::byte{0xa5};
+    require_rejected([&] { model.readv_range("weight", payload.size() - 1, invalid); },
+        "scatter read accepted an oversized combined range");
+    require(bytes.front() == std::byte{0xa5}, "scatter range validation wrote before rejecting");
+    require_rejected([&] { model.readv_range("weight", std::numeric_limits<std::uint64_t>::max(), {}); },
+        "scatter read accepted an invalid empty offset");
+    const auto copy = model;
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    for (int worker = 0; worker < 8; ++worker) threads.emplace_back([&, worker] {
+        try {
+            std::array<std::byte, 31> output;
+            const std::array<std::span<std::byte>, 4> parts{
+                std::span(output).first(7), {}, std::span(output).subspan(7, 11), std::span(output).subspan(18)};
+            for (int repeat = 0; repeat < 16; ++repeat) {
+                const auto offset = worker * 47 + repeat * 31;
+                (worker % 2 ? copy : model).readv_range("weight", offset, parts);
+                if (std::memcmp(output.data(), payload.data() + offset, output.size())) failed = true;
+            }
+        } catch (...) { failed = true; }
+    });
+    for (auto& thread : threads) thread.join();
+    require(!failed, "concurrent scatter reads crossed file offsets");
+    std::filesystem::resize_file(path, model.record("weight").offset + 64);
+    for (int attempt = 0; attempt < 2; ++attempt)
+        require_rejected([&] { model.readv_range("weight", 0, spans); },
+            "scatter read accepted a short source read");
 }
 
 void test_load_progress(const std::filesystem::path& root) {
@@ -548,6 +606,17 @@ void test_hf_virtual_full_precision_container(
     require(
         dense_cross == std::vector<std::uint8_t>({0, 0, 1, 2}),
         "HF virtual prefix/payload range mismatch");
+    std::array<std::byte, 7> dense_scatter;
+    const std::array<std::span<std::byte>, 4> dense_parts{
+        std::span(dense_scatter).first(1), {}, std::span(dense_scatter).subspan(1, 3),
+        std::span(dense_scatter).subspan(4)};
+    model.readv_range("model.embed_tokens.weight", 18, dense_parts);
+    require(std::memcmp(dense_scatter.data(), dense.data() + 18, dense_scatter.size()) == 0,
+        "HF scatter fallback changed virtual prefix/payload bytes");
+    const auto asset = model.read("__mfq_asset__/model_config.json");
+    model.readv_range("__mfq_asset__/model_config.json", 1, dense_parts);
+    require(std::memcmp(dense_scatter.data(), asset.data() + 1, dense_scatter.size()) == 0,
+        "HF scatter fallback changed asset bytes");
     const auto dense_mapped = model.map_record("model.embed_tokens.weight");
     require(
         std::vector<std::uint8_t>(
@@ -1021,6 +1090,7 @@ int main() {
     try {
         const TemporaryDirectory root;
         test_basic_container(root.path());
+        test_scatter_ranges(root.path());
         test_concurrent_file_cache_ownership(root.path());
         test_load_progress(root.path());
         test_malformed_tables(root.path());

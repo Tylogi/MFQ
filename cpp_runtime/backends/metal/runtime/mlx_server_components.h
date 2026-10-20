@@ -34,6 +34,10 @@ struct MlxEngineComponents {
     bool mtp_available = false;
 };
 
+std::vector<MlxDeepseekV41ImageInput> prepare_deepseek_v41_images(
+    const std::vector<std::int64_t>& prompt, const MfqMultimodalInput& media,
+    const DeepseekV41Config& config);
+
 MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,

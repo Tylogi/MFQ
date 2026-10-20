@@ -29,6 +29,7 @@ constexpr std::uint8_t kRecurrentUnavailableLayer = 3;
 constexpr std::uint32_t kMiniRuntime = 1;
 constexpr std::uint32_t kQwen35Runtime = 2;
 constexpr std::uint32_t kQwen4Runtime = 3;
+constexpr std::uint32_t kDeepseekV41Runtime = 4;
 constexpr std::uint8_t kQsaLayer = 4;
 constexpr std::uint8_t kGdnLayer = 5;
 constexpr std::uint8_t kGdnUnavailableLayer = 6;
@@ -780,6 +781,94 @@ MlxQwen35LinearAttentionCacheSnapshot rebuild_recurrent(
     };
 }
 
+struct V41LayerBlock {
+    int ratio = 0, capacity = 0, kv_width = 0, index_width = 0;
+    Dtype dtype = mlx::core::uint8;
+    std::optional<SerializedTensor> kv, index, local, partial, score;
+};
+
+struct V41Block {
+    std::uint32_t start = 0, count = 0;
+    bool exact = false;
+    std::vector<V41LayerBlock> layers;
+    std::vector<std::int64_t> context;
+    std::vector<SerializedTensor> rings;
+};
+
+std::optional<SerializedTensor> read_optional_tensor(Reader& reader) {
+    const auto present = reader.scalar<std::uint8_t>("tensor presence");
+    if (present > 1) throw std::runtime_error("invalid cache tensor presence");
+    return present ? std::optional<SerializedTensor>(reader.tensor()) : std::nullopt;
+}
+
+V41Block read_v41_block(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null DeepSeek-V4.1 cache payload");
+    Reader reader(*payload);
+    std::array<std::uint8_t, 8> magic{};
+    reader.raw(magic.data(), magic.size(), "magic");
+    if (magic != kMagic || reader.scalar<std::uint32_t>("version") != kVersion ||
+        reader.scalar<std::uint32_t>("runtime") != kDeepseekV41Runtime)
+        throw std::runtime_error("incompatible DeepSeek-V4.1 cache payload");
+    V41Block block;
+    block.start = reader.scalar<std::uint32_t>("start");
+    block.count = reader.scalar<std::uint32_t>("count");
+    const auto layers = reader.scalar<std::uint32_t>("layers");
+    const auto exact = reader.scalar<std::uint8_t>("exact boundary");
+    const auto boundary = std::uint64_t(block.start) + block.count;
+    if (!block.count || !layers || layers > 4096 || exact > 1 ||
+        boundary > std::uint64_t(std::numeric_limits<int>::max()))
+        throw std::runtime_error("invalid DeepSeek-V4.1 cache boundary");
+    block.exact = exact != 0;
+    for (std::uint32_t i = 0; i < layers; ++i) {
+        V41LayerBlock layer;
+        layer.ratio = reader.scalar<std::int32_t>("compression ratio");
+        layer.capacity = reader.scalar<std::int32_t>("compression capacity");
+        layer.kv_width = reader.scalar<std::int32_t>("KV width");
+        layer.index_width = reader.scalar<std::int32_t>("Indexer width");
+        const auto dtype = reader.scalar<std::uint8_t>("CSA2 dtype");
+        if (dtype == static_cast<std::uint8_t>(mlx::core::uint8.val())) layer.dtype = mlx::core::uint8;
+        else if (dtype == static_cast<std::uint8_t>(mlx::core::float16.val())) layer.dtype = mlx::core::float16;
+        else if (dtype == static_cast<std::uint8_t>(mlx::core::bfloat16.val())) layer.dtype = mlx::core::bfloat16;
+        else if (dtype == static_cast<std::uint8_t>(mlx::core::float32.val())) layer.dtype = mlx::core::float32;
+        else throw std::runtime_error("invalid CSA2 checkpoint dtype");
+        if (layer.ratio < 0 || layer.capacity < 0 || layer.kv_width < 0 || layer.index_width < 0 ||
+            (layer.ratio == 0 ? (layer.capacity || layer.kv_width || layer.index_width)
+                : (!layer.capacity || !layer.kv_width || !layer.index_width || boundary / layer.ratio > std::uint64_t(layer.capacity))))
+            throw std::runtime_error("invalid CSA2 checkpoint geometry");
+        layer.kv = read_optional_tensor(reader);
+        layer.index = read_optional_tensor(reader);
+        layer.local = read_optional_tensor(reader);
+        layer.partial = read_optional_tensor(reader);
+        layer.score = read_optional_tensor(reader);
+        const int rows = layer.ratio ? int(boundary / layer.ratio - block.start / layer.ratio) : 0;
+        const auto range_valid = [&](const auto& tensor, int width) {
+            return tensor.has_value() == (rows > 0) && (!tensor ||
+                (tensor->shape == Shape{1, rows, width} && tensor->dtype == layer.dtype));
+        };
+        if (!range_valid(layer.kv, layer.kv_width) || !range_valid(layer.index, layer.index_width) ||
+            layer.local.has_value() != block.exact || (layer.local &&
+                (layer.local->shape.size() != 3 || layer.local->shape[0] != 1)) ||
+            layer.partial.has_value() != (block.exact && layer.ratio > 1) ||
+            layer.score.has_value() != layer.partial.has_value() || (layer.partial &&
+                (layer.partial->shape.size() != 3 || layer.partial->shape[0] != 1 ||
+                 layer.partial->shape[1] != layer.ratio || layer.partial->shape != layer.score->shape ||
+                 layer.partial->dtype != mlx::core::float32 || layer.score->dtype != mlx::core::float32)))
+            throw std::runtime_error("invalid CSA2 checkpoint tensors");
+        block.layers.push_back(std::move(layer));
+    }
+    const auto context = reader.scalar<std::uint32_t>("Engram context size");
+    if (context > 65536 || (!block.exact && context))
+        throw std::runtime_error("invalid Engram checkpoint history");
+    for (std::uint32_t i = 0; i < context; ++i)
+        block.context.push_back(reader.scalar<std::int64_t>("Engram history"));
+    const auto stages = reader.scalar<std::uint32_t>("DSpark stages");
+    if (stages > 4096 || (!block.exact && stages))
+        throw std::runtime_error("invalid DSpark checkpoint stage count");
+    for (std::uint32_t i = 0; i < stages; ++i) block.rings.push_back(reader.tensor());
+    reader.expect_end();
+    return block;
+}
+
 template <typename State, typename LayerWriter>
 std::vector<MlxPagedPayload> encode_state(
     const State& state,
@@ -843,6 +932,150 @@ std::vector<MlxPagedPayload> encode_state(
 }
 
 } // namespace
+
+MlxPagedPayload MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::encode_block(
+    const MlxDeepseekV41TextSessionState& state, std::size_t block_size, std::size_t index) {
+    if (!block_size || state.cache_batch != 1 || state.cache_position <= 0 ||
+        state.tokens.size() != std::size_t(state.cache_position) || state.layers.empty() ||
+        index > (state.tokens.size() - 1) / block_size ||
+        state.engram_hash.batch != 1 || state.engram_hash.position != state.cache_position)
+        throw std::runtime_error("invalid DeepSeek-V4.1 session for paging");
+    const auto start = index * block_size;
+    const auto count = std::min(block_size, state.tokens.size() - start);
+    const auto end = start + count;
+    const bool exact = end == state.tokens.size();
+    Writer writer;
+    write_header(writer, kDeepseekV41Runtime, start, count, state.layers.size());
+    writer.scalar<std::uint8_t>(exact);
+    for (const auto& entry : state.layers) {
+        const auto& layer = entry.attention;
+        const int ratio = layer.compressed_kv ? (layer.partial_kv ? layer.partial_kv->shape(1) : 1) : 0;
+        if (layer.position != state.cache_position || layer.speculation ||
+            layer.compressed_kv.has_value() != layer.index_k.has_value() ||
+            layer.partial_kv.has_value() != layer.partial_score.has_value() ||
+            layer.compressed_length != (ratio ? state.cache_position / ratio : 0) ||
+            layer.partial_length != (ratio ? state.cache_position % ratio : 0))
+            throw std::runtime_error("inconsistent DeepSeek-V4.1 checkpoint state");
+        const int capacity = ratio ? layer.compressed_kv->shape(1) : 0;
+        const int kv_width = ratio ? layer.compressed_kv->shape(2) : 0;
+        const int index_width = ratio ? layer.index_k->shape(2) : 0;
+        const auto dtype = ratio ? layer.compressed_kv->dtype() : mlx::core::uint8;
+        if (ratio && (layer.compressed_kv->shape() != Shape{1, capacity, kv_width} ||
+            layer.index_k->shape() != Shape{1, capacity, index_width} || layer.index_k->dtype() != dtype))
+            throw std::runtime_error("invalid DeepSeek-V4.1 compressed cache shape");
+        for (int value : {ratio, capacity, kv_width, index_width}) writer.scalar<std::int32_t>(value);
+        writer.scalar<std::uint8_t>(static_cast<std::uint8_t>(dtype.val()));
+        const auto range = [&](const std::optional<array>& value) -> std::optional<array> {
+            if (!ratio || start / ratio == end / ratio) return std::nullopt;
+            return mlx::core::slice(*value, Shape{0, int(start / ratio), 0},
+                Shape{1, int(end / ratio), value->shape(2)});
+        };
+        write_optional_tensor(writer, range(layer.compressed_kv));
+        write_optional_tensor(writer, range(layer.index_k));
+        write_optional_tensor(writer, exact ? std::optional<array>(layer.local_kv) : std::nullopt);
+        write_optional_tensor(writer, exact ? layer.partial_kv : std::nullopt);
+        write_optional_tensor(writer, exact ? layer.partial_score : std::nullopt);
+    }
+    writer.scalar<std::uint32_t>(exact ? state.engram_hash.context.size() : 0);
+    if (exact) for (auto token : state.engram_hash.context) writer.scalar<std::int64_t>(token);
+    if (exact && state.dspark && state.dspark->position() != state.cache_position)
+        throw std::runtime_error("DSpark checkpoint position mismatch");
+    writer.scalar<std::uint32_t>(exact && state.dspark ? state.dspark->stages() : 0);
+    if (exact && state.dspark) for (std::size_t stage = 0; stage < state.dspark->stages(); ++stage)
+        writer.tensor(state.dspark->ring(stage));
+    return std::move(writer).finish();
+}
+
+MlxDeepseekV41TextSessionState MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::decode(
+    const std::vector<MlxPagedPayload>& payloads, const std::vector<std::int64_t>& tokens,
+    std::size_t block_size) {
+    if (!block_size || tokens.empty() || tokens.size() > std::size_t(std::numeric_limits<int>::max()) ||
+        payloads.size() != (tokens.size() + block_size - 1) / block_size)
+        throw std::runtime_error("invalid DeepSeek-V4.1 cache chain length");
+    std::vector<V41Block> blocks;
+    for (std::size_t i = 0; i < payloads.size(); ++i) {
+        auto block = read_v41_block(payloads[i]);
+        if (block.start != i * block_size || block.count != std::min(block_size, tokens.size() - i * block_size) ||
+            (!blocks.empty() && block.layers.size() != blocks.front().layers.size()))
+            throw std::runtime_error("incompatible DeepSeek-V4.1 cache chain");
+        blocks.push_back(std::move(block));
+    }
+    const auto& final = blocks.back();
+    if (!final.exact) throw std::runtime_error("DeepSeek-V4.1 cache has no exact checkpoint");
+    MlxDeepseekV41TextSessionState state;
+    state.tokens = tokens;
+    state.cache_batch = 1;
+    state.cache_position = static_cast<int>(tokens.size());
+    state.engram_hash = {1, state.cache_position, final.context};
+    state.bytes = final.context.size() * sizeof(std::int64_t);
+    for (std::size_t index = 0; index < final.layers.size(); ++index) {
+        const auto& layout = final.layers[index];
+        for (const auto& block : blocks) {
+            const auto& part = block.layers[index];
+            if (part.ratio != layout.ratio || part.capacity != layout.capacity || part.kv_width != layout.kv_width ||
+                part.index_width != layout.index_width || part.dtype != layout.dtype)
+                throw std::runtime_error("inconsistent CSA2 cache chain layout");
+        }
+        MlxDeepseekV41AttentionState layer;
+        layer.position = state.cache_position;
+        layer.compressed_length = layout.ratio ? state.cache_position / layout.ratio : 0;
+        layer.partial_length = layout.ratio ? state.cache_position % layout.ratio : 0;
+        layer.local_kv = copy_tensor(*layout.local);
+        if (layout.partial) layer.partial_kv = copy_tensor(*layout.partial);
+        if (layout.score) layer.partial_score = copy_tensor(*layout.score);
+        const auto rebuild = [&](bool kv) {
+            const int width = kv ? layout.kv_width : layout.index_width;
+            const auto lane = std::size_t(width) * layout.dtype.size();
+            if (std::size_t(layout.capacity) > std::numeric_limits<std::size_t>::max() / lane)
+                throw std::runtime_error("CSA2 checkpoint allocation overflow");
+            const auto bytes = lane * layout.capacity;
+            MlxResidentBudgetScope::reserve(bytes);
+            auto value = array(mlx::core::allocator::malloc(bytes), Shape{1, layout.capacity, width}, layout.dtype);
+            auto* destination = value.data<std::uint8_t>();
+            std::memset(destination, 0, bytes);
+            for (const auto& block : blocks) {
+                const auto& part = block.layers[index];
+                const auto& source = kv ? part.kv : part.index;
+                if (source) std::memcpy(destination + (block.start / layout.ratio) * lane, source->data, source->bytes);
+            }
+            return value;
+        };
+        if (layout.ratio) {
+            layer.compressed_kv = rebuild(true);
+            layer.index_k = rebuild(false);
+        }
+        state.bytes += layer.nbytes();
+        state.layers.push_back({std::move(layer)});
+    }
+    if (!final.rings.empty()) {
+        std::vector<array> rings;
+        for (const auto& ring : final.rings) rings.push_back(copy_tensor(ring));
+        state.dspark = MlxDeepseekV41DSparkState::from_snapshot(std::move(rings), state.cache_position);
+        state.bytes += state.dspark->nbytes();
+    }
+    return state;
+}
+
+bool MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::has_exact_boundary(const MlxPagedPayload& payload) {
+    return read_v41_block(payload).exact;
+}
+
+bool MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::has_mtp(const MlxPagedPayload& payload) {
+    const auto block = read_v41_block(payload);
+    return block.exact && !block.rings.empty();
+}
+
+std::size_t MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::token_count(const MlxPagedPayload& payload) {
+    const auto block = read_v41_block(payload);
+    return std::size_t(block.start) + block.count;
+}
+
+std::size_t MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>::decodable_blocks(
+    const std::vector<MlxPagedPayload>& payloads) {
+    for (std::size_t count = payloads.size(); count > 0; --count)
+        if (has_exact_boundary(payloads[count - 1])) return count;
+    return 0;
+}
 
 std::vector<MlxPagedPayload>
 MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode(

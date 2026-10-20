@@ -10,6 +10,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -74,9 +75,9 @@ void write_fixture(const std::filesystem::path& path,
     require(static_cast<bool>(stream), "cannot write MXFP8 row fixture");
 }
 
-std::string nint_payload(bool adaptive) {
-    constexpr int rows = 4, width = 32, group = 16, groups = 2;
-    const std::array<int, rows> qs{1, 2, 4, 8}, ks{1, 2, 3, 4};
+std::string nint_payload(bool adaptive, int rows = 4) {
+    constexpr int width = 32, group = 16, groups = 2;
+    const std::array<int, 4> qs{1, 2, 4, 8}, ks{1, 2, 3, 4};
     std::string result;
     result.push_back(static_cast<char>(4 | (adaptive ? 128 : 0)));
     result.push_back(static_cast<char>(adaptive ? 2 : 4));
@@ -103,25 +104,33 @@ std::string nint_payload(bool adaptive) {
         }
         result += bytes;
     };
-    if (adaptive) pack({0, 1, 2, 3}, 2);
+    if (adaptive) {
+        std::vector<unsigned> selectors;
+        for (int row = 0; row < rows; ++row) selectors.push_back(row % 4);
+        pack(selectors, 2);
+    }
     for (int bits = 1; bits <= 8; ++bits) {
         if (!adaptive && bits != 4) continue;
         for (int field = 0; field < 2; ++field) {
             std::vector<unsigned> values;
             for (int row = 0; row < rows; ++row) {
-                if (adaptive && ks[row] != bits) continue;
+                if (adaptive && ks[row % 4] != bits) continue;
                 for (int g = 0; g < groups; ++g)
                     values.push_back(field ? g : ((g + 1) & ((1u << bits) - 1)));
             }
             pack(values, bits);
         }
     }
-    if (adaptive) pack({0, 1, 3, 7}, 3);
+    if (adaptive) {
+        std::vector<unsigned> selectors;
+        for (int row = 0; row < rows; ++row) selectors.push_back(qs[row % 4] - 1);
+        pack(selectors, 3);
+    }
     for (int bits = 1; bits <= 8; ++bits) {
         if (!adaptive && bits != 4) continue;
         std::vector<unsigned> values;
         for (int row = 0; row < rows; ++row) {
-            if (adaptive && qs[row] != bits) continue;
+            if (adaptive && qs[row % 4] != bits) continue;
             for (int column = 0; column < width; ++column)
                 values.push_back((row + column) & ((1u << bits) - 1));
         }
@@ -148,7 +157,8 @@ void test_nint_rows(const std::filesystem::path& path, bool adaptive) {
                 "streamed NINT row differs from resident decoder");
     const auto stats = store.stats();
     require(stats.row_requests == 5 && stats.rows_loaded == 4 && stats.cache_hits == 1
-        && stats.read_calls == 20 && stats.resident_rows == 2
+        && stats.read_calls == 1 && stats.bytes_read <= payload.size()
+        && stats.bytes_read != 0 && stats.resident_rows == 2
         && stats.resident_payload_bytes <= stats.cache_limit_bytes,
         "NINT row-store accounting mismatch");
     const std::array<std::int64_t, 1> first{3}, second{0};
@@ -168,12 +178,81 @@ void test_nint_rows(const std::filesystem::path& path, bool adaptive) {
     try { mfq::metal::MlxQuantizedRowStore wrong(model, "table.weight", 5, 32, 2, 2); }
     catch (const std::runtime_error&) { rejected = true; }
     require(rejected, "NINT row store accepted mismatched table geometry");
+
+    for (const auto workers : {std::size_t{0}, std::numeric_limits<std::size_t>::max()}) {
+        rejected = false;
+        try { mfq::metal::MlxQuantizedRowStore wrong(model, "table.weight", 4, 32, 2, workers); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "NINT row store accepted an invalid worker count");
+    }
+
+    auto invalid_payload = payload;
+    invalid_payload[48] = 0;
+    invalid_payload[49] = static_cast<char>(0x7e);
+    write_fixture(path, "NINT", invalid_payload);
+    mfq::metal::MfqContainer invalid_model(path);
+    mfq::metal::MlxQuantizedRowStore invalid_store(invalid_model, "table.weight", 4, 32, 2, 2);
+    const std::array<std::int64_t, 2> invalid_batch{0, 3};
+    rejected = false;
+    try { (void)invalid_store.prepare_rows(invalid_batch); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected && invalid_store.cached_rows() == 0,
+        "NINT row store published a partially validated batch");
+    require(values(invalid_store.gather(second)) == std::vector<float>(reference.begin(), reference.begin() + 32),
+        "NINT row store did not recover after an invalid anchor");
+
+    write_fixture(path, "NINT", payload);
+    mfq::metal::MfqContainer truncated_model(path);
+    mfq::metal::MlxQuantizedRowStore truncated_store(truncated_model, "table.weight", 4, 32, 2, 2);
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    rejected = false;
+    try { (void)truncated_store.prepare_rows(invalid_batch); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected && truncated_store.cached_rows() == 0,
+        "NINT row store published a short-read batch");
+    write_fixture(path, "NINT", payload);
+    require(values(truncated_store.gather(second)) == std::vector<float>(reference.begin(), reference.begin() + 32),
+        "NINT row store did not recover after a short read");
 }
 
 std::vector<float> values(mlx::core::array value) {
     value = mlx::core::astype(value, mlx::core::float32);
     value.eval();
     return {value.data<float>(), value.data<float>() + value.size()};
+}
+
+void test_multi_page_nint_rows(const std::filesystem::path& path, int rows, std::size_t workers) {
+    constexpr int width = 32;
+    const auto payload = nint_payload(true, rows);
+    write_fixture(path, "NINT", payload);
+    mfq::metal::MfqContainer model(path);
+    const auto blob = std::span(reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());
+    const auto reference = values(mfq::metal::MlxNintWeight::from_blob(blob)
+        .dequantize(mlx::core::float16));
+    mfq::metal::MlxQuantizedRowStore store(model, "table.weight", rows, width, 8, workers);
+    std::vector<std::int64_t> request;
+    for (int index = 0; index < rows / 2; ++index) {
+        request.push_back((index * 2053) % rows);
+        if (index % 7 == 0) request.push_back(request.back());
+    }
+    const auto check = [&](const auto& selected, auto prepared) {
+        const auto actual = values(prepared.decode());
+        for (std::size_t row = 0; row < selected.size(); ++row)
+            for (int column = 0; column < width; ++column)
+                require(actual[row * width + column] == reference[selected[row] * width + column],
+                    "multi-page NINT read changed row order or precision");
+    };
+    check(request, store.prepare_rows(request));
+    const auto stats = store.stats();
+    require(stats.rows_loaded == rows / 2 && stats.read_calls > 1
+        && stats.read_calls < stats.rows_loaded && stats.bytes_read <= payload.size()
+        && stats.resident_payload_bytes <= stats.cache_limit_bytes,
+        "multi-page NINT reads were not bounded and coalesced");
+    std::vector<std::int64_t> reversed(request.rbegin(), request.rend());
+    auto a = std::async(std::launch::async, [&] { return store.prepare_rows(request); });
+    auto b = std::async(std::launch::async, [&] { return store.prepare_rows(reversed); });
+    check(request, a.get());
+    check(reversed, b.get());
 }
 
 void require_row(
@@ -244,6 +323,8 @@ int main() {
         mlx::core::set_default_stream(runtime_stream);
         test_nint_rows(root / "nint.mfq", false);
         test_nint_rows(root / "adaptive-nint.mfq", true);
+        test_multi_page_nint_rows(root / "multi-page-nint.mfq", 4096, 4);
+        test_multi_page_nint_rows(root / "multi-page-nint32.mfq", 32768, 32);
         mlx::core::synchronize();
         mlx::core::set_default_stream(previous_stream);
 

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <barrier>
 #include <chrono>
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -6553,6 +6555,244 @@ void test_concatenate_resident_mfe_experts() {
     }
 }
 
+void test_streamed_mfe_read_validation() {
+    constexpr int experts = 4, rows = 16, input = 96;
+    for (bool nvq : {false, true}) for (bool prefill : {false, true}) {
+        const auto mx = make_mxfp4(experts * rows, input);
+        const auto vq = make_jsc_nvq(experts * rows, input);
+        auto payload = nvq ? vq.blob : mx.blob;
+        if (nvq) {
+            const std::uint16_t nan = 0x7e00;
+            std::memcpy(payload.data() + 40 + 64 + 2 * 256 * 8 + rows * 2, &nan, 2);
+        } else payload[56 + experts * rows * input / 2 + rows * input / 32] = 255;
+        const auto wrap = [&](const std::vector<std::uint8_t>& bytes) {
+            return make_raw_nim2(experts, rows, input, {
+                {{0, 1, 2, 3}, nvq ? vq.dtype : "MXFP4", {bytes, {}, experts * rows, input}, {}}});
+        };
+        const auto good = wrap(nvq ? vq.blob : mx.blob);
+        const TemporaryMfq file({{"bad", "MFE", wrap(payload)}, {"good", "MFE", good}});
+        const mfq::metal::MfqContainer model(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(model, 1u << 24);
+        require(cache.can_stream("bad"), "invalid-value fixture did not reach streaming parser");
+        bool rejected = false;
+        try { (void)cache.grouped_mfe("bad", {1, 2}, {}, prefill); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected, "streamed SSD path bypassed metadata validation");
+        require(cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+            "failed streamed SSD read published a partial expert");
+        auto recovered = cache.grouped_mfe("good", {0, 1, 2, 3}, {}, prefill);
+        const auto full = mfq::metal::MlxMfeWeight::from_blob(good);
+        auto x = mlx::core::full({2, input}, 0.125f, mlx::core::float16);
+        auto ids = mlx::core::array({0, 1, 2, 3}, mlx::core::Shape{2, 2});
+        require(evaluated_floats(recovered.routed_matmul(x, ids)) ==
+            evaluated_floats(full.routed_matmul(x, ids)), "failed SSD read corrupted subsequent preparation");
+    }
+    const auto mx = make_mxfp4(experts * rows, input);
+    const auto blob = make_raw_nim2(experts, rows, input,
+        {{{0, 1, 2, 3}, "MXFP4", {mx.blob, mx.dense, experts * rows, input}, {}}});
+    const TemporaryMfq file({{"short", "MFE", blob}});
+    const mfq::metal::MfqContainer model(file.path());
+    mfq::metal::MlxMfeOffloadCache cache(model, 1u << 24);
+    require(cache.can_stream("short"), "short-read fixture failed preparation");
+    std::filesystem::resize_file(file.path(), model.record("short").offset + blob.size() / 2);
+    bool rejected = false;
+    try { (void)cache.grouped_mfe("short", {1, 2}); }
+    catch (const std::exception&) { rejected = true; }
+    require(rejected && cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+        "short SSD read was silently accepted or retained a partial expert");
+}
+
+void test_streamed_mfe_overlapped_read() {
+    constexpr int experts = 4, rows = 16, input = 96;
+    const auto mx = make_mxfp4(experts * rows, input);
+    const auto vq = make_nvq1_s(experts * rows, input);
+    const auto gate = make_raw_nim2(experts, rows, input,
+        {{{0, 1, 2, 3}, "MXFP4", {mx.blob, mx.dense, experts * rows, input}, {}}});
+    const auto up = make_raw_nim2(experts, rows, input,
+        {{{0, 1, 2, 3}, vq.dtype, {vq.blob, vq.dense, experts * rows, input}, vq.runtime}});
+    const std::array<std::string, 3> names{"z_gate", "a_up", "m_down"};
+    const TemporaryMfq file({{names[0], "MFE", gate}, {names[1], "MFE", up}, {names[2], "MFE", gate}});
+    const mfq::metal::MfqContainer model(file.path());
+    mfq::metal::MlxMfeOffloadCache cache(model, 0);
+    const std::vector<std::int32_t> active{3, 1};
+    std::vector<mfq::metal::MlxMfeWeight> prefix;
+    const auto initial_temporary = mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+    mfq::metal::MlxResidentBudgetScope budget([](std::size_t) {});
+    const auto loaded = cache.grouped_mfe(names, active, {}, false,
+        [&](const auto& value) { prefix = value; });
+    require(prefix.size() == 2 && loaded.size() == 3, "overlapped SSD prefix has the wrong size");
+    require(mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+        "overlapped SSD read leaked its caller's memory reservation");
+    const bool parallel = std::thread::hardware_concurrency() >= 6;
+    require(cache.reuse_stats().overlapped_read_batches == static_cast<std::size_t>(parallel),
+        "overlapped SSD read did not report its dispatch");
+    require(cache.reuse_stats().parallel_body_read_batches ==
+        (mfq::metal::mlx_reference_enabled() ? 0 : active.size() * names.size()),
+        "overlapped SSD reads did not include both MXFP4 values and scales");
+    auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+    auto local = mlx::core::array({0, 1}, mlx::core::Shape{1, 2});
+    auto global = mlx::core::array(active.begin(), mlx::core::Shape{1, 2});
+    for (int index = 0; index < 3; ++index) {
+        const auto reference = mfq::metal::MlxMfeWeight::from_blob(index == 1 ? up : gate);
+        require(evaluated_floats(loaded[index].routed_matmul(x, local)) ==
+            evaluated_floats(reference.routed_matmul(x, global)), "overlapped SSD read changed projection order or values");
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool rejected = false;
+        try {
+            (void)cache.grouped_mfe(names, active, {}, false,
+                [](const auto&) { throw std::runtime_error("prefix failure"); });
+        } catch (const std::runtime_error& error) { rejected = std::string(error.what()) == "prefix failure"; }
+        require(rejected && mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+            "overlapped SSD read swallowed a callback failure or leaked its reservation");
+        require(cache.grouped_mfe(names, active).size() == 3, "overlapped SSD callback failure left an in-flight load");
+    }
+    std::atomic<int> callbacks{0};
+    const auto concurrent = [&] {
+        return cache.grouped_mfe(names, active, {}, false, [&](const auto&) { ++callbacks; });
+    };
+    auto first = std::async(std::launch::async, concurrent);
+    auto second = std::async(std::launch::async, concurrent);
+    require(first.get().size() == 3 && second.get().size() == 3 && callbacks == 2,
+        "concurrent overlapped SSD reads did not complete");
+
+    for (bool truncate : {false, true}) {
+        auto invalid = mx.blob;
+        if (!truncate) invalid[56 + experts * rows * input / 2 + rows * input / 32] = 255;
+        const auto bad = make_raw_nim2(experts, rows, input,
+            {{{0, 1, 2, 3}, "MXFP4", {invalid, {}, experts * rows, input}, {}}});
+        const TemporaryMfq broken({{names[0], "MFE", gate}, {names[1], "MFE", up},
+            {names[2], "MFE", gate}, {"bad_down", "MFE", bad}});
+        const mfq::metal::MfqContainer source(broken.path());
+        mfq::metal::MlxMfeOffloadCache failed(source, 0);
+        const std::array<std::string, 3> bad_names{names[0], names[1], "bad_down"};
+        for (const auto& name : bad_names) require(failed.can_stream(name), "broken overlap fixture failed layout preparation");
+        if (truncate) std::filesystem::resize_file(broken.path(), source.record("bad_down").offset + bad.size() / 2);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            bool rejected = false;
+            try { (void)failed.grouped_mfe(bad_names, active, {}, false, [](const auto&) {}); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected && mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+                "overlapped SSD read accepted corrupt data or retained an in-flight reservation");
+            require(failed.grouped_mfe(names, active).size() == 3,
+                "overlapped SSD read did not recover after a reader failure");
+        }
+    }
+}
+
+void test_streamed_mfe_parallel_body_reads() {
+    constexpr int experts = 4, rows = 16, input = 96;
+    const auto vq = make_nvq1_s(experts * rows, input);
+    const auto blob = make_raw_nim2(experts, rows, input,
+        {{{0, 1, 2, 3}, vq.dtype, {vq.blob, vq.dense, experts * rows, input}, vq.runtime}});
+    const TemporaryMfq file({{"weight", "MFE", blob}});
+    const mfq::metal::MfqContainer model(file.path());
+    const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
+    const auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+    for (bool prefill : {false, true}) for (int count : {1, 2, 3}) {
+        const std::vector<std::int32_t> order{3, 1, 0};
+        const std::vector<std::int32_t> active(order.begin(), order.begin() + count);
+        mfq::metal::MlxMfeOffloadCache cache(model, 0);
+        const auto weight = cache.grouped_mfe("weight", active, {}, prefill);
+        const auto expected_batches = !mfq::metal::mlx_reference_enabled()
+            && count <= 2 && (!prefill || count == 1) ? count : 0;
+        require(cache.reuse_stats().parallel_body_read_batches == static_cast<std::size_t>(expected_batches),
+            "parallel body readers did not respect the cold expert queue bound");
+        std::vector<std::int32_t> local(count);
+        std::iota(local.begin(), local.end(), 0);
+        require(evaluated_floats(weight.routed_matmul(x,
+            mlx::core::array(local.begin(), mlx::core::Shape{1, count}))) ==
+            evaluated_floats(full.routed_matmul(x,
+                mlx::core::array(active.begin(), mlx::core::Shape{1, count}))),
+            "parallel body readers changed expert order or values");
+        require(cache.cached_expert_count() == 0 && cache.resident_packed_bytes() == 0,
+            "zero-budget parallel body read retained expert pages");
+        const auto read = [&] { return cache.grouped_mfe("weight", active); };
+        auto first = std::async(std::launch::async, read);
+        auto second = std::async(std::launch::async, read);
+        (void)first.get();
+        (void)second.get();
+    }
+    const TemporaryMfq broken({{"good", "MFE", blob}, {"short", "MFE", blob}});
+    const mfq::metal::MfqContainer source(broken.path());
+    mfq::metal::MlxMfeOffloadCache failed(source, 0);
+    require(failed.can_stream("short"), "parallel short-read fixture failed layout preparation");
+    std::filesystem::resize_file(broken.path(), source.record("short").offset + blob.size() - 1);
+    const auto initial_temporary = mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+    mfq::metal::MlxResidentBudgetScope budget([](std::size_t) {});
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        bool rejected = false;
+        try { (void)failed.grouped_mfe("short", {3, 1}); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && failed.cached_expert_count() == 0
+            && mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+            "parallel body read swallowed a short read or retained a reservation");
+        (void)failed.grouped_mfe("good", {3, 1});
+    }
+}
+
+void test_streamed_mfe_wide_readers() {
+    constexpr int experts = 32, cohort = experts / 2, rows = 16, input = 96;
+    const auto mx = make_mxfp4(cohort * rows, input);
+    const auto vq = make_nvq1_s(cohort * rows, input);
+    std::vector<std::int32_t> mx_ids(cohort), vq_ids(cohort), active(experts);
+    std::iota(mx_ids.begin(), mx_ids.end(), 0);
+    std::iota(vq_ids.begin(), vq_ids.end(), cohort);
+    for (int index = 0; index < experts; ++index) active[index] = index * 13 % experts;
+    const auto payload = make_raw_nim2(experts, rows, input,
+        {{mx_ids, "MXFP4", {mx.blob, mx.dense, cohort * rows, input}, {}},
+         {vq_ids, vq.dtype, {vq.blob, vq.dense, cohort * rows, input}, vq.runtime}});
+    const std::array<std::string, 3> names{"gate", "up", "down"};
+    const TemporaryMfq file({{names[0], "MFE", payload}, {names[1], "MFE", payload}, {names[2], "MFE", payload}});
+    const mfq::metal::MfqContainer model(file.path());
+    mfq::metal::MlxMfeOffloadCache cache(model, 0);
+    const auto initial_temporary = mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+    mfq::metal::MlxResidentBudgetScope budget([](std::size_t) {});
+    auto loaded = cache.grouped_mfe(names, active);
+    require(loaded.size() == 3 && cache.cached_expert_count() == 0
+        && mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+        "wide SSD read leaked its cache pages or memory reservation");
+    auto x = mlx::core::full({1, input}, 0.125f, mlx::core::float16);
+    const std::array<std::int32_t, 4> selected{0, 7, 19, 31};
+    std::array<std::int32_t, 4> global_selected;
+    for (std::size_t index = 0; index < selected.size(); ++index) global_selected[index] = active[selected[index]];
+    const auto local = mlx::core::array(selected.begin(), mlx::core::Shape{1, 4});
+    const auto global = mlx::core::array(global_selected.begin(), mlx::core::Shape{1, 4});
+    const auto reference = mfq::metal::MlxMfeWeight::from_blob(payload);
+    const auto expected = evaluated_floats(reference.routed_matmul(x, global));
+    for (const auto& weight : loaded)
+        require(evaluated_floats(weight.routed_matmul(x, local)) == expected,
+            "wide SSD read changed projection values or expert order");
+    auto first = std::async(std::launch::async, [&] { return cache.grouped_mfe(names, active); });
+    auto second = std::async(std::launch::async, [&] { return cache.grouped_mfe(names, active); });
+    require(first.get().size() == 3 && second.get().size() == 3,
+        "concurrent wide SSD readers did not release in-flight loads");
+    for (bool truncate : {false, true}) {
+        auto invalid = mx.blob;
+        if (!truncate) invalid[56 + cohort * rows * input / 2 + (cohort - 1) * rows * input / 32] = 255;
+        const auto bad = make_raw_nim2(experts, rows, input,
+            {{mx_ids, "MXFP4", {invalid, {}, cohort * rows, input}, {}},
+             {vq_ids, vq.dtype, {vq.blob, vq.dense, cohort * rows, input}, vq.runtime}});
+        const TemporaryMfq broken({{names[0], "MFE", payload}, {names[1], "MFE", payload},
+            {names[2], "MFE", payload}, {"bad_down", "MFE", bad}});
+        const mfq::metal::MfqContainer source(broken.path());
+        mfq::metal::MlxMfeOffloadCache failed(source, 0);
+        const std::array<std::string, 3> bad_names{names[0], names[1], "bad_down"};
+        for (const auto& name : bad_names) require(failed.can_stream(name), "wide SSD fixture could not prepare its layout");
+        if (truncate) std::filesystem::resize_file(broken.path(), source.record("bad_down").offset + bad.size() / 2);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            bool rejected = false;
+            try { (void)failed.grouped_mfe(bad_names, active); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected && failed.cached_expert_count() == 0
+                && mfq::metal::MlxResidentBudgetScope::temporary_bytes() == initial_temporary,
+                "wide SSD readers accepted corrupt data or leaked an in-flight reservation");
+            require(failed.grouped_mfe(names, active).size() == 3,
+                "wide SSD readers did not recover after a failed read");
+        }
+    }
+}
+
 void test_streamed_mfe_partition_preparation() {
     {
         constexpr int input = 96, output = 13;
@@ -6826,6 +7066,35 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
             require(layer.attention.position == 17, "V4.1 CED left a decoder cache at the tail length");
         const auto next = mlx::core::array({3}, mlx::core::Shape{1, 1}, mlx::core::int32);
         const auto expected = evaluated_floats(runtime.decode(next));
+        using PrefixCodec = MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>;
+        const auto persist = [&](const MlxDeepseekV41TextSessionState& state) {
+            std::vector<MlxPagedPayload> blocks;
+            for (std::size_t index = 0; index < (state.tokens.size() + 7) / 8; ++index)
+                blocks.push_back(PrefixCodec::encode_block(state, 8, index));
+            require(PrefixCodec::has_exact_boundary(blocks.back()) &&
+                    PrefixCodec::has_mtp(blocks.back()) == state.dspark.has_value() &&
+                    PrefixCodec::token_count(blocks.back()) == state.tokens.size(),
+                "V4.1 prefix codec lost its checkpoint metadata");
+            require(!PrefixCodec::has_exact_boundary(blocks.front()) &&
+                    PrefixCodec::decodable_blocks({blocks.front()}) == 0,
+                "V4.1 prefix accepted a non-exact ring/history boundary");
+            for (int damage : {0, 1, 2}) {
+                auto damaged = blocks;
+                auto bytes = std::make_shared<std::vector<std::uint8_t>>(*blocks.back());
+                if (damage == 0) bytes->pop_back();
+                else if (damage == 1) (*bytes)[0] ^= 1;
+                else bytes->push_back(0);
+                damaged.back() = std::move(bytes);
+                bool rejected = false;
+                try { (void)PrefixCodec::decode(damaged, state.tokens, 8); }
+                catch (const std::exception&) { rejected = true; }
+                require(rejected, "V4.1 prefix accepted truncated or malformed payload");
+            }
+            return PrefixCodec::decode(blocks, state.tokens, 8);
+        };
+        runtime.restore_text_session_state(persist(saved));
+        require(evaluated_floats(runtime.decode(next)) == expected,
+            "V4.1 persisted CSA2/Engram prefix changed subsequent decode");
         runtime.restore_text_session_state(saved);
         require(evaluated_floats(runtime.decode(next)) == expected,
             "V4.1 CED prefix restore changed subsequent decode");
@@ -6938,6 +7207,37 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
                 ? runtime.last_mtp_stats().accepted_tokens < runtime.last_mtp_stats().drafted_tokens
                 : runtime.last_mtp_stats().accepted_tokens > 0,
             "V4.1 DSpark fixture did not exercise its acceptance/rollback branch");
+        for (bool mtp : {false, true}) {
+            auto history = prompt;
+            std::vector<std::int64_t> output;
+            std::vector<MlxDeepseekV41TextSessionState> checkpoints;
+            MlxPrefixCacheHooks hooks{8, prompt.size(), true, [&](std::size_t position) {
+                require(position <= history.size(), "V4.1 checkpoint precedes delivered history");
+                checkpoints.push_back(runtime.capture_text_session_state(
+                    std::vector<std::int64_t>(history.begin(), history.begin() + position), true));
+            }};
+            sampling.enable_mtp = mtp;
+            require(runtime.generate(prompt, sampling, 8, [&](auto token) {
+                history.push_back(token); output.push_back(token); return true;
+            }, {}, {}, prompt.size(), 8, hooks) == 8 && output == ordinary,
+                "V4.1 block checkpointing changed ordinary/DSpark greedy output");
+            require(!checkpoints.empty() && checkpoints.back().cache_position == 24 &&
+                    checkpoints.back().dspark.has_value() == mtp,
+                "V4.1 did not cache committed generated tokens and predictor history");
+            const auto restored = persist(checkpoints.back());
+            runtime.restore_text_session_state(restored);
+            const auto before = evaluated_floats(runtime.decode(next));
+            runtime.restore_text_session_state(persist(restored));
+            const auto after = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < before.size(); ++index)
+                require_close(after[index], before[index], 0.002f + std::abs(before[index]) * 0.002f);
+            const auto history_ids = mlx::core::array(restored.tokens.begin(),
+                mlx::core::Shape{1, static_cast<int>(restored.tokens.size())}, mlx::core::int32);
+            (void)evaluated_floats(runtime.prefill(history_ids, 8));
+            const auto fresh = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < fresh.size(); ++index)
+                require_close(before[index], fresh[index], 0.002f + std::abs(fresh[index]) * 0.002f);
+        }
     }
 }
 
@@ -7036,6 +7336,74 @@ void test_deepseek_v41_streamed_moe() {
                     }
                 }
             }
+        }
+    }
+}
+
+void test_deepseek_v41_visual_router_precision() {
+    using namespace mfq::metal;
+    constexpr int experts = 8, hidden = 96, intermediate = 64;
+    const std::string prefix = "model.block.0.mlp";
+    const auto projection = [&](int output, int input, int salt) {
+        const auto nint = make_nint_v2_tensor(4 * output, input, salt, 16);
+        const auto vq = make_jsc_nvq(4 * output, input);
+        return make_raw_nim2(experts, output, input, {
+            {{0, 2, 4, 6}, "NINTv2", nint, {}},
+            {{1, 3, 5, 7}, vq.dtype, {vq.blob, vq.dense, 4 * output, input}, vq.runtime},
+        });
+    };
+    const auto bias = [&](bool visual) {
+        std::vector<std::uint8_t> result;
+        append<std::uint32_t>(result, 1);
+        append<std::int64_t>(result, experts);
+        for (int expert = 0; expert < experts; ++expert)
+            append<float>(result, expert == 0 ? (visual ? 0.0001f : 0.1f) : expert == 1 ? 0.0f : -100.0f);
+        return result;
+    };
+    const auto records = [&](bool bf16) {
+        std::vector<std::uint8_t> router;
+        append<std::uint32_t>(router, 2);
+        append<std::int64_t>(router, experts);
+        append<std::int64_t>(router, hidden);
+        for (int expert = 0; expert < experts; ++expert) for (int col = 0; col < hidden; ++col) {
+            const float value = col == 0 && expert < 2 ? 1.0f : col == 1 && expert == 1 ? 1.0f / 1024 : 0.0f;
+            if (bf16) append<std::uint16_t>(router, static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(value) >> 16));
+            else append<float>(router, value);
+        }
+        return std::vector<MappedRecordFixture>{
+            {prefix + ".router.weight", bf16 ? "BF16" : "F32", std::move(router)},
+            {prefix + ".router.bias", "F32", bias(false)},
+            {prefix + ".router.vision_bias", "F32", bias(true)},
+            {prefix + ".shared_expert.gate.weight", "F16", make_dense_tensor("F16", intermediate, hidden, 5).blob},
+            {prefix + ".shared_expert.up.weight", "F16", make_dense_tensor("F16", intermediate, hidden, 7).blob},
+            {prefix + ".shared_expert.down.weight", "F16", make_dense_tensor("F16", hidden, intermediate, 11).blob},
+            {prefix + ".experts.gate_up.weight", "MFE", projection(2 * intermediate, hidden, 17)},
+            {prefix + ".experts.down.weight", "MFE", projection(hidden, intermediate, 13)},
+        };
+    };
+    const TemporaryMfq packed_file(records(true)), reference_file(records(false));
+    const MfqContainer packed(packed_file.path()), reference(reference_file.path());
+    DeepseekV41Config config;
+    config.hidden = hidden; config.moe_inter = intermediate;
+    config.n_experts = experts; config.top_k = 1;
+    config.norm_topk_prob = true; config.routed_scaling = 1.0; config.swiglu_limit = 10.0;
+    const auto expected = MlxDeepseekV41Moe::load(reference, config, prefix);
+    for (const bool streamed : {false, true}) {
+        auto cache = streamed ? std::make_shared<MlxMfeOffloadCache>(packed, 0) : nullptr;
+        const auto actual = MlxDeepseekV41Moe::load(packed, config, prefix, false, nullptr, cache);
+        for (int rows : {1, 2, 7}) {
+            std::vector<float> values(rows * hidden, 0.0f);
+            std::vector<std::uint8_t> mask(rows);
+            for (int row = 0; row < rows; ++row) {
+                values[row * hidden] = values[row * hidden + 1] = 1.0f;
+                mask[row] = row % 2 == 0;
+            }
+            const auto x = mlx::core::astype(mlx::core::array(values.begin(), mlx::core::Shape{1, rows, hidden}), mlx::core::float16);
+            const auto images = mlx::core::astype(mlx::core::array(mask.begin(), mlx::core::Shape{1, rows}), mlx::core::bool_);
+            const auto a = evaluated_floats(actual.forward(x, images).routed);
+            const auto b = evaluated_floats(expected.forward(x, images).routed);
+            for (std::size_t index = 0; index < a.size(); ++index)
+                require_close(a[index], b[index], 0.002f + std::abs(b[index]) * 0.002f);
         }
     }
 }
@@ -9971,10 +10339,26 @@ int main(int argc, char** argv) {
             std::cout << "MFQ MXFP4 repeated-route tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-v41-vision-routing") {
+            test_deepseek_v41_visual_router_precision();
+            std::cout << "MFQ DeepSeek-V4.1 visual router precision tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-v41-prefix") {
+            test_deepseek_v41_ced_text_cache();
+            test_deepseek_v41_ced_text_cache(true);
+            std::cout << "MFQ DeepSeek-V4.1 persistent prefix tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
+            test_streamed_mfe_read_validation();
+            test_streamed_mfe_overlapped_read();
+            test_streamed_mfe_parallel_body_reads();
+            test_streamed_mfe_wide_readers();
             test_deepseek_v41_ced_text_cache();
             test_deepseek_v41_ced_text_cache(true);
             test_deepseek_v41_streamed_moe();
+            test_deepseek_v41_visual_router_precision();
             test_streamed_mfe_partition_preparation();
             test_concatenate_resident_mfe_experts();
             test_compact_nint_mhc();
@@ -10117,6 +10501,10 @@ int main(int argc, char** argv) {
         test_multiple_nint_pools_share_cpp_dispatch(513);
         test_grouped_mxfp4_vq_mmq_prefill();
         test_grouped_mxfp4_vq_mmq_prefill(129, 224);
+        test_streamed_mfe_read_validation();
+        test_streamed_mfe_overlapped_read();
+        test_streamed_mfe_parallel_body_reads();
+        test_streamed_mfe_wide_readers();
         test_streamed_mfe_partition_preparation();
         test_concatenate_resident_mfe_experts();
         test_compact_nint_mhc();
