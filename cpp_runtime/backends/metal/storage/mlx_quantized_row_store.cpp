@@ -1,30 +1,39 @@
 #include "mlx_quantized_row_store.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_nint_rows.h"
+#include "mfq/host_parallel.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstring>
-#include <deque>
-#include <exception>
-#include <functional>
-#include <future>
 #include <limits>
 #include <list>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace mfq::metal {
 namespace {
 
 constexpr std::size_t kMxHeaderBytes = 56;
+
+struct RowReadCounts {
+    std::uint64_t bytes = 0, calls = 0;
+};
+
+thread_local RowReadCounts* current_row_reads = nullptr;
+
+struct RowReadScope {
+    explicit RowReadScope(RowReadCounts& value)
+        : previous(std::exchange(current_row_reads, &value)) {}
+    ~RowReadScope() { current_row_reads = previous; }
+    RowReadCounts* previous;
+};
 
 std::uint64_t read_u64_at(
     std::span<const std::uint8_t> bytes,
@@ -72,70 +81,6 @@ float decode_e8m0(std::uint8_t raw) {
         : std::ldexp(1.0f, static_cast<int>(raw) - 127);
 }
 
-class WorkerPool {
-public:
-    explicit WorkerPool(std::size_t count) {
-        if (count == 0) {
-            throw std::invalid_argument(
-                "native MXFP8 row store requires at least one I/O worker");
-        }
-        workers_.reserve(count);
-        for (std::size_t index = 0; index < count; ++index) {
-            workers_.emplace_back([this] { run(); });
-        }
-    }
-
-    ~WorkerPool() {
-        {
-            std::scoped_lock lock(mutex_);
-            stopping_ = true;
-        }
-        condition_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-    }
-
-    std::future<void> submit(std::function<void()> function) {
-        auto task = std::make_shared<std::packaged_task<void()>>(
-            std::move(function));
-        auto result = task->get_future();
-        {
-            std::scoped_lock lock(mutex_);
-            if (stopping_) {
-                throw std::runtime_error(
-                    "native MXFP8 row-store worker pool is stopping");
-            }
-            tasks_.push_back([task] { (*task)(); });
-        }
-        condition_.notify_one();
-        return result;
-    }
-
-private:
-    void run() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock lock(mutex_);
-                condition_.wait(lock, [this] {
-                    return stopping_ || !tasks_.empty();
-                });
-                if (stopping_ && tasks_.empty()) return;
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-            }
-            task();
-        }
-    }
-
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::deque<std::function<void()>> tasks_;
-    std::vector<std::thread> workers_;
-    bool stopping_ = false;
-};
-
 } // namespace
 
 struct MlxQuantizedRowStore::Impl {
@@ -161,8 +106,12 @@ struct MlxQuantizedRowStore::Impl {
         std::size_t io_workers)
         : model(selected_model),
           record(std::move(selected_record)),
-          cache_capacity(selected_cache_rows),
-          workers(io_workers) {
+          cache_capacity(selected_cache_rows) {
+        if (io_workers == 0 || io_workers > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("quantized row store requires a valid I/O worker count");
+        }
+        worker_count = static_cast<int>(io_workers);
         const auto& entry = model.record(record);
         if (entry.dtype == "NINT") {
             nint = std::make_unique<mfq::NintRows>(
@@ -170,7 +119,9 @@ struct MlxQuantizedRowStore::Impl {
                 [this](std::size_t offset, std::uint8_t* output, std::size_t count) {
                     model.read_range_into(record, offset, std::as_writable_bytes(
                         std::span(output, count)));
-                }, true);
+                }, true, [this](const std::vector<mfq::ReadSpan>& spans) {
+                    read_batch(spans);
+                });
             if (nint->rows() != expected_rows || nint->width() != expected_width) {
                 throw std::runtime_error("NINT row-store geometry disagrees: " + record);
             }
@@ -255,13 +206,61 @@ struct MlxQuantizedRowStore::Impl {
         }
     }
 
-    void read_decode(
+    void read_batch(const std::vector<mfq::ReadSpan>& spans) const {
+        auto sorted = spans;
+        const auto source_size = model.record(record).nbytes;
+        for (const auto& span : sorted) {
+            if (span.offset > source_size || span.size > source_size - span.offset)
+                throw std::out_of_range("NINT row read exceeds its record");
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.offset < b.offset;
+        });
+        struct Group { std::size_t first, last; std::uint64_t begin, end; };
+        std::vector<Group> groups;
+        const auto page = static_cast<std::uint64_t>(getpagesize());
+        for (std::size_t first = 0; first < sorted.size();) {
+            const auto begin = sorted[first].offset;
+            auto end = begin + sorted[first].size;
+            auto last = first + 1;
+            const auto limit = std::max(page, end - begin);
+            while (last < sorted.size()) {
+                const auto next_end = sorted[last].offset + sorted[last].size;
+                if ((sorted[last].offset / page != begin / page && sorted[last].offset > end)
+                    || std::max(end, next_end) - begin > limit) break;
+                end = std::max(end, next_end);
+                ++last;
+            }
+            groups.push_back({first, last, begin, end});
+            first = last;
+        }
+        workers.run(0, groups.size(), 1, worker_count,
+            [&](std::int64_t begin, std::int64_t end) {
+                std::vector<std::uint8_t> scratch;
+                for (auto item = begin; item < end; ++item) {
+                    const auto& group = groups[item];
+                    if (group.last == group.first + 1) {
+                        const auto& span = sorted[group.first];
+                        model.read_range_into(record, span.offset, {span.destination, span.size});
+                    } else {
+                        scratch.resize(group.end - group.begin);
+                        model.read_range_into(record, group.begin,
+                            std::as_writable_bytes(std::span(scratch)));
+                        for (auto part = group.first; part < group.last; ++part)
+                            std::memcpy(sorted[part].destination,
+                                scratch.data() + sorted[part].offset - group.begin, sorted[part].size);
+                    }
+                }
+            });
+        if (current_row_reads) {
+            current_row_reads->calls += groups.size();
+            for (const auto& group : groups) current_row_reads->bytes += group.end - group.begin;
+        }
+    }
+
+    void read_mxfp8(
         std::int64_t row,
         RequestedRow& requested) const {
-        if (nint) {
-            nint->append_row(row, requested.packed);
-            return;
-        }
         auto& output = requested.values;
         std::vector<std::uint8_t> raw(source_row_bytes);
         model.read_range_into(
@@ -371,22 +370,25 @@ struct MlxQuantizedRowStore::Impl {
         }
 
         const auto io_begin = std::chrono::steady_clock::now();
-        std::vector<std::future<void>> futures;
-        futures.reserve(misses.size());
-        for (const auto index : misses) {
-            futures.push_back(workers.submit([this, &requested, index] {
-                read_decode(requested[index].row, requested[index]);
-            }));
+        RowReadCounts read_counts;
+        if (nint) {
+            RowReadScope observation(read_counts);
+            std::vector<std::int64_t> selected;
+            selected.reserve(misses.size());
+            for (const auto index : misses) selected.push_back(requested[index].row);
+            mfq::NintRowBatch packed;
+            nint->append_rows(selected.data(), selected.size(), packed);
+            for (std::size_t item = 0; item < misses.size(); ++item)
+                packed.copy_row(item, requested[misses[item]].packed);
+        } else {
+            workers.run(0, misses.size(), 1, worker_count,
+                [&](std::int64_t begin, std::int64_t end) {
+                    for (auto item = begin; item < end; ++item) {
+                        const auto index = misses[item];
+                        read_mxfp8(requested[index].row, requested[index]);
+                    }
+                });
         }
-        std::exception_ptr failure;
-        for (auto& future : futures) {
-            try {
-                future.get();
-            } catch (...) {
-                if (!failure) failure = std::current_exception();
-            }
-        }
-        if (failure) std::rethrow_exception(failure);
         const auto io_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - io_begin).count();
 
@@ -408,10 +410,9 @@ struct MlxQuantizedRowStore::Impl {
         }
         {
             std::scoped_lock lock(mutex);
+            counters.bytes_read += nint ? read_counts.bytes : misses.size() * source_row_bytes;
+            counters.read_calls += nint ? read_counts.calls : misses.size() * 2;
             for (const auto index : misses) {
-                counters.bytes_read += nint ? requested[index].packed.source_bytes_read()
-                    : source_row_bytes;
-                counters.read_calls += nint ? 5 : 2;
                 admit(std::move(requested[index]));
             }
             counters.row_requests += row_ids.size();
@@ -437,7 +438,8 @@ struct MlxQuantizedRowStore::Impl {
     mutable std::size_t resident_cache_bytes = 0;
     std::unique_ptr<mfq::NintRows> nint;
     std::array<mlx::core::float16_t, 1u << 16u> decode_lut{};
-    mutable WorkerPool workers;
+    mutable mfq::HostParallelPool workers;
+    int worker_count;
     mutable std::mutex mutex;
     mutable std::list<std::int64_t> recency;
     mutable std::unordered_map<std::int64_t, CacheEntry> cache;

@@ -42,6 +42,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <dispatch/dispatch.h>
+#include <exception>
 #include <future>
 #include <list>
 #include <limits>
@@ -75,6 +77,8 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 constexpr int kDescriptorSize = 32;
+constexpr unsigned kMfeSmallMReadWorkers = 16;
+constexpr std::size_t kMfeDirectRangeMaxExperts = 2;
 std::atomic<std::size_t> uncached_packed_storage_bytes{0};
 constexpr int kMfeFoldedGateSimdPairs = 4;
 
@@ -2622,6 +2626,41 @@ array empty_packed_array(Dtype dtype) {
     return *entry.value;
 }
 
+struct MfeDirectReadTarget {
+    std::uint64_t offset;
+    std::uint8_t* wire;
+    std::size_t bytes;
+    std::uint8_t* destination = nullptr;
+};
+thread_local std::vector<MfeDirectReadTarget>* direct_read_targets = nullptr;
+enum class MfeMetadataRead { Planned, Eager, DeferredMxScales };
+thread_local MfeMetadataRead direct_read_metadata = MfeMetadataRead::Planned;
+struct MfeDirectReadScope {
+    explicit MfeDirectReadScope(std::vector<MfeDirectReadTarget>& targets)
+        : previous(std::exchange(direct_read_targets, &targets)) {}
+    ~MfeDirectReadScope() { direct_read_targets = previous; }
+    std::vector<MfeDirectReadTarget>* previous;
+};
+bool redirect_direct_read(std::span<const std::uint8_t> source, std::uint8_t* destination) {
+    if (!direct_read_targets) return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(source.data());
+    std::size_t copied = 0;
+    bool redirected = false;
+    for (auto& range : *direct_read_targets) {
+        const auto address = reinterpret_cast<std::uintptr_t>(range.wire);
+        if (address < begin || address - begin > source.size()
+            || range.bytes > source.size() - (address - begin)) continue;
+        const auto offset = static_cast<std::size_t>(address - begin);
+        if (offset < copied || range.destination) throw std::runtime_error("overlapping direct MFE read");
+        std::memcpy(destination + copied, source.data() + copied, offset - copied);
+        range.destination = destination + offset;
+        copied = offset + range.bytes;
+        redirected = true;
+    }
+    if (redirected) std::memcpy(destination + copied, source.data() + copied, source.size() - copied);
+    return redirected;
+}
+
 // Keep source ownership, not a second model-sized byte vector. Once all chunks
 // are known, write them directly into one exact-sized Metal allocation.
 class PackedStream {
@@ -2740,6 +2779,12 @@ public:
                         if constexpr (std::is_same_v<T, array>) return source.template data<std::uint8_t>();
                         else return source.data();
                     }();
+                    if constexpr (std::is_same_v<T, std::span<const std::uint8_t>>) {
+                        if (redirect_direct_read(source, destination + offset)) {
+                            offset += count;
+                            return;
+                        }
+                    }
                     std::memcpy(destination + offset, data, count);
                     offset += count;
                 }
@@ -7469,7 +7514,7 @@ std::vector<std::uint8_t> pack_small_selectors(
 }
 
 struct MfeReadCounters {
-    std::size_t bytes = 0, calls = 0;
+    std::size_t bytes = 0, calls = 0, parallel_body_batches = 0;
     double seconds = 0;
 };
 struct MfeReadRange {
@@ -7498,6 +7543,52 @@ void record_mfe_read(std::size_t bytes, std::chrono::steady_clock::time_point st
     ++current_mfe_reads->calls;
     current_mfe_reads->seconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
+}
+
+void read_mfe_direct_targets(const MfqContainer& model, const std::string& name,
+    std::span<const MfeDirectReadTarget> targets, bool complete, std::size_t missing) {
+    if (missing > kMfeDirectRangeMaxExperts || targets.size() < 2) {
+        for (const auto& range : targets) {
+            const auto started = std::chrono::steady_clock::now();
+            auto* destination = complete ? range.destination : range.wire;
+            model.read_range_into(name, range.offset,
+                std::as_writable_bytes(std::span(destination, range.bytes)));
+            record_mfe_read(range.bytes, started);
+        }
+        return;
+    }
+    struct Context {
+        const MfqContainer& model;
+        const std::string& name;
+        std::span<const MfeDirectReadTarget> targets;
+        bool complete;
+        std::mutex mutex;
+        std::exception_ptr failure;
+    } context{model, name, targets, complete, {}, {}};
+    const auto started = std::chrono::steady_clock::now();
+    dispatch_apply_f(targets.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        &context, [](void* raw, std::size_t index) {
+            auto& work = *static_cast<Context*>(raw);
+            const auto& range = work.targets[index];
+            try {
+                auto* destination = work.complete ? range.destination : range.wire;
+                work.model.read_range_into(work.name, range.offset,
+                    std::as_writable_bytes(std::span(destination, range.bytes)));
+            } catch (...) {
+                std::scoped_lock lock(work.mutex);
+                if (!work.failure) work.failure = std::current_exception();
+            }
+        });
+    if (context.failure) std::rethrow_exception(context.failure);
+    if (current_mfe_reads) {
+        for (const auto& range : targets) {
+            current_mfe_reads->bytes += range.bytes;
+            ++current_mfe_reads->calls;
+        }
+        ++current_mfe_reads->parallel_body_batches;
+        current_mfe_reads->seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    }
 }
 
 template <typename Bytes>
@@ -7533,13 +7624,16 @@ void read_mfe_batch(const MfqContainer& model, const std::string& name,
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.source < b.source; });
     constexpr std::size_t max_read = std::size_t{8} << 20;
     MfeReadBytes scratch;
+    std::vector<std::span<std::byte>> destinations;
     for (std::size_t first = 0; first < ranges.size();) {
         const auto offset = ranges[first].source;
         auto end = checked_range_add(offset, ranges[first].target.size(), "MFE batch range");
         auto last = first + 1;
+        bool contiguous = true;
         while (last < ranges.size() && ranges[last].source <= end) {
             const auto next = checked_range_add(ranges[last].source, ranges[last].target.size(), "MFE batch range");
             if (next - offset > max_read) break;
+            contiguous = contiguous && ranges[last].source == end;
             end = std::max(end, next);
             ++last;
         }
@@ -7547,6 +7641,12 @@ void read_mfe_batch(const MfqContainer& model, const std::string& name,
         const auto started = std::chrono::steady_clock::now();
         if (last == first + 1) {
             model.read_range_into(name, offset, std::as_writable_bytes(ranges[first].target));
+            record_mfe_read(bytes, started);
+        } else if (contiguous) {
+            destinations.clear();
+            for (auto index = first; index < last; ++index)
+                destinations.push_back(std::as_writable_bytes(ranges[index].target));
+            model.readv_range(name, offset, destinations);
             record_mfe_read(bytes, started);
         } else {
             scratch.resize(bytes);
@@ -8398,10 +8498,13 @@ void append_streamed_nvq_expert(
     patch_scalar_bytes<std::uint32_t>(
         result, payload_begin + 36, static_cast<std::uint32_t>(rows_per_expert),
         "NVQ-JSC output size");
-    append_record_range(
-        result, model, name,
-        layout.anchors_offset + begin * 2,
-        static_cast<std::uint64_t>(rows_per_expert) * 2);
+    {
+        MfeReadPlanScope immediate(direct_read_metadata != MfeMetadataRead::Planned ? nullptr : current_mfe_plan);
+        append_record_range(
+            result, model, name,
+            layout.anchors_offset + begin * 2,
+            static_cast<std::uint64_t>(rows_per_expert) * 2);
+    }
     if (layout.group64) {
         append_record_range(
             result, model, name,
@@ -8465,10 +8568,14 @@ void append_streamed_mx_expert(
             layout.columns / 32);
         patch_scalar_bytes<std::uint64_t>(
             result, payload_begin + 40, rows_per_expert, "MXFP4 scale rows");
+        const bool deferred = direct_read_metadata == MfeMetadataRead::DeferredMxScales;
+        MfeReadPlanScope immediate(direct_read_metadata == MfeMetadataRead::Eager ? nullptr : current_mfe_plan);
+        const auto scale_begin = result.size();
         append_record_range(
             result, model, name,
             layout.scales_offset + begin * scale_stride,
             static_cast<std::uint64_t>(rows_per_expert) * scale_stride);
+        if (deferred) std::fill(result.begin() + scale_begin, result.end(), std::uint8_t{0});
     } else {
         if ((begin & 127u) != 0u) {
             throw MfeStreamUnsupported(
@@ -9472,7 +9579,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             if (missing_count) {
                 const auto workers = std::max(1u, std::thread::hardware_concurrency());
                 const auto concurrent = std::min(missing_count,
-                    std::size_t(prefill_scan ? workers : std::min(8u, workers)));
+                    std::size_t(prefill_scan ? workers : std::min(kMfeSmallMReadWorkers, workers)));
                 const auto batch_bytes = prefill_scan
                     ? std::max(largest_missing, std::size_t{8} << 20) : largest_missing;
                 const auto in_flight = std::min(missing_bytes,
@@ -9730,12 +9837,67 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                 auto& request = pending[index];
                 const auto& location = *projection->experts_by_id[request.expert];
                 const auto started = std::chrono::steady_clock::now();
-                const auto blob = impl_->load_mfe_expert_blob(name, *projection, location, &request.reads);
-                const std::array blobs{std::span<const std::uint8_t>(blob)};
-                pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
-                    request.expert, request.destination
+                const auto eligible = [&] {
+                    if (mlx_reference_enabled()) return false;
+                    if (const auto* mx = std::get_if<MfeMxStreamLayout>(&location.pool->layout))
+                        return mx->bits == 4;
+                    const auto* vq = std::get_if<MfeNvqJscStreamLayout>(&location.pool->layout);
+                    if (!vq || vq->group64 || vq->execution_layout != 0
+                        || vq->decoder_profile == kVqProfileGeneric
+                        || vq->decoder_profile == kVqProfileNpqS || vq->decoder_profile == kVqProfileNpqL) return false;
+                    const auto rows = static_cast<std::uint64_t>(projection->out_per_expert);
+                    return rows * vq->groups * vq->state_bits % 8 == 0
+                        && rows * vq->vectors * vq->index_bits % 8 == 0
+                        && rows * vq->signs * vq->auxiliary_bits % 8 == 0;
+                }();
+                const auto* mx = std::get_if<MfeMxStreamLayout>(&location.pool->layout);
+                const bool deferred_scales = eligible && mx && !prefill_scan
+                    && pending.size() <= kMfeDirectRangeMaxExperts;
+                MfeReadPlan plan;
+                struct MetadataScope {
+                    MfeMetadataRead previous;
+                    MetadataScope(MfeMetadataRead value) : previous(std::exchange(direct_read_metadata, value)) {}
+                    ~MetadataScope() { direct_read_metadata = previous; }
+                } metadata_scope(deferred_scales ? MfeMetadataRead::DeferredMxScales
+                    : eligible ? MfeMetadataRead::Eager : MfeMetadataRead::Planned);
+                auto blob = impl_->load_mfe_expert_blob(name, *projection, location, &request.reads,
+                    eligible ? &plan : nullptr);
+                std::vector<MfeDirectReadTarget> targets;
+                for (const auto& range : plan)
+                    targets.push_back({range.source, blob.data() + range.destination, range.bytes});
+                std::optional<MlxMfeWeight> parsed;
+                const auto parse = [&] {
+                    const std::array blobs{std::span<const std::uint8_t>(blob)};
+                    return request.destination
                         ? MlxMfeWeight::from_projection_blobs_impl(blobs, false, nullptr, &*request.destination)
-                        : MlxMfeWeight::from_blob(blob), request.destination.has_value());
+                        : MlxMfeWeight::from_blob(blob);
+                };
+                if (eligible) {
+                    MfeDirectReadScope redirect(targets);
+                    parsed.emplace(parse());
+                } else parsed.emplace(parse());
+                const bool complete = std::all_of(targets.begin(), targets.end(),
+                    [](const auto& range) { return range.destination != nullptr; });
+                {
+                    MfeReadScope observation(&request.reads);
+                    read_mfe_direct_targets(impl_->model, name, targets, complete, pending.size());
+                }
+                if (deferred_scales && complete) {
+                    const auto scale_offset = mx->scales_offset
+                        + static_cast<std::uint64_t>(location.local_expert)
+                            * projection->out_per_expert * (mx->columns / 32);
+                    const auto scale = std::find_if(targets.begin(), targets.end(),
+                        [&](const auto& range) { return range.offset == scale_offset; });
+                    if (scale == targets.end()) throw std::logic_error("deferred MX scale range is missing");
+                    if (std::find(scale->destination, scale->destination + scale->bytes, std::uint8_t{255})
+                        != scale->destination + scale->bytes)
+                        throw std::runtime_error("MFE MXFP4 contains an E8M0 NaN scale");
+                }
+                if (!complete) {
+                    parsed.emplace(parse());
+                }
+                pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
+                    request.expert, std::move(*parsed), request.destination.has_value());
                 request.prepare_seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started).count() - request.reads.seconds;
             }
@@ -9784,6 +9946,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     for (const auto& request : pending) {
         impl_->stats.bytes_read += request.reads.bytes;
         impl_->stats.read_calls += request.reads.calls;
+        impl_->stats.parallel_body_read_batches += request.reads.parallel_body_batches;
         impl_->stats.io_seconds += request.reads.seconds;
         impl_->stats.prepare_seconds += request.prepare_seconds;
     }
@@ -9854,12 +10017,35 @@ MlxMfeWeight MlxMfeOffloadCache::grouped_mfe(
 std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
     std::span<const std::string> names,
     const std::vector<std::int32_t>& active_experts,
-    std::span<const std::uint32_t> activation_counts, bool prefill_scan) {
+    std::span<const std::uint32_t> activation_counts, bool prefill_scan,
+    const std::function<void(const std::vector<MlxMfeWeight>&)>& prefix_ready) {
     if (names.empty()) throw std::invalid_argument("streamed MFE projections cannot be empty");
     std::unordered_set<std::string> unique;
     for (const auto& name : names)
         if (!unique.insert(name).second)
             throw std::invalid_argument("streamed MFE projections must be distinct");
+    const auto workers = std::max(1u, std::thread::hardware_concurrency());
+    if (prefix_ready) {
+        if (names.size() != 3)
+            throw std::invalid_argument("streamed MFE prefix submission requires three projections");
+        bool parallel = !prefill_scan;
+        std::array<std::size_t, 2> missing{};
+        if (parallel) {
+            std::lock_guard lock(impl_->mutex);
+            for (std::size_t index = 0; index < names.size(); ++index) {
+                (void)impl_->mfe_projection_locked(names[index]);
+                for (const auto expert : active_experts)
+                    missing[index == 2] += !impl_->mfe_cache.contains({names[index], expert});
+            }
+            parallel = missing[0] && missing[1] && missing[0] + missing[1] <= std::min(8u, workers);
+        }
+        if (!parallel) {
+            auto result = grouped_mfe(names.first(2), active_experts, activation_counts, prefill_scan);
+            prefix_ready(result);
+            result.push_back(grouped_mfe(names.back(), active_experts, activation_counts, prefill_scan));
+            return result;
+        }
+    }
     std::vector<MfeGroupTask> tasks;
     std::vector<MfeGroupWork*> jobs;
     std::vector<std::size_t> offsets{0};
@@ -9875,12 +10061,81 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             offsets.push_back(checked_add(offsets.back(), work->count, "MFE grouped expert tasks"));
         }
     }
-    const auto workers = std::max(1u, std::thread::hardware_concurrency());
     // Prefill has wide CPU parsing work; small route sets mostly contend on
     // the allocator's resource/residency lock once the I/O queue is saturated.
-    impl_->io_workers.run(0, offsets.back(), 1,
+    if (prefix_ready) {
+        std::vector<std::pair<std::size_t, MfeGroupWork*>> prioritized;
+        for (std::size_t index = 0; index < tasks.size(); ++index)
+            if (auto& work = tasks[index].handle.promise().work; work)
+                prioritized.emplace_back(order[index], &*work);
+        std::sort(prioritized.begin(), prioritized.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        jobs.clear();
+        offsets.assign(1, 0);
+        std::size_t prefix_jobs = 0;
+        for (const auto& [index, job] : prioritized) {
+            jobs.push_back(job);
+            offsets.push_back(checked_add(offsets.back(), job->count, "MFE grouped expert tasks"));
+            if (index < 2) ++prefix_jobs;
+        }
+        std::atomic<std::size_t> prefix_left{offsets[prefix_jobs]};
+        std::mutex ready_mutex;
+        std::condition_variable ready_condition;
+        bool io_done = false;
+        auto background = std::async(std::launch::async, [&] {
+            struct Finish {
+                std::mutex& mutex;
+                std::condition_variable& condition;
+                bool& done;
+                ~Finish() {
+                    { std::lock_guard lock(mutex); done = true; }
+                    condition.notify_all();
+                }
+            } finish{ready_mutex, ready_condition, io_done};
+            impl_->io_workers.run(0, offsets.back(), 1,
+                static_cast<int>(std::min<std::size_t>(offsets.back(), std::min(8u, workers))),
+                [&](std::int64_t begin, std::int64_t end) {
+                    while (begin < end) {
+                        const auto index = std::upper_bound(offsets.begin(), offsets.end(),
+                            static_cast<std::size_t>(begin)) - offsets.begin() - 1;
+                        const auto next = std::min<std::int64_t>(end, offsets[index + 1]);
+                        jobs[index]->load(begin - offsets[index], next - offsets[index]);
+                        const auto count = static_cast<std::size_t>(next - begin);
+                        if (index < prefix_jobs && prefix_left.fetch_sub(count) == count) {
+                            std::lock_guard lock(ready_mutex);
+                            ready_condition.notify_all();
+                        }
+                        begin = next;
+                    }
+                });
+        });
+        {
+            std::unique_lock lock(ready_mutex);
+            ready_condition.wait(lock, [&] { return prefix_left.load() == 0 || io_done; });
+        }
+        if (prefix_left.load() != 0) background.get();
+        std::array<std::optional<MlxMfeWeight>, 2> selected;
+        for (std::size_t index = 0; index < tasks.size(); ++index) if (order[index] < 2) {
+            auto& task = tasks[index];
+            if (task.handle.promise().work) task.resume();
+            if (!task.handle.promise().result)
+                throw std::logic_error("streamed MFE prefix preparation did not finish");
+            selected[order[index]] = *task.handle.promise().result;
+        }
+        const std::vector<MlxMfeWeight> prefix{*selected[0], *selected[1]};
+        prefix_ready(prefix);
+        bool submitted_early = false;
+        { std::lock_guard lock(ready_mutex); submitted_early = !io_done; }
+        if (prefix_jobs && prefix_jobs < jobs.size()) {
+            std::lock_guard lock(impl_->mutex);
+            ++impl_->stats.overlapped_read_batches;
+            impl_->stats.overlapped_read_submissions += submitted_early;
+        }
+        background.get();
+    } else impl_->io_workers.run(0, offsets.back(), 1,
         static_cast<int>(std::min(std::max<std::size_t>(1, offsets.back()),
-            std::size_t(prefill_scan ? workers : std::min(8u, workers)))),
+            std::size_t(prefill_scan ? workers : std::min(kMfeSmallMReadWorkers, workers)))),
         [&](std::int64_t begin, std::int64_t end) {
             while (begin < end) {
                 const auto index = std::upper_bound(offsets.begin(), offsets.end(),

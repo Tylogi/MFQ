@@ -196,6 +196,11 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
         attention_residual,
         attention_mix.expansion);
 
+    if (ced_replay && index_ + 1 == config_.n_layers && value.shape(1) > 1) {
+        const int last = value.shape(1) - 1;
+        value = slice_tokens(value, last, last + 1);
+        attention_mix.next_pre = slice_tokens(attention_mix.next_pre, last, last + 1);
+    }
     const auto ffn_residual = value;
     auto ffn_mix = ffn_mhc_.collapse(
         ffn_residual, attention_mix.next_pre);
@@ -648,6 +653,9 @@ MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
     stats.device_route_hits = reuse.cached_route_hits;
     stats.device_route_misses = reuse.cached_route_misses;
     stats.device_route_layers = reuse.cached_route_hits + reuse.cached_route_misses;
+    stats.overlapped_read_batches = reuse.overlapped_read_batches;
+    stats.overlapped_read_submissions = reuse.overlapped_read_submissions;
+    stats.parallel_body_read_batches = reuse.parallel_body_read_batches;
     stats.resident_experts = mfe_offload_cache_->cached_expert_count();
     stats.resident_bytes = mfe_offload_cache_->resident_packed_bytes();
     return stats;

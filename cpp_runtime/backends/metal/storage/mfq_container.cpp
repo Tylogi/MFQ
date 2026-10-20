@@ -16,7 +16,9 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace mfq::metal {
@@ -84,10 +86,7 @@ struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAcce
         mutable int descriptor = -1;
     };
 
-    void read(
-        const std::filesystem::path& path,
-        std::uint64_t offset,
-        std::span<std::byte> destination) {
+    std::shared_ptr<File> source_for(const std::filesystem::path& path) {
         struct LastFile {
             const RandomAccessFiles* owner = nullptr;
             std::weak_ptr<RandomAccessFiles> lifetime;
@@ -109,6 +108,14 @@ struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAcce
             }
             last = {this, weak_from_this(), path, source};
         }
+        return source;
+    }
+
+    void read(
+        const std::filesystem::path& path,
+        std::uint64_t offset,
+        std::span<std::byte> destination) {
+        const auto source = source_for(path);
         if (offset > source->size ||
             destination.size() > source->size - offset) {
             throw std::runtime_error(
@@ -137,6 +144,48 @@ struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAcce
                     "MFQ record source was truncated: " + path.string());
             }
             done += static_cast<std::size_t>(count);
+        }
+    }
+
+    void readv(const std::filesystem::path& path, std::uint64_t offset,
+        std::span<const std::span<std::byte>> destinations, std::uint64_t total) {
+        const auto source = source_for(path);
+        if (offset > source->size || total > source->size - offset)
+            throw std::runtime_error("MFQ record source was truncated: " + path.string());
+        std::size_t index = 0, consumed = 0;
+        std::uint64_t done = 0;
+        std::vector<iovec> vectors;
+        vectors.reserve(std::min<std::size_t>(destinations.size(), IOV_MAX));
+        while (done < total) {
+            vectors.clear();
+            std::size_t batch_bytes = 0;
+            constexpr std::size_t maximum_read = std::size_t{32} << 20;
+            for (auto next = index; next < destinations.size() && vectors.size() < IOV_MAX
+                    && batch_bytes < maximum_read; ++next) {
+                const auto start = next == index ? consumed : 0;
+                const auto count = std::min(destinations[next].size() - start, maximum_read - batch_bytes);
+                if (!count) continue;
+                vectors.push_back({destinations[next].data() + start, count});
+                batch_bytes += count;
+            }
+            const auto count = ::preadv(source->open(), vectors.data(), static_cast<int>(vectors.size()),
+                static_cast<off_t>(offset + done));
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("failed reading MFQ record source: " + path.string()
+                    + ": " + std::strerror(errno));
+            }
+            if (!count) throw std::runtime_error("MFQ record source was truncated: " + path.string());
+            done += static_cast<std::uint64_t>(count);
+            auto remaining = static_cast<std::size_t>(count);
+            while (index < destinations.size()) {
+                const auto available = destinations[index].size() - consumed;
+                if (remaining < available) { consumed += remaining; break; }
+                remaining -= available;
+                ++index;
+                consumed = 0;
+                if (!remaining && (index == destinations.size() || !destinations[index].empty())) break;
+            }
         }
     }
 
@@ -429,6 +478,30 @@ void MfqContainer::read_range_into(
     }
     random_access_files_->read(
         value.source_path, absolute_offset, destination);
+}
+
+void MfqContainer::readv_range(const std::string& name, std::uint64_t relative_offset,
+    std::span<const std::span<std::byte>> destinations) const {
+    const auto& value = record(name);
+    if (relative_offset > value.nbytes)
+        throw std::out_of_range("MFQ record byte range is out of bounds: " + name);
+    std::uint64_t total = 0;
+    for (const auto destination : destinations) {
+        if (destination.size() > value.nbytes - relative_offset - total)
+            throw std::out_of_range("MFQ record byte range is out of bounds: " + name);
+        total += destination.size();
+    }
+    if (!total) return;
+    const auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
+    if (value.offset > maximum || relative_offset > maximum - value.offset
+        || total > maximum - value.offset - relative_offset)
+        throw std::runtime_error("MFQ record byte range is too large: " + name);
+    if (hf_source_) {
+        for (const auto destination : destinations) {
+            read_range_into(name, relative_offset, destination);
+            relative_offset += destination.size();
+        }
+    } else random_access_files_->readv(value.source_path, value.offset + relative_offset, destinations, total);
 }
 
 

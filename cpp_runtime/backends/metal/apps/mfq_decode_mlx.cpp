@@ -2472,15 +2472,18 @@ private:
         const auto target = budget - allocation;
         if (used() <= target) return;
         mfq::metal::drain_metal_work(runtime_stream);
-        mlx::core::set_cache_limit(0);
-        allocator_cache_limit = 0;
-        mlx::core::clear_cache();
+        const auto clear_allocator_excess = [&] {
+            if (mlx::core::get_cache_memory() > reserve) mlx::core::clear_cache();
+        };
+        clear_allocator_excess();
         std::size_t prefix = 0;
         for (const auto& metric : session_cache->metrics()) if (metric.first == "prefix_cache_hot_bytes") prefix = static_cast<std::size_t>(metric.second);
         const auto shortage = used() > target ? used() - target : 0;
         session_cache->trim_hot(prefix > shortage ? prefix - shortage : 0);
+        clear_allocator_excess();
         if constexpr (requires(Runtime& value) { value.trim_mtp_sessions(std::size_t{}); })
             if (used() > target) runtime_holder->value().trim_mtp_sessions(0);
+        clear_allocator_excess();
         if (used() <= target) return;
         if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
             auto& runtime = runtime_holder->value();
@@ -2492,7 +2495,7 @@ private:
                 mfq::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
                 if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
                 resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
-                mlx::core::clear_cache();
+                clear_allocator_excess();
                 release_host_allocator_cache();
                 if (runtime.reclaimable_expert_bytes() >= available) break;
             }
@@ -2736,6 +2739,9 @@ private:
                     metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
                     metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);
                     metrics.emplace_back("ssd_expert_device_route_misses", stats->device_route_misses);
+                    metrics.emplace_back("ssd_expert_overlapped_read_batches", stats->overlapped_read_batches);
+                    metrics.emplace_back("ssd_expert_overlapped_read_submissions", stats->overlapped_read_submissions);
+                    metrics.emplace_back("ssd_expert_parallel_body_read_batches", stats->parallel_body_read_batches);
                     metrics.emplace_back(
                         "ssd_expert_resident_bytes",
                         static_cast<double>(stats->resident_bytes));

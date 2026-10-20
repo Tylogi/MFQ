@@ -247,6 +247,15 @@ int main() {
                 throw std::runtime_error("MTP retained an obsolete depth cost after a long observation gap");
         }
         {
+            mfq::metal::MlxDsparkDepthController controller(5);
+            for (int cycle = 0; cycle < 3; ++cycle) controller.observe(2, 2, 205.0);
+            for (int cycle = 0; cycle < 3; ++cycle) controller.observe(0, 0, 72.0);
+            for (int cycle = 0; cycle < 3; ++cycle) controller.observe(1, 1, 173.0);
+            if (controller.depth() <= 2) {
+                throw std::runtime_error("DSpark charged fixed predictor startup to every additional draft");
+            }
+        }
+        {
             int target_position = 0, verify_calls = 0, decode_calls = 0, resolve_calls = 0;
             mfq::engine::mtp::PolicyState policy_state;
             mfq::metal::MlxMtpEngineCallbacks callbacks;

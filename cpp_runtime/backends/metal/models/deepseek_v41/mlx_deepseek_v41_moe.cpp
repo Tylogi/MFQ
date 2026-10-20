@@ -536,9 +536,18 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         const bool prefill_scan = rows > 6;
         auto weights = prefill_scan ? mfe_offload_cache_->layer_mfe(names, active)
             : std::nullopt;
-        const bool layer_ready = weights.has_value();
+        bool layer_ready = weights.has_value();
+        std::optional<array> staged_hidden;
         if (weights) {
             local_ids = global_ids;
+        } else if (rows == 1 && streamed_up_name_) {
+            weights = mfe_offload_cache_->grouped_mfe(names, active, activation_counts, false,
+                [&](const std::vector<MlxMfeWeight>& gu) {
+                    staged_hidden = gu[0].routed_swiglu_pair(gu[1], source,
+                        local_ids, swiglu_limit_, route_groups);
+                    mlx::core::async_eval({*staged_hidden});
+                });
+            layer_ready = true;
         } else {
             const auto projections = std::span<const std::string>(names);
             weights = mfe_offload_cache_->grouped_mfe(projections.first(projections.size() - 1),
@@ -556,6 +565,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 gate.recommended_grouped_mmq_block_rows(route_count, !streamed_up_name_));
         }
         array routed_hidden = [&]() {
+            if (staged_hidden) return *staged_hidden;
             if (sorted_routes) {
                 auto projected = gate.routed_matmul_sorted(source, local_ids, *sorted_routes,
                     false, !streamed_up_name_, swiglu_limit_, &*gate_plan);
