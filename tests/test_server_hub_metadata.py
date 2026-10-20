@@ -87,6 +87,15 @@ def test_mfq_index_excludes_assets_and_streamed_ple_without_reading_payloads():
         inspect_mfq_header(data, size + 1)
 
 
+def test_shared_mxfp8_engram_table_is_streamed_instead_of_resident():
+    data, size = mfq_index([
+        ('model.block.1.associative_memory.embedding.weight', 'MXFP8', 100_000_000_000),
+    ])
+    result = inspect_mfq_header(data, size)
+    assert result.weight_bytes == 0 and result.ssd_ple_bytes == 100_000_000_000
+    assert result.estimated_weight_bytes_by_role == {'dense': 0, 'experts': 0, 'embedding': 0}
+
+
 @pytest.mark.parametrize('status', [200, 206])
 def test_range_reads_are_bounded_and_never_accept_whole_weight_downloads(status):
     data, size = mfq_index([('model.weight', 'NINT', 1000000)])

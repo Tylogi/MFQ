@@ -90,7 +90,9 @@ export function DownloadQueue({ jobs, onJobCreated }: {
           ? Array.from(new Set(job.payload.include.filter((file): file is string => typeof file === 'string' && !!file && !/[?*\[]/.test(file))))
           : [];
         const destination = String(job.payload.destination || '');
-        const title = files[0] || destination.split(/[\\/]/).filter(Boolean).pop() || String(job.payload.repo_id || job.kind);
+        const primary = Array.isArray(job.payload.include) ? job.payload.include.find(
+          (file): file is string => typeof file === 'string' && /\.mfq$/i.test(file) && !/(?:^|\/)Engram\//i.test(file)) : undefined;
+        const title = primary || files[0] || destination.split(/[\\/]/).filter(Boolean).pop() || String(job.payload.repo_id || job.kind);
         return (
           <article className={`download-queue-item ${job.status}`} key={job.id} data-job-id={job.id}>
             <div className="download-item-icon"><Icon name={job.status === 'succeeded' ? 'check' : 'download'} size={20} /></div>

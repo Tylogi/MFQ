@@ -15,6 +15,7 @@ from typing import Protocol
 
 from mfq.formats.assets import is_asset_record
 from mfq.formats.compat import canonical_dtype
+from mfq.formats.companions import with_engram_shards
 from mfq.formats.header import MFQ_MAGIC, FileHeader
 
 SPLIT_NO_KEY = "split.no"
@@ -91,6 +92,16 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
         if index in available:
             raise ValueError(f"duplicate MFQ shard index {index}: {base}")
         available[index] = candidate
+    # Shared tables retain their original split indices in a sibling Engram/.
+    directories = {base.parent, base.parent / 'Engram', base.parent.parent / 'Engram'}
+    candidates = [candidate for directory in directories if directory.is_dir()
+                  for candidate in directory.iterdir() if candidate.is_file()]
+    names = [candidate.as_posix() for candidate in candidates]
+    for name in with_engram_shards([Path(path).as_posix()], names):
+        candidate = Path(name)
+        entry = parse_shard_path(candidate)
+        if entry is not None and entry[1] not in available:
+            available[entry[1]] = candidate
     return [available.get(index, candidate) for index, candidate in enumerate(expected, 1)]
 
 

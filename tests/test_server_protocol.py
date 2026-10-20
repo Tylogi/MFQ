@@ -179,6 +179,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/hub/official",
         "/api/v1/hub/download-directory",
         "/api/v1/hub/download-sources/probe",
+        "/api/v1/hub/download-reuse",
         "/api/v1/hub/resolve",
         "/api/v1/runtime/instances",
         "/api/v1/runtime/instances/{instance_id}",

@@ -390,6 +390,32 @@ std::vector<std::filesystem::path> shard_paths(
         result[index - 1] = entry.path();
         found[index - 1] = true;
     }
+    // Shared Engram shards keep their original indices, but live once beside
+    // the precision directories. Never substitute another model or split set.
+    static const std::regex engram_pattern(R"(^(.*)-Engram-.+$)", std::regex::icase);
+    std::unordered_map<std::uint64_t, std::filesystem::path> shared;
+    std::vector<std::filesystem::path> directories{
+        path.parent_path(), path.parent_path() / "Engram",
+        path.parent_path().parent_path() / "Engram"};
+    std::sort(directories.begin(), directories.end());
+    directories.erase(std::unique(directories.begin(), directories.end()), directories.end());
+    for (const auto& directory : directories) {
+        if (!std::filesystem::is_directory(directory)) continue;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            std::smatch candidate, family;
+            const auto name = entry.path().filename().string();
+            if (!entry.is_regular_file() || !std::regex_match(name, candidate, pattern)) continue;
+            const auto stem = candidate[1].str();
+            if (!std::regex_match(stem, family, engram_pattern) ||
+                match[1].str().compare(0, family[1].length() + 1, family[1].str() + "-") != 0 ||
+                std::stoull(candidate[3].str()) != split_count) continue;
+            const auto index = std::stoull(candidate[2].str());
+            if (index < 1 || index > split_count || found[index - 1]) continue;
+            if (!shared.emplace(index, entry.path()).second)
+                throw std::runtime_error("ambiguous shared Engram shard " + std::to_string(index));
+        }
+    }
+    for (const auto& [index, candidate] : shared) result[index - 1] = candidate;
     for (std::uint64_t index = 1; index <= split_count; ++index) {
         result[index - 1] = stable_path(result[index - 1]);
     }
@@ -592,6 +618,18 @@ MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mod
         auto expected_tensors = std::numeric_limits<std::uint64_t>::max();
         for (std::uint64_t index = 0; index < split_count; ++index) {
             auto current = parse_file(paths[static_cast<std::size_t>(index)]);
+            static const std::regex shared_name(R"(^.*-Engram-.+-[0-9]{5}-of-[0-9]{5}\.[mM][fF][qQ]$)", std::regex::icase);
+            if (std::regex_match(paths[index].filename().string(), shared_name)) {
+                const auto table = [](const MfqStoredRecord& record) {
+                    const auto& name = record.tensor.name;
+                    for (const std::string_view suffix : {".associative_memory.embedding.weight", ".engram.embed.weight"})
+                        if (name.size() >= suffix.size() &&
+                            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
+                    return false;
+                };
+                if (current.records.empty() || !std::all_of(current.records.begin(), current.records.end(), table))
+                    throw std::runtime_error("shared Engram shard contains non-table records: " + paths[index].string());
+            }
             if (current.header.version != initial.header.version ||
                 current.header.architecture != initial.header.architecture ||
                 metadata_uint(current.header, "split.no", split_count) != index ||

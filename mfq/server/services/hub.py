@@ -23,6 +23,7 @@ from urllib.request import proxy_bypass_environment
 import httpx
 
 from mfq.architectures.tensor_schema import tensor_schema_for_config
+from mfq.formats.companions import is_engram_shard, with_engram_shards
 from mfq.server.protocol.models import (
     HubMemoryPool,
     HubModelFile,
@@ -54,7 +55,7 @@ _MFQ_SHARD_PATTERN = re.compile(
     r"^(?P<name>.+?)(?:-\d{5}-of-\d{5})?\.mfq$", re.IGNORECASE
 )
 _PRECISION_PATTERN = re.compile(
-    r"(?:^|[-_.])((?:S|V|Q|NINT|NVQ)\d+(?:[-_][A-Za-z0-9]+)?)",
+    r"(?:^|[-_.])((?:S|V|Q|NINT|NVQ)\d+(?:\.\d+)?(?:[-_][A-Za-z0-9]+)?)",
     re.IGNORECASE,
 )
 _METADATA_TIMEOUT = 8.0
@@ -412,18 +413,30 @@ def _model_variants(
             )
         elif basename.lower().endswith((".safetensors", ".bin")):
             hf_files.append(item)
+    by_name = {item.name: item for item in files}
     for label, group in mfq_groups.items():
+        if all(is_engram_shard(item.name) for item in group):
+            continue
+        group = [by_name[name] for name in with_engram_shards(
+            [item.name for item in group], list(by_name))]
         size = sum(item.byte_size for item in group)
+        shared = [item for item in group if is_engram_shard(item.name)]
+        primary = [item for item in group if not is_engram_shard(item.name)]
         inspected = all(item.weight_bytes is not None and item.ssd_ple_bytes is not None for item in group)
+        inspected = inspected and all(item.weight_bytes == 0 for item in shared)
         weights = sum(item.weight_bytes or 0 for item in group) if inspected else None
-        ple = sum(item.ssd_ple_bytes or 0 for item in group) if inspected else None
+        # Before header inspection finishes, shared table files already have
+        # an unambiguous streamed-only role. Do not count them as RAM weights.
+        ple = sum(item.ssd_ple_bytes or 0 for item in group) if inspected else (
+            sum(item.ssd_ple_bytes if item.weight_bytes == 0 and item.ssd_ple_bytes is not None
+                else item.byte_size for item in shared) if shared else None)
         estimated = sum(estimated_resident_weight_bytes(
             item.weight_bytes or 0, item.weight_bytes_by_dtype,
-        ) for item in group) if inspected else estimated_resident_weight_bytes(size, {})
-        roles = {role: sum(item.estimated_weight_bytes_by_role[role] for item in group)
+        ) for item in group) if inspected else estimated_resident_weight_bytes(sum(item.byte_size for item in primary), {})
+        roles = {role: sum(item.estimated_weight_bytes_by_role[role] for item in primary)
                  for role in ('dense', 'experts', 'embedding')} if all(
             all(role in item.estimated_weight_bytes_by_role for role in ('dense', 'experts', 'embedding'))
-            for item in group) else {}
+            for item in primary) else {}
         configuration = _configuration_status(
             estimated, profile, supported=runtime_compatible,
             unsupported_reason="This model architecture is not registered in MFQ.",
@@ -719,7 +732,8 @@ class HubCatalog:
     def _missing_mfq_files(info: HubModelInfo) -> list[tuple[int, HubModelFile]]:
         return [(index, item) for index, item in enumerate(info.files)
                 if item.name.lower().endswith('.mfq') and item.byte_size >= 64
-                and (item.weight_bytes is None or item.ssd_ple_bytes is None)]
+                and (item.weight_bytes is None or item.ssd_ple_bytes is None
+                     or is_engram_shard(item.name) and item.weight_bytes != 0)]
 
     @staticmethod
     def _missing_model_metadata(info: HubModelInfo) -> bool:

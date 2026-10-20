@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import hashlib
 import json
 import subprocess
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
+
+from mfq.formats.companions import is_engram_shard
 
 from mfq.server.runtime.backend import (
     BackendDelta,
@@ -412,10 +415,25 @@ class ServerService:
             other, path = await asyncio.to_thread(self.tool_handlers.download_request, job.kind, job.payload)
             if path not in destinations:
                 continue
-            same_files = (other.repo_id.casefold(), sorted(other.include), sorted(other.exclude)) == (
-                payload.repo_id.casefold(), sorted(payload.include), sorted(payload.exclude))
+            other_tables = {name for name in other.include if is_engram_shard(name)}
+            tables = {name for name in payload.include if is_engram_shard(name)}
+            # Automatically added shared tables do not change model identity;
+            # an explicit choice of a different table must remain distinct.
+            same_files = (other.repo_id.casefold(), sorted(name for name in other.include if not is_engram_shard(name)), sorted(other.exclude)) == (
+                payload.repo_id.casefold(), sorted(name for name in payload.include if not is_engram_shard(name)), sorted(payload.exclude))
+            same_files = same_files and (not tables or tables == other_tables)
             if same_files and (path != destination or (job.kind, other.revision) == (request.kind, payload.revision)):
                 return job
+            if (path == destination and tables and tables == other_tables and
+                    (job.kind, other.repo_id, other.revision) == (request.kind, payload.repo_id, payload.revision)):
+                weights = [name for name in payload.include if name.lower().endswith('.mfq') and not is_engram_shard(name)]
+                other_weights = [name for name in other.include if name.lower().endswith('.mfq') and not is_engram_shard(name)]
+                if weights and other_weights and not any(
+                    fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left)
+                    for left in weights for right in other_weights):
+                    # Distinct tiers share one directory; the downloader
+                    # serializes writes so the common files stay intact.
+                    continue
             raise ServiceError(409, 'download_destination_busy', 'This folder already has an active download.')
         return None
 
@@ -426,15 +444,28 @@ class ServerService:
             payload, destination = await asyncio.to_thread(self.tool_handlers.download_request, request.kind, request.payload)
             destinations = await asyncio.to_thread(self.tool_handlers.download_destinations, request.kind, payload)
             existing = await asyncio.to_thread(lambda: [path for path in destinations if path.is_dir() and any(path.iterdir())])
-            if not existing:
+            needs_dependencies = payload.repo_type == 'model' and any(
+                pattern.lower().endswith('.mfq') and ('/' in pattern or '-of-' in pattern)
+                for pattern in payload.include)
+            if not existing and not needs_dependencies:
                 return
             provider = request.kind.split('.')[1]
             info = await self.hub_catalog.download_files(provider, payload.repo_id, payload.revision)
+            selected = self.tool_handlers.selected_download_files(payload, info.files)
+            extra = [item.name for item in selected if payload.include and not any(
+                fnmatch.fnmatchcase(item.name, pattern) for pattern in payload.include)]
+            if extra:
+                values = {'include': [*payload.include, *extra],
+                          'expected_bytes': sum(item.byte_size for item in selected)}
+                request.payload.update(values)
+                payload = payload.model_copy(update=values)
             for path in existing:
                 if await asyncio.to_thread(self.tool_handlers.download_files_present, path, payload, info.files, mfq_only=path != destination):
                     raise ServiceError(409, 'download_already_exists', 'The requested files already exist in the download folder.')
         except JobExecutionError as error:
             raise ServiceError(422, error.detail.code, error.detail.message) from error
+        except ValueError as error:
+            raise ServiceError(422, 'invalid_model_dependencies', str(error)) from error
         except (HubError, asyncio.TimeoutError) as error:
             raise ServiceError(502, 'model_hub_error', 'Could not verify existing download files. Refresh the model and retry.', retryable=True) from error
 
@@ -481,7 +512,7 @@ class ServerService:
                     if existing is not None:
                         return existing
                     await self._check_download_job(request)
-                    return await self.jobs.retry(job_id)
+                    return await self.jobs.retry(job_id, payload=request.payload)
             return await self.jobs.retry(job_id)
         except JobNotFoundError as error:
             raise ServiceError(404, "job_not_found", str(error)) from error

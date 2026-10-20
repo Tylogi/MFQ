@@ -29,6 +29,8 @@ from mfq.server.protocol.models import (
     HubModelSearchResult,
     HubReferenceRequest,
     HubDownloadProbeRequest,
+    HubDownloadReuseRequest,
+    HubDownloadReuseResponse,
     ModelArtifactList,
     ModelCacheProfile,
     ModelDirectoryList,
@@ -57,6 +59,24 @@ router = APIRouter()
 @hub_router.post('/api/v1/hub/download-sources/probe', responses=ERROR_RESPONSES, tags=['models'])
 async def probe_download_sources(service: ServiceDependency, body: HubDownloadProbeRequest) -> dict[str, Any]:
     return await service.hub_catalog.probe_download_sources(body.sources)
+
+
+@hub_router.post('/api/v1/hub/download-reuse', response_model=HubDownloadReuseResponse,
+                 responses=ERROR_RESPONSES, tags=['models'])
+async def download_reuse(service: ServiceDependency, body: HubDownloadReuseRequest) -> HubDownloadReuseResponse:
+    from mfq.server.services.hub import HubError
+    from mfq.server.services.jobs import JobExecutionError
+    if service.tool_handlers is None:
+        raise ServiceError(422, 'download_unavailable', 'Model downloads are unavailable on this server.')
+    try:
+        info = await service.hub_catalog.download_files(body.provider, body.repo_id, body.revision)
+        reusable = await asyncio.to_thread(service.tool_handlers.download_reuse,
+                                          body.destination, body.download_directory, info.files)
+        return HubDownloadReuseResponse(reusable_files=reusable)
+    except JobExecutionError as error:
+        raise ServiceError(422, error.detail.code, error.detail.message) from error
+    except (HubError, asyncio.TimeoutError) as error:
+        raise ServiceError(502, 'model_hub_error', 'Could not check reusable model files.', retryable=True) from error
 
 @hub_router.get("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
 async def download_directory(service: ServiceDependency) -> dict[str, str | int | bool | None]:

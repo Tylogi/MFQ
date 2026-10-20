@@ -207,6 +207,18 @@ export interface HubModelVariant {
   configuration: ModelConfigurationStatus;
 }
 
+export interface HubDownloadReuseRequest {
+  provider: HubModelSummary['provider'];
+  repo_id: string;
+  revision?: string | null;
+  destination: string;
+  download_directory?: string | null;
+}
+
+export interface HubDownloadReuseResponse {
+  reusable_files: Record<string, number>;
+}
+
 export interface HubMemoryPool {
   kind: 'uma' | 'vram' | 'ram';
   device?: string | null;

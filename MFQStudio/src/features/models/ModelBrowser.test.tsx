@@ -2,15 +2,40 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest';
 import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '../../shared/api/types';
 import { modelsApi } from '../../shared/api/resources/models';
+import { jobsApi } from '../../shared/api/resources/jobs';
 import { ModelBrowser } from './ModelBrowser';
+import { useJobStore } from '../../stores/jobStore';
 
 vi.mock('../../shared/api/resources/models', () => ({
-  modelsApi: { officialHubModels: vi.fn(), hubModelInfo: vi.fn(), resolveHubModel: vi.fn(), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }) },
+  modelsApi: { officialHubModels: vi.fn(), hubModelInfo: vi.fn(), resolveHubModel: vi.fn(), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }), downloadReuse: vi.fn().mockResolvedValue({ reusable_files: {} }) },
 }));
+vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { createJob: vi.fn() } }));
 
 const configuration = {
   status: 'unknown' as const, recommendation: 'unknown' as const, reasons: [],
 };
+
+it.each([3, 60])('downloads all shared Engram dependencies into one repository directory (%i shards)', async (count) => {
+  const data = catalog(false, true);
+  const table = 'Engram/model-EW-Engram-MXFP8-00002-of-00060.mfq';
+  const first = data.data[0];
+  first.variants[0] = { ...first.variants[0], label: 'Q3/model-EW-Q3',
+    files: [table, ...Array.from({ length: count }, (_, index) => `Q3/model-EW-Q3-${String(index + 1).padStart(5, '0')}-of-00060.mfq`)] };
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  vi.mocked(jobsApi.createJob).mockResolvedValue({ id: 'engram-download', kind: 'download.modelscope',
+    status: 'queued', progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' });
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()}
+    jobKinds={[{ kind: 'download.modelscope', payload_schema: {} }]}
+    onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const button = await screen.findByRole('button', { name: 'Download' });
+  await waitFor(() => expect(button).toBeEnabled());
+  fireEvent.click(button);
+  await waitFor(() => expect(jobsApi.createJob).toHaveBeenCalledWith('download.modelscope',
+    expect.objectContaining({ destination: 'models/modelscope/owner/first',
+      include: expect.arrayContaining([table]) })));
+  const include = vi.mocked(jobsApi.createJob).mock.calls[0][1].include as string[];
+  expect(include[0]).toMatch(/^Q3\//);
+});
 
 it('uses one combined MoE pressure bar and includes applied KV in its total', async () => {
   const data = catalog(false, true);
@@ -62,6 +87,57 @@ afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(modelsApi.probeDownloadSources).mockResolvedValue({ data: [] });
+  vi.mocked(modelsApi.downloadReuse).mockResolvedValue({ reusable_files: {} });
+  useJobStore.getState().setJobs([]);
+});
+
+const tableA = 'Engram/model-EW-Engram-MXFP8-00002-of-00003.mfq';
+const tableB = 'Engram/model-EW-Engram-MXFP8-00003-of-00003.mfq';
+const primary = 'Q3/model-EW-Q3-00001-of-00003.mfq';
+function engramCatalog() {
+  const data = catalog(false, true);
+  data.data[0].variants[0] = { ...data.data[0].variants[0], files: [primary, tableA, tableB],
+    byte_size: 70 * 2 ** 30, ssd_ple_bytes: 50 * 2 ** 30 };
+  return data;
+}
+
+it.each([25, 50])('shows reusable Engram and reduces download size for %i GiB already present', async (size) => {
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(engramCatalog());
+  vi.mocked(modelsApi.downloadReuse).mockResolvedValue({ reusable_files: {
+    [tableA]: 25 * 2 ** 30, ...(size === 50 ? { [tableB]: 25 * 2 ** 30 } : {}),
+  } });
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  expect(await screen.findByText(`Engram reusable · ${size}.0 GiB`)).toBeInTheDocument();
+  expect(screen.getByText(`Download needed ${70 - size}.0 GiB`)).toBeInTheDocument();
+  expect(document.querySelector('.model-variant small')).toHaveTextContent('file 70.0 GiB');
+});
+
+it('clears previous-directory reuse immediately and ignores late responses', async () => {
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(engramCatalog());
+  let resolveOld!: (value: { reusable_files: Record<string, number> }) => void;
+  vi.mocked(modelsApi.downloadReuse).mockImplementation(payload => payload.download_directory === '/old'
+    ? new Promise(resolve => { resolveOld = resolve; }) : Promise.resolve({ reusable_files: {} }));
+  const props = { tab: 'official' as const, onTabChange: vi.fn(), jobKinds: [], onError: vi.fn(), onJobCreated: vi.fn(), tr: (_: string, en: string) => en };
+  const view = render(<ModelBrowser {...props} downloadDirectory="/old" />);
+  await waitFor(() => expect(resolveOld).toBeDefined());
+  view.rerender(<ModelBrowser {...props} downloadDirectory="/new" />);
+  expect(await screen.findByText('Download needed 70.0 GiB')).toBeInTheDocument();
+  await act(async () => resolveOld({ reusable_files: { [tableA]: 25 * 2 ** 30 } }));
+  expect(screen.queryByText(/Engram reusable/)).not.toBeInTheDocument();
+});
+
+it('refreshes reuse after a download completes and marks complete tiers downloaded', async () => {
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(engramCatalog());
+  vi.mocked(modelsApi.downloadReuse).mockResolvedValueOnce({ reusable_files: {} }).mockResolvedValue({ reusable_files: {
+    [primary]: 20 * 2 ** 30, [tableA]: 25 * 2 ** 30, [tableB]: 25 * 2 ** 30,
+  } });
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  await screen.findByText('Download needed 70.0 GiB');
+  act(() => useJobStore.getState().setJobs([{ id: 'new-table', kind: 'download.modelscope',
+    status: 'succeeded', progress: 1, cancel_requested: false, payload: {}, created_at: '', updated_at: '' }]));
+  expect(await screen.findByText('Engram reusable · 50.0 GiB')).toBeInTheDocument();
+  expect(screen.getByText('Download needed 0 B')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Downloaded' })).toBeDisabled();
 });
 
 it('automatically selects the faster measured source without overriding a manual choice', async () => {

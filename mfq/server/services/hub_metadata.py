@@ -96,7 +96,7 @@ def inspect_mfq_header(data: bytes, file_size: int) -> MfqMetadata:
         block = re.match(r'^blk\.(\d+)\.', name)
         if block:
             last_legacy_block = max(last_legacy_block, int(block[1]))
-        if _is_always_streamed_tensor(name) and dtype in {'NINT', 'F16', 'BF16', 'F32', 'F8_E4M3'}:
+        if _is_always_streamed_tensor(name):
             ple_bytes += size
         else:
             weight_bytes += size
