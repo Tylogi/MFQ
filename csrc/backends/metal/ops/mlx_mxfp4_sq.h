@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-#include "mfq/quant/mxfp4_sq_blob.h"
+#include "quant/mxfp4_sq_blob.h"
 
 namespace mfq::metal {
 

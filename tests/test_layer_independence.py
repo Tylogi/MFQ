@@ -3,7 +3,7 @@
 
 The rules are about responsibility, not about directory names:
 
-  1. core, scheduler, transport, engine, models and file I/O never name a backend
+  1. core, formats, scheduler, transport, engine, models and file I/O never name a backend
      (mfq::cuda, mfq::metal, mfq_tensor_backend, backends/ includes).
   2. A model family may be named in engine/model/<family>/ and in models/, where
      the family lives.  The generic request table, the Planner, both Stores, the
@@ -38,7 +38,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 CSRC = REPO / "csrc"
-SHARED = ("core", "scheduler", "transport", "engine", "models", "components/io")
+SHARED = ("core", "formats", "scheduler", "transport", "engine", "models", "components/io")
 BACKEND_TOKEN = re.compile(r"mfq::(cuda|metal)\b|mfq_tensor_backend\b|backends/")
 # Family stems anywhere in an identifier: Qwen35, qwen3_5 and is_qwen35 all hit.
 FAMILY_TOKEN = re.compile(
@@ -75,19 +75,24 @@ def check_tree(csrc):
             continue
         under_model = relative.startswith("engine/model/")
         under_io = relative.startswith("components/io/")
+        under_formats = module == "formats"
         exempt = relative in FAMILY_EXCEPTIONS
         for lineno, line in code_lines(path):
             if BACKEND_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: shared layer names a backend: {line.strip()}")
             if module == "engine" and not under_model and not exempt and FAMILY_TOKEN.search(line):
                 failures.append(f"{relative}:{lineno}: generic engine code names a model family: {line.strip()}")
-        if not (under_model or under_io):
+        if not (under_model or under_io or under_formats):
             continue
         for lineno, raw in includes(path):
             hits = resolve(raw, path, roots)
             if not hits:
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
+            if under_formats:
+                if target.startswith(("core/", "engine/", "models/", "model_source/", "backends/")):
+                    failures.append(f"{relative}:{lineno}: format headers reach a higher layer: {raw}")
+                continue
             if under_io:
                 if (target.startswith(("core/", "models/", "model_source/", "engine/", "formats/")) or
                         target.startswith("backends/") and not target.startswith("backends/cpu/native/")):
@@ -110,6 +115,18 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("format headers may compose other format headers", {
+        "formats/quant/decode.h": '#include "quant/blob.h"\n',
+        "formats/quant/blob.h": "struct Blob {};\n",
+    }, None),
+    ("format headers may not reach the old core", {
+        "formats/quant/blob.h": '#include "mfq/runtime.h"\n',
+        "core/include/mfq/runtime.h": "struct Request {};\n",
+    }, "format headers reach a higher layer"),
+    ("format headers may not reach a backend by a bare include", {
+        "formats/quant/blob.h": '#include "tensor.h"\n',
+        "backends/cuda/tensor.h": "struct Tensor {};\n",
+    }, "format headers reach a higher layer"),
     ("file I/O may use host thread primitives", {
         "components/io/read.cpp": '#include "mfq/host_parallel.h"\n',
         "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",

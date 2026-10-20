@@ -208,6 +208,10 @@ FIXTURES = [
         "components/io/read.cpp": '#include "table.h"\n',
         "engine/requests/table.h": "struct Row {};\n",
     }, "engine private headers may not be included here"),
+    ("format headers may not include an engine private header", {
+        "formats/quant/blob.h": '#include "table.h"\n',
+        "engine/requests/table.h": "struct Row {};\n",
+    }, "engine private headers may not be included here"),
     ("scheduler may not reach a private header by relative path", {
         "scheduler/side.cpp": '#include "../engine/requests/table.h"\n',
         "engine/requests/table.h": "struct Row {};\n",

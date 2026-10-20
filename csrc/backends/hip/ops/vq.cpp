@@ -4,7 +4,7 @@
 #include "vq.h"
 #include "hip_execution.h"
 #include "format.h"
-#include "nvq_codebooks.generated.h"
+#include "generated/nvq_codebooks.generated.h"
 #include "quant_dot.h"
 #include "nvq_group.h"
 #include "cpu_projection_rows.h"

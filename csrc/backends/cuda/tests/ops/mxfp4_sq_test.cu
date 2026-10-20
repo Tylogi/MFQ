@@ -1,6 +1,6 @@
 #include "native/env.h"
 #include "csrc/backends/cuda/kernels/quant/mxfp4_sq.h"
-#include "mfq/quant/mxfp4_sq_decode.h"
+#include "quant/mxfp4_sq_decode.h"
 
 #include <cmath>
 #include <cstdlib>

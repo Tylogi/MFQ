@@ -1,4 +1,4 @@
-#include "mfq/quant/fp8_sq_blob.h"
+#include "quant/fp8_sq_blob.h"
 #include "mfq/model_source/hf_model_source.h"
 #include "mfq/model_source/hf_safetensors_source.h"
 #include "mfq/model_source/mfq_model_source.h"

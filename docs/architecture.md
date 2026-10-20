@@ -113,8 +113,8 @@ ControlResult control(ControlRequest request);
 - Metal 保留独立 generation；`mlx_mtp.cpp` 的 `GenerationPolicy<MlxDsparkDepthController>` 引用残留源码可见，接口仍需同步。见 [B18](bugs.md)。
 - Store 所有权未收口（`CudaStores`）。见 [B34](bugs.md) 与 plan §1.4 R4。
 - 没有 `csrc/engine/model/`，没有 `Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
-- `core/` 聚合仍在。K1 的 host/CPU 原语、专家调度与文件 I/O 已拆出；`components/io` 的 `mfq-io` 只依赖 host 线程原语，主机拷贝声明归 `backends/cpu/ops`。formats、model_source、视觉算法与 K2–K4 仍待迁移。见 plan §1.6。
-- 已知非绿：`mfq-float-projection-test`（[B11](bugs.md)）、`mfq-cuda-include-graph-test` 重复注册（[B15](bugs.md)）。
+- `core/` 聚合仍在。K1 的 host/CPU 原语、专家调度与文件 I/O 已拆出；纯格式头和冻结码表归 `formats`，CUDA kernel 不再取得 core 的 include 路径或链接 `mfq-core`。native 的分配失败异常仍私有依赖 core，随 K2 迁移。格式 schema、行读取、ModelSource、视觉算法与 K2–K4 仍待迁移。见 plan §1.6。
+- 已知非绿：`mfq-float-projection-test`（[B11](bugs.md)）、`mfq-cuda-include-graph-test` 重复注册（[B15](bugs.md)）、普通 MXFP8 的 16 行反向回退误差（[B35](bugs.md)）。
 
 ## 7. 规则与目标在哪里
 

@@ -43,10 +43,11 @@ add_library(mfq-cuda-native STATIC
 )
 add_library(mfq::cuda-native ALIAS mfq-cuda-native)
 target_include_directories(mfq-cuda-native PUBLIC
-    ${MFQ_CORE_INCLUDE_DIR}
     ${MFQ_CUDA_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
+# shortcut: allocation errors still live in core, remove this private path when K2 moves them.
+target_include_directories(mfq-cuda-native PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 target_link_libraries(mfq-cuda-native PUBLIC
     CUDA::cudart CUDA::cublas mfq-host-parallel)
 if(WIN32)
@@ -172,8 +173,8 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
-    PUBLIC mfq-cuda-native CUDA::cuda_driver mfq-ggml
-    PRIVATE mfq-core mfq-ggml-internal-headers
+    PUBLIC mfq-cuda-native CUDA::cuda_driver mfq-ggml mfq-formats
+    PRIVATE mfq-ggml-internal-headers
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
@@ -231,7 +232,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT} ${MFQ_CUDA_ROOT})
     target_link_libraries(mfq-mxfp4-sq-test PRIVATE
-        mfq-core mfq-cuda-native mfq-cuda-native-kernels)
+        mfq-formats mfq-cuda-native mfq-cuda-native-kernels)
     set_target_properties(mfq-mxfp4-sq-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

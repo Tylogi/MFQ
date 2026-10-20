@@ -30,6 +30,10 @@ architecture-named entry point.
   `model_source/`, `backends/cpu/` and the Engine modules, and
   [plan.md](docs/plan.md) §1.6 (K1–K4) removes `csrc/core/` and `mfq-core`.
   Do not add new code to `core/` that belongs in one of those owners.
+- Packed format headers and frozen codebooks live in `csrc/formats/`
+  (`mfq-formats`), without a model-source, Engine or backend dependency.
+  CUDA native kernels link this header target directly; they must not link
+  `mfq-core` or use its include directories.
 - File ranges, batched reads and I/O statistics live in `csrc/components/io/`
   (`mfq-io`), with headers beside the implementation. It links only host
   thread primitives and must not depend on model loading, formats, Engine

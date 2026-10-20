@@ -30,7 +30,6 @@ add_library(mfq-model-source STATIC
     include/mfq/quant/nint_rows.h
     quant/nvq_rows.cpp
     include/mfq/quant/nvq_rows.h
-    include/mfq/quant/packed_row_range.h
     model_source/hf_model_source.cpp
     model_source/hf_safetensors_source.cpp
     include/mfq/model_source/hf_model_source.h
@@ -47,7 +46,7 @@ target_include_directories(mfq-model-source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
-target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-io)
+target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-formats mfq-io)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)
@@ -72,9 +71,9 @@ target_include_directories(mfq-core INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
-    ${CMAKE_CURRENT_SOURCE_DIR}/generated
 )
 target_link_libraries(mfq-core INTERFACE
+    mfq-formats
     mfq-host-parallel
     mfq-model-graph
     mfq-model-source

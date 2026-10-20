@@ -1,6 +1,6 @@
 #include "qwen35_model.h"
 
-#include "mfq/quant/nint_blob.h"
+#include "quant/nint_blob.h"
 
 #include "nlohmann/json.hpp"
 

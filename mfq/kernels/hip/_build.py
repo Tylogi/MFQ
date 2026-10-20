@@ -11,7 +11,7 @@ def stage_sources(repository: Path, build_directory: Path) -> Path:
     trees = (
         "mfq/kernels/hip",
         "csrc/backends/hip/include",
-        "csrc/core/include",
+        "csrc/formats",
         "csrc/components/ggml/include",
         "csrc/components/ggml/src/ggml-hip",
     )

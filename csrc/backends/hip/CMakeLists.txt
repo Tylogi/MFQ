@@ -113,8 +113,8 @@ target_include_directories(mfq-hip-native-kernels PRIVATE
     ${MFQ_REPOSITORY_ROOT}/csrc/components/ggml/src/ggml-hip/vendors
 )
 target_link_libraries(mfq-hip-native-kernels
-    PUBLIC mfq-hip-core
-    PRIVATE mfq-core mfq-ggml-internal-headers
+    PUBLIC mfq-hip-core mfq-formats
+    PRIVATE mfq-ggml-internal-headers
 )
 # nvq_matmul's heavily templated tile kernels take ~25 minutes at -O3 for
 # gfx942 with negligible runtime difference on the memory-bound decode path;

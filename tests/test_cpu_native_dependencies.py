@@ -1,5 +1,6 @@
 """CPU primitives and file I/O must not pull in expert execution or the old core."""
 from pathlib import Path
+import json
 import re
 import sys
 
@@ -43,18 +44,80 @@ def _check_native_targets(graph: str, cuda: bool) -> None:
         assert not dependencies & forbidden, f"{target} reaches {dependencies & forbidden}"
     assert "mfq-cpu-execution" in _target_dependencies(graph, "mfq-cpu-expert-pool-test")
     assert "mfq-host-parallel" in _target_dependencies(graph, "mfq-cpu-execution")
+    if cuda:
+        _check_kernel_target(graph)
+
+
+def _check_kernel_target(graph: str) -> None:
+    dependencies = _target_dependencies(graph, "mfq-cuda-native-kernels")
+    assert "mfq-formats" in dependencies
+    forbidden = {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-engine", "mfq-models",
+                 "mfq-json", "mfq-io", "mfq-cpu-ops", "mfq-cpu-execution", "mfq-qsa-kv-store"}
+    assert not dependencies & forbidden, f"kernels reach {dependencies & forbidden}"
+    assert _target_dependencies(graph, "mfq-formats") == {"mfq-formats"}
+
+
+def test_kernel_target_check_rejects_transitive_core_dependency() -> None:
+    graph = '\n'.join(f'"n{i}" [ label = "{name}" ];' for i, name in enumerate(
+        ["mfq-cuda-native-kernels", "mfq-formats", "bridge", "mfq-core"]))
+    graph += '\n"n0" -> "n1";\n"n0" -> "n2";'
+    _check_kernel_target(graph)
+    with pytest.raises(AssertionError, match="kernels reach"):
+        _check_kernel_target(graph + '\n"n2" -> "n3";')
+
+
+def _check_kernel_sources(csrc: Path) -> None:
+    core = csrc / "core"
+    units = list(sources(str(csrc / "backends/cuda/kernels")))
+    assert units, "CUDA kernel sources missing"
+    for unit in units:
+        reached, _ = closure(unit, str(csrc))
+        escaped = [path for path in reached if Path(path).is_relative_to(core)]
+        assert not escaped, f"{unit} reaches core sources: {escaped}"
+
+
+def test_kernel_source_closure() -> None:
+    _check_kernel_sources(CSRC)
+
+
+def test_kernel_source_check_rejects_transitive_core_include(tmp_path: Path) -> None:
+    kernel = tmp_path / "backends/cuda/kernels"
+    kernel.mkdir(parents=True)
+    (kernel / "read.cu").write_text('#include "bridge.h"\n')
+    bridge = kernel / "bridge.h"
+    bridge.write_text('#include "quant/blob.h"\n')
+    blob = tmp_path / "formats/quant/blob.h"
+    blob.parent.mkdir(parents=True)
+    blob.write_text('#pragma once\n')
+    _check_kernel_sources(tmp_path)
+    forbidden = tmp_path / "core/include/mfq/runtime.h"
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_text('#pragma once\n')
+    blob.write_text('#include <mfq/runtime.h>\n')
+    with pytest.raises(AssertionError, match="reaches core sources"):
+        _check_kernel_sources(tmp_path)
 
 
 @pytest.mark.parametrize("cuda", [False, True], ids=["host-only", "cuda"])
-def test_native_target_closure(tmp_path: Path, cuda: bool) -> None:
+@pytest.mark.parametrize("communication", [False, True], ids=["no-communication", "communication"])
+def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) -> None:
     if cuda and (not NOT_APPLE or _cuda_compiler() is None):
         pytest.skip("CUDA target graph requires a supported CUDA toolchain")
-    options = [f"-DMFQ_BUILD_CUDA_RUNTIME={'ON' if cuda else 'OFF'}", "-DMFQ_BUILD_METAL_RUNTIME=OFF"]
+    options = [f"-DMFQ_BUILD_CUDA_RUNTIME={'ON' if cuda else 'OFF'}", "-DMFQ_BUILD_METAL_RUNTIME=OFF",
+               f"-DMFQ_BUILD_RUNTIME_COMMUNICATION={'ON' if communication else 'OFF'}",
+               "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
     if not cuda:
         options.extend(NO_CUDA_TOOLKIT)
     code, output, _ = _configure(tmp_path, "native-closure", *options)
     assert code == 0, output
     _check_native_targets((tmp_path / "native-closure/targets.dot").read_text(), cuda)
+    if cuda:
+        commands = json.loads((tmp_path / "native-closure/compile_commands.json").read_text())
+        kernels = [item["command"].replace("\\", "/") for item in commands
+                   if "mfq-cuda-native-kernels.dir" in item["command"]]
+        assert kernels, "native kernel compile commands missing"
+        assert all((CSRC / "formats").as_posix() in command for command in kernels)
+        assert all((CSRC / "core").as_posix() not in command for command in kernels)
 
 
 def test_target_check_rejects_transitive_expert_dependency() -> None:

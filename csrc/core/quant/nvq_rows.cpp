@@ -1,5 +1,5 @@
 #include "mfq/quant/nvq_rows.h"
-#include "mfq/quant/packed_row_range.h"
+#include "quant/packed_row_range.h"
 
 #include <cstring>
 #include <limits>

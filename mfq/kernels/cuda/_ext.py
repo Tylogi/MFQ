@@ -19,7 +19,7 @@ _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
 _BACKEND_DIR = str(Path(_REPOSITORY_ROOT) / "csrc" / "backends" / "cuda")
 _KERNEL_DIR = str(Path(_BACKEND_DIR) / "kernels")
-_CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "csrc" / "core" / "include")
+_FORMATS_INCLUDE = str(Path(_REPOSITORY_ROOT) / "csrc" / "formats")
 _GGML_ROOT = Path(_REPOSITORY_ROOT) / "csrc" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
@@ -126,7 +126,7 @@ def ext():
                 _REPOSITORY_ROOT,
                 _BACKEND_DIR,
                 _KERNEL_DIR,
-                _CORE_INCLUDE,
+                _FORMATS_INCLUDE,
                 _GGML_INCLUDE,
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,

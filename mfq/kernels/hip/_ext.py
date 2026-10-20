@@ -63,7 +63,7 @@ def ext():
                 str(kernel),
                 str(root),
                 str(root / "csrc/backends/hip/include"),
-                str(root / "csrc/core/include"),
+                str(root / "csrc/formats"),
                 str(ggml / "include"),
                 str(ggml / "src"),
                 str(ggml / "src/ggml-hip"),

@@ -9,7 +9,7 @@
 #include "kernels/gated_residual_fused.h"
 #include "kernels/quant_ops.h"
 #include "kernels/attention/selected_attention.h"
-#include "mfq/quant/mxfp4_sq_decode.h"
+#include "quant/mxfp4_sq_decode.h"
 
 #include <algorithm>
 #include <cstring>

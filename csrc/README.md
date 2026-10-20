@@ -3,18 +3,23 @@
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
 target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`, and adds `formats/` and `model_source/`.
-File I/O already lives in `components/io/`. That end state is defined in
+`engine/model/<family>/`, and adds `model_source/`.
+Pure format headers and frozen codebooks already live in `formats/`, and file
+I/O lives in `components/io/`. That end state is defined in
 [docs/refactor.md](../docs/refactor.md) and sequenced in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
 - `core/` — canonical model graph, request/value contracts, policies, and
-  generated tables; temporary old-artifact name adapters live in
+  row readers; temporary old-artifact name adapters live in
   `core/compat/`. This is a transitional aggregation target (`mfq-core`), not a
   target module: its responsibilities are reassigned in
   [docs/refactor.md](../docs/refactor.md) and removed by K1–K4 in
   [docs/plan.md](../docs/plan.md);
+- `formats/` — packed quantization schemas, byte-range decoding helpers and
+  frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
+  dependency. Model sources and backend operators consume it directly; CUDA
+  native kernels no longer depend on `mfq-core`;
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
