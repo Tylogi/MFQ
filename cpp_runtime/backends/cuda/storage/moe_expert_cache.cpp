@@ -666,33 +666,45 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::prepare_ssd_expe
 void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,bool background) {
     if(reads.missing.empty())return;
     std::optional<SsdReadPriority::Demand> demand;
-    if(!background && !reads.demand)demand.emplace(ssd_read_priority_);
+    if(!background && !reads.demand)demand.emplace(ssd_read_priority_,reads.missing.size());
     auto* pool=background?ssd_background_read_pool_.get():ssd_read_pool_.get();
     if(!pool)throw std::logic_error("SSD expert read pool is not initialized");
     // An adaptive batch must not hold the demand executor's dispatch mutex
     // while a predictor is waiting for just its current routed experts.
     const int workers=std::max(1,background?config_.moe_ssd_io_workers/2:config_.moe_ssd_io_workers);
-    execute_ssd_expert_reads(reads,*pool,workers);
+    execute_ssd_expert_reads(reads,*pool,workers,true,
+        reads.demand?&*reads.demand:demand?&*demand:nullptr);
 }
 
-void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch) {
+void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch,
+        SsdReadPriority::Demand* demand) {
     if(reads.missing.empty())return;
     ssd_scheduled_read_jobs_.fetch_add(reads.missing.size(),std::memory_order_relaxed);
     pool.run(0,int64_t(reads.missing.size()),1,workers,
         [&](int64_t begin,int64_t end) {
             const mfq::MappedPrefetchScope copied(false,true);
             for(auto i=begin;i<end;++i) {
+                struct FinishField {
+                    SsdReadPriority::Demand* demand;
+                    ~FinishField(){if(demand)demand->complete();}
+                } finish{demand};
                 const auto index=reads.missing[i];
                 // A not-yet-started forecast owns no source flight. Demand
                 // can read that projection itself while this worker waits.
                 if(!touch) {
                     const auto canceled=[&]{return reads.prediction_canceled(std::size_t(i));};
-                    if(ssd_read_priority_.wait_for_idle(canceled) &&
+                    // Two forecast readers may use slots left by a short
+                    // urgent batch. A queued full batch still takes priority.
+                    const auto allowance=std::size_t(std::max(0,config_.moe_ssd_io_workers-2));
+                    bool overlapped=false;
+                    if(ssd_read_priority_.wait_for_capacity(allowance,canceled,&overlapped) &&
                             !ssd_prediction_io_deferrals_.fetch_add(1,std::memory_order_relaxed))
                         std::fprintf(stderr,"moe_ssd_forecast_idle_io scope=first_deferred_request enabled=1 policy=demand_first\n");
                     // Claim and cancellation compete before acquire_expert
                     // creates a source flight. Started reads finish normally.
                     if(!reads.start_prediction(std::size_t(i)))continue;
+                    if(overlapped && !ssd_prediction_spare_jobs_.fetch_add(1,std::memory_order_relaxed))
+                        std::fprintf(stderr,"moe_ssd_forecast_spare_io scope=first_overlap enabled=1 urgent_allowance=%zu readers=2\n",allowance);
                 }
                 reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second,touch);
                 if(reads.publish_progress)reads.publish_read(index);
@@ -795,7 +807,7 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert
         if(!ssd_prefill_reader_)throw std::logic_error("SSD expert read queue is not initialized");
         // Register before queueing so a predictor cannot win the worker wakeup
         // race. The counter is released on completion, failure or queue rejection.
-        reads->demand.emplace(ssd_read_priority_);
+        reads->demand.emplace(ssd_read_priority_,reads->missing.size());
         reads->ready=ssd_prefill_reader_->submit([this,pending=reads.get()] {
             struct FinishDemand {
                 SsdExpertReads& reads;

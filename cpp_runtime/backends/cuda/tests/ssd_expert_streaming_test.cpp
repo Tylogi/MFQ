@@ -61,7 +61,7 @@ struct MoeResidencyTestAccess {
             MoeExpertCache::SsdReadPriority priority;
             std::optional<MoeExpertCache::SsdReadPriority::Demand> held;held.emplace(priority);
             auto waiting=std::async(std::launch::async,[&] {
-                return priority.wait_for_idle([&]{return queued.prediction_canceled(0);});
+                return priority.wait_for_capacity(0,[&]{return queued.prediction_canceled(0);});
             });
             const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
             bool registered=false;
@@ -92,7 +92,7 @@ struct MoeResidencyTestAccess {
             MoeExpertCache::SsdReadPriority priority;
             using Demand=MoeExpertCache::SsdReadPriority::Demand;
             std::optional<Demand> first,second;first.emplace(priority);second.emplace(priority);
-            auto prediction=std::async(std::launch::async,[&]{return priority.wait_for_idle();});
+            auto prediction=std::async(std::launch::async,[&]{return priority.wait_for_capacity(0);});
             const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
             bool waiting=false;
             while(std::chrono::steady_clock::now()<deadline) {
@@ -102,14 +102,48 @@ struct MoeResidencyTestAccess {
             first.reset();
             const bool held=prediction.wait_for(std::chrono::seconds(0))==std::future_status::timeout;
             second.reset();const bool deferred=prediction.get();
-            if(!waiting || !held || !deferred || priority.wait_for_idle())
+            if(!waiting || !held || !deferred || priority.wait_for_capacity(0))
                 throw std::runtime_error("SSD prediction bypassed a queued demand or waited after its release");
             try {Demand failing(priority);throw std::runtime_error("injected read failure");}
             catch(const std::runtime_error&){}
             {std::lock_guard lock(priority.mutex);
              if(priority.pending || priority.waiting)
                  throw std::runtime_error("failed SSD demand retained a live priority guard");}
-            if(priority.wait_for_idle())throw std::runtime_error("failed SSD demand retained its I/O priority");
+            if(priority.wait_for_capacity(0))throw std::runtime_error("failed SSD demand retained its I/O priority");
+        }
+        {
+            MoeExpertCache::SsdReadPriority priority;
+            using Demand=MoeExpertCache::SsdReadPriority::Demand;
+            Demand batch(priority,8);
+            bool spare=false;
+            auto prediction=std::async(std::launch::async,[&]{return priority.wait_for_capacity(6,{},&spare);});
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            bool waiting=false;
+            while(std::chrono::steady_clock::now()<deadline) {
+                {std::lock_guard lock(priority.mutex);waiting=priority.waiting>0;}
+                if(waiting)break;std::this_thread::yield();
+            }
+            batch.complete();
+            const bool full=prediction.wait_for(std::chrono::seconds(0))==std::future_status::timeout;
+            batch.complete();
+            const bool released=prediction.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+            if(!released) {
+                for(int i=0;i<6;++i)batch.complete();
+                (void)prediction.get();
+                throw std::runtime_error("SSD spare reader did not wake as urgent fields completed");
+            }
+            if(!waiting || !full || !prediction.get() || !spare)
+                throw std::runtime_error("SSD spare reader bypassed full demand or waited for the entire batch");
+            auto first=std::async(std::launch::async,[&]{for(int i=0;i<3;++i)batch.complete();});
+            auto second=std::async(std::launch::async,[&]{for(int i=0;i<3;++i)batch.complete();});
+            first.get();second.get();
+            {std::lock_guard lock(priority.mutex);
+             if(priority.pending || priority.waiting)
+                 throw std::runtime_error("parallel SSD fields retained demand capacity after completion");}
+            try {Demand failed(priority,9);failed.complete();throw std::runtime_error("partial read failure");}
+            catch(const std::runtime_error&){}
+            {std::lock_guard lock(priority.mutex);
+             if(priority.pending)throw std::runtime_error("partially completed SSD batch leaked its unread fields");}
         }
         {
             MoeExpertCache::SsdExpertReads ordered;

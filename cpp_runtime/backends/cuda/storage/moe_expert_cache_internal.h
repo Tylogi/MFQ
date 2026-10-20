@@ -377,23 +377,38 @@ public:
     struct SsdReadPriority {
         std::mutex mutex;
         std::condition_variable idle;
+        // Count unfinished urgent fields, including queued work. Completed
+        // fields release their capacity while the remaining batch is consumed.
         std::size_t pending=0,waiting=0;
         struct Demand {
             SsdReadPriority& priority;
-            explicit Demand(SsdReadPriority& value):priority(value) {
-                std::lock_guard lock(priority.mutex);++priority.pending;
+            std::size_t remaining;
+            explicit Demand(SsdReadPriority& value,std::size_t jobs=1):priority(value),remaining(jobs) {
+                std::lock_guard lock(priority.mutex);priority.pending+=remaining;
             }
             Demand(const Demand&)=delete;
             Demand& operator=(const Demand&)=delete;
+            void complete() {
+                {
+                    std::lock_guard lock(priority.mutex);
+                    if(!remaining)throw std::logic_error("SSD demand completion exceeded its registered fields");
+                    --remaining;--priority.pending;
+                }
+                priority.idle.notify_all();
+            }
             ~Demand() {
-                {std::lock_guard lock(priority.mutex);--priority.pending;}
+                {std::lock_guard lock(priority.mutex);priority.pending-=remaining;}
                 priority.idle.notify_all();
             }
         };
-        bool wait_for_idle(const std::function<bool()>& canceled={}) {
-            const auto ready=[&]{return !pending || (canceled && canceled());};
-            std::unique_lock lock(mutex);if(ready())return false;
-            ++waiting;idle.wait(lock,ready);--waiting;return true;
+        bool wait_for_capacity(std::size_t urgent_allowance,const std::function<bool()>& canceled={},
+                bool* overlapped=nullptr) {
+            const auto ready=[&]{return pending<=urgent_allowance || (canceled && canceled());};
+            std::unique_lock lock(mutex);
+            const bool deferred=!ready();
+            if(deferred){++waiting;idle.wait(lock,ready);--waiting;}
+            if(overlapped)*overlapped=pending>0 && pending<=urgent_allowance;
+            return deferred;
         }
         void notify_canceled() {
             // Pair notification with the wait mutex even though cancellation
@@ -526,7 +541,8 @@ public:
     };
     std::unique_ptr<SsdExpertReads> prepare_ssd_expert_reads(std::vector<SsdExpertRequest> requests,bool background=false,bool prediction=false);
     void execute_ssd_expert_reads(SsdExpertReads& reads,bool background=false);
-    void execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch=true);
+    void execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch=true,
+        SsdReadPriority::Demand* demand=nullptr);
     void queue_ssd_prediction(std::vector<SsdExpertRequest> requests);
     void observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests,
         const std::array<MoeQuantRangeSource*,3>& current_sources);
@@ -1118,6 +1134,7 @@ public:
             {"ssd_router_prediction_hits",double(ssd_prediction_hits_)},
             {"ssd_router_prefetch_busy_skips",double(ssd_prediction_busy_skips_)},
             {"ssd_router_prefetch_io_deferrals",double(ssd_prediction_io_deferrals_.load())},
+            {"ssd_router_prefetch_spare_capacity_jobs",double(ssd_prediction_spare_jobs_.load())},
             {"ssd_router_prefetch_io_wait_us",double(ssd_prediction_wait_ns_)/1000},
             {"ssd_router_prefetch_route_wait_ms",double(ssd_prediction_route_wait_ns_)/1e6},
             {"ssd_router_gpu_protected_fields",double(ssd_prediction_gpu_protected_fields_)},
@@ -1313,7 +1330,7 @@ private:
     bool ssd_prediction_auto_=false;
     std::uint64_t ssd_prediction_route_wait_ns_=0;
     std::atomic<std::uint64_t> ssd_ram_read_fast_hits_{0},ssd_scheduled_read_jobs_{0};
-    std::atomic<std::uint64_t> ssd_prediction_io_deferrals_{0};
+    std::atomic<std::uint64_t> ssd_prediction_io_deferrals_{0},ssd_prediction_spare_jobs_{0};
     bool pipeline_residency_suspended_=false;
     bool pipeline_reuse_learning_=true;
     CudaExecutionConfig config_;
