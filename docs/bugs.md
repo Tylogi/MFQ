@@ -147,21 +147,21 @@
 ### B27：只排列回调的共享模板
 
 - 状态：待处理，随 plan 阶段 7 的旧主链删除。
-- 位置：[`attention_layer`](../csrc/models/common/transformer_layer.h)、[`full_attention`](../csrc/models/common/attention.h)（接收八个操作回调）、[`full_block.cpp`](../csrc/backends/cuda/models/common/full_block.cpp)；`gated_mlp` 有类似拆分。
+- 位置：[`attention_layer`](../csrc/engine/model/common/transformer_layer.h)、[`full_attention`](../csrc/engine/model/common/attention.h)（接收八个操作回调）、[`full_block.cpp`](../csrc/backends/cuda/models/common/full_block.cpp)；`gated_mlp` 有类似拆分。
 - 影响：实际计算、融合条件与临时状态仍在后端，共享模板只排列 callback，读不出模型数学。
 - 关闭条件：逐项判断删除模板后复杂度是消失还是转移；纯转发合回拥有实际行为的模块，保留有独立语义、验证或真实复用收益的组合。
 
 ### B28：模型继承与绑定链，Metal 未接入共享 model/engine
 
 - 状态：待处理，随 plan 阶段 2（CUDA）与阶段 4（Metal）。
-- 位置：入口 [`models/common/causal_model.h`](../csrc/models/common/causal_model.h)、[`backends/cuda/models/common/causal_model_ops.h`](../csrc/backends/cuda/models/common/causal_model_ops.h)、[`backends/cuda/models/qwen35/ops.h`](../csrc/backends/cuda/models/qwen35/ops.h)；链路 `CausalLm → CausalModelBase → CudaCausalOps → Qwen35Model → CausalResources`，另有 `ForwardOps` 与 `CudaSessionCodec`。Metal 的 `MlxEngine` 实现公共 `Engine` 但有自己的 generation，不使用 `EngineInstance` 或共享模型模板。
+- 位置：入口 [`engine/model/common/causal_model.h`](../csrc/engine/model/common/causal_model.h)、[`backends/cuda/models/common/causal_model_ops.h`](../csrc/backends/cuda/models/common/causal_model_ops.h)、[`backends/cuda/models/qwen35/ops.h`](../csrc/backends/cuda/models/qwen35/ops.h)；链路 `CausalLm → CausalModelBase → CudaCausalOps → Qwen35Model → CausalResources`，另有 `ForwardOps` 与 `CudaSessionCodec`。Metal 的 `MlxEngine` 实现公共 `Engine` 但有自己的 generation，不使用 `EngineInstance` 或共享模型模板。
 - 影响：多层直接依赖同一对象的 `config`、`metadata`、`blocks`、`execution`；实现者必须了解内部成员。共享性只由头文件不依赖后端来证明，实际是两套执行。
 - 关闭条件：CUDA 侧沿 Qwen35 调用链确认没有 CausalModelBase/CudaCausalOps/ForwardOps；Metal 侧接入同一 Engine 装配与 family forward，不转发到旧 MLX generation loop。
 
 ### B29：重复状态需要手动同步
 
 - 状态：待处理，随 plan 阶段 2。
-- 位置：[`models/qwen35/causal_lm.h`](../csrc/models/qwen35/causal_lm.h) 的 `load_config` 逐字段复制到 `CausalLmMetadata`，`set_max_position_embeddings()` 同时改 config 与 metadata；[`backends/cuda/engine/model_components.h`](../csrc/backends/cuda/engine/model_components.h) 同时保存 `mtp_available` 等声明与实际状态。
+- 位置：[`engine/model/qwen35/causal_lm.h`](../csrc/engine/model/qwen35/causal_lm.h) 的 `load_config` 逐字段复制到 `CausalLmMetadata`，`set_max_position_embeddings()` 同时改 config 与 metadata；[`backends/cuda/engine/model_components.h`](../csrc/backends/cuda/engine/model_components.h) 同时保存 `mtp_available` 等声明与实际状态。
 - 影响：漏同步会产生互相矛盾的可变事实。
 - 关闭条件：配置与加载结果各只有一份所有者，可派生状态不再单独存储；保留「模型声明 / 后端支持 / 权重实际加载成功」三者的语义区别。
 

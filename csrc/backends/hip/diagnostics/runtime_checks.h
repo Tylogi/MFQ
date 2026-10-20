@@ -5,11 +5,11 @@
 #include "../../hip/diagnostics/generation_result.h"
 #include "models/deepseek_v4/ops.h"
 #include "diagnostics/flash_next_mtp.h"
-#include "qwen35/mtp.h"
+#include "models/qwen35/mtp.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
 #include "hip_execution.h"
-#include "qwen35/linear_attention.h"
+#include "models/qwen35/linear_attention.h"
 #include "mfq/kernels/hip/deepseek_v41.h"
 #include "nlohmann/json.hpp"
 

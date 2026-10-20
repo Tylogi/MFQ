@@ -3,7 +3,7 @@
 #include "causal_forward.h"
 #include "step_sequence.h"
 #include "gated_mlp.h"
-#include "../../engine/model/common/vision/grid_vision.h"
+#include "common/vision/grid_vision.h"
 #include "transformer_layer.h"
 #include <cmath>
 #include <utility>

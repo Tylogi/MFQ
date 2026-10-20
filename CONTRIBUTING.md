@@ -53,12 +53,13 @@ architecture-named entry point.
   `StepSequence` live in `csrc/engine/include/`. Sampling has one definition in
   `sampling_params.h`; device sampling adapters include that narrow contract.
   Native allocators include `resource_error.h` directly without core.
-- Shared model configurations and forward definitions live today in
-  `csrc/models/<family>/`, with shared layer compositions in
-  `csrc/models/common/`. Family equations, positions and topology are defined
-  once and composed with backend operations. The target moves each family to
-  `csrc/engine/model/<family>/` composed with complete backend operators;
-  [refactor.md](docs/refactor.md) defines that end state and
+- Shared model configurations and forward definitions live in
+  `csrc/engine/model/<family>/`, with shared layer compositions in
+  `csrc/engine/model/common/`. Their non-template implementations compile in
+  `mfq-engine`; backend adapters and tests opt into the private model include
+  path. Family equations, positions and topology are defined once. The target
+  composes complete backend operators; [refactor.md](docs/refactor.md) defines
+  that execution chain and
   [bugs.md](docs/bugs.md) B28 tracks the current binding chain
   (`CausalModelBase → CudaCausalOps → native model`) as debt, not as a rule to
   reproduce.

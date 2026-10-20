@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../engine/model/common/vision/grid_vision.h"
+#include "common/vision/grid_vision.h"
 #include "tensor_layout.h"
 #include "model_graph/model_graph.h"
 #include "common/model_config.h"

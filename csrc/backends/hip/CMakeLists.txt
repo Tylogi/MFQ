@@ -157,11 +157,11 @@ endfunction()
 function(mfq_configure_hip_runtime_target target)
     mfq_configure_hip_backend_target(${target})
     target_include_directories(${target} PRIVATE
-        ${MFQ_HIP_ROOT}/models
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_HIP_ROOT}/commands
         ${MFQ_HIP_ROOT}/engine
     )
-    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
+    target_link_libraries(${target} PRIVATE mfq-engine)
 endfunction()
 
 set(MFQ_HIP_MODEL_SOURCES

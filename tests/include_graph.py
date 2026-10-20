@@ -37,8 +37,7 @@ def include_roots(csrc):
     roots += [os.path.join(csrc, "backends", "cpu", "ops"),
               os.path.join(csrc, "components", "io")]
     roots += [os.path.join(csrc, "components", "tokenizer"),
-              os.path.join(csrc, "components", "tokenizer", "include"),
-              os.path.join(csrc, "models")]
+              os.path.join(csrc, "components", "tokenizer", "include")]
     return [r for r in roots if os.path.isdir(r)]
 
 

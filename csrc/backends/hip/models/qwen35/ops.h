@@ -3,8 +3,8 @@
 
 #include "core/causal_model.h"
 #include "storage/session_state.h"
-#include "models/qwen35/causal_lm.h"
-#include "models/qwen35/config.h"
+#include "qwen35/causal_lm.h"
+#include "qwen35/config.h"
 
 #include <cstdint>
 #include <memory>

@@ -315,7 +315,6 @@ target_include_directories(mfq-metal-runtime PRIVATE
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-core
-    mfq-models
     mfq-engine
     mfq-mlx
     mfq-jaccl

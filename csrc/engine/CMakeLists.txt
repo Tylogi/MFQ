@@ -1,5 +1,14 @@
 add_library(mfq-engine STATIC
     model/common/vision/grid_vision.cpp
+    model/common/model_config.cpp
+    model/deepseek_v4/config.cpp
+    model/deepseek_v41/config.cpp
+    model/gemma4/config.cpp
+    model/glm5_next/config.cpp
+    model/glm_dsa/config.cpp
+    model/minicpmo45/config.cpp
+    model/qwen35/config.cpp
+    model/qwen4_exp/config.cpp
     weights/slots.cpp
     src/settings.cpp
     src/policy.cpp
@@ -12,12 +21,12 @@ target_include_directories(mfq-engine
     PRIVATE ${MFQ_ENGINE_PRIVATE_DIRS}
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
-target_link_libraries(mfq-engine PUBLIC mfq-core)
+target_link_libraries(mfq-engine PRIVATE mfq-core)
 set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(TARGET mfq-paged-prefix-cache)
     target_sources(mfq-engine PRIVATE state/paged.cpp)
-    target_link_libraries(mfq-engine PUBLIC mfq-paged-prefix-cache)
+    target_link_libraries(mfq-engine PRIVATE mfq-paged-prefix-cache)
 endif()
 
 if(TARGET mfq-tokenizer)

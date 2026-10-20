@@ -78,10 +78,10 @@ ControlResult control(ControlRequest request);
 
 ## 3. 当前模型组织与资源持有
 
-- 共享 family 定义在 `csrc/models/<family>/`（`config.h/.cpp` + `causal_lm.h`）。`models/common/causal_model.h` 提供 `CausalModelBase<Backend, Derived>`；`CausalLm<Backend>` 由各 family 自己的 `causal_lm.h` 定义（例如 `models/qwen35/causal_lm.h`）。
+- 共享 family 定义在 `csrc/engine/model/<family>/`（`config.h/.cpp` + `causal_lm.h`）。`engine/model/common/causal_model.h` 提供 `CausalModelBase<Backend, Derived>`；`CausalLm<Backend>` 由各 family 自己的 `causal_lm.h` 定义（例如 `engine/model/qwen35/causal_lm.h`）。
 - CUDA 绑定在 `csrc/backends/cuda/models/`：`common/causal_model_ops.h` 的 `CudaCausalOps<Model> : Model, CudaCausalModel`与 `attention_ops.h`；`qwen35/ops.h` 实例化 `CausalLm<CudaCausalOps<Qwen35Model>>`。另有 `ForwardOps` 与 `CudaSessionCodec`。
 - **这套共享目前只覆盖 CUDA 侧**：Metal 有自己的 family 实现（`backends/metal/models/` 下的 `mlx_*`），不实例化这些模板，也不接 `EngineInstance`。见 [bugs.md B28](bugs.md)。
-- Engine 模块目录：`csrc/engine/{include,model,src,requests,batch,state,weights,executor,text}`。`include/` 是 PUBLIC，其余模块目录在 `engine/CMakeLists.txt` 里是 PRIVATE，只有 `backends/` 与 `tests/` 把它们加进 include path。
+- Engine 模块目录：`csrc/engine/{include,model,src,requests,batch,state,weights,executor,text}`。`include/` 是唯一 PUBLIC include 目录，core/prefix/tokenizer 的实现依赖均为 PRIVATE；其余模块目录在 `engine/CMakeLists.txt` 里是 PRIVATE，只有 `backends/` 与 `tests/` 把它们加进 include path。
 - 资源持有：`CudaStores` 持有 `kv_memory`、`moe_expert_cache` 和 `qsa_kv_store`，由 `CudaExecutionContext` 持有（`ops/execution/cuda_execution.h`）；`CudaEngineState` 创建 family 的物理 batch storage，`CudaBatchExecution` 按引用借用。公共 StateStore/WeightStore 尚未拥有这些资源（[B34](bugs.md)）。
 - 连续批处理：共享 `ContinuousBatch` 在 `engine/executor/driver.h`，由 `backends/cuda/engine/batch_execution.*` 驱动；当前由 family policy 与 `batch_executor_t<Model>` 选择实现，包含 Qwen35 与单独的 Qwen4/Flash-Next batch 绑定；Qwen35 请求状态仍专用绑定，尚未收敛到目标共享 Executor（[B32](bugs.md)）。
 - host parallel、拓扑、亲和性和 host copy 位于 `backends/cpu/native/`，专家调度位于 `backends/cpu/execution/`；CUDA native 的线程原语依赖不引入 CPU 专家调度。
@@ -92,7 +92,7 @@ ControlResult control(ControlRequest request);
 | 方面 | CUDA | Metal |
 | --- | --- | --- |
 | Engine 装配 | `EngineInstance<CudaBackend>` | `MlxEngine` 自己实现 `Engine` |
-| family forward | `csrc/models/<family>` + `CudaCausalOps` 绑定 | `backends/metal/models/` 独立实现，按 backbone 在 `mfq_decode_mlx.cpp` 分派 |
+| family forward | `csrc/engine/model/<family>` + `CudaCausalOps` 绑定 | `backends/metal/models/` 独立实现，按 backbone 在 `mfq_decode_mlx.cpp` 分派 |
 | 交错 batch | `ContinuousBatch` + `batch_execution.*` | `MlxEngineModel` 默认不支持 batch，`execute()` 为空实现；`MlxEngine` 委托该模型接口 |
 | CUDA Graph / DecodeGraph | `backends/cuda/engine/decode_graph.*` | 整个 `backends/metal` 无 `DecodeGraph` 引用 |
 | MTP | `engine/requests/{depth,speculate}.h` + `backends/cuda/engine/mtp.cpp` | `runtime/mlx_mtp.*`；`mlx_mtp.cpp` 仍引用 `GenerationPolicy<MlxDsparkDepthController>` |
@@ -101,7 +101,7 @@ ControlResult control(ControlRequest request);
 
 ## 5. 构建边界（当前）
 
-`csrc/CMakeLists.txt` 的配置顺序：`components/json` → `core` → `backends/cpu` → `models` → `components/ggml` → `components/tokenizer` →（`components/http`）→ `engine` → `scheduler` →（`transport`）→（`backends/metal`，Apple）→（`backends/cuda`，非 Apple）→（`tests`，`BUILD_TESTING`）。CUDA/Metal 子目录各由 `MFQ_BUILD_CUDA_RUNTIME` 与 `MFQ_BUILD_METAL_RUNTIME` 控制；关闭 CUDA 时不启用 CUDA 语言、不查找其 SDK、不生成设备 target。HIP 也有独立后端开关，CUDA 与 HIP 不能在同一构建目录同时启用。
+`csrc/CMakeLists.txt` 的配置顺序：`components/json` → `formats` → `backends/cpu` → `components/io` → `model_source` → `core` → `components/ggml` → `components/tokenizer` →（`components/http`）→ `engine` → `scheduler` →（`transport`）→（`backends/metal`，Apple）→（`backends/cuda`，非 Apple）→（`tests`，`BUILD_TESTING`）。CUDA/Metal 子目录各由 `MFQ_BUILD_CUDA_RUNTIME` 与 `MFQ_BUILD_METAL_RUNTIME` 控制；关闭 CUDA 时不启用 CUDA 语言、不查找其 SDK、不生成设备 target。HIP 也有独立后端开关，CUDA 与 HIP 不能在同一构建目录同时启用。
 
 产物：CUDA 侧 `mfq-runtime`、`mfq-diagnostics`、`mfq-eval`（可选 `mfq-runtime-torch`，需要通信开启）；Metal 侧 `mfq-decode-metal`、`mfq-perplexity`。`mfq/commands/build.py` 默认只请求当前后端的推理 target（CUDA `mfq-runtime`，Metal `mfq-decode-metal`），diagnostics 与 eval 需要显式 `cmake --build ... --target`；服务只用推理程序，缺工具时在任务里报错。当前构建入口和验证范围见 [plan.md](plan.md) §1.5。
 
@@ -112,7 +112,7 @@ ControlResult control(ControlRequest request);
 - Duplex 走第二条控制路径：`ControlPending` / `ControlCompletion`（`engine/include/engine.h`）、Scheduler 侧 `pending_control` / `duplex_active`（`scheduler/src/scheduler.cpp`）、CUDA 侧 `duplex_active` / `duplex_pending` / `duplex_stop` / `duplex_sequence`（`cuda_engine.cpp`）。见 [B26](bugs.md)。
 - Metal 保留独立 generation；`mlx_mtp.cpp` 的 `GenerationPolicy<MlxDsparkDepthController>` 引用残留源码可见，接口仍需同步。见 [B18](bugs.md)。
 - Store 所有权未收口（`CudaStores`）。见 [B34](bugs.md) 与 plan §1.4 R4。
-- `csrc/engine/model/` 目前只有共享视觉几何，尚无新 family forward、`Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
+- `csrc/engine/model/` 已收拢共享配置、旧 family 组合、视觉几何与 YaRN，原 `csrc/models/` 与 `mfq-models` 已删除；编译实现归 `mfq-engine`，模型根目录仅供实际消费者显式使用。尚无新 family forward、`Preparation` / `InFlightBatch`；旧继承链与双层 batch 驱动仍是主链。见 plan 阶段 2。
 - K1 底层依赖迁移已完成。schema、范围解码和码表归 `formats/`，输入与旧名称读取归 `model_source/`，视觉几何由 `mfq-engine` 编译；文件 I/O 与 host 原语已独立。`mfq-model-graph` 与 `mfq-model-source` 不再依赖 core，CUDA kernel 不再取得 core 的 include 路径或链接 `mfq-core`。
 - 旧 dtype 在 MFQ 元数据和 MFE cohort 输入解析处规范化，VQ/SQ 算子只分派规范格式；ModelSource 只暴露 TensorLayout，名称映射保留在 compat 读取实现。
 - 请求/媒体值、唯一 SamplingParams、语法游标、资源错误与 StepSequence 已归 `engine/include/`；CUDA native 只取得公共错误声明的 include 路径，不再依赖 core。`core/` 聚合随 K3/K4 拆除。Metal MFE 输入解析暂与 offload 缓存同在 `mlx_moe.cpp`，其缓存拆分随 K3/后端迁移推进。见 plan §1.6。

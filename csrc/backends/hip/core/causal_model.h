@@ -3,7 +3,7 @@
 
 #include "../../hip/include/hip_model_plan.h"
 #include "core/block.h"
-#include "models/common/causal_model.h"
+#include "common/causal_model.h"
 #include "quant_linear.h"
 
 #include <cstdint>

@@ -4,14 +4,14 @@
 #include "../../hip/include/mfq_hip_cache_ops.h"
 #include "../../hip/include/mfq_hip_norm_ops.h"
 #include "../../hip/include/mfq_hip_quant_ops.h"
-#include "models/common/transformer_layer.h"
-#include "models/deepseek_v4/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "deepseek_v4/causal_lm.h"
 
 #include "core/causal_model.h"
 #include "mfq/kernels/hip/deepseek_v4_attention.h"
 #include "mfq/kernels/hip/deepseek_v4_hc.h"
 #include "core/block.h"
-#include "models/deepseek_v4/config.h"
+#include "deepseek_v4/config.h"
 #include "core/ffn.h"
 
 #include <iomanip>

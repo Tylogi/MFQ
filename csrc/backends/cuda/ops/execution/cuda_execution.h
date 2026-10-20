@@ -8,7 +8,7 @@ bool decode_window_recording() noexcept;
 
 #include "native/tensor/backend.h"
 #include "csrc/core/tensor_parallel.h"
-#include "mfq/yarn.h"
+#include "common/yarn.h"
 
 #include <cuda_runtime_api.h>
 #ifdef MFQ_HAVE_NCCL

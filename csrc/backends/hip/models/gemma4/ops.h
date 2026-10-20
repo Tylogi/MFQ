@@ -2,8 +2,8 @@
 #pragma once
 
 #include "core/causal_model.h"
-#include "models/gemma4/causal_lm.h"
-#include "models/gemma4/config.h"
+#include "gemma4/causal_lm.h"
+#include "gemma4/config.h"
 
 #include <memory>
 #include <string>

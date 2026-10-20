@@ -1,7 +1,7 @@
 #pragma once
 
 #include "native/tensor/backend.h"
-#include "mfq/yarn.h"
+#include "common/yarn.h"
 
 #include <cstdint>
 #include <mutex>

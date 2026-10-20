@@ -3,8 +3,8 @@
 
 #include "core/causal_model.h"
 #include "core/block.h"
-#include "models/glm5_next/causal_lm.h"
-#include "models/glm5_next/config.h"
+#include "glm5_next/causal_lm.h"
+#include "glm5_next/config.h"
 #include "quant_linear.h"
 
 #include <memory>

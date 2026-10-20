@@ -1,6 +1,6 @@
 #include "ffn.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/moe.h"
+#include "common/gated_mlp.h"
+#include "common/moe.h"
 
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_moe_ops.h"

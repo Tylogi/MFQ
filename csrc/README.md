@@ -2,8 +2,8 @@
 
 The native runtime is organized by responsibility. Shared models are grouped
 by model family. The tree below is the **current transitional layout**; the
-target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`.
+target layout removes the remaining `core/` aggregation and replaces the old
+model binding chain with complete backend operators.
 Format schemas, range readers and frozen codebooks live in `formats/`,
 model input lives in `model_source/`, and file
 I/O lives in `components/io/`. That end state is defined in
@@ -12,7 +12,7 @@ I/O lives in `components/io/`. That end state is defined in
 has landed.
 
 - `core/` — remaining placement rules and state storage.
-  The transitional `mfq-core` aggregation is removed by K2–K4 in
+  The transitional `mfq-core` aggregation is removed by K3/K4 in
   [docs/plan.md](../docs/plan.md);
 - `model_source/` — input discovery, metadata normalization and bounded reads,
   built as `mfq-model-source`. Headers sit beside implementations; old graph/name
@@ -30,19 +30,22 @@ has landed.
   validation live in `formats/model_graph/` (`mfq-model-graph`); that target
   contains no vision algorithm or old model reader. Legacy dtype spellings are
   normalized at metadata/cohort input; VQ/SQ operators accept canonical IDs;
-- `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
+- `engine/model/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
-  MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
-  causal traversal, attention, MLP, MoE, recurrence, and shared layer compositions;
+  MiniCPM also defines `TtsCausalLm`. `engine/model/common/` contains `CausalModelBase`,
+  causal traversal, attention, MLP, MoE, recurrence, shared layer compositions
+  and YaRN scaling. Compiled model functions belong to `mfq-engine`; the old
+  `models/` root and `mfq-models` target are gone;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral logical request lifecycle, admission,
   cancellation decisions and bounded output queues;
 - `engine/model/common/vision/` — shared grid vision configuration, geometry,
-  positions and canonical tensor roles, compiled by `mfq-engine`. Two old model
-  headers still consume this implementation until their K2 migration;
+  positions and canonical tensor roles, compiled by `mfq-engine` and consumed
+  within the shared model tree without old-model dependency exceptions;
 - `engine/include/` — public request/media values, the sole `SamplingParams`,
   grammar cursor, resource errors and `StepSequence`. Native allocation errors
-  no longer require a core include path;
+  no longer require a core include path. Engine clients inherit only this public
+  directory; implementation dependencies stay private;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
@@ -110,7 +113,7 @@ identity materialization, numerical verification, CUDA Graph execution, and
 physical batch operations stay CUDA-specific. Generation, MTP draft/accept/commit
 rules, and the continuous-batching request state machine are shared. Qwen3.5
 and the other seven model families now keep their forward definitions in
-`models/<family>/causal_lm.h`, including sparse/recurrent attention, MoE,
+`engine/model/<family>/causal_lm.h`, including sparse/recurrent attention, MoE,
 predictors, and MiniCPM audio/vision/TTS traversal. CUDA family `ops.h/.cpp`
 files bind these definitions to native tensors, kernels, weights, and caches.
 Qwen4/GLM5 decoder order, DeepSeek-V4.1 target/DSpark mega-layers, and

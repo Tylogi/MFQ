@@ -127,6 +127,13 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
               ("mfq-model-source.dir", "mfq-model-graph.dir"))]
     assert inputs
     assert all((CSRC / "core").as_posix() not in item["command"] for item in inputs)
+    clients = [item for item in commands if any(target in item["command"] for target in
+               ("mfq-engine-contract-test.dir", "mfq-runtime-scheduler.dir"))]
+    assert clients
+    for item in clients:
+        assert (CSRC / "engine/include").as_posix() in item["command"]
+        assert (CSRC / "core").as_posix() not in item["command"]
+        assert (CSRC / "engine/model").as_posix() not in item["command"]
     schema = [item for item in inputs if "mfq-model-graph.dir" in item["command"]]
     assert len(schema) == 1 and schema[0]["file"].endswith("formats/model_graph/model_graph.cpp")
     if cuda:

@@ -2,7 +2,7 @@
 #pragma once
 
 #include "storage/weight_loader.h"
-#include "models/common/grid_vision_model.h"
+#include "common/grid_vision_model.h"
 #include <array>
 
 #include "core/causal_model.h"

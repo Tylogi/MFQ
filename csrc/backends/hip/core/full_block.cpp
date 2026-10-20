@@ -1,8 +1,8 @@
 #include "hip/hip_runtime.h"
 #include "full_block.h"
-#include "models/common/attention.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/transformer_layer.h"
+#include "common/attention.h"
+#include "common/gated_mlp.h"
+#include "common/transformer_layer.h"
 #include <array>
 
 #include "mfq_hip_activation_ops.h"

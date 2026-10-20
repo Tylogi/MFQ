@@ -2,12 +2,12 @@
 #pragma once
 #include "../../hip/include/mfq_hip_linear_attention_ops.h"
 #include "../../hip/include/mfq_hip_norm_ops.h"
-#include "models/common/transformer_layer.h"
+#include "common/transformer_layer.h"
 
 #include "core/block.h"
 #include "core/ffn.h"
-#include "models/qwen35/config.h"
-#include "models/qwen35/causal_lm.h"
+#include "qwen35/config.h"
+#include "qwen35/causal_lm.h"
 
 namespace mfq::cuda::qwen35 {
 

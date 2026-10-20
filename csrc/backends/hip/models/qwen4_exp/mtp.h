@@ -3,7 +3,7 @@
 
 #include "core/mtp.h"
 #include "core/attention.h"
-#include "models/qwen4_exp/config.h"
+#include "qwen4_exp/config.h"
 
 namespace mfq::cuda::qwen4_exp {
 using attention_ops::Linear;

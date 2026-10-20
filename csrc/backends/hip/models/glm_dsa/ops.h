@@ -3,13 +3,13 @@
 #include "../../hip/include/mfq_hip_attention_ops.h"
 #include "../../hip/include/mfq_hip_cache_ops.h"
 #include "../../hip/include/mfq_hip_norm_ops.h"
-#include "models/common/transformer_layer.h"
-#include "models/glm_dsa/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "glm_dsa/causal_lm.h"
 
 #include "core/causal_model.h"
 #include "core/block.h"
 #include "core/ffn.h"
-#include "models/glm_dsa/config.h"
+#include "glm_dsa/config.h"
 
 #include <memory>
 

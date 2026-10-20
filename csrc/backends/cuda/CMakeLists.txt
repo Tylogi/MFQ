@@ -306,14 +306,10 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     mfq_add_cuda_test(mfq-flash-next-test
         ${MFQ_CUDA_ROOT}/tests/kernels/flash_next_test.cpp
-        mfq-cuda-native-kernels mfq-json mfq-models)
+        mfq-cuda-native-kernels)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-nint-row-pipeline-test tests/ops/nint_row_pipeline_test.cpp mfq-model-source mfq-quant-readers mfq-cuda-native-kernels)
     target_compile_definitions(mfq-nint-row-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
-    target_include_directories(mfq-flash-next-test PRIVATE
-        ${MFQ_CUDA_ROOT}
-        ${MFQ_REPOSITORY_ROOT}
-        ${MFQ_CUDA_ROOT}/../../core)
 endif()
 
 set(MFQ_NCCL_ROOT "" CACHE PATH
@@ -367,7 +363,7 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
     )
-    target_link_libraries(${target} PRIVATE mfq-models mfq-engine mfq-tokenizer)
+    target_link_libraries(${target} PRIVATE mfq-engine mfq-tokenizer)
 endfunction()
 
 function(mfq_configure_cuda_model_target target)
@@ -376,7 +372,7 @@ function(mfq_configure_cuda_model_target target)
         ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_CUDA_ROOT}
     )
-    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
+    target_link_libraries(${target} PRIVATE mfq-engine)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
@@ -427,6 +423,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-ops)
+target_include_directories(mfq-cuda-ops PRIVATE ${PROJECT_SOURCE_DIR}/engine/model)
 target_compile_definitions(mfq-cuda-ops PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -450,7 +447,7 @@ set(MFQ_CUDA_LOADING_SOURCES
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-loading)
 target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_ENGINE_PRIVATE_DIRS})
-target_link_libraries(mfq-cuda-loading PRIVATE mfq-models mfq-cpu-execution)
+target_link_libraries(mfq-cuda-loading PRIVATE mfq-engine mfq-cpu-execution)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -808,6 +805,7 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-execution-scope-test PRIVATE
         mfq-cuda-runtime)
+    mfq_configure_cuda_runtime_target(mfq-flash-next-test)
     target_link_libraries(mfq-flash-next-test PRIVATE
         mfq-cuda-runtime)
     add_test(NAME mfq-cuda-execution-scope-test

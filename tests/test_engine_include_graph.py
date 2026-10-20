@@ -66,12 +66,6 @@ DEVICE_FORBIDDEN = ("executor/", "state/", "weights/", "src/",
                     "requests/table.h", "requests/inference.h")
 STORAGE_FORBIDDEN = ("executor/", "requests/table.h", "requests/inference.h")
 DEVICE_DIRS = ("ops", "kernels", "native", "device", "execution")
-# (backend file, engine header) still open; delete the entry when the consumer moves.
-# shortcut: old family headers still consume the shared geometry, remove with K2 family migration.
-MODEL_CONSUMERS = {
-    ("models/qwen35/config.h", "model/common/vision/grid_vision.h"),
-    ("models/common/grid_vision_model.h", "model/common/vision/grid_vision.h"),
-}
 BACKEND_EXCEPTIONS = {
     ("backends/cuda/storage/session/text_cache.cpp", "src/settings.h"),
 }
@@ -148,8 +142,7 @@ class Graph:
                     continue
                 if target in self.private_headers:
                     includers[target].add(src)
-                    if self.area(src) not in ALLOWED_CONSUMERS and (
-                            rel(src, self.csrc), rel(target, self.engine)) not in MODEL_CONSUMERS:
+                    if self.area(src) not in ALLOWED_CONSUMERS:
                         violations.append((src, lineno, raw,
                             "engine private headers may not be included here"))
                 if from_engine and src in self.engine_headers:

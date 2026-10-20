@@ -13,9 +13,9 @@
 #include "runtime/router_lookahead_audit.h"
 #include <fstream>
 #include <iostream>
-#include "models/common/gated_mlp.h"
-#include "models/common/moe.h"
-#include "models/common/transformer_layer.h"
+#include "common/gated_mlp.h"
+#include "common/moe.h"
+#include "common/transformer_layer.h"
 #include "storage/session_codec.h"
 #include "gated_residual.h"
 #include "gated_residual_fused.h"

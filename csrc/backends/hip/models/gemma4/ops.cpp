@@ -3,12 +3,12 @@
 #include "storage/weight_loader.h"
 #include "ops.h"
 #include "storage/session_codec.h"
-#include "models/common/transformer_layer.h"
-#include "models/gemma4/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "gemma4/causal_lm.h"
 
 #include "core/full_block.h"
 
-#include "models/common/gated_mlp.h"
+#include "common/gated_mlp.h"
 #include <array>
 #include <bit>
 #include <cmath>

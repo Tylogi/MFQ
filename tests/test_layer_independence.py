@@ -139,9 +139,9 @@ FIXTURES = [
         "model_source/source.cpp": '#include "mfq/runtime.h"\n',
         "core/include/mfq/runtime.h": "struct Request {};\n",
     }, "model source reaches a runtime layer"),
-    ("model source may not reach the old model chain", {
+    ("model source may not reach model execution", {
         "model_source/source.cpp": '#include "common/forward.h"\n',
-        "models/common/forward.h": "struct Model {};\n",
+        "engine/model/common/forward.h": "struct Model {};\n",
     }, "model source reaches a runtime layer"),
     ("format readers may use host workers", {
         "formats/quant/rows.cpp": '#include "mfq/host_parallel.h"\n',

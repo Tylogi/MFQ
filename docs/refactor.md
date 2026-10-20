@@ -495,7 +495,7 @@ cuda/csrc/
 
 因此新增的公共职责目录只有 `formats/`、`model_source/`、`components/io/`；线程、主机存储和 CPU 执行进入已有 `backends/cpu/`，其余回到五个 Module、模型或文本。每个目录有明确消费者和职责，不新增包揽所有依赖的第六个 Engine Module，也不保留 `core2/common/base` 等价聚合库。
 
-Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokenizer 底层实现留在 `components/tokenizer/`，两者都不并入 Engine 模块或公共值目录。`models/` 现有配置与公式最终合入 `engine/model/`，迁完全部消费者后删除旧根目录，不长期维护两份 family 树。`engine/internal/` 抽屉已拆为 `engine/{include,src,requests,batch,state,weights,executor,text}`，其有效实现按职责留在这些目录。
+Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokenizer 底层实现留在 `components/tokenizer/`，两者都不并入 Engine 模块或公共值目录。`models/` 的现有配置与公式已合入 `engine/model/`，旧根目录和 `mfq-models` 已删除；旧继承与 ForwardOps 绑定仍待阶段 2 用完整算子组合替换。`engine/internal/` 抽屉已拆为 `engine/{include,src,requests,batch,state,weights,executor,text}`，其有效实现按职责留在这些目录。
 
 `Preparation/InFlightBatch` 归 executor，拥有已提交任务及资源，跨 step 存活；batch 只生成计划。后端 storage 是公共 Store 的具体物理实现，同一实例被组合持有，不是另一份 StateStore/WeightStore。后端 execution 只有设备行为，不持有 RequestTable、模型选择或 acceptance/commit 规则。
 
