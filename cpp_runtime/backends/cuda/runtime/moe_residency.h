@@ -10,7 +10,7 @@ class MoeResidencyManager {
 public:
     struct MemorySample {
         std::uint64_t resident_bytes=0,available_bytes=0;
-        std::optional<std::uint64_t> commit_available_bytes;
+        std::optional<std::uint64_t> commit_available_bytes = std::nullopt;
         // WDDM also charges device allocations to the commit limit, so the
         // smaller of physical and commit headroom bounds new host allocations.
         std::uint64_t available_host_bytes() const noexcept {

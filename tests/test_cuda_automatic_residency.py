@@ -90,30 +90,6 @@ def test_cuda_vram_limit_keeps_existing_margin_and_explicit_limit(tmp_path, monk
     assert pool._estimated_load_bytes(artifact(tmp_path), selected) <= limit
 
 
-def test_cuda_vram_limit_uses_live_headroom_on_the_selected_device(tmp_path, monkeypatch):
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
-        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB), GpuMemory("RTX GPU", 16 * GIB))))
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [
-        {"id": "0", "memory_available_bytes": GIB},
-        {"id": "1", "memory_available_bytes": 12 * GIB},
-    ])
-    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
-    request = ModelLoadRequest(model="model", device_ids=["1"])
-    assert pool._cuda_device_vram_limit(request) == 12 * GIB - (256 << 20)
-
-
-def test_cuda_vram_limit_rejects_exhausted_live_headroom(tmp_path, monkeypatch):
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
-        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
-    monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [
-        {"id": "0", "memory_available_bytes": 0},
-    ])
-    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda")
-    with pytest.raises(JobExecutionError) as error:
-        pool._cuda_device_vram_limit(ModelLoadRequest(model="model", device_ids=["0"]))
-    assert error.value.detail.code == "runtime_vram_budget_exceeded"
-
-
 @pytest.mark.parametrize("configured", ["0", "-1", "nan", "inf", "invalid"])
 def test_cuda_vram_limit_rejects_invalid_explicit_values(tmp_path, monkeypatch, configured):
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(

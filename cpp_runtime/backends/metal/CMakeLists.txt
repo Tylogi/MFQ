@@ -1355,6 +1355,8 @@ set_target_properties(
     mfq-metal-nemotron-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
+add_test(NAME mfq-metal-nemotron-conv-test
+    COMMAND mfq-metal-nemotron-test --check-cached-conv)
 add_executable(mfq-metal-minicpmo45-test
     tests/mlx_minicpmo45_test.cpp
 )

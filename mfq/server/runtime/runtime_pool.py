@@ -3740,15 +3740,10 @@ class RuntimePool:
             limit = min(capacity, requested)
         else:
             limit = max(0, capacity - max(1 << 30, capacity // 16))
-        # Account for other processes on the selected physical devices. Keep
-        # the existing capacity margin and a small live allocation margin,
-        # without reserving a fixed fifth of every Windows GPU.
-        devices = {item["id"]: item for item in gpu_memory_status()}
-        selected = [devices.get(value) for value in self._cuda_device_ids(request)]
-        if selected and all(item is not None and isinstance(item.get("memory_available_bytes"), int)
-                            and item["memory_available_bytes"] >= 0 for item in selected):
-            available = sum(item["memory_available_bytes"] for item in selected)
-            limit = min(limit, max(0, available - (256 << 20)))
+        # This is the worker's ceiling. Live free VRAM and reclaimable idle
+        # caches are accounted together by admission and resident rebalancing;
+        # capping this ceiling by raw free VRAM would prevent cache reuse and
+        # model replacement while an existing worker still owns its storage.
         if limit <= 0:
             raise _job_error("runtime_vram_budget_exceeded", "No free VRAM remains for the model runtime", retryable=True)
         return limit

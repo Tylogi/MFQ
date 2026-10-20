@@ -52,5 +52,9 @@ jobs:
 
       - name: Check text prefill chunking
         run: |
-          cmake --build build/cpp_runtime --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test
-          ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45)-test$'
+          cmake --build build/cpp_runtime --target mfq-metal-qwen35-causal-lm-test mfq-metal-minicpmo45-test mfq-metal-nemotron-test
+          ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-(qwen35-causal-lm|minicpmo45|nemotron-conv)-test$'
+      - name: Check Nemotron text, MTP and RADIO vision
+        env:
+          MFQ_METAL_NEMOTRON_TEST: build/cpp_runtime/metal/mfq-metal-nemotron-test
+        run: uv run --with pytest python -m pytest tests/test_metal_nemotron_runtime.py -q
