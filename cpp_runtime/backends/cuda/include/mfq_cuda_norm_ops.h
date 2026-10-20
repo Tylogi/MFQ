@@ -11,6 +11,13 @@ mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_t
                                 double weight_offset);
 mfq_tensor_backend::Tensor grouped_rms_norm_cuda(mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor weight, int64_t group, double eps, double weight_offset);
+// Grouped gated RMSNorm: y = weight * (x * silu(gate)) / sqrt(mean_group(hat^2) + eps),
+// i.e. the gate is applied before the group mean square. x/gate are
+// [..., D] contiguous CUDA tensors of any f32/f16/bf16 dtype (each may differ);
+// group_size divides D; the output keeps the dtype of x.
+mfq_tensor_backend::Tensor grouped_gated_rms_norm_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    mfq_tensor_backend::Tensor weight, int64_t group_size, double eps);
 mfq_tensor_backend::Tensor gdn_rms_norm_gate_cuda(mfq_tensor_backend::Tensor attended,
     mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor weight, double eps,
     bool silu_gate, bool output_half);
