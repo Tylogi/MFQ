@@ -110,6 +110,7 @@ def test_hot_rebalance_respects_disabled_and_capped_models(tmp_path):
         a = cached_instance(tmp_path, 'a', 0, 0, pressure=4 * GIB)
         b = cached_instance(tmp_path, 'b', 0, 0, pressure=4 * GIB)
         c = cached_instance(tmp_path, 'c', 0, 0, pressure=4 * GIB)
+        b.last_used_at = datetime.now(timezone.utc)
         pool._instances = {item.id: item for item in (a, b, c)}
         pool._load_requests = {'a': ModelLoadRequest(model='a', prefix_cache_hot_bytes=0),
                                'b': ModelLoadRequest(model='b', prefix_cache_hot_bytes=GIB)}

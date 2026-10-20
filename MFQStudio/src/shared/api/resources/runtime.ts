@@ -18,6 +18,7 @@ import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client
 export interface RuntimeMemoryPolicy {
   total_limit_bytes?: number | null;
   effective_total_limit_bytes?: number | null;
+  automatic_total_limit_bytes?: number | null;
   total_capacity_limit_bytes?: number | null;
   model_limit_bytes: number | null;
   prefix_limit_bytes: number | null;

@@ -4,9 +4,10 @@ import { MemoryBudgetControls } from './MemoryBudgetControls';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
+import type { RuntimeStatus } from '../../shared/api/types';
 
 const api = vi.hoisted(() => ({ policy: vi.fn(), configure: vi.fn(), getJob: vi.fn(), addJob: vi.fn() }));
-const state = vi.hoisted(() => ({ runtime: null as { runtime_memory_effective_budget_bytes: number } | null }));
+const state = vi.hoisted(() => ({ runtime: null as Partial<RuntimeStatus> | null }));
 vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { memoryPolicy: api.policy, configureMemoryPolicy: api.configure } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { getJob: api.getJob } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: api.addJob, runtime: state.runtime, instances: [] }) }));
@@ -114,6 +115,67 @@ it('clears the manual total without changing the weight and prefix sublimits', a
   fireEvent.change(screen.getByLabelText('Total resident memory budget mode'), { target: { value: 'automatic' } });
   fireEvent.click(screen.getByRole('button', { name: 'Apply budgets' }));
   await waitFor(() => expect(api.configure).toHaveBeenCalledWith({ total_limit_bytes: null, model_limit_bytes: 80 * 2 ** 30, prefix_limit_bytes: 4 * 2 ** 30 }));
+});
+
+it('previews the automatic budget instead of the applied manual cap before applying', async () => {
+  state.runtime = { runtime_memory_effective_budget_bytes: 30 * 2 ** 30 };
+  api.policy.mockResolvedValue({ total_limit_bytes: 30 * 2 ** 30, effective_total_limit_bytes: 30 * 2 ** 30,
+    automatic_total_limit_bytes: 90.25 * 2 ** 30, model_limit_bytes: 24 * 2 ** 30, prefix_limit_bytes: 2 * 2 ** 30 });
+  render(<MemoryBudgetControls residency="20 GiB" />);
+  await screen.findByLabelText('Total resident memory budget budget limit');
+  api.policy.mockResolvedValue({ total_limit_bytes: 30 * 2 ** 30, effective_total_limit_bytes: 30 * 2 ** 30,
+    automatic_total_limit_bytes: 84.66 * 2 ** 30 });
+  const mode = screen.getByLabelText('Total resident memory budget mode');
+  fireEvent.change(mode, { target: { value: 'automatic' } });
+  expect(screen.getByText('90.3 GiB')).toBeInTheDocument();
+  await screen.findByText('84.7 GiB');
+  expect(screen.queryByText('30.0 GiB')).not.toBeInTheDocument();
+  expect(api.configure).not.toHaveBeenCalled();
+  fireEvent.change(mode, { target: { value: 'manual' } });
+  expect(screen.getByLabelText('Total resident memory budget budget limit')).toHaveDisplayValue('84.7');
+  fireEvent.change(mode, { target: { value: 'automatic' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply budgets' }));
+  await waitFor(() => expect(api.configure).toHaveBeenCalledWith({ total_limit_bytes: null,
+    model_limit_bytes: 24 * 2 ** 30, prefix_limit_bytes: 2 * 2 ** 30 }));
+});
+
+it('refreshes applied policy even when the budget job finishes before polling', async () => {
+  state.runtime = { runtime_memory_effective_budget_bytes: 30 * 2 ** 30, runtime_memory_budget_mode: 'explicit' };
+  api.policy.mockResolvedValue({ total_limit_bytes: 30 * 2 ** 30, automatic_total_limit_bytes: 90 * 2 ** 30 });
+  api.getJob.mockResolvedValue({ id: 'job', kind: 'runtime.memory.configure', status: 'succeeded' });
+  render(<MemoryBudgetControls residency="20 GiB" />);
+  await screen.findByLabelText('Total resident memory budget budget limit');
+  fireEvent.change(screen.getByLabelText('Total resident memory budget mode'), { target: { value: 'automatic' } });
+  await waitFor(() => expect(api.policy).toHaveBeenCalledTimes(2));
+  api.policy.mockResolvedValue({ total_limit_bytes: null, effective_total_limit_bytes: 90 * 2 ** 30 });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply budgets' }));
+  await waitFor(() => expect(api.addJob).toHaveBeenCalled());
+  await waitFor(() => expect(api.policy.mock.calls.length).toBeGreaterThanOrEqual(3));
+  expect(screen.getByText('90.0 GiB')).toBeInTheDocument();
+  expect(screen.queryByText('30.0 GiB')).not.toBeInTheDocument();
+});
+
+it('uses device capacity for an uncapped automatic VRAM preview', async () => {
+  state.runtime = { memory_architecture: 'discrete', device_memory_total_bytes: 24 * 2 ** 30,
+    runtime_memory_effective_budget_bytes: 8 * 2 ** 30 };
+  api.policy.mockResolvedValue({ total_limit_bytes: 8 * 2 ** 30, automatic_total_limit_bytes: null });
+  render(<MemoryBudgetControls residency="4 GiB" />);
+  await screen.findByLabelText('Total resident VRAM budget budget limit');
+  fireEvent.change(screen.getByLabelText('Total resident VRAM budget mode'), { target: { value: 'automatic' } });
+  expect(screen.getByText('24.0 GiB')).toBeInTheDocument();
+  expect(screen.queryByText('8.0 GiB')).not.toBeInTheDocument();
+  expect(api.configure).not.toHaveBeenCalled();
+});
+
+it('does not present a manual cap as an automatic preview on an older backend', async () => {
+  state.runtime = { runtime_memory_effective_budget_bytes: 30 * 2 ** 30 };
+  api.policy.mockResolvedValue({ total_limit_bytes: 30 * 2 ** 30, effective_total_limit_bytes: 30 * 2 ** 30 });
+  render(<MemoryBudgetControls residency="20 GiB" />);
+  await screen.findByLabelText('Total resident memory budget budget limit');
+  fireEvent.change(screen.getByLabelText('Total resident memory budget mode'), { target: { value: 'automatic' } });
+  expect(screen.getByText('--')).toBeInTheDocument();
+  expect(screen.queryByText('30.0 GiB')).not.toBeInTheDocument();
+  expect(api.configure).not.toHaveBeenCalled();
 });
 
 it('places current residency and the shared apply action below expert-cache warmup', async () => {

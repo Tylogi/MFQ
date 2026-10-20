@@ -19,6 +19,7 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
   const [totalManual, setTotalManual] = useState(false);
   const [totalDraft, setTotalDraft] = useState('96');
   const [totalDetected, setTotalDetected] = useState<number | null>(null);
+  const [totalAutomatic, setTotalAutomatic] = useState<number | null>(null);
   const [prefixManual, setPrefixManual] = useState(false);
   const [modelDraft, setModelDraft] = useState('64');
   const [prefixDraft, setPrefixDraft] = useState('4');
@@ -41,6 +42,9 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
   const modelLabel = separate ? tr('模型显存驻留', 'Model VRAM residency') : tr('模型总驻留', 'Total model residency');
   const prefixLabel = separate ? tr('前缀显存配额', 'Prefix VRAM allowance') : tr('前缀 RAM 配额', 'Prefix RAM allowance');
   const effectiveTotal = residentMemoryCapacity(runtime) ?? totalDetected;
+  const automaticPreview = totalAutomatic ?? (separate ? runtime?.device_memory_total_bytes ?? runtime?.device_total_bytes : null);
+  const automaticTotal = applied.current?.total_limit_bytes != null ? automaticPreview
+    : runtime?.runtime_memory_budget_mode === 'explicit' ? automaticPreview ?? totalDetected : effectiveTotal;
   useEffect(() => {
     if (pending) return;
     let disposed = false;
@@ -50,6 +54,7 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
       setModelManual(policy.model_limit_bytes != null);
       setTotalManual(policy.total_limit_bytes != null);
       setTotalDetected(policy.effective_total_limit_bytes ?? null);
+      setTotalAutomatic(policy.automatic_total_limit_bytes ?? null);
       if (policy.total_limit_bytes != null) setTotalDraft(String(policy.total_limit_bytes / 2 ** 30));
       else if (policy.effective_total_limit_bytes) setTotalDraft((policy.effective_total_limit_bytes / 2 ** 30).toFixed(1));
       setPrefixManual(policy.prefix_limit_bytes != null);
@@ -58,7 +63,16 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
       setAvailable(true);
     }).catch(() => {});
     return () => { disposed = true; };
-  }, [pending]);
+  }, [pending, operation?.id, operation?.status]);
+  useEffect(() => {
+    if (totalManual || !available || applied.current?.total_limit_bytes == null) return;
+    let disposed = false;
+    const current = connectionScope();
+    void runtimeApi.memoryPolicy().then((policy) => {
+      if (!disposed && current()) setTotalAutomatic(policy.automatic_total_limit_bytes ?? null);
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [totalManual, available, connectionScope]);
   function restore() {
     const policy = applied.current;
     if (!policy) return;
@@ -94,7 +108,7 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
     finally { if (current()) setSaving(false); }
   }
   function changeTotalMode(manual: boolean) {
-    if (manual && !totalManual && effectiveTotal != null) setTotalDraft((effectiveTotal / 2 ** 30).toFixed(1));
+    if (manual && !totalManual && automaticTotal != null) setTotalDraft((automaticTotal / 2 ** 30).toFixed(1));
     setTotalManual(manual);
   }
   function control(label: string, manual: boolean, setManual: (value: boolean) => void, draft: string, setDraft: (value: string) => void, min: number) {
@@ -117,7 +131,7 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
   return <>
     <SettingRow title={totalLabel}
       detail={separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；RAM 专家、KV 和前缀缓存单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. RAM experts, KV and prefix caches are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
-      trailing={<>{!totalManual && effectiveTotal != null && <small className="memory-budget-available">{(effectiveTotal / 2 ** 30).toFixed(1)} GiB</small>}
+      trailing={<>{!totalManual && <small className="memory-budget-available">{automaticTotal != null ? `${(automaticTotal / 2 ** 30).toFixed(1)} GiB` : '--'}</small>}
         {control(totalLabel, totalManual, changeTotalMode, totalDraft, setTotalDraft, 0.1)}</>} />
     <SettingRow title={modelLabel}
       detail={separate ? tr('所有模型权重的显存上限；放不下的 MoE 专家在 RAM 中按需传入显存，SSD 专家流式加载尚未支持。', 'VRAM ceiling across model weights; overflowing MoE experts stream from RAM to VRAM. SSD expert streaming is not yet supported.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
