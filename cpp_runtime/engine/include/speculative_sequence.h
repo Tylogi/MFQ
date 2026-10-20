@@ -15,7 +15,7 @@ namespace mfq::engine {
 template <class Ops>
 Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOutput &output,
     int64_t prefill_chunk_size, size_t reused_tokens, typename Ops::Tensor restored_last_hidden,
-    typename Ops::Tensor *session_last_hidden) {
+    typename Ops::Tensor *session_last_hidden, size_t stable_prefix_tokens = 0) {
     const auto &prompt = request.prompt;
     const auto &sampling = request.sampling;
     const auto &token_constraint = request.token_constraint;
@@ -116,6 +116,20 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         std::vector<Tensor> raw_chunks;
         double prefill_ms = 0.0;
         double target_prefill_ms=0.0, predictor_prefill_ms=0.0, predictor_workspace_ms=0.0;
+        const auto checkpoint=mtp.blockwise_drafting() && session_last_hidden &&
+            stable_prefix_tokens>reused_tokens && stable_prefix_tokens<prompt.size()
+            ?static_cast<int64_t>(stable_prefix_tokens):int64_t(0);
+        bool prompt_context_seeded=false;
+        const auto prime_blockwise=[&](Tensor context,int64_t position,bool seed) {
+            if constexpr(requires { ops.blockwise_prompt_context(context,position,seed); }) {
+                const auto elapsed=ops.blockwise_prompt_context(context,position,seed);
+                prefill_ms+=elapsed;predictor_prefill_ms+=elapsed;
+            } else if(seed) {
+                if constexpr(requires { mtp.seed_target_context(context,position); })
+                    mtp.seed_target_context(context,position);
+                else mtp.append_target_context(context,0);
+            } else mtp.append_target_context(context,position-ops.size(context,1));
+        };
         const bool stream_prompt_history = mtp.teacher_forced_prompt_prime() && !mtp.blockwise_drafting() && [&] {
             if constexpr (requires { ops.stream_prompt_history(ops.size(input_ids, 1)); })
                 return ops.stream_prompt_history(ops.size(input_ids, 1));
@@ -155,8 +169,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             offset < ops.size(input_ids, 1);) {
             if (output.result.cancelled)
                 co_return;
-            const auto chunk =
+            auto chunk =
                 next_prefill_chunk(ops.size(input_ids, 1), offset, prefill_chunk_size);
+            if(checkpoint>offset)chunk.count=std::min(chunk.count,checkpoint-offset);
+            chunk.last=chunk.offset+chunk.count==ops.size(input_ids,1);
             auto step = [&] {
                 PrefillActivity activity;
                 return ops.prefill(chunk);
@@ -175,6 +191,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             offset += chunk.count;
             prefill_ms += step.elapsed;
             target_prefill_ms += step.elapsed;
+            if(offset==checkpoint) {
+                // Keep an exact checkpoint before the final prompt token so
+                // an identical retry can reuse the prefix and recompute logits.
+                auto context=raw_chunks.size()==1?std::move(raw_chunks.front()):ops.concatenate(raw_chunks,1);
+                *session_last_hidden=ops.clone(ops.slice(context,1,ops.size(context,1)-1,1));
+                prime_blockwise(context,offset,reused_tokens==0);
+                prompt_context_seeded=true;raw_chunks.clear();
+                co_yield PrefillProgress{
+                    {static_cast<std::size_t>(offset)-reused_tokens,prefill_ms,0.0,prefill_ms},true};
+                if(output.stopped())co_return;
+                continue;
+            }
             co_yield PrefillProgress{
                 {static_cast<std::size_t>(offset) - reused_tokens, prefill_ms, 0.0, prefill_ms}};
         }
@@ -202,13 +230,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         int32_t pending = ops.sample_constrained(logits, counts, initial_constraint);
 
         if (mtp.blockwise_drafting()) {
-            if(reused_tokens)
-                mtp.append_target_context(raw,ops.size(input_ids,1)-ops.size(raw,1));
-            else {
-                if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
-                    mtp.seed_target_context(raw, ops.size(input_ids, 1));
-                else mtp.append_target_context(raw, 0);
-            }
+            prime_blockwise(raw,ops.size(input_ids,1),!reused_tokens && !prompt_context_seeded);
         }
 
         if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {

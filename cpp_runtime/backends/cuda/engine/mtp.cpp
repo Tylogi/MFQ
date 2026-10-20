@@ -339,6 +339,16 @@ template <class Model> struct CudaMtpOps {
     Tensor hidden, raw;
     double elapsed;
   };
+  double blockwise_prompt_context(Tensor hidden,int64_t position,bool seed) {
+    PrefillCudaTimer timer;
+    if(seed)mtp.seed_target_context(std::move(hidden),position);
+    else {
+      const auto start=position-hidden.size(1);
+      mtp.append_target_context(std::move(hidden),start);
+    }
+    MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+    return timer.elapsed_ms();
+  }
   PrefillResult prefill(mfq::engine::PrefillChunk chunk) {
     PrefillCudaTimer timer;
     bool prefill_finished=false;
@@ -810,7 +820,8 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    const CudaPreparedPrompt *prepared,
                    std::size_t reused_tokens,
                    mfq_tensor_backend::Tensor restored_last_hidden,
-                   mfq_tensor_backend::Tensor *session_last_hidden) {
+                   mfq_tensor_backend::Tensor *session_last_hidden,
+                   std::size_t stable_prefix_tokens) {
   auto logical_chunk=prefill_chunk_size;
   if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
     logical_chunk=std::min<int64_t>(logical_chunk,8192);
@@ -827,13 +838,13 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
       logical_chunk, reused_tokens, std::move(restored_last_hidden),
-      session_last_hidden);
+      session_last_hidden,stable_prefix_tokens);
 }
 #define MFQ_INSTANTIATE_MTP(MODEL)                                             \
   template Generation run_mtp_generation<MODEL>(                               \
       MODEL &, MtpModule &, InferenceRequest &, InferenceOutput &, int64_t,    \
       const CudaPreparedPrompt *, std::size_t, mfq_tensor_backend::Tensor,     \
-      mfq_tensor_backend::Tensor *)
+      mfq_tensor_backend::Tensor *, std::size_t)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);

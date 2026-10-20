@@ -790,6 +790,55 @@ void run_restored_blockwise_context() {
     assert(rejected && predictor.context_appends.empty() && model.cache_pos==4);
 }
 
+void run_blockwise_prompt_checkpoint() {
+    for(int reused:{0,4})for(int stable:{5,9})for(int chunk:{3,64})for(bool tail_only:{false,true}) {
+        if(tail_only && chunk<64)continue;
+        Model model;model.cache_pos=reused;
+        Predictor predictor;predictor.blockwise=true;predictor.position=reused;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(10,1);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        struct CheckpointOps:Ops {
+            bool tail_only;
+            std::vector<PrefillChunk>* chunks;
+            int* primes;
+            double blockwise_prompt_context(Tensor context,int64_t position,bool seed) {
+                ++*primes;
+                if(seed)mtp.seed_target_context(context,position);
+                else mtp.append_target_context(context,position-size(context,1));
+                return 3.0;
+            }
+            Prefill prefill(PrefillChunk chunk) {
+                chunks->push_back(chunk);
+                auto result=Ops::prefill(chunk);
+                if(tail_only)result.raw.shape[1]=std::min<int64_t>(2,chunk.count);
+                return result;
+            }
+        };
+        InferenceOutput output(request,nullptr,"blockwise-prompt-checkpoint");
+        std::vector<PrefillChunk> chunks;std::vector<int64_t> checkpoints;Tensor hidden;int primes=0;
+        auto generation=speculative_sequence(CheckpointOps{{model,predictor},tail_only,&chunks,&primes},
+            request,output,chunk,reused,Tensor{{1,1,1}},&hidden,stable);
+        while(auto step=generation.next())if(step.value)
+            if(const auto* progress=std::get_if<PrefillProgress>(&*step.value);progress && progress->session_boundary) {
+                if(output.metrics.saw_token || predictor.cache_position()!=model.cache_pos ||
+                        !Ops::defined(hidden) || Ops::size(hidden,1)!=1)
+                    throw std::runtime_error("blockwise prompt checkpoint lost its committed predictor boundary");
+                checkpoints.push_back(model.cache_pos);
+                if(primes!=int(checkpoints.size()) || progress->timing.model_ms<primes*3.0+1.0)
+                    throw std::runtime_error("blockwise predictor prompt preparation was omitted from PP timing");
+            }
+        if(checkpoints!=std::vector<int64_t>{stable,10} || output.result.completion_tokens!=1 ||
+                model.cache_pos!=10 || predictor.cache_position()!=10)
+            throw std::runtime_error("stable MTP prompt checkpoint changed the target/predictor history");
+        int64_t position=reused;
+        for(const auto& part:chunks) {
+            if(part.offset!=position || part.count<=0 || part.last!=(position+part.count==10))
+                throw std::runtime_error("MTP checkpoint duplicated prefill rows or changed the final-chunk flag");
+            position+=part.count;
+        }
+        if(position!=10)throw std::runtime_error("MTP checkpoint omitted a prompt suffix");
+    }
+}
 void run_blockwise_final_context() {
     for(bool accepted:{false,true})for(bool eos:{false,true})for(int limit:{2,3,4,7,8}) {
         struct BlockOps:Ops {
@@ -842,6 +891,7 @@ int main() try {
     }
     run_prepared_default_positions();
     run_restored_blockwise_context();
+    run_blockwise_prompt_checkpoint();
     run_blockwise_final_context();
     run(false);
     run(false,true);

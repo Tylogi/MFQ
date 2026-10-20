@@ -522,6 +522,8 @@ template <class Model> struct CudaGenerationContext {
         return true;
     }
     void invalidate_plan() { graph.invalidate(); }
+    std::size_t prefix_boundary=0;
+    void set_prefix_boundary(std::size_t tokens) { prefix_boundary=tokens; }
     bool has_hidden(const Hidden &value) const { return value.defined(); }
     void reset() {
         if (batching) return;
@@ -570,7 +572,7 @@ template <class Model> struct CudaGenerationContext {
             prepared ? &*prepared : nullptr,
             reused,
             std::move(restored),
-            committed);
+            committed,prefix_boundary);
     }
 };
 

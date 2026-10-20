@@ -83,6 +83,8 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         plan.stable_prefix_tokens > 0 &&
         (!cache_plan.session_id.empty() || session_cache.persistent_prefix_enabled());
     const bool use_mtp = mtp && sampling.enable_mtp && sampling.max_tokens > 1;
+    if constexpr(requires { ops.set_prefix_boundary(size_t{}); })
+        ops.set_prefix_boundary(caching?std::min(plan.stable_prefix_tokens,prompt.size()-1):0);
     if (mtp) {
         mtp->last_stats = {};
         mtp->last_stats.available = true;
