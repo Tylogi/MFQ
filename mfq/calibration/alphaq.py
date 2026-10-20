@@ -125,9 +125,14 @@ def alphaq_weight_statistics(weights: Any, *, backend: str = "auto") -> tuple[np
             count = min(batch, blocks.shape[0] - start)
             try:
                 part = blocks[start : start + count]
-                spectra[start : start + count] = (
-                    gram_eigenvalues(part) if gram_backend else torch.linalg.svdvals(part).square()
-                )
+                try:
+                    spectra[start : start + count] = (
+                        gram_eigenvalues(part) if gram_backend else torch.linalg.svdvals(part).square()
+                    )
+                except ArithmeticError:
+                    # cuSOLVER's batched Jacobi solver can stop short of
+                    # convergence on a few blocks; the SVD reference is exact.
+                    spectra[start : start + count] = torch.linalg.svdvals(part).square()
             except torch.OutOfMemoryError:
                 if count == 1:
                     raise
