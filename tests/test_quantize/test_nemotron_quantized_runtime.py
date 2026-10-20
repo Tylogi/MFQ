@@ -134,7 +134,29 @@ def _dequantized(path: Path) -> tuple[dict[str, np.ndarray], object]:
         store.close()
 
 
-def _run_bridge(path: Path, cache: bool) -> dict[str, np.ndarray]:
+# The environment RuntimePool._launch_configuration gives a CUDA worker whose
+# routed experts do not fit the RAM budget: the RAM expert pipeline with SSD
+# streaming, pinned decode transfers and the layer-wise asynchronous prefill.
+SERVER_STREAMING_ENVIRONMENT = {
+    "MFQ_MOE_HOST_CACHE_BYTES": str(64 << 20),
+    "MFQ_MOE_PIPELINE": "1",
+    "MFQ_MOE_TWO_STAGE_FFN": "1",
+    "MFQ_MOE_PRELOAD_ALL": "0",
+    "MFQ_MOE_ASSERT_RESIDENT": "0",
+    "MFQ_MOE_RAM_PCIE": "1",
+    "MFQ_MOE_RAM_PCIE_FRACTION": "1",
+    "MFQ_MOE_DECODE_HOST_PIN": "1",
+    "MFQ_MOE_TRANSFER_CACHE": "1",
+    "MFQ_MOE_MAPPED_COPY": "0",
+    "MFQ_MOE_PREFILL_LAYER": "1",
+    "MFQ_MOE_PREFILL_LAYER_ASYNC": "1",
+    "MFQ_MOE_RESIDENCY_INTERVAL": "4",
+    "MFQ_MOE_SSD_EXPERTS": "1",
+    "MFQ_MOE_NVQ_DENSE": "0",
+}
+
+
+def _run_bridge(path: Path, cache: bool | str) -> dict[str, np.ndarray]:
     value = os.environ.get("MFQ_NEMOTRON_H_NATIVE_TEST")
     if not value:
         pytest.skip("MFQ_NEMOTRON_H_NATIVE_TEST required")
@@ -146,7 +168,14 @@ def _run_bridge(path: Path, cache: bool) -> dict[str, np.ndarray]:
     environment = dict(os.environ)
     command = [str(binary), "--model", str(path), "--ctx-size", "32",
                "--check-nemotron-h"]
-    if cache:
+    if cache in ("streaming", "transfer"):
+        # The transfer variant keeps the GPU expert quota below one routed bank,
+        # so every decode step stages the ungated banks through the pinned DMA.
+        environment.update(SERVER_STREAMING_ENVIRONMENT)
+        command[command.index("--check-nemotron-h"):command.index("--check-nemotron-h")] = [
+            "--moe-gpu-cache-gb", "0.05" if cache == "streaming" else "0.000001",
+        ]
+    elif cache:
         # Force every routed expert resident, then run the two-stage MFE
         # pipeline instead of the direct per-projection path.
         environment.update(
@@ -175,7 +204,7 @@ def _run_bridge(path: Path, cache: bool) -> dict[str, np.ndarray]:
     }
 
 
-def _run_mtp_bridge(path: Path, cache: bool) -> dict:
+def _run_mtp_bridge(path: Path, cache: bool | str) -> dict:
     value = os.environ.get("MFQ_NEMOTRON_H_NATIVE_TEST")
     if not value:
         pytest.skip("MFQ_NEMOTRON_H_NATIVE_TEST required")
@@ -185,7 +214,13 @@ def _run_mtp_bridge(path: Path, cache: bool) -> dict:
     environment = dict(os.environ)
     command = [str(binary), "--model", str(path), "--ctx-size", "64",
                "--check-nemotron-h-mtp"]
-    if cache:
+    if cache == "streaming":
+        # Same RAM expert pipeline, SSD streaming and layer-wise prefill the
+        # server gives a worker whose routed experts exceed its RAM budget.
+        environment.update(SERVER_STREAMING_ENVIRONMENT)
+        command[command.index("--check-nemotron-h-mtp"):command.index(
+            "--check-nemotron-h-mtp")] = ["--moe-gpu-cache-gb", "0.05"]
+    elif cache:
         # Force every routed expert resident so the predictor MoE sub-block
         # also runs the two-stage MFE pipeline instead of the direct path.
         environment.update(
@@ -208,8 +243,8 @@ def _run_mtp_bridge(path: Path, cache: bool) -> dict:
     ))
 
 
-@pytest.mark.parametrize("cache", [False, True])
-def test_quantized_mtp_matches_dequantized_reference(tmp_path: Path, cache: bool) -> None:
+@pytest.mark.parametrize("cache", [False, True, "streaming"])
+def test_quantized_mtp_matches_dequantized_reference(tmp_path: Path, cache: bool | str) -> None:
     config, weights = oracle.model_fixture(GEOMETRY, mtp=True)
     root = tmp_path / "hf"
     _write_hf_checkpoint(root, config, weights)
@@ -342,7 +377,7 @@ def test_quantized_text_graph_matches_dequantized_reference(tmp_path: Path, pres
         oracle.HIDDEN,
     )
 
-    for cache in (False, True):
+    for cache in (False, True, "streaming", "transfer"):
         actual = _run_bridge(artifact, cache)
         np.testing.assert_allclose(actual["full"][0], expected_logits[0],
                                    atol=tolerance, rtol=5e-2)

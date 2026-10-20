@@ -19,6 +19,7 @@
 #include "runtime/kv_memory.h"
 #include "runtime/kv_expert_loan.h"
 #include "runtime/dma_copy_batch.h"
+#include "mfe_cached_dispatch_test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1466,6 +1467,7 @@ int main(int argc, char** argv) try {
     check_gemma_composition();
     check_tts_sampling();
     check_ffn_branches();
+    check_mfe_cached_dispatch_geometry();
     {
         CudaExecutionContext execution;
         check_snapshots(execution, false);

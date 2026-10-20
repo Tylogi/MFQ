@@ -2028,7 +2028,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             return runtime.forward(execution.config,execution.kl_mmq,execution.force_moe_prefill_mma_off,
                 execution.force_moe_pool_path,x,route,cell.shared_input && i<2);
         };
-        auto gate_output=projection(0,cell.input),up_output=projection(1,cell.input);
+        auto gate_output=projection(0,cell.input);
+        // An ungated bank publishes Up in the Gate slot and has no activation
+        // partner, so the duplicated projection only feeds relu-squared.
+        if(up_only_)return projection(2,relu_squared_cuda(gate_output.contiguous()));
+        auto up_output=projection(1,cell.input);
         if(swiglu_limit_>0 || cell.fused_activation)
             return projection(2,activation(gate_output,up_output,cell.fused_activation));
         auto gu=tb::cat({gate_output,up_output},-1);
@@ -2609,6 +2613,12 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             throw std::logic_error("MFE transfer descriptor capacity exceeded");
         auto& image=early_image?*early_image:*cell.transfer_descriptors;
         std::memcpy(image.host,cell.transfer_views.data(),std::size_t(bytes));
+        if(up_only_) {
+            // An ungated bank transfers Up through the Gate slot; the kernel reads
+            // it as projection 1, which must publish the same staged image.
+            auto* views=image.h<mfq::cuda::MfePackedProjection>();
+            for(std::size_t i=0;i<cell.transfer_views.size();i+=3)views[i+1]=cell.transfer_views[i];
+        }
         if(combined_gate_up_) {
             auto* views=image.h<mfq::cuda::MfePackedProjection>();
             for(std::size_t i=0;i<cell.transfer_views.size();i+=3) {

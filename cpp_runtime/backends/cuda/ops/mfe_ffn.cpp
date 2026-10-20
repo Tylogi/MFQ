@@ -531,6 +531,11 @@ void MfeFfnRuntime::enable_cached_dispatch(const mfq::cuda::MfeCachedExpert* map
     for(int p=0;p<3;++p) {
         const int count=batch_.projection_counts[p];
         original_offsets[p]=batch_.projection_offsets[p];
+        // An ungated bank stores only Up and Down: projection 0 keeps its empty
+        // layout and has no cohort count or per-expert slots to install.
+        if(ungated_experts_ && p==0) {
+            offsets[p]=int(views.size());counts[p]=0;cached_dispatch_.primary_counts[p]=0;continue;
+        }
         int64_t capacity=0;
         for(int c=0;c<count;++c)capacity+=host_views_[batch_.projection_offsets[p]+c].local_experts;
         cached_dispatch_.primary_incomplete|=capacity<batch_.experts;
