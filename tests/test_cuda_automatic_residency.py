@@ -167,6 +167,20 @@ def test_windows_discrete_expert_budget_is_limited_by_commit(tmp_path, monkeypat
     assert pool._cuda_expert_host_budget(model, request) == 80 * GIB
 
 
+def test_windows_commit_footprint_covers_the_worker_vram_limit(tmp_path, monkeypatch):
+    pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
+                               commit_available=120 * GIB)
+    monkeypatch.setattr(pool, "_cuda_discrete_device_capacity", lambda _request: 96 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    plan = pool._cuda_expert_host_budget_plan(model, request)
+    # The worker may grow to its VRAM limit (96 GiB minus 1/16), which WDDM
+    # commits even though the load estimate is only 24 GiB.
+    assert plan.commit_footprint_bytes == 90 * GIB
+    assert plan.commit_bytes == 14 * GIB
+    assert pool._cuda_expert_host_budget(model, request) == 14 * GIB
+
+
 def test_expert_budget_ignores_commit_without_windows_accounting(tmp_path, monkeypatch):
     pool = _commit_budget_pool(tmp_path, monkeypatch, architecture="discrete",
                                commit_available=None)

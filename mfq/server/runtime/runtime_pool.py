@@ -3700,6 +3700,13 @@ class RuntimePool:
             return None
         return sum(device.capacity_bytes for device in selected if device is not None)
 
+    def _cuda_device_vram_limit(self, request: ModelLoadRequest) -> int | None:
+        """VRAM the native worker may allocate on discrete GPUs (MFQ_CUDA_VRAM_LIMIT_GIB)."""
+        capacity = self._cuda_discrete_device_capacity(request)
+        if not capacity:
+            return None
+        return max(1, capacity - max(1 << 30, capacity // 16))
+
     def _apply_automatic_expert_residency(
         self,
         artifact: DiscoveredModel,
@@ -3715,12 +3722,11 @@ class RuntimePool:
             else self.max_runtime_memory_bytes
         )
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
-            capacity = self._cuda_discrete_device_capacity(request)
-            if capacity:
+            device_ceiling = self._cuda_device_vram_limit(request)
+            if device_ceiling:
                 # The native worker prices concrete dense/KV allocations and
                 # decode scratch after load; prefill borrows expert storage.
                 # Do not reserve another third before that calculation.
-                device_ceiling = max(1, capacity - max(1 << 30, capacity // 16))
                 ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
@@ -4531,6 +4537,12 @@ class RuntimePool:
                 if plan is not None:
                     footprint += plan.gpu_budget_bytes
                 footprint += _WINDOWS_GPU_WORKSPACE_BYTES
+                # Workspaces, transfer staging and KV growth fill VRAM up to the
+                # worker's limit, and WDDM commits whatever it allocates
+                # (measured: 96 GB used on a 96 GB card with a 40 GB expert cache).
+                device_limit = self._cuda_device_vram_limit(request)
+                if device_limit is not None:
+                    footprint = max(footprint, device_limit)
                 commit_bytes = max(
                     0, commit_available - footprint - _WINDOWS_COMMIT_RESERVE_BYTES
                 )
@@ -4675,12 +4687,11 @@ class RuntimePool:
                     "MFQ_MOE_PREFILL_LAYER_ASYNC": "1",
                     "MFQ_MOE_RESIDENCY_INTERVAL": "4",
                 }
-                capacity = self._cuda_discrete_device_capacity(request)
-                if capacity:
+                device_limit = self._cuda_device_vram_limit(request)
+                if device_limit:
                     # WDDM can page overcommitted allocations into host RAM
                     # without reporting OOM. The native limit also trims idle
                     # pool pages before a new allocation reaches that boundary.
-                    device_limit = max(1, capacity - max(1 << 30, capacity // 16))
                     defaults["MFQ_CUDA_VRAM_LIMIT_GIB"] = str(device_limit / float(1 << 30))
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
