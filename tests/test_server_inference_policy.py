@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
+from mfq.server.api.auth import ApiKeyManager, required_scope
 from mfq.server.protocol.models import RuntimeInferencePolicy, RuntimeInstanceState, SamplingParams, TokenUsage
 from mfq.server.runtime.backend import BackendDelta
 from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
@@ -108,3 +109,38 @@ def test_service_mtp_policy_also_controls_fallback_requests(tmp_path):
         assert backend.sampling[-1].enable_mtp is False
 
     asyncio.run(run())
+
+
+def test_inference_policy_updates_require_admin_scope(tmp_path):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", automatic_memory_budget=False)
+        store = SessionStore(tmp_path / "studio.sqlite3")
+        service = ServerService(store, pool, runtime_manager=pool)
+        app = create_app(service, api_keys=ApiKeyManager(store, "root-secret"))
+        root = {"Authorization": "Bearer root-secret"}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            headers = {}
+            for name, grant in (("models", {"scopes": ["models"]}), ("operator", {"role": "operator"}),
+                    ("viewer", {"role": "viewer"})):
+                created = await client.post("/api/v1/auth/keys", headers=root, json={"name": name, **grant})
+                assert created.status_code == 201, created.text
+                headers[name] = {"Authorization": f"Bearer {created.json()['token']}"}
+            for name in headers:
+                response = await client.put("/api/v1/runtime/inference-policy", headers=headers[name],
+                    json={"mtp_enabled": False})
+                assert response.status_code == 403, name
+            for name in ("operator", "viewer"):
+                assert (await client.get("/api/v1/runtime/inference-policy", headers=headers[name])).status_code == 200
+            assert pool.inference_policy.mtp_enabled is True
+            assert store.runtime_inference_policy() == {}
+            response = await client.put("/api/v1/runtime/inference-policy", headers=root, json={"mtp_enabled": False})
+            assert response.status_code == 200
+            assert pool.inference_policy.mtp_enabled is False
+        await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_inference_policy_permissions():
+    assert required_scope("PUT", "/api/v1/runtime/inference-policy") == "admin"
+    assert required_scope("GET", "/api/v1/runtime/inference-policy") == "inference"

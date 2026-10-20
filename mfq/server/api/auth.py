@@ -132,7 +132,7 @@ def required_scope(method: str, path: str) -> ApiKeyScope:
         return "models"
     if path.startswith("/api/v1/runtime/cache/entries") or path == "/api/v1/runtime/cache/purge":
         return "admin"
-    if path in {"/api/v1/runtime/listener", "/api/v1/runtime/memory-policy", "/api/v1/runtime/model-aliases", "/api/v1/runtime/context-policy"} and method != "GET":
+    if path in {"/api/v1/runtime/listener", "/api/v1/runtime/memory-policy", "/api/v1/runtime/model-aliases", "/api/v1/runtime/context-policy", "/api/v1/runtime/inference-policy"} and method != "GET":
         return "admin"
     if path.startswith("/api/v1/auth/"):
         return "admin"
