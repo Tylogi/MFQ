@@ -571,3 +571,30 @@ def test_cli_defaults_to_naq_imatrix():
     )
 
     assert args.objective == "naq"
+
+
+@pytest.mark.parametrize("direct_io", [False, True])
+def test_calibration_index_reads_own_their_bytes(tmp_path, monkeypatch, direct_io):
+    """Reads must not alias the shard: Windows commits a whole private mapping per view."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from mfq.calibration.qwen35 import HfSafetensorIndex
+
+    shard = "model-00001-of-00001.safetensors"
+    save_file({"embed.weight": torch.arange(64 * 32, dtype=torch.float32).reshape(64, 32),
+               "model.language_model.layers.0.norm.weight": torch.ones(32)}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        "embed.weight": shard, "model.language_model.layers.0.norm.weight": shard}}))
+    monkeypatch.setenv("MFQ_SAFETENSORS_DIRECT_IO", "1" if direct_io else "0")
+    index = HfSafetensorIndex(tmp_path)
+
+    def owned(value: torch.Tensor) -> bool:
+        return value.untyped_storage().nbytes() == value.numel() * value.element_size()
+
+    row = index.tensor("embed.weight", row_start=5, row_end=6)
+    torch.testing.assert_close(row, torch.arange(5 * 32, 6 * 32, dtype=torch.float32)[None])
+    assert owned(row)
+    assert owned(index.tensor("embed.weight"))
+    assert all(owned(value) for _, value in index.layer_state(0))
