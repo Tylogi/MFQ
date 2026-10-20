@@ -21,11 +21,13 @@ int main_impl(const std::vector<std::string>& arguments) {
             const auto& option = arguments[i];
             if (option == "--help" || option == "-h") {
                 std::cout << "MFQ native server " << MFQ_SERVER_VERSION << "\n"
-                    "Usage: mfq-server [--host 127.0.0.1|::1] [--port PORT]\n"
-                    "                  [--data-dir PATH] [--web-root PATH]\n"
+                    "Usage: mfq-server [--host IP] [--port PORT]\n"
+                    "                  [--data-dir PATH] [--db PATH] [--web-root PATH]\n"
+                    "                  [--api-key-env NAME] [--model-dir PATH ...]\n"
                     "                  [--exit-on-stdin-close] [--studio-instance-id UUID]\n"
                     "Default port: 8090; port 0 selects an available port.\n"
-                    "This initial server provides health, identity and optional static files.\n";
+                    "Non-loopback listeners require enabled authentication.\n"
+                    "Root API key environment variable: MFQ_SERVER_API_KEY.\n";
                 return 0;
             }
             if (option == "--version") {
@@ -37,7 +39,8 @@ int main_impl(const std::vector<std::string>& arguments) {
                 continue;
             }
             if (option != "--host" && option != "--port" && option != "--data-dir" &&
-                option != "--web-root" && option != "--studio-instance-id")
+                option != "--web-root" && option != "--studio-instance-id" &&
+                option != "--api-key-env" && option != "--db" && option != "--model-dir")
                 throw std::invalid_argument("unknown option: " + option);
             if (++i == arguments.size() || arguments[i].empty())
                 throw std::invalid_argument("missing value for " + option);
@@ -45,6 +48,9 @@ int main_impl(const std::vector<std::string>& arguments) {
             if (option == "--host") config.host = value;
             else if (option == "--data-dir") config.data_dir = std::filesystem::u8path(value);
             else if (option == "--web-root") config.web_root = std::filesystem::u8path(value);
+            else if (option == "--db") config.database = std::filesystem::u8path(value);
+            else if (option == "--model-dir") config.model_dirs.push_back(std::filesystem::u8path(value));
+            else if (option == "--api-key-env") config.api_key_env = value;
             else if (option == "--studio-instance-id") config.instance_id = value;
             else {
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), config.port);
@@ -54,8 +60,6 @@ int main_impl(const std::vector<std::string>& arguments) {
                     throw std::invalid_argument("--port must be an integer in [0, 65535]");
             }
         }
-        if (config.host != "127.0.0.1" && config.host != "::1")
-            throw std::invalid_argument("only 127.0.0.1 and ::1 are supported until authentication is migrated");
         if (!config.instance_id.empty() && !config.exit_on_stdin_close)
             throw std::invalid_argument("--studio-instance-id requires --exit-on-stdin-close");
         std::signal(SIGINT, stop);

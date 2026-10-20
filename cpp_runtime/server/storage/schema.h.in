@@ -1,0 +1,5 @@
+#pragma once
+
+namespace mfq::server {
+inline constexpr const char* schema_sql = R"MFQSQL(@MFQ_SERVER_SCHEMA@)MFQSQL";
+}

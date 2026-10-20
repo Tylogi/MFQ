@@ -7,6 +7,7 @@
 namespace mfq::server {
 
 std::filesystem::path resolved_path(const std::filesystem::path& path);
+std::string normalize_uuid(std::string value);
 
 class InstanceLock {
 public:
