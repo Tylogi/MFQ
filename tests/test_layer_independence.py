@@ -90,7 +90,9 @@ def check_tree(csrc):
                 continue
             target = os.path.relpath(hits[0], csrc).replace(os.sep, "/")
             if under_formats:
-                if target.startswith(("core/", "engine/", "models/", "model_source/", "backends/")):
+                if (target.startswith(("core/", "engine/", "models/", "model_source/")) or
+                        target.startswith("backends/") and not (
+                            path.endswith(".cpp") and target.startswith("backends/cpu/native/"))):
                     failures.append(f"{relative}:{lineno}: format headers reach a higher layer: {raw}")
                 continue
             if under_io:
@@ -115,6 +117,10 @@ def test_layer_independence():
 
 # A rule with nothing to check it against is not a rule.
 FIXTURES = [
+    ("format readers may use host workers", {
+        "formats/quant/rows.cpp": '#include "mfq/host_parallel.h"\n',
+        "backends/cpu/native/include/mfq/host_parallel.h": "struct Pool {};\n",
+    }, None),
     ("format headers may compose other format headers", {
         "formats/quant/decode.h": '#include "quant/blob.h"\n',
         "formats/quant/blob.h": "struct Blob {};\n",

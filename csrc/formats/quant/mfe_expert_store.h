@@ -1,7 +1,7 @@
 #pragma once
 
-#include "mfq/quant/nint_rows.h"
-#include "mfq/quant/nvq_rows.h"
+#include "quant/nint_rows.h"
+#include "quant/nvq_rows.h"
 
 #include <memory>
 #include <functional>

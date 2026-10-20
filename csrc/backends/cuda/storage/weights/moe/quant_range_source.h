@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/quant/mfe_expert_store.h"
+#include "quant/mfe_expert_store.h"
 #include "ops/moe/moe.h"
 #include "host_expert_cache.h"
 #include <atomic>

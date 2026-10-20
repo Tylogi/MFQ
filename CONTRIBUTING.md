@@ -32,6 +32,8 @@ architecture-named entry point.
   Do not add new code to `core/` that belongs in one of those owners.
 - Packed format headers and frozen codebooks live in `csrc/formats/`
   (`mfq-formats`), without a model-source, Engine or backend dependency.
+  Compiled range readers in `formats/quant/` use `mfq-quant-readers`; keep them
+  independent of core and model loading, and keep kernels on the header target.
   CUDA native kernels link this header target directly; they must not link
   `mfq-core` or use its include directories.
 - File ranges, batched reads and I/O statistics live in `csrc/components/io/`

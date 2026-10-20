@@ -1,18 +1,8 @@
 #pragma once
 
-#include <string_view>
+#include "dtype.h"
 
 namespace mfq {
-
-inline constexpr std::string_view kNintDtype = "NINT";
-inline constexpr std::string_view kMfeDtype = "MFE";
-inline constexpr std::string_view kMfeDeltaDtype = "MFED";
-inline constexpr std::string_view kNvqDtype = "NVQ";
-inline constexpr std::string_view kNpqDtype = "NPQ";
-inline constexpr std::string_view kNepqDtype = "NEPQ";
-inline constexpr std::string_view kMxfp4SqDtype = "MXFP4-SQ";
-inline constexpr std::string_view kMxfp8SqDtype = "MXFP8-SQ";
-inline constexpr std::string_view kFp8Block128SqDtype = "FP8-128SQ";
 
 inline bool is_legacy_nint_dtype(std::string_view dtype) noexcept {
     return dtype == "NINTv2" ||
@@ -55,14 +45,6 @@ inline std::string_view canonical_format_dtype(
         return kMxfp4SqDtype;
     }
     return dtype;
-}
-
-inline bool is_current_mfe_magic(std::string_view magic) noexcept {
-    return magic == "MFE1";
-}
-
-inline bool is_current_mfe_delta_magic(std::string_view magic) noexcept {
-    return magic == "MFD1";
 }
 
 inline bool is_legacy_mfe_magic(std::string_view magic) noexcept {

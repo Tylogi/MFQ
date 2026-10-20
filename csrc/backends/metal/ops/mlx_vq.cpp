@@ -2,7 +2,7 @@
 #include "mlx_nvq_decode.h"
 #include "runtime/mlx_weight_residency.h"
 
-#include "compat/mfq_format_compat.h"
+#include "compat/format.h"
 #include "generated/nvq_codebooks.generated.h"
 #include "runtime/mlx_staging_allocator.h"
 #include <mlx/allocator.h>

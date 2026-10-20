@@ -7,7 +7,7 @@
 
 #include "ops/quant/quant_linear.h"
 #include "ops/format.h"
-#include "compat/mfq_format_compat.h"
+#include "compat/format.h"
 #include "kernels/moe/pipeline.h"
 
 #include <algorithm>

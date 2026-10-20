@@ -52,7 +52,7 @@ def _check_kernel_target(graph: str) -> None:
     dependencies = _target_dependencies(graph, "mfq-cuda-native-kernels")
     assert "mfq-formats" in dependencies
     forbidden = {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-engine", "mfq-models",
-                 "mfq-json", "mfq-io", "mfq-cpu-ops", "mfq-cpu-execution", "mfq-qsa-kv-store"}
+                 "mfq-json", "mfq-io", "mfq-quant-readers", "mfq-cpu-ops", "mfq-cpu-execution", "mfq-qsa-kv-store"}
     assert not dependencies & forbidden, f"kernels reach {dependencies & forbidden}"
     assert _target_dependencies(graph, "mfq-formats") == {"mfq-formats"}
 
@@ -111,6 +111,11 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     code, output, _ = _configure(tmp_path, "native-closure", *options)
     assert code == 0, output
     _check_native_targets((tmp_path / "native-closure/targets.dot").read_text(), cuda)
+    readers = _target_dependencies((tmp_path / "native-closure/targets.dot").read_text(),
+                                   "mfq-quant-readers")
+    assert {"mfq-formats", "mfq-io", "mfq-host-parallel"} <= readers
+    assert not readers & {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json",
+                          "mfq-engine", "mfq-models", "mfq-cpu-execution"}
     if cuda:
         commands = json.loads((tmp_path / "native-closure/compile_commands.json").read_text())
         kernels = [item["command"].replace("\\", "/") for item in commands

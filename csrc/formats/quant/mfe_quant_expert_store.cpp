@@ -1,6 +1,6 @@
-#include "mfq/quant/mfe_expert_store.h"
-#include "mfq/quant/packed_nint_expert_store.h"
-#include "compat/mfq_format_compat.h"
+#include "quant/mfe_expert_store.h"
+#include "quant/packed_nint_expert_store.h"
+#include "compat/format.h"
 #include "mfq/host_parallel.h"
 
 #include <algorithm>

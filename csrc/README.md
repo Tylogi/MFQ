@@ -18,7 +18,11 @@ has landed.
   [docs/plan.md](../docs/plan.md);
 - `formats/` — packed quantization schemas, byte-range decoding helpers and
   frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
-  dependency. Model sources and backend operators consume it directly; CUDA
+  dependency. Compiled NINT/NVQ/MFE range readers live beside those headers
+  in `formats/quant/` and build as `mfq-quant-readers`, with file-read values
+  and host workers but no core/model dependency. Canonical dtype identifiers
+  live in `formats/dtype.h`; legacy spelling recognition stays in `formats/compat/`.
+  Model sources and backend operators consume the headers directly; CUDA
   native kernels no longer depend on `mfq-core`;
 - `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.

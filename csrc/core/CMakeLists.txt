@@ -10,7 +10,6 @@ add_library(mfq-model-graph STATIC
     compat/mfq_legacy_model_graph.h
     compat/mfq_legacy_tensor_names.cpp
     compat/mfq_legacy_tensor_names.h
-    compat/mfq_format_compat.h
 )
 add_library(mfq::model-graph ALIAS mfq-model-graph)
 target_include_directories(mfq-model-graph PUBLIC
@@ -24,12 +23,6 @@ set_target_properties(mfq-model-graph PROPERTIES
 )
 
 add_library(mfq-model-source STATIC
-    quant/mfe_quant_expert_store.cpp
-    include/mfq/quant/mfe_expert_store.h
-    quant/nint_rows.cpp
-    include/mfq/quant/nint_rows.h
-    quant/nvq_rows.cpp
-    include/mfq/quant/nvq_rows.h
     model_source/hf_model_source.cpp
     model_source/hf_safetensors_source.cpp
     include/mfq/model_source/hf_model_source.h
@@ -46,7 +39,7 @@ target_include_directories(mfq-model-source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
-target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-formats mfq-io)
+target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-quant-readers mfq-io)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)

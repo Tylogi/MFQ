@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/quant/nint_rows.h"
+#include "quant/nint_rows.h"
 #include <span>
 #include <mlx/mlx.h>
 

@@ -1,4 +1,4 @@
-#include "mfq/quant/nint_rows.h"
+#include "quant/nint_rows.h"
 
 #include "quant/nint_blob.h"
 #include "mfq/host_parallel.h"

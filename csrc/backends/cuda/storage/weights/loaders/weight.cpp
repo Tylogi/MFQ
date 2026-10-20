@@ -21,7 +21,7 @@
 #include "storage/weights/moe/expert_cache.h"
 #include "storage/weights/mfe_expert_store.h"
 #include "storage/weights/moe/quant_range_source.h"
-#include "mfq/quant/packed_nint_expert_store.h"
+#include "quant/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
 #include "storage/weights/moe/weight_loader.h"

@@ -1,4 +1,4 @@
-#include "mfq/quant/nvq_rows.h"
+#include "quant/nvq_rows.h"
 #include "quant/packed_row_range.h"
 
 #include <cstring>

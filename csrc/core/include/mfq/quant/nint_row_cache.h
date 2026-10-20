@@ -1,5 +1,5 @@
 #pragma once
-#include "nint_rows.h"
+#include "quant/nint_rows.h"
 #include <list>
 #include <memory>
 #include <mutex>

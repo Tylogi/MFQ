@@ -4,7 +4,7 @@
 #include "mfq/mapped_prefetch_scope.h"
 #include "mfq/mapped_tensor_pages.h"
 
-#include "compat/mfq_format_compat.h"
+#include "compat/format.h"
 #include "compat/mfq_legacy_tensor_names.h"
 
 #include <algorithm>

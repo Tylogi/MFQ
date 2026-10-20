@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/quant/mfe_expert_store.h"
+#include "quant/mfe_expert_store.h"
 
 namespace mfq {
 // Present packed [experts, out, in] NINT as a virtual MFE container. Only the

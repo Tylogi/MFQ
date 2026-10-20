@@ -6,7 +6,7 @@
 
 #include "quant_linear.h"
 #include "format.h"
-#include "mfq_format_compat.h"
+#include "compat/format.h"
 #include "mfe_expert_store.h"
 #include "runtime/moe_pipeline.h"
 

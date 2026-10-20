@@ -23,7 +23,7 @@
 
 终态目录与逐文件归属以 [refactor.md](refactor.md) 为准，剩余迁移包括：
 
-- 将 `core/` 剩余的模型 schema、行读取和旧格式标识归入 `formats/`，模型读取归入 `model_source/`。
+- 将 `core/` 剩余的模型 schema 和旧格式输入边界归入 `formats/`，模型读取归入 `model_source/`。
 - 将共享配置和 forward 收敛到 `engine/model/<family>/`，删除旧 Ops/继承/ForwardOps 绑定链。
 - 将状态、权重与执行规则分别落实到 `engine/state/`、`engine/weights/` 和 `engine/executor/`；后端保留物理存储与数值执行。
 - 将 CUDA `engine/` 收敛为装配入口，迁走其中的生成、事务和可复用模型行为。
@@ -73,7 +73,7 @@
 
 | 步骤 | 剩余工作 |
 | --- | --- |
-| K1 底层依赖 | 迁移剩余格式 schema、行读取、旧标识与 model_source，将 model-graph 中的视觉算法归位 |
+| K1 底层依赖 | 迁移剩余格式 schema 与 model_source，收口旧标识输入边界，将 model-graph 中的视觉算法归位 |
 | K2 契约与模型 | 合并请求/采样值契约，归位 StepSequence、grid vision 与公共头，收口 ModelSource 的 compat 暴露 |
 | K3 状态与放置 | 将 prefix/QSA、在线 CPU 成本测量、MoE 放置和分片规则接入 Store/Executor |
 | K4 删除入口 | 删除 `csrc/core/`、`mfq-core`/`mfq::core` 及全部活动消费者 |

@@ -4,7 +4,7 @@
 #include "ops/format.h"
 #include "kernels/moe/ops.h"
 #include "kernels/quant_ops.h"
-#include "compat/mfq_format_compat.h"
+#include "compat/format.h"
 #include "ops/quant/quant_linear.h"
 
 #include <algorithm>
