@@ -7066,6 +7066,35 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
             require(layer.attention.position == 17, "V4.1 CED left a decoder cache at the tail length");
         const auto next = mlx::core::array({3}, mlx::core::Shape{1, 1}, mlx::core::int32);
         const auto expected = evaluated_floats(runtime.decode(next));
+        using PrefixCodec = MlxPagedSessionCodec<MlxDeepseekV41TextSessionState>;
+        const auto persist = [&](const MlxDeepseekV41TextSessionState& state) {
+            std::vector<MlxPagedPayload> blocks;
+            for (std::size_t index = 0; index < (state.tokens.size() + 7) / 8; ++index)
+                blocks.push_back(PrefixCodec::encode_block(state, 8, index));
+            require(PrefixCodec::has_exact_boundary(blocks.back()) &&
+                    PrefixCodec::has_mtp(blocks.back()) == state.dspark.has_value() &&
+                    PrefixCodec::token_count(blocks.back()) == state.tokens.size(),
+                "V4.1 prefix codec lost its checkpoint metadata");
+            require(!PrefixCodec::has_exact_boundary(blocks.front()) &&
+                    PrefixCodec::decodable_blocks({blocks.front()}) == 0,
+                "V4.1 prefix accepted a non-exact ring/history boundary");
+            for (int damage : {0, 1, 2}) {
+                auto damaged = blocks;
+                auto bytes = std::make_shared<std::vector<std::uint8_t>>(*blocks.back());
+                if (damage == 0) bytes->pop_back();
+                else if (damage == 1) (*bytes)[0] ^= 1;
+                else bytes->push_back(0);
+                damaged.back() = std::move(bytes);
+                bool rejected = false;
+                try { (void)PrefixCodec::decode(damaged, state.tokens, 8); }
+                catch (const std::exception&) { rejected = true; }
+                require(rejected, "V4.1 prefix accepted truncated or malformed payload");
+            }
+            return PrefixCodec::decode(blocks, state.tokens, 8);
+        };
+        runtime.restore_text_session_state(persist(saved));
+        require(evaluated_floats(runtime.decode(next)) == expected,
+            "V4.1 persisted CSA2/Engram prefix changed subsequent decode");
         runtime.restore_text_session_state(saved);
         require(evaluated_floats(runtime.decode(next)) == expected,
             "V4.1 CED prefix restore changed subsequent decode");
@@ -7178,6 +7207,37 @@ void test_deepseek_v41_ced_text_cache(bool reject_drafts = false) {
                 ? runtime.last_mtp_stats().accepted_tokens < runtime.last_mtp_stats().drafted_tokens
                 : runtime.last_mtp_stats().accepted_tokens > 0,
             "V4.1 DSpark fixture did not exercise its acceptance/rollback branch");
+        for (bool mtp : {false, true}) {
+            auto history = prompt;
+            std::vector<std::int64_t> output;
+            std::vector<MlxDeepseekV41TextSessionState> checkpoints;
+            MlxPrefixCacheHooks hooks{8, prompt.size(), true, [&](std::size_t position) {
+                require(position <= history.size(), "V4.1 checkpoint precedes delivered history");
+                checkpoints.push_back(runtime.capture_text_session_state(
+                    std::vector<std::int64_t>(history.begin(), history.begin() + position), true));
+            }};
+            sampling.enable_mtp = mtp;
+            require(runtime.generate(prompt, sampling, 8, [&](auto token) {
+                history.push_back(token); output.push_back(token); return true;
+            }, {}, {}, prompt.size(), 8, hooks) == 8 && output == ordinary,
+                "V4.1 block checkpointing changed ordinary/DSpark greedy output");
+            require(!checkpoints.empty() && checkpoints.back().cache_position == 24 &&
+                    checkpoints.back().dspark.has_value() == mtp,
+                "V4.1 did not cache committed generated tokens and predictor history");
+            const auto restored = persist(checkpoints.back());
+            runtime.restore_text_session_state(restored);
+            const auto before = evaluated_floats(runtime.decode(next));
+            runtime.restore_text_session_state(persist(restored));
+            const auto after = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < before.size(); ++index)
+                require_close(after[index], before[index], 0.002f + std::abs(before[index]) * 0.002f);
+            const auto history_ids = mlx::core::array(restored.tokens.begin(),
+                mlx::core::Shape{1, static_cast<int>(restored.tokens.size())}, mlx::core::int32);
+            (void)evaluated_floats(runtime.prefill(history_ids, 8));
+            const auto fresh = evaluated_floats(runtime.decode(next));
+            for (std::size_t index = 0; index < fresh.size(); ++index)
+                require_close(before[index], fresh[index], 0.002f + std::abs(fresh[index]) * 0.002f);
+        }
     }
 }
 
@@ -10282,6 +10342,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--test-v41-vision-routing") {
             test_deepseek_v41_visual_router_precision();
             std::cout << "MFQ DeepSeek-V4.1 visual router precision tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-v41-prefix") {
+            test_deepseek_v41_ced_text_cache();
+            test_deepseek_v41_ced_text_cache(true);
+            std::cout << "MFQ DeepSeek-V4.1 persistent prefix tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {

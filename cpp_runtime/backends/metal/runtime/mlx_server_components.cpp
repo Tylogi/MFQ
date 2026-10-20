@@ -648,6 +648,53 @@ MlxEngineComponents make_mlx_engine_components(
     return result;
 }
 
+std::vector<MlxDeepseekV41ImageInput> prepare_deepseek_v41_images(
+    const std::vector<std::int64_t>& prompt, const MfqMultimodalInput& media,
+    const DeepseekV41Config& config) {
+    if (media.processor != MfqMultimodalProcessor::deepseek_v41 || media.processor_name != "deepseek_v41")
+        throw std::invalid_argument("DeepSeek-V4.1 received a foreign multimodal payload");
+    const auto shape = checked_shape(media.pixel_shape, "pixel_values");
+    if (shape.size() != 3 || media.image_bounds.empty() || media.image_bounds.size() % 4 ||
+        media.vision_grid.size() != media.image_bounds.size() ||
+        shape[0] != static_cast<int>(media.image_bounds.size() / 4) ||
+        shape[2] != 3 * config.vision.patch_size * config.vision.patch_size ||
+        media.pixel_values.size() != std::size_t(shape[0]) * shape[1] * shape[2])
+        throw std::invalid_argument("DeepSeek-V4.1 media payload geometry is invalid");
+    const auto pixels = mlx::core::array(media.pixel_values.begin(), shape, mlx::core::float32);
+    std::vector<MlxDeepseekV41ImageInput> images;
+    const int ratio = static_cast<int>(config.vision.downsample_ratio);
+    int previous_end = 0;
+    for (std::size_t source = 0; source < media.image_bounds.size() / 4; ++source) {
+        const auto begin = media.image_bounds[4 * source + 2];
+        const auto end = media.image_bounds[4 * source + 3];
+        const int height = media.vision_grid[4 * source], width = media.vision_grid[4 * source + 1];
+        const int rows = media.vision_grid[4 * source + 2], cols = media.vision_grid[4 * source + 3];
+        const auto active = std::int64_t(height) * width;
+        const auto span = std::int64_t(rows) * (std::int64_t(cols) + 1) + 2;
+        if (ratio <= 0 || media.image_bounds[4 * source + 1] != static_cast<std::int64_t>(source) ||
+            begin < previous_end || end <= begin || std::uint64_t(end) > prompt.size() || end - begin != span ||
+            height <= 0 || width <= 0 || rows != (std::int64_t(height) + ratio - 1) / ratio ||
+            cols != (std::int64_t(width) + ratio - 1) / ratio || active > shape[1])
+            throw std::invalid_argument("DeepSeek-V4.1 image span is invalid");
+        for (auto position = begin; position < end; ++position)
+            if (prompt[position] != config.image_token_id)
+                throw std::invalid_argument("DeepSeek-V4.1 image span contains a text token");
+        auto patches = mlx::core::reshape(mlx::core::slice(pixels,
+            mlx::core::Shape{static_cast<int>(source), 0, 0},
+            mlx::core::Shape{static_cast<int>(source + 1), static_cast<int>(active), shape[2]}),
+            mlx::core::Shape{static_cast<int>(active), shape[2]});
+        std::vector<std::int64_t> types{0};
+        for (int row = 0; row < rows; ++row) {
+            types.insert(types.end(), static_cast<std::size_t>(cols), 1);
+            types.push_back(2);
+        }
+        types.push_back(3);
+        images.push_back({std::move(patches), height, width, static_cast<int>(begin), static_cast<int>(end), std::move(types)});
+        previous_end = static_cast<int>(end);
+    }
+    return images;
+}
+
 MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
@@ -679,81 +726,9 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "DeepSeek-V4.1 runtime is unavailable after a failed reload");
             }
-            if (media.processor != MfqMultimodalProcessor::deepseek_v41 ||
-                media.processor_name != "deepseek_v41") {
-                throw std::invalid_argument(
-                    "DeepSeek-V4.1 received a foreign multimodal payload");
-            }
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
-            const auto& config = runtime_holder->value().config();
-            const auto pixel_shape = checked_shape(
-                media.pixel_shape, "pixel_values");
-            if (pixel_shape.size() != 3 ||
-                media.image_bounds.size() % 4 != 0 ||
-                media.vision_grid.size() != media.image_bounds.size() ||
-                pixel_shape[0] !=
-                    static_cast<int>(media.image_bounds.size() / 4)) {
-                throw std::invalid_argument(
-                    "DeepSeek-V4.1 media payload geometry is invalid");
-            }
-            const auto pixels = mlx::core::array(
-                media.pixel_values.begin(), pixel_shape,
-                mlx::core::float32);
-            std::vector<MlxDeepseekV41ImageInput> images;
-            const std::size_t count = media.image_bounds.size() / 4;
-            images.reserve(count);
-            for (std::size_t source = 0; source < count; ++source) {
-                const int bound_source = static_cast<int>(
-                    media.image_bounds[4 * source + 1]);
-                const int begin = static_cast<int>(
-                    media.image_bounds[4 * source + 2]);
-                const int end = static_cast<int>(
-                    media.image_bounds[4 * source + 3]);
-                const int vit_h = media.vision_grid[4 * source];
-                const int vit_w = media.vision_grid[4 * source + 1];
-                const int llm_h = media.vision_grid[4 * source + 2];
-                const int llm_w = media.vision_grid[4 * source + 3];
-                const int active = vit_h * vit_w;
-                const int span = llm_h * (llm_w + 1) + 2;
-                if (bound_source != static_cast<int>(source) ||
-                    begin < 0 || end - begin != span ||
-                    end > static_cast<int>(prompt.size()) ||
-                    vit_h <= 0 || vit_w <= 0 ||
-                    llm_h != (vit_h + 2) / 3 ||
-                    llm_w != (vit_w + 2) / 3 ||
-                    active > pixel_shape[1]) {
-                    throw std::invalid_argument(
-                        "DeepSeek-V4.1 image span is invalid");
-                }
-                for (int position = begin; position < end; ++position) {
-                    if (prompt[static_cast<std::size_t>(position)] !=
-                        config.image_token_id) {
-                        throw std::invalid_argument(
-                            "DeepSeek-V4.1 image span contains a text token");
-                    }
-                }
-                auto patches = mlx::core::slice(
-                    pixels,
-                    mlx::core::Shape{static_cast<int>(source), 0, 0},
-                    mlx::core::Shape{
-                        static_cast<int>(source + 1), active,
-                        pixel_shape[2]});
-                patches = mlx::core::reshape(
-                    patches, mlx::core::Shape{active, pixel_shape[2]});
-                std::vector<std::int64_t> types;
-                types.reserve(static_cast<std::size_t>(span));
-                types.push_back(0);
-                for (int row = 0; row < llm_h; ++row) {
-                    types.insert(
-                        types.end(), static_cast<std::size_t>(llm_w), 1);
-                    types.push_back(2);
-                }
-                types.push_back(3);
-                images.push_back({
-                    std::move(patches), vit_h, vit_w, begin, end,
-                    std::move(types)});
-            }
+            const auto images = prepare_deepseek_v41_images(prompt, media, runtime_holder->value().config());
             std::function<void(std::size_t, double)> report_prefill;
             {
                 report_prefill = [on_prefill](

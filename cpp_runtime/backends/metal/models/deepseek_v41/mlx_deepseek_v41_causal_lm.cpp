@@ -1359,7 +1359,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
     const MlxSamplingParams& sampling,
     std::int32_t limit,
     const std::function<bool(std::int64_t)>& callback,
-    const MfqTokenConstraintPtr& token_constraint) {
+    const MfqTokenConstraintPtr& token_constraint,
+    const MlxPrefixCacheHooks& prefix_cache) {
     const int vocab = static_cast<int>(config_.vocab);
     std::optional<array> counts;
     if (sampling.has_penalties()) {
@@ -1384,6 +1385,13 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
         0,
     };
     if (mtp_active) {
+        const auto commit_history = [&](const MlxMtpDraftContext& context) {
+            if (context.initial || dspark_state_->position() == cache_position_) return;
+            const int expected_width = static_cast<int>(config_.hidden *
+                static_cast<std::int64_t>(config_.dspark_target_layer_ids.size()));
+            dspark_->append_context(mlx_mtp_committed_hidden(context, 1, expected_width),
+                *dspark_state_, context.target_cache_start);
+        };
         MlxMtpEngineCallbacks callbacks;
         callbacks.predictor = dspark_->mtp_descriptor();
         callbacks.target_cache_position = [this] {
@@ -1392,18 +1400,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
         callbacks.prepare_draft =
             [&](const MlxMtpDraftContext& context,
                 const MlxMtpTokenSelector& select_token) {
-                if (!context.initial) {
-                    const int expected_width = static_cast<int>(
-                        config_.hidden *
-                        static_cast<std::int64_t>(
-                            config_.dspark_target_layer_ids.size()));
-                    auto committed_hidden = mlx_mtp_committed_hidden(
-                        context, 1, expected_width);
-                    dspark_->append_context(
-                        committed_hidden,
-                        *dspark_state_,
-                        context.target_cache_start);
-                }
+                commit_history(context);
                 if (context.requested_depth == 0) {
                     return;
                 }
@@ -1464,7 +1461,16 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 rollback_speculative_target(
                     accepted_drafts, draft_count);
             };
-        return run_mlx_mtp_generation(
+        if (prefix_cache) {
+            callbacks.draft_limit = [&](int position, int depth) {
+                return prefix_cache.draft_limit(position, depth);
+            };
+            callbacks.committed_target = [&](const MlxMtpDraftContext& context) {
+                commit_history(context);
+                prefix_cache.checkpoint(cache_position_);
+            };
+        }
+        const auto generated = run_mlx_mtp_generation(
             MlxMtpEngineRequest{
                 vocab,
                 limit,
@@ -1479,6 +1485,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
             },
             callbacks,
             last_mtp_stats_);
+        prefix_cache.checkpoint(cache_position_, true);
+        return generated;
     }
 
     MlxSampler sampler(sampling);
@@ -1530,7 +1538,9 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
             break;
         }
         logits = mlx_last_token_logits(decode(token_ids), vocab);
+        prefix_cache.checkpoint(cache_position_);
     }
+    prefix_cache.checkpoint(cache_position_, true);
     return generated;
 }
 
@@ -1542,7 +1552,20 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
     std::optional<std::size_t> stable_prefix_tokens,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
+    return generate_impl(prompt, sampling, max_tokens, callback, prefill_callback,
+        token_constraint, stable_prefix_tokens, prefill_chunk_size, prefix_cache);
+}
+
+std::int32_t MlxDeepseekV41CausalLm::generate_impl(
+    const std::vector<std::int64_t>& prompt, const MlxSamplingParams& sampling,
+    std::int32_t max_tokens, const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens, int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache,
+    const std::vector<MlxDeepseekV41ImageInput>* images) {
     if (prompt.empty() || max_tokens < 0 || prefill_chunk_size <= 0) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4.1 generation request");
@@ -1569,9 +1592,13 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     const bool mtp_candidate = supports_mtp() && sampling.enable_mtp &&
         max_tokens > 1;
     mtp_context_requested_ = mtp_candidate;
-    const std::size_t requested_stable_count = stable_prefix_tokens
+    std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
         : 0;
+    if (prefix_cache) requested_stable_count = std::min(requested_stable_count, prompt.size() - 1);
+    if (images) for (const auto& image : *images)
+        if (requested_stable_count > std::size_t(image.begin) && requested_stable_count < std::size_t(image.end))
+            requested_stable_count = image.begin;
     const bool retain_stable_prefix =
         requested_stable_count > 0;
     const std::size_t stable_count = retain_stable_prefix
@@ -1712,31 +1739,53 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     array logits(0.0f);
     try {
         if (!retain_stable_prefix) {
-            logits = prefill(prompt_ids, prefill_chunk_size, false);
+            logits = images ? prefill_multimodal(prompt, *images) : prefill(prompt_ids, prefill_chunk_size, false);
         } else {
             const auto prefill_range = [&](std::size_t begin, std::size_t end) {
                 std::optional<array> last;
                 const auto length = end - begin;
                 const auto chunk = static_cast<std::size_t>(prefill_chunk_size);
                 const auto final_tokens = length ? length - ((length - 1) / chunk) * chunk : 0;
-                for (std::size_t offset = begin; offset < end;
-                     offset += static_cast<std::size_t>(prefill_chunk_size)) {
-                    const auto stop = std::min(
+                for (std::size_t offset = begin; offset < end;) {
+                    auto stop = prefix_cache.prefill_end(offset, std::min(
                         end,
-                        offset + static_cast<std::size_t>(prefill_chunk_size));
+                        offset + static_cast<std::size_t>(prefill_chunk_size)));
+                    std::optional<array> image_mask, embeddings;
+                    if (images) {
+                        for (const auto& image : *images)
+                            if (stop > std::size_t(image.begin) && stop < std::size_t(image.end)) stop = image.end;
+                        std::vector<MlxDeepseekV41ImageInput> selected;
+                        for (const auto& image : *images) if (std::size_t(image.end) > offset && std::size_t(image.begin) < stop) {
+                            if (std::size_t(image.begin) < offset || std::size_t(image.end) > stop || stop > end)
+                                throw std::runtime_error("DeepSeek-V4.1 cache boundary splits an image");
+                            selected.push_back(image);
+                            selected.back().begin -= static_cast<int>(offset);
+                            selected.back().end -= static_cast<int>(offset);
+                        }
+                        if (!selected.empty()) {
+                            const std::vector<std::int64_t> ids(prompt.begin() + offset, prompt.begin() + stop);
+                            embeddings = vision_->embed_prompt(ids, selected, embedding_, mlx::core::float16);
+                            image_mask = vision_->image_mask(static_cast<int>(stop - offset), selected);
+                        }
+                    }
                     last = forward_impl(
                         slice_tokens(
                             prompt_ids,
                             static_cast<int>(offset),
                             static_cast<int>(stop)),
-                        std::nullopt,
+                        image_mask,
                         true,
-                        std::nullopt,
+                        embeddings,
                         nullptr,
                         true,
                         stop < end,
                         true,
-                        stop < end && final_tokens > config_.sliding_window);
+                        stop < end && final_tokens > config_.sliding_window && !prefix_cache);
+                    if (prefix_cache.wants(stop)) {
+                        materialize_states(states_);
+                        prefix_cache.checkpoint(stop);
+                    }
+                    offset = stop;
                 }
                 if (!last) {
                     throw std::runtime_error(
@@ -1752,11 +1801,13 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
                 stable_logits = prefill_range(reused_tokens, stable_count);
             }
             materialize_states(states_);
-            stable_restore.capture(prompt, stable_count);
-            materialize_states(stable_restore.states());
-            if (stable_restore.dspark()) {
-                materialize_deepseek_v41_dspark_state(
-                    *stable_restore.dspark());
+            if (!prefix_cache) {
+                stable_restore.capture(prompt, stable_count);
+                materialize_states(stable_restore.states());
+                if (stable_restore.dspark())
+                    materialize_deepseek_v41_dspark_state(*stable_restore.dspark());
+            } else {
+                prefix_cache.checkpoint(stable_count);
             }
             if (stable_count < prompt.size()) {
                 logits = prefill_range(stable_count, prompt.size());
@@ -1785,7 +1836,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
         max_context_ - static_cast<int>(prompt.size()) + 1);
     return generate_from_prefill(
         std::move(logits), prompt, sampling, limit, callback,
-        token_constraint);
+        token_constraint, prefix_cache);
 }
 
 std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
@@ -1795,51 +1846,23 @@ std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    const MfqTokenConstraintPtr& token_constraint) {
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens, int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
     if (prompt.empty() || images.empty() || max_tokens < 0) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4.1 multimodal generation request");
     }
-    mlx_validate_token_set(prompt, static_cast<int>(config_.vocab));
-    last_mtp_stats_ = {supports_mtp(), false, 0, 0, 0};
-    if (max_tokens == 0) {
-        mtp_context_requested_ = false;
-        reset_cache(1);
-        return 0;
-    }
-    const auto started = std::chrono::steady_clock::now();
-    mtp_context_requested_ = supports_mtp() && sampling.enable_mtp &&
-        max_tokens > 1;
-    array logits(0.0f);
-    try {
-        logits = prefill_multimodal(prompt, images);
-    } catch (...) {
-        mtp_context_requested_ = false;
-        throw;
-    }
-    mtp_context_requested_ = false;
-    logits.eval();
-    mlx::core::synchronize();
-    if (prefill_callback) {
-        prefill_callback(
-            prompt.size(),
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count());
-    }
-    const auto limit = std::min<std::int32_t>(
-        max_tokens,
-        max_context_ - static_cast<int>(prompt.size()) + 1);
-    return generate_from_prefill(
-        std::move(logits), prompt, sampling, limit, callback,
-        token_constraint);
+    return generate_impl(prompt, sampling, max_tokens, callback, prefill_callback,
+        token_constraint, stable_prefix_tokens, prefill_chunk_size, prefix_cache, &images);
 }
 
 MlxDeepseekV41TextSessionState
 MlxDeepseekV41CausalLm::capture_text_session_state(
-    const std::vector<std::int64_t>& tokens) const {
+    const std::vector<std::int64_t>& tokens, bool copy_arrays) const {
     if (cache_batch_ != 1 || cache_position_ <= 0 ||
         static_cast<std::size_t>(cache_position_) != tokens.size() ||
-        states_.size() != layers_.size() || dspark_state_ ||
+        states_.size() != layers_.size() ||
         speculative_engram_snapshot_ || speculative_token_ids_ ||
         speculative_cache_start_ >= 0) {
         throw std::runtime_error(
@@ -1855,19 +1878,21 @@ MlxDeepseekV41CausalLm::capture_text_session_state(
     state.engram_hash = std::move(hash);
     state.cache_position = cache_position_;
     state.cache_batch = cache_batch_;
+    state.bytes = state.engram_hash.context.size() * sizeof(std::int64_t);
     state.layers.reserve(states_.size());
     for (const auto& layer : states_) {
-        auto snapshot = layer.attention.snapshot();
+        auto snapshot = layer.attention.snapshot(copy_arrays);
         state.bytes += snapshot.nbytes();
         state.layers.push_back({std::move(snapshot)});
     }
-    if (stable_dspark_state_) {
-        if (!dspark_ || stable_dspark_state_->batch() != cache_batch_ ||
-            stable_dspark_state_->position() != cache_position_) {
+    const auto& predictor = dspark_state_ ? dspark_state_ : stable_dspark_state_;
+    if (predictor) {
+        if (!dspark_ || predictor->batch() != cache_batch_ ||
+            predictor->position() != cache_position_) {
             throw std::runtime_error(
                 "DeepSeek-V4.1 stable DSpark state does not match cache");
         }
-        state.dspark.emplace(stable_dspark_state_->snapshot());
+        state.dspark.emplace(predictor->snapshot(copy_arrays));
         state.bytes += state.dspark->nbytes();
     }
     materialize_states(state.layers);

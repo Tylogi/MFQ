@@ -274,11 +274,26 @@ const array& MlxDeepseekV41DSparkState::ring(std::size_t stage) const {
     return rings_.at(stage);
 }
 
-MlxDeepseekV41DSparkState MlxDeepseekV41DSparkState::snapshot() const {
+MlxDeepseekV41DSparkState MlxDeepseekV41DSparkState::snapshot(bool copy_arrays) const {
     std::vector<array> rings;
     rings.reserve(rings_.size());
-    for (const auto& ring : rings_) rings.push_back(detached_copy(ring));
+    for (const auto& ring : rings_) rings.push_back(copy_arrays ? detached_copy(ring) : ring);
     return MlxDeepseekV41DSparkState(std::move(rings), position_);
+}
+
+MlxDeepseekV41DSparkState MlxDeepseekV41DSparkState::from_snapshot(
+    std::vector<array> rings, int position) {
+    if (rings.empty() || position < 0 || rings.front().ndim() != 3 ||
+        rings.front().shape(0) != 1 || rings.front().shape(1) <= 0 ||
+        rings.front().shape(2) <= 0 ||
+        (rings.front().dtype() != mlx::core::float16 &&
+         rings.front().dtype() != mlx::core::bfloat16 &&
+         rings.front().dtype() != mlx::core::float32))
+        throw std::invalid_argument("invalid DeepSeek-V4.1 DSpark checkpoint");
+    for (const auto& ring : rings)
+        if (ring.shape() != rings.front().shape() || ring.dtype() != rings.front().dtype())
+            throw std::invalid_argument("inconsistent DeepSeek-V4.1 DSpark checkpoint rings");
+    return MlxDeepseekV41DSparkState(std::move(rings), position);
 }
 
 void MlxDeepseekV41DSparkState::restore_snapshot(

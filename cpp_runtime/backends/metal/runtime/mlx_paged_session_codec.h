@@ -4,6 +4,7 @@
 #include "mlx_minicpmo45.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_qwen4_causal_lm.h"
+#include "mlx_deepseek_v41_causal_lm.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,23 @@ using MlxPagedPayload = mfq::cache::PagedPrefixPayload;
 template <typename SessionState>
 struct MlxPagedSessionCodec {
     static constexpr bool available = false;
+};
+
+template <>
+struct MlxPagedSessionCodec<MlxDeepseekV41TextSessionState> {
+    static constexpr bool available = true;
+    static constexpr bool refresh_final_block = true;
+    static constexpr bool supports_tail_blocks = true;
+    static constexpr std::string_view name = "deepseek-v41-csa2-engram-dspark-v1";
+
+    static MlxPagedPayload encode_block(const MlxDeepseekV41TextSessionState& state,
+        std::size_t block_size, std::size_t index);
+    static MlxDeepseekV41TextSessionState decode(const std::vector<MlxPagedPayload>& payloads,
+        const std::vector<std::int64_t>& tokens, std::size_t block_size);
+    static std::size_t decodable_blocks(const std::vector<MlxPagedPayload>& payloads);
+    static bool has_exact_boundary(const MlxPagedPayload& payload);
+    static bool has_mtp(const MlxPagedPayload& payload);
+    static std::size_t token_count(const MlxPagedPayload& payload);
 };
 
 template <>

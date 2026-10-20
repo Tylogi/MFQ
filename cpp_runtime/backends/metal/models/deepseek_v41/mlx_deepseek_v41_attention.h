@@ -41,7 +41,7 @@ struct MlxDeepseekV41AttentionState {
         mlx::core::Dtype dtype = mlx::core::float16);
 
     void reset() noexcept;
-    MlxDeepseekV41AttentionState snapshot() const;
+    MlxDeepseekV41AttentionState snapshot(bool copy_arrays = true) const;
     void restore_snapshot(MlxDeepseekV41AttentionState snapshot);
     std::size_t nbytes() const noexcept;
 };

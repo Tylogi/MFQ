@@ -1046,6 +1046,7 @@ set_target_properties(mfq-metal-deepseek-v41-vision-test PROPERTIES
 )
 add_test(NAME mfq-metal-deepseek-v41-vision-test COMMAND mfq-metal-deepseek-v41-vision-test)
 add_test(NAME mfq-metal-deepseek-v41-vision-routing-test COMMAND mfq-metal-moe-test --test-v41-vision-routing)
+add_test(NAME mfq-metal-deepseek-v41-prefix-test COMMAND mfq-metal-moe-test --test-v41-prefix)
 
 add_executable(mfq-metal-moe-ops-test
     tests/mlx_moe_ops_test.cpp
