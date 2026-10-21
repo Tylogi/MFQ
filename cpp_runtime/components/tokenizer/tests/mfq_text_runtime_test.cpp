@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "mfq_text.h"
 #include "mfq_grammar.h"
+#include "unicode.h"
 
 #include <cmath>
 #include <cstdio>
@@ -18,6 +19,43 @@ namespace {
 void require(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+constexpr const char * kTekkenRegex =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
+void require_tekken_parts(
+        const std::string & text,
+        const std::vector<std::string> & expected) {
+    const auto actual = unicode_regex_split(text, {kTekkenRegex}, false);
+    require(actual == expected, "Tekken regex split mismatch");
+}
+
+void test_tekken_regex_split() {
+    require_tekken_parts("abcDEF", {"abc", "DEF"});
+    require_tekken_parts("ABCdef", {"ABCdef"});
+    require_tekken_parts("aBcDeF", {"a", "Bc", "De", "F"});
+    require_tekken_parts("Hello, world!", {"Hello", ",", " world", "!"});
+    require_tekken_parts("국É한ʰ", {"국É한ʰ"});
+    require_tekken_parts("aBcDeF 123\r\n",
+        {"a", "Bc", "De", "F", " ", "1", "2", "3", "\r\n"});
+    require_tekken_parts("Ünicode ÄÖÜ äöü ß",
+        {"Ünicode", " ÄÖÜ", " äöü", " ß"});
+    // The Tekken punctuation tail includes '/', unlike the Qwen splitter.
+    require_tekken_parts("_\n/'", {"_\n/", "'"});
+
+    // GPQA question 74 contains a long DNA sequence. A std::regex fallback
+    // exhausted its stack on this shape; the custom splitter must stay linear.
+    std::string dna;
+    const std::string codon =
+        "ATGTACCCATACGATGTTCCAGATTACGCCAAATGACTCTGGAAGAAGTCCGCGGCCAGGACACAGTTCCGGAAAGCACAGCCAGGATGCAGGGTGCCGGGAA";
+    for (int repeat = 0; repeat < 40; ++repeat) dna += codon;
+    const auto pieces = unicode_regex_split(dna, {kTekkenRegex}, false);
+    std::string joined;
+    for (const auto & piece : pieces) joined += piece;
+    require(joined == dna, "Tekken long DNA split did not preserve the input");
+    require(pieces.size() == 1, "Tekken long DNA split changed the uppercase run");
+}
+
 
 std::filesystem::path write_tokenizer_fixture() {
     std::vector<std::string> token_storage = {"<unk>", "<s>", "</s>"};
@@ -76,6 +114,7 @@ std::filesystem::path write_tokenizer_fixture() {
 }  // namespace
 
 int main() try {
+    test_tekken_regex_split();
     const auto path = write_tokenizer_fixture();
     std::ifstream input(path, std::ios::binary);
     std::vector<uint8_t> encoded(
