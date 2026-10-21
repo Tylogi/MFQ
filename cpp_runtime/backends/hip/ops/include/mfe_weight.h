@@ -46,18 +46,29 @@ struct MfeWeight {
         activation_workspaces = std::make_shared<std::unordered_map<
             MoeActivationKey, MoeActivationWorkspace, MoeActivationKeyHash>>();
 
-    MoeActivationWorkspace & activation_workspace(
-            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs) const {
-        MoeActivationKey key{input_rows, groups, gs, x.get_device()};
+    MoeActivationWorkspace activation_workspace(
+            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
+            bool stable = true) const {
+        // A producer may have already quantized this exact view for us.
+        const MoeActivationKey exact{input_rows, groups, gs, x.get_device()};
+        auto found = activation_workspaces->find(exact);
+        if (found != activation_workspaces->end()) return found->second;
+        stable = stable && input_rows <= MoeActivationWorkspace::stable_row_limit;
+        const int capacity = MoeActivationWorkspace::capacity_rows(input_rows, stable);
+        // Each negative key owns a permanent capacity bucket. Larger eager
+        // prefill uses key zero and cannot replace a captured bucket address.
+        const MoeActivationKey key{stable ? -capacity : 0, groups, gs, x.get_device()};
         auto it = activation_workspaces->find(key);
-        if (it != activation_workspaces->end()) return it->second;
-        MoeActivationWorkspace workspace;
-        workspace.qx = mfq_tensor_backend::empty(
-            {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-        workspace.xscale = mfq_tensor_backend::empty(
-            {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
-        return activation_workspaces->emplace(
-            key, std::move(workspace)).first->second;
+        if (it == activation_workspaces->end() || it->second.qx.size(0) < input_rows) {
+            MoeActivationWorkspace workspace;
+            workspace.qx = mfq_tensor_backend::empty(
+                {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+            workspace.xscale = mfq_tensor_backend::empty(
+                {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+            it = activation_workspaces->insert_or_assign(key, std::move(workspace)).first;
+        }
+        return {it->second.qx.narrow(0, 0, input_rows),
+                it->second.xscale.narrow(0, 0, input_rows)};
     }
 
     bool expert_parallel() const {
@@ -222,11 +233,12 @@ struct MfeWeight {
                 x.options().dtype(mfq_tensor_backend::kFloat16));
         std::unordered_set<MoeActivationKey, MoeActivationKeyHash> quantized;
         int nint_pool_phase = 0;
+        const bool stable = input_rows <= 2048;
         for (const auto & pool : pools) {
             int groups = (int)pool.weight.ng;
             int gs = (int)pool.weight.gs;
             MoeActivationKey key{input_rows, groups, gs, x.get_device()};
-            auto & workspace = activation_workspace(x, input_rows, groups, gs);
+            auto workspace = activation_workspace(x, input_rows, groups, gs, stable);
             bool input_quantized = input_prequantized ||
                 quantized.find(key) != quantized.end();
             const int route_tile_m = select_nint_prefill_route_tile(

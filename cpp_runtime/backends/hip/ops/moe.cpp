@@ -1332,20 +1332,34 @@ bool MixedMoeRuntime::nint_only() const {
         });
 }
 
-MoeActivationWorkspace & MixedMoeRuntime::activation_workspace(
+MoeActivationWorkspace MixedMoeRuntime::activation_workspace(
         mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
-        MixedMoeTransformKey transform) const {
-    MixedMoeActivationKey key{
+        MixedMoeTransformKey transform, bool stable) const {
+    // Shared quantization publishes an exact-row view. Honor that binding
+    // before selecting our own scratch, including graph-sized inputs.
+    const MixedMoeActivationKey exact{
         input_rows, groups, gs, x.get_device(), transform};
-    auto found = activation_workspaces.find(key);
+    auto found = activation_workspaces.find(exact);
     if (found != activation_workspaces.end()) return found->second;
-    MoeActivationWorkspace value;
-    value.qx = mfq_tensor_backend::empty(
-        {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-    value.xscale = mfq_tensor_backend::empty(
-        {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
-    return activation_workspaces.emplace(
-        key, std::move(value)).first->second;
+    stable = stable && input_rows <= MoeActivationWorkspace::stable_row_limit;
+    const int capacity = MoeActivationWorkspace::capacity_rows(input_rows, stable);
+    // Permanent capacity buckets bound decode scratch without reserving
+    // 2048 rows for a single token. Eager prefill grows independently.
+    const MixedMoeActivationKey key{
+        stable ? -capacity : 0, groups, gs, x.get_device(), transform};
+    auto it = activation_workspaces.find(key);
+    if (it == activation_workspaces.end() || it->second.qx.size(0) < input_rows) {
+        // Publish both allocations together so an allocation failure cannot
+        // leave new Q8 storage paired with an old scale buffer.
+        MoeActivationWorkspace workspace;
+        workspace.qx = mfq_tensor_backend::empty(
+            {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+        workspace.xscale = mfq_tensor_backend::empty(
+            {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+        it = activation_workspaces.insert_or_assign(key, std::move(workspace)).first;
+    }
+    return {it->second.qx.narrow(0, 0, input_rows),
+            it->second.xscale.narrow(0, 0, input_rows)};
 }
 
 std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
@@ -1410,6 +1424,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         throw std::runtime_error("mixed MFE input and route shape mismatch");
     }
     const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
+    const bool stable = input_rows <= MoeActivationWorkspace::stable_row_limit;
     const int result_width = epilogue_mode == 0
         ? out_per_expert
         : out_per_expert / 2;
@@ -1511,8 +1526,8 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         const int groups = (neuron_len + 23) / 24;
         const MixedMoeActivationKey activation_key{
             input_rows, groups, 24, x.get_device(), identity};
-        auto & workspace = activation_workspace(
-            x, input_rows, groups, 24, identity);
+        auto workspace = activation_workspace(
+            x, input_rows, groups, 24, identity, stable);
         auto qx = workspace.qx;
         auto xscale = workspace.xscale;
         bool input_quantized = input_prequantized;
@@ -1542,7 +1557,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             MixedNintInputPlan plan;
             for(int index:nint_dispatch->pools) {
                 const auto& w=pools[index].nint;
-                auto& workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
+                auto workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity,stable);
                 pointers.insert(pointers.end(),{reinterpret_cast<int64_t>(w.q_packed.data_ptr()),
                     reinterpret_cast<int64_t>(w.row_q_bits.data_ptr()),reinterpret_cast<int64_t>(w.row_q_bit_offsets.data_ptr()),
                     reinterpret_cast<int64_t>(w.sub_scale.data_ptr()),reinterpret_cast<int64_t>(w.sub_min.data_ptr()),
@@ -1736,8 +1751,8 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         }
         MixedMoeActivationKey activation_key{
             input_rows, groups, gs, x.get_device(), transform};
-        auto & workspace = activation_workspace(
-            value, input_rows, groups, gs, transform);
+        auto workspace = activation_workspace(
+            value, input_rows, groups, gs, transform, stable);
         bool input_quantized = input_prequantized ||
             quantized.find(activation_key) != quantized.end();
         bool activation_quantized_after_call = true;
