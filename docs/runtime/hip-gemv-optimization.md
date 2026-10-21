@@ -160,3 +160,21 @@ under `post_sync_validation` in the JSON; the original campaigns are retained.
 | qwen35-08b-s4m.mfq | 238.0 | 186.0 | -21.9% |
 | qwen35-4b-s4m.mfq | 122.0 | 114.7 | -5.9% |
 | qwen35-4b-fp.mfq | 110.8 | 60.0 | -45.8% |
+
+That sequential post-sync pass was affected by another workload: the original
+GPU showed 100% utilization and 16% VRAM use after all benchmark clients had
+exited. Its unchanged BF16 control fell 45.8%, and later samples recovered.
+The samples above are retained for disclosure and excluded from speedup
+estimates.
+
+A second confirmation uses an idle MI300X, with both runtimes resident and
+six alternating before/after request pairs in AB/BA order after two warmups
+per version. Each request uses p2048 and 256 generated tokens. GPU utilization
+was zero before loading and after closing the clients; initial VRAM allocation
+was zero. Raw requests and idle checks are under `post_sync_interleaved`.
+
+| Model | Decode before | Decode after | Gain |
+| --- | ---: | ---: | ---: |
+| qwen35-08b-s4m.mfq | 255.0 | 288.3 | +13.1% |
+| qwen35-4b-s4m.mfq | 136.4 | 179.3 | +31.5% |
+| qwen35-4b-fp.mfq | 117.9 | 117.6 | -0.3% |
