@@ -48,6 +48,7 @@ void test_tekken_regex_split() {
     require_tekken_parts("a𝐚A", {"a𝐚", "A"});
     require_tekken_parts("中A", {"中", "A"});
     require_tekken_parts("aʰA", {"aʰ", "A"});
+    require_tekken_parts("ʕAa", {"ʕ", "Aa"});  // Ll in the runtime's Unicode version
     // The Tekken punctuation tail includes '/', unlike the Qwen splitter.
     require_tekken_parts("_\n/'", {"_\n/", "'"});
 
