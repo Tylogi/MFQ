@@ -8,11 +8,26 @@ endif()
 set(MFQ_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(MFQ_CUDA_KERNEL_ROOT "${MFQ_REPOSITORY_ROOT}/mfq/kernels/cuda")
 
+set(MFQ_CUDA_ARCHITECTURES "" CACHE STRING
+    "Optional CUDA architecture override; otherwise use CMAKE_CUDA_ARCHITECTURES, CUDAARCHS or native")
+if(NOT "${MFQ_CUDA_ARCHITECTURES}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}")
+elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(_mfq_cuda_architectures native)
+    if(NOT "$ENV{CUDAARCHS}" STREQUAL "")
+        set(_mfq_cuda_architectures "$ENV{CUDAARCHS}")
+    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${_mfq_cuda_architectures}" CACHE STRING
+        "CUDA architectures compiled into MFQ CUDA targets")
+    unset(_mfq_cuda_architectures)
+endif()
+
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(MFQ_CUDA_ARCHITECTURES "86" CACHE STRING
-    "CUDA architectures compiled into MFQ CUDA targets")
+# Keep the override cache empty unless explicitly set, so later changes to the
+# standard CMake option are honored on reconfigure.
+set(MFQ_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)

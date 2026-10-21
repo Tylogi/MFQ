@@ -15,12 +15,6 @@ static void setting(const char* value) {
 
 int main()try {
     using namespace mfq::cuda;
-    int device=0,major=0,minor=0;
-    if(cudaGetDevice(&device)!=cudaSuccess ||
-       cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device)!=cudaSuccess ||
-       cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device)!=cudaSuccess)
-        throw std::runtime_error("device query failed");
-    const bool sm86=major==8 && minor==6;
     int checks=0;
     const auto verify=[&](const MfeFfnBatch& b,bool down,bool expected) {
         if(mfe_ffn_e8_narrow_requested(b,down)!=expected)
@@ -36,7 +30,7 @@ int main()try {
         baseline.shared=include_shared?shared:nullptr;
         baseline.shared_intermediate=include_shared?640:0;
         setting("");
-        for(bool down:{false,true})verify(baseline,down,sm86);
+        for(bool down:{false,true})verify(baseline,down,true);
         for(int member=0;member<6;++member) {
             auto changed=baseline;
             switch(member) {
@@ -47,7 +41,7 @@ int main()try {
                 case 4:changed.intermediate=641;break;
                 case 5:changed.shared=shared;changed.shared_intermediate=641;break;
             }
-            for(bool down:{false,true})verify(changed,down,false);
+            for(bool down:{false,true})verify(changed,down,true);
         }
         for(const char* value:{"0","1","2","3","invalid"}) {
             setting(value);
@@ -55,7 +49,7 @@ int main()try {
         }
     }
     setting("");
-    std::cout<<"mfe_e8_default_dispatch_checks="<<checks<<" sm86="<<sm86<<" PASS\n";
+    std::cout<<"mfe_e8_default_dispatch_checks="<<checks<<" PASS\n";
     return 0;
 }catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;

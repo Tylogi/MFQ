@@ -479,7 +479,10 @@ static void upload_mixed_dispatch_metadata(
         bytes=(bytes+15)&~std::size_t(15);
         bytes+=source.nbytes();
     }
-    host_owner=tb::empty({int64_t(bytes)},tb::TensorOptions().dtype(tb::kUInt8).pinned_memory(true));
+    // Small metadata packets are rebuilt while previous layers are running.
+    // cudaHostAlloc here interrupts that overlap. Keep pageable storage alive
+    // through its upload; cross-stream publication still synchronizes below.
+    host_owner=tb::empty({int64_t(bytes)},tb::TensorOptions().dtype(tb::kUInt8));
     device_owner=tb::empty({int64_t(bytes)},host_owner.options().device(device).pinned_memory(false));
     std::memset(host_owner.data_ptr(),0,bytes);
     std::size_t offset=0;
