@@ -154,7 +154,8 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         int group_size,
         int activation_mode,
         bool input_fp32,
-        bool gate_fp32) {
+        bool gate_fp32,
+        int * __restrict__ sum_output = nullptr) {
     const int row = static_cast<int>(blockIdx.x);
     const int group = static_cast<int>(blockIdx.y);
     const int lane = static_cast<int>(threadIdx.x);
@@ -197,8 +198,8 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         scale_output[static_cast<size_t>(row) * groups + group] = group_scale;
     }
     __syncthreads();
+    int code = 0;
     if (lane < group_size) {
-        int code = 0;
         if (valid) {
             code = static_cast<int>(roundf(value / group_scale));
             code = max(-127, min(127, code));
@@ -206,8 +207,80 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         quantized[static_cast<size_t>(row) * padded_width + column] =
             static_cast<int8_t>(code);
     }
+    if (sum_output != nullptr) {
+        for (int offset = 16; offset > 0; offset >>= 1)
+            code += __shfl_down_sync(0xffffffffu, code, offset);
+        if ((lane & 31) == 0) warp_maxima[lane >> 5] = static_cast<float>(code);
+        __syncthreads();
+        if (lane == 0) sum_output[static_cast<size_t>(row) * groups + group] =
+            static_cast<int>(warp_maxima[0]) +
+            (blockDim.x > 32 ? static_cast<int>(warp_maxima[1]) : 0);
+    }
 }
 
+
+template<int GroupSize>
+__global__ void __launch_bounds__(128) nint_quantize_decode_kernel(
+        const void* __restrict__ input, const void* __restrict__ gate,
+        int8_t* __restrict__ quantized, float* __restrict__ scales,
+        int* __restrict__ sums, int width, int groups, int mode,
+        bool input_fp32, bool gate_fp32) {
+    const int lane = int(threadIdx.x) & 31;
+    const int group = int(blockIdx.x) * 4 + int(threadIdx.x) / 32;
+    if (group >= groups) return;
+    float values[(GroupSize + 31) / 32];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int part = 0; part < (GroupSize + 31) / 32; ++part) {
+        const int element = lane + part * 32, column = group * GroupSize + element;
+        float value = element < GroupSize && column < width
+            ? nint_activation_value(input, column, input_fp32) : 0.0f;
+        if (gate != nullptr && element < GroupSize && column < width) {
+            const float g = nint_activation_value(gate, column, gate_fp32);
+            const float sigmoid = 1.0f / (1.0f + expf(-g));
+            value *= mode == 1 ? sigmoid : g * sigmoid;
+        }
+        values[part] = value;
+        maximum = fmaxf(maximum, fabsf(value));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    int sum = 0;
+#pragma unroll
+    for (int part = 0; part < (GroupSize + 31) / 32; ++part) {
+        const int element = lane + part * 32;
+        if (element < GroupSize) {
+            const int code = max(-127, min(127, int(roundf(values[part] / scale))));
+            quantized[group * GroupSize + element] = static_cast<int8_t>(code);
+            sum += code;
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0) { scales[group] = scale; sums[group] = sum; }
+}
+
+bool launch_nint_quantize_decode(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor* gate, int mode,
+        mfq_tensor_backend::Tensor& quantized, mfq_tensor_backend::Tensor& scales,
+        mfq_tensor_backend::Tensor& sums, int group_size, int groups, hipStream_t stream) {
+    const auto launch = [&](auto size) {
+        hipLaunchKernelGGL((nint_quantize_decode_kernel<decltype(size)::value>),
+            dim3((groups + 3) / 4), dim3(128), 0, stream,
+            input.data_ptr(), gate ? gate->data_ptr() : nullptr,
+            quantized.data_ptr<int8_t>(), scales.data_ptr<float>(), sums.data_ptr<int>(),
+            int(input.size(1)), groups, mode,
+            input.scalar_type() == mfq_tensor_backend::kFloat32,
+            gate && gate->scalar_type() == mfq_tensor_backend::kFloat32);
+    };
+    if (group_size == 24) launch(std::integral_constant<int, 24>{});
+    else if (group_size == 48) launch(std::integral_constant<int, 48>{});
+    else return false;
+    return true;
+}
 
 constexpr int kNintPrefillTileN = 64;
 constexpr int kNintPrefillTileK = 64;
@@ -1286,6 +1359,48 @@ __global__ void __launch_bounds__(1024) nint_matmul_activation_cache_kernel(
 }
 
 
+__global__ void __launch_bounds__(128) nint_q8_grouped_decode_kernel(
+        const uint8_t* __restrict__ weights, const int64_t* __restrict__ offsets,
+        const uint8_t* __restrict__ scales, const uint8_t* __restrict__ minima,
+        const float* __restrict__ outer_scales, const float* __restrict__ outer_minima,
+        const int8_t* __restrict__ activation, const float* __restrict__ activation_scales,
+        const int* __restrict__ activation_sums, __half* __restrict__ output,
+        int rows, int groups) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y), lane = int(threadIdx.x);
+    if (row >= rows) return;
+    const auto* weight = weights + (uint64_t(offsets[row]) >> 3);
+    const float outer_scale = outer_scales[row], outer_minimum = outer_minima[row];
+    float accumulator = 0.0f;
+    for (int group = lane; group < groups; group += 32) {
+        int dot = 0;
+#pragma unroll
+        for (int chunk = 0; chunk < 3; ++chunk) {
+            const int column = group * 48 + chunk * 16;
+            uint4 w;
+            if ((reinterpret_cast<uintptr_t>(weight + column) & 15u) == 0) {
+                w = *reinterpret_cast<const uint4*>(weight + column);
+            } else {
+                const auto* p = reinterpret_cast<const uint32_t*>(weight + column);
+                w = make_uint4(p[0], p[1], p[2], p[3]);
+            }
+            const auto x = *reinterpret_cast<const int4*>(activation + column);
+            dot = __dp4a(int(w.x ^ 0x80808080u), x.x, dot);
+            dot = __dp4a(int(w.y ^ 0x80808080u), x.y, dot);
+            dot = __dp4a(int(w.z ^ 0x80808080u), x.z, dot);
+            dot = __dp4a(int(w.w ^ 0x80808080u), x.w, dot);
+        }
+        const int sum = activation_sums[group];
+        const float scale = outer_scale * float(scales[size_t(row) * groups + group]);
+        const float minimum = outer_minimum * float(minima[size_t(row) * groups + group]);
+        accumulator += activation_scales[group] *
+            (scale * float(dot + 128 * sum) - minimum * float(sum));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        accumulator += __shfl_xor_sync(0xffffffffu, accumulator, offset);
+    if (lane == 0) output[row] = __float2half_rn(accumulator);
+}
+
 // The caller has proven q8
 // row widths, aligned offsets, four-element groups and aligned storage.
 template<int maximum_activation_rows>
@@ -2025,11 +2140,9 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
 }
 
 
-static // Fused single-row decode over the load-time slot layout: every group is
-// one 4-byte-aligned slot [weight bits | pad | u16 scale/minimum], rows are
-// grouped into uniform-bit segments, and the kernel is templated on Bits so
-// the per-chunk extraction shifts and byte-perm selectors are constants.
-template <int Bits>
+// Decode uniform-bit row segments from [weight bits | pad | scale/minimum] slots.
+// Fixed group sizes keep unpacking and vector loads in registers.
+template <int Bits, int GroupSize = 0>
 __global__ void __launch_bounds__(128) nint_fused_decode_kernel(
         const uint8_t * __restrict__ fused,
         const int32_t * __restrict__ row_ids,
@@ -2037,12 +2150,14 @@ __global__ void __launch_bounds__(128) nint_fused_decode_kernel(
         const float * __restrict__ neuron_minimum,
         const int8_t * __restrict__ activation,
         const float * __restrict__ activation_scale,
+        const int * __restrict__ activation_sums,
         __half * __restrict__ output,
         int segment_rows,
         int groups,
         int padded_width,
         int group_size,
         int slot_bytes) {
+    if constexpr (GroupSize != 0) group_size = GroupSize;
     const int lane = static_cast<int>(threadIdx.x);
     const int row = static_cast<int>(blockIdx.x) * 4 +
         static_cast<int>(threadIdx.y);
@@ -2058,27 +2173,72 @@ __global__ void __launch_bounds__(128) nint_fused_decode_kernel(
         const uint8_t * slot = row_base +
             static_cast<size_t>(group) * slot_bytes;
         const auto * words = reinterpret_cast<const uint32_t *>(slot);
-        const uint16_t packed_scales = *reinterpret_cast<const uint16_t*>(
-            slot + slot_bytes - 2);
+        constexpr int word_count = (GroupSize * Bits + 31) / 32 + 1;
+        uint32_t cached[word_count];
+        if constexpr (GroupSize != 0) {
+            constexpr int bytes = word_count * 4;
+            if constexpr (bytes == 16) {
+                if ((reinterpret_cast<uintptr_t>(slot) & 15u) == 0) {
+                    const uint4 value = *reinterpret_cast<const uint4*>(slot);
+                    cached[0] = value.x; cached[1] = value.y;
+                    cached[2] = value.z; cached[3] = value.w;
+                } else {
+#pragma unroll
+                    for (int index = 0; index < word_count; ++index) cached[index] = words[index];
+                }
+            } else if constexpr (bytes % 8 == 0) {
+                if ((reinterpret_cast<uintptr_t>(slot) & 7u) == 0) {
+#pragma unroll
+                    for (int index = 0; index < word_count / 2; ++index) {
+                        const auto value = reinterpret_cast<const uint2*>(slot)[index];
+                        cached[index * 2] = value.x; cached[index * 2 + 1] = value.y;
+                    }
+                } else {
+#pragma unroll
+                    for (int index = 0; index < word_count; ++index) cached[index] = words[index];
+                }
+            } else {
+#pragma unroll
+                for (int index = 0; index < word_count; ++index) cached[index] = words[index];
+            }
+        }
+        const uint16_t packed_scales = GroupSize != 0
+            ? static_cast<uint16_t>(cached[word_count - 1] >> 16)
+            : *reinterpret_cast<const uint16_t*>(slot + slot_bytes - 2);
         const int8_t * activation_group = activation + group * group_size;
+        int activation_words[GroupSize != 0 ? GroupSize / 4 : 1];
+        if constexpr (GroupSize == 24) {
+#pragma unroll
+            for (int index = 0; index < 3; ++index) {
+                const auto value = reinterpret_cast<const int2*>(activation_group)[index];
+                activation_words[index * 2] = value.x;
+                activation_words[index * 2 + 1] = value.y;
+            }
+        } else if constexpr (GroupSize == 48) {
+#pragma unroll
+            for (int index = 0; index < 3; ++index) {
+                const auto value = reinterpret_cast<const int4*>(activation_group)[index];
+                activation_words[index * 4] = value.x; activation_words[index * 4 + 1] = value.y;
+                activation_words[index * 4 + 2] = value.z; activation_words[index * 4 + 3] = value.w;
+            }
+        }
         int dot = 0;
-        int activation_sum = 0;
-#pragma unroll 8
+        const int activation_sum = activation_sums[group];
+#pragma unroll
         for (int element = 0; element + 3 < group_size; element += 4) {
             const int bit = element * Bits;
             const int shift = bit & 31;
             const int word = bit >> 5;
-            const uint32_t packed = shift == 0
-                ? words[word]
-                : __funnelshift_r(words[word], words[word + 1], shift);
+            const uint32_t low = GroupSize != 0 ? cached[word] : words[word];
+            const uint32_t packed = shift == 0 ? low : __funnelshift_r(low,
+                GroupSize != 0 ? cached[word + 1] : words[word + 1], shift);
             const uint32_t pairs =
                 __byte_perm(packed, packed >> (2 * Bits), 0x5410);
             const int weight_codes = static_cast<int>(
                 __byte_perm(pairs, pairs >> Bits, 0x6240) & mask);
             const int activation_codes =
-                load_i8x4(activation_group + element);
-            activation_sum =
-                __dp4a(0x01010101, activation_codes, activation_sum);
+                GroupSize != 0 ? activation_words[element / 4]
+                               : load_i8x4(activation_group + element);
             dot = __dp4a(
                 Bits == 8
                     ? (weight_codes ^ static_cast<int>(0x80808080u))
@@ -2114,7 +2274,10 @@ mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
         const std::vector<int64_t>& segment_byte_offsets,
         const std::vector<int64_t>& segment_slots,
         mfq_tensor_backend::Tensor quantized_input,
-        mfq_tensor_backend::Tensor input_scale) {
+        mfq_tensor_backend::Tensor input_scale,
+        mfq_tensor_backend::Tensor input_sum,
+        mfq_tensor_backend::Tensor gate,
+        int64_t activation_mode) {
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.is_contiguous() && input.dim() == 2 &&
             input.size(0) == 1 &&
@@ -2127,24 +2290,51 @@ mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
             row_ids.is_cuda() && row_ids.scalar_type() ==
                 mfq_tensor_backend::kInt32,
         "NINT fused layout tensors are invalid");
+    MFQ_RUNTIME_CHECK(
+        (!gate.defined() && activation_mode == 0) ||
+            (gate.defined() && (activation_mode == 1 || activation_mode == 2) &&
+             gate.device() == input.device() && gate.is_contiguous() &&
+             gate.sizes() == input.sizes() &&
+             (gate.scalar_type() == mfq_tensor_backend::kFloat16 ||
+              gate.scalar_type() == mfq_tensor_backend::kFloat32)),
+        "NINT fused gate is invalid");
     const int groups = static_cast<int>(input_scale.size(1));
     const int real_width = static_cast<int>(input.size(1));
     const int padded_width = groups * static_cast<int>(group_size);
     const int output_rows = static_cast<int>(row_ids.numel());
+    MFQ_RUNTIME_CHECK(
+        group_size >= 4 && group_size <= 64 && group_size % 4 == 0 &&
+        real_width <= padded_width &&
+        quantized_input.is_cuda() && quantized_input.is_contiguous() &&
+        quantized_input.scalar_type() == mfq_tensor_backend::kInt8 &&
+        quantized_input.numel() >= padded_width &&
+        input_scale.is_cuda() && input_scale.is_contiguous() &&
+        input_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        input_sum.is_cuda() && input_sum.is_contiguous() &&
+        input_sum.scalar_type() == mfq_tensor_backend::kInt32 && input_sum.numel() >= groups &&
+        quantized_input.device() == input.device() && input_scale.device() == input.device() &&
+        input_sum.device() == input.device(),
+        "NINT fused workspace is invalid");
     auto output = mfq_tensor_backend::empty(
         {1, output_rows},
         input.options().dtype(mfq_tensor_backend::kFloat16));
     const hipStream_t stream = mfq_current_cuda_stream();
     const int quantize_threads = group_size <= 32 ? 32 : 64;
+    if (!launch_nint_quantize_decode(input, gate.defined() ? &gate : nullptr,
+            int(activation_mode), quantized_input, input_scale, input_sum,
+            int(group_size), groups, stream)) {
     hipLaunchKernelGGL((nint_quantize_activation_kernel),
         dim3(dim3(1, groups)), dim3(quantize_threads), 0, stream,
             input.data_ptr(),
-            nullptr,
+            gate.defined() ? gate.data_ptr() : nullptr,
             quantized_input.data_ptr<int8_t>(),
             input_scale.data_ptr<float>(),
             1, real_width, padded_width, groups,
-            static_cast<int>(group_size), 0,
-            input.scalar_type() == mfq_tensor_backend::kFloat32, false);
+            static_cast<int>(group_size), static_cast<int>(activation_mode),
+            input.scalar_type() == mfq_tensor_backend::kFloat32,
+            gate.defined() && gate.scalar_type() == mfq_tensor_backend::kFloat32,
+            input_sum.data_ptr<int>());
+    }
     for (std::size_t segment = 0; segment < segment_bits.size(); ++segment) {
         const int bits = static_cast<int>(segment_bits[segment]);
         const int first =
@@ -2157,17 +2347,26 @@ mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
         const uint8_t * base = fused_q.data_ptr<uint8_t>() +
             static_cast<size_t>(segment_byte_offsets[segment]);
         const auto launch = [&](auto bits_constant) {
+            const auto launch_group = [&](auto group_constant) {
             hipLaunchKernelGGL(
-                (nint_fused_decode_kernel<decltype(bits_constant)::value>),
+                (nint_fused_decode_kernel<decltype(bits_constant)::value, decltype(group_constant)::value>),
                 dim3(dim3((rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream,
                     base, row_ids.data_ptr<int32_t>() + first,
                     neuron_scale.data_ptr<float>(),
                     neuron_minimum.data_ptr<float>(),
                     quantized_input.data_ptr<int8_t>(),
                     input_scale.data_ptr<float>(),
+                    input_sum.data_ptr<int>(),
                     reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
                     rows, groups, padded_width,
                     static_cast<int>(group_size), slot);
+            };
+            const auto alignment = reinterpret_cast<uintptr_t>(quantized_input.data_ptr());
+            if (group_size == 24 && (alignment & 7u) == 0)
+                launch_group(std::integral_constant<int, 24>{});
+            else if (group_size == 48 && (alignment & 15u) == 0)
+                launch_group(std::integral_constant<int, 48>{});
+            else launch_group(std::integral_constant<int, 0>{});
         };
         switch (bits) {
             case 2: launch(std::integral_constant<int, 2>{}); break;
@@ -2290,7 +2489,19 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
     auto output = mfq_tensor_backend::empty(
         {activation_rows, output_rows}, input.options().dtype(mfq_tensor_backend::kFloat16));
     const hipStream_t stream = mfq_current_cuda_stream();
+    const auto* q8_group_flag = std::getenv("MFQ_NINT_GROUP_DOT");
+    const bool grouped_q8 = (!q8_group_flag || std::strcmp(q8_group_flag, "0") != 0) &&
+        aligned_q8 && group_size == 48 && activation_rows == 1 &&
+        output_rows >= 16 && groups >= 32 &&
+        (reinterpret_cast<uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
+        (reinterpret_cast<uintptr_t>(quantized_input.data_ptr()) & 15u) == 0;
+    auto input_sum = grouped_q8 ? mfq_tensor_backend::empty(
+        {groups}, input.options().dtype(mfq_tensor_backend::kInt32)) : mfq_tensor_backend::Tensor{};
     const int quantize_threads = group_size <= 32 ? 32 : 64;
+    if (grouped_q8) {
+        launch_nint_quantize_decode(input, gate, int(activation_mode),
+            quantized_input, input_scale, input_sum, int(group_size), groups, stream);
+    } else {
    hipLaunchKernelGGL(( nint_quantize_activation_kernel), 
         dim3(dim3(activation_rows, groups)), dim3(quantize_threads), 0, stream, 
             input.data_ptr(),
@@ -2306,8 +2517,19 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             static_cast<int>(group_size),
             static_cast<int>(activation_mode),
             input.scalar_type() == mfq_tensor_backend::kFloat32,
-            gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32);
-    if (aligned_q8 && group_size % 4 == 0 &&
+            gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32,
+            grouped_q8 ? input_sum.data_ptr<int>() : nullptr);
+    }
+    if (grouped_q8) {
+        hipLaunchKernelGGL((nint_q8_grouped_decode_kernel),
+            dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream,
+            bitstream.data_ptr<uint8_t>(), row_q_bit_offsets.data_ptr<int64_t>(),
+            subgroup_scale.data_ptr<uint8_t>(), subgroup_minimum.data_ptr<uint8_t>(),
+            neuron_scale.data_ptr<float>(), neuron_minimum.data_ptr<float>(),
+            quantized_input.data_ptr<int8_t>(), input_scale.data_ptr<float>(),
+            input_sum.data_ptr<int>(), reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            output_rows, groups);
+    } else if (aligned_q8 && group_size % 4 == 0 &&
         (reinterpret_cast<uintptr_t>(bitstream.data_ptr<uint8_t>()) & 3u) == 0) {
         // Specialize only the proven one-row input, independent of device.
         if (activation_rows == 1) {

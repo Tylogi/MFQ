@@ -383,6 +383,14 @@ if(BUILD_TESTING)
         mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
         mfq-hip-runtime mfq-runtime-communication mfq-model-graph)
 
+    add_executable(mfq-hip-nint-bench ${MFQ_REPOSITORY_ROOT}/bench/hip_nint_bench.cpp)
+    target_include_directories(mfq-hip-nint-bench PRIVATE ${MFQ_HIP_TEST_INCLUDES})
+    target_compile_definitions(mfq-hip-nint-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_link_libraries(mfq-hip-nint-bench PRIVATE
+        mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
+        mfq-hip-runtime mfq-runtime-communication mfq-model-graph)
+    target_compile_features(mfq-hip-nint-bench PRIVATE cxx_std_20)
+
     mfq_add_hip_test(mfq-hip-nint-rows-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_rows_test.cu)
     target_link_libraries(mfq-hip-nint-rows-test PRIVATE

@@ -197,6 +197,7 @@ mfq_tensor_backend::Tensor load_dense_gpu(
 
 static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     if (ws.empty()) throw std::runtime_error("empty NINT group");
+    if (ws.size() == 1) return ws.front();
     const auto & a = ws[0];
     std::vector<mfq_tensor_backend::Tensor> qp, rqb, rqoff, q8s, ss, sm, ns, nm;
     int64_t out = 0;
@@ -248,6 +249,39 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.sub_min = mfq_tensor_backend::cat(sm, 0).contiguous();
     g.neuron_scale = mfq_tensor_backend::cat(ns, 0).contiguous();
     g.neuron_min = mfq_tensor_backend::cat(nm, 0).contiguous();
+    if (std::all_of(ws.begin(), ws.end(), [](const auto& w) { return w.fused_ok; })) {
+        std::vector<mfq_tensor_backend::Tensor> packed, row_ids;
+        g.fused_segment_row_offsets = {0};
+        g.fused_segment_byte_offsets = {0};
+        for (int bits = 2; bits <= 8; ++bits) {
+            int64_t row_base = 0, rows = 0, bytes = 0, slot = 0;
+            for (const auto& w : ws) {
+                const auto found = std::find(
+                    w.fused_segment_bits.begin(), w.fused_segment_bits.end(), bits);
+                if (found != w.fused_segment_bits.end()) {
+                    const size_t segment = found - w.fused_segment_bits.begin();
+                    const auto first_row = w.fused_segment_row_offsets[segment];
+                    const auto count = w.fused_segment_row_offsets[segment + 1] - first_row;
+                    const auto first_byte = w.fused_segment_byte_offsets[segment];
+                    const auto size = w.fused_segment_byte_offsets[segment + 1] - first_byte;
+                    packed.push_back(w.fused_q.narrow(0, first_byte, size));
+                    row_ids.push_back(w.fused_row_ids.narrow(0, first_row, count) + row_base);
+                    rows += count;
+                    bytes += size;
+                    slot = w.fused_segment_slots[segment];
+                }
+                row_base += w.out;
+            }
+            if (rows == 0) continue;
+            g.fused_segment_bits.push_back(bits);
+            g.fused_segment_slots.push_back(slot);
+            g.fused_segment_row_offsets.push_back(g.fused_segment_row_offsets.back() + rows);
+            g.fused_segment_byte_offsets.push_back(g.fused_segment_byte_offsets.back() + bytes);
+        }
+        g.fused_q = mfq_tensor_backend::cat(packed, 0).contiguous();
+        g.fused_row_ids = mfq_tensor_backend::cat(row_ids, 0).contiguous();
+        g.fused_ok = true;
+    }
     return g;
 }
 

@@ -1,6 +1,7 @@
 #include "mfq_cuda_quant_ops.h"
 #include "hip_execution.h"
 #include "nint.h"
+#include "quant_linear.h"
 
 #include <cuda_runtime_api.h>
 #include <cstdint>
@@ -88,6 +89,9 @@ void grouped_half(const Tensor &actual, const Tensor &expected) {
         const double difference = std::abs(double(av[i]) - bv[i]);
         // Integer group dots reassociate the FP32 reduction before FP16 storage.
         // Keep a bounded numerical check; exact quantizer/legacy checks remain separate.
+        if (!(std::isfinite(av[i]) && std::isfinite(bv[i]) &&
+            difference <= 0.002 + 0.002 * std::abs(double(bv[i]))))
+            std::cerr<<"output="<<i<<" actual="<<av[i]<<" reference="<<bv[i]<<"\n";
         require(std::isfinite(av[i]) && std::isfinite(bv[i]) &&
             difference <= 0.002 + 0.002 * std::abs(double(bv[i])),
             "NINT grouped output exceeds FP16 reduction tolerance");
@@ -309,51 +313,157 @@ void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& chan
         exact_half(actual,expected);bytes(qx[1],qx[0]);bytes(xs[1],xs[0]);++changing;
     }
 }
-void check_fused(int& cases) {
-    const Device gpu{DeviceType::cuda,0};
-    constexpr int n=9,gs=24,ng=5,width=ng*gs;
+NintWeight fused_weight(int n, int gs, int ng, int bits, int seed) {
     NintCpu c;
-    c.format_version=2; c.bits=5; c.sub_bits=6; c.gs=gs; c.ng=ng;
-    c.axis=0; c.neuron_len=width; c.shape={n,width}; c.out=n;
-    std::uint64_t total=5;  // Misaligned start exercises the bit copy.
+    c.format_version=2; c.bits=bits ? bits : 5; c.sub_bits=6; c.gs=gs; c.ng=ng;
+    c.axis=0; c.neuron_len=ng*gs; c.shape={n,ng*gs}; c.out=n;
+    std::uint64_t total=5;
     c.row_q_bits.resize(n); c.row_q_bit_offsets.resize(n);
     c.row_sub_bits.assign(n,0);
     for(int row=0;row<n;++row) {
-        const int bits=row<3?4:row<6?5:row<8?6:8;
-        c.row_q_bits[row]=std::uint8_t(bits);
+        const int q=bits ? bits : 2+(row+seed)%7;
+        c.row_q_bits[row]=std::uint8_t(q);
         c.row_q_bit_offsets[row]=std::int64_t(total);
-        total+=std::uint64_t(width)*std::uint64_t(bits);
+        total+=std::uint64_t(ng*gs)*std::uint64_t(q);
     }
     c.q_packed.assign(std::size_t((total+7)/8)+8,0);
     for(std::size_t i=0;i<c.q_packed.size();++i)
-        c.q_packed[i]=std::uint8_t((i*149+37)&0xff);
-    c.sub_scale.resize(std::size_t(n)*ng);
-    c.sub_min.resize(std::size_t(n)*ng);
+        c.q_packed[i]=std::uint8_t((i*149+37+seed*17)&0xff);
+    c.sub_scale.resize(std::size_t(n)*ng); c.sub_min.resize(std::size_t(n)*ng);
     for(std::size_t i=0;i<c.sub_scale.size();++i) {
-        c.sub_scale[i]=std::uint8_t((i*13)%37);
-        c.sub_min[i]=std::uint8_t(i%19);
+        c.sub_scale[i]=std::uint8_t((i*13+seed)%37);
+        c.sub_min[i]=std::uint8_t((i+seed)%19);
     }
     c.neuron_scale_h.resize(n); c.neuron_min_h.resize(n);
     for(int row=0;row<n;++row) {
-        const __half scale=__float2half_rn(.000123f*float(row%7-3));
-        const __half minimum=__float2half_rn(.004731f*float(row%5-2));
+        const __half scale=__float2half_rn(.000123f*float((row+seed)%7-3));
+        const __half minimum=__float2half_rn(.004731f*float((row+seed)%5-2));
         std::memcpy(&c.neuron_scale_h[row],&scale,sizeof(scale));
         std::memcpy(&c.neuron_min_h[row],&minimum,sizeof(minimum));
     }
-    NintWeight w=to_device_nint(c,true);
-    require(w.fused_ok,"NINT fused decode layout was not built");
-    std::vector<float> input(width);
-    for(int column=0;column<width;++column)
-        input[column]=std::sin(float(column+7)*.193f)*.31f;
-    auto x=tensor(input).reshape({1,width}).to(gpu,kFloat16);
-    single_path(true);group_path(true);
-    Workspace& ws=w.workspace(1);
-    auto expected=nint_matmul_ws_cuda(w.q_packed,w.row_q_bits,
-        w.row_q_bit_offsets,w.sub_scale,w.sub_min,w.neuron_scale,
-        w.neuron_min,x,gs,ws.qx,ws.xscale);
-    CudaProfiler profiler;
-    auto actual=nint_matmul(profiler,w,x);
-    exact_half(actual,expected);++cases;
+    return to_device_nint(c,true);
+}
+
+Tensor fused_reference(NintWeight& w, Tensor x, Tensor gate, int mode) {
+    auto& ws=w.workspace(1);
+    if(mode) return nint_matmul_input_mul_ws_cuda(w.q_packed,w.row_q_bits,
+        w.row_q_bit_offsets,w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+        x,gate,mode,w.gs,ws.qx,ws.xscale);
+    return nint_matmul_ws_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+        w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,w.gs,ws.qx,ws.xscale);
+}
+
+void check_fused(int gs, int ng, int bits, int mode, bool fp32, int& cases) {
+    const Device gpu{DeviceType::cuda,0};
+    auto w=fused_weight(9,gs,ng,bits,0), other=fused_weight(13,gs,ng,bits,3);
+    require(w.fused_ok && other.fused_ok,"NINT fused decode layout was not built");
+    QuantLinear a,b; a.nint=w; b.nint=other;
+    CudaExecutionContext execution;
+    execution.config.diagnostic_nint_group=true;
+    auto group=make_quant_group(execution,{a,b});
+    require(group.nint_grouped && group.nint.w.fused_ok,
+        "NINT grouped projection lost its fused layout");
+    auto& combined=group.nint.w;
+    const int width=ng*gs-1;
+    const auto options=TensorOptions().device(gpu);
+    auto x=empty({1,width},options.dtype(fp32?kFloat32:kFloat16));
+    auto gate=empty({1,width},options.dtype(fp32?kFloat16:kFloat32));
+    const auto change=[&](int step) {
+        std::vector<float> input(width), gates(width);
+        const float midpoint=1.f+1.f/2048.f;
+        const std::vector<float> edges={0.f,-0.f,std::ldexp(1.f,-25),-std::ldexp(1.f,-25),
+            std::nextafter(midpoint,0.f),midpoint,std::nextafter(midpoint,2.f)};
+        for(int column=0;column<width;++column) {
+            input[column]=std::sin(float(column+step*17+7)*.193f)*.31f;
+            gates[column]=std::cos(float(column+step*23)*.137f)*2.f;
+            if(column < int(edges.size())) {
+                if(fp32) input[column]=edges[(column+step)%edges.size()];
+                else gates[column]=edges[(column+step)%edges.size()];
+            }
+            if(step==3 && column<gs) input[column]=0.f;
+        }
+        x.copy_(tensor(input).reshape({1,width}).to(gpu,x.scalar_type()));
+        gate.copy_(tensor(gates).reshape({1,width}).to(gpu,gate.scalar_type()));
+    };
+    const auto expected=[&] {
+        return cat({fused_reference(w,x,gate,mode),fused_reference(other,x,gate,mode)},1);
+    };
+    const auto run=[&] {
+        return mode ? nint_matmul_input_mul(execution.profiler,combined,x,gate,mode)
+                    : nint_matmul(execution.profiler,combined,x);
+    };
+    single_path(true); group_path(true);
+    change(0); auto reference=expected();
+    grouped_half(run(),reference); ++cases;
+    const auto stream=mfq_get_stream_from_pool(false); MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph; mfq_prepare_cuda_graph_memory(graph);
+    auto actual=run(); MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    actual=Tensor{}; graph.capture_begin(); actual=run(); graph.capture_end();
+    for(int step=1;step<=3;++step) {
+        change(step); reference=expected(); graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        grouped_half(actual,reference); ++cases;
+        auto& ws=combined.workspace(1);
+        for (const auto& pair : {std::pair{ws.qx, w.workspace(1).qx},
+                                 std::pair{ws.xscale, w.workspace(1).xscale}}) {
+            auto a=pair.first.cpu().contiguous(), b=pair.second.cpu().contiguous();
+            require(std::memcmp(a.data_ptr(), b.data_ptr(),
+                size_t(a.numel()) * a.element_size()) == 0, "NINT fused quantizer changed input bytes");
+        }
+        auto q=ws.qx.cpu().contiguous(), sum=ws.xsum.cpu().contiguous();
+        for(int group=0;group<ng;++group) {
+            int total=0;
+            for(int i=0;i<gs;++i)total+=int(q.data_ptr<int8_t>()[group*gs+i]);
+            require(total==sum.data_ptr<int>()[group],"NINT cached activation sum mismatch");
+        }
+    }
+}
+
+void check_grouped_q8(int n, int mode, bool fp32, int storage_offset, int& cases) {
+    constexpr int gs=48,ng=54,width=gs*ng-1;
+    const Device gpu{DeviceType::cuda,0};
+    auto w=fused_weight(n,gs,ng,8,0);
+    // Use aligned rows while retaining a partial final output block.
+    std::vector<uint8_t> codes(size_t(n)*ng*gs+storage_offset);
+    for(int row=0;row<n;++row)for(int col=0;col<ng*gs;++col)
+        codes[size_t(storage_offset)+size_t(row)*ng*gs+col]=uint8_t(row*97+col*31);
+    auto q=tensor(codes).to(gpu);
+    w.q_packed=q.narrow(0,storage_offset,q.numel()-storage_offset);
+    std::vector<int64_t> offsets(n);
+    for(int row=0;row<n;++row)offsets[row]=int64_t(row)*ng*gs*8;
+    w.row_q_bit_offsets=tensor(offsets).to(gpu);
+    auto options=TensorOptions().device(gpu);
+    auto x=empty({1,width},options.dtype(fp32?kFloat32:kFloat16));
+    auto gate=empty({1,width},options.dtype(fp32?kFloat16:kFloat32));
+    auto& ws=w.workspace(1);
+    const auto run=[&](bool fast) {
+        group_path(fast);
+        if(!fast)return fused_reference(w,x,gate,mode);
+        if(mode)return nint_matmul_input_mul_q8_ws_cuda(w.q_packed,w.row_q_bits,
+            w.row_q_bit_offsets,w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+            x,gate,mode,gs,ws.qx,ws.xscale);
+        return nint_matmul_q8_ws_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+            w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,gs,ws.qx,ws.xscale);
+    };
+    const auto change=[&](int step) {
+        std::vector<float> input(width), gates(width);
+        for(int i=0;i<width;++i) {
+            input[i]=std::sin(float(i+step*13)*.17f)*.31f;
+            gates[i]=std::cos(float(i+step*17)*.11f)*2.f;
+        }
+        x.copy_(tensor(input).reshape({1,width}).to(gpu,x.scalar_type()));
+        gate.copy_(tensor(gates).reshape({1,width}).to(gpu,gate.scalar_type()));
+    };
+    change(0); auto reference=run(false); grouped_half(run(true),reference); ++cases;
+    const auto stream=mfq_get_stream_from_pool(false); MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph; mfq_prepare_cuda_graph_memory(graph);
+    auto actual=run(true); MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    actual=Tensor{}; graph.capture_begin(); actual=run(true); graph.capture_end();
+    for(int step=1;step<=3;++step) {
+        change(step); reference=run(false); graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        grouped_half(actual,reference); ++cases;
+    }
 }
 
 }  // namespace
@@ -387,8 +497,18 @@ int main() {
         }
         std::cout<<"NINT single-row original Half bits ordinary/changing graphs cases="<<single_cases<<" PASS\n";
         int fused_cases=0;
-        check_fused(fused_cases);
-        std::cout<<"NINT fused decode exact vs grouped cases="<<fused_cases<<" PASS\n";
+        for(int gs:{4,24,28,32,48,64})for(int ng:{3,37})
+            for(int bits:{0,4,6})for(int mode:{0,1,2})for(bool fp32:{false,true})
+                try { check_fused(gs,ng,bits,mode,fp32,fused_cases); }
+                catch(const std::exception&) {
+                    std::cerr<<"fused fixture gs="<<gs<<" ng="<<ng<<" bits="<<bits
+                             <<" mode="<<mode<<" fp32="<<fp32<<"\n"; throw;
+                }
+        int grouped_q8_cases=0;
+        for(int n:{17,133})for(int mode:{0,1,2})for(bool fp32:{false,true})for(int offset:{0,4,1})
+            check_grouped_q8(n,mode,fp32,offset,grouped_q8_cases);
+        std::cout<<"NINT grouped q8 ordinary/changing graphs cases="<<grouped_q8_cases<<" PASS\n";
+        std::cout<<"NINT fused grouped/input-gated reduction cases="<<fused_cases<<" PASS\n";
         for (int gs : {4, 12, 28, 32, 48, 64, 5, 47, 63}) {
             for (int ng : {1, 3, 22}) {
                 for (int m = 1; m <= 8; ++m) {
