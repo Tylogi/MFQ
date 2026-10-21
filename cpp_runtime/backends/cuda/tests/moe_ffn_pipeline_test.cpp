@@ -2434,11 +2434,28 @@ void verify_activation_workspace_reuse() {
     std::cout<<"mfe_activation_workspace_reuse rows=6 cached_entries="
         <<weight.activation_workspaces->size()<<" PASS\n";
 }
+void verify_activation_workspace_capture_stability() {
+    MfeWeight weight;
+    auto small=tb::empty({22,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+    auto large=tb::empty({500,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+    auto captured=weight.activation_workspace(small,22,8,32,true);
+    const void* pointer=captured.qx.data_ptr();
+    (void)weight.activation_workspace(large,500,8,32,false);
+    auto again=weight.activation_workspace(small,22,8,32,true);
+    if(again.qx.data_ptr()!=pointer)
+        throw std::runtime_error("MFE captured activation workspace moved after a larger eager prompt");
+    if(weight.activation_workspaces->size()!=2)
+        throw std::runtime_error("MFE captured workspace did not stay separate from the eager capacity");
+    std::cout<<"mfe_activation_workspace_capture_stability captured_entries=2 PASS\n";
+}
 
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc==2 && std::string(argv[1])=="--activation-workspace-reuse-check") {
         verify_activation_workspace_reuse();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--activation-workspace-capture-check") {
+        verify_activation_workspace_capture_stability();return 0;
     }
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");
     const std::filesystem::path root(argv[1]);

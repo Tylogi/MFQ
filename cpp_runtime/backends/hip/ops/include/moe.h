@@ -143,7 +143,7 @@ struct MixedMoeRuntime {
     bool nint_only() const;
     MoeActivationWorkspace activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
-            MixedMoeTransformKey transform) const;
+            MixedMoeTransformKey transform, bool captured = false) const;
 
     std::vector<MoeActivationGeometry> activation_geometry() const;
 

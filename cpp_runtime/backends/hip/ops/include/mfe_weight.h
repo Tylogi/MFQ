@@ -47,14 +47,17 @@ struct MfeWeight {
             MoeActivationKey, MoeActivationWorkspace, MoeActivationKeyHash>>();
 
     MoeActivationWorkspace activation_workspace(
-            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs) const {
-        // Reuse one growing quantization scratch per geometry. Caching one
-        // allocation per prompt row count retains a full activation buffer
-        // for every distinct request length ever served.
+            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
+            bool captured = false) const {
+        // Captured kernels record the scratch address for the lifetime of the
+        // graph. Keep an exact-sized workspace for every captured shape and
+        // never replace it. Eager dispatch uses one growing allocation per
+        // geometry so a new prompt length cannot retain another full buffer.
         MoeActivationKey key{0, groups, gs, x.get_device()};
+        if (captured) key.input_rows = input_rows;
         auto it = activation_workspaces->find(key);
         if (it == activation_workspaces->end() || it->second.qx.size(0) < input_rows) {
-            const int capacity = ((input_rows + 255) / 256) * 256;
+            const int capacity = captured ? input_rows : ((input_rows + 255) / 256) * 256;
             MoeActivationWorkspace workspace;
             workspace.qx = mfq_tensor_backend::empty(
                 {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
@@ -228,11 +231,14 @@ struct MfeWeight {
                 x.options().dtype(mfq_tensor_backend::kFloat16));
         std::unordered_set<MoeActivationKey, MoeActivationKeyHash> quantized;
         int nint_pool_phase = 0;
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        MFQ_CUDA_CHECK(hipStreamIsCapturing(mfq_current_cuda_stream(), &capture_status));
+        const bool captured = capture_status != hipStreamCaptureStatusNone;
         for (const auto & pool : pools) {
             int groups = (int)pool.weight.ng;
             int gs = (int)pool.weight.gs;
             MoeActivationKey key{input_rows, groups, gs, x.get_device()};
-            auto workspace = activation_workspace(x, input_rows, groups, gs);
+            auto workspace = activation_workspace(x, input_rows, groups, gs, captured);
             bool input_quantized = input_prequantized ||
                 quantized.find(key) != quantized.end();
             const int route_tile_m = select_nint_prefill_route_tile(
