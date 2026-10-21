@@ -3,6 +3,9 @@
 `mfq serve` starts the API and Web UI, with or without an initial model. It
 selects the C++ executable and manages workers on private loopback ports.
 
+For copyable CUDA deployment commands and performance settings, see the
+[service deployment guide (中文)](../deployment.zh-CN.md).
+
 ## Quick start
 
 Sync the server and backend dependencies once:
@@ -82,8 +85,8 @@ handling for internal connections.
 `0.0.0.0` is a bind address, not a browser destination. On the same machine,
 open `http://127.0.0.1:9000/`; from another machine, use the server's reachable
 IP address or hostname. Any non-loopback bind can expose both the API and Web UI
-to the network. The CLI does not require authentication for this, so configure
-an API key before exposing the listener:
+to the network. Non-loopback binds require an API key. Configure it before
+starting the listener:
 
 ```shell
 MFQ_SERVER_API_KEY='replace-with-a-secret' \
@@ -226,13 +229,18 @@ persistent paths. MFQ resolves data, work, and model paths before startup.
 uv run mfq serve \
   --model /models/model.mfq \
   --context-size 32768 \
-  --prefill-chunk-size 4096 \
+  --prefill-chunk-size auto \
   --runtime-startup-timeout 1800
 ```
 
-- `--context-size 0` leaves context sizing to the native runtime.
-- `--prefill-chunk-size` is forwarded to the Metal worker; the CUDA worker does
-  not receive this option.
+- `--context-size 0` uses the saved model context policy, otherwise the model's
+  declared capacity; it does not impose a 32K limit. Set an explicit target to
+  avoid budgeting KV for a larger context than needed.
+- `--prefill-chunk-size` defaults to `auto`. CUDA selects a compute tile up to
+  `8192` from the remaining input and workspace budget, reserving expert-transfer
+  buffers before growing the tile. Ordinary and MTP prefill share this policy.
+  Explicit integers from `1` to `8192` set a smaller limit and are always passed
+  to the worker. On Metal and HIP, `auto` preserves their native default policy.
 - `--max-requests-per-runtime N` enables continuous batching on supported
   native paths; capacity limits and scheduling behavior are documented in
   [Flash-Next continuous batching](../runtime/cuda-continuous-batching.md).
@@ -246,8 +254,8 @@ inspected and purged through the [runtime API](../api/http.md).
 
 Resident-model admission is capped by `--max-runtime-memory`, and
 `--moe-gpu-cache-gb` bounds the resident routed-expert cache (`0` keeps
-experts fully resident; native HF Metal models otherwise choose an automatic
-budget). `--no-memory-guard` disables the automatic Metal model-residency
+experts fully resident). Omitting it lets the service choose an automatic
+budget on supported CUDA and Metal paths. `--no-memory-guard` disables the automatic Metal model-residency
 budget. `--max-queued-requests-per-runtime` bounds waiting requests per
 worker, and `--runtime-idle-timeout` is the default unload delay for idle
 unpinned models; instances may override it through the runtime API.
@@ -263,8 +271,8 @@ unpinned models; instances may override it through the runtime API.
 | `--port PORT` | OpenAI API bind port. | Saved listener port or `8090` |
 | `--anthropic-port PORT` | Dedicated Anthropic Messages API port. | Saved listener port or `8091` |
 | `--access-log / --no-access-log` | Emit one HTTP access-log line per request. | Enabled |
-| `--context-size N` | Native context size; `0` keeps the runtime default. | `0` |
-| `--prefill-chunk-size N` | Metal prefill chunk size. | `2048` |
+| `--context-size N` | Target context; `0` uses saved policy or declared model capacity. | `0` |
+| `--prefill-chunk-size auto\|N` | Native compute chunk limit; CUDA selects a fitting tile up to 8192. | `auto` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |
 | `--data-dir PATH` | Managed database, media, models, and components. | `./.mfq` |
 | `--db PATH` | Deprecated explicit database override retained for compatibility. | None |
@@ -274,19 +282,19 @@ unpinned models; instances may override it through the runtime API.
 | `--work-dir PATH` | Workspace boundary for tool jobs. | Current directory |
 | `--api-key-env NAME` | Environment variable containing the administrator API key. | `MFQ_SERVER_API_KEY` |
 | `--max-runtime-instances N` | Maximum managed native workers. | `2` |
-| `--max-requests-per-runtime N` | Concurrent requests per worker. | `1` |
+| `--max-requests-per-runtime N` | Concurrent requests per worker. | CUDA/HIP: `1`; Metal: `8` |
 | `--max-queued-requests-per-runtime N` | Waiting requests per worker. | `max(32, 4 × concurrency)` |
 | `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
-| `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic on native HF Metal |
+| `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic where supported |
 | `--no-memory-guard` | Disable the automatic Metal model-residency budget. | Off |
 | `--prefix-cache-dir PATH` | Persistent Session KV cache directory. | Managed `prefix-cache` directory beside the server database |
 | `--prefix-cache-disk-size SIZE` | Maximum persistent Session KV cache size, such as `100G`. | None |
-| `--prefix-cache-hot-size SIZE` | Maximum RAM hot-cache size, such as `2G`. | None |
+| `--prefix-cache-hot-size SIZE` | Maximum hot prefix-cache size, such as `2G`; its memory tier depends on the backend. | None |
 | `--prefix-cache-block-tokens N` | Tokens per content-addressed Session KV block. | Runtime default |
 | `--no-prefix-cache` | Disable persistent Session KV caching. | Off |
 | `--runtime-idle-timeout SECONDS` | Default unload delay for an idle unpinned model. | Runtime default |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
-| `--backend {auto,cuda,metal}` | Select or detect the native backend. | `auto` |
+| `--backend {auto,cuda,hip,metal}` | Select or detect the native backend. | `auto` |
 | `--transport {stdio,http}` | Python-to-native-runtime communication transport. | `stdio` |
 
 When the current database does not yet exist, an existing legacy Studio

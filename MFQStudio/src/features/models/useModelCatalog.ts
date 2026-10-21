@@ -173,7 +173,7 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      await modelsApi.loadModel(name, loadContext.context_size ?? 32768, 2048, {
+      await modelsApi.loadModel(name, loadContext.context_size ?? 32768, 'auto', {
         pin: loadPinned,
         device_ids: loadDeviceIds,
         idle_ttl_seconds: loadIdleTtl,
@@ -221,7 +221,7 @@ export function useModelCatalog() {
         instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
         runtime?.model === artifact.name;
       if (!loaded) {
-        await modelsApi.loadModel(artifact.name, loadContext.context_size ?? 32768, 2048, {
+        await modelsApi.loadModel(artifact.name, loadContext.context_size ?? 32768, 'auto', {
           pin: loadPinned,
           device_ids: loadDeviceIds,
           idle_ttl_seconds: loadIdleTtl,

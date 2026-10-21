@@ -26,6 +26,7 @@ struct CudaContinuousBatchConfig : mfq::engine::ContinuousBatchConfig {
 };
 
 struct CudaRuntimeConfig : mfq::engine::RuntimeConfig {
+    bool prefill_chunk_auto = true;
     CudaDecodeGraphConfig decode_graph;
     CudaContinuousBatchConfig continuous_batch;
 };
@@ -54,7 +55,8 @@ struct CudaLoadOptions {
 
 struct CudaEngineOptions : CudaLoadOptions {
     int continuous_batching = 0;
-    int64_t prefill_chunk_size = 2048;
+    // Zero selects Auto; the resolved runtime limit is always positive.
+    int64_t prefill_chunk_size = 0;
 };
 
 std::unique_ptr<mfq::engine::Engine> load_cuda_engine(CudaEngineOptions options);

@@ -7,6 +7,7 @@
 #include "models/qwen35/ops.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
+#include "prefill_budget.h"
 
 #include <algorithm>
 #include <exception>
@@ -23,6 +24,35 @@ using internal::PrefillCudaTimer;
 using Tensor = mfq_tensor_backend::Tensor;
 using qwen35::Qwen35BatchStateAdapter;
 using qwen35::QwenBatchRequestState;
+
+template<class Model>
+static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
+        CudaExecutionContext& execution,mfq::engine::PrefillChunk chunk,std::size_t growth=0) {
+    const auto context=default_context(execution.layer_placement.primary_device());
+    const auto transfer=moe_prefill_workspace_budget(execution.moe_expert_cache,false).transfer_bytes;
+    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
+    const auto available=context->available_memory()+context->workspace_available();
+    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
+    const auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
+    if(!selected)throw mfq::engine::InferenceInputError(
+        mfq::engine::InferenceInputErrorCode::ContextLength,
+        "insufficient CUDA workspace for batched prefill; reduce concurrent requests");
+    chunk.count=selected;
+    return chunk;
+}
+
+mfq::engine::PrefillChunk QwenBatchOperations::prefill_chunk(
+        const std::shared_ptr<Request>&,mfq::engine::PrefillChunk chunk) {
+    MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    return budget_batch_prefill(model_,execution_,chunk);
+}
+
+mfq::engine::PrefillChunk FlashNextBatchOperations::prefill_chunk(
+        const std::shared_ptr<Request>& request,mfq::engine::PrefillChunk chunk) {
+    MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    initialize_prefill(request,chunk);
+    return budget_batch_prefill(model_,execution_,chunk,request->cache->prefill_growth_bytes(chunk.count));
+}
 
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &model,
                                               const CudaContinuousBatchConfig &config) {

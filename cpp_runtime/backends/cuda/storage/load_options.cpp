@@ -64,10 +64,14 @@ std::int32_t graph_minimum(const char* name) {
 CudaRuntimeConfig resolve_cuda_runtime_config(
         const CudaEngineOptions& options) {
     CudaRuntimeConfig config;
+    if(options.prefill_chunk_size < 0 || options.prefill_chunk_size > 8192)
+        throw std::invalid_argument("prefill chunk size must be Auto (0) or in [1, 8192]");
+    config.prefill_chunk_auto = options.prefill_chunk_size == 0;
+    const auto chunk_limit = config.prefill_chunk_auto ? int64_t(8192) : options.prefill_chunk_size;
     static_cast<mfq::engine::RuntimeConfig&>(config) =
-        mfq::engine::resolve_runtime_config(options.prefill_chunk_size);
+        mfq::engine::resolve_runtime_config(chunk_limit);
     static_cast<mfq::engine::ContinuousBatchConfig&>(config.continuous_batch) =
-        mfq::engine::resolve_batch_config(options.continuous_batching, options.prefill_chunk_size);
+        mfq::engine::resolve_batch_config(options.continuous_batching, chunk_limit);
     config.decode_graph.enabled = environment_enabled(
         "MFQ_RUNTIME_CUDA_GRAPH", true);
     config.decode_graph.trace = environment_enabled(

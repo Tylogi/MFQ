@@ -826,7 +826,7 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
   auto logical_chunk=prefill_chunk_size;
   if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
     logical_chunk=std::min<int64_t>(logical_chunk,8192);
-    if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
+    if(prefill_chunk_size>8 && reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();
   }

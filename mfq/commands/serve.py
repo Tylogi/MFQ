@@ -30,6 +30,15 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _prefill_chunk_size(value: str) -> int | str:
+    if value == "auto":
+        return value
+    parsed = _positive_int(value)
+    if parsed > 8192:
+        raise argparse.ArgumentTypeError("prefill chunk size must be at most 8192")
+    return parsed
+
+
 def _port(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > 65535:
@@ -441,7 +450,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Anthropic Messages API bind port (default: saved listener port or 8091)",
     )
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
-    parser.add_argument("--prefill-chunk-size", type=_positive_int, default=2048)
+    parser.add_argument(
+        "--prefill-chunk-size", type=_prefill_chunk_size, default="auto",
+        metavar="auto|N",
+        help="prefill compute chunk limit (default: auto; CUDA chooses up to 8192)",
+    )
     parser.add_argument(
         "--moe-gpu-cache-gb",
         type=_nonnegative_float,

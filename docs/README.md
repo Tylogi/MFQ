@@ -6,6 +6,7 @@ matches what you want to do.
 
 ## Get started
 
+- [Deploy a service and check performance (中文)](deployment.zh-CN.md)
 - [Build the C++ runtime](cli/build.md)
 - [Run MFQ Server and Studio](cli/serve.md)
 - [Create a self-contained release](packaging.md)

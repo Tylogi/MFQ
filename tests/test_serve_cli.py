@@ -131,6 +131,8 @@ def test_serve_accepts_an_explicit_expert_cache_budget() -> None:
         ("--port", "65536"),
         ("--context-size", "-1"),
         ("--prefill-chunk-size", "0"),
+        ("--prefill-chunk-size", "8193"),
+        ("--prefill-chunk-size", "automatic"),
         ("--moe-gpu-cache-gb", "nan"),
         ("--prefix-cache-disk-size", "invalid"),
         ("--prefix-cache-hot-size", "-1M"),

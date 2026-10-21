@@ -34,10 +34,11 @@ jobs:
           mfq-moe-host-memory-test mfq-model-config-test
           mfq-nemotron-vision-config-test mfq-nemotron-vision-geometry-test
           mfq-deepseek-v41-vision-layout-test
+          mfq-prefill-budget-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout)-test$'
+          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout|prefill-budget)-test$'
 
   macos-metal:
     name: macOS Metal

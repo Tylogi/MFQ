@@ -46,6 +46,7 @@ class QwenBatchOperations {
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
+    mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request> &, mfq::engine::PrefillChunk);
     void activate(const std::shared_ptr<Request> &, const Sample &);
     void resume_decode(int64_t cache_position);
@@ -101,6 +102,7 @@ class FlashNextBatchOperations {
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
+    mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     std::size_t prefill_batch_limit() const;
     int64_t prefill_batch_token_budget() const;

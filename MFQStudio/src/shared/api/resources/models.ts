@@ -111,7 +111,7 @@ export const modelsApi = {
   loadModel(
     model: string,
     contextSize: number | null = null,
-    prefillChunkSize = 2048,
+    prefillChunkSize: number | 'auto' = 'auto',
     policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {

@@ -16,6 +16,7 @@
 #include "mfq_cuda_sampling_ops.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
+#include "prefill_budget.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -443,11 +444,51 @@ template <class Model> struct CudaGenerationContext {
         return model.cache_pos>0 && tokens<=128 &&
             moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
     }
-    int64_t prefill_chunk(std::size_t tokens) const {
+    int64_t prefill_chunk(std::size_t tokens) {
         // Reuse ordinary/MTP widths before allocating wider temporary graphs
         // whose activation storage would displace persistent expert images.
-        return short_streamed_prefill(tokens)?std::min<int64_t>(4,config.generation.prefill_chunk_size):
-            config.generation.prefill_chunk_size;
+        const auto limit=config.generation.prefill_chunk_size;
+        if(short_streamed_prefill(tokens))return std::min<int64_t>(4,limit);
+        if(tokens<=128)return std::min<int64_t>(std::max<std::size_t>(1,tokens),limit);
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        bool allow_borrow=false;
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            allow_borrow=qwen4_layer_major_prefill_eligible(model,std::min<std::size_t>(tokens,8192)) &&
+                (!prepared || !prepared->transformed());
+        auto budget=moe_prefill_workspace_budget(model.execution->moe_expert_cache,allow_borrow);
+        const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        auto available=mfq::engine::prefill_budget_add(
+            mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()),
+            budget.lendable_bytes);
+        const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
+        const auto sequence_bytes=allow_borrow
+            ? std::size_t(tokens<=16384?tokens:std::min<std::size_t>(tokens,limit))*row_bytes*3/8 : 0;
+        const auto reserve=moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)
+            ? std::max(std::size_t(1)<<30,mfq::cuda::runtime_options::workspace_reserve_bytes())
+            : std::size_t(1)<<30;
+        const auto fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
+        const auto wanted=std::min<int64_t>({int64_t(tokens),limit,mfq::engine::max_prefill_compute_chunk});
+        const auto required=mfq::engine::prefill_budget_add(fixed,std::size_t(wanted)*row_bytes);
+        if(required>available) {
+            // Expert overflow in the unused KV budget is revocable too. Ask
+            // its existing owner to return pages before reducing the tile.
+            reserve_workspace(required>budget.lendable_bytes?required-budget.lendable_bytes:0);
+            budget=moe_prefill_workspace_budget(model.execution->moe_expert_cache,allow_borrow);
+            available=mfq::engine::prefill_budget_add(
+                context->available_memory()+context->workspace_available(),budget.lendable_bytes);
+        }
+        const auto selected=mfq::engine::select_prefill_chunk(tokens,limit,available,fixed,row_bytes);
+        if(!selected)throw mfq::engine::InferenceInputError(
+            mfq::engine::InferenceInputErrorCode::ContextLength,
+            "insufficient CUDA workspace for prefill computation and expert transfer buffers");
+        std::cerr<<"runtime_prefill_plan mode="<<(config.prefill_chunk_auto?"auto":"limited")
+            <<" tokens="<<tokens<<" limit="<<limit<<" compute_chunk="<<selected
+            <<" available_bytes="<<available<<" lendable_bytes="<<budget.lendable_bytes
+            <<" transfer_bytes="<<budget.transfer_bytes<<'\n';
+        return selected;
+#else
+        return std::min<int64_t>(tokens,limit);
+#endif
     }
     void prepare_prefill_workspace(std::size_t tokens) {
         if(short_streamed_prefill(tokens)) {
@@ -543,12 +584,13 @@ template <class Model> struct CudaGenerationContext {
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
         prepare_prefill_workspace(input.prompt.size()-reused);
-        auto logical_chunk=prefill_chunk(input.prompt.size()-reused);
+        const auto compute_chunk=prefill_chunk(input.prompt.size()-reused);
+        auto logical_chunk=compute_chunk;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
             // prompts advance each bounded chunk through all layers.
             logical_chunk=std::min<int64_t>(logical_chunk,8192);
-            if(reused==0 && (stable==0 || stable==input.prompt.size()) &&
+            if(compute_chunk>8 && reused==0 && (stable==0 || stable==input.prompt.size()) &&
                 (!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
                 logical_chunk=input.prompt.size();
@@ -559,7 +601,7 @@ template <class Model> struct CudaGenerationContext {
         }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
-                config.decode_graph,config.generation.prefill_chunk_size,&output),
+                config.decode_graph,compute_chunk,&output),
             output, input.prompt.size(), reused, stable,logical_chunk);
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
