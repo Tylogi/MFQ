@@ -40,6 +40,14 @@ void test_tekken_regex_split() {
         {"a", "Bc", "De", "F", " ", "1", "2", "3", "\r\n"});
     require_tekken_parts("Ünicode ÄÖÜ äöü ß",
         {"Ünicode", " ÄÖÜ", " äöü", " ß"});
+    // General categories differ from case-conversion targets. Titlecase is
+    // upper-only; mathematical letters retain Lu/Ll without case mappings.
+    require_tekken_parts("ǅA", {"ǅA"});
+    require_tekken_parts("aǅA", {"a", "ǅA"});
+    require_tekken_parts("𝐀A", {"𝐀A"});
+    require_tekken_parts("a𝐚A", {"a𝐚", "A"});
+    require_tekken_parts("中A", {"中", "A"});
+    require_tekken_parts("aʰA", {"aʰ", "A"});
     // The Tekken punctuation tail includes '/', unlike the Qwen splitter.
     require_tekken_parts("_\n/'", {"_\n/", "'"});
 
@@ -54,6 +62,16 @@ void test_tekken_regex_split() {
     for (const auto & piece : pieces) joined += piece;
     require(joined == dna, "Tekken long DNA split did not preserve the input");
     require(pieces.size() == 1, "Tekken long DNA split changed the uppercase run");
+
+    // Many short matches in one letter run must not repeatedly scan its suffix.
+    std::string alternating;
+    for (int repeat = 0; repeat < 16384; ++repeat) alternating += "aB";
+    const auto mixed = unicode_regex_split(alternating, {kTekkenRegex}, false);
+    require(mixed.size() == 16385, "Tekken alternating-case boundaries changed");
+    require(mixed.front() == "a" && mixed.back() == "B",
+        "Tekken alternating-case edge tokens changed");
+    for (size_t i = 1; i + 1 < mixed.size(); ++i)
+        require(mixed[i] == "Ba", "Tekken alternating-case middle tokens changed");
 }
 
 

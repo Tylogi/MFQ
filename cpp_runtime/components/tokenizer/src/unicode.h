@@ -20,6 +20,9 @@ struct unicode_cpt_flags {
         LOWERCASE       = 0x0200,
         UPPERCASE       = 0x0400,
         NFD             = 0x0800,
+        LETTER_UPPERCASE = 0x1000,  // Unicode general category Lu
+        LETTER_LOWERCASE = 0x2000,  // Unicode general category Ll
+        LETTER_TITLECASE = 0x4000,  // Unicode general category Lt
     };
 
     // codepoint type
@@ -36,6 +39,9 @@ struct unicode_cpt_flags {
     uint16_t is_lowercase   : 1;
     uint16_t is_uppercase   : 1;
     uint16_t is_nfd         : 1;
+    uint16_t is_uppercase_letter : 1;
+    uint16_t is_lowercase_letter : 1;
+    uint16_t is_titlecase_letter : 1;
 
     // decode from uint16
     inline unicode_cpt_flags(const uint16_t flags = 0) {
@@ -54,6 +60,9 @@ struct unicode_cpt_flags {
         is_lowercase   = (flags & LOWERCASE)   ? 1 : 0;
         is_uppercase   = (flags & UPPERCASE)   ? 1 : 0;
         is_nfd         = (flags & NFD)         ? 1 : 0;
+        is_uppercase_letter = (flags & LETTER_UPPERCASE) ? 1 : 0;
+        is_lowercase_letter = (flags & LETTER_LOWERCASE) ? 1 : 0;
+        is_titlecase_letter = (flags & LETTER_TITLECASE) ? 1 : 0;
 #else
 #error Unexpected or undefined __BYTE_ORDER__
 #endif
@@ -76,6 +85,9 @@ struct unicode_cpt_flags {
             + is_lowercase   * LOWERCASE
             + is_uppercase   * UPPERCASE
             + is_nfd         * NFD
+            + is_uppercase_letter * LETTER_UPPERCASE
+            + is_lowercase_letter * LETTER_LOWERCASE
+            + is_titlecase_letter * LETTER_TITLECASE
             ;
 
         return result;

@@ -770,15 +770,14 @@ static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string &
             return len;
         };
 
-        // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] - letters that are not lowercase,
-        // plus combining marks.
+        // Use general categories, not case-conversion targets: titlecase and
+        // letters without case mappings still have distinct Lu/Ll/Lt classes.
         const auto upperish = [](const unicode_cpt_flags & flags) {
-            return flags.is_accent_mark || (flags.is_letter && !flags.is_lowercase);
+            return flags.is_accent_mark || (flags.is_letter && !flags.is_lowercase_letter);
         };
-        // [\p{Ll}\p{Lm}\p{Lo}\p{M}] - letters that are not uppercase, plus
-        // combining marks.
         const auto lowerish = [](const unicode_cpt_flags & flags) {
-            return flags.is_accent_mark || (flags.is_letter && !flags.is_uppercase);
+            return flags.is_accent_mark ||
+                (flags.is_letter && !flags.is_uppercase_letter && !flags.is_titlecase_letter);
         };
 
         for (size_t pos = offset_ini; pos < offset_end; /*pos++*/) {
@@ -800,46 +799,25 @@ static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string &
             }
             if (run_start != no_position) {
                 size_t end = run_start;
+                size_t last_lowerish_end = no_position;
+                // Greedy upperish*. Remember where it can backtrack to satisfy
+                // lowerish+ without rescanning the rest of the letter run.
                 while (end < offset_end) {
                     const auto value = _get_flags(end);
-                    if (!(upperish(value) || lowerish(value))) break;
+                    if (!upperish(value)) break;
                     ++end;
+                    if (lowerish(value)) last_lowerish_end = end;
                 }
-                size_t first_lowerish_only = no_position;
-                for (size_t i = run_start; i < end; ++i) {
-                    const auto value = _get_flags(i);
-                    if (lowerish(value) && !upperish(value)) {
-                        first_lowerish_only = i;
-                        break;
-                    }
+                if (lowerish(_get_flags(end))) {
+                    do { ++end; } while (lowerish(_get_flags(end)));
+                } else if (last_lowerish_end != no_position) {
+                    // The first alternative ends at the last shared-category
+                    // character. Only an uppercase-only suffix is revisited.
+                    end = last_lowerish_end;
                 }
-                size_t match_end = end;
-                if (first_lowerish_only != no_position) {
-                    // A lowercase-only letter fixes the split; an upper-only
-                    // letter after it starts a new token.
-                    for (size_t i = first_lowerish_only + 1; i < end; ++i) {
-                        const auto value = _get_flags(i);
-                        if (upperish(value) && !lowerish(value)) {
-                            match_end = i;
-                            break;
-                        }
-                    }
-                } else {
-                    // The last lower-ish character fixes the end of the
-                    // upper-ish* lower-ish+ alternative.
-                    size_t last_lowerish = no_position;
-                    for (size_t i = end; i > run_start; --i) {
-                        const auto value = _get_flags(i - 1);
-                        if (lowerish(value)) {
-                            last_lowerish = i - 1;
-                            break;
-                        }
-                    }
-                    if (last_lowerish != no_position && last_lowerish + 1 < end) {
-                        match_end = last_lowerish + 1;
-                    }
-                }
-                pos = match_end;
+                // With no lowerish character, the second alternative (upperish+
+                // lowerish*) consumes the uppercase-only run already scanned.
+                pos = end;
                 _add_token(pos);
                 continue;
             }
