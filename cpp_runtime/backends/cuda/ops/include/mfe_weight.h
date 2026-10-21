@@ -45,18 +45,24 @@ struct MfeWeight {
         activation_workspaces = std::make_shared<std::unordered_map<
             MoeActivationKey, MoeActivationWorkspace, MoeActivationKeyHash>>();
 
-    MoeActivationWorkspace & activation_workspace(
+    MoeActivationWorkspace activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs) const {
-        MoeActivationKey key{input_rows, groups, gs, x.get_device()};
+        // Reuse one growing quantization scratch per geometry. Caching one
+        // allocation per prompt row count retains a full activation buffer
+        // for every distinct request length ever served.
+        MoeActivationKey key{0, groups, gs, x.get_device()};
         auto it = activation_workspaces->find(key);
-        if (it != activation_workspaces->end()) return it->second;
-        MoeActivationWorkspace workspace;
-        workspace.qx = mfq_tensor_backend::empty(
-            {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-        workspace.xscale = mfq_tensor_backend::empty(
-            {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
-        return activation_workspaces->emplace(
-            key, std::move(workspace)).first->second;
+        if (it == activation_workspaces->end() || it->second.qx.size(0) < input_rows) {
+            const int capacity = ((input_rows + 255) / 256) * 256;
+            MoeActivationWorkspace workspace;
+            workspace.qx = mfq_tensor_backend::empty(
+                {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+            workspace.xscale = mfq_tensor_backend::empty(
+                {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+            it = activation_workspaces->insert_or_assign(key, std::move(workspace)).first;
+        }
+        return {it->second.qx.narrow(0, 0, input_rows),
+                it->second.xscale.narrow(0, 0, input_rows)};
     }
 
     bool expert_parallel() const {
@@ -225,7 +231,7 @@ struct MfeWeight {
             int groups = (int)pool.weight.ng;
             int gs = (int)pool.weight.gs;
             MoeActivationKey key{input_rows, groups, gs, x.get_device()};
-            auto & workspace = activation_workspace(x, input_rows, groups, gs);
+            auto workspace = activation_workspace(x, input_rows, groups, gs);
             bool input_quantized = input_prequantized ||
                 quantized.find(key) != quantized.end();
             const int route_tile_m = select_nint_prefill_route_tile(

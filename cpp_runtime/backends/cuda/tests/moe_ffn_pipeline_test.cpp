@@ -188,8 +188,8 @@ int verify_shared_input(const std::filesystem::path& root) {
             window.run();
             for(const auto& geometry:geometries) {
                 const bool in_gate=std::find(gate_geometries.begin(),gate_geometries.end(),geometry)!=gate_geometries.end();
-                auto& expected=(in_gate?reference_gate:reference_up).activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
-                auto& actual=gate.activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
+                auto expected=(in_gate?reference_gate:reference_up).activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
+                auto actual=gate.activation_workspace(x,tokens,geometry.groups,geometry.gs,{});
                 same(actual.qx,expected.qx,"quantized bytes/tail padding");same(actual.xscale,expected.xscale,"group scales");
             }
             same(actual_gate,expected_gate,"mixed Gate output");same(actual_up,expected_up,"mixed Up output");
@@ -2421,8 +2421,25 @@ void verify_memory_phase_reuse(const std::filesystem::path& root) {
     }
     std::cout<<"memory_phase_reuse_cases="<<cases<<" PASS\n";
 }
+void verify_activation_workspace_reuse() {
+    MfeWeight weight;
+    for(int rows:{1,17,33,129,513,1024}) {
+        auto x=tb::empty({rows,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto workspace=weight.activation_workspace(x,rows,8,32);
+        if(workspace.qx.size(0)!=rows || workspace.xscale.size(0)!=rows)
+            throw std::runtime_error("MFE activation workspace view does not match the row count");
+    }
+    if(weight.activation_workspaces->size()!=1)
+        throw std::runtime_error("MFE activation workspace cache retained one allocation per row count");
+    std::cout<<"mfe_activation_workspace_reuse rows=6 cached_entries="
+        <<weight.activation_workspaces->size()<<" PASS\n";
+}
+
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
+    if(argc==2 && std::string(argv[1])=="--activation-workspace-reuse-check") {
+        verify_activation_workspace_reuse();return 0;
+    }
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());

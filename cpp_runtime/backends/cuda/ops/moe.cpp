@@ -1413,35 +1413,36 @@ bool MixedMoeRuntime::nint_only() const {
         });
 }
 
-MoeActivationWorkspace & MixedMoeRuntime::activation_workspace(
+MoeActivationWorkspace MixedMoeRuntime::activation_workspace(
         mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
         MixedMoeTransformKey transform) const {
-    MixedMoeActivationKey key{
+    // Pipeline callers publish an exact-row workspace before forward(); keep
+    // using it so their pre-quantized input stays shared across projections.
+    const MixedMoeActivationKey exact{
         input_rows, groups, gs, x.get_device(), transform};
-    auto found = activation_workspaces.find(key);
+    auto found = activation_workspaces.find(exact);
     if (found != activation_workspaces.end()) return found->second;
-    MoeActivationWorkspace value;
-    value.qx = mfq_tensor_backend::empty(
-        {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-    value.xscale = mfq_tensor_backend::empty(
-        {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
-    return activation_workspaces.emplace(
-        key, std::move(value)).first->second;
+    // Resident dispatch reuses one growing allocation per geometry. A cache
+    // keyed by exact row count retains an activation scratch for every prompt
+    // length ever served.
+    const MixedMoeActivationKey shared{
+        0, groups, gs, x.get_device(), transform};
+    auto& value = activation_workspaces[shared];
+    if (!value.qx.defined() || value.qx.size(0) < input_rows) {
+        const int capacity = ((input_rows + 255) / 256) * 256;
+        value.qx = mfq_tensor_backend::empty(
+            {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+        value.xscale = mfq_tensor_backend::empty(
+            {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+    }
+    return {value.qx.narrow(0, 0, input_rows),
+            value.xscale.narrow(0, 0, input_rows)};
 }
 
 MoeActivationWorkspace MixedMoeRuntime::prefill_activation_workspace(
         mfq_tensor_backend::Tensor x,int input_rows,int groups,int gs,
         MixedMoeTransformKey transform) const {
-    // All prompt groups execute on the same compute stream. One growing
-    // allocation per geometry can therefore serve every layer and density.
-    const MixedMoeActivationKey key{0,groups,gs,x.get_device(),transform};
-    auto& value=activation_workspaces[key];
-    if(!value.qx.defined() || value.qx.size(0)<input_rows) {
-        const int capacity=((input_rows+255)/256)*256;
-        value.qx=mfq_tensor_backend::empty({capacity,groups*gs},x.options().dtype(mfq_tensor_backend::kInt8));
-        value.xscale=mfq_tensor_backend::empty({capacity,groups},x.options().dtype(mfq_tensor_backend::kFloat32));
-    }
-    return {value.qx.narrow(0,0,input_rows),value.xscale.narrow(0,0,input_rows)};
+    return activation_workspace(x, input_rows, groups, gs, transform);
 }
 
 std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
@@ -1607,7 +1608,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         const int groups = (neuron_len + 23) / 24;
         const MixedMoeActivationKey activation_key{
             input_rows, groups, 24, x.get_device(), identity};
-        auto & workspace = activation_workspace(
+        auto workspace = activation_workspace(
             x, input_rows, groups, 24, identity);
         auto qx = workspace.qx;
         auto xscale = workspace.xscale;
@@ -1638,7 +1639,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             MixedNintInputPlan plan;
             for(int index:nint_dispatch->pools) {
                 const auto& w=pools[index].nint;
-                auto& workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
+                auto workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
                 pointers.insert(pointers.end(),{reinterpret_cast<int64_t>(w.q_packed.data_ptr()),
                     reinterpret_cast<int64_t>(w.row_q_bits.data_ptr()),reinterpret_cast<int64_t>(w.row_q_bit_offsets.data_ptr()),
                     reinterpret_cast<int64_t>(w.sub_scale.data_ptr()),reinterpret_cast<int64_t>(w.sub_min.data_ptr()),
@@ -1692,7 +1693,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         bool direct=false;
         if(nint_dispatch->pools.size()==1) {
             const auto& pool=pools[nint_dispatch->pools.front()];const auto& w=pool.nint;
-            auto& workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
+            auto workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
             const auto& row_metadata=prepare_rows?plan.row_metadata_workspace:w.route_metadata;
             const NintSingleRouteWeight view{{reinterpret_cast<int64_t>(w.q_packed.data_ptr()),
                 reinterpret_cast<int64_t>(w.row_q_bits.data_ptr()),reinterpret_cast<int64_t>(w.row_q_bit_offsets.data_ptr()),
@@ -1877,7 +1878,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         }
         MixedMoeActivationKey activation_key{
             input_rows, groups, gs, x.get_device(), transform};
-        auto & workspace = activation_workspace(
+        auto workspace = activation_workspace(
             value, input_rows, groups, gs, transform);
         bool input_quantized = input_prequantized ||
             quantized.find(activation_key) != quantized.end();

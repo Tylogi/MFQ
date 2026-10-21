@@ -141,7 +141,7 @@ struct MixedMoeRuntime {
         MixedMoeActivationKeyHash> activation_workspaces;
 
     bool nint_only() const;
-    MoeActivationWorkspace & activation_workspace(
+    MoeActivationWorkspace activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const;
 
