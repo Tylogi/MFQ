@@ -424,7 +424,10 @@ void check_grouped_q8(int n, int mode, bool fp32, int storage_offset, int& cases
     const Device gpu{DeviceType::cuda,0};
     auto w=fused_weight(n,gs,ng,8,0);
     // Use aligned rows while retaining a partial final output block.
-    auto q=tensor(std::vector<uint8_t>(size_t(n)*ng*gs+storage_offset,137)).to(gpu);
+    std::vector<uint8_t> codes(size_t(n)*ng*gs+storage_offset);
+    for(int row=0;row<n;++row)for(int col=0;col<ng*gs;++col)
+        codes[size_t(storage_offset)+size_t(row)*ng*gs+col]=uint8_t(row*97+col*31);
+    auto q=tensor(codes).to(gpu);
     w.q_packed=q.narrow(0,storage_offset,q.numel()-storage_offset);
     std::vector<int64_t> offsets(n);
     for(int row=0;row<n;++row)offsets[row]=int64_t(row)*ng*gs*8;

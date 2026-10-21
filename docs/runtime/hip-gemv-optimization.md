@@ -137,3 +137,26 @@ python bench/model_bench.py qwen35-08b-s4m.mfq qwen35-4b-s4m.mfq qwen35-4b-fp.mf
 
 The microbenchmark driver must also be added to the baseline checkout; it
 calls the same existing projection APIs in both builds.
+
+## Post-sync verification
+
+The branch was rebased onto upstream `42f0e9a2` (MoE workspace fixes).
+The GEMV kernel sources are unchanged from the primary benchmark candidate.
+The q8 regression fixture now varies weights across rows and columns to
+check vector-load ordering as well as unsigned-code correction.
+
+The combined tree passes all 46 HIP native tests, all 37 backend-neutral
+native tests, and all 67 focused Python tests. The full Python rerun has
+3,258 passed, 770 skipped, and the same 26 baseline failures. All six
+generation comparisons still match exactly (390 generated tokens).
+
+A p2048 confirmation uses two warmups and three measured requests per model,
+with 256 generated tokens. It compares the frozen `2557bd1e` baseline with
+the rebased candidate. Raw samples and final source/binary hashes are stored
+under `post_sync_validation` in the JSON; the original campaigns are retained.
+
+| Model | Decode before | Decode after | Gain |
+| --- | ---: | ---: | ---: |
+| qwen35-08b-s4m.mfq | 238.0 | 186.0 | -21.9% |
+| qwen35-4b-s4m.mfq | 122.0 | 114.7 | -5.9% |
+| qwen35-4b-fp.mfq | 110.8 | 60.0 | -45.8% |
