@@ -44,7 +44,7 @@ for (const memory_architecture of ['unified', 'discrete'] as const) {
 
     await load.click();
     await expect.poll(() => writes.length).toBe(1);
-    expect(writes[0]).toMatchObject({ model: 'Low Memory MoE', context_size: 32768, prefill_chunk_size: 2048, pin: false });
+    expect(writes[0]).toMatchObject({ model: 'Low Memory MoE', context_size: 32768, prefill_chunk_size: 'auto', pin: false });
     expect(writes[0]).not.toHaveProperty('device_ids');
     await expect(load).toBeDisabled();
     release();

@@ -14,6 +14,12 @@
 #include <utility>
 
 class MoeExpertCache;
+struct MoePrefillWorkspaceBudget {
+    std::size_t lendable_bytes = 0;
+    std::size_t transfer_bytes = 0;
+};
+MoePrefillWorkspaceBudget moe_prefill_workspace_budget(
+    const std::shared_ptr<MoeExpertCache>& cache, bool allow_borrow);
 // Bound each target/predictor transfer arena across single-token and batched decode.
 inline int moe_decode_transfer_slots(int rows, int routes) {
     return std::max(80, rows * routes);

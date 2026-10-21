@@ -34,9 +34,6 @@ class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
 
 
-_NATIVE_DEFAULT_PREFILL_CHUNK_SIZE = 2048
-
-
 # Plain dense expert banks (for example an unquantized MTP head) are resident
 # on the device and run on the dense routed path, outside the RAM expert
 # pipeline, so they neither qualify nor disqualify a model for it.
@@ -79,12 +76,15 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
 
 def append_native_prefill_chunk_override(
     command: list[str],
-    prefill_chunk_size: int,
+    prefill_chunk_size: int | str,
 ) -> None:
-    """Pass only real overrides so the native model may autotune its default."""
+    """Leave Auto to the backend; forward every explicit limit, including 2048."""
 
-    if prefill_chunk_size != _NATIVE_DEFAULT_PREFILL_CHUNK_SIZE:
-        command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
+    if prefill_chunk_size == "auto":
+        return
+    if type(prefill_chunk_size) is not int or not 1 <= prefill_chunk_size <= 8192:
+        raise NativeRuntimeError("prefill chunk size must be auto or an integer in [1, 8192]")
+    command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
 
 
 def native_request_capacity(
@@ -183,7 +183,7 @@ class NativeRuntime:
     model_name: str
     backend: str
     context_size: int = 0
-    prefill_chunk_size: int = 2048
+    prefill_chunk_size: int | str = "auto"
     continuous_batching: int = 0
     routed_expert_bytes: int = 0
     moe_gpu_cache_gb: float | None = None
@@ -199,8 +199,6 @@ class NativeRuntime:
         return f"http://127.0.0.1:{self.port}"
 
     def command(self, port: int) -> list[str]:
-        if self.prefill_chunk_size < 1:
-            raise NativeRuntimeError("prefill chunk size must be positive")
         if self.continuous_batching < 0:
             raise NativeRuntimeError("continuous batching must be non-negative")
         if self.continuous_batching > 0 and self.backend not in {"cuda", "metal"}:

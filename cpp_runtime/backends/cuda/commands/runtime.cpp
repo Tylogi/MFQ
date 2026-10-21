@@ -37,7 +37,7 @@ void print_help() {
         << "  --api-key KEY                   API key\n"
         << "  --sampling-profile PATH         sampling profile override\n"
         << "  --continuous-batching N         maximum concurrent sequences\n"
-        << "  --prefill-chunk-size N          prefill chunk size (default 2048)\n"
+        << "  --prefill-chunk-size auto|N     compute chunk limit (default auto, max 8192)\n"
         << "  --tokenizer PATH                external tokenizer GGUF\n"
         << "  --ctx-size N                    context size; 0 selects a default\n"
         << "  -t, --threads N                 positive CPU thread count\n"
@@ -111,9 +111,10 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
             transport_option = true;
         }
         else if (option == "--prefill-chunk-size") {
-            result.prefill_chunk_size = integer<int64_t>(args.value(option), option);
-            if (result.prefill_chunk_size <= 0) {
-                usage_error("--prefill-chunk-size must be positive");
+            const auto value = args.value(option);
+            result.prefill_chunk_size = value == "auto" ? 0 : integer<int64_t>(value, option);
+            if (value != "auto" && (result.prefill_chunk_size <= 0 || result.prefill_chunk_size > 8192)) {
+                usage_error("--prefill-chunk-size must be auto or an integer in [1, 8192]");
             }
             transport_option = true;
         }

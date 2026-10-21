@@ -454,7 +454,7 @@ describe('useModelCatalog', () => {
       result.current.setLoadDeviceIds(['2']);
     });
     await act(async () => result.current.loadArtifact(artifact.name));
-    expect(load).toHaveBeenCalledWith('Local Model', 32768, 2048, {
+    expect(load).toHaveBeenCalledWith('Local Model', 32768, 'auto', {
       pin: true,
       idle_ttl_seconds: 300,
       device_ids: ['2'],

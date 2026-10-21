@@ -927,6 +927,61 @@ std::size_t MoeExpertCache::prefill_transfer_bytes(bool predictor) const {
     return maximum*std::min<std::size_t>(2,layers);
 }
 
+MoePrefillWorkspaceBudget MoeExpertCache::prefill_workspace_budget(bool allow_borrow) const {
+    MoePrefillWorkspaceBudget budget;
+    const auto* option=std::getenv("MFQ_PREFILL_BORROW");
+    allow_borrow=allow_borrow && (!option || option[0]!='0') &&
+        complete_residency_ && layer_prefill_ready() && !prefill_loan_;
+    if(allow_borrow)for(const auto& [key,arena]:arenas_)
+        budget.lendable_bytes+=std::size_t(arena->slots-arena->minimum_slots)*arena->slot_bytes;
+    if(ssd_experts()) {
+        // Match the normal SSD streaming ring, including its double buffering.
+        // Auto must shrink computation before reducing transfer overlap.
+        struct Layer {std::size_t baseline=0,largest=0;};
+        std::map<int,Layer> layers;
+        for(const auto& source:sources_)if(source->layer_id_>=0) {
+            auto& layer=layers[source->layer_id_];std::size_t largest=0;
+            for(const auto& cohort:source->cohorts_) {
+                std::size_t bytes=0;
+                for(const auto size:cohort.bytes_per_expert) {
+                    bytes+=size;layer.baseline+=(size+255)&~std::size_t(255);
+                }
+                largest=std::max(largest,bytes);
+            }
+            layer.largest+=largest;
+        }
+        std::size_t largest=1;
+        for(const auto& [id,layer]:layers)largest=std::max(largest,layer.largest);
+        auto slots=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE")
+            ? mfq::cuda::runtime_options::moe_prefill_group_size() : 64;
+        slots=std::min<std::size_t>(std::clamp(slots,1,96),
+            std::max<std::size_t>(1,host_experts_->stats().budget_bytes/2/largest));
+        for(const auto& [id,layer]:layers)
+            budget.transfer_bytes=std::max(budget.transfer_bytes,
+                2*((layer.baseline+slots*layer.largest+255)&~std::size_t(255)));
+        return budget;
+    }
+    std::map<int,std::size_t> layers;
+    for(const auto& [id,span]:pipeline_prefill_layers_)if(id>=0)layers[id]=std::size_t(span.second);
+    if(allow_borrow) {
+        // Include the largest possible appended cold image before any arena is
+        // lent. Actual loans can only add fewer rows than this bound.
+        for(const auto& source:sources_)if(source->layer_id_>=0)
+            for(const auto& cohort:source->cohorts_) {
+                std::size_t count=0;
+                for(int expert=0;expert<source->n_experts();++expert)
+                    if(source->expert_to_cohort_[expert]==cohort.index &&
+                       cohort.arena->book->slot_for({source->id_,cohort.index,expert})>=cohort.arena->minimum_slots)
+                        ++count;
+                for(const auto bytes:cohort.bytes_per_expert)
+                    layers[source->layer_id_]=((layers[source->layer_id_]+255)&~std::size_t(255))+count*bytes;
+            }
+    }
+    for(const auto& [id,bytes]:layers)budget.transfer_bytes=std::max(budget.transfer_bytes,bytes);
+    budget.transfer_bytes*=std::min<std::size_t>(2,layers.size());
+    return budget;
+}
+
 std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     if(prefill_loan_)throw std::logic_error("prefill workspace loan is already active");
@@ -1217,6 +1272,10 @@ void MoePrefillWorkspaceLoan::suspend(){if(active_)cache_->suspend_prefill_loan(
 void MoePrefillWorkspaceLoan::finish(){if(active_){cache_->end_prefill_loan();active_=false;}}
 std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor) {
     return cache?cache->prefill_transfer_bytes(predictor):0;
+}
+MoePrefillWorkspaceBudget moe_prefill_workspace_budget(
+        const std::shared_ptr<MoeExpertCache>& cache,bool allow_borrow) {
+    return cache?cache->prefill_workspace_budget(allow_borrow):MoePrefillWorkspaceBudget{};
 }
 
 void MoeExpertCache::resize(std::size_t bytes) {

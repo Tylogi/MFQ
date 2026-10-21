@@ -55,6 +55,11 @@ target_link_libraries(mfq-text-emitter-test PRIVATE mfq-engine)
 target_compile_features(mfq-text-emitter-test PRIVATE cxx_std_17)
 add_test(NAME mfq-text-emitter-test COMMAND mfq-text-emitter-test)
 
+add_executable(mfq-prefill-budget-test prefill_budget_test.cpp)
+target_link_libraries(mfq-prefill-budget-test PRIVATE mfq-engine)
+target_compile_features(mfq-prefill-budget-test PRIVATE cxx_std_17)
+add_test(NAME mfq-prefill-budget-test COMMAND mfq-prefill-budget-test)
+
 if(TARGET mfq-tokenizer)
     add_executable(mfq-text-processor-test text_processor_test.cpp)
     target_link_libraries(mfq-text-processor-test PRIVATE mfq-engine)

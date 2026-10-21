@@ -44,6 +44,7 @@ public:
     void end_prefill_loan();
     bool prefill_loan_active() const {return bool(prefill_loan_);}
     std::size_t prefill_transfer_bytes(bool predictor=false) const;
+    MoePrefillWorkspaceBudget prefill_workspace_budget(bool allow_borrow) const;
     std::optional<std::size_t> available_host_ram() const;
     std::size_t reclaim_optional_host(std::size_t allocation_bytes);
     void reserve_workspace(std::size_t bytes) {if(reserve_workspace_)reserve_workspace_(bytes);}

@@ -608,7 +608,7 @@ class ModelLoadRequest(ProtocolModel):
     pin: bool = False
     context_size: int | None = Field(default=None, ge=512, le=2147483647)
     yarn_enabled: bool | None = Field(default=None, strict=True)
-    prefill_chunk_size: int = Field(default=2048, ge=1)
+    prefill_chunk_size: Literal["auto"] | Annotated[int, Field(ge=1, le=8192)] = "auto"
     moe_gpu_cache_gb: float | None = Field(
         default=None,
         ge=0.0,

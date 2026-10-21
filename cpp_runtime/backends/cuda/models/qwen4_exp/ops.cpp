@@ -9,6 +9,7 @@
 #include "storage/weight_loader.h"
 #include "storage/moe_ffn_pipeline.h"
 #include "storage/moe_expert_cache.h"
+#include "prefill_budget.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/decode_window.h"
 #include "runtime/moe_pipeline.h"
@@ -2496,7 +2497,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     compute_chunk=std::min(compute_chunk,tokens);
     MoePrefillWorkspaceLoan workspace_loan(model.execution->moe_expert_cache);
     bool borrowed_workspace=false;
-    if(model.reuse_decode_graphs && model.graph_registry) {
+    {
         // Persistent decode graphs and prefill now coexist. Bound the compute
         // tile by actual remaining workspace instead of discarding those graphs
         // or allocating an 8K projection tile on top of their live buffers.
@@ -2506,16 +2507,19 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         // Whole-prompt residual and FFN injection remain live across tiles.
         // Their previous hidden input and the assembled FFN output can overlap
         // them at a layer boundary. Include that third sequence-sized buffer.
-        const auto sequence_reserve=tokens>16384
-            ? std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float)*3 : 0;
-        const auto transfer=moe_prefill_transfer_bytes(model.execution->moe_expert_cache);
-        borrowed_workspace=workspace_loan.begin(reserve+sequence_reserve+std::size_t(compute_chunk)*row_bytes+transfer)>0;
+        const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float)*3;
+        const auto budget=moe_prefill_workspace_budget(model.execution->moe_expert_cache,true);
+        const auto planned_fixed=mfq::engine::prefill_budget_add(reserve+sequence_reserve,budget.transfer_bytes);
+        const auto planned_available=mfq::engine::prefill_budget_add(
+            context->available_memory()+context->workspace_available(),budget.lendable_bytes);
+        compute_chunk=mfq::engine::select_prefill_chunk(tokens,compute_chunk,planned_available,planned_fixed,row_bytes);
+        MFQ_RUNTIME_CHECK(compute_chunk>0,"insufficient CUDA prefill workspace before expert loan");
+        borrowed_workspace=workspace_loan.begin(planned_fixed+std::size_t(compute_chunk)*row_bytes)>0;
         const auto available=context->available_memory()+context->workspace_available();
         const auto requested=compute_chunk;
-        const auto fixed=reserve+sequence_reserve+(borrowed_workspace?moe_prefill_transfer_bytes(model.execution->moe_expert_cache):0);
-        while(compute_chunk>1024 && (available<=fixed ||
-                std::size_t(compute_chunk)>((available-fixed)/std::max<std::size_t>(1,row_bytes))))
-            compute_chunk=std::max<int64_t>(1024,compute_chunk/2);
+        const auto fixed=reserve+sequence_reserve+moe_prefill_transfer_bytes(model.execution->moe_expert_cache);
+        compute_chunk=mfq::engine::select_prefill_chunk(tokens,compute_chunk,available,fixed,row_bytes);
+        MFQ_RUNTIME_CHECK(compute_chunk>0,"insufficient CUDA prefill workspace after expert loan");
         if(compute_chunk!=requested)std::cerr<<"runtime_prefill_chunk_budget requested="<<requested
             <<" compute="<<compute_chunk<<" available_bytes="<<available<<'\n';
     }
