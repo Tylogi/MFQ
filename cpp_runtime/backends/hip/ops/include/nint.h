@@ -24,6 +24,7 @@ struct Workspace {
     int K_pad = 0;
     mfq_tensor_backend::Tensor qx;
     mfq_tensor_backend::Tensor xscale;
+    mfq_tensor_backend::Tensor xsum;
 };
 
 struct NintWeight {
@@ -71,6 +72,8 @@ struct NintWeight {
             {M, K_pad}, workspace_options.dtype(mfq_tensor_backend::kInt8));
         ws.xscale = mfq_tensor_backend::empty(
             {M, ng}, workspace_options.dtype(mfq_tensor_backend::kFloat32));
+        ws.xsum = mfq_tensor_backend::empty(
+            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kInt32));
         auto res = workspaces.emplace(M, std::move(ws));
         return res.first->second;
     }

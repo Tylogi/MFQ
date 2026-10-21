@@ -435,7 +435,7 @@ mfq_tensor_backend::Tensor nint_matmul(
                         w.neuron_min, x, w.gs, w.fused_segment_bits,
                         w.fused_segment_row_offsets,
                         w.fused_segment_byte_offsets,
-                        w.fused_segment_slots, ws.qx, ws.xscale);
+                        w.fused_segment_slots, ws.qx, ws.xscale, ws.xsum);
                 });
             }
             return profiler.measure("nint.matmul", [&]() {
@@ -582,6 +582,15 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     gate = pad_last(gate, w.neuron_len);
     if (!w.q8_zero && x.size(0) <= 8) {
         Workspace & ws = w.workspace(static_cast<int>(x.size(0)));
+        if (x.size(0) == 1 && w.fused_ok) {
+            return profiler.measure("nint.matmul.input_mul.fused", [&]() {
+                return nint_matmul_fused_decode_cuda(
+                    w.fused_q, w.fused_row_ids, w.neuron_scale,
+                    w.neuron_min, x, w.gs, w.fused_segment_bits,
+                    w.fused_segment_row_offsets, w.fused_segment_byte_offsets,
+                    w.fused_segment_slots, ws.qx, ws.xscale, ws.xsum, gate, mode);
+            });
+        }
         return profiler.measure("nint.matmul.input_mul", [&]() {
             if (w.aligned_q8) {
                 return nint_matmul_input_mul_q8_ws_cuda(
@@ -1320,8 +1329,7 @@ void build_fused_decode_layout(
     const size_t total_bytes =
         size_t(segment_byte_offsets.back());
     std::vector<uint8_t> fused(total_bytes, 0);
-    std::vector<int32_t> row_ids;
-    row_ids.reserve(size_t(c.out));
+    std::vector<int32_t> row_ids(size_t(c.out));
     std::vector<int64_t> filled(9, 0);
     std::vector<uint8_t> staging;
     for (int64_t row = 0; row < c.out; ++row) {
@@ -1373,7 +1381,7 @@ void build_fused_decode_layout(
                 uint16_t(uint16_t(min_src[size_t(group)]) << 8);
             std::memcpy(slot_ptr + slot - 2, &scales, sizeof(scales));
         }
-        row_ids.push_back(int32_t(row));
+        row_ids[size_t(segment_row_offsets[segment] + slot_row)] = int32_t(row);
     }
 
     const auto target = w.q_packed.device();

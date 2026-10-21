@@ -63,7 +63,9 @@ mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
     const std::vector<int64_t>& segment_row_offsets,
     const std::vector<int64_t>& segment_byte_offsets,
     const std::vector<int64_t>& segment_slots,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor gate = {}, int64_t activation_mode = 0);
 // Caller proves every row is q8 with a 32-bit-aligned row bit offset.
 // Misaligned storage or a non-four-element group uses the generic kernel.
 mfq_tensor_backend::Tensor nint_matmul_q8_ws_cuda(
