@@ -735,6 +735,154 @@ static std::vector<size_t> unicode_regex_split_custom_qwen35(const std::string &
     return bpe_offsets;
 }
 
+// Tekken (Mistral) system regex from tokenizer.json:
+//   "[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|..."
+// std::regex can exhaust its stack on long letter runs (GPQA DNA sequences).
+// Use the Unicode case flags directly while preserving the same leftmost-first
+// alternatives.
+static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
+        auto _get_cpt = [&](const size_t pos) -> uint32_t {
+            return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
+        };
+        auto _get_flags = [&](const size_t pos) -> unicode_cpt_flags {
+            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        };
+
+        size_t _prev_end = offset_ini;
+        auto _add_token = [&](const size_t end) -> size_t {
+            assert(_prev_end <= end && end <= offset_end);
+            const size_t len = end - _prev_end;
+            if (len > 0) bpe_offsets.push_back(len);
+            _prev_end = end;
+            return len;
+        };
+
+        // Use general categories, not case-conversion targets: titlecase and
+        // letters without case mappings still have distinct Lu/Ll/Lt classes.
+        const auto upperish = [](const unicode_cpt_flags & flags) {
+            return flags.is_accent_mark || (flags.is_letter && !flags.is_lowercase_letter);
+        };
+        const auto lowerish = [](const unicode_cpt_flags & flags) {
+            return flags.is_accent_mark ||
+                (flags.is_letter && !flags.is_uppercase_letter && !flags.is_titlecase_letter);
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end; /*pos++*/) {
+            const uint32_t cpt = _get_cpt(pos);
+            const auto flags = _get_flags(pos);
+            const size_t no_position = static_cast<size_t>(-1);
+
+            // regex: [^\r\n\p{L}\p{N}]?[\p{Lu}...]*[\p{Ll}...]+
+            //      | [^\r\n\p{L}\p{N}]?[\p{Lu}...]+[\p{Ll}...]*
+            size_t run_start = no_position;
+            if (!(cpt == '\r' || cpt == '\n' || flags.is_number)) {
+                if (upperish(flags) || lowerish(flags)) {
+                    run_start = pos;
+                } else if (pos + 1 < offset_end && !flags.is_letter && !flags.is_number &&
+                           (upperish(_get_flags(pos + 1)) || lowerish(_get_flags(pos + 1)))) {
+                    // optional one-codepoint prefix (space, punctuation, ...)
+                    run_start = pos + 1;
+                }
+            }
+            if (run_start != no_position) {
+                size_t end = run_start;
+                size_t last_lowerish_end = no_position;
+                // Greedy upperish*. Remember where it can backtrack to satisfy
+                // lowerish+ without rescanning the rest of the letter run.
+                while (end < offset_end) {
+                    const auto value = _get_flags(end);
+                    if (!upperish(value)) break;
+                    ++end;
+                    if (lowerish(value)) last_lowerish_end = end;
+                }
+                if (lowerish(_get_flags(end))) {
+                    do { ++end; } while (lowerish(_get_flags(end)));
+                } else if (last_lowerish_end != no_position) {
+                    // The first alternative ends at the last shared-category
+                    // character. Only an uppercase-only suffix is revisited.
+                    end = last_lowerish_end;
+                }
+                // With no lowerish character, the second alternative (upperish+
+                // lowerish*) consumes the uppercase-only run already scanned.
+                pos = end;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \p{N}
+            if (flags.is_number) {
+                pos++;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: <space>?[^\s\p{L}\p{N}]+[\r\n/]*
+            auto flags2 = (cpt == ' ' ? _get_flags(pos + 1) : flags);
+            if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
+                pos += (cpt == ' ');
+                while (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
+                    flags2 = _get_flags(++pos);
+                }
+                uint32_t cpt2 = _get_cpt(pos);
+                while (cpt2 == '\r' || cpt2 == '\n' || cpt2 == '/') {
+                    cpt2 = _get_cpt(++pos);
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            size_t num_whitespaces = 0;
+            size_t last_end_r_or_n = 0;
+            while (_get_flags(pos + num_whitespaces).is_whitespace) {
+                const uint32_t cpt2 = _get_cpt(pos + num_whitespaces);
+                if (cpt2 == '\r' || cpt2 == '\n') {
+                    last_end_r_or_n = pos + num_whitespaces + 1;
+                }
+                num_whitespaces++;
+            }
+
+            // regex: \s*[\r\n]+
+            if (last_end_r_or_n > 0) {
+                pos = last_end_r_or_n;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \s+(?!\S)
+            if (num_whitespaces > 1 && _get_cpt(pos + num_whitespaces) != OUT_OF_RANGE) {
+                pos += num_whitespaces - 1;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \s+
+            if (num_whitespaces > 0) {
+                pos += num_whitespaces;
+                _add_token(pos);
+                continue;
+            }
+
+            // no matches
+            _add_token(++pos);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 template <typename CharT>
 static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT> & text, const std::basic_string<CharT> & regex, const std::vector<size_t> & offsets) {
     using BidirIt = typename std::basic_string<CharT>::const_iterator;
@@ -1050,7 +1198,9 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
-    if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
+    if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_tekken(text, offsets);
+    } else if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
