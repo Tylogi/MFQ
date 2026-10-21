@@ -72,6 +72,13 @@ struct MoeActivationKeyHash {
 };
 
 struct MoeActivationWorkspace {
+    static constexpr int stable_row_limit = 2048;
+    static int capacity_rows(int rows, bool stable) {
+        if (!stable) return ((rows + 255) / 256) * 256;
+        int capacity = 1;
+        while (capacity < rows) capacity *= 2;
+        return capacity;
+    }
     mfq_tensor_backend::Tensor qx;
     mfq_tensor_backend::Tensor xscale;
 };

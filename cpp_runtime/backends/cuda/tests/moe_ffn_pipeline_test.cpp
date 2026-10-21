@@ -182,9 +182,9 @@ int verify_shared_input(const std::filesystem::path& root) {
             x.copy_(tb::tensor(input).reshape({tokens,2560}).to(tb::kFloat16).to(tb::kCUDA));
             ids.copy_(tb::tensor(selected).reshape({tokens,10}).to(tb::kCUDA));
             auto route=build_moe_route_plan(ids,12);
-            execution.config.moe_nint_heterogeneous_decode=false;
+            // Hold arithmetic dispatch fixed when checking byte-exact input
+            // reuse. Heterogeneous-vs-pool arithmetic has its own tests.
             auto expected_gate=forward(reference_gate,x,route,false),expected_up=forward(reference_up,x,route,false);
-            execution.config.moe_nint_heterogeneous_decode=true;
             window.run();
             for(const auto& geometry:geometries) {
                 const bool in_gate=std::find(gate_geometries.begin(),gate_geometries.end(),geometry)!=gate_geometries.end();
@@ -2422,37 +2422,103 @@ void verify_memory_phase_reuse(const std::filesystem::path& root) {
     std::cout<<"memory_phase_reuse_cases="<<cases<<" PASS\n";
 }
 void verify_activation_workspace_reuse() {
-    MfeWeight weight;
-    for(int rows:{1,17,33,129,513,1024}) {
-        auto x=tb::empty({rows,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
-        auto workspace=weight.activation_workspace(x,rows,8,32);
-        if(workspace.qx.size(0)!=rows || workspace.xscale.size(0)!=rows)
-            throw std::runtime_error("MFE activation workspace view does not match the row count");
+    for(bool mixed:{false,true}) {
+        MfeWeight weight;MixedMoeRuntime runtime;
+        for(int rows:{1,17,33,129,513,1024,2049,4096,8193,22}) {
+            auto x=tb::empty({rows,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+            auto workspace=mixed?runtime.activation_workspace(x,rows,8,32,{},false):
+                weight.activation_workspace(x,rows,8,32,false);
+            if(workspace.qx.size(0)!=rows || workspace.xscale.size(0)!=rows)
+                throw std::runtime_error("activation workspace view does not match the row count");
+        }
+        const auto entries=mixed?runtime.activation_workspaces.size():weight.activation_workspaces->size();
+        if(entries!=1)throw std::runtime_error("eager activation scratch retained one buffer per prompt length");
     }
-    if(weight.activation_workspaces->size()!=1)
-        throw std::runtime_error("MFE activation workspace cache retained one allocation per row count");
-    std::cout<<"mfe_activation_workspace_reuse rows=6 cached_entries="
-        <<weight.activation_workspaces->size()<<" PASS\n";
+    std::cout<<"activation_workspace_reuse eager_rows=10 runtimes=2 PASS\n";
+}
+void verify_activation_workspace_binding() {
+    for(int rows:{1,3,8,1024,2048,4096})for(bool stable:{false,true}) {
+        auto options=tb::TensorOptions().device(tb::kCUDA);
+        auto x=tb::empty({rows,256},options.dtype(tb::kFloat16));
+        const MoeActivationWorkspace shared{tb::empty({rows,256},options.dtype(tb::kInt8)),
+            tb::empty({rows,8},options.dtype(tb::kFloat32))};
+        MfeWeight weight;MixedMoeRuntime runtime;
+        weight.activation_workspaces->insert_or_assign({rows,8,32,x.get_device()},shared);
+        runtime.activation_workspaces.insert_or_assign({rows,8,32,x.get_device(),{}},shared);
+        for(auto workspace:{weight.activation_workspace(x,rows,8,32,stable),
+                runtime.activation_workspace(x,rows,8,32,{},stable)})
+            if(workspace.qx.data_ptr()!=shared.qx.data_ptr() || workspace.xscale.data_ptr()!=shared.xscale.data_ptr())
+                throw std::runtime_error("activation scratch ignored a producer's prequantized binding");
+        if(weight.activation_workspaces->size()!=1 || runtime.activation_workspaces.size()!=1)
+            throw std::runtime_error("prequantized binding allocated redundant activation scratch");
+    }
+    std::cout<<"activation_workspace_binding rows=6 policies=2 runtimes=2 PASS\n";
 }
 void verify_activation_workspace_stable_allocation() {
-    MfeWeight weight;
-    auto small=tb::empty({22,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
-    auto large=tb::empty({500,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
-    auto captured=weight.activation_workspace(small,22,8,32,true);
-    const void* pointer=captured.qx.data_ptr();
-    (void)weight.activation_workspace(large,500,8,32,false);
-    auto again=weight.activation_workspace(small,22,8,32,true);
-    if(again.qx.data_ptr()!=pointer)
-        throw std::runtime_error("MFE stable activation workspace moved after a larger eager prompt");
-    if(weight.activation_workspaces->size()!=2)
-        throw std::runtime_error("MFE stable workspace did not stay separate from the eager capacity");
-    std::cout<<"mfe_activation_workspace_stable_allocation stable_entries=2 PASS\n";
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();
+    for(bool mixed:{false,true}) {
+        MfeWeight weight;MixedMoeRuntime runtime;
+        const auto scratch=[&](const tb::Tensor& x,int rows,bool stable) {
+            return mixed?runtime.activation_workspace(x,rows,8,32,{},stable):
+                weight.activation_workspace(x,rows,8,32,stable);
+        };
+        auto small=tb::empty({1,256},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto captured=scratch(small,1,true);
+        const void* pointer=captured.qx.data_ptr();
+        const void* scale_pointer=captured.xscale.data_ptr();
+        const auto initial=mixed?runtime.activation_workspaces.begin()->second.qx.size(0):
+            weight.activation_workspaces->begin()->second.qx.size(0);
+        if(initial!=1)throw std::runtime_error("one-token scratch reserved a full short-prefill buffer");
+        context->begin_graph_pool(stream);
+        {
+            mfq::cuda::DecodeWindow window(stream);
+            window.capture([&] {
+                MFQ_CUDA_CHECK(cudaMemsetAsync(captured.qx.data_ptr(),0x35,256,stream));
+                MFQ_CUDA_CHECK(cudaMemsetAsync(captured.xscale.data_ptr(),0,8*sizeof(float),stream));
+            },[]{},[]{});
+            for(int rows:{2,3,8,9,33,129,513,1024,2048,2049,8193}) {
+                auto x=tb::empty({rows,256},small.options());
+                auto workspace=scratch(x,rows,rows<=2048);
+                auto matching=mixed?runtime.activation_workspace(x,rows,8,32,{}):
+                    weight.activation_workspace(x,rows,8,32);
+                if(workspace.qx.data_ptr()!=matching.qx.data_ptr())
+                    throw std::runtime_error("forward and producer default activation policies differ");
+            }
+            auto inputs=tb::empty({128,256},small.options());
+            for(int rows=1;rows<=128;++rows)(void)scratch(inputs.narrow(0,0,rows),rows,true);
+            const auto retained=scratch(small,1,true);
+            if(retained.qx.data_ptr()!=pointer || retained.xscale.data_ptr()!=scale_pointer)
+                throw std::runtime_error("larger prefill moved graph-captured activation scratch");
+            window.run();
+            auto result=captured.qx.cpu();
+            for(int i=0;i<256;++i)if(result.data_ptr<int8_t>()[i]!=0x35)
+                throw std::runtime_error("captured activation scratch was not valid on replay");
+            auto scales=captured.xscale.cpu();
+            for(int i=0;i<8;++i)if(scales.data_ptr<float>()[i]!=0.0f)
+                throw std::runtime_error("captured activation scales were not valid on replay");
+            std::size_t rows=0,entries=0;
+            const auto count=[&](const auto& values) {
+                for(const auto& item:values)if(item.first.input_rows<0) {
+                    rows+=std::size_t(item.second.qx.size(0));++entries;
+                }
+            };
+            if(mixed)count(runtime.activation_workspaces);else count(*weight.activation_workspaces);
+            if(rows>4095 || entries>12)
+                throw std::runtime_error("stable activation capacity buckets exceeded their memory bound");
+        }
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
+    }
+    std::cout<<"activation_workspace_stable_allocation graph_replay=2 bounded_buckets=1 PASS\n";
 }
 
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc==2 && std::string(argv[1])=="--activation-workspace-reuse-check") {
         verify_activation_workspace_reuse();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--activation-workspace-binding-check") {
+        verify_activation_workspace_binding();return 0;
     }
     if(argc==2 && std::string(argv[1])=="--activation-workspace-stable-check") {
         verify_activation_workspace_stable_allocation();return 0;

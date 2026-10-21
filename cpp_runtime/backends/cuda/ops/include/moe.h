@@ -150,7 +150,7 @@ struct MixedMoeRuntime {
     bool nint_only() const;
     MoeActivationWorkspace activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
-            MixedMoeTransformKey transform, bool stable = false) const;
+            MixedMoeTransformKey transform, bool stable = true) const;
     MoeActivationWorkspace prefill_activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const;

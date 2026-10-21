@@ -1335,44 +1335,31 @@ bool MixedMoeRuntime::nint_only() const {
 MoeActivationWorkspace MixedMoeRuntime::activation_workspace(
         mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
         MixedMoeTransformKey transform, bool stable) const {
-    // Decode-sized scratch can be referenced by captured graphs, so it lives
-    // in one fixed-capacity allocation that is never replaced.
-    constexpr int kStableRows = 2048;
-    if (stable && input_rows > kStableRows) stable = false;
-    if (stable) {
-        const MixedMoeActivationKey key{
-            -1, groups, gs, x.get_device(), transform};
-        auto& value = activation_workspaces[key];
-        if (!value.qx.defined() || value.qx.size(0) < input_rows) {
-            value.qx = mfq_tensor_backend::empty(
-                {kStableRows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-            value.xscale = mfq_tensor_backend::empty(
-                {kStableRows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
-        }
-        return {value.qx.narrow(0, 0, input_rows),
-                value.xscale.narrow(0, 0, input_rows)};
-    }
-    // Pipeline callers publish an exact-row workspace before forward(); keep
-    // using it so their pre-quantized input stays shared across projections.
+    // Shared quantization publishes an exact-row view. Honor that binding
+    // before selecting our own scratch, including graph-sized inputs.
     const MixedMoeActivationKey exact{
         input_rows, groups, gs, x.get_device(), transform};
     auto found = activation_workspaces.find(exact);
     if (found != activation_workspaces.end()) return found->second;
-    // Eager dispatch reuses one growing allocation per geometry. A cache
-    // keyed by exact row count retains an activation scratch for every prompt
-    // length ever served.
-    const MixedMoeActivationKey shared{
-        0, groups, gs, x.get_device(), transform};
-    auto& value = activation_workspaces[shared];
-    if (!value.qx.defined() || value.qx.size(0) < input_rows) {
-        const int capacity = ((input_rows + 255) / 256) * 256;
-        value.qx = mfq_tensor_backend::empty(
+    stable = stable && input_rows <= MoeActivationWorkspace::stable_row_limit;
+    const int capacity = MoeActivationWorkspace::capacity_rows(input_rows, stable);
+    // Permanent capacity buckets bound decode scratch without reserving
+    // 2048 rows for a single token. Eager prefill grows independently.
+    const MixedMoeActivationKey key{
+        stable ? -capacity : 0, groups, gs, x.get_device(), transform};
+    auto it = activation_workspaces.find(key);
+    if (it == activation_workspaces.end() || it->second.qx.size(0) < input_rows) {
+        // Publish both allocations together so an allocation failure cannot
+        // leave new Q8 storage paired with an old scale buffer.
+        MoeActivationWorkspace workspace;
+        workspace.qx = mfq_tensor_backend::empty(
             {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
-        value.xscale = mfq_tensor_backend::empty(
+        workspace.xscale = mfq_tensor_backend::empty(
             {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+        it = activation_workspaces.insert_or_assign(key, std::move(workspace)).first;
     }
-    return {value.qx.narrow(0, 0, input_rows),
-            value.xscale.narrow(0, 0, input_rows)};
+    return {it->second.qx.narrow(0, 0, input_rows),
+            it->second.xscale.narrow(0, 0, input_rows)};
 }
 
 std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
@@ -1437,7 +1424,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         throw std::runtime_error("mixed MFE input and route shape mismatch");
     }
     const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
-    const bool stable = input_rows <= 2048;
+    const bool stable = input_rows <= MoeActivationWorkspace::stable_row_limit;
     const int result_width = epilogue_mode == 0
         ? out_per_expert
         : out_per_expert / 2;

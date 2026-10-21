@@ -48,18 +48,18 @@ struct MfeWeight {
 
     MoeActivationWorkspace activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
-            bool stable = false) const {
-        // Decode-sized scratch can be referenced by captured graphs, so it
-        // lives in one fixed-capacity allocation that is never replaced.
-        // Eager prefill scratch grows with the prompt and is not a graph
-        // address; keeping one growing allocation stops a new prompt length
-        // from retaining another full buffer.
-        constexpr int kStableRows = 2048;
-        if (stable && input_rows > kStableRows) stable = false;
-        MoeActivationKey key{stable ? -1 : 0, groups, gs, x.get_device()};
+            bool stable = true) const {
+        // A producer may have already quantized this exact view for us.
+        const MoeActivationKey exact{input_rows, groups, gs, x.get_device()};
+        auto found = activation_workspaces->find(exact);
+        if (found != activation_workspaces->end()) return found->second;
+        stable = stable && input_rows <= MoeActivationWorkspace::stable_row_limit;
+        const int capacity = MoeActivationWorkspace::capacity_rows(input_rows, stable);
+        // Each negative key owns a permanent capacity bucket. Larger eager
+        // prefill uses key zero and cannot replace a captured bucket address.
+        const MoeActivationKey key{stable ? -capacity : 0, groups, gs, x.get_device()};
         auto it = activation_workspaces->find(key);
         if (it == activation_workspaces->end() || it->second.qx.size(0) < input_rows) {
-            const int capacity = stable ? kStableRows : ((input_rows + 255) / 256) * 256;
             MoeActivationWorkspace workspace;
             workspace.qx = mfq_tensor_backend::empty(
                 {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
