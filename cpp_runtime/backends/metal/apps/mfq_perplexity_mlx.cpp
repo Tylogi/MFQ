@@ -491,10 +491,10 @@ std::filesystem::path default_manifest_path(
 json gpu_manifest() {
     json result = json::object();
     const auto& values = mlx::core::gpu::device_info(0);
-    for (const auto& [key, value] : values) {
+    for (const auto& entry : values) {
         std::visit(
-            [&](const auto& item) { result[key] = item; },
-            value);
+            [&](const auto& item) { result[entry.first] = item; },
+            entry.second);
     }
     return result;
 }
