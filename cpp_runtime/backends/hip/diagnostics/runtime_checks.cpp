@@ -168,6 +168,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         RequestExecutor executor(4);
         EngineInfo info;
         info.max_requests = 4;
+        info.batch_capacity = info.max_requests;
         info.vocab_size = model.vocab_size();
         info.max_context = model.max_position_embeddings();
         std::map<std::string, std::vector<int64_t>> tokens;

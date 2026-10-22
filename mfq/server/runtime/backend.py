@@ -574,6 +574,7 @@ class OpenAIChatBackend:
             ),
             mtp_available=bool(payload.get("mtp_available", False)),
             duplex_available=payload.get("duplex_available") is True,
+            batch_capacity=max(1, int(payload.get("batch_capacity") or 1)),
         )
 
     @staticmethod

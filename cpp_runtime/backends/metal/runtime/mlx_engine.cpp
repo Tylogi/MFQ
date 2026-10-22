@@ -10,6 +10,7 @@ MlxEngine::MlxEngine(std::unique_ptr<MlxEngineModel> model,
       requests_(model_ ? model_->request_capacity() : 1) {
     if (!model_ || !text_) throw std::invalid_argument("Metal engine requires model and tokenizer");
     info_.max_requests = model_->request_capacity();
+    info_.batch_capacity = info_.max_requests;
     info_.chat = text_->chat_template_capabilities();
 }
 MlxEngine::~MlxEngine() { try { shutdown(); } catch (...) {} }

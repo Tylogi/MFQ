@@ -6952,6 +6952,12 @@
           "sampling": {
             "$ref": "#/components/schemas/SamplingParams"
           },
+          "server_queue_wait_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Server Queue Wait Ms",
+            "type": "number"
+          },
           "ttft_ms": {
             "minimum": 0.0,
             "title": "Ttft Ms",
@@ -7426,6 +7432,12 @@
       "RuntimeCapabilitiesResource": {
         "additionalProperties": false,
         "properties": {
+          "batch_capacity": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Batch Capacity",
+            "type": "integer"
+          },
           "duplex_available": {
             "default": false,
             "title": "Duplex Available",
@@ -7875,6 +7887,12 @@
             "title": "Active Sessions",
             "type": "integer"
           },
+          "batch_capacity": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Batch Capacity",
+            "type": "integer"
+          },
           "context_capacity": {
             "anyOf": [
               {
@@ -8020,9 +8038,33 @@
             "title": "Qsa Kv Offload Supported",
             "type": "boolean"
           },
+          "queue_wait_ms_avg": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Queue Wait Ms Avg",
+            "type": "number"
+          },
+          "queue_wait_ms_max": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Queue Wait Ms Max",
+            "type": "number"
+          },
           "queued_requests": {
             "minimum": 0.0,
             "title": "Queued Requests",
+            "type": "integer"
+          },
+          "rejected_requests": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Rejected Requests",
+            "type": "integer"
+          },
+          "request_capacity": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Request Capacity",
             "type": "integer"
           },
           "resident_bytes": {

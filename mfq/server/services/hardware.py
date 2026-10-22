@@ -8,11 +8,17 @@ import platform
 import plistlib
 import re
 import subprocess
+import time
 import psutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from xml.parsers.expat import ExpatError
+
+# NVML is initialized per uncached call; this bounds how often a polling client
+# can pay that cost.
+_GPU_STATUS_CACHE_SECONDS = 1.0
+_GPU_STATUS_CACHE: tuple[float, list[dict[str, Any]]] | None = None
 
 
 def _unified_gpu_name(name: str) -> bool:
@@ -172,11 +178,27 @@ def _nvidia_memory() -> tuple[GpuMemory, ...]:
         library.nvmlShutdown()
 
 
-def gpu_memory_status() -> list[dict[str, Any]]:
-    """Live NVML counters; CUDA worker ordinals are mapped separately by the pool."""
-    return [{"id": item.device_id or str(index), "name": item.name,
+def gpu_memory_status(*, refresh: bool = False) -> list[dict[str, Any]]:
+    """Live NVML counters; CUDA worker ordinals are mapped separately by the pool.
+
+    Studio and the runtime-status endpoint poll this every 0.5-5 s, and each
+    uncached call loads NVML, initializes it, reads every device and shuts it
+    down again. A short cache keeps that cost off the serving hot path; callers
+    that need a guaranteed-fresh reading pass ``refresh=True``.
+    """
+    global _GPU_STATUS_CACHE
+    now = time.monotonic()
+    if (
+        not refresh
+        and _GPU_STATUS_CACHE is not None
+        and now - _GPU_STATUS_CACHE[0] < _GPU_STATUS_CACHE_SECONDS
+    ):
+        return [dict(item) for item in _GPU_STATUS_CACHE[1]]
+    devices = [{"id": item.device_id or str(index), "name": item.name,
         "memory_total_bytes": item.capacity_bytes, "memory_available_bytes": item.available_bytes,
         "unified_memory": item.unified} for index, item in enumerate(_nvidia_memory())]
+    _GPU_STATUS_CACHE = (now, devices)
+    return [dict(item) for item in devices]
 
 
 def _amd_memory() -> tuple[GpuMemory, ...]:

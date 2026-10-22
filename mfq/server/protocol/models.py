@@ -384,6 +384,9 @@ class ResponsePerformance(ProtocolModel):
     generation_ms: float = Field(ge=0.0)
     complete_generation_ms: float = Field(default=0.0, ge=0.0)
     generation_tps: float = Field(ge=0.0)
+    # Time the request spent waiting for a runtime slot inside the server. It is
+    # separate from ttft_ms so queueing never hides native prefill latency.
+    server_queue_wait_ms: float = Field(default=0.0, ge=0.0)
     mtp_available: bool = False
     mtp_used: bool = False
     mtp_cycles: int = Field(default=0, ge=0)
@@ -845,6 +848,11 @@ class RuntimeInstanceResource(ProtocolModel):
     devices: list[str]
     active_sessions: int = Field(ge=0)
     queued_requests: int = Field(ge=0)
+    request_capacity: int = Field(default=1, ge=1)
+    batch_capacity: int = Field(default=1, ge=1)
+    queue_wait_ms_avg: float = Field(default=0.0, ge=0.0)
+    queue_wait_ms_max: float = Field(default=0.0, ge=0.0)
+    rejected_requests: int = Field(default=0, ge=0)
     resident_bytes: int | None = Field(default=None, ge=0)
     kv_bytes: int | None = Field(default=None, ge=0)
     memory: RuntimeMemoryResources | None = None
@@ -1374,6 +1382,9 @@ class RuntimeCapabilitiesResource(ProtocolModel):
     vision_available: bool = False
     mtp_available: bool = False
     duplex_available: bool = False
+    # Rows the worker can batch concurrently. The control plane adopts this
+    # report after load instead of assuming the requested concurrency.
+    batch_capacity: int = Field(default=1, ge=1)
 
 
 class OperationAccepted(ProtocolModel):
