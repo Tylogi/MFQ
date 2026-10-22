@@ -11,6 +11,11 @@ sorting or grouping rows. Inference reconstructs FP16 weights, accumulates in
 FP32, and accepts FP16 or BF16 activations. FFN uses two kernels, including
 intermediate activation rounding and memory traffic.
 
+For 1–4 bit fitting, the default search uses paired FP16 path costs, sampled
+scale trials and weighted row/subgroup scale refinement. It retains the full
+Trellis state space. `quantize(..., search="full")` uses the original FP32
+encoder and exhaustive scale trials. Both produce the same TQ format.
+
 ```python
 import numpy as np
 import torch
