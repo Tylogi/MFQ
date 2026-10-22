@@ -165,7 +165,7 @@ def run_model(runtime_path, model, args, env):
     try:
         runtime = RuntimeProcess(command, env, Path.cwd())
     except (RuntimeError, OSError) as error:
-        return {"model": str(model), "runs": [], "error": str(error)[:400]}
+        return {"model": Path(model).name, "runs": [], "error": str(error)[:400]}
     runs = []
     for length in args.prefill_lengths:
         for mode in ("decode", "mtp") if args.mtp else ("decode",):
@@ -185,7 +185,7 @@ def run_model(runtime_path, model, args, env):
                     entry["detail"] = result.get("detail") or " | ".join(result.get("tail", []))
                     break
     runtime.close()
-    return {"model": str(model), "runs": runs, "error": None}
+    return {"model": Path(model).name, "runs": runs, "error": None}
 
 
 def summarize(report):
@@ -276,7 +276,7 @@ def main():
         report.append(run_model(runtime_path, model, args, env))
 
     document = {
-        "runtime": str(runtime_path),
+        "runtime": runtime_path.name,
         "prefill_lengths": args.prefill_lengths,
         "decode_tokens": args.decode_tokens,
         "repetitions": args.repetitions,
