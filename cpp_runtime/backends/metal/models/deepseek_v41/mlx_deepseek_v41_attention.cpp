@@ -1,6 +1,7 @@
 #include "mlx_deepseek_v41_attention.h"
 
 #include "mlx_dsa.h"
+#include "mlx_dsa_cache_ops.h"
 #include "mlx_csa2.h"
 #include "mlx_detached_copy.h"
 #include "mlx_mx.h"
@@ -780,21 +781,15 @@ std::vector<array> MlxDeepseekV41Attention::rollback_speculative(
         }
         *state.partial_kv = std::move(*transaction->partial_kv_backup);
         *state.partial_score = std::move(*transaction->partial_score_backup);
-        for (int token = 0; token < keep; ++token) {
-            const int slot =
-                (transaction->start_position + token) % ratio_;
-            auto row = mlx::core::full(
-                Shape{batch, 1}, slot, mlx::core::int32);
-            *state.partial_kv = mlx_cache_write_inplace(
-                *state.partial_kv,
-                slice_axis(
-                    *transaction->projected_kv, 1, token, token + 1),
-                row);
-            *state.partial_score = mlx_cache_write_inplace(
-                *state.partial_score,
-                slice_axis(
-                    *transaction->projected_score, 1, token, token + 1),
-                row);
+        if (keep > 0) {
+            auto restored = mlx_dsa_compress_window(
+                slice_axis(*transaction->projected_kv, 1, 0, keep),
+                slice_axis(*transaction->projected_score, 1, 0, keep),
+                *state.partial_kv, *state.partial_score,
+                *components_.compressor_norm, transaction->partial_length,
+                mlx::core::float32, static_cast<float>(config_.rms_eps));
+            *state.partial_kv = std::move(restored.partial_kv);
+            *state.partial_score = std::move(restored.partial_score);
         }
         state.partial_length =
             (transaction->partial_length + keep) % ratio_;
@@ -900,10 +895,8 @@ array MlxDeepseekV41Attention::forward(
         }
         std::optional<array> latent;
         if (ratio_ == 1) {
-            latent = weighted_rms(
-                *compressor_key_value,
-                *components_.compressor_norm,
-                eps);
+            latent = packed ? *compressor_key_value : weighted_rms(
+                *compressor_key_value, *components_.compressor_norm, eps);
         } else {
             if (!components_.compressor_gate || !state.partial_kv ||
                 !state.partial_score) {
@@ -918,69 +911,13 @@ array MlxDeepseekV41Attention::forward(
                 state.speculation->projected_kv = projected_kv;
                 state.speculation->projected_score = projected_score;
             }
-            std::vector<array> emitted;
-            if (state.partial_length == 0 && pos0 % ratio_ == 0) {
-                const int complete = tokens / ratio_;
-                const int cutoff = complete * ratio_;
-                if (complete > 0) {
-                    auto kv_groups = mlx::core::reshape(
-                        slice_axis(projected_kv, 1, 0, cutoff),
-                        Shape{batch, complete, ratio_, head_dim});
-                    auto score_groups = mlx::core::reshape(
-                        slice_axis(projected_score, 1, 0, cutoff),
-                        Shape{batch, complete, ratio_, head_dim});
-                    auto pooled = mlx::core::sum(
-                        kv_groups * mlx::core::softmax(score_groups, 2, true), 2);
-                    emitted.push_back(weighted_rms(
-                        mlx::core::astype(pooled, input.dtype()),
-                        *components_.compressor_norm,
-                        eps));
-                }
-                const int remainder = tokens - cutoff;
-                if (remainder > 0) {
-                    auto rows = repeated_rows(batch, 0, remainder);
-                    *state.partial_kv = mlx_cache_write_inplace(
-                        *state.partial_kv,
-                        slice_axis(projected_kv, 1, cutoff, tokens),
-                        rows);
-                    *state.partial_score = mlx_cache_write_inplace(
-                        *state.partial_score,
-                        slice_axis(projected_score, 1, cutoff, tokens),
-                        rows);
-                }
-                state.partial_length = remainder;
-            } else {
-                for (int token = 0; token < tokens; ++token) {
-                    const int slot = (pos0 + token) % ratio_;
-                    auto row = mlx::core::full(
-                        Shape{batch, 1}, slot, mlx::core::int32);
-                    *state.partial_kv = mlx_cache_write_inplace(
-                        *state.partial_kv,
-                        slice_axis(projected_kv, 1, token, token + 1),
-                        row);
-                    *state.partial_score = mlx_cache_write_inplace(
-                        *state.partial_score,
-                        slice_axis(projected_score, 1, token, token + 1),
-                        row);
-                    if (slot + 1 == ratio_) {
-                        auto pooled = mlx::core::sum(
-                            *state.partial_kv *
-                                mlx::core::softmax(*state.partial_score, 1, true),
-                            1,
-                            true);
-                        emitted.push_back(weighted_rms(
-                            mlx::core::astype(pooled, input.dtype()),
-                            *components_.compressor_norm,
-                            eps));
-                    }
-                }
-                state.partial_length = (pos0 + tokens) % ratio_;
-            }
-            if (!emitted.empty()) {
-                latent = emitted.size() == 1
-                    ? std::move(emitted.front())
-                    : mlx::core::concatenate(std::move(emitted), 1);
-            }
+            auto compressed = mlx_dsa_compress_window(projected_kv, projected_score,
+                *state.partial_kv, *state.partial_score, *components_.compressor_norm,
+                state.partial_length, input.dtype(), eps);
+            *state.partial_kv = std::move(compressed.partial_kv);
+            *state.partial_score = std::move(compressed.partial_score);
+            state.partial_length = (state.partial_length + tokens) % ratio_;
+            if (compressed.latent.shape(1) > 0) latent = std::move(compressed.latent);
         }
 
         if (latent) {
@@ -1004,23 +941,31 @@ array MlxDeepseekV41Attention::forward(
             auto group_cosine = mlx::core::take(rope_.first, group_positions, 0);
             auto group_sine = mlx::core::take(rope_.second, group_positions, 0);
 
-            auto index_key = weighted_rms(
-                (*components_.index_key)(*latent),
-                *components_.index_key_norm,
-                eps);
-            index_key = rope_tail(
-                index_key, rotary, group_cosine, group_sine);
-            index_key = packed ? mlx_csa2_pack(index_key, 4, 32) : mlx_mxfp4_sim(index_key);
             auto cache_rows = repeated_rows(batch, begin, count);
-            *state.index_k = mlx_cache_write_inplace(
-                *state.index_k, index_key, cache_rows);
-
-            auto compressed = rope_tail(
-                *latent, rotary, group_cosine, group_sine);
-            compressed = packed ? mlx_csa2_pack(compressed, 4, 16, true)
-                : mlx_mxfp4_e4m3_scale_sim(compressed);
-            *state.compressed_kv = mlx_cache_write_inplace(
-                *state.compressed_kv, compressed, cache_rows);
+            if (packed) {
+                if (ratio_ == 1) {
+                    auto update = mlx_dsa_norm_rope_pack_store(*state.compressed_kv,
+                        *latent, *components_.compressor_norm, group_cosine, group_sine,
+                        begin, rotary, 16, true, eps, true, true);
+                    *state.compressed_kv = std::move(update.cache);
+                    latent = std::move(update.normalized);
+                } else {
+                    *state.compressed_kv = mlx_dsa_norm_rope_pack_store(*state.compressed_kv,
+                        *latent, *components_.compressor_norm, group_cosine, group_sine,
+                        begin, rotary, 16, true, eps, false).cache;
+                }
+                *state.index_k = mlx_dsa_norm_rope_pack_store(*state.index_k,
+                    (*components_.index_key)(*latent), *components_.index_key_norm,
+                    group_cosine, group_sine, begin, rotary, 32, false, eps, true).cache;
+            } else {
+                auto index_key = weighted_rms((*components_.index_key)(*latent),
+                    *components_.index_key_norm, eps);
+                index_key = mlx_mxfp4_sim(rope_tail(index_key, rotary, group_cosine, group_sine));
+                *state.index_k = mlx_cache_write_inplace(*state.index_k, index_key, cache_rows);
+                auto compressed = mlx_mxfp4_e4m3_scale_sim(
+                    rope_tail(*latent, rotary, group_cosine, group_sine));
+                *state.compressed_kv = mlx_cache_write_inplace(*state.compressed_kv, compressed, cache_rows);
+            }
             state.compressed_length += count;
         }
         shared.compressed_kv = *state.compressed_kv;

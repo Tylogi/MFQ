@@ -16,6 +16,12 @@
 
 namespace mfq::metal {
 
+mlx::core::array deepseek_v41_engram_gate(
+    const mlx::core::array& hidden, const mlx::core::array& key_value,
+    const mlx::core::array& weight,
+    const std::optional<mlx::core::array>& participation_mask,
+    float eps);
+
 // Hashes are stored layer-major so each Engram layer receives one contiguous
 // [batch,tokens,hash-columns] view without copying.
 struct DeepseekV41EngramHashBatch {

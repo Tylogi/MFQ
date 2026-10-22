@@ -49,6 +49,19 @@ mlx::core::array deepseek_v41_hc_post_sum(
     const mlx::core::array& post,
     const mlx::core::array& combination);
 
+struct MlxDeepseekV41HcPostPreResult {
+    mlx::core::array residual;
+    mlx::core::array branch;
+};
+
+MlxDeepseekV41HcPostPreResult deepseek_v41_hc_post_collapse_norm(
+    const mlx::core::array& branch,
+    const mlx::core::array& residual,
+    const MlxDeepseekV41HcMetadataResult& expansion,
+    const mlx::core::array& previous_pre,
+    const mlx::core::array& norm,
+    float eps);
+
 struct MlxDeepseekV41MhcResult {
     mlx::core::array branch;
     mlx::core::array next_pre;
@@ -69,6 +82,13 @@ public:
         const mlx::core::array& residual,
         const mlx::core::array& previous_pre) const;
 
+    MlxDeepseekV41MhcResult collapse_after(
+        const mlx::core::array& branch,
+        const mlx::core::array& residual,
+        const MlxDeepseekV41HcMetadataResult& expansion,
+        const mlx::core::array& previous_pre,
+        mlx::core::array& expanded) const;
+
     mlx::core::array expand(
         const mlx::core::array& branch,
         const mlx::core::array& residual,
@@ -84,6 +104,9 @@ public:
         int tokens);
 
 private:
+    MlxDeepseekV41HcMetadataResult metadata(
+        const mlx::core::array& residual) const;
+
     MlxDeepseekV41Mhc(
         DeepseekV41Config config,
         MlxLinear function,

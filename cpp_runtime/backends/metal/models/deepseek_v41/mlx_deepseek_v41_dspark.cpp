@@ -537,13 +537,11 @@ struct MlxDeepseekV41DSpark::Impl {
         auto residual = hidden;
         auto attention_mix = stage.attention_mhc.collapse(
             residual, previous_pre);
-        auto result = stage.attention_mhc.expand(
-            attention(attention_mix.branch, stage, ring, position),
-            residual,
-            attention_mix.expansion);
+        auto attention_branch = attention(attention_mix.branch, stage, ring, position);
+        auto result = residual;
+        auto ffn_mix = stage.ffn_mhc.collapse_after(attention_branch, residual,
+            attention_mix.expansion, attention_mix.next_pre, result);
         residual = result;
-        auto ffn_mix = stage.ffn_mhc.collapse(
-            residual, attention_mix.next_pre);
         auto ffn_branches = stage.moe.forward(ffn_mix.branch);
         result = stage.ffn_mhc.expand_sum(
             ffn_branches.routed,
