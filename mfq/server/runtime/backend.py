@@ -174,6 +174,15 @@ class OpenAIChatBackend:
         self._local_tensor_files = local_tensor_files and os.name in {"posix", "nt"}
         self._runtime_metric_overrides: dict[str, dict[str, float]] = {}
 
+    async def count_tokens(self, prompt: str) -> dict[str, Any]:
+        result = await self._runtime.count_tokens({"prompt": prompt})
+        if not isinstance(result, dict) or result.get("tokenization") != "raw-no-special-tokens":
+            raise BackendProtocolError("invalid native token count response")
+        for key in ("prompt_tokens", "context_size"):
+            if type(result.get(key)) is not int or result[key] < 1:
+                raise BackendProtocolError(f"invalid native {key}")
+        return result
+
     async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
         import math
         result = await self._runtime.score(payload)

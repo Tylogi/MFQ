@@ -564,6 +564,12 @@ InferenceRequest TextProcessor::prepare(
     return work;
 }
 
+std::size_t TextProcessor::count_tokens(const std::string& prompt) const {
+    if (prompt.empty() || prompt.size() > 262144)
+        throw std::invalid_argument("token count requires a nonempty prompt of at most 262144 bytes");
+    return impl_->tokenizer->tokenize(prompt, false, false).size();
+}
+
 const MfqTokenizer& TextProcessor::tokenizer() const {
     return *impl_->tokenizer;
 }

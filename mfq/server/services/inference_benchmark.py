@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mfq.evaluation.inference import BenchmarkValidationError, validate_benchmark_result
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.services.jobs import JobContext, JobExecutionError
 
@@ -57,30 +57,10 @@ def _failure(code: str, message: str) -> JobExecutionError:
 
 
 def validate_benchmark_run(result: dict[str, Any], request: InferenceBenchmarkPayload, mode: str) -> dict[str, Any]:
-    metrics, usage = result["metrics"], result["usage"]
-    required = ("prefill_tokens", "prefill_ms", "decode_ms", "ttft_ms", "mtp_drafted_tokens", "mtp_accepted_tokens")
-    values = {key: metrics.get(key, 0) for key in required}
-    for key, value in values.items():
-        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-            raise _failure("invalid_benchmark_metrics", f"invalid native {key}")
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    if prompt_tokens != request.prompt_tokens or values["prefill_tokens"] != request.prompt_tokens:
-        raise _failure("benchmark_prefix_reused", "native input sizing or cache bypass was not applied; refusing this timing")
-    if not isinstance(completion_tokens, int) or not 1 <= completion_tokens <= request.output_tokens:
-        raise _failure("invalid_benchmark_metrics", "invalid completion token count")
-    if values["prefill_ms"] <= 0 or (completion_tokens > 1 and values["decode_ms"] <= 0):
-        raise _failure("invalid_benchmark_metrics", "native timing interval is empty")
-    if values["mtp_accepted_tokens"] > values["mtp_drafted_tokens"]:
-        raise _failure("invalid_benchmark_metrics", "accepted MTP tokens exceed drafted tokens")
-    mtp_used = bool(metrics.get("mtp_used"))
-    if mode == "decode" and mtp_used:
-        raise _failure("benchmark_mode_mismatch", "ordinary decode unexpectedly used MTP")
-    if mode == "mtp" and not mtp_used:
-        raise _failure("mtp_not_used", "MTP was requested but did not execute; refusing to label ordinary decode as MTP")
-    return {"mode": mode, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-        "decode_tokens": max(0, completion_tokens - 1), "finish_reason": result.get("finish_reason"),
-        "metrics": metrics}
+    try:
+        return validate_benchmark_result(result, request.prompt_tokens, request.output_tokens, mode)
+    except BenchmarkValidationError as error:
+        raise _failure(error.code, str(error)) from error
 
 
 def aggregate_benchmark_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:

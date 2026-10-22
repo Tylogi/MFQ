@@ -66,6 +66,16 @@ int main() try {
     using namespace mfq::engine;
     TokenizerFixture fixture;
     TextProcessor processor(fixture.path.string(), fixture.vocabulary, "deepseek_v41");
+    for (const auto& prompt : std::vector<std::string>{"abc", "<s>abc</s>", std::string(4096, 'a')})
+        require(processor.count_tokens(prompt) == processor.tokenizer().tokenize(prompt, false, false).size(),
+            "token count differs from raw scoring tokenization");
+    require(processor.count_tokens("<s>") > 1, "token count parsed a special token");
+    for (const std::string prompt : {std::string(), std::string(262145, 'a')}) {
+        bool rejected = false;
+        try { (void)processor.count_tokens(prompt); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "token count accepted an unbounded prompt");
+    }
     for (int images : {0, 1, 2}) for (bool enabled : {false, true}) {
         InferenceInput input;
         input.chat = true;

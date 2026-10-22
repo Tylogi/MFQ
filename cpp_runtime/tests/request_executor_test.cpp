@@ -134,6 +134,7 @@ static void check_engine_lifecycle() {
     assert(first.session({SessionCommand::Kind::metrics}).metrics == Metrics({{"sessions", 0}}));
     assert(std::get<Metrics>(first.control(RuntimeMetrics{})) == Metrics({{"advances", 0}}));
     rejects([&] { first.control(DecodeTokens{{1, 2}, {}}); });
+    rejects([&] { first.control(CountTokens{"prompt"}); });
     assert(first.info().max_context == 32 && second.info().max_context == 64);
     assert(first.admit(request()) == Admission::accepted);
     first.step({"one"});

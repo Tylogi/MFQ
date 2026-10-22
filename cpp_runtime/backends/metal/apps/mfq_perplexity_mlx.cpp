@@ -6,6 +6,7 @@
 #include "qwen35_model.h"
 
 #include "transport.h"
+#include "tokenizer_identity.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -437,6 +438,15 @@ std::string sha256_bytes(const void* data, std::size_t size) {
     return hex_digest(digest, sizeof(digest));
 }
 
+std::string tokenizer_mapping_sha256(
+    const Arguments& arguments, const mfq::metal::MfqContainer& model) {
+    const auto tokenizer = arguments.tokenizer_gguf.empty()
+        ? std::make_unique<mfq::engine::MfqTokenizer>(model.read(kTokenizerAsset))
+        : std::make_unique<mfq::engine::MfqTokenizer>(arguments.tokenizer_gguf.string());
+    const auto bytes = mfq::engine::tokenizer_identity_bytes(*tokenizer);
+    return sha256_bytes(bytes.data(), bytes.size());
+}
+
 std::string sha256_file(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
@@ -703,7 +713,8 @@ KlReference load_kl_reference(
 
 ReferenceContract load_reference_contract(
     const Arguments& arguments,
-    const KlReference& reference) {
+    const KlReference& reference,
+    const std::string& candidate_tokenizer_identity) {
     ReferenceContract contract;
     contract.path = arguments.kl_manifest.empty()
         ? default_manifest_path(arguments.kl_base)
@@ -826,7 +837,13 @@ ReferenceContract load_reference_contract(
             throw std::runtime_error(
                 "logits manifest/reference token SHA-256 mismatch");
         }
-        if (document.at("tokenizer").at("vocab_size").get<int>() !=
+        const auto& tokenizer = document.at("tokenizer");
+        const auto identity = tokenizer.value("identity", json::object());
+        mfq::validate_tokenizer_identity(
+            identity.value("format", std::string()),
+            identity.value("sha256", std::string()),
+            candidate_tokenizer_identity);
+        if (tokenizer.at("vocab_size").get<int>() !=
             reference.vocabulary) {
             throw std::runtime_error(
                 "logits manifest/reference vocabulary mismatch");
@@ -1350,6 +1367,10 @@ void write_logits_manifest(
         }},
         {"tokenizer", {
             {"source", tokenizer_source},
+            {"identity", {
+                {"format", mfq::tokenizer_identity_format},
+                {"sha256", tokenizer_mapping_sha256(arguments, model)},
+            }},
             {"vocab_size", tokenizer.vocab_size},
             {"bos_token", tokenizer.bos_token},
             {"eos_token", tokenizer.eos_token},
@@ -1958,7 +1979,8 @@ int run_kl(
     }
     const auto contract = load_reference_contract(
         arguments,
-        reference);
+        reference,
+        tokenizer_mapping_sha256(arguments, model));
     const int context = contract.n_ctx;
     const int score_count = contract.score_count;
     const int parallel = contract.n_seq;

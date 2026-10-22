@@ -96,6 +96,8 @@ int main() {
             loaded->control(StopDuplex{});
             require(loaded->status().available == 1, "duplex release");
             require(std::get<std::string>(loaded->control(DecodeTokens{{0, 1}, {}})) == "ab", "text control");
+            const auto count = std::get<TokenCount>(loaded->control(CountTokens{"abab"}));
+            require(count.prompt_tokens == 4 && count.context_size == loaded->info().max_context, "raw token count control");
         }
         for (bool cleanup_failure : {false, true}) {
             auto model = std::make_unique<FakeModel>();

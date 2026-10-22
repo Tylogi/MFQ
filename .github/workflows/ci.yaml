@@ -24,7 +24,7 @@ jobs:
         run: >-
           cmake -S cpp_runtime -B build/linux-core -DCMAKE_BUILD_TYPE=Release
           -DMFQ_BUILD_CUDA_RUNTIME=OFF -DMFQ_BUILD_HIP_RUNTIME=OFF
-          -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_BUILD_RUNTIME_COMMUNICATION=OFF
+          -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_BUILD_RUNTIME_COMMUNICATION=ON
           -DBUILD_TESTING=ON
       - name: Build storage and cache regression tests
         run: >-
@@ -35,10 +35,31 @@ jobs:
           mfq-nemotron-vision-config-test mfq-nemotron-vision-geometry-test
           mfq-deepseek-v41-vision-layout-test
           mfq-prefill-budget-test
+          mfq-benchmark-validation-test mfq-tokenizer-identity-test
+          mfq-text-processor-test mfq-request-executor-test mfq-runtime-transport-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout|prefill-budget)-test$'
+          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout|prefill-budget|benchmark-validation|tokenizer-identity|text-processor|request-executor|runtime-transport)-test$'
+
+  benchmark-regressions:
+    name: Benchmark regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: Sync benchmark test dependencies
+        run: uv sync --extra benchmark --extra dev --python 3.11
+      - name: Check benchmark validation and evaluation contracts
+        run: >-
+          uv run python -m pytest -q
+          tests/test_model_bench.py tests/test_inference_benchmark.py
+          tests/test_mmlu_prompt_sizing.py tests/test_accuracy_benchmark.py
+          tests/test_probability_scoring.py tests/test_official_evaluation_datasets.py
+          tests/test_server_evaluations.py tests/test_scoring_sandbox.py
+          tests/test_tokenizer_identity.py tests/test_wt2_reference.py
+          tests/test_native_wt2_reference.py tests/test_wikitext_quality_jobs.py
 
   macos-metal:
     name: macOS Metal
@@ -53,6 +74,17 @@ jobs:
 
       - name: Build
         run: uv run mfq build
+
+      - name: Build quality and benchmark paths
+        run: >-
+          cmake --build build/cpp_runtime --target mfq-perplexity
+          mfq-metal-dense-smallm-benchmark mfq-metal-engine-test
+      - name: Check Metal runtime controls
+        run: ctest --test-dir build/cpp_runtime --output-on-failure -R '^mfq-metal-engine-test$'
+      - name: Check evaluator tokenizer contracts
+        env:
+          MFQ_METAL_PERPLEXITY_TEST: build/cpp_runtime/metal/mfq-perplexity
+        run: uv run --with pytest python -m pytest tests/test_tokenizer_identity_cli.py -q
 
       - name: Check text prefill chunking
         run: |

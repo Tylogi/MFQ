@@ -8,6 +8,9 @@ released MFQ weights supplied by the caller; weights are not distributed.
 `cases.example.tsv` lists representative S2-L and V4-XS formats and shapes.
 Copy it to a local manifest and set its model column to the first MFQ shard
 of each checkpoint. Pass that manifest explicitly to the format runners.
+Each label and shape pair must be unique. Use distinct labels when comparing
+the same format and shape from different checkpoints, tensors, or experts.
+The runners reject duplicate fixture keys before exporting weights.
 
 ```sh
 cmake --build build/cuda --target mfq-cuda-format-bench mfq-cuda-format-moe-bench mfq-cuda-real-mfe-bench

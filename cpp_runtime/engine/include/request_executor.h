@@ -211,11 +211,13 @@ template <class Backend> class EngineInstance final : public Engine {
         if (!loaded_) throw std::runtime_error("engine is unloaded");
         return std::visit([&](auto&& value) -> ControlResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, DecodeTokens> ||
+            if constexpr (std::is_same_v<T, DecodeTokens> || std::is_same_v<T, CountTokens> ||
                           std::is_same_v<T, PrepareDuplex> || std::is_same_v<T, PrepareDuplexStep>) {
                 if (!text_) throw std::invalid_argument("text control requires a tokenizer");
                 if constexpr (std::is_same_v<T, DecodeTokens>)
                     return text_->decode_tokens(value.tokens, value.excluded);
+                else if constexpr (std::is_same_v<T, CountTokens>)
+                    return TokenCount{text_->count_tokens(value.prompt), info_.max_context};
                 else if constexpr (std::is_same_v<T, PrepareDuplex>) {
                     text_->prepare_duplex_session(value.prompt, value.parameters);
                     return std::move(value.parameters);

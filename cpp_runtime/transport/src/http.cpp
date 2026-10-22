@@ -845,6 +845,16 @@ int run_mfq_http_transport(
         });
     });
 
+    server.Post("/runtime/count_tokens", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!authorized(req, res, config.api_key)) return;
+        try {
+            set_json(res, token_count_json(std::get<mfq::engine::TokenCount>(
+                scheduler.control(parse_token_count_request(parse_body(req))))));
+        } catch (const ApiError& error) { handle_api_error(res, error); }
+        catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
+        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+    });
+
     server.Post("/runtime/score", [&](const httplib::Request& req, httplib::Response& res) {
         if (!authorized(req, res, config.api_key)) return;
         try {
