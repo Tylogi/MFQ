@@ -455,6 +455,135 @@ mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_
     return attention_impl_cuda(q, k, v, scale, true, (int)window);
 }
 
+__device__ __forceinline__ int attention_decode_active_parts(
+    int token_count, int launch_parts, int dynamic_parts)
+{
+    if (!dynamic_parts) {
+        return launch_parts;
+    }
+    const int cache_position = token_count > 0 ? token_count - 1 : 0;
+    if (cache_position < 192) {
+        return 1;
+    }
+    const int active = (cache_position + 127) / 128;
+    return active < launch_parts ? active : launch_parts;
+}
+
+template <int D, typename scalar_t, bool Split>
+__global__ void __launch_bounds__(64) attention_cache_decode_wave_kernel(
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v, const int64_t* __restrict__ seq_len,
+    scalar_t* __restrict__ out, float* __restrict__ partial_o,
+    float* __restrict__ partial_m, float* __restrict__ partial_l,
+    int Hq, int Hk, int max_seq, int parts, int workspace_parts,
+    float scale, int dynamic_parts)
+{
+    const int Wave = warpSize;
+    constexpr int Columns = 16;
+    const int Tokens = Wave / Columns;
+    const int lane = threadIdx.x;
+    if (lane >= Wave) return;
+    const int column = lane % Columns, token_lane = lane / Columns;
+    const int part = blockIdx.x % parts, qv = blockIdx.x / parts;
+    const int b = qv / Hq, hk = (qv % Hq) / (Hq / Hk);
+    const int count = static_cast<int>(seq_len[b]);
+    const int length = max(0, min(count, max_seq));
+    const int active = attention_decode_active_parts(length, parts, dynamic_parts);
+    const size_t stat = size_t(qv) * workspace_parts + part;
+    if (part >= active) {
+        if constexpr (Split) {
+#pragma unroll
+            for (int i = 0; i < D / Columns; ++i)
+                if (token_lane == 0) partial_o[stat * D + column + i * Columns] = 0.f;
+            if (lane == 0) { partial_m[stat] = -1e30f; partial_l[stat] = 0.f; }
+        }
+        return;
+    }
+    const int begin = int(int64_t(length) * part / active);
+    const int end = int(int64_t(length) * (part + 1) / active);
+    float query[D / Columns], output[D / Columns];
+#pragma unroll
+    for (int i = 0; i < D / Columns; ++i) {
+        query[i] = float(q[size_t(qv) * D + column + i * Columns]);
+        output[i] = 0.f;
+    }
+    float maximum = -1e30f, denominator = 0.f;
+    const size_t base = size_t(b * Hk + hk) * max_seq * D;
+    for (int tile = begin; tile < end; tile += Tokens) {
+        const int token = tile + token_lane;
+        const size_t index = base + size_t(min(token, end - 1)) * D + column;
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < D / Columns; ++i)
+            dot += query[i] * float(k[index + i * Columns]);
+#pragma unroll
+        for (int offset = Columns / 2; offset > 0; offset >>= 1)
+            dot += __shfl_xor(dot, offset, Columns);
+        const float score = token < end ? dot * scale : -1e30f;
+        float tile_maximum = score;
+#pragma unroll
+        for (int offset = Columns; offset < Wave; offset <<= 1)
+            tile_maximum = fmaxf(tile_maximum, __shfl_xor(tile_maximum, offset, Wave));
+        const float next = fmaxf(maximum, tile_maximum);
+        const float correction = expf(maximum - next);
+        const float probability = token < end ? expf(score - next) : 0.f;
+        float tile_sum = probability;
+#pragma unroll
+        for (int offset = Columns; offset < Wave; offset <<= 1)
+            tile_sum += __shfl_xor(tile_sum, offset, Wave);
+#pragma unroll
+        for (int i = 0; i < D / Columns; ++i) {
+            const float value = float(v[index + i * Columns]);
+            output[i] = output[i] * correction + probability * value;
+        }
+        denominator = denominator * correction + tile_sum;
+        maximum = next;
+    }
+#pragma unroll
+    for (int i = 0; i < D / Columns; ++i) {
+        float value = output[i];
+#pragma unroll
+        for (int offset = Columns; offset < Wave; offset <<= 1)
+            value += __shfl_xor(value, offset, Wave);
+        if (token_lane == 0) {
+            if constexpr (Split) partial_o[stat * D + column + i * Columns] = value;
+            else out[size_t(qv) * D + column + i * Columns] =
+                scalar_t(value / (denominator > 0.f ? denominator : 1.f));
+        }
+    }
+    if constexpr (Split) {
+        if (lane == 0) { partial_m[stat] = maximum; partial_l[stat] = denominator; }
+    }
+}
+
+static bool attention_wave_decode_enabled(int dimension)
+{
+    const char* flag = std::getenv("MFQ_HIP_ATTENTION_WAVE");
+    return (dimension == 64 || dimension == 128 || dimension == 256 || dimension == 512) &&
+           !(flag && flag[0] == '0');
+}
+
+template <typename scalar_t, bool Split>
+static void launch_attention_wave_decode(
+    const mfq_tensor_backend::Tensor& q, const mfq_tensor_backend::Tensor& k,
+    const mfq_tensor_backend::Tensor& v, const mfq_tensor_backend::Tensor& lengths,
+    scalar_t* output, float* partial_o, float* partial_m, float* partial_l,
+    int parts, int workspace_parts, float scale, int dynamic_parts, hipStream_t stream)
+{
+#define WAVE_DECODE(D) hipLaunchKernelGGL((attention_cache_decode_wave_kernel<D, scalar_t, Split>), \
+    dim3(q.size(0) * q.size(1) * parts), dim3(64), 0, stream, \
+    q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), \
+    lengths.data_ptr<int64_t>(), output, partial_o, partial_m, partial_l, \
+    int(q.size(1)), int(k.size(1)), int(k.size(2)), parts, workspace_parts, scale, dynamic_parts)
+    switch (q.size(3)) {
+        case 64: WAVE_DECODE(64); break;
+        case 128: WAVE_DECODE(128); break;
+        case 256: WAVE_DECODE(256); break;
+        case 512: WAVE_DECODE(512); break;
+    }
+#undef WAVE_DECODE
+}
+
 template <int BD, typename scalar_t>
 __global__ void attention_cache_decode_kernel(
     const scalar_t* __restrict__ q,
@@ -547,6 +676,18 @@ static mfq_tensor_backend::Tensor attention_cache_decode_impl_cuda(
     int rep = Hq / Hk;
     auto out = mfq_tensor_backend::empty_like(q);
     int total = B * Hq;
+    if (attention_wave_decode_enabled(D) && maximum_cache_position < 0) {
+        MFQ_DISPATCH_FLOATING_TYPES_AND2(
+            mfq_dispatch_half, mfq_dispatch_bfloat16,
+            q.scalar_type(), "attention_cache_decode_wave", [&] {
+                launch_attention_wave_decode<scalar_t, false>(
+                    q, k_cache, v_cache, seq_len, out.data_ptr<scalar_t>(),
+                    nullptr, nullptr, nullptr, 1, 1, float(scale), 0,
+                    mfq_current_cuda_stream());
+            });
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
     int shmem = D * (int)sizeof(float);
     hipStream_t stream = mfq_current_cuda_stream();
 #define ATT_CACHE(BD)hipLaunchKernelGGL(( attention_cache_decode_kernel<BD, scalar_t>), dim3(total), dim3(BD), shmem, stream,  \
@@ -564,20 +705,6 @@ static mfq_tensor_backend::Tensor attention_cache_decode_impl_cuda(
     });
 #undef ATT_CACHE
     return out;
-}
-
-__device__ __forceinline__ int attention_decode_active_parts(
-    int token_count, int launch_parts, int dynamic_parts)
-{
-    if (!dynamic_parts) {
-        return launch_parts;
-    }
-    const int cache_position = token_count > 0 ? token_count - 1 : 0;
-    if (cache_position < 192) {
-        return 1;
-    }
-    const int active = (cache_position + 127) / 128;
-    return active < launch_parts ? active : launch_parts;
 }
 
 template <int BD, typename scalar_t>
@@ -842,8 +969,13 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     const int shmem = D * (int)sizeof(float);
     const int rep = Hq / Hk;
     hipStream_t stream = mfq_current_cuda_stream();
+    const bool wave_decode = attention_wave_decode_enabled(D);
 #define ATT_CACHE_SPLIT(BD) do {                                                                    \
-    if (D == 128 && rep == 4) {                                                                       \
+    if (wave_decode) {                                                                               \
+        launch_attention_wave_decode<scalar_t, true>(q, k_cache, v_cache, seq_len, nullptr,            \
+            partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),    \
+            int(parts), workspace_parts, float(scale), dynamic_parts ? 1 : 0, stream);                \
+    } else if (D == 128 && rep == 4) {                                                                       \
        hipLaunchKernelGGL(( attention_cache_decode_split_gqa4_d128_part_kernel<scalar_t>)                                 \
             , dim3(B * Hk * (int)parts), dim3(128), 0, stream,                                                \
                 q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(),                                 \
