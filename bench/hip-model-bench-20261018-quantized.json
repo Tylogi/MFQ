@@ -15,7 +15,7 @@
   },
   "results": [
     {
-      "model": "/root/qwen35-0.8b-s4m.mfq",
+      "model": "qwen35-0.8b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
@@ -309,7 +309,7 @@
       "error": null
     },
     {
-      "model": "/root/qwen35-2b-s4m.mfq",
+      "model": "qwen35-2b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
@@ -603,7 +603,7 @@
       "error": null
     },
     {
-      "model": "/root/qwen35-4b-s4m.mfq",
+      "model": "qwen35-4b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
@@ -897,7 +897,7 @@
       "error": null
     },
     {
-      "model": "/root/qwen35-9b-s4m.mfq",
+      "model": "qwen35-9b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
@@ -1191,7 +1191,7 @@
       "error": null
     },
     {
-      "model": "/root/qwen35-27b-s4m.mfq",
+      "model": "qwen35-27b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
@@ -1485,7 +1485,7 @@
       "error": null
     },
     {
-      "model": "/root/qwen38-27b-s4m.mfq",
+      "model": "qwen38-27b-s4m.mfq",
       "runs": [
         {
           "prompt_tokens_requested": 32,
