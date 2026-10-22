@@ -368,6 +368,59 @@ const mlx::core::fast::CustomKernelFunction& metadata_exact_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction& post_collapse_kernel() {
+    static const auto kernel = make_kernel("mfq_dsv41_hc_post_collapse_norm",
+        {"residual", "branch", "post", "combination", "pre", "norm", "params"},
+        {"expanded", "normalized"}, R"MSL(
+        const uint row = threadgroup_position_in_grid.x;
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd = simdgroup_index_in_threadgroup;
+        threadgroup volatile T collapsed[HIDDEN];
+        threadgroup float partial[32];
+        threadgroup float inverse;
+        float square = 0.0f;
+        for (uint offset = 0u; offset < HIDDEN; offset += 4096u) {
+            for (uint local = 0u; local < 4u; ++local) {
+                const uint d = tid * 4u + offset + local;
+                if (d < HIDDEN) {
+                    float x[4];
+                    const float v = float(branch[row * HIDDEN + d]);
+                    for (uint dest = 0u; dest < 4u; ++dest) {
+                        float products[4];
+                        for (uint source = 0u; source < 4u; ++source)
+                            products[source] = combination[(row * 4u + source) * 4u + dest]
+                                * float(residual[(row * 4u + source) * HIDDEN + d]);
+                        const float sum = ((products[0] + products[1]) + products[2]) + products[3];
+                        const float direct = post[row * 4u + dest] * v;
+                        const T value = T(direct + sum);
+                        expanded[(row * 4u + dest) * HIDDEN + d] = value;
+                        x[dest] = float(value);
+                    }
+                    const float p0 = pre[row * 4u] * x[0];
+                    const float p1 = pre[row * 4u + 1u] * x[1];
+                    const float p2 = pre[row * 4u + 2u] * x[2];
+                    const float p3 = pre[row * 4u + 3u] * x[3];
+                    const T value = T(p3 + (p2 + (p1 + p0)));
+                    collapsed[d] = value;
+                    square += float(value) * float(value);
+                }
+            }
+        }
+        square = simd_sum(square);
+        if (lane == 0u) partial[simd] = square;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            const float total = simd_sum(partial[lane]);
+            if (lane == 0u) inverse = metal::precise::rsqrt(total / float(HIDDEN) + params[0]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint d = tid; d < HIDDEN; d += 1024u)
+            normalized[row * HIDDEN + d] = T(norm[d] * (float(collapsed[d]) * inverse));
+        )MSL");
+    return kernel;
+}
+
 const mlx::core::fast::CustomKernelFunction& metadata_lanes_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv41_hc_metadata_lanes_f32",
@@ -750,6 +803,14 @@ MlxDeepseekV41MhcResult MlxDeepseekV41Mhc::collapse(
         throw std::invalid_argument(
             "DeepSeek-V4.1 Mega-mHC input mismatch");
     }
+    auto expansion = metadata(residual);
+    auto branch = deepseek_v41_hc_collapse_norm(
+        residual, previous_pre, norm_.weight(), norm_.eps());
+    auto next_pre = expansion.pre;
+    return {std::move(branch), std::move(next_pre), std::move(expansion)};
+}
+
+MlxDeepseekV41HcMetadataResult MlxDeepseekV41Mhc::metadata(const array& residual) const {
     const int batch = residual.shape(0);
     const int tokens = residual.shape(1);
     auto mixes = [&]() {
@@ -766,23 +827,12 @@ MlxDeepseekV41MhcResult MlxDeepseekV41Mhc::collapse(
             static_cast<float>(config_.rms_eps));
         return mlx::core::astype(function_(flattened * inverse), mlx::core::float32);
     }();
-    auto expansion = deepseek_v41_hc_metadata_exact(
+    return deepseek_v41_hc_metadata_exact(
         mixes,
         scale_,
         base_,
         static_cast<int>(config_.hc_sinkhorn_iters),
         static_cast<float>(config_.hc_eps));
-    auto branch = deepseek_v41_hc_collapse_norm(
-        residual,
-        previous_pre,
-        norm_.weight(),
-        norm_.eps());
-    auto next_pre = expansion.pre;
-    return {
-        std::move(branch),
-        std::move(next_pre),
-        std::move(expansion),
-    };
 }
 
 array MlxDeepseekV41Mhc::expand(
@@ -794,6 +844,46 @@ array MlxDeepseekV41Mhc::expand(
         residual,
         expansion.post,
         expansion.combination);
+}
+
+MlxDeepseekV41HcPostPreResult deepseek_v41_hc_post_collapse_norm(
+    const array& branch, const array& residual,
+    const MlxDeepseekV41HcMetadataResult& expansion,
+    const array& previous_pre, const array& norm, float eps) {
+    if (residual.ndim() != 4)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 fused Post/Pre rank");
+    if (residual.shape(-1) != kOfficialHidden ||
+        (residual.dtype() != mlx::core::float16 && residual.dtype() != mlx::core::bfloat16)) {
+        auto expanded = deepseek_v41_hc_post(branch, residual, expansion.post, expansion.combination);
+        auto normalized = deepseek_v41_hc_collapse_norm(expanded, previous_pre, norm, eps);
+        return {std::move(expanded), std::move(normalized)};
+    }
+    if (residual.shape(2) != 4 || branch.shape() != Shape{residual.shape(0), residual.shape(1), kOfficialHidden} ||
+        previous_pre.shape() != Shape{residual.shape(0), residual.shape(1), 4} ||
+        expansion.post.shape() != previous_pre.shape() ||
+        expansion.combination.shape() != Shape{residual.shape(0), residual.shape(1), 4, 4} ||
+        norm.size() != kOfficialHidden)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 fused Post/Pre boundary");
+    auto output = post_collapse_kernel()({mlx::core::contiguous(residual),
+        floating_contiguous(branch),
+        float32_contiguous(expansion.post), float32_contiguous(expansion.combination),
+        float32_contiguous(previous_pre), float32_contiguous(norm), array({eps})},
+        {residual.shape(), branch.shape()}, {residual.dtype(), residual.dtype()},
+        {residual.shape(0) * residual.shape(1) * 1024, 1, 1}, {1024, 1, 1},
+        {{"T", residual.dtype()}, {"HIDDEN", kOfficialHidden}}, std::nullopt, false, {});
+    return {std::move(output[0]), std::move(output[1])};
+}
+
+MlxDeepseekV41MhcResult MlxDeepseekV41Mhc::collapse_after(
+    const array& branch, const array& residual,
+    const MlxDeepseekV41HcMetadataResult& expansion,
+    const array& previous_pre, array& expanded) const {
+    auto output = deepseek_v41_hc_post_collapse_norm(branch, residual, expansion,
+        previous_pre, norm_.weight(), norm_.eps());
+    expanded = std::move(output.residual);
+    auto next = metadata(expanded);
+    auto next_pre = next.pre;
+    return {std::move(output.branch), std::move(next_pre), std::move(next)};
 }
 
 array MlxDeepseekV41Mhc::expand_sum(

@@ -191,19 +191,21 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
         pos0,
         ced_replay,
         encoder_source ? &*encoder_source : nullptr);
-    value = attention_mhc_.expand(
-        attention_branch,
-        attention_residual,
-        attention_mix.expansion);
-
-    if (ced_replay && index_ + 1 == config_.n_layers && value.shape(1) > 1) {
-        const int last = value.shape(1) - 1;
-        value = slice_tokens(value, last, last + 1);
-        attention_mix.next_pre = slice_tokens(attention_mix.next_pre, last, last + 1);
-    }
-    const auto ffn_residual = value;
-    auto ffn_mix = ffn_mhc_.collapse(
-        ffn_residual, attention_mix.next_pre);
+    auto ffn_residual = attention_residual;
+    auto ffn_mix = [&] {
+        if (ced_replay && index_ + 1 == config_.n_layers) {
+            ffn_residual = attention_mhc_.expand(attention_branch, attention_residual,
+                attention_mix.expansion);
+            if (ffn_residual.shape(1) > 1) {
+                const int last = ffn_residual.shape(1) - 1;
+                ffn_residual = slice_tokens(ffn_residual, last, last + 1);
+                attention_mix.next_pre = slice_tokens(attention_mix.next_pre, last, last + 1);
+            }
+            return ffn_mhc_.collapse(ffn_residual, attention_mix.next_pre);
+        }
+        return ffn_mhc_.collapse_after(attention_branch, attention_residual,
+            attention_mix.expansion, attention_mix.next_pre, ffn_residual);
+    }();
     auto ffn_branches = moe_.forward(
         ffn_mix.branch, image_mask, prefetched, deferred_route);
     value = ffn_mhc_.expand_sum(
