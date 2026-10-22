@@ -5,6 +5,13 @@ else()
     add_compile_options(-UNDEBUG)
 endif()
 
+add_executable(mfq-benchmark-validation-test benchmark_validation_test.cpp)
+target_include_directories(mfq-benchmark-validation-test PRIVATE
+    ${MFQ_REPOSITORY_ROOT}/bench
+)
+target_compile_features(mfq-benchmark-validation-test PRIVATE cxx_std_17)
+add_test(NAME mfq-benchmark-validation-test COMMAND mfq-benchmark-validation-test)
+
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
 )
@@ -61,6 +68,11 @@ target_compile_features(mfq-prefill-budget-test PRIVATE cxx_std_17)
 add_test(NAME mfq-prefill-budget-test COMMAND mfq-prefill-budget-test)
 
 if(TARGET mfq-tokenizer)
+    add_executable(mfq-tokenizer-identity-test tokenizer_identity_test.cpp)
+    target_link_libraries(mfq-tokenizer-identity-test PRIVATE mfq-engine)
+    target_compile_features(mfq-tokenizer-identity-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-tokenizer-identity-test COMMAND mfq-tokenizer-identity-test)
+
     add_executable(mfq-text-processor-test text_processor_test.cpp)
     target_link_libraries(mfq-text-processor-test PRIVATE mfq-engine)
     target_compile_features(mfq-text-processor-test PRIVATE cxx_std_20)

@@ -133,6 +133,8 @@ json chat_template_capabilities_json(
     const mfq::engine::ChatTemplateCapabilities & capabilities);
 bool valid_mfq_session_id(const std::string & session_id);
 json runtime_generate_body(const json & params);
+mfq::engine::CountTokens parse_token_count_request(const json& body);
+json token_count_json(const mfq::engine::TokenCount& result);
 mfq::engine::ScoreText parse_score_request(const json& body);
 json likelihood_result_json(const mfq::engine::LikelihoodResult& result);
 RequestInput parse_input(

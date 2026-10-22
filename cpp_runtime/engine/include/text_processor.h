@@ -83,6 +83,7 @@ public:
         InferenceInput input,
         std::int64_t max_context) const;
     const MfqTokenizer& tokenizer() const;
+    std::size_t count_tokens(const std::string& prompt) const;
 
     void prepare_duplex_session(
         const std::string& system_prompt,

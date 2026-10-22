@@ -813,6 +813,19 @@ bool valid_mfq_session_id(const std::string & session_id) {
             });
 }
 
+mfq::engine::CountTokens parse_token_count_request(const json& body) {
+    if (!body.is_object() || body.size() != 1 || !body.contains("prompt") ||
+        !body["prompt"].is_string() || body["prompt"].get_ref<const std::string&>().empty() ||
+        body["prompt"].get_ref<const std::string&>().size() > 262144)
+        throw ApiError(400, "invalid_request_error", "token count requires a nonempty prompt of at most 262144 bytes");
+    return {body["prompt"].get<std::string>()};
+}
+
+json token_count_json(const mfq::engine::TokenCount& result) {
+    return {{"prompt_tokens", result.prompt_tokens}, {"context_size", result.context_size},
+        {"tokenization", "raw-no-special-tokens"}};
+}
+
 mfq::engine::ScoreText parse_score_request(const json& body) {
     if (!body.is_object() || !body.contains("prompt") || !body["prompt"].is_string() ||
         body["prompt"].get_ref<const std::string&>().empty() || body["prompt"].get_ref<const std::string&>().size() > 262144 ||

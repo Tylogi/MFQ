@@ -95,6 +95,11 @@ struct PrepareDuplex { std::string prompt; MfqDuplexSessionParams parameters; };
 struct PrepareDuplexStep { std::string text; MfqDuplexStepInput input; };
 struct StopDuplex {};
 struct RuntimeMetrics {};
+struct CountTokens { std::string prompt; };
+struct TokenCount {
+    std::size_t prompt_tokens = 0;
+    std::int64_t context_size = 0;
+};
 struct ScoreText {
     std::string prompt;
     std::vector<std::string> continuations;
@@ -117,10 +122,10 @@ struct LikelihoodResult {
 };
 using ControlRequest = std::variant<DecodeTokens, PrepareDuplex,
     PrepareDuplexStep, MfqDuplexSessionParams, MfqDuplexStepInput, StopDuplex,
-    RuntimeMetrics, ScoreText, ScoreTokens>;
+    RuntimeMetrics, CountTokens, ScoreText, ScoreTokens>;
 using ControlResult = std::variant<std::monostate,
     std::string, MfqDuplexSessionParams, MfqDuplexStepInput, MfqDuplexStepResult,
-    Metrics, LikelihoodResult>;
+    Metrics, TokenCount, LikelihoodResult>;
 
 // Only the scheduler loop calls these methods. Execution returns owned values;
 // no caller code or response writer can run on the device execution stack.

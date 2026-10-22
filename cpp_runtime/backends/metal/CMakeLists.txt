@@ -652,6 +652,9 @@ add_executable(mfq-metal-dense-smallm-benchmark
 target_link_libraries(mfq-metal-dense-smallm-benchmark PRIVATE
     mfq-metal-runtime
 )
+target_include_directories(mfq-metal-dense-smallm-benchmark PRIVATE
+    ${MFQ_REPOSITORY_ROOT}/bench
+)
 target_compile_features(
     mfq-metal-dense-smallm-benchmark PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-dense-smallm-benchmark PROPERTIES

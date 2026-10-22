@@ -47,6 +47,8 @@ ControlResult MlxEngine::control(ControlRequest request) {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, DecodeTokens>)
             return text_->decode_tokens(value.tokens, value.excluded);
+        else if constexpr (std::is_same_v<T, CountTokens>)
+            return TokenCount{text_->count_tokens(value.prompt), info_.max_context};
         else if constexpr (std::is_same_v<T, ScoreText>) {
             if (!info_.probability) throw std::invalid_argument("probability scoring is unavailable for this model");
             if (!requests_.empty() || duplex_active_)

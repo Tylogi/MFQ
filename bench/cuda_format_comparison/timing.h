@@ -1,4 +1,5 @@
 #pragma once
+#include "cases.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
@@ -15,31 +16,6 @@
 namespace format_bench {
 inline void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-struct Case {
-    std::string label, model, tensor;
-    int expert=0, n=0, k=0;
-    double file_bpw=0;
-    std::string name() const { return label+"_"+std::to_string(n)+"x"+std::to_string(k); }
-};
-inline std::vector<Case> read_cases(const char* path) {
-    std::ifstream file(path);
-    if (!file) throw std::runtime_error("cannot open cases manifest");
-    std::vector<Case> result;
-    for (std::string line; std::getline(file,line);) {
-        if (line.empty()) continue;
-        std::istringstream row(line); Case c; std::string expert,n,k,bpw;
-        if (!std::getline(row,c.label,'\t') || !std::getline(row,c.model,'\t') ||
-            !std::getline(row,c.tensor,'\t') || !std::getline(row,expert,'\t') ||
-            !std::getline(row,n,'\t') || !std::getline(row,k,'\t') || !std::getline(row,bpw))
-            throw std::runtime_error("invalid cases manifest row");
-        c.expert=std::stoi(expert);c.n=std::stoi(n);c.k=std::stoi(k);c.file_bpw=std::stod(bpw);
-        if (c.n<=0 || c.k<=0 || c.expert<0 || !std::isfinite(c.file_bpw))
-            throw std::runtime_error("invalid case dimensions");
-        result.push_back(std::move(c));
-    }
-    if(result.empty()) throw std::runtime_error("empty cases manifest");
-    return result;
 }
 inline std::vector<float> input(int m,int k) {
     std::vector<float> values(std::size_t(m)*k);

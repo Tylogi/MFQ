@@ -139,6 +139,22 @@ void test_decode_timing() {
     const auto empty = mfq::transport_detail::request_metric_values(result, InferenceMetrics{});
     assert(empty.decode_ms == 0.0 && empty.decode_tps == 0.0);
 }
+void test_token_count_contract() {
+    using namespace mfq::transport_detail;
+    assert(parse_token_count_request({{"prompt", "raw <s> text"}}).prompt == "raw <s> text");
+    for (const auto& invalid : std::vector<json>{
+            json::array(), json::object(), {{"prompt", ""}}, {{"prompt", 1}},
+            {{"prompt", "a"}, {"parse_special", true}}, {{"prompt", std::string(262145, 'a')}}}) {
+        bool rejected = false;
+        try { (void)parse_token_count_request(invalid); }
+        catch (const ApiError&) { rejected = true; }
+        assert(rejected);
+    }
+    const auto counted = token_count_json(TokenCount{2100, 2048});
+    assert(counted["prompt_tokens"] == 2100 && counted["context_size"] == 2048);
+    assert(counted["tokenization"] == "raw-no-special-tokens");
+}
+
 void test_benchmark_input_contract() {
     using namespace mfq::transport_detail;
     json params = {{"input", {{"messages", json::array({{{"role", "user"}, {"content", "test input"}}})}, {"preformatted_prompt", "test input"},
@@ -207,6 +223,7 @@ int main() {
     test_live_request_metrics();
     test_probability_contract();
     test_benchmark_input_contract();
+    test_token_count_contract();
     test_decode_timing();
     {
         FakeEngine engine;

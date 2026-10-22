@@ -822,6 +822,11 @@ public:
                     send_result(id, {{"status", "ok"}});
                     continue;
                 }
+                if (op == "count_tokens") {
+                    send_result(id, token_count_json(std::get<mfq::engine::TokenCount>(
+                        scheduler.control(parse_token_count_request(params)))));
+                    continue;
+                }
                 if (op == "score") {
                     if (!scheduler.info().probability)
                         throw ApiError(501, "probability_unavailable", "probability scoring is unavailable for this model");

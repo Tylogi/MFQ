@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from mfq.evaluation.source import ReferenceSource, loading_plan
+from mfq.formats.tokenizer_identity import tokenizer_identity
 
 
 def sha256(path):
@@ -94,7 +95,7 @@ class ReferenceWriter:
             self.partial.unlink(missing_ok=True)
 
 
-def tokenize_windows(root, text, context, chunks):
+def tokenize_windows(root, text, context, chunks, vocabulary_size=None):
     from tokenizers import Tokenizer
     root = Path(root)
     tokenizer = Tokenizer.from_file(str(root / 'tokenizer.json'))
@@ -121,7 +122,8 @@ def tokenize_windows(root, text, context, chunks):
         windows[:, 0] = bos
     return windows, {'vocab_size': tokenizer.get_vocab_size(), 'bos_token': bos, 'eos_token': eos,
         'pad_token': pad, 'add_bos': add_bos, 'add_eos': add_eos, 'add_special': True,
-        'parse_special': True, 'source': 'original_hf_tokenizer'}
+        'parse_special': True, 'source': 'original_hf_tokenizer',
+        'identity': tokenizer_identity(tokenizer, vocabulary_size)}
 
 
 def generate_reference(model, dataset, output, *, context_size=512, chunks=8, device='mps', layerwise=True, runtime=None):
@@ -146,8 +148,8 @@ def generate_reference(model, dataset, output, *, context_size=512, chunks=8, de
     mode = {'layerwise': layerwise or not plan['resident_allowed'], 'requested_layerwise': layerwise,
         'fallback_reason': 'insufficient_memory' if not layerwise and not plan['resident_allowed'] else None, 'memory': plan}
     print(json.dumps({'event': 'source_loading', **mode}), flush=True)
-    tokens, tokenizer = tokenize_windows(source.path, dataset.read_text(encoding='utf-8'), context_size, chunks)
     vocab = int(source.text.get('vocab_size', source.config.get('vocab_size', 0)))
+    tokens, tokenizer = tokenize_windows(source.path, dataset.read_text(encoding='utf-8'), context_size, chunks, vocab)
     if vocab < 1 or tokens.min() < 0 or tokens.max() >= vocab:
         raise ValueError('tokenizer IDs exceed the source output vocabulary')
     tokenizer['vocab_size'] = vocab

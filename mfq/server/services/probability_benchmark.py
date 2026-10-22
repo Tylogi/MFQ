@@ -99,12 +99,17 @@ async def mmlu_question(context, backend, question, scorer, examples):
     while True:
         context.raise_if_cancelled()
         prompt = scorer["gen_prompt"](dev, subject, k) + scorer["format_example"](test, 0, include_answer=False)
-        result = await backend.score({"prompt": prompt, "continuations": ["A", "B", "C", "D"], "mode": "next_token"})
-        if result["prompt_tokens"] <= 2048:
+        counted = await backend.count_tokens(prompt)
+        limit = min(2048, counted["context_size"])
+        if counted["prompt_tokens"] <= limit:
             break
         if k == 0:
-            raise _failure("benchmark_context_exceeded", "MMLU question exceeds the official 2048-token limit even without demonstrations")
+            raise _failure("benchmark_context_exceeded", f"MMLU question exceeds the {limit}-token limit even without demonstrations")
         k -= 1
+    context.raise_if_cancelled()
+    result = await backend.score({"prompt": prompt, "continuations": ["A", "B", "C", "D"], "mode": "next_token"})
+    if result["prompt_tokens"] != counted["prompt_tokens"]:
+        raise _failure("probability_tokenization_changed", "prompt tokenization changed between sizing and scoring")
     def tokenize(text, **_kwargs):
         if text in {"A", "B", "C", "D"}:
             return SimpleNamespace(input_ids=[ord(text) - 65])

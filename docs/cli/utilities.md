@@ -24,6 +24,11 @@ uv run mfq optimize-layout --input model.mfq --output model-native.mfq --overwri
 Generate official WT2 reference logits from original HF weights. The output
 feeds KL evaluation through `mfq-eval kl --kl-base`.
 
+The manifest records a SHA-256 identity of the ordered token vocabulary.
+Metal `mfq-perplexity` checks this identity against the candidate tokenizer
+before evaluation. Older manifests without this identity must be regenerated;
+matching vocabulary sizes alone do not establish compatible token IDs.
+
 | Option | Meaning | Default |
 |---|---|---|
 | `--model PATH` | Original HF checkpoint. | Required |

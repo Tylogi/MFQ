@@ -72,7 +72,7 @@ Responses use the same ID:
 {"v":1,"id":"2","type":"error","error":{"code":"...","message":"...","status_code":500,"retryable":false}}
 ```
 
-Supported operations are `generate`, `health`, `status`, `models`,
+Supported operations are `generate`, `count_tokens`, `score`, `health`, `status`, `models`,
 `session.fork`, `session.close`, `session.cancel`, `request.cancel`, `reload`,
 `cache.clear`, `cache.trim`, `realtime.capabilities`, `realtime.open`,
 `realtime.send`, `realtime.close`, and `shutdown`.
@@ -84,6 +84,14 @@ out of band in the existing controlled temporary files.
 ## Private HTTP
 
 HTTP mode exposes the same runtime concepts under `/runtime/*`, including
-`/runtime/generate`, `/runtime/health`, `/runtime/status`, `/runtime/models`,
+`/runtime/generate`, `/runtime/count_tokens`, `/runtime/score`, `/runtime/health`, `/runtime/status`, `/runtime/models`,
 cache/session controls, and `/runtime/realtime`. It does not expose public
 `/v1/*` or OpenAI-compatible routes; Python performs that translation.
+
+`count_tokens` (`POST /runtime/count_tokens`) accepts only a nonempty `prompt`
+string of at most 262144 UTF-8 bytes. It returns `prompt_tokens`, the loaded
+`context_size`, and `tokenization: "raw-no-special-tokens"`. It uses the same
+raw tokenizer settings as probability scoring and performs no model inference.
+Prompts longer than the loaded context can be counted so callers can shorten
+them before scoring. MMLU uses this operation to reduce demonstrations until
+the prompt fits both the loaded context and its official 2048-token limit.

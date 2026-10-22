@@ -1,5 +1,6 @@
 #include "mfq_container.h"
 #include "mlx_tensor.h"
+#include "numerical_check.h"
 
 #include <algorithm>
 #include <chrono>
@@ -147,16 +148,12 @@ array candidate(
 }
 
 float max_difference(const array& left, const array& right) {
+    require(left.shape() == right.shape(), "comparison output shapes differ");
     auto left32 = mlx::core::astype(left, mlx::core::float32);
     auto right32 = mlx::core::astype(right, mlx::core::float32);
     mlx::core::eval(left32, right32);
-    float maximum = 0.0f;
-    for (std::size_t index = 0; index < left32.size(); ++index) {
-        maximum = std::max(
-            maximum,
-            std::abs(left32.data<float>()[index] - right32.data<float>()[index]));
-    }
-    return maximum;
+    return mfq::bench::max_absolute_difference(
+        left32.data<float>(), right32.data<float>(), left32.size());
 }
 
 template <typename Projection>
