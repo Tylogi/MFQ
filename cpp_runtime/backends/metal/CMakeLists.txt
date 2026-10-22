@@ -283,6 +283,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
     ops/mlx_csa2.cpp
+    ops/mlx_dsa_cache_ops.cpp
     ops/mlx_vq.cpp
     models/deepseek_v4/deepseek_v4_model.cpp
     models/deepseek_v4/mlx_deepseek_v4_attention.cpp
@@ -786,6 +787,16 @@ add_test(
     NAME mfq-metal-deepseek-v4-hc-test
     COMMAND mfq-metal-deepseek-v4-hc-test
 )
+
+add_executable(mfq-metal-deepseek-v41-fusions-test
+    tests/mlx_deepseek_v41_fusions_test.cpp
+)
+target_link_libraries(mfq-metal-deepseek-v41-fusions-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-deepseek-v41-fusions-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-deepseek-v41-fusions-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-deepseek-v41-fusions-test COMMAND mfq-metal-deepseek-v41-fusions-test)
 
 add_executable(mfq-metal-deepseek-v4-model-test
     tests/deepseek_v4_model_test.cpp

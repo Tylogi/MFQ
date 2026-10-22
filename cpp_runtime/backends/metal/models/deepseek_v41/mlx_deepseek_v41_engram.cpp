@@ -18,6 +18,55 @@ namespace {
 using mlx::core::Shape;
 using mlx::core::array;
 
+const mlx::core::fast::CustomKernelFunction& engram_gate_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Safe;
+        return mlx::core::fast::metal_kernel("mfq_v41_engram_gate",
+            {"hidden", "kv", "weight", "mask", "params"}, {"output"}, R"MSL(
+            const uint row = threadgroup_position_in_grid.x;
+            const uint stream = threadgroup_position_in_grid.y;
+            const uint tid = thread_index_in_threadgroup;
+            threadgroup float partial[3][8];
+            threadgroup float gate;
+            float xx = 0.0f, kk = 0.0f, xk = 0.0f;
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                const float x = float(hidden[(row * STREAMS + stream) * HIDDEN + d]);
+                const float k = float(kv[row * (STREAMS + 1u) * HIDDEN + stream * HIDDEN + d]);
+                xx += x * x;
+                kk += k * k;
+                xk += (x * k) * weight[stream * HIDDEN + d];
+            }
+            xx = simd_sum(xx); kk = simd_sum(kk); xk = simd_sum(xk);
+            if (thread_index_in_simdgroup == 0u) {
+                const uint group = simdgroup_index_in_threadgroup;
+                partial[0][group] = xx; partial[1][group] = kk; partial[2][group] = xk;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < 32u) {
+                xx = simd_sum(tid < 8u ? partial[0][tid] : 0.0f);
+                kk = simd_sum(tid < 8u ? partial[1][tid] : 0.0f);
+                xk = simd_sum(tid < 8u ? partial[2][tid] : 0.0f);
+                if (tid == 0u) {
+                    const float inverse = metal::precise::rsqrt(xx / float(HIDDEN) + params[0])
+                        * metal::precise::rsqrt(kk / float(HIDDEN) + params[0]);
+                    const float score = (xk * inverse) / metal::precise::sqrt(float(HIDDEN));
+                    const float signed_root = sign(score) * metal::precise::sqrt(max(abs(score), 1e-6f));
+                    gate = 1.0f / (1.0f + metal::precise::exp(-signed_root));
+                    if (MASKED && !mask[row]) gate = 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                const uint offset = (row * STREAMS + stream) * HIDDEN + d;
+                const float value = float(kv[row * (STREAMS + 1u) * HIDDEN + STREAMS * HIDDEN + d]);
+                output[offset] = T(float(hidden[offset]) + gate * value);
+            }
+            )MSL", "", true, false, options);
+    }();
+    return kernel;
+}
+
 constexpr std::string_view kEngramAsset =
     "__mfq_asset__/deepseek-v41-engram-v1.bin";
 constexpr std::array<std::uint8_t, 8> kEngramMagic{
@@ -180,6 +229,25 @@ std::uint64_t checked_product(
 }
 
 } // namespace
+
+array deepseek_v41_engram_gate(const array& hidden, const array& key_value,
+    const array& weight, const std::optional<array>& participation_mask, float eps) {
+    if (hidden.ndim() != 4 || key_value.ndim() != 3 || hidden.shape(0) <= 0 ||
+        hidden.shape(1) <= 0 || hidden.shape(2) <= 0 || hidden.shape(3) <= 0 ||
+        hidden.shape(0) != key_value.shape(0) ||
+        hidden.shape(1) != key_value.shape(1) ||
+        key_value.shape(2) != (hidden.shape(2) + 1) * hidden.shape(3) ||
+        weight.size() != hidden.shape(2) * hidden.shape(3) || !(eps > 0) ||
+        (participation_mask && participation_mask->shape() != Shape{hidden.shape(0), hidden.shape(1)}))
+        throw std::invalid_argument("invalid DeepSeek-V4.1 Engram gate input");
+    auto mask = participation_mask ? mlx::core::contiguous(mlx::core::astype(*participation_mask, mlx::core::bool_))
+        : array({true}, mlx::core::bool_);
+    return engram_gate_kernel()({mlx::core::contiguous(hidden), mlx::core::contiguous(key_value),
+        mlx::core::contiguous(mlx::core::astype(weight, mlx::core::float32)), mask, array({eps})},
+        {hidden.shape()}, {hidden.dtype()}, {hidden.shape(0) * hidden.shape(1) * 256, hidden.shape(2), 1},
+        {256, 1, 1}, {{"HIDDEN", hidden.shape(3)}, {"STREAMS", hidden.shape(2)},
+            {"MASKED", bool(participation_mask)}, {"T", hidden.dtype()}}, std::nullopt, false, {}).front();
+}
 
 std::span<const std::int64_t> DeepseekV41EngramHashBatch::layer(
     int index) const {
@@ -634,50 +702,8 @@ array MlxDeepseekV41Engram::forward(
         std::move(gathered),
         Shape{batch, tokens, hashes.hash_columns * table_->width()});
     auto key_value = projection_(embeddings);
-    const int key_width = streams * hidden;
-    auto key = mlx::core::slice(
-        key_value,
-        Shape{0, 0, 0},
-        Shape{batch, tokens, key_width});
-    key = mlx::core::reshape(
-        mlx::core::astype(std::move(key), mlx::core::float32),
-        Shape{batch, tokens, streams, hidden});
-    auto value = mlx::core::slice(
-        key_value,
-        Shape{0, 0, key_width},
-        Shape{batch, tokens, key_width + hidden});
-    value = mlx::core::reshape(
-        mlx::core::astype(std::move(value), mlx::core::float32),
-        Shape{batch, tokens, 1, hidden});
-    auto source = mlx::core::astype(hidden_streams, mlx::core::float32);
-    auto inverse = mlx::core::rsqrt(
-        mlx::core::mean(source * source, -1) +
-        static_cast<float>(config_.rms_eps));
-    inverse = inverse * mlx::core::rsqrt(
-        mlx::core::mean(key * key, -1) +
-        static_cast<float>(config_.rms_eps));
-    auto score = mlx::core::sum(
-        source * key * query_key_weight_, -1) * inverse /
-        std::sqrt(static_cast<float>(hidden));
-    auto sign = mlx::core::astype(
-        mlx::core::less(array(0.0f), score), mlx::core::float32) -
-        mlx::core::astype(
-            mlx::core::less(score, array(0.0f)), mlx::core::float32);
-    auto gate = mlx::core::sigmoid(
-        sign * mlx::core::sqrt(
-            mlx::core::maximum(mlx::core::abs(score), array(1e-6f))));
-    if (participation_mask) {
-        if (participation_mask->shape() != Shape{batch, tokens}) {
-            throw std::invalid_argument(
-                "DeepSeek-V4.1 Engram gate mask shape disagrees");
-        }
-        gate = gate * mlx::core::expand_dims(
-            mlx::core::astype(*participation_mask, mlx::core::float32), -1);
-    }
-    auto output = source + mlx::core::expand_dims(gate, -1) * value;
-    return hidden_streams.dtype() == mlx::core::float32
-        ? output
-        : mlx::core::astype(std::move(output), hidden_streams.dtype());
+    return deepseek_v41_engram_gate(hidden_streams, key_value, query_key_weight_,
+        participation_mask, static_cast<float>(config_.rms_eps));
 }
 
 void MlxDeepseekV41Engram::prefetch(
