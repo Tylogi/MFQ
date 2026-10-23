@@ -1,6 +1,6 @@
 #include "cli.h"
 #include "engine/model_registry.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 
 #include <algorithm>
 #include <cstring>

@@ -6,8 +6,7 @@
 #include "../../hip/include/mfq_hip_context.h"
 #include "runtime/moe_residency.h"
 #include "mfq/host_parallel.h"
-#include "mfq/moe_cpu_cost_model.h"
-#include "mfq/moe_cpu_calibration.h"
+#include "cpu_cost_model.h"
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -704,7 +703,7 @@ private:
     std::uint64_t pipeline_cpu_policy_changed_routes_=0;
     bool pipeline_shared_cpu_cost_=false;
     mfq::MoeCpuCostModel pipeline_cpu_cost_;
-    mfq::MoeCpuCalibration pipeline_cpu_calibration_;
+    mfq::MoeCpuCalibrationState pipeline_cpu_calibration_;
     bool measuring_preload_h2d_=false;
     std::vector<std::unique_ptr<MoePreloadH2DTiming>> preload_h2d_timings_;
     friend class MoeCachedSource;

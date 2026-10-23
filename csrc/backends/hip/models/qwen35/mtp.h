@@ -5,7 +5,7 @@
 
 #include "core/mtp.h"
 #include "core/full_block.h"
-#include "models/qwen35/causal_lm.h"
+#include "qwen35/causal_lm.h"
 #include "../../../hip/models/qwen35/ops.h"
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only

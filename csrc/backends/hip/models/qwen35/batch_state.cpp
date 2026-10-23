@@ -1,7 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "batch_state.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "linear_attention.h"
 #include "ops.h"
 #include "paged_kv.h"

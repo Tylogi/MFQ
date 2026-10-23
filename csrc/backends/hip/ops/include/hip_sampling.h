@@ -2,7 +2,8 @@
 #pragma once
 
 #include "sampling.h"
-#include "mfq/runtime.h"
+#include "sampling_params.h"
+#include "token_constraint.h"
 #include "../../hip/include/mfq_hip_sampling_ops.h"
 
 #include <cstddef>
@@ -15,7 +16,7 @@ namespace mfq::cuda {
 class SamplingOps {
 public:
     using Tensor = mfq_tensor_backend::Tensor;
-    using Params = ::MfqSamplingParams;
+    using Params = mfq::SamplingParams;
 
     SamplingOps()
         : random_host_(mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()

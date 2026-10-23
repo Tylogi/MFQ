@@ -6,7 +6,7 @@
 #include "kernels/quant_ops.h"
 #include "nint.h"
 #include "nint_prefill_cache.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "ops/format.h"
 #include "csrc/backends/cpu/ops/packed_nint.h"
 #include "cpu_projection_rows.h"

@@ -1,6 +1,6 @@
 # Native HIP runtime validation
 
-Status of the HIP backend (`cpp_runtime/backends/hip`, `mfq/kernels/hip`) on
+Status of the HIP backend (`csrc/backends/hip`, `mfq/kernels/hip`) on
 ROCm 7.14 / Instinct MI300X (gfx942). The backend is generated from the CUDA
 sources (torch hipify for the imported kernel trees, hipify-perl for host
 translation units) with the NVIDIA tensor-core tile paths replaced by direct
@@ -50,7 +50,7 @@ nint q8, packed prefill, and paged KV.
 
 The additional `mfq-hip-wave-test` checks width-8/16/32 shuffle semantics and
 independent 32-lane ballots on multidimensional blocks. Run it on an AMD host
-with `ctest --test-dir build/cpp_runtime -R mfq-hip-wave-test --output-on-failure`.
+with `ctest --test-dir build -R mfq-hip-wave-test --output-on-failure`.
 CPU shim and source-isolation tests in `tests/test_hip_portability.py` do not
 replace this device check.
 

@@ -134,6 +134,8 @@ find_package(OpenMP QUIET)
 
 function(mfq_configure_hip_backend_target target)
     target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/include
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_HIP_ROOT}
         ${MFQ_HIP_ROOT}/include
@@ -142,7 +144,12 @@ function(mfq_configure_hip_backend_target target)
         ${MFQ_HIP_KERNEL_ROOT}
     )
     target_link_libraries(${target} PRIVATE
-        mfq-core
+        mfq-formats
+        mfq-model-source
+        mfq-quant-readers
+        mfq-qsa-kv-store
+        mfq-prefix-blocks
+        mfq-cpu-execution
         mfq-cpu-ops
         mfq-json
         mfq-ggml-internal-headers
@@ -157,11 +164,11 @@ endfunction()
 function(mfq_configure_hip_runtime_target target)
     mfq_configure_hip_backend_target(${target})
     target_include_directories(${target} PRIVATE
-        ${MFQ_HIP_ROOT}/models
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_HIP_ROOT}/commands
         ${MFQ_HIP_ROOT}/engine
     )
-    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
+    target_link_libraries(${target} PRIVATE mfq-engine)
 endfunction()
 
 set(MFQ_HIP_MODEL_SOURCES
@@ -188,7 +195,7 @@ set(MFQ_HIP_TRANSFORMER_SOURCES
 )
 
 set(MFQ_HIP_RUNTIME_OP_SOURCES
-    ${MFQ_HIP_ROOT}/ops/cuda_execution.cpp
+    ${MFQ_HIP_ROOT}/execution/runtime_context.cpp
     ${MFQ_HIP_ROOT}/ops/format.cpp
     ${MFQ_HIP_ROOT}/ops/gated_residual.cpp
     ${MFQ_HIP_ROOT}/ops/fp8_sq.cpp
@@ -197,7 +204,7 @@ set(MFQ_HIP_RUNTIME_OP_SOURCES
     ${MFQ_HIP_ROOT}/ops/moe.cpp
     ${MFQ_HIP_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_HIP_ROOT}/ops/nint.cpp
-    ${MFQ_HIP_ROOT}/ops/quant_linear.cpp
+    ${MFQ_HIP_ROOT}/storage/linear_weights.cpp
     ${MFQ_HIP_ROOT}/ops/vq.cpp
 )
 
@@ -211,7 +218,7 @@ set(MFQ_HIP_LOADING_SOURCES
     ${MFQ_HIP_ROOT}/storage/load_options.cpp
     ${MFQ_HIP_ROOT}/storage/model_loader.cpp
     ${MFQ_HIP_ROOT}/storage/moe_expert_cache.cpp
-    ${MFQ_HIP_ROOT}/storage/moe_ffn_pipeline.cpp
+    ${MFQ_HIP_ROOT}/execution/moe_ffn_pipeline.cpp
     ${MFQ_HIP_ROOT}/storage/moe_quant_range_source.cpp
     ${MFQ_HIP_ROOT}/runtime/moe_host_expert_cache.cpp
     ${MFQ_HIP_ROOT}/runtime/graph_registry.cpp
@@ -329,7 +336,7 @@ if(BUILD_TESTING)
     # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the
     # cuda_* runtime API names onto hip.
     set(MFQ_HIP_TEST_INCLUDES
-        ${MFQ_REPOSITORY_ROOT}/csrc/core
+        ${MFQ_ENGINE_PRIVATE_DIRS}
         ${MFQ_HIP_ROOT}/tests/cuda_compat
         ${MFQ_REPOSITORY_ROOT}/csrc/components/ggml/src/ggml-hip/vendors
         ${MFQ_REPOSITORY_ROOT}
@@ -371,7 +378,7 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-attention-mma-test
         ${MFQ_HIP_ROOT}/tests/attention_mma_test.cu)
     target_link_libraries(mfq-hip-attention-mma-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core mfq-ggml)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-ggml)
 
     mfq_add_hip_test(mfq-hip-native-tensor-test
         ${MFQ_HIP_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
@@ -386,12 +393,12 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-nint-rows-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_rows_test.cu)
     target_link_libraries(mfq-hip-nint-rows-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-quant-readers)
 
     mfq_add_hip_test(mfq-hip-packed-prefill-test
         ${MFQ_HIP_ROOT}/tests/mfq_packed_prefill_test.cu)
     target_link_libraries(mfq-hip-packed-prefill-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels mfq-core)
+        mfq-hip-core mfq-hip-native-kernels mfq-formats mfq-quant-readers)
 
     mfq_add_hip_test(mfq-hip-paged-kv-test
         ${MFQ_HIP_ROOT}/tests/mfq_paged_kv_test.cu)

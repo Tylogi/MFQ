@@ -2,8 +2,8 @@
 #include "text_cache_impl.h"
 #include "settings.h"
 #include "model_source.h"
-#include "csrc/core/mfq_paged_prefix_cache.h"
-#include "ops/execution/cuda_execution.h"
+#include "prefix_cache.h"
+#include "execution/cuda_execution.h"
 
 #include <array>
 #include <cstring>
@@ -75,7 +75,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
         !supports_paged_text_session_state) {
         return {};
     }
-    mfq::cache::PagedPrefixCacheConfig cache;
+    mfq::cache::PrefixBlockStoreConfig cache;
     cache.cache_dir = config.directory;
     if (!source.source_paths().empty()) cache.model_path = source.source_paths().front();
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);

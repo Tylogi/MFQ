@@ -299,7 +299,7 @@ void test_chat_input_contract() {
         {"chat_template_kwargs", {{"mode", "strict"}}},
     };
     auto input = mfq::transport::parse_input(
-        body, true, MfqSamplingParams{});
+        body, true, mfq::SamplingParams{});
     assert(input.chat_input);
     const auto& chat = *input.chat_input;
     assert(chat.messages.size() == 1);
@@ -316,7 +316,7 @@ void test_chat_input_contract() {
     bool rejected = false;
     try {
         (void) mfq::transport::parse_input(
-            body, true, MfqSamplingParams{});
+            body, true, mfq::SamplingParams{});
     } catch (const ApiError& error) {
         rejected = error.status == 400 && error.param == "tool_choice";
     }

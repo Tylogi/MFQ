@@ -2,7 +2,7 @@
 
 #include "kernels/moe/ops.h"
 
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "ops/quant/fp8_sq.h"
 #include "ops/quant/mx.h"
 #include "ops/quant/mxfp4_sq.h"

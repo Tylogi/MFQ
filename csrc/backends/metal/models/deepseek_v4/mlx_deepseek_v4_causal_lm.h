@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_dspark.h"

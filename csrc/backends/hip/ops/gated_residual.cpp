@@ -1,7 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "gated_residual.h"
 #include "qwen4_exp.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 namespace {
 std::vector<mfq_tensor_backend::Tensor> residual_pre(

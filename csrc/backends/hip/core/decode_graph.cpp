@@ -1,6 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "core/decode_graph.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 #include <algorithm>
 
@@ -57,7 +57,7 @@ std::vector<MfqCudaStream> DecodeGraphCache::graph_participant_streams(
 }
 
 bool DecodeGraphCache::matches(
-        int64_t candidate_len, const MfqSamplingParams & sampling,
+        int64_t candidate_len, const mfq::SamplingParams & sampling,
         bool candidate_greedy) const {
     return valid && planned_len == candidate_len && greedy == candidate_greedy &&
            (candidate_greedy ||
@@ -93,7 +93,7 @@ void DecodeGraphCache::invalidate() {
 }
 
 void DecodeGraphCache::set_key(
-        int64_t candidate_len, const MfqSamplingParams & sampling,
+        int64_t candidate_len, const mfq::SamplingParams & sampling,
         bool candidate_greedy) {
     planned_len = candidate_len;
     greedy = candidate_greedy;

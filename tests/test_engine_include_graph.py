@@ -8,17 +8,17 @@ drive the shared generation loop, so the arrangement is allowed -- but only for
 them.
 
 Rules:
-  1. engine/** never includes backends/**.
+  1. engine/** only consumes the three listed CPU host contracts in backends/**.
   2. engine private module headers are included only from engine/, backends/,
      tests/ and bench/.  Every scanned file is judged, including core/,
      scheduler/ and transport/, whichever way the include is spelled.
   3. Inside engine, modules only point one way (FORBIDDEN below): the request
      table, the Planner, the Store rules and the text layer never reach the
      Executor driver.
-  4. A backend's device implementation (ops, kernels, native primitives,
-     execution) never reaches the shared execution driver or either Store;
-     backend storage is the Store's physical implementation, so it may use the
-     shared state and weight rules.  Listed exceptions carry open debt.
+  4. Numeric ops, kernels and native primitives never reach shared execution or
+     Store policies. Physical execution may consume weight/observation rules,
+     but never the shared driver or request flow. Backend storage may use shared
+     state/weight rules. Listed exceptions carry open debt.
   5. The engine header graph -- public, private and model headers alike -- is a
      DAG, and every private header has a consumer.
   6. A bare include never names two different files, which is what makes the
@@ -65,12 +65,14 @@ FORBIDDEN = {
 DEVICE_FORBIDDEN = ("executor/", "state/", "weights/", "src/",
                     "requests/table.h", "requests/inference.h")
 STORAGE_FORBIDDEN = ("executor/", "requests/table.h", "requests/inference.h")
-DEVICE_DIRS = ("ops", "kernels", "native", "device", "execution")
-# (backend file, engine header) still open; delete the entry when the consumer moves.
-# shortcut: old family headers still consume the shared geometry, remove with K2 family migration.
-MODEL_CONSUMERS = {
-    ("models/qwen35/config.h", "model/common/vision/grid_vision.h"),
-    ("models/common/grid_vision_model.h", "model/common/vision/grid_vision.h"),
+DEVICE_DIRS = ("ops", "kernels", "native", "device")
+EXECUTION_FORBIDDEN = ("executor/driver.h", "executor/flow.h", "state/", "src/",
+                       "requests/table.h", "requests/inference.h")
+# Shared rules consume these explicit host contracts, without device execution.
+HOST_CONTRACTS = {
+    ("executor", "backends/cpu/execution/include/mfq/moe/cpu_measurement.h"),
+    ("state", "backends/cpu/storage/prefix_blocks.h"),
+    ("state", "backends/cpu/storage/qsa_blocks.h"),
 }
 BACKEND_EXCEPTIONS = {
     ("backends/cuda/storage/session/text_cache.cpp", "src/settings.h"),
@@ -112,6 +114,8 @@ class Graph:
         if len(parts) < 3 or parts[0] != "backends":
             return ()
         kind = parts[2]
+        if kind == "execution":
+            return EXECUTION_FORBIDDEN
         if kind in DEVICE_DIRS:
             return DEVICE_FORBIDDEN
         if kind == "storage":
@@ -138,15 +142,17 @@ class Graph:
                 if not target.endswith(".h"):
                     continue
                 engine_relative = rel(target, self.csrc)
+                if rel(src, self.csrc).startswith("engine/include/") and not engine_relative.startswith("engine/include/"):
+                    violations.append((src, lineno, raw,
+                        "public engine contract reaches an implementation header"))
                 if not engine_relative.startswith("engine" + os.sep):
-                    if from_engine and engine_relative.startswith("backends" + os.sep):
+                    if from_engine and engine_relative.startswith("backends" + os.sep) and (self.module(src), engine_relative) not in HOST_CONTRACTS:
                         violations.append((src, lineno, raw,
                             "engine may not include a backend header"))
                     continue
                 if target in self.private_headers:
                     includers[target].add(src)
-                    if self.area(src) not in ALLOWED_CONSUMERS and (
-                            rel(src, self.csrc), rel(target, self.engine)) not in MODEL_CONSUMERS:
+                    if self.area(src) not in ALLOWED_CONSUMERS:
                         violations.append((src, lineno, raw,
                             "engine private headers may not be included here"))
                 if from_engine and src in self.engine_headers:
@@ -177,6 +183,32 @@ def check_tree(csrc, bench=None):
 
 # Small positive and negative trees: a rule that never fires is not a rule.
 FIXTURES = [
+    ("Executor may submit host measurements", {
+        "engine/executor/calibration.h": '#include "mfq/moe/cpu_measurement.h"\n',
+        "backends/cpu/execution/include/mfq/moe/cpu_measurement.h": "void measure();\n",
+        "backends/cuda/execution/adapter.cpp": '#include "calibration.h"\n',
+    }, None),
+    ("physical execution may not drive requests", {
+        "backends/cuda/execution/work.cpp": '#include "driver.h"\n',
+        "engine/executor/driver.h": "struct Driver {};\n",
+    }, "backend device implementation may not include executor/driver.h"),
+    ("state may consume byte storage", {
+        "engine/state/prefix.h": '#include "prefix_blocks.h"\n',
+        "backends/cpu/storage/prefix_blocks.h": "struct Blocks {};\n",
+        "backends/cuda/storage/codec.cpp": '#include "prefix.h"\n',
+    }, None),
+    ("public contracts may compose other public values", {
+        "engine/include/engine.h": '#include "request.h"\n',
+        "engine/include/request.h": "struct Request {};\n",
+    }, None),
+    ("public contracts may not expose core", {
+        "engine/include/engine.h": '#include "mfq/state.h"\n',
+        "core/include/mfq/state.h": "struct State {};\n",
+    }, "public engine contract reaches an implementation header"),
+    ("public contracts may not expose engine implementation", {
+        "engine/include/engine.h": '#include "table.h"\n',
+        "engine/requests/table.h": "struct Table {};\n",
+    }, "public engine contract reaches an implementation header"),
     ("unlisted old model consumer may not include shared model internals", {
         "models/other/config.h": '#include "common/vision/grid_vision.h"\n',
         "engine/model/common/vision/grid_vision.h": "struct Geometry {};\n",

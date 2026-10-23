@@ -3,7 +3,7 @@
 
 #include "core/block.h"
 #include "core/ffn.h"
-#include "models/common/weight_loading.h"
+#include "common/weight_loading.h"
 
 #include <memory>
 #include <string>

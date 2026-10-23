@@ -7,7 +7,7 @@
 #include "kernels/moe/ops.h"
 #include "kernels/norm_ops.h"
 #include "storage/weights/moe/expert_cache.h"
-#include "storage/weights/moe/ffn_pipeline.h"
+#include "execution/moe_ffn_pipeline.h"
 
 #include <algorithm>
 #include <array>

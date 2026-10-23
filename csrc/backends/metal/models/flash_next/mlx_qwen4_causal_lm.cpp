@@ -14,7 +14,7 @@
 #include "runtime/mlx_kernel_prepare.h"
 #include "runtime/mlx_mtp_lora.h"
 #include "settings.h"
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "runtime/mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
@@ -3673,7 +3673,7 @@ private:
     MlxProjectionBatch cache_projections_;
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
-    std::shared_ptr<QsaKvStore> kv_store_ = mlx_qsa_kv_offload_store();
+    std::shared_ptr<mfq::cache::QsaKvStore> kv_store_ = mlx_qsa_kv_offload_store();
     std::unique_ptr<MlxQsaKvOffload> offloaded_kv_;
     std::unique_ptr<MlxQsaIndexOffload> offloaded_pool_;
     std::unique_ptr<MlxKvCache> cache_;
@@ -5555,7 +5555,7 @@ std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
     return bytes;
 }
 
-std::optional<QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
+std::optional<mfq::cache::QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
     if (kv_offload_store_) return kv_offload_store_->stats();
     return std::nullopt;
 }
@@ -6311,9 +6311,9 @@ MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(
     const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
         if (layer.kv) state.bytes += layer.kv->nbytes();
         if (layer.offloaded_kv) state.bytes += layer.offloaded_kv->rows.tail.size() +
-            layer.offloaded_kv->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_kv->rows.blocks.size() * sizeof(mfq::cache::QsaKvStore::BlockPtr);
         if (layer.offloaded_pooled_keys) state.bytes += layer.offloaded_pooled_keys->rows.tail.size() +
-            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(mfq::cache::QsaKvStore::BlockPtr);
         for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
             &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
         state.bytes += layer.ple_context.size() * sizeof(std::int64_t);

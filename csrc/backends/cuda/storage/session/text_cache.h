@@ -1,7 +1,7 @@
 #pragma once
 
 #include "native/tensor/backend.h"
-#include "csrc/core/step_sequence.h"
+#include "step_sequence.h"
 #include <variant>
 
 #include <cstddef>

@@ -1,6 +1,7 @@
+#include "resource_error.h"
 #include "native/context.h"
 #include "native/resident_allocations.h"
-#include "mfq/runtime.h"
+#include "request.h"
 
 #include <cuda_runtime_api.h>
 

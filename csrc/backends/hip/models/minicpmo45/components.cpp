@@ -2,7 +2,7 @@
 #include "ops.h"
 #include "runtime.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "hip_sampling.h"
 #include "mfq_tensor_backend.h"
 #include "tensor_parallel.h"

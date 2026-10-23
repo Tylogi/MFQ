@@ -31,7 +31,7 @@ mlx::core::Shape checked_shape(
     return shape;
 }
 
-MlxSamplingParams metal_sampling(const MfqSamplingParams& sampling) {
+MlxSamplingParams metal_sampling(const mfq::SamplingParams& sampling) {
     MlxSamplingParams result;
     result.temperature = sampling.temperature;
     result.top_k = sampling.top_k;
@@ -100,11 +100,11 @@ static MlxEngineComponents make_grid_vision_engine_components(
          runtime_holder = std::move(runtime_holder), runtime_stream](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
-            const MfqSamplingParams& sampling,
+            const mfq::SamplingParams& sampling,
             MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
             const auto callback = [&job](std::int64_t token) { return job.token(token); };
-            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+            const auto on_prefill = [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -154,7 +154,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
             {
                 report_prefill = [on_prefill, component_ms](
                     std::size_t tokens, double llm_ms) {
-                    on_prefill(MfqPrefillTiming{
+                    on_prefill(mfq::PrefillTiming{
                         tokens, llm_ms, component_ms,
                         llm_ms + component_ms});
                 };
@@ -191,11 +191,11 @@ MlxEngineComponents make_mlx_engine_components(
             [runtime_mutex, runtime_holder, runtime_stream](
                 const std::vector<std::int64_t>& prompt,
                 const MfqMultimodalInput& media,
-                const MfqSamplingParams& sampling,
+                const mfq::SamplingParams& sampling,
                 MlxGenerationJob& job,
                 const MfqTokenConstraintPtr& token_constraint) {
                 const auto callback = [&job](std::int64_t token) { return job.token(token); };
-                const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+                const auto on_prefill = [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
                 std::lock_guard<std::mutex> lock(*runtime_mutex);
                 if (!runtime_holder->has_value()) {
                     throw std::runtime_error(
@@ -290,7 +290,7 @@ MlxEngineComponents make_mlx_engine_components(
                         double llm_ms,
                         double multimodal_ms,
                         double model_ms) {
-                        on_prefill(MfqPrefillTiming{
+                        on_prefill(mfq::PrefillTiming{
                             tokens, llm_ms, multimodal_ms, model_ms});
                     };
                 }
@@ -520,11 +520,11 @@ MlxEngineComponents make_mlx_engine_components(
          runtime_holder = std::move(runtime_holder), runtime_stream](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
-            const MfqSamplingParams& sampling,
+            const mfq::SamplingParams& sampling,
             MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
             const auto callback = [&job](std::int64_t token) { return job.token(token); };
-            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+            const auto on_prefill = [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -631,7 +631,7 @@ MlxEngineComponents make_mlx_engine_components(
                     double llm_ms,
                     double multimodal_ms,
                     double model_ms) {
-                    on_prefill(MfqPrefillTiming{
+                    on_prefill(mfq::PrefillTiming{
                         tokens, llm_ms, multimodal_ms, model_ms});
                 };
             }
@@ -669,11 +669,11 @@ MlxEngineComponents make_mlx_engine_components(
          runtime_holder = std::move(runtime_holder), runtime_stream](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
-            const MfqSamplingParams& sampling,
+            const mfq::SamplingParams& sampling,
             MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
             const auto callback = [&job](std::int64_t token) { return job.token(token); };
-            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+            const auto on_prefill = [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -758,7 +758,7 @@ MlxEngineComponents make_mlx_engine_components(
             {
                 report_prefill = [on_prefill](
                     std::size_t tokens, double total_ms) {
-                    on_prefill(MfqPrefillTiming{
+                    on_prefill(mfq::PrefillTiming{
                         tokens, total_ms, 0.0, total_ms});
                 };
             }

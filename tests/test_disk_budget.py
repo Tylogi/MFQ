@@ -175,11 +175,11 @@ def native_writer(tmp_path_factory):
     root = Path(__file__).resolve().parents[1]
     output = tmp_path_factory.mktemp('disk-native') / 'writer'
     source = r'''
-#include "mfq_paged_prefix_cache.h"
-#include "mfq/qsa_kv_store.h"
+#include "prefix_cache.h"
+#include "qsa_blocks.h"
 #include <iostream>
 int main(int argc, char** argv) {
-    mfq::cache::PagedPrefixCacheConfig prefix;
+    mfq::cache::PrefixBlockStoreConfig prefix;
     prefix.cache_dir = std::filesystem::path(argv[1]) / "prefix";
     prefix.compatibility_key = "disk-budget-test";
     prefix.block_size_tokens = 4;
@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
     mfq::cache::PagedPrefixCache cache(prefix);
     std::int64_t tokens[] = {1,2,3,4};
     cache.store({}, tokens, 4, std::make_shared<const std::vector<std::uint8_t>>(512, 7));
-    cache.flush();
+    cache.blocks.flush();
     std::cout << cache.metrics().writes << " ";
     mfq::cache::QsaKvStoreConfig kv;
     kv.directory = argv[1]; kv.budget_bytes = 4096; kv.buffer_bytes = 4096;
@@ -200,9 +200,11 @@ int main(int argc, char** argv) {
 }
 '''
     result = subprocess.run([compiler, '-std=c++17', '-pthread', '-Wno-deprecated-declarations',
-        '-I' + str(root / 'csrc/core'), '-I' + str(root / 'csrc/core/include'),
-        '-x', 'c++', '-', str(root / 'csrc/core/mfq_paged_prefix_cache.cpp'),
-        str(root / 'csrc/core/qsa_kv_store.cpp'), '-o', str(output),
+        '-I' + str(root / 'csrc/engine/state'), '-I' + str(root / 'csrc/backends/cpu/storage'),
+        '-I' + str(root / 'csrc/formats'),
+        '-x', 'c++', '-', str(root / 'csrc/engine/state/prefix_cache.cpp'),
+        str(root / 'csrc/backends/cpu/storage/prefix_blocks.cpp'),
+        str(root / 'csrc/backends/cpu/storage/qsa_blocks.cpp'), '-o', str(output),
 ], input=source, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     return output

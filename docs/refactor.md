@@ -313,7 +313,7 @@ for (std::size_t i = 0; i < layers.size(); ++i)
 return head.run(final_norm.run(hidden, run), batch.outputs, run);
 ```
 
-实际 `forward_steps` 复用现有 [StepSequence](../csrc/core/step_sequence.h)（终态归 `engine/include/`），将可能等待的完整算子通过 `next()` 和 `co_yield` 逐步推进；普通非阻塞 norm/Linear 调用保持直接。每次 Executor::poll 只推进有界工作，serving 不使用会循环耗尽任务的 `finish_steps`。需要等待的 CPU/offload 路径也必须让出控制权；不为此引入通用任务调度器。
+实际 `forward_steps` 复用现有 [StepSequence](../csrc/engine/include/step_sequence.h)，将可能等待的完整算子通过 `next()` 和 `co_yield` 逐步推进；普通非阻塞 norm/Linear 调用保持直接。每次 Executor::poll 只推进有界工作，serving 不使用会循环耗尽任务的 `finish_steps`。需要等待的 CPU/offload 路径也必须让出控制权；不为此引入通用任务调度器。
 
 例如 MoE 路由结果就绪后才能确定要读取的专家，顺序是提交 routing、等待其 event、提交 SSD 读取、等待 I/O、提交 H2D/专家计算。等待发生在 forward 内，不能全部假设在 launch 前完成。MoE 在必要位置 yield，父层和 family 逐级传播 waiting；算子保留自己的计算进度，InFlightBatch 保证其 frame、activation 和外部资源的生命周期。现有 StepSequence 析构会直接销毁 frame，取消路径必须先完成前述 drain，不能直接丢弃任务。
 
@@ -426,7 +426,7 @@ Duplex 是允许追加输入 chunk 的长请求。输入追加、关闭和取消
 
 ## 目录与构建职责
 
-五个 Module、模型和文本在 `engine/` 内形成公共实现。后端目录保留真实设备差异；不能把 CUDA 宿主实现整体搬进 engine 后仍称它公共层。终态没有 `core/` 聚合目录：它现在同时包含模型文件读取、格式解码、模型几何、请求值契约、线程池、KV 磁盘存储与专家放置策略，这些能力按职责归到下列位置，不整体改名为 common/base 后保留聚合依赖。
+五个 Module、模型和文本在 `engine/` 内形成公共实现。后端目录保留真实设备差异；不能把 CUDA 宿主实现整体搬进 engine 后仍称它公共层，也不建立 common/base 聚合依赖。
 
 ```text
 cuda/csrc/
@@ -468,34 +468,9 @@ cuda/csrc/
 
 原生基础设施使用 `native/`；目录迁移必须同步 `mfq/kernels/cuda/_ext.py` 的源码清单。
 
-### `core/` 的终态归属
+Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokenizer 底层实现留在 `components/tokenizer/`，两者都不并入 Engine 模块或公共值目录。模型配置与公式归 `engine/model/`；旧继承与 ForwardOps 绑定按阶段 2 用完整算子组合替换。
 
-下表来源相对 `csrc/core/`，目标相对 `csrc/`。目录迁移与职责拆分一起进行；不能只改 include 拼写而保留原来的整包依赖。
-
-| 当前内容 | 目标归属 |
-| --- | --- |
-| `include/mfq/runtime.h`、`sampling.h`、`token_constraint.h` | 请求/采样/媒体输入值契约归 `engine/include/`；生成规则归 `engine/requests/`，语法实现归 `engine/text/`。合并重复的 SamplingParams/PromptCachePlan；模型特有媒体配置归对应 family。后端数值算子只接收所需标量、mask 和 view |
-| `step_sequence.h` | `engine/include/` 的任务推进契约；保留无设备依赖的 coroutine 实现，不借此暴露 Executor 私有实现 |
-| `mfq_model_graph.h/.cpp`、`include/mfq/model_graph.h` | `formats/model_graph/` 的产物 schema、解析与校验；只表达持久化描述，family forward 与执行策略仍归 `engine/model/`，不把 ModelGraph 扩成计算 IR |
-| `model_source/`、`include/mfq/model_source/` | 独立 `model_source/`，复用 `mfq-model-source`；只负责打开输入、规范化元数据、有界读取，不管理权重驻留、请求或设备执行 |
-| `compat/mfq_legacy_model_graph.*`、`mfq_legacy_tensor_names.*` | `model_source/compat/` 私有读取实现；旧格式与名称在输入处规范化，ModelSource 公共头不再暴露 LegacyTensorAliases |
-| `compat/mfq_format_compat.h` | 规范格式标识归 `formats/`，旧标识识别留 `formats/compat/`；原生算子只分派规范格式，不保留旧 C++ 转发头 |
-| `include/mfq/quant/` 中 blob、row、MFE payload 解码及 `quant/*.cpp`（不含 row cache） | `formats/quant/`；保留范围读取、字节数/溢出校验和编码布局。MfeQuantExpertStore 是产物范围读取实现，不是新的 WeightStore |
-| `generated/nvq_codebooks.generated.h` | `formats/generated/`；共享只读格式表，推理构建不运行 Python 校准/量化来重新生成它 |
-| `io/`、`include/mfq/io/{file_range_reader,async_range_reader,read_span}.h` | `components/io/`；只负责文件范围、批量读取及统计，不认识 Tensor、family 或 Engine |
-| `include/mfq/io/host_memory_copy.h` | 拷贝声明归已有 `backends/cpu/ops/`；保持 CUDA/Metal CPU offload 的实际调用 |
-| `include/mfq/moe/{dispatch_plan,cpu_cost_model}.h`、`tensor_parallel.h` 中纯分片规划 | `engine/weights/` 的放置、成本与分片规则；WeightStore 输出显式计划，后端只执行。设备 launch 次序归相应 backend execution |
-| `include/mfq/moe/cpu_calibration.h` | 异步任务推进归 `engine/executor/`；CPU 测量工作归 `backends/cpu/execution/`；观测结果回写 weights 成本模型。这是推理期间的在线测量，不是离线量化校准 |
-| `mfq_paged_prefix_cache.*` | prefix 身份、匹配、失效与预算归 `engine/state/`；文件、字节缓存和读写队列归 `backends/cpu/storage/`。后端 session codec 不另建 prefix 策略 |
-| `qsa_kv_store.cpp`、`include/mfq/qsa_kv_store.h` | RAM/SSD 字节块存储归 `backends/cpu/storage/`；sequence/snapshot 的逻辑状态归 `engine/state/`；QSA 设备布局仍归本后端 |
-| `include/mfq/quant/nint_row_cache.h` | `backends/cuda/storage/weights/`；当前实际消费者是 CUDA 行读取路径及其测试，逻辑预算/lease 与 WeightStore 对齐 |
-| `grid_vision.h/.cpp` | `engine/model/common/vision/`；模型配置、patch 几何和 canonical tensor roles 保留一份，model-graph target 不再夹带视觉模型算法 |
-
-线程、拓扑、亲和性与 host copy 原语已归 `backends/cpu/native/`，CPU 专家调度已归 `backends/cpu/execution/`；CUDA native 仅依赖 host 原语，不经它引入专家调度。
-
-因此新增的公共职责目录只有 `formats/`、`model_source/`、`components/io/`；线程、主机存储和 CPU 执行进入已有 `backends/cpu/`，其余回到五个 Module、模型或文本。每个目录有明确消费者和职责，不新增包揽所有依赖的第六个 Engine Module，也不保留 `core2/common/base` 等价聚合库。
-
-Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokenizer 底层实现留在 `components/tokenizer/`，两者都不并入 Engine 模块或公共值目录。`models/` 现有配置与公式最终合入 `engine/model/`，迁完全部消费者后删除旧根目录，不长期维护两份 family 树。`engine/internal/` 抽屉已拆为 `engine/{include,src,requests,batch,state,weights,executor,text}`，其有效实现按职责留在这些目录。
+ModelGraph 只描述持久化 schema，不扩成计算 IR。格式范围解码保留字节数、溢出和布局校验；只读码表不在推理构建中重新生成。CPU 成本观测是推理期间的在线测量，其异步推进归 executor，测量工作归 CPU execution，结果回写 weights 成本模型。
 
 `Preparation/InFlightBatch` 归 executor，拥有已提交任务及资源，跨 step 存活；batch 只生成计划。后端 storage 是公共 Store 的具体物理实现，同一实例被组合持有，不是另一份 StateStore/WeightStore。后端 execution 只有设备行为，不持有 RequestTable、模型选择或 acceptance/commit 规则。
 
@@ -534,9 +509,9 @@ Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokeniz
 
 `mfq-engine` 编译公共非模板实现并导出必要契约；模板实现仅由需要的后端装配/测试使用。CUDA/Metal target 各自链接公共库并实例化，公共 target 不链接任一设备 target。配置/model target 是否合并由真实链接关系决定，不为五个 Module 各造一个空 library，不将全部私有目录设为 PUBLIC include。
 
-构建 target 的终态：删除 `mfq-core`/`mfq::core`/`MFQ_CORE_INCLUDE_DIR`/`add_subdirectory(core)`，删除后端 target 配置函数里统一链接 core 的做法，各 target 声明自己用到的库；复用 `mfq-model-source`、`mfq-model-graph`、`mfq-host-parallel` 等已有明确 target，调整源码归属；格式纯头可用 `mfq-format-headers` 暴露，格式解码实现、文件读取、CPU 专家执行和 host 存储按实际链接需求建 target，kernel 只用格式头时不得顺便编译完整 decoder 或 loader。每个 Module 只导出自身公开 include 目录，内部实现、generated 表和 compat 按实际需要限定可见范围；不保留 core 根目录/compat/generated 的统一导出及旧路径转发头，也不保留为旧 include 拼写开放的仓库根路径。
+各 target 声明自己用到的库，复用 `mfq-model-source`、`mfq-model-graph`、`mfq-host-parallel` 等已有 target。`mfq-formats` 暴露纯格式头；格式解码、文件读取、CPU 专家执行和 host 存储按实际链接需求建 target，kernel 只用格式头时不得顺便编译完整 decoder 或 loader。每个 Module 只导出自身公开 include 目录，内部实现、generated 表和 compat 按实际需要限定可见范围；不保留旧路径转发头或为旧 include 拼写开放的仓库根路径。
 
-保留 `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`：runtime、tokenizer、cache、诊断与评估仍可构建。目标还要求公共层可以关闭设备后端：只构建公共 Engine 与契约测试时不要求 CUDA/Metal SDK、Torch 或 Python 扩展；开关名与实施顺序见 [plan.md](plan.md) §1.5。移动共享代码时同步 Metal、Python 扩展/校准与诊断消费者。三项依赖检查共用 `cuda/tests/include_graph.py` 并从目录树读模块列表；随新目录继续更新规则并保留反例验证。
+保留 `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`：后端、tokenizer、cache、诊断与评估仍可构建，服务程序不参与构建。只构建公共 Engine 与契约测试时不要求 CUDA/Metal SDK、Torch 或 Python 扩展；构建与验证范围见 [plan.md](plan.md) §1.5。移动共享代码时同步 Metal、Python 扩展/校准与诊断消费者。三项依赖检查共用 `cuda/tests/include_graph.py` 并从目录树读模块列表；随新目录继续更新规则并保留反例验证。
 
 ## 旧架构的替换要求
 
@@ -550,7 +525,6 @@ Transport 与 tokenizer 保持独立归属：协议只在 `transport/`，tokeniz
 | ContinuousBatch<Execution> + CudaBatchExecution 双层驱动 | 纯 BatchPlanner + 共享 Executor；后端仅提交和完成 |
 | CudaExecutionContext 中 expert cache、QSA KV owner | 对应 Store 组合物理实现；RunContext 只保留限定执行资源 |
 | model_components 的视觉数学、MiniCPM move/dynamic_cast | 数学归共享模型/完整算子；模型包直接拥有子模型 |
-| `csrc/core/` 与 `mfq-core` 聚合依赖 | 按职责归到 formats、model_source、components/io、backends/cpu、五个 Module 与模型；删除聚合 target、别名与目录，不留转发库 |
 | kernels、设备 RAII、已有 reader、有效采样/文本算法 | 保留真实行为并调整调用；不因改架构重写已验证数值实现 |
 
 旧 `MFQ_CUDA_EACH_MODEL` 同时实例化加载、generation、MTP、KL。新模型不能只换类型名后继续承担旧协议；工厂切换完整 Engine 路径，并同步迁移这些消费者。公共 Interface 上不留永久兼容 facade。

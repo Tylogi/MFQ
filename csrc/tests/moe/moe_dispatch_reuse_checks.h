@@ -1,5 +1,5 @@
 #pragma once
-#include "mfq/moe/dispatch_plan.h"
+#include "dispatch_plan.h"
 #include <stdexcept>
 
 inline int dispatch_reuse_checks() {

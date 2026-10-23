@@ -5,7 +5,7 @@
 namespace mfq::cuda::diagnostics {
 struct GenerationResult {
     std::vector<int64_t> tokens;
-    MfqPrefillTiming prefill;
+    mfq::PrefillTiming prefill;
     std::chrono::steady_clock::time_point first_token;
 };
 inline GenerationResult collect_generation(mfq::engine::Generation generation) {
@@ -24,7 +24,7 @@ inline GenerationResult collect_generation(mfq::engine::Generation generation) {
 }
 template <class Model>
 std::vector<int64_t> check_mtp_steps(Model& model, MtpModule& mtp,
-        const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling, int stop_after = 0) {
+        const std::vector<int64_t>& prompt, const mfq::SamplingParams& sampling, int stop_after = 0) {
     mfq::engine::InferenceRequest request;
     request.prompt = prompt; request.sampling = sampling;
     mfq::engine::InferenceOutput output(request, nullptr, "mtp-check");
@@ -53,7 +53,7 @@ std::vector<int64_t> check_mtp_steps(Model& model, MtpModule& mtp,
     return tokens;
 }
 inline GenerationResult collect_engine_steps(mfq::engine::Engine& engine,
-        std::vector<int64_t> prompt, MfqSamplingParams sampling) {
+        std::vector<int64_t> prompt, mfq::SamplingParams sampling) {
     mfq::engine::EngineRequest request;
     request.id = "check";
     request.diagnostic_input = mfq::engine::DiagnosticTokenInput{std::move(prompt)}; request.input.sampling = sampling;
@@ -86,7 +86,7 @@ inline GenerationResult collect_engine_steps(mfq::engine::Engine& engine,
     return result;
 }
 inline std::vector<int64_t> check_engine_steps(mfq::engine::Engine& engine,
-        std::vector<int64_t> prompt, MfqSamplingParams sampling) {
+        std::vector<int64_t> prompt, mfq::SamplingParams sampling) {
     return collect_engine_steps(engine, std::move(prompt), sampling).tokens;
 }
 } // namespace mfq::cuda::diagnostics

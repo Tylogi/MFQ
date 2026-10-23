@@ -24,10 +24,13 @@ Anything that can be shared by more than one model architecture **must not**
 be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
-- Remaining runtime values, placement rules and state storage still pass through
-  transitional `mfq-core`; K2–K4 remove that aggregation. Schemas and row readers
-  already belong to `formats/`, model input to `model_source/`, and vision
-  geometry to `engine/model/common/vision/`. Do not add new code to `core/`.
+- Runtime placement and cost rules live in `engine/weights/`, task collection
+  in `engine/executor/`, and logical prefix/QSA state in `engine/state/`.
+  Host byte storage, disk reservations and encoded-row leases belong to
+  `backends/cpu/storage/`; measured CPU work belongs to CPU execution.
+  Schemas and row readers belong to `formats/`, model input to `model_source/`,
+  and vision geometry to `engine/model/common/vision/`. Do not recreate a core
+  aggregation or add forwarding headers.
 - `mfq-model-graph` parses only persisted schema. `mfq-model-source` opens inputs,
   normalizes metadata and retains bounded readers; neither may depend on core,
   Engine or model execution. Keep alias maps in `model_source/compat/`; public
@@ -49,12 +52,17 @@ architecture-named entry point.
 - Cross-backend request execution, tokenization, sampling semantics, physical
   batch policy, session/cache lifecycle, metrics and MTP acceptance/commit rules
   belong in `csrc/engine/`.
-- Shared model configurations and forward definitions live today in
-  `csrc/models/<family>/`, with shared layer compositions in
-  `csrc/models/common/`. Family equations, positions and topology are defined
-  once and composed with backend operations. The target moves each family to
-  `csrc/engine/model/<family>/` composed with complete backend operators;
-  [refactor.md](docs/refactor.md) defines that end state and
+- Engine request/media values, sampling parameters, grammar cursor and
+  `StepSequence` live in `csrc/engine/include/`. Sampling has one definition in
+  `sampling_params.h`; device sampling adapters include that narrow contract.
+  Native allocators include `resource_error.h` directly.
+- Shared model configurations and forward definitions live in
+  `csrc/engine/model/<family>/`, with shared layer compositions in
+  `csrc/engine/model/common/`. Their non-template implementations compile in
+  `mfq-engine`; backend adapters and tests opt into the private model include
+  path. Family equations, positions and topology are defined once. The target
+  composes complete backend operators; [refactor.md](docs/refactor.md) defines
+  that execution chain and
   [bugs.md](docs/bugs.md) B28 tracks the current binding chain
   (`CausalModelBase → CudaCausalOps → native model`) as debt, not as a rule to
   reproduce.
@@ -64,7 +72,8 @@ architecture-named entry point.
   `csrc/backends/cuda/kernels`; `mfq/kernels/cuda/` holds only the Python
   wrappers, `mfq_cuda.cpp` and the `_ext.py` manifest, which compiles a subset
   of those same native sources. There is no pending kernel move.
-- CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
+- CUDA `native/` owns tensors and contexts, `execution/` owns runtime context
+  and expert task submission, `storage/` owns weight materialization
   and physical cache storage, and `engine/` is the sole composition root for
   family selection, runtime components, batching and CUDA Graphs.
   `models/<family>/` supplies native operator/state bindings, with reusable
@@ -94,8 +103,9 @@ are not exceptions.
 ## Dependency and header boundaries
 
 Transport depends on scheduler contracts. Scheduler depends on the shared
-Engine interface. Shared Engine/model code must not include backend headers or
-branch on backend identity. Backends provide native types and compile-time
+Engine interface. Shared model code must not include backend headers or
+branch on backend identity. Engine state/executor consume only the three CPU
+host contracts listed in `tests/test_engine_include_graph.py`. Backends provide native types and compile-time
 operations; do not add a universal type-erased tensor/KV layer, callback Engine,
 or per-backend generation loop. Backend operations must not publish request
 events or receive token emitters, cancellation callbacks or transport objects.
@@ -106,7 +116,7 @@ kernel declarations. Internal consumers include those headers explicitly;
 internal include paths stay PRIVATE in CMake. Do not add forwarding headers
 for old paths or expose implementation directories through a PUBLIC include.
 
-`mfq-cuda-runtime` and `mfq-paged-prefix-cache` build independently of transport.
+`mfq-cuda-runtime`, `mfq-engine` and the host byte stores build independently of transport.
 `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` removes communication modules and the
 serving executable; it does not disable backend, tokenizer, cache, diagnostics
 or evaluation targets. Only serving applications link backend and transport.
@@ -118,9 +128,11 @@ without invoking a CUDA compiler or linking a CUDA library.
 Inside `backends/cuda`, a cross-directory include is written as
 `"<dir>/<name>"` (`#include "ops/moe/moe.h"`, never `"moe.h"` or `"../ops/moe/moe.h"`);
 the build no longer adds the layer directories to the include path, so the bare
-form cannot compile. The directories form a DAG from lowest to highest:
-`native`, `kernels`, `ops`, `storage`, `models`, `engine`. A file may include
-its own directory or a lower one. `apps/`, `commands/`, `diagnostics/`, `eval/`
+form cannot compile. The include layers form a DAG from lowest to highest:
+`native`, `kernels`, context, `ops`, `storage`, `execution`, `models`, `engine`.
+The context layer is the existing `execution/cuda_execution.h` contract used by
+operators; execution implementations submit work and may depend on storage.
+A file may include its own layer or a lower one. `apps/`, `commands/`, `diagnostics/`, `eval/`
 and `tests/` are top-level consumers. `tests/test_cuda_include_graph.py`
 enforces the include form and the DAG, and `tests/test_layer_independence.py`
 keeps the shared layers free of backend and model-family names.
@@ -134,18 +146,17 @@ unchanged, the path is still rooted at the layer directory.
 `src`) is PRIVATE in `engine/CMakeLists.txt`, and the backends and tests add
 those directories to their include path and include their headers bare. That is
 the only way a backend drives the shared generation loop, so it is allowed for
-`backends/` and `tests/`; the boundary check lists the two temporary old-model
-geometry consumers explicitly. Other consumers are forbidden: `core/`, `transport/`,
-`scheduler/`, `models/` and `components/` must not include an engine private
-header. `engine/` never includes a backend header, and inside `engine/` the
+`backends/`, `tests/` and `bench/`. Other consumers are forbidden:
+`transport/`, `scheduler/` and `components/` must not include an engine private
+header. Engine consumes only the listed CPU host contracts, and inside `engine/` the
 request table, Planner, Store rules and text layer never reach the Executor
-driver. A backend's `ops/`, `kernels/` or `execution/` code never includes the
-shared Executor or Store headers; `storage/` may, because it is the physical
-StateStore and WeightStore. The engine header graph is a DAG and no private
+driver. A backend's `ops/`, `kernels/` and native primitives never include shared
+Executor or Store policy headers. Physical `execution/` may consume weight and
+observation rules, but never the shared driver or request flow; `storage/` may
+use shared state/weight rules. The engine header graph is a DAG and no private
 header is orphaned. `tests/test_engine_include_graph.py` checks all of this, and
 carries one small fixture per rule so a rule that stopped firing fails the test
 by itself.
-`tests/test_engine_include_graph.py` enforces all four.
 
 There is no `runtime/` layer and no `Runtime` type. Composition and lifetime
 live in the application executable (`apps/`, `commands/`); a word that names no
@@ -182,7 +193,7 @@ weights provide them; missing weights or an explicit user override disables them
 
 Before submitting a runtime or quantization change:
 
-1. Identify the owner: core, file I/O, transport, scheduler, shared Engine/model,
+1. Identify the owner: formats, model input, file I/O, transport, scheduler, shared Engine/model,
    backend operation/storage, importer, or application.
 2. Search all architectures and both backends for an equivalent implementation.
 3. Extract reusable behavior before extending it; keep model adapters thin.

@@ -1,9 +1,9 @@
 # MFQ C++ runtime
 
 The native runtime is organized by responsibility. Shared models are grouped
-by model family. The tree below is the **current transitional layout**; the
-target layout removes the `core/` aggregation, moves each family to
-`engine/model/<family>/`.
+by model family. The tree below is the **current transitional layout**;
+replacing the old model binding chain with complete backend operators remains
+in the plan.
 Format schemas, range readers and frozen codebooks live in `formats/`,
 model input lives in `model_source/`, and file
 I/O lives in `components/io/`. That end state is defined in
@@ -11,9 +11,6 @@ I/O lives in `components/io/`. That end state is defined in
 [docs/plan.md](../docs/plan.md); nothing here claims the new execution chain
 has landed.
 
-- `core/` — remaining request/value contracts, placement rules and state storage.
-  The transitional `mfq-core` aggregation is removed by K2–K4 in
-  [docs/plan.md](../docs/plan.md);
 - `model_source/` — input discovery, metadata normalization and bounded reads,
   built as `mfq-model-source`. Headers sit beside implementations; old graph/name
   readers stay in `compat/`. The public source contract exposes layout facts,
@@ -23,23 +20,27 @@ has landed.
   frozen NVQ codebooks. `mfq-formats` publishes these headers without a library
   dependency. Compiled NINT/NVQ/MFE range readers live beside those headers
   in `formats/quant/` and build as `mfq-quant-readers`, with file-read values
-  and host workers but no core/model dependency. Canonical dtype identifiers
+  and host workers but no model dependency. Canonical dtype identifiers
   live in `formats/dtype.h`; legacy spelling recognition stays in `formats/compat/`.
-  Model sources and backend operators consume the headers directly; CUDA
-  native kernels no longer depend on `mfq-core`. Persisted model schema and
-  validation live in `formats/model_graph/` (`mfq-model-graph`); that target
+  Model sources, backend operators and CUDA native kernels consume the headers
+  directly. Persisted model schema and validation live in `formats/model_graph/`
+  (`mfq-model-graph`); that target
   contains no vision algorithm or old model reader. Legacy dtype spellings are
   normalized at metadata/cohort input; VQ/SQ operators accept canonical IDs;
-- `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
+- `engine/model/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
   defines its concrete `CausalLm`, forward graph, topology, and position rules.
-  MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
-  causal traversal, attention, MLP, MoE, recurrence, and shared layer compositions;
+  MiniCPM also defines `TtsCausalLm`. `engine/model/common/` contains `CausalModelBase`,
+  causal traversal, attention, MLP, MoE, recurrence, shared layer compositions
+  and YaRN scaling. Compiled model functions belong to `mfq-engine`;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral logical request lifecycle, admission,
   cancellation decisions and bounded output queues;
 - `engine/model/common/vision/` — shared grid vision configuration, geometry,
-  positions and canonical tensor roles, compiled by `mfq-engine`. Two old model
-  headers still consume this implementation until their K2 migration;
+  positions and canonical tensor roles, compiled by `mfq-engine` and consumed
+  within the shared model tree;
+- `engine/include/` — public request/media values, the sole `SamplingParams`,
+  grammar cursor, resource errors and `StepSequence`. Engine clients inherit
+  only this public directory; implementation dependencies stay private;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
@@ -48,12 +49,21 @@ has landed.
   independently of model sources and Engine; its only library dependency is
   `mfq-host-parallel`. `mfq-model-source` exposes the reader value contracts
   through its public link to `mfq-io`;
-- `backends/cpu/` — host thread primitives, CPU expert execution and host math;
-  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`, which no longer publishes
-  the old core include directory;
+- `engine/state/` owns prefix identity/matching and QSA sequence/snapshot rules;
+  a prefix cache composes its host byte store. `engine/weights/` owns MoE cost,
+  placement and pure shard planning; `engine/executor/` starts/collects measured
+  CPU jobs and plans rank submission order. Operators consume the public
+  dispatch/slice values, rather than loading these policies;
+- `backends/cpu/` — host thread primitives, CPU expert execution and host math.
+  `storage/` owns RAM/SSD byte stores, disk reservation guards and the immutable
+  encoded-row cache shared by CUDA/HIP. `mfq-prefix-blocks` and
+  `mfq-qsa-kv-store` contain no Engine policy; CPU execution measures work while
+  captured inputs retain their leases;
+  `ops/host_memory_copy.h` belongs to `mfq-cpu-ops`;
 - `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests. `native/` implements
-  Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains
+  Tensor/context primitives in the `mfq-cuda-native` target. `execution/` owns
+  the runtime context and expert submission pipeline. `ops/` contains
   device operators, including RoPE; operators consume loaded weights.
   `storage/` owns weight/source primitives, KV storage, paged payload I/O and
   cache storage; it does not select model families.
@@ -87,7 +97,8 @@ results after execution returns. Engine owns physical request state, model
 composition, tokenization, sampling semantics, MTP commit rules and session/cache
 lifecycle. Backend operations own numerical execution and native resources;
 they do not receive output/cancellation callbacks or transport objects. Shared
-model and Engine code must not depend on concrete backend headers.
+model code does not depend on backend headers; Engine state/executor use only
+the three CPU host contracts listed by the include-boundary check.
 
 CUDA's public header is `backends/cuda/include/cuda_engine.h`, containing
 load options and `load_cuda_engine()`. Tensor/context headers stay in `native/`,
@@ -107,7 +118,7 @@ identity materialization, numerical verification, CUDA Graph execution, and
 physical batch operations stay CUDA-specific. Generation, MTP draft/accept/commit
 rules, and the continuous-batching request state machine are shared. Qwen3.5
 and the other seven model families now keep their forward definitions in
-`models/<family>/causal_lm.h`, including sparse/recurrent attention, MoE,
+`engine/model/<family>/causal_lm.h`, including sparse/recurrent attention, MoE,
 predictors, and MiniCPM audio/vision/TTS traversal. CUDA family `ops.h/.cpp`
 files bind these definitions to native tensors, kernels, weights, and caches.
 Qwen4/GLM5 decoder order, DeepSeek-V4.1 target/DSpark mega-layers, and

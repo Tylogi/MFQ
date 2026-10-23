@@ -1,7 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "kv_cache.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "mfq_hip_cache_ops.h"
 #include "mfq_hip_paged_kv.h"
 

@@ -2,7 +2,7 @@
 #include "mfq_hip_norm_ops.h"
 #include "mfq_hip_quant_ops.h"
 #include "vq.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "format.h"
 #include "generated/nvq_codebooks.generated.h"
 #include "quant_dot.h"

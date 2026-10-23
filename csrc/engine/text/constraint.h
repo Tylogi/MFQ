@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/runtime.h"
+#include "token_constraint.h"
 
 struct common_chat_params;
 

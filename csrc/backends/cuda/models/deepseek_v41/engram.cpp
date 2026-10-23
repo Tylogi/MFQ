@@ -2,7 +2,7 @@
 #include "native/context.h"
 #include "mfq/host_parallel.h"
 #include "mapped_prefetch_scope.h"
-#include "mfq/quant/nint_row_cache.h"
+#include "nint_row_cache.h"
 #include "storage/weights/nint_row_pipeline.h"
 
 #include <condition_variable>

@@ -23,7 +23,7 @@ struct MlxMtpBatchRound {
     bool stable;
 };
 
-inline MlxSamplingParams mlx_batch_sampling(const MfqSamplingParams& input) {
+inline MlxSamplingParams mlx_batch_sampling(const mfq::SamplingParams& input) {
     MlxSamplingParams result;
     result.temperature = input.temperature;
     result.top_k = input.top_k;
@@ -42,7 +42,7 @@ struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
         : BatchRequest(std::move(id), input), sampler(mlx_batch_sampling(input.sampling)),
           cache_plan(input.cache_plan), history(input.prompt) {}
     MlxSampler sampler;
-    MfqPromptCachePlan cache_plan;
+    mfq::PromptCachePlan cache_plan;
     std::shared_ptr<MlxQwen4RequestCache> cache;
     std::optional<mlx::core::array> counts;
     std::optional<mlx::core::array> initial_logits;
@@ -72,7 +72,7 @@ public:
     using State = mfq::engine::BatchState<Request>;
     struct Sample {
         std::int64_t token = 0;
-        MfqPrefillTiming timing;
+        mfq::PrefillTiming timing;
     };
     struct Decoded {
         mlx::core::array logits;

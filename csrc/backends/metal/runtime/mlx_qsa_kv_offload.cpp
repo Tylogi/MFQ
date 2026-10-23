@@ -16,7 +16,7 @@ namespace {
 using mlx::core::array;
 using mlx::core::Shape;
 std::mutex store_mutex;
-std::weak_ptr<QsaKvStore> current_store;
+std::weak_ptr<mfq::cache::QsaKvStore> current_store;
 
 std::size_t environment_size(const char* name, std::size_t fallback) {
     const char* value = std::getenv(name);
@@ -31,16 +31,16 @@ std::size_t environment_size(const char* name, std::size_t fallback) {
 
 }
 
-std::shared_ptr<QsaKvStore> mlx_qsa_kv_offload_store() {
+std::shared_ptr<mfq::cache::QsaKvStore> mlx_qsa_kv_offload_store() {
     std::lock_guard<std::mutex> guard(store_mutex);
     return current_store.lock();
 }
-void mlx_set_qsa_kv_offload_store(const std::shared_ptr<QsaKvStore>& store) {
+void mlx_set_qsa_kv_offload_store(const std::shared_ptr<mfq::cache::QsaKvStore>& store) {
     std::lock_guard<std::mutex> guard(store_mutex);
     current_store = store;
 }
 
-std::shared_ptr<QsaKvStore> mlx_configure_qsa_kv_offload(
+std::shared_ptr<mfq::cache::QsaKvStore> mlx_configure_qsa_kv_offload(
     int maximum, int layers, int heads, int dimension, int index_width, int ratio) {
     mlx_set_qsa_kv_offload_store({});
     const auto budget = environment_size("MFQ_QSA_KV_BUDGET_BYTES", 0);
@@ -49,7 +49,7 @@ std::shared_ptr<QsaKvStore> mlx_configure_qsa_kv_offload(
     if (!target || target > static_cast<std::size_t>(maximum) || layers <= 0 ||
         heads <= 0 || dimension <= 0 || index_width <= 0 || ratio <= 0)
         throw std::invalid_argument("invalid QSA KV target context or architecture");
-    QsaKvStoreConfig config;
+    mfq::cache::QsaKvStoreConfig config;
     config.budget_bytes = budget;
     config.reserve = [](std::size_t bytes) { MlxResidentBudgetScope::reserve(bytes); };
     config.microblock_rows = ratio;
@@ -64,12 +64,12 @@ std::shared_ptr<QsaKvStore> mlx_configure_qsa_kv_offload(
         static_cast<std::size_t>(target) / ratio * 4) + 2);
     const char* directory = std::getenv("MFQ_RUNTIME_PREFIX_CACHE_DIR");
     if (directory) config.directory = directory;
-    auto store = std::make_shared<QsaKvStore>(std::move(config));
+    auto store = std::make_shared<mfq::cache::QsaKvStore>(std::move(config));
     mlx_set_qsa_kv_offload_store(store);
     return store;
 }
 
-MlxQsaKvOffload::MlxQsaKvOffload(std::shared_ptr<QsaKvStore> store,
+MlxQsaKvOffload::MlxQsaKvOffload(std::shared_ptr<mfq::cache::QsaKvStore> store,
     int heads, int dimension, int maximum, int ratio)
     : store_(std::move(store)), quantization_(mlx_kv_quantization()),
       rows_(store_, quantization_.enabled() ? static_cast<std::size_t>(heads) * 4 *
@@ -320,7 +320,7 @@ array MlxQsaKvOffload::attention(const array& query, const std::optional<array>&
     return results.size() == 1 ? results.front() : mlx::core::concatenate(results, 1);
 }
 
-MlxQsaIndexOffload::MlxQsaIndexOffload(std::shared_ptr<QsaKvStore> store,
+MlxQsaIndexOffload::MlxQsaIndexOffload(std::shared_ptr<mfq::cache::QsaKvStore> store,
     int width, mlx::core::Dtype dtype, int priority)
     : rows_(std::move(store), static_cast<std::size_t>(width) * dtype.size(), 16, priority),
       width_(width), dtype_(dtype) {}

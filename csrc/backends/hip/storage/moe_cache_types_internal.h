@@ -3,7 +3,7 @@
 
 #include "storage/moe_expert_cache.h"
 
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "moe.h"
 #include "../../hip/storage/mfe_expert_store.h"
 #include "../../hip/storage/moe_quant_range_source.h"

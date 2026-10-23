@@ -3,8 +3,8 @@
 
 #include "core/causal_model.h"
 #include "core/block.h"
-#include "models/qwen4_exp/causal_lm.h"
-#include "models/qwen4_exp/config.h"
+#include "qwen4_exp/causal_lm.h"
+#include "qwen4_exp/config.h"
 #include "quant_linear.h"
 
 #include <memory>

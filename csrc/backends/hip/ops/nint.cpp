@@ -2,7 +2,7 @@
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"
 #include "nint.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "format.h"
 #include "packed_nint.h"
 #include "cpu_projection_rows.h"

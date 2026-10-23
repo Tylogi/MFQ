@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/token_constraint.h"
+#include "token_constraint.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "runtime/mlx_mtp.h"

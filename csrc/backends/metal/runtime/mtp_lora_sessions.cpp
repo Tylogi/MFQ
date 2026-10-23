@@ -1,5 +1,5 @@
 #include "mtp_lora_sessions.h"
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 
 #include <algorithm>
 #include <array>

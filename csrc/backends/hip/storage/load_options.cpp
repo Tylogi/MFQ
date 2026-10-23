@@ -1,6 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "hip_runtime_config.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"
 #include "mfq_tensor_backend.h"

@@ -2,14 +2,14 @@
 #pragma once
 
 #include "storage/weight_loader.h"
-#include "models/common/grid_vision_model.h"
+#include "common/grid_vision_model.h"
 #include <array>
 
 #include "core/causal_model.h"
 #include "../../../engine/model/common/vision/grid_vision.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "../../hip/include/mfq_hip_attention_ops.h"
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 
 #include <algorithm>
 #include <cmath>

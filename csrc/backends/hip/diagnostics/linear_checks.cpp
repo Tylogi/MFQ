@@ -3,7 +3,7 @@
 #include "model_checks.h"
 
 #include "quant_linear.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_linear_attention_ops.h"
 #include "mfq_hip_quant_ops.h"

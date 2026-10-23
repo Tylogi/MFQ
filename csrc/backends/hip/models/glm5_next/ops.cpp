@@ -4,9 +4,9 @@
 #include "model.h"
 #include "mtp.h"
 #include "storage/weight_loader.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/moe.h"
-#include "models/common/transformer_layer.h"
+#include "common/gated_mlp.h"
+#include "common/moe.h"
+#include "common/transformer_layer.h"
 #include "storage/session_codec.h"
 
 namespace mfq::cuda::glm5_next {

@@ -117,6 +117,15 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     assert not readers & {"mfq-core", "mfq-model-source", "mfq-model-graph", "mfq-json",
                           "mfq-engine", "mfq-models", "mfq-cpu-execution"}
     graph = (tmp_path / "native-closure/targets.dot").read_text()
+    assert not (CSRC / "core").exists()
+    assert 'label = "mfq-core' not in graph and 'mfq::core' not in graph
+    for target in ("mfq-prefix-blocks", "mfq-qsa-kv-store"):
+        deps = _target_dependencies(graph, target)
+        assert "mfq-formats" in deps
+        assert not deps & {"mfq-engine", "mfq-model-source", "mfq-model-graph", "mfq-json",
+                           "mfq-quant-readers", "mfq-cpu-execution"}
+    cpu = _target_dependencies(graph, "mfq-cpu-execution")
+    assert not cpu & {"mfq-engine", "mfq-model-source", "mfq-model-graph", "mfq-json", "mfq-formats"}
     for target in ("mfq-model-graph", "mfq-model-source"):
         deps = _target_dependencies(graph, target)
         assert not deps & {"mfq-core", "mfq-engine", "mfq-models", "mfq-cpu-execution",
@@ -126,7 +135,18 @@ def test_native_target_closure(tmp_path: Path, cuda: bool, communication: bool) 
     inputs = [item for item in commands if any(target in item["command"] for target in
               ("mfq-model-source.dir", "mfq-model-graph.dir"))]
     assert inputs
-    assert all((CSRC / "core").as_posix() not in item["command"] for item in inputs)
+    assert all((CSRC / "core").as_posix() not in item["command"] for item in commands)
+    storage = [item for item in commands if any(target in item["command"] for target in
+               ("mfq-prefix-blocks.dir", "mfq-qsa-kv-store.dir", "mfq-cpu-execution.dir"))]
+    assert storage
+    assert all((CSRC / "engine").as_posix() not in item["command"] for item in storage)
+    clients = [item for item in commands if any(target in item["command"] for target in
+               ("mfq-engine-contract-test.dir", "mfq-runtime-scheduler.dir"))]
+    assert clients
+    for item in clients:
+        assert (CSRC / "engine/include").as_posix() in item["command"]
+        assert (CSRC / "core").as_posix() not in item["command"]
+        assert (CSRC / "engine/model").as_posix() not in item["command"]
     schema = [item for item in inputs if "mfq-model-graph.dir" in item["command"]]
     assert len(schema) == 1 and schema[0]["file"].endswith("formats/model_graph/model_graph.cpp")
     if cuda:
@@ -150,6 +170,38 @@ def test_target_check_rejects_transitive_expert_dependency() -> None:
         _check_native_targets(graph + '\n"n0" -> "n5";\n"n5" -> "n3";', False)
     with pytest.raises(AssertionError, match="mfq-io reaches"):
         _check_native_targets(graph + '\n"n8" -> "n5";\n"n5" -> "n3";', False)
+
+
+def _check_cuda_native_sources(csrc: Path) -> None:
+    native = csrc / "backends/cuda/native"
+    units = list(sources(str(native)))
+    assert units, "CUDA native sources missing"
+    for unit in units:
+        reached, _ = closure(unit, str(csrc))
+        escaped = [path for path in reached if not (
+            Path(path).is_relative_to(native) or
+            Path(path).is_relative_to(csrc / "backends/cpu/native") or
+            Path(path) == csrc / "engine/include/resource_error.h")]
+        assert not escaped, f"{unit} reaches non-native sources: {escaped}"
+
+
+def test_cuda_native_contract_closure() -> None:
+    _check_cuda_native_sources(CSRC)
+
+
+def test_cuda_native_check_rejects_request_include(tmp_path: Path) -> None:
+    native = tmp_path / "backends/cuda/native"
+    native.mkdir(parents=True)
+    (native / "context.cu").write_text('#include "resource_error.h"\n')
+    public = tmp_path / "engine/include"
+    public.mkdir(parents=True)
+    error = public / "resource_error.h"
+    error.write_text("#pragma once\n")
+    _check_cuda_native_sources(tmp_path)
+    (public / "request.h").write_text("struct Request {};\n")
+    error.write_text('#include "request.h"\n')
+    with pytest.raises(AssertionError, match="reaches non-native sources"):
+        _check_cuda_native_sources(tmp_path)
 
 
 def _check_native_sources(csrc: Path) -> None:

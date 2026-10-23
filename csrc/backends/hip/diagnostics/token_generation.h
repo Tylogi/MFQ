@@ -4,7 +4,7 @@
 #include "inference.h"
 
 #include "../../hip/include/mfq_hip_sampling_ops.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "core/decode_graph.h"
 #include "core/full_block.h"
 #include "storage/moe_expert_cache.h"

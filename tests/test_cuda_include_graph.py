@@ -5,7 +5,10 @@ Every cross-directory include inside csrc/backends/cuda must be written as
 "<dir>/<name>", resolved against the backend root.  The directory graph must
 stay a DAG in the documented order:
 
-    native -> kernels -> ops -> storage -> models -> engine
+    native -> kernels -> context -> ops -> storage -> execution -> models -> engine
+
+execution/cuda_execution.h is the existing context contract used by operators;
+execution implementations submit work and may depend on storage.
 
 Run: python3 cuda/tests/test_cuda_include_graph.py [--verbose]
 """
@@ -22,8 +25,8 @@ BACKEND_ROOT = os.path.normpath(
 # Directories that hold the layered library.  Everything else under the
 # backend root (apps/, commands/, diagnostics/, eval/, tests/) is a top-level
 # consumer and may include anything below it.
-DIRS = ["native", "kernels", "ops", "storage", "models", "engine"]
-LAYERS = DIRS
+DIRS = ["native", "kernels", "ops", "storage", "execution", "models", "engine"]
+LAYERS = ["native", "kernels", "context", "ops", "storage", "execution", "models", "engine"]
 RANK = {d: i for i, d in enumerate(LAYERS)}
 SOURCE_EXT = (".cpp", ".cu", ".cuh", ".c", ".h", ".tpp")
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
@@ -33,6 +36,8 @@ def layer_of(path):
     rel = os.path.relpath(path, BACKEND_ROOT)
     if rel.startswith(".."):
         return None
+    if rel == os.path.join("execution", "cuda_execution.h"):
+        return "context"
     head = rel.split(os.sep)[0]
     return head if head in LAYERS else None
 
@@ -48,8 +53,7 @@ CSRC_ROOT = os.path.normpath(os.path.join(BACKEND_ROOT, "..", ".."))
 # Every directory the CUDA targets put on the include path, from the one place
 # that knows them.  A first-party include that no longer resolves is then
 # reported instead of skipped.
-INCLUDE_ROOTS = [REPO_ROOT, BACKEND_ROOT, os.path.join(CSRC_ROOT, "core")] + \
-    include_roots(CSRC_ROOT)
+INCLUDE_ROOTS = [REPO_ROOT, BACKEND_ROOT] + include_roots(CSRC_ROOT)
 
 # Basenames of every header under the backend root.  An include of one of these
 # that does not resolve is a broken path, not a system header.
@@ -149,6 +153,30 @@ def test_cuda_include_graph_is_a_dag():
     assert not upward, f"upward layer edges: {upward}"
     cycles = find_cycles(edges)
     assert not cycles, "layer cycles: " + "; ".join(" -> ".join(c) for c in cycles)
+
+
+def test_execution_contract_and_submission_are_checked(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "BACKEND_ROOT", str(tmp_path))
+    monkeypatch.setitem(globals(), "INCLUDE_ROOTS", [str(tmp_path)])
+    for name, body in {
+        "native/tensor/backend.h": "",
+        "execution/cuda_execution.h": '#include "native/tensor/backend.h"\n',
+        "storage/bytes.h": '#include "execution/cuda_execution.h"\n',
+        "execution/work.cpp": '#include "storage/bytes.h"\n',
+        "ops/bad.cpp": '#include "execution/work.h"\n',
+        "execution/work.h": '#include "models/family.h"\n',
+        "models/family.h": "",
+    }.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    edges, violations = collect()
+    assert not violations
+    assert edges["context"] == {"native"}
+    assert edges["storage"] == {"context"}
+    assert edges["execution"] == {"storage", "models"}
+    upward = {(s, d) for s in edges for d in edges[s] if RANK[s] < RANK[d]}
+    assert upward == {("ops", "execution"), ("execution", "models")}
 
 
 def main():

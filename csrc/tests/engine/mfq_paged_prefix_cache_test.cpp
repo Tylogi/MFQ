@@ -1,4 +1,4 @@
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "paged.h"
 
 #include <algorithm>
@@ -68,7 +68,7 @@ void run_benchmark() {
             "prefix cache benchmark size overflow");
     const auto total_bytes = block_count * payload_bytes;
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             root,
             "benchmark-v1",
             block_tokens,
@@ -85,12 +85,12 @@ void run_benchmark() {
                 block_tokens,
                 shared);
         }
-        cache.flush();
+        cache.blocks.flush();
         const auto match = cache.match(tokens, {}, false);
         volatile std::uint64_t checksum = 0;
         const auto started = std::chrono::steady_clock::now();
         for (const auto& hash : match.blocks) {
-            const auto loaded = cache.load(hash);
+            const auto loaded = cache.blocks.load(hash);
             require(loaded.has_value(), "benchmark hot load failed");
             checksum += loaded->front();
             checksum += loaded->back();
@@ -103,7 +103,7 @@ void run_benchmark() {
                   << " checksum=" << checksum << '\n';
         checksum = 0;
         const auto shared_started = std::chrono::steady_clock::now();
-        const auto loaded = cache.load_prefix(match.blocks);
+        const auto loaded = cache.blocks.load_prefix(match.blocks);
         require(loaded.size() == block_count, "benchmark shared hot load failed");
         for (const auto& block : loaded) {
             checksum += block->front();
@@ -117,7 +117,7 @@ void run_benchmark() {
                   << " checksum=" << checksum << '\n';
     }
     const auto benchmark_cold = [&](const char* phase, std::size_t readers) {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             root,
             "benchmark-v1",
             block_tokens,
@@ -130,7 +130,7 @@ void run_benchmark() {
         const auto match = cache.match(tokens, {}, false);
         volatile std::uint64_t checksum = 0;
         const auto started = std::chrono::steady_clock::now();
-        const auto loaded = cache.load_prefix(match.blocks);
+        const auto loaded = cache.blocks.load_prefix(match.blocks);
         require(loaded.size() == block_count, "benchmark cold load failed");
         for (const auto& block : loaded) {
             checksum += block->front();
@@ -156,37 +156,37 @@ int main() try {
     using namespace mfq::cache;
     const auto inspect_root = temporary_directory();
     for (const bool disk : {false, true}) {
-        PagedPrefixCacheConfig config{inspect_root, disk ? "disposable-ram-ssd" : "disposable-ram", 4,
+        PrefixBlockStoreConfig config{inspect_root, disk ? "disposable-ram-ssd" : "disposable-ram", 4,
             disk ? 4096ULL : 0ULL, 8, 8};
         config.spill_hot_on_eviction = true;
         PagedPrefixCache cache(config);
         const std::vector<std::int64_t> a{1,2,3,4}, b{5,6,7,8}, c{9,10,11,12};
         const auto first = cache.store({}, a.data(), a.size(), payload({1,2,3,4}));
         const auto second = cache.store({}, b.data(), b.size(), payload({5,6,7,8}));
-        cache.pin({first, second});
-        cache.flush();
+        cache.blocks.pin({first, second});
+        cache.blocks.flush();
         require(cache.metrics().disk_bytes == 0, "RAM hits must not write through to SSD");
-        require(cache.load(first).has_value(), "first RAM hit missing");
+        require(cache.blocks.load(first).has_value(), "first RAM hit missing");
         cache.store({}, c.data(), c.size(), payload({9,10,11,12}));
-        cache.flush();
+        cache.blocks.flush();
         require(cache.metrics().hot_bytes == 8, "pinned prefixes exceeded disposable RAM budget");
         require(cache.metrics().disk_blocks == (disk ? 1 : 0), "LRU eviction did not spill to enabled SSD");
         require(cache.match(a).matched_tokens == 4, "most recent RAM prefix evicted");
         require(cache.match(b).matched_tokens == (disk ? 4 : 0), "LRU victim retention incorrect");
-        require(cache.set_hot_limit(4) == 4, "partial RAM reclaim failed");
-        require(cache.set_hot_limit(0) == 4, "complete RAM reclaim failed");
+        require(cache.blocks.set_hot_limit(4) == 4, "partial RAM reclaim failed");
+        require(cache.blocks.set_hot_limit(0) == 4, "complete RAM reclaim failed");
         require(cache.metrics().hot_bytes == 0 && cache.metrics().pending_bytes == 0,
             "reclaimed prefixes still hold RAM");
-        require(cache.load(second).has_value() == disk, "SSD restore/discard behavior incorrect");
-        cache.set_hot_limit(8);
-        cache.set_disk_limit(0);
-        cache.flush();
+        require(cache.blocks.load(second).has_value() == disk, "SSD restore/discard behavior incorrect");
+        cache.blocks.set_hot_limit(8);
+        cache.blocks.set_disk_limit(0);
+        cache.blocks.flush();
         cache.store({}, a.data(), a.size(), payload({1,2,3,4}));
-        cache.set_hot_limit(0);
-        require(cache.metrics().disk_bytes == 0 && !cache.load(first), "disabling SSD still retained an evicted prefix");
+        cache.blocks.set_hot_limit(0);
+        require(cache.metrics().disk_bytes == 0 && !cache.blocks.load(first), "disabling SSD still retained an evicted prefix");
     }
     {
-        PagedPrefixCacheConfig config{inspect_root, "ram-pressure", 4, 0, 8, 8};
+        PrefixBlockStoreConfig config{inspect_root, "ram-pressure", 4, 0, 8, 8};
         config.spill_hot_on_eviction = true;
         std::atomic<std::uint64_t> available{100};
         config.available_ram_bytes = [&] { return available.load(); };
@@ -194,23 +194,23 @@ int main() try {
         PagedPrefixCache cache(config);
         const std::vector<std::int64_t> tokens{1,2,3,4};
         auto hash = cache.store({}, tokens.data(), tokens.size(), payload({1,2,3,4}));
-        cache.pin({hash});
-        require(cache.reserve_ram(96) == 4 && cache.metrics().hot_bytes == 0,
+        cache.blocks.pin({hash});
+        require(cache.blocks.reserve_ram(96) == 4 && cache.metrics().hot_bytes == 0,
             "higher priority RAM allocation did not reclaim prefixes first");
         hash = cache.store({}, tokens.data(), tokens.size(), payload({1,2,3,4}));
         available = 0;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (cache.metrics().hot_bytes && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        require(cache.metrics().hot_bytes == 0 && !cache.load(hash), "host pressure must reclaim pinned RAM without a request");
+        require(cache.metrics().hot_bytes == 0 && !cache.blocks.load(hash), "host pressure must reclaim pinned RAM without a request");
     }
     {
-        PagedPrefixCacheConfig config{inspect_root, "text-record-test", 4, 4096, 4096, 8};
+        PrefixBlockStoreConfig config{inspect_root, "text-record-test", 4, 4096, 4096, 8};
         config.model_path = inspect_root / "sample.mfq";
         PagedPrefixCache cache(config);
         const std::vector<std::int64_t> sequence{1, 2, 3, 4};
         const auto hash = cache.store({}, sequence.data(), 4, payload({1, 2}));
-        cache.flush();
+        cache.blocks.flush();
         const auto name = block_hash_hex(hash);
         const auto directory = inspect_root / block_hash_hex(cache.compatibility_hash());
         const auto block = directory / name.substr(0, 2) / (name + ".mfqkv");
@@ -235,22 +235,22 @@ int main() try {
         record.close();
         std::filesystem::remove(block);
         std::filesystem::remove(text);
-        require(cache.refresh_disk_index() == 1, "external deletion did not refresh native cache index");
+        require(cache.blocks.refresh_disk_index() == 1, "external deletion did not refresh native cache index");
         require(cache.metrics().hot_blocks == 0 && cache.metrics().disk_blocks == 0,
             "deleted cache retained stale hot payloads");
         require(cache.match(sequence).matched_tokens == 0, "deleted cache still matched");
         cache.store({}, sequence.data(), 4, payload({1, 2}));
-        cache.flush();
-        cache.clear();
+        cache.blocks.flush();
+        cache.blocks.clear();
         require(!std::filesystem::exists(text), "clearing left a token sidecar behind");
     }
     {
-        PagedPrefixCacheConfig config{inspect_root, "disk-reserve-test", 4, 4096, 4096, 8};
+        PrefixBlockStoreConfig config{inspect_root, "disk-reserve-test", 4, 4096, 4096, 8};
         config.min_disk_free_bytes = std::numeric_limits<std::uint64_t>::max();
         PagedPrefixCache cache(config);
         const std::vector<std::int64_t> sequence{1, 2, 3, 4};
         cache.store({}, sequence.data(), 4, payload({1, 2}));
-        cache.flush();
+        cache.blocks.flush();
         require(cache.metrics().low_disk_space_skips == 1 && cache.metrics().failed_writes == 1,
             "disk reserve did not reject the write");
         require(cache.metrics().disk_blocks == 0 && cache.match(sequence).matched_tokens == 4,
@@ -259,7 +259,7 @@ int main() try {
     std::filesystem::remove_all(inspect_root);
     const auto tail_root = temporary_directory();
     for (const bool disk : {false, true}) {
-        const PagedPrefixCacheConfig config{tail_root, disk ? "tail-disk" : "tail-ram", 4,
+        const PrefixBlockStoreConfig config{tail_root, disk ? "tail-disk" : "tail-ram", 4,
             disk ? 4096U : 0U, disk ? 0U : 4096U, 8};
         const std::vector<std::int64_t> sequence{1, 2, 3, 4, 5, 6, 7};
         {
@@ -272,15 +272,15 @@ int main() try {
                 "divergent tail did not fall back");
             require(cache.match({1, 2, 3, 4, 5}).matched_tokens == 4,
                 "tail matched an incomplete token sequence");
-            cache.flush();
+            cache.blocks.flush();
         }
         if (disk) {
             PagedPrefixCache cache(config);
             const auto match = cache.match(sequence);
             require(match.matched_tokens == 7 && match.blocks.size() == 2,
                 "tail index did not survive restart");
-            require(cache.load_prefix(match.blocks).size() == 2, "tail payload did not reload");
-            cache.clear();
+            require(cache.blocks.load_prefix(match.blocks).size() == 2, "tail payload did not reload");
+            cache.blocks.clear();
             require(cache.match(sequence).matched_tokens == 0, "cleared tail still matched");
         }
     }
@@ -293,24 +293,24 @@ int main() try {
         cache.store({}, branch.data(), branch.size(), payload({9}));
         for (std::size_t count = 2; count <= sequence.size(); ++count) {
             cache.store({}, sequence.data(), count, payload({static_cast<std::uint8_t>(count)}));
-            cache.flush();
+            cache.blocks.flush();
         }
         require(cache.metrics().disk_blocks == 3, "growing tails retained obsolete snapshots");
         require(cache.match(sequence).matched_tokens == 6, "newest tail was discarded");
         require(cache.match({1, 2, 3, 4, 5, 99}).matched_tokens == 5, "previous tail fallback was discarded");
         require(cache.match(branch).matched_tokens == 3, "unrelated branch tail was discarded");
-        require(cache.set_hot_limit(0) > 0 && cache.metrics().hot_bytes == 0, "online hot budget did not trim RAM");
-        require(cache.load_prefix(cache.match(sequence).blocks).size() == 1, "hot budget change deleted durable cache");
+        require(cache.blocks.set_hot_limit(0) > 0 && cache.metrics().hot_bytes == 0, "online hot budget did not trim RAM");
+        require(cache.blocks.load_prefix(cache.match(sequence).blocks).size() == 1, "hot budget change deleted durable cache");
         require(cache.metrics().hot_bytes == 0, "disabled hot tier retained restored payloads");
-        cache.set_disk_limit(0);
-        cache.flush();
+        cache.blocks.set_disk_limit(0);
+        cache.blocks.flush();
         require(cache.metrics().disk_bytes == 0,
             "online SSD disable retained durable cache");
-        cache.set_disk_limit(4096);
+        cache.blocks.set_disk_limit(4096);
         cache.store({}, sequence.data(), sequence.size(), payload({6}));
         cache.store({}, sequence.data(), sequence.size() - 1, payload({5}));
         cache.store({}, branch.data(), branch.size(), payload({9}));
-        cache.flush();
+        cache.blocks.flush();
         require(cache.metrics().disk_blocks == 3, "online SSD enable did not resume writes");
     }
     {
@@ -319,7 +319,7 @@ int main() try {
         require(cache.metrics().disk_blocks == 3, "restart restored discarded tail versions");
         const std::vector<std::int64_t> full{1, 2, 3, 4, 5, 6, 7, 8};
         cache.store({}, full.data(), full.size(), payload({8}));
-        cache.flush();
+        cache.blocks.flush();
         require(cache.metrics().disk_blocks == 3, "full block left superseded tail versions");
         require(cache.match(full).matched_tokens == 8, "full block was not reusable");
     }
@@ -329,20 +329,28 @@ int main() try {
         PagedPrefixCache cache({budgets_root, "concurrent-budgets", 4, 0, 4096, 64});
         std::thread budgets([&] {
             for (std::size_t index = 0; index < 64; ++index) {
-                cache.set_disk_limit(index % 2 ? 4096 : 16384);
-                cache.set_hot_limit(index % 2 ? 0 : 4096);
-                cache.trim_hot(0);
+                cache.blocks.set_disk_limit(index % 2 ? 4096 : 16384);
+                cache.blocks.set_hot_limit(index % 2 ? 0 : 4096);
+                cache.blocks.trim_hot(0);
             }
+        });
+        std::thread observations([&] {
+            for (int sample = 0; sample < 4096; ++sample) cache.record_match(4);
         });
         for (std::int64_t index = 0; index < 64; ++index) {
             const std::vector<std::int64_t> sequence{index, 1, 2, 3};
             cache.store({}, sequence.data(), sequence.size(), payload({1, 2, 3}));
-            (void)cache.metrics();
+            const auto sample = cache.metrics();
+            require(sample.hits <= sample.queries && sample.hit_tokens == sample.hits * 4,
+                "concurrent prefix observations produced inconsistent metrics");
         }
         budgets.join();
-        cache.set_disk_limit(0);
-        cache.set_hot_limit(0);
-        cache.flush();
+        observations.join();
+        require(cache.metrics().queries == 4096 && cache.metrics().hits == 4096,
+            "concurrent prefix observations were lost");
+        cache.blocks.set_disk_limit(0);
+        cache.blocks.set_hot_limit(0);
+        cache.blocks.flush();
         const auto stats = cache.metrics();
         require(stats.disk_bytes == 0 && stats.hot_bytes == 0 && stats.pending_bytes == 0,
             "concurrent budget updates left pending or over-budget cache data");
@@ -353,26 +361,26 @@ int main() try {
     std::filesystem::remove_all(budgets_root);
     const auto binding_root = temporary_directory();
     {
-        auto cache = std::make_shared<PagedPrefixCache>(PagedPrefixCacheConfig{binding_root, "bound-disk", 4, 200, 0, 8});
+        auto cache = std::make_shared<PagedPrefixCache>(PrefixBlockStoreConfig{binding_root, "bound-disk", 4, 200, 0, 8});
         mfq::engine::PagedSessionBindings bindings(cache, 16);
         const std::vector<std::int64_t> a{1, 2, 3, 4}, b{5, 6, 7, 8};
         const auto first_block = cache->store({}, a.data(), 4, payload({1}));
-        cache->flush();
+        cache->blocks.flush();
         bindings.bind("idle-a", {first_block}, 4);
         const auto second_block = cache->store({}, b.data(), 4, payload({2}));
-        cache->flush();
+        cache->blocks.flush();
         bindings.bind("idle-b", {second_block}, 4);
         require(cache->metrics().disk_bytes <= 200, "idle session pins bypassed the SSD budget");
         require(cache->match(a).matched_tokens == 0 && cache->match(b).matched_tokens == 4, "SSD LRU did not evict the older idle session");
         require(bindings.clear() == 2, "stale bindings could not be released safely");
     }
     {
-        auto cache = std::make_shared<PagedPrefixCache>(PagedPrefixCacheConfig{binding_root, "bound-ram", 4, 0, 4, 8});
+        auto cache = std::make_shared<PagedPrefixCache>(PrefixBlockStoreConfig{binding_root, "bound-ram", 4, 0, 4, 8});
         mfq::engine::PagedSessionBindings bindings(cache, 16);
         const std::vector<std::int64_t> sequence{1, 2, 3, 4};
         const auto block = cache->store({}, sequence.data(), 4, payload({1, 2, 3, 4}));
         bindings.bind("idle-ram", {block}, 4);
-        require(cache->set_hot_limit(0) == 4, "idle session bypassed the RAM budget");
+        require(cache->blocks.set_hot_limit(0) == 4, "idle session bypassed the RAM budget");
         require(cache->match(sequence).matched_tokens == 0, "evicted RAM-only prefix still matched");
         require(bindings.close("idle-ram") == 1, "evicted RAM-only binding could not be closed");
     }
@@ -387,7 +395,7 @@ int main() try {
     BlockHash first{};
     BlockHash second{};
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             root,
             "model-sha|layout-v1|fp16",
             4,
@@ -399,28 +407,28 @@ int main() try {
         first = cache.store(parent, tokens.data(), 4, payload({10, 11, 12}));
         second = cache.store(
             first, tokens.data() + 4, 4, payload({20, 21, 22, 23}));
-        cache.flush();
+        cache.blocks.flush();
 
         const auto match = cache.match(tokens);
         require(match.matched_tokens == 8, "longest prefix match failed");
         require(match.blocks.size() == 2, "prefix block chain length mismatch");
         require(match.blocks[0] == first && match.blocks[1] == second,
                 "prefix block chain mismatch");
-        const auto shared_chain = cache.load_prefix(match.blocks);
+        const auto shared_chain = cache.blocks.load_prefix(match.blocks);
         require(shared_chain.size() == 2,
                 "shared prefix chain load length mismatch");
         require(*shared_chain[0] == std::vector<std::uint8_t>({10, 11, 12}) &&
                     *shared_chain[1] ==
                         std::vector<std::uint8_t>({20, 21, 22, 23}),
                 "shared prefix chain payload mismatch");
-        const auto loaded = cache.load(second);
+        const auto loaded = cache.blocks.load(second);
         require(loaded && *loaded == std::vector<std::uint8_t>({20, 21, 22, 23}),
                 "hot block load mismatch");
 
         const auto duplicate = cache.store(
             first, tokens.data() + 4, 4, payload({99}));
         require(duplicate == second, "content address changed on duplicate store");
-        const auto original = cache.load(second);
+        const auto original = cache.blocks.load(second);
         require(original && *original == std::vector<std::uint8_t>({20, 21, 22, 23}),
                 "duplicate store replaced deterministic block content");
         const auto replaced = cache.replace(
@@ -430,12 +438,12 @@ int main() try {
             payload({30, 31, 32, 33, 34}));
         require(replaced == second,
                 "payload refresh changed the content-addressed block hash");
-        const auto refreshed = cache.load(second);
+        const auto refreshed = cache.blocks.load(second);
         require(refreshed &&
                     *refreshed ==
                         std::vector<std::uint8_t>({30, 31, 32, 33, 34}),
                 "pending payload refresh was not immediately visible");
-        cache.flush();
+        cache.blocks.flush();
         const auto stats = cache.metrics();
         require(stats.writes == 3, "unexpected physical write count");
         require(stats.deduplicated_writes == 1, "deduplication was not counted");
@@ -444,7 +452,7 @@ int main() try {
 
     {
         auto cache = std::make_shared<PagedPrefixCache>(
-            PagedPrefixCacheConfig{
+            PrefixBlockStoreConfig{
                 root,
                 "model-sha|layout-v1|fp16",
                 4,
@@ -476,7 +484,7 @@ int main() try {
         output << "incomplete";
     }
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             root,
             "model-sha|layout-v1|fp16",
             4,
@@ -486,10 +494,10 @@ int main() try {
         });
         const auto match = cache.match(tokens);
         require(match.matched_tokens == 8, "restart prefix recovery failed");
-        const auto loaded = cache.load(first);
+        const auto loaded = cache.blocks.load(first);
         require(loaded && *loaded == std::vector<std::uint8_t>({10, 11, 12}),
                 "restart disk load mismatch");
-        const auto replaced = cache.load(second);
+        const auto replaced = cache.blocks.load(second);
         require(replaced &&
                     *replaced ==
                         std::vector<std::uint8_t>({30, 31, 32, 33, 34}),
@@ -499,7 +507,7 @@ int main() try {
     }
 
     {
-        PagedPrefixCache incompatible(PagedPrefixCacheConfig{
+        PagedPrefixCache incompatible(PrefixBlockStoreConfig{
             root,
             "different-model",
             4,
@@ -514,7 +522,7 @@ int main() try {
 
     const auto semantic_root = temporary_directory();
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             semantic_root,
             "semantic-invalidation",
             4,
@@ -526,11 +534,11 @@ int main() try {
             BlockHash{}, tokens.data(), 4, payload({1, 3, 5, 7}));
         require(cache.match(tokens).matched_tokens == 4,
                 "hot-only block was not indexed");
-        require(cache.invalidate(block),
+        require(cache.blocks.invalidate(block),
                 "semantic invalidation did not remove the block");
         require(cache.match(tokens).matched_tokens == 0,
                 "semantically invalid block remained matchable");
-        require(!cache.invalidate(block),
+        require(!cache.blocks.invalidate(block),
                 "semantic invalidation reported a missing block");
         require(cache.metrics().corrupt_blocks == 1,
                 "semantic invalidation metric was not stable");
@@ -539,7 +547,7 @@ int main() try {
 
     const auto effective_metrics_root = temporary_directory();
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             effective_metrics_root,
             "effective-match-metrics",
             4,
@@ -565,7 +573,7 @@ int main() try {
 
     const auto multiprocess_root = temporary_directory();
     {
-        const PagedPrefixCacheConfig config{
+        const PrefixBlockStoreConfig config{
             multiprocess_root,
             "cross-process-upgrade",
             4,
@@ -580,7 +588,7 @@ int main() try {
             tokens.data(),
             4,
             payload({21, 22, 23, 24, 25}));
-        upgrading_writer.flush();
+        upgrading_writer.blocks.flush();
         require(
             stale_writer.store(
                 BlockHash{},
@@ -588,9 +596,9 @@ int main() try {
                 4,
                 payload({1, 2})) == block,
             "stale writer changed the shared block identity");
-        stale_writer.flush();
+        stale_writer.blocks.flush();
         PagedPrefixCache reader(config);
-        const auto loaded = reader.load(block);
+        const auto loaded = reader.blocks.load(block);
         require(
             loaded &&
                 *loaded == std::vector<std::uint8_t>({21, 22, 23, 24, 25}),
@@ -603,7 +611,7 @@ int main() try {
         const std::vector<std::int64_t> header_tokens{61, 62, 63, 64};
         BlockHash block{};
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 header_root,
                 "header-chain-validation",
                 4,
@@ -617,7 +625,7 @@ int main() try {
                 header_tokens.data(),
                 4,
                 payload({31, 32, 33}));
-            cache.flush();
+            cache.blocks.flush();
         }
         const auto block_text = block_hash_hex(block);
         const auto block_path =
@@ -638,7 +646,7 @@ int main() try {
             file.seekp(token_count_offset);
             file.write(partial_count.data(), partial_count.size());
         }
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             header_root,
             "header-chain-validation",
             4,
@@ -660,7 +668,7 @@ int main() try {
         const std::vector<std::int64_t> new_tokens{41, 42, 43, 44};
         std::uint64_t one_file_bytes = 0;
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 lru_root,
                 "restart-lru",
                 4,
@@ -671,12 +679,12 @@ int main() try {
             BlockHash parent{};
             (void)cache.store(
                 parent, old_tokens.data(), old_tokens.size(), payload({1, 2, 3}));
-            cache.flush();
+            cache.blocks.flush();
             one_file_bytes = cache.metrics().disk_bytes;
             require(one_file_bytes > 0, "restart LRU fixture was not persisted");
         }
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 lru_root,
                 "restart-lru",
                 4,
@@ -687,7 +695,7 @@ int main() try {
             BlockHash parent{};
             (void)cache.store(
                 parent, new_tokens.data(), new_tokens.size(), payload({4, 5, 6}));
-            cache.flush();
+            cache.blocks.flush();
             require(cache.match(new_tokens).matched_tokens == 4,
                     "new block was treated as oldest after restart");
             require(cache.match(old_tokens).matched_tokens == 0,
@@ -699,7 +707,7 @@ int main() try {
         const auto recovery_root = root / "scan-recovery-test";
         std::filesystem::path canonical;
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 recovery_root,
                 "scan-recovery",
                 4,
@@ -710,7 +718,7 @@ int main() try {
             BlockHash parent{};
             const auto hash = cache.store(
                 parent, tokens.data(), 4, payload({7, 8, 9}));
-            cache.flush();
+            cache.blocks.flush();
             const auto text = block_hash_hex(hash);
             canonical = recovery_root /
                 block_hash_hex(sha256("scan-recovery")) /
@@ -729,7 +737,7 @@ int main() try {
             output << "incomplete";
         }
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 recovery_root,
                 "scan-recovery",
                 4,
@@ -750,7 +758,7 @@ int main() try {
 
     {
         const auto pin_root = root / "pin-test";
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             pin_root,
             "pin-before-write",
             4,
@@ -761,18 +769,18 @@ int main() try {
         BlockHash parent{};
         const auto pinned = cache.store(
             parent, tokens.data(), 4, payload({1, 2, 3, 4}));
-        cache.pin({pinned});
-        cache.flush();
+        cache.blocks.pin({pinned});
+        cache.blocks.flush();
         require(cache.metrics().disk_blocks == 1,
                 "pending pinned block was evicted after write");
-        cache.unpin({pinned});
+        cache.blocks.unpin({pinned});
         require(cache.metrics().disk_blocks == 0,
                 "unpinned over-budget block was not evicted");
     }
 
     {
         const auto hot_only_root = root / "hot-only-test";
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             hot_only_root,
             "hot-only",
             4,
@@ -785,7 +793,7 @@ int main() try {
             parent, tokens.data(), 4, payload({5, 6, 7, 8}));
         const auto duplicate = cache.store(
             parent, tokens.data(), 4, payload({9, 9, 9, 9}));
-        cache.flush();
+        cache.blocks.flush();
         const auto stats = cache.metrics();
         require(duplicate == hot, "RAM-only duplicate changed its block hash");
         require(stats.disk_blocks == 0 && stats.hot_blocks == 1,
@@ -796,7 +804,7 @@ int main() try {
                 "RAM-only duplicate store was not deduplicated");
         require(cache.match(tokens).matched_tokens == 4,
                 "RAM-only prefix block was not matched");
-        const auto loaded = cache.load(hot);
+        const auto loaded = cache.blocks.load(hot);
         require(loaded && *loaded == std::vector<std::uint8_t>({5, 6, 7, 8}),
                 "RAM-only prefix block could not be loaded");
         require(
@@ -806,17 +814,17 @@ int main() try {
                 4,
                 payload({10, 11, 12, 13})) == hot,
             "RAM-only payload refresh changed its block hash");
-        const auto refreshed = cache.load(hot);
+        const auto refreshed = cache.blocks.load(hot);
         require(refreshed &&
                     *refreshed == std::vector<std::uint8_t>({10, 11, 12, 13}),
                 "RAM-only payload refresh was not visible");
-        cache.pin({hot});
-        require(cache.trim_hot() == 0,
+        cache.blocks.pin({hot});
+        require(cache.blocks.trim_hot() == 0,
                 "trim discarded a pinned RAM-only prefix block");
-        cache.unpin({hot});
-        require(cache.trim_hot() == 4,
+        cache.blocks.unpin({hot});
+        require(cache.blocks.trim_hot() == 4,
                 "trim did not reclaim an unpinned RAM-only prefix block");
-        require(!cache.load(hot),
+        require(!cache.blocks.load(hot),
                 "trimmed RAM-only prefix block remained readable");
         require(std::none_of(
                     std::filesystem::recursive_directory_iterator(hot_only_root),
@@ -827,7 +835,7 @@ int main() try {
 
     {
         const auto trim_root = root / "hot-trim-test";
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             trim_root,
             "hot-trim",
             4,
@@ -840,15 +848,15 @@ int main() try {
             parent, tokens.data(), 4, payload({12, 13, 14, 15}));
         const auto second = cache.store(
             block, tokens.data(), 4, payload({16, 17, 18, 19}));
-        cache.flush();
+        cache.blocks.flush();
         require(cache.metrics().hot_bytes == 8,
                 "durable block was not promoted into the hot tier");
-        require(cache.trim_hot(4) == 4,
+        require(cache.blocks.trim_hot(4) == 4,
                 "hot trim did not report released durable payload bytes");
         const auto trimmed = cache.metrics();
         require(trimmed.hot_bytes == 4 && trimmed.disk_blocks == 2,
                 "hot trim deleted or retained the wrong cache tier");
-        const auto restored = cache.load_prefix({block, second});
+        const auto restored = cache.blocks.load_prefix({block, second});
         require(restored.size() == 2 &&
                     *restored[0] == std::vector<std::uint8_t>({12, 13, 14, 15}) &&
                     *restored[1] == std::vector<std::uint8_t>({16, 17, 18, 19}),
@@ -859,7 +867,7 @@ int main() try {
 
     {
         const auto byte_root = root / "pending-byte-test";
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             byte_root,
             "pending-byte-budget",
             4,
@@ -882,7 +890,7 @@ int main() try {
 
     {
         const auto clear_root = root / "disabled-write-queue";
-        PagedPrefixCacheConfig config;
+        PrefixBlockStoreConfig config;
         config.cache_dir = clear_root;
         config.compatibility_key = "disabled-write-queue";
         config.block_size_tokens = 4;
@@ -893,19 +901,19 @@ int main() try {
         const auto block = cache.store({}, tokens.data(), 4, payload({1, 2, 3, 4}));
         require(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100),
                 "disabled writer blocked the caller");
-        require(cache.load(block) == std::vector<std::uint8_t>({1, 2, 3, 4}),
+        require(cache.blocks.load(block) == std::vector<std::uint8_t>({1, 2, 3, 4}),
                 "skipped persistence discarded the hot entry");
-        cache.flush();
+        cache.blocks.flush();
         const auto stats = cache.metrics();
         require(stats.skipped_writes == 1 && stats.writes == 0 && stats.pending_bytes == 0,
                 "disabled writer retained pending work");
-        cache.clear();
+        cache.blocks.clear();
         require(cache.match(tokens).matched_tokens == 0, "skipped write survived clear");
     }
 
     {
         const auto clear_root = root / "queued-clear-test";
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             clear_root,
             "queued-clear",
             4,
@@ -939,7 +947,7 @@ int main() try {
         }
         require(cache.metrics().pending_writes >= 4,
                 "queued clear fixture did not build a write backlog");
-        (void)cache.clear();
+        (void)cache.blocks.clear();
         const auto stats = cache.metrics();
         require(stats.pending_writes == 0 && stats.pending_bytes == 0 &&
                     stats.disk_blocks == 0 && stats.hot_blocks == 0,
@@ -955,7 +963,7 @@ int main() try {
             concurrent_tokens[index] = static_cast<std::int64_t>(index + 100);
         }
         {
-            PagedPrefixCache cache(PagedPrefixCacheConfig{
+            PagedPrefixCache cache(PrefixBlockStoreConfig{
                 concurrent_root,
                 "concurrent-load",
                 4,
@@ -972,9 +980,9 @@ int main() try {
                     4,
                     payload({1, 3, 5, 7, 9}));
             }
-            cache.flush();
+            cache.blocks.flush();
         }
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             concurrent_root,
             "concurrent-load",
             4,
@@ -988,7 +996,7 @@ int main() try {
             callers.emplace_back([&] {
                 for (int iteration = 0; iteration < 4; ++iteration) {
                     const auto match = cache.match(concurrent_tokens);
-                    const auto loaded = cache.load_prefix(match.blocks);
+                    const auto loaded = cache.blocks.load_prefix(match.blocks);
                     if (loaded.size() != 8 || loaded.front()->at(2) != 5) {
                         ++failures;
                     }
@@ -1016,7 +1024,7 @@ int main() try {
         file.write(&byte, 1);
     }
     {
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
+        PagedPrefixCache cache(PrefixBlockStoreConfig{
             root,
             "model-sha|layout-v1|fp16",
             4,
@@ -1027,7 +1035,7 @@ int main() try {
         const auto match = cache.match(tokens);
         require(match.matched_tokens == 8,
                 "corrupt block was not indexed for validation");
-        const auto loaded = cache.load_prefix(match.blocks);
+        const auto loaded = cache.blocks.load_prefix(match.blocks);
         require(loaded.size() == 1 &&
                     *loaded.front() == std::vector<std::uint8_t>({10, 11, 12}),
                 "batch load did not stop at the corrupt block");

@@ -5,11 +5,11 @@
 #include "../../hip/diagnostics/generation_result.h"
 #include "models/deepseek_v4/ops.h"
 #include "diagnostics/flash_next_mtp.h"
-#include "qwen35/mtp.h"
+#include "models/qwen35/mtp.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
-#include "hip_execution.h"
-#include "qwen35/linear_attention.h"
+#include "execution/runtime_context.h"
+#include "models/qwen35/linear_attention.h"
 #include "mfq/kernels/hip/deepseek_v41.h"
 #include "nlohmann/json.hpp"
 
@@ -602,7 +602,7 @@ static int run_qwen35_mtp_check(
     MFQ_RUNTIME_CHECK(!numerical_mismatch, "MTP predictor gate numerical mismatch");
     uint64_t total_cycles = 0;
     for (const auto& input : std::vector<std::vector<int64_t>>{{1, 2, 3}, prompt, std::vector<int64_t>(17, 10)}) {
-        MfqSamplingParams params;
+        mfq::SamplingParams params;
         params.max_tokens = 32;
         params.temperature = 0.;
         params.top_k = 1;
@@ -632,7 +632,7 @@ static int run_qwen35_mtp_check(
         MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
             "MTP step emitted extra or incorrect tokens");
     }
-    MfqSamplingParams stochastic;
+    mfq::SamplingParams stochastic;
     stochastic.max_tokens = 8;
     stochastic.temperature = .8;
     stochastic.top_k = 100;

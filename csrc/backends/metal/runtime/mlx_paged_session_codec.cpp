@@ -673,7 +673,7 @@ MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks
             const auto key_lane = static_cast<std::size_t>(key_width) * final.dtype.size();
             const auto value_lane = static_cast<std::size_t>(value_width) * final.dtype.size();
             const auto key_bytes = key_lane * final.heads, value_bytes = value_lane * final.heads;
-            QsaKvSequence rows(store, key_bytes + value_bytes, store->config().microblock_rows, 1);
+            mfq::cache::QsaKvSequence rows(store, key_bytes + value_bytes, store->config().microblock_rows, 1);
             std::vector<std::uint8_t> row(key_bytes + value_bytes);
             for (const auto& block : blocks) {
                 const auto& layer = block.layers.at(index);
@@ -717,9 +717,9 @@ MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks
         if (pool_count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width) / 4)
             throw std::runtime_error("QSA block index checkpoint size overflow");
         std::optional<array> pooled;
-        std::unique_ptr<QsaKvSequence> pool_rows;
+        std::unique_ptr<mfq::cache::QsaKvSequence> pool_rows;
         if (auto store = mlx_qsa_kv_offload_store())
-            pool_rows = std::make_unique<QsaKvSequence>(store, width * 4, 16, 2);
+            pool_rows = std::make_unique<mfq::cache::QsaKvSequence>(store, width * 4, 16, 2);
         else if (pool_count) {
             MlxResidentBudgetScope::reserve(pool_count * width * 4);
             pooled = array(mlx::core::allocator::malloc(pool_count * width * 4),
@@ -1084,9 +1084,9 @@ MlxQwen4TextSessionState MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
     const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
         if (layer.kv) state.bytes += layer.kv->nbytes();
         if (layer.offloaded_kv) state.bytes += layer.offloaded_kv->rows.tail.size() +
-            layer.offloaded_kv->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_kv->rows.blocks.size() * sizeof(mfq::cache::QsaKvStore::BlockPtr);
         if (layer.offloaded_pooled_keys) state.bytes += layer.offloaded_pooled_keys->rows.tail.size() +
-            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(mfq::cache::QsaKvStore::BlockPtr);
         for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
             &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
         state.bytes += layer.ple_context.size() * sizeof(std::int64_t);

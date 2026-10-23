@@ -28,7 +28,7 @@ bool MlxGenerationJob::push(Event event) {
 }
 
 bool MlxGenerationJob::token(std::int64_t value) { return push(value); }
-void MlxGenerationJob::prefill(MfqPrefillTiming timing) {
+void MlxGenerationJob::prefill(mfq::PrefillTiming timing) {
     if (!push(timing)) throw CancelledWork{};
 }
 bool MlxGenerationJob::cancelled() const {
@@ -71,7 +71,7 @@ mfq::engine::Generation consume_mlx_generation(
         if (auto event = job.take()) {
             if (auto* token = std::get_if<std::int64_t>(&*event))
                 co_yield output.append({*token});
-            else co_yield mfq::engine::PrefillProgress{std::get<MfqPrefillTiming>(*event)};
+            else co_yield mfq::engine::PrefillProgress{std::get<mfq::PrefillTiming>(*event)};
         } else if (job.done()) break;
         else co_yield mfq::StepState::waiting;
     }

@@ -439,9 +439,9 @@ double number_field(const json & body, const char * name, double fallback) {
     return body[name].get<double>();
 }
 
-MfqSamplingParams default_sampling_params(
+mfq::SamplingParams default_sampling_params(
         const MfqRuntimeTransportConfig & config) {
-    MfqSamplingParams defaults;
+    mfq::SamplingParams defaults;
     const auto & profile = config.runtime_profile.chat;
     if (profile.max_tokens) defaults.max_tokens = *profile.max_tokens;
     if (profile.temperature) defaults.temperature = *profile.temperature;
@@ -467,7 +467,7 @@ MfqSamplingParams default_sampling_params(
     return defaults;
 }
 
-json sampling_params_json(const MfqSamplingParams & sampling) {
+json sampling_params_json(const mfq::SamplingParams & sampling) {
     return {
         {"max_tokens", sampling.max_tokens},
         {"temperature", sampling.temperature},
@@ -924,7 +924,7 @@ json runtime_generate_body(const json & params) {
 RequestInput parse_input(
         const json & body,
         bool chat,
-        const MfqSamplingParams & defaults) {
+        const mfq::SamplingParams & defaults) {
     if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
     if (integer_field(body, "n", 1) != 1) {
         throw ApiError(400, "unsupported_parameter", "only n=1 is supported", "n");
@@ -1073,7 +1073,7 @@ RequestInput parse_input(
 
 static json request_metric_values_json(
         const RequestMetricValues & values,
-        const MfqSamplingParams & sampling) {
+        const mfq::SamplingParams & sampling) {
     return {
         {"prefill_tokens", values.prefill_tokens},
         {"ttft_ms", values.ttft_ms},
@@ -1147,7 +1147,7 @@ RequestMetricValues request_metric_values(
 }
 
 static void log_request_metrics(const std::string & id, bool chat, bool stream,
-                                size_t prompt_tokens, const MfqSamplingParams & sampling,
+                                size_t prompt_tokens, const mfq::SamplingParams & sampling,
                                 const CompletionResult & result,
                                 const RequestMetricValues & values) {
     const char * enabled = std::getenv("MFQ_RUNTIME_REQUEST_METRICS");

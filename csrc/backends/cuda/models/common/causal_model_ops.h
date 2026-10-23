@@ -1,6 +1,6 @@
 #pragma once
 
-#include "csrc/core/step_sequence.h"
+#include "step_sequence.h"
 
 #include "models/cuda_model_plan.h"
 #include "block.h"

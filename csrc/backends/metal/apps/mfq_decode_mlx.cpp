@@ -15,7 +15,7 @@
 #include "nlohmann/json.hpp"
 
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION
-#include "mfq_paged_prefix_cache.h"
+#include "prefix_cache.h"
 #include "transport.h"
 #include "runtime/mlx_paged_session_codec.h"
 #include "runtime/mlx_server_components.h"
@@ -923,7 +923,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
             throw std::runtime_error(
                 "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
         }
-        mfq::cache::PagedPrefixCacheConfig config;
+        mfq::cache::PrefixBlockStoreConfig config;
         config.reserve_memory = [](std::size_t bytes) { mfq::metal::MlxResidentBudgetScope::reserve(bytes); };
         config.cache_dir = default_prefix_cache_directory();
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();
@@ -1327,7 +1327,7 @@ public:
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 clear_live_sessions();
-                return paged_cache_->clear();
+                return paged_cache_->blocks.clear();
             }
         }
         return clear_live_sessions();
@@ -1337,7 +1337,7 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if constexpr (Codec::available) {
             if (paged_cache_) {
-                const auto released = paged_cache_->trim_hot(target_bytes);
+                const auto released = paged_cache_->blocks.trim_hot(target_bytes);
                 if (released > 0) release_host_allocator_cache();
                 return released;
             }
@@ -1349,7 +1349,7 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_hot_budget_ = max_bytes;
-        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        const auto released = paged_cache_->blocks.set_hot_limit(max_bytes);
         if (released > 0) release_host_allocator_cache();
         return released;
     }
@@ -1358,12 +1358,12 @@ public:
         std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_disk_budget_ = max_bytes;
-        return paged_cache_->set_disk_limit(max_bytes);
+        return paged_cache_->blocks.set_disk_limit(max_bytes);
     }
 
     std::uint64_t refresh_disk_index() {
         if (!paged_cache_) return 0;
-        const auto removed = paged_cache_->refresh_disk_index();
+        const auto removed = paged_cache_->blocks.refresh_disk_index();
         if (removed > 0) release_host_allocator_cache();
         return removed;
     }
@@ -1412,7 +1412,7 @@ private:
             return 0;
         }
 
-        auto payloads = paged_cache_->load_prefix(match.blocks);
+        auto payloads = paged_cache_->blocks.load_prefix(match.blocks);
         if (payloads.empty()) {
             paged_cache_->record_match(0);
             return 0;
@@ -1459,7 +1459,7 @@ private:
                 paged_cache_->block_size_tokens()));
         } catch (const std::exception& error) {
             if (!match.blocks.empty()) {
-                paged_cache_->invalidate(match.blocks.back());
+                paged_cache_->blocks.invalidate(match.blocks.back());
             }
             paged_cache_->record_match(0);
             reset_runtime(runtime);
@@ -1553,7 +1553,7 @@ private:
             }) {
             if (Codec::refresh_final_block &&
                 existing_blocks == full_blocks && !blocks.empty()) {
-                auto final_payload = paged_cache_->load_prefix(
+                auto final_payload = paged_cache_->blocks.load_prefix(
                     {blocks.back()});
                 const bool exact = final_payload.size() == 1 &&
                     Codec::has_exact_boundary(final_payload.front());
@@ -1772,15 +1772,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1804,15 +1804,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1835,15 +1835,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1867,15 +1867,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -1898,15 +1898,15 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
-    const std::function<void(MfqPrefillTiming)>& on_prefill,
-    const MfqPromptCachePlan& cache_plan,
+    const std::function<void(mfq::PrefillTiming)>& on_prefill,
+    const mfq::PromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
     const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
-            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+            on_prefill(mfq::PrefillTiming{tokens, llm_ms, 0.0, llm_ms});
         };
     }
     return runtime.generate(
@@ -2031,8 +2031,8 @@ public:
         const auto& token_constraint = request.token_constraint;
         const std::function<bool(std::int64_t)> callback =
             [&job](std::int64_t token) { return job.token(token); };
-        const std::function<void(MfqPrefillTiming)> on_prefill =
-            [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+        const std::function<void(mfq::PrefillTiming)> on_prefill =
+            [&job](mfq::PrefillTiming timing) { job.prefill(timing); };
         job.mtp.available = runtime_components.mtp_available;
         try {
             if (request.vision) {

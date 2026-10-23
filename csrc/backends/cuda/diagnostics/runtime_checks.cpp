@@ -39,7 +39,7 @@ int run_qwen35_mtp_bench(
     const auto runtime_config = resolve_cuda_runtime_config({});
     TextSessionCache session_cache(
         runtime_config.session_cache, runtime_config.prefix_cache);
-    MfqSamplingParams params;
+    mfq::SamplingParams params;
     params.max_tokens = generated_tokens;
     params.temperature = 0.;
     params.top_k = 1;
@@ -73,7 +73,7 @@ int run_qwen35_mtp_bench(
         for (int repeat = -1; repeat < repetitions; ++repeat) {
             std::vector<int64_t> output;
             output.reserve(generated_tokens);
-            MfqPrefillTiming prefill;
+            mfq::PrefillTiming prefill;
             Clock::time_point first_token;
             mfq_cuda_synchronize();
             // Capture only the actual request; its independent oracle, full
@@ -133,14 +133,14 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
     config.generation.prefill_chunk_size = 64;
     MFQ_RUNTIME_CHECK(requests >= 2 && requests <= 32,"batching check supports 2..32 requests");
     config.continuous_batch.max_sequences = std::max(4,requests);
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = 20; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
     std::vector<int64_t> first_prompt(193), second_prompt(17);
     for (size_t i = 0; i < first_prompt.size(); ++i) first_prompt[i] = (101 + (i * 37) % 900) % model.vocab_size();
     for (size_t i = 0; i < second_prompt.size(); ++i) second_prompt[i] = (113 + (i * 53) % 880) % model.vocab_size();
     DecodeGraphCache graph(model.max_position_embeddings());
     TextSessionCache cache(config.session_cache, config.prefix_cache);
-    auto serial = [&](const std::vector<int64_t>& prompt, MfqPromptCachePlan plan = {}) {
+    auto serial = [&](const std::vector<int64_t>& prompt, mfq::PromptCachePlan plan = {}) {
         InferenceRequest request; request.prompt = prompt; request.sampling = sampling; request.cache_plan = std::move(plan);
         InferenceOutput output(request, nullptr, "serial");
         return collect_generation(generate(model, graph, cache, config, request, output)).tokens;
@@ -196,7 +196,7 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
         std::map<std::string, std::vector<int64_t>> tokens;
         std::map<std::string, int> terminals, cancellations, prefills;
         const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt,
-                               const MfqSamplingParams* params = nullptr) {
+                               const mfq::SamplingParams* params = nullptr) {
             EngineRequest request;
             request.id = id; request.diagnostic_input = DiagnosticTokenInput{prompt}; request.input.sampling = params ? *params : sampling;
             MFQ_RUNTIME_CHECK(executor.admit(std::move(request), nullptr, info, execution) == Admission::accepted,
@@ -352,7 +352,7 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
             << " captures=" << captures << " prewarms=" << prewarms << " replays=" << replays
             << " prefill_cancel=1 slot_reuse=1\n";
     }
-    MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};
+    mfq::PromptCachePlan plan{"batch-check", first_prompt.size() - 1};
     cache.clear();
     const auto fresh_session = serial(first_prompt,plan), restored_session = serial(first_prompt,plan);
     // Prefix capture changes workspace/residency. Compare the restore against
@@ -402,7 +402,7 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     if (first_error) std::rethrow_exception(first_error);
     if (second_error) std::rethrow_exception(second_error);
 
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     sampling.max_tokens = 2;
     sampling.temperature = 0.0;
     sampling.top_k = 1;

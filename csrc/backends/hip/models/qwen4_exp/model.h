@@ -2,8 +2,8 @@
 #pragma once
 #include "../../hip/include/mfq_hip_linear_attention_ops.h"
 #include "../../hip/include/mfq_hip_norm_ops.h"
-#include "models/qwen4_exp/causal_lm.h"
-#include "models/qwen4_exp/ngram.h"
+#include "qwen4_exp/causal_lm.h"
+#include "qwen4_exp/ngram.h"
 #include "core/attention.h"
 #include "core/rope.h"
 #include "mfq/kernels/hip/qwen4_exp.h"

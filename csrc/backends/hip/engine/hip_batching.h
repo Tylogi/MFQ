@@ -2,7 +2,7 @@
 #pragma once
 
 #include "continuous_batch.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 #include "../../hip/include/hip_runtime_config.h"
 #include "hip_sampling.h"
 #include "models/qwen35/batch_state.h"
@@ -31,7 +31,7 @@ class QwenBatchOperations {
     struct Sample {
         Tensor next;
         int64_t token = 0;
-        MfqPrefillTiming timing;
+        mfq::PrefillTiming timing;
     };
     struct Decoded {
         Tensor logits, greedy_tokens;

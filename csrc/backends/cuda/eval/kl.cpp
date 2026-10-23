@@ -3,7 +3,7 @@
 #include "engine/cuda_model_list.h"
 #include "storage/weights/loaders/weight.h"
 #include "ops/quant/quant_linear.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "kernels/deepseek_v4_attention.h"
 #include "kernels/deepseek_v4_hc.h"

@@ -16,7 +16,7 @@ struct BatchRequest {
           token_constraint(input.token_constraint), generation_limit(input.sampling.max_tokens) {}
     std::string id;
     std::vector<int64_t> prompt;
-    MfqSamplingParams sampling;
+    mfq::SamplingParams sampling;
     MfqTokenConstraintPtr token_constraint;
     int32_t generation_limit = 0, produced = 0;
     int64_t pending_token = 0;
@@ -25,7 +25,7 @@ struct BatchRequest {
 
 struct BatchSample {
     int64_t token = 0;
-    MfqPrefillTiming timing;
+    mfq::PrefillTiming timing;
 };
 
 template <class Sample> struct PrefillBatchResult { Sample sample; std::exception_ptr failure; };

@@ -1,10 +1,10 @@
 #include "minicpmo_components.h"
 #include "models/minicpmo45/runtime.h"
 
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "ops/execution/cuda_sampling.h"
 #include "native/tensor/backend.h"
-#include "csrc/core/tensor_parallel.h"
+#include "tensor_parallel.h"
 
 #include <algorithm>
 #include <chrono>

@@ -1,10 +1,11 @@
+#include "resource_error.h"
 #include "native/env.h"
 #include "ops/execution/execution_options.h"
 #include "cached_source_internal.h"
 #include "moe_pinned_expert_arena.h"
 #include "native/resident_allocations.h"
 #include "mfq/host_parallel.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "mapped_read_profile.h"
 #include "mapped_prefetch_scope.h"
 #include "mapped_tensor_pages.h"
@@ -2703,11 +2704,6 @@ void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>& ca
     // Existing CPU/GPU arithmetic can change downstream router IDs. Run the
     // measured policy naturally and retain the first baseline for final replay.
     if(cache->pipeline_comparison_cpu_policy_)cache->pipeline_dispatch_replay_.clear();
-}
-void prepare_moe_cpu_calibration_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
-    prepare_moe_cpu_budget_comparison(cache,replay,true);
-    cache->pipeline_cpu_calibration_.reset(cache->pipeline_cpu_cost_);
-    cache->pipeline_cpu_cost_={};
 }
 std::size_t finish_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache) {
     if(!cache || !cache->pipeline_dispatch_capture_required_ || cache->pipeline_dispatch_records_.empty())

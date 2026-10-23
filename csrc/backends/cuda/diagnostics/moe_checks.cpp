@@ -7,7 +7,7 @@
 #include "models/gemma4/ops.h"
 #include "models/glm_dsa/ops.h"
 #include "ops/quant/quant_linear.h"
-#include "ops/execution/cuda_execution.h"
+#include "execution/cuda_execution.h"
 #include "storage/weights/moe/expert_cache.h"
 #include "kernels/moe/ops.h"
 

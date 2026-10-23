@@ -3,9 +3,9 @@
 
 #include "../../hip/include/mfq_tensor_backend.h"
 #include "../../hip/include/hip_model_plan.h"
-#include "mfq/runtime.h"
+#include "request.h"
 #include "../../hip/core/block.h"
-#include "hip_execution.h"
+#include "execution/runtime_context.h"
 
 #include <cstdint>
 #include <memory>
@@ -50,18 +50,18 @@ struct DecodeGraphCache {
     void ensure_compute_streams(const ParallelConfig& parallel);
     std::vector<MfqCudaStream> graph_participant_streams(
         const ModelParallelCollectiveRuntime& collectives) const;
-    bool matches(int64_t candidate_len, const MfqSamplingParams& sampling,
+    bool matches(int64_t candidate_len, const mfq::SamplingParams& sampling,
                  bool candidate_greedy) const;
     void ensure_storage(int64_t vocab_size);
     void invalidate();
-    void set_key(int64_t candidate_len, const MfqSamplingParams& sampling,
+    void set_key(int64_t candidate_len, const mfq::SamplingParams& sampling,
                  bool candidate_greedy);
 
     template <typename Model, typename Sample, typename Commit>
     bool ensure_captured(
         Model& model,
         int64_t candidate_len,
-        const MfqSamplingParams& sampling,
+        const mfq::SamplingParams& sampling,
         bool candidate_greedy,
         Sample&& sample,
         Commit&& commit);
@@ -126,7 +126,7 @@ template <typename Model, typename Sample, typename Commit>
 bool DecodeGraphCache::ensure_captured(
         Model& model,
         int64_t candidate_len,
-        const MfqSamplingParams& sampling,
+        const mfq::SamplingParams& sampling,
         bool candidate_greedy,
         Sample&& sample,
         Commit&& commit) {
