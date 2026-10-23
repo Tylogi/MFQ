@@ -36,6 +36,7 @@ _SOURCES = [
     os.path.join(_DIR, "rope.cu"),
     os.path.join(_DIR, "attention.cu"),
     os.path.join(_DIR, "gated_delta_net.cu"),
+    os.path.join(_DIR, "gdn_prefill_chunk.cu"),
     os.path.join(_DIR, "kv_cache.cu"),
     os.path.join(_DIR, "activation.cu"),
     os.path.join(_DIR, "embedding.cu"),
