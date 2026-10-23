@@ -35,8 +35,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
     state_adapter_.prepare_decode(max_position);
     const auto planned_len = decode_graph_bucket(requested_len, model_.max_position_embeddings());
     const auto parts = decode_graph_attention_parts(planned_len, FullBlock::kDecodeAttentionMaxParts);
-    const bool graph_supported = config_.greedy && batch_greedy &&
-        qwen_continuous_batch_cuda_graph_enabled(model_, config_);
+    const bool graph_supported = qwen_continuous_batch_cuda_graph_enabled(model_, config_);
     const auto batch = graph_supported ? batch_decode_row_bucket(requests.size(), max_sequences_)
                                        : static_cast<int64_t>(requests.size());
     auto& graph = decode_graphs_->get({batch, planned_len, 0, state_adapter_.decode_capacities()},
@@ -80,7 +79,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
             }
         }
     };
-    Tensor logits, graph_tokens;
+    Tensor logits;
     const auto invoke = [&](bool captured) {
         state_adapter_.load_decode_rows(input);
         auto ids = input.ids();
@@ -90,7 +89,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
             : model_.hidden_forward(ids, positions, input.lengths(), nullptr, positions);
         auto output = state_adapter_.logits_from_last_hidden(std::move(hidden));
         state_adapter_.store_decode_rows(input);
-        return captured ? sample_greedy_cuda(output.contiguous().view({batch, -1})) : output;
+        return output;
     };
     try {
         if (graph_decode) {
@@ -120,7 +119,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
                     std::chrono::steady_clock::now() - started).count());
             }
             graph.graph->replay();
-            graph_tokens = graph.output;
+            logits = graph.output;
             decode_graphs_->replayed(graph);
         } else {
             logits = invoke(false);
@@ -135,15 +134,22 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
     }
     ++decode_batches_;
     decode_tokens_ += requests.size();
+    // Only compact, eligible rows reach sampling; bucket padding owns no RNG or counts.
+    logits = logits.narrow(0, 0, requests.size()).contiguous().view({int64_t(requests.size()), -1});
     Tensor greedy_tokens;
-    if (graph_tokens.defined()) {
-        greedy_tokens = graph_tokens.to(tb::kCPU).contiguous();
-        ++batched_greedy_batches_;
-    } else if (config_.greedy && batch_greedy) {
-        greedy_tokens = sample_greedy_cuda(logits.contiguous().view({batch, -1})).to(tb::kCPU).contiguous();
+    if (config_.greedy && batch_greedy) {
+        greedy_tokens = sample_greedy_cuda(logits).to(tb::kCPU).contiguous();
         ++batched_greedy_batches_;
     }
-    return {std::move(logits), std::move(greedy_tokens)};
+    BatchSamplingResult sampled;
+    if (!greedy_tokens.defined()) {
+        std::vector<BatchSamplingInput> inputs;
+        for (const auto& request : requests)
+            inputs.push_back({&*request->sampler, request->counts, request->token_constraint});
+        sampling_.reserve(max_sequences_, int(vocab_size()), logits.device());
+        sampled = sampling_.sample(logits, inputs);
+    }
+    return {std::move(logits), std::move(greedy_tokens), std::move(sampled.next), std::move(sampled.host)};
 }
 
 } // namespace mfq::cuda

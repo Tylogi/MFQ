@@ -13,21 +13,21 @@ from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
 from tests.test_native_nint_ple import _worker_tokenizer
 
 
-def write_qwen35_fixture(path):
+def write_qwen35_fixture(path, *, vocabulary=32, context_size=256):
     from mfq.formats.io import save
     from mfq.formats.header import FileHeader
     from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
 
     rng = np.random.default_rng(6184)
-    config = dict(model_type="qwen3_5", hidden_size=32, vocab_size=32, intermediate_size=64,
+    config = dict(model_type="qwen3_5", hidden_size=32, vocab_size=vocabulary, intermediate_size=64,
         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=64,
-        max_position_embeddings=256, layer_types=["full_attention"] * 2,
+        max_position_embeddings=context_size, layer_types=["full_attention"] * 2,
         rope_theta=10000., rms_norm_eps=1e-6, eos_token_id=31, tie_word_embeddings=False)
     weights = {}
     def matrix(name, shape):
         weights[name] = rng.normal(0, .08, shape).astype(np.float32)
-    matrix("model.token_embedding.weight", (32, 32))
-    matrix("model.output.weight", (32, 32))
+    matrix("model.token_embedding.weight", (vocabulary, 32))
+    matrix("model.output.weight", (vocabulary, 32))
     weights["model.output_norm.weight"] = np.zeros(32, np.float32)
     for i in range(2):
         prefix = f"model.block.{i}."

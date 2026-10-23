@@ -7,11 +7,27 @@
 
 namespace mfq::cuda::internal {
 
+inline MfqSamplingParams batch_graph_sampling_params(int row, int tokens) {
+    MfqSamplingParams params;
+    const int top_k[] = {0, 1, 2, 8, 20};
+    params.max_tokens = tokens;
+    params.temperature = .7 + .1 * (row % 4);
+    params.top_k = top_k[row % 5];
+    params.top_p = row % 2 ? .8 : 1.;
+    params.presence_penalty = .2;
+    params.frequency_penalty = -.01;
+    params.repetition_penalty = 1.2;
+    params.seed = 73 + row * 173;
+    params.enable_mtp = false;
+    return params;
+}
+
 // Exercise the public batch adapter directly so row order and arrivals are
 // deterministic, including a prefill between two replays of the same bucket.
 template<class Model>
 void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config,
-        const std::vector<int64_t>& prompt, const std::vector<int64_t>& reference) {
+        const std::vector<int64_t>& prompt, const std::vector<int64_t>& reference,
+        const std::vector<std::vector<int64_t>>& sampling_references = {}) {
     namespace tb = mfq_tensor_backend;
     using Ops = CudaBatchOperations<Model>;
     using Request = typename Ops::Request;
@@ -20,6 +36,7 @@ void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config
     config.cuda_graph_minimum_tokens = 1;
     config.cuda_graph = true;
     config.greedy = true;
+    const bool stochastic = !sampling_references.empty();
     std::cerr << "batch_membership_bench begin\n";
     {
         Ops operations(model, *model.execution, config);
@@ -39,6 +56,8 @@ void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config
             input.sampling.temperature = 0;
             input.sampling.top_k = 1;
             input.sampling.enable_mtp = false;
+            if (stochastic)
+                input.sampling = batch_graph_sampling_params(requests.size(), reference.size());
             auto request = std::make_shared<Request>("row-" + std::to_string(requests.size()), input);
             operations.suspend_decode();
             auto sample = operations.prefill(request, {0, int64_t(prompt.size())});
@@ -105,9 +124,11 @@ void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config
                 auto sample = operations.sample(request, decoded);
                 const auto index = std::find(requests.begin(), requests.end(), request) - requests.begin();
                 tokens[index].push_back(sample.token);
-                MFQ_RUNTIME_CHECK(tokens[index].size() <= reference.size() &&
-                    std::equal(tokens[index].begin(), tokens[index].end(), reference.begin()),
+                const auto& expected = stochastic ? sampling_references.at(index) : reference;
+                MFQ_RUNTIME_CHECK(tokens[index].size() <= expected.size() &&
+                    std::equal(tokens[index].begin(), tokens[index].end(), expected.begin()),
                     "membership change differs from serial generation");
+                operations.accept(request, sample);
                 request->pending_token = sample.token;
                 ++request->cache_length;
                 ++request->produced;
@@ -130,7 +151,11 @@ void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config
             for (const auto& value : live)
                 before.push_back(value.cpu());
             const auto position = paused->cache_length;
+            auto sampler_before = *paused->sampler;
             decode();
+            auto sampler_after = *paused->sampler;
+            MFQ_RUNTIME_CHECK(sampler_before.next_uniform_float() == sampler_after.next_uniform_float(),
+                              "inactive request RNG advanced during a bucket replay");
             for (std::size_t i = 0; i < live.size(); ++i) {
                 auto after = live[i].cpu();
                 MFQ_RUNTIME_CHECK(after.nbytes() == before[i].nbytes() &&
@@ -183,11 +208,13 @@ void check_batch_graph_membership(Model& model, CudaContinuousBatchConfig config
         double total_ms = 0;
         for (const auto milliseconds : step_ms)
             total_ms += milliseconds;
-        std::cout << "continuous_batching_membership_check rows=" << initial_rows << " steps=" << step_ms.size()
+        std::cout << (stochastic ? "continuous_batching_sampling_membership_check rows="
+                                : "continuous_batching_membership_check rows=")
+                  << initial_rows << " steps=" << step_ms.size()
                   << " captures=" << captures << " capture_ms="
                   << metric("continuous_batching_cuda_graph_capture_ms")
                   << " mean_step_ms=" << total_ms / step_ms.size() << " bucket_reuses=" << reuses
-                  << " serial=PASS inactive_state_bits=PASS padding_routes=PASS\n";
+                  << " serial=PASS inactive_state_bits=PASS inactive_rng=PASS padding_routes=PASS\n";
         operations.retire(state.active, 0);
     }
     std::cerr << "batch_membership_bench end\n";
