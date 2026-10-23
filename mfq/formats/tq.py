@@ -3,8 +3,8 @@
 Each row selects 1..8 bits per weight. Independent 256-element tail-biting
 rings address a procedural 65536-state Gaussian book. A row has an FP16
 anchor and either 4-bit subgroup selectors or shared FP16 column scales.
-No rotation is applied. This experimental payload is not registered with
-the model container or routed-expert cache.
+No rotation is applied. Model containers retain the logical matrix dimensions
+separately from this ordinary 2D packed payload.
 
 The payload stores the padded width; callers retain the logical input width
 in their model metadata and pass it to ``Projection(input_columns=...)``.
