@@ -2,6 +2,7 @@
 #include "hip_execution.h"
 #include "nint.h"
 #include "quant_linear.h"
+#include "core/ffn.h"
 
 #include <cuda_runtime_api.h>
 #include <cstdint>
@@ -466,6 +467,133 @@ void check_grouped_q8(int n, int mode, bool fp32, int storage_offset, int& cases
     }
 }
 
+void exact_bytes(const Tensor& actual, const Tensor& expected, const char* message) {
+    require(actual.sizes() == expected.sizes() &&
+        actual.scalar_type() == expected.scalar_type(), message);
+    auto a = actual.cpu().contiguous(), b = expected.cpu().contiguous();
+    require(std::memcmp(a.data_ptr(), b.data_ptr(),
+        size_t(a.numel()) * a.element_size()) == 0, message);
+}
+
+void check_rounded_swiglu(int gs, int ng, int bits, int tail, bool q8,
+                         int offset, bool exhaustive, int& cases) {
+    const Device gpu{DeviceType::cuda, 0};
+    auto w = fused_weight(17, gs, ng, bits, 0);
+    if (q8) {
+        std::vector<uint8_t> codes(size_t(w.out) * ng * gs + offset);
+        std::vector<int64_t> offsets(w.out);
+        for (int row = 0; row < w.out; ++row) {
+            offsets[row] = int64_t(row) * ng * gs * 8;
+            for (int col = 0; col < ng * gs; ++col)
+                codes[size_t(offset) + size_t(row) * ng * gs + col] = uint8_t(row * 97 + col * 31);
+        }
+        auto packed = tensor(codes).to(gpu);
+        w.q_packed = packed.narrow(0, offset, packed.numel() - offset);
+        w.row_q_bit_offsets = tensor(offsets).to(gpu);
+        w.aligned_q8 = true;
+        w.fused_ok = false;
+    }
+    const int width = ng * gs - tail;
+    auto up = empty({1, width}, TensorOptions().device(gpu).dtype(kFloat16));
+    auto gate = empty_like(up);
+    CudaExecutionContext execution;
+    const auto change = [&](int step) {
+        std::vector<float> values(width), gates(width);
+        const std::vector<float> edges = {0.f, -0.f, std::ldexp(1.f, -24),
+            -std::ldexp(1.f, -24), 0.333251953125f, -0.333251953125f,
+            1.f, -1.f, 11.f, -11.f, 80.f, -80.f, 65504.f, -65504.f};
+        for (int i = 0; i < width; ++i) {
+            values[i] = std::sin(float(i + step * 17) * .193f) * .9375f;
+            gates[i] = std::cos(float(i + step * 23) * .137f) * 12.f;
+            if (exhaustive) {
+                const uint16_t raw = uint16_t(i + step * 8191);
+                __half h;
+                std::memcpy(&h, &raw, sizeof(h));
+                gates[i] = std::isfinite(float(h)) ? float(h) : 0.f;
+            } else if (i < int(edges.size())) {
+                gates[i] = edges[(i + step) % edges.size()];
+                values[i] = edges[(i + step * 3) % 8];
+            }
+            if (step == 3 && i < gs) values[i] = 0.f;
+        }
+        up.copy_(tensor(values).reshape({1, width}).to(gpu, kFloat16));
+        gate.copy_(tensor(gates).reshape({1, width}).to(gpu, kFloat16));
+    };
+    Tensor expected_q, expected_scale;
+    const auto reference = [&] {
+        auto result = nint_matmul(execution.profiler, w, silu(gate) * up);
+        expected_q = w.workspace(1).qx.cpu();
+        expected_scale = w.workspace(1).xscale.cpu();
+        return result;
+    };
+    const auto run = [&] {
+        return nint_matmul_input_swiglu_f16(execution.profiler, w, up, gate);
+    };
+    const auto verify = [&](const Tensor& actual, const Tensor& expected) {
+        exact_half(actual, expected);
+        exact_bytes(w.workspace(1).qx, expected_q, "rounded SwiGLU quantized bytes differ");
+        exact_bytes(w.workspace(1).xscale, expected_scale, "rounded SwiGLU scales differ");
+        ++cases;
+    };
+    change(0);
+    auto expected = reference();
+    verify(run(), expected);
+    const auto stream = mfq_get_stream_from_pool(false);
+    MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph;
+    mfq_prepare_cuda_graph_memory(graph);
+    auto actual = run();
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    actual = Tensor{};
+    graph.capture_begin(); actual = run(); graph.capture_end();
+    for (int step = 1; step <= 3; ++step) {
+        change(step); expected = reference(); graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        verify(actual, expected);
+    }
+}
+
+void check_ffn_rounded_swiglu(int rows, int& cases) {
+    constexpr int width = 96;
+    const Device gpu{DeviceType::cuda, 0};
+    CudaExecutionContext execution;
+    execution.config.diagnostic_nint_group = true;
+    execution.config.ffn_swiglu_fusion = true;
+    QuantLinear g, u;
+    g.nint = fused_weight(width, 24, 4, 4, 0);
+    u.nint = fused_weight(width, 24, 4, 6, 3);
+    FFN ffn;
+    ffn.gate_up = make_quant_group(execution, {g, u});
+    ffn.down.nint = fused_weight(53, 24, 4, 6, 0);
+    require(ffn.gate_up.nint_grouped && ffn.gate_up.nint.split_w.empty(),
+        "rounded FFN fixture requires a combined projection");
+    auto input = empty({1, rows, width}, TensorOptions().device(gpu).dtype(kFloat16));
+    const auto change = [&](int step) {
+        std::vector<float> values(rows * width);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = std::sin(float(i + step * 17) * .193f) * 2.f;
+        input.copy_(tensor(values).reshape({1, rows, width}).to(gpu, kFloat16));
+    };
+    const auto reference = [&] {
+        return ffn.down.forward(execution, ffn.gate_up.forward_swiglu(execution, input));
+    };
+    const auto run = [&] { return ffn.forward(execution, input); };
+    change(0); auto expected = reference(); exact_half(run(), expected); ++cases;
+    const auto stream = mfq_get_stream_from_pool(false);
+    MfqCudaStreamGuard guard(stream);
+    MfqCudaGraph graph;
+    mfq_prepare_cuda_graph_memory(graph);
+    auto actual = run();
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    actual = Tensor{};
+    graph.capture_begin(); actual = run(); graph.capture_end();
+    for (int step = 1; step <= 3; ++step) {
+        change(step); expected = reference(); graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        exact_half(actual, expected); ++cases;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -486,6 +614,18 @@ int main() {
         for(int rows:{1,3,8})check_float_input(32,rows,2,0,float_ordinary,float_changing);
         std::cout<<"NINT Float activation rounding ordinary="<<float_ordinary
                  <<" changing_graph="<<float_changing<<" quantized/scales/output bytes exact PASS\n";
+        int rounded_cases = 0;
+        for (int gs : {5, 24, 28, 32, 48, 64})
+            for (int bits : {0, 4, 6})
+                for (int tail : {0, 1})
+                    check_rounded_swiglu(gs, 37, bits, tail, false, 0, false, rounded_cases);
+        for (int offset : {0, 1, 4})
+            for (int tail : {0, 1})
+                check_rounded_swiglu(48, 37, 8, tail, true, offset, false, rounded_cases);
+        check_rounded_swiglu(24, 2731, 6, 8, false, 0, true, rounded_cases);
+        for (int rows : {1, 2, 6}) check_ffn_rounded_swiglu(rows, rounded_cases);
+        std::cout << "NINT FP16 SwiGLU materialized reference ordinary/changing graphs cases="
+                  << rounded_cases << " quantized/scales/output bytes exact PASS\n";
         int single_cases=0;
         for(int gs:{5,24,28,32,48,64})for(int width:{53,640,2560})
             for(int preset:{0,4,5,8})for(int offset:{0,1})for(int padding:{0,8})
