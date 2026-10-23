@@ -74,7 +74,7 @@ struct EngramTable::Impl {
          int columns, std::uint64_t values, std::size_t cache_rows,std::shared_ptr<mfq::NintRows> nint)
         : source(data), name(std::move(tensor)), rows(count), value_bytes(values),
           width(columns), capacity(cache_rows), row_bytes(columns + columns / 32) {
-        if(require_tensor(source,name).dtype=="TQ") {
+        if(is_tq_row_table(source,name)) {
             tq_table=std::make_shared<TqRowTable>(source,name);
             if(tq_table->rows()!=rows || tq_table->width()!=width)
                 throw std::invalid_argument("TQ Engram table shape differs");
@@ -269,9 +269,9 @@ EngramTensor EngramTable::gather(const std::int64_t* rows, int batch, int tokens
 std::shared_ptr<EngramTable> EngramTable::load(const mfq::ModelSource &model, const std::string &name,
                                              std::int64_t expected_rows, int expected_width,
                                              std::size_t cache_capacity_rows) {
-        const auto record = require_tensor(model, name);
-        if(record.dtype=="TQ")return std::shared_ptr<EngramTable>(new EngramTable(model,name,record.nbytes,
+        if(is_tq_row_table(model,name))return std::shared_ptr<EngramTable>(new EngramTable(model,name,0,
             expected_rows,expected_width,0,cache_capacity_rows,{}));
+        const auto record = require_tensor(model, name);
         if(record.dtype=="NINT") {
             auto table=load_nint_row_table(model,name,true);
             if(table->rows()!=expected_rows || table->width()!=expected_width)
