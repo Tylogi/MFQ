@@ -16,6 +16,9 @@ def is_engram_shard(name: str) -> bool:
 
 
 def is_engram_table(name: str) -> bool:
+    base, marker, index = name.rpartition('.tq_row_shard.')
+    if marker and index.isascii() and index.isdecimal():
+        name = base
     return name.endswith(('.associative_memory.embedding.weight', '.engram.embed.weight'))
 
 
