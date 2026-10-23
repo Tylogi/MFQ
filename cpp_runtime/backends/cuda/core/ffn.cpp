@@ -28,44 +28,6 @@ bool dense_linear_defined(const QuantLinear &linear) {
 
 } // namespace
 
-Tensor dense_routed_projection(const Tensor &bank, const Tensor &input, const Tensor &ids,
-                               std::size_t gather_budget_bytes) {
-    MFQ_RUNTIME_CHECK(bank.is_cuda() && bank.is_contiguous() && bank.dim() == 3,
-                      "dense routed expert bank must be contiguous CUDA [experts,out,in]");
-    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.dim() == 2, "dense routed ids must be [tokens,routes]");
-    const int64_t rows = ids.size(0), routes = ids.size(1);
-    const int64_t output = bank.size(1), width = bank.size(2);
-    MFQ_RUNTIME_CHECK(input.size(0) == rows && input.size(-1) == width,
-                      "dense routed input shape does not match the expert bank");
-    MFQ_RUNTIME_CHECK(input.dim() == 2 || (input.dim() == 3 && input.size(1) == routes),
-                      "dense routed activation shape does not match the route plan");
-    auto project = [&](const Tensor &chunk_ids, const Tensor &chunk_input) {
-        const int64_t count = chunk_ids.size(0);
-        auto selected =
-            bank.index_select(0, chunk_ids.reshape({-1}).to(mfq_tensor_backend::kInt64))
-                .reshape({count, routes, output, width});
-        auto source = chunk_input.dim() == 2
-                          ? chunk_input.unsqueeze(1).expand({count, routes, width})
-                          : chunk_input;
-        return mfq_tensor_backend::matmul(selected, source.to(bank.scalar_type()).unsqueeze(-1))
-            .squeeze(-1);
-    };
-    // Every route copies its whole expert matrix, so a long prompt would gather
-    // tokens * routes full matrices at once; bound each copy by row chunks.
-    const auto row_bytes = static_cast<std::size_t>(routes * output * width) * bank.element_size();
-    const auto rows_per_chunk = gather_budget_bytes / std::max<std::size_t>(1, row_bytes);
-    const auto chunk_rows = static_cast<int64_t>(std::max<std::size_t>(1, rows_per_chunk));
-    if (rows <= chunk_rows)
-        return project(ids, input);
-    std::vector<Tensor> parts;
-    parts.reserve(static_cast<std::size_t>((rows + chunk_rows - 1) / chunk_rows));
-    for (int64_t start = 0; start < rows; start += chunk_rows) {
-        const auto count = std::min(chunk_rows, rows - start);
-        parts.push_back(project(ids.narrow(0, start, count), input.narrow(0, start, count)));
-    }
-    return mfq_tensor_backend::cat(parts, 0);
-}
-
 namespace {
 
 Tensor dense_expert_activation(ActivationKind activation, Tensor gate, Tensor up, double limit) {
@@ -514,8 +476,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     // Dense (source-precision) banks are not MFE cohorts, so
                     // their expert count comes from the bank itself.
                     const auto routed_experts =
-                        moe_dense_up.defined()
-                            ? static_cast<int>(moe_dense_up.size(0))
+                        (moe_dense_up.defined() || moe_dense_gate_up.defined())
+                            ? static_cast<int>((moe_dense_up.defined() ? moe_dense_up : moe_dense_gate_up).size(0))
                             : (moe_ungated_experts
                                    ? moe_up.n_experts
                                    : (moe_split_gate_up ? moe_gate.n_experts
@@ -573,7 +535,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             [&](const auto &selected) -> ExpertOutput {
                 const bool dense_routed =
                     moe_dense_up.defined() || moe_dense_down.defined() ||
-                    moe_dense_gate.defined();
+                    moe_dense_gate.defined() || moe_dense_gate_up.defined();
                 // Only routed experts run in the latent space; the router and
                 // the shared expert keep reading the original hidden state.
                 const bool latent_routed =
@@ -592,37 +554,49 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                 };
                 if (dense_routed) {
                     if (moe_ungated_experts &&
-                        (moe_dense_gate.defined() || moe_gate_up.n_experts > 0 ||
+                        (moe_dense_gate.defined() || moe_dense_gate_up.defined() || moe_gate_up.n_experts > 0 ||
                          moe_gate.n_experts > 0 || moe_up.n_experts > 0 ||
                          moe_gate_up.cached_source || moe_up.cached_source))
                         throw std::runtime_error(
                             "ungated routed MoE cannot mix a gate with a dense expert bank");
-                    MFQ_RUNTIME_CHECK(moe_dense_up.defined() && moe_dense_down.defined(),
+                    MFQ_RUNTIME_CHECK((moe_dense_up.defined() || moe_dense_gate_up.defined()) &&
+                                      moe_dense_down.defined(),
                                       "dense routed MoE requires Up and Down banks");
                     auto expert_input = xf;
                     if (dense_linear_defined(moe_latent_in))
                         expert_input = profiler.measure("moe.latent_down", [&] {
                             return moe_latent_in.forward(execution, xf);
                         });
-                    auto up = profiler.measure("moe.dense_up", [&] {
-                        return dense_routed_projection(moe_dense_up, expert_input,
-                                                       selected.at(0));
-                    });
+                    Tensor up;
                     Tensor gate;
-                    if (!moe_ungated_experts) {
-                        MFQ_RUNTIME_CHECK(moe_dense_gate.defined(),
-                                          "gated dense routed MoE requires a Gate bank");
-                        gate = profiler.measure("moe.dense_gate", [&] {
-                            return dense_routed_projection(moe_dense_gate, expert_input,
-                                                           selected.at(0));
+                    if (moe_dense_gate_up.defined()) {
+                        MFQ_RUNTIME_CHECK(!moe_dense_gate.defined() && !moe_dense_up.defined() &&
+                                          moe_dense_gate_up.size(1) % 2 == 0,
+                                          "dense combined Gate/Up cannot mix separate banks and needs even rows");
+                        auto pair = profiler.measure("moe.dense_gate_up", [&] {
+                            return dense_routed_projection(moe_dense_gate_up, expert_input, route);
                         });
+                        const auto width = pair.size(-1) / 2;
+                        gate = pair.narrow(-1, 0, width);
+                        up = pair.narrow(-1, width, width);
+                    } else {
+                        up = profiler.measure("moe.dense_up", [&] {
+                            return dense_routed_projection(moe_dense_up, expert_input, route);
+                        });
+                        if (!moe_ungated_experts) {
+                            MFQ_RUNTIME_CHECK(moe_dense_gate.defined(),
+                                              "gated dense routed MoE requires a Gate bank");
+                            gate = profiler.measure("moe.dense_gate", [&] {
+                                return dense_routed_projection(moe_dense_gate, expert_input, route);
+                            });
+                        }
                     }
                     auto hidden = profiler.measure("moe.dense_activation", [&] {
                         return dense_expert_activation(activation, std::move(gate),
                                                        std::move(up), swiglu_limit);
                     });
                     auto down_pair = profiler.measure("moe.dense_down", [&] {
-                        return dense_routed_projection(moe_dense_down, hidden, selected.at(0));
+                        return dense_routed_projection(moe_dense_down, hidden, route);
                     });
                     auto reduced = profiler.measure("moe.dense_reduce", [&] {
                         return moe_weighted_reduce_cuda(down_pair, selected.at(1));
@@ -632,7 +606,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             return moe_latent_out.forward(execution, reduced);
                         });
                     record_moe_route_stats(execution, moe_layer, selected.at(0), selected.at(1),
-                                           down_pair, static_cast<int>(moe_dense_up.size(0)));
+                                           down_pair, route.n_experts);
                     return {reduced, true};
                 }
                 if (moe_ungated_experts && !use_pipeline) {

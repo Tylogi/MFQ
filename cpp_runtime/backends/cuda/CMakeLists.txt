@@ -99,6 +99,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/dense_moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
@@ -405,6 +406,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
     ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/dense_moe.cpp
     ${MFQ_CUDA_ROOT}/ops/moe.cpp
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
