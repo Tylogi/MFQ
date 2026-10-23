@@ -3213,7 +3213,7 @@ int run_native_runtime(
             << load_seconds << " s; runtime=native-cpp"
             << " expert_backing="
             << (expert_cache_bytes.has_value()
-                    ? "mfe-ssd"
+                    ? "ssd-streamed"
                     : "full-resident")
             << std::endl;
         const auto load_runtime =
@@ -3428,7 +3428,7 @@ int run_native_runtime(
             << load_seconds << " s; runtime=native-cpp"
             << " expert_backing="
             << (expert_cache_bytes.has_value()
-                    ? "mfe-ssd"
+                    ? "ssd-streamed"
                     : "full-resident")
             << std::endl;
         const auto load_runtime =

@@ -45,11 +45,15 @@ std::size_t pool_page() {
 struct PoolStorage {
     void* data = MAP_FAILED;
     std::size_t bytes = 0;
-    allocator::Buffer buffer{nullptr};
     ~PoolStorage() {
-        if (buffer.ptr()) allocator::release(buffer);
         if (data != MAP_FAILED) munmap(data, bytes);
     }
+};
+
+struct PoolBuffer {
+    std::shared_ptr<PoolStorage> storage;
+    allocator::Buffer buffer{nullptr};
+    ~PoolBuffer() { if (buffer.ptr()) allocator::release(buffer); }
 };
 
 struct Pool {
@@ -58,6 +62,7 @@ struct Pool {
     array words = array(0, uint32);
     std::byte* data = nullptr;
     std::size_t capacity = 0;
+    std::shared_ptr<PoolStorage> storage;
     std::map<std::size_t, FreeRange> free;
     Sizes sizes;
 
@@ -83,16 +88,27 @@ struct Pool {
             throw std::invalid_argument("invalid TQ expert pool capacity");
         if (capacity > mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength())
             throw std::invalid_argument("TQ expert pool exceeds the Metal buffer size limit");
-        auto storage = std::make_shared<PoolStorage>();
+        storage = std::make_shared<PoolStorage>();
         storage->bytes = capacity;
         storage->data = mmap(nullptr, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (storage->data == MAP_FAILED) throw std::bad_alloc();
-        storage->buffer = allocator::make_buffer(storage->data, capacity);
-        if (!storage->buffer.ptr()) throw std::runtime_error("cannot register TQ expert pool with Metal");
-        words = array(storage->buffer, Shape{int(capacity / 4096), 1024}, uint32,
-            [storage](allocator::Buffer) {});
-        data = reinterpret_cast<std::byte*>(words.data<std::uint32_t>());
+        bind_storage(capacity);
         reset_free(0);
+    }
+
+    void bind_storage(std::size_t bytes) {
+        if (!storage || !bytes || bytes > storage->bytes || bytes % pool_page())
+            throw std::invalid_argument("invalid TQ expert pool view");
+        if (bytes > capacity)
+            madvise(static_cast<std::byte*>(storage->data) + capacity, bytes - capacity, MADV_FREE_REUSE);
+        auto view = std::make_shared<PoolBuffer>();
+        view->storage = storage;
+        view->buffer = allocator::make_buffer(storage->data, bytes);
+        if (!view->buffer.ptr()) throw std::runtime_error("cannot register TQ expert pool with Metal");
+        words = array(view->buffer, Shape{int(bytes / 4096), 1024}, uint32,
+            [view](allocator::Buffer) {});
+        capacity = bytes;
+        data = reinterpret_cast<std::byte*>(words.data<std::uint32_t>());
     }
 
     bool fits(std::size_t bytes) const {
@@ -207,7 +223,9 @@ struct MlxTqExpertCache::Impl {
             std::size_t budget, int io_workers) : source(source), io_workers(io_workers) {
         if (prefixes.empty() || prefixes.size() > std::size_t(UINT32_MAX) || io_workers < 1)
             throw std::invalid_argument("invalid TQ expert cache configuration");
-        const auto shapes = nlohmann::json::parse(source.header().extra_json.at("tq_shapes"));
+        const auto meta = source.header().extra_json.find("tq_shapes");
+        const auto shapes = meta == source.header().extra_json.end() ? nlohmann::json::object()
+            : nlohmann::json::parse(meta->second);
         std::array<std::size_t, 3> largest{};
         layers.resize(prefixes.size());
         for (std::size_t index = 0; index < layers.size(); ++index) {
@@ -218,14 +236,22 @@ struct MlxTqExpertCache::Impl {
                     + std::array<const char*, 3>{"gate", "up", "down"}[projection] + ".weight";
                 if (source.record(bank.name).dtype != "TQ")
                     throw std::invalid_argument("TQ expert cache requires three TQ banks per layer");
-                const auto shape = shapes.at(bank.name).get<std::vector<int>>();
+                bank.mapping = source.map_record(bank.name, true);
+                std::vector<int> shape;
+                if (shapes.contains(bank.name)) shape = shapes.at(bank.name).get<std::vector<int>>();
+                else {
+                    bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view());
+                    const auto& rows = *bank.rows;
+                    if (!rows.expert_container()) throw std::invalid_argument("TQ expert bank lacks logical shape");
+                    shape = {int(rows.expert_count()), int(rows.rows() / rows.expert_count()), rows.width()};
+                }
                 if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int x) { return x < 1; })
                     || (projection && layer.experts != shape[0]))
                     throw std::invalid_argument("invalid TQ expert bank geometry");
                 layer.experts = shape[0];
-                bank.mapping = source.map_record(bank.name, true);
-                bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view(), shape[2]);
-                if (bank.rows->rows() != std::int64_t(shape[0]) * shape[1])
+                if (!bank.rows) bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view(), shape[2]);
+                if (bank.rows->rows() != std::int64_t(shape[0]) * shape[1]
+                    || (bank.rows->expert_container() && bank.rows->expert_count() != std::size_t(shape[0])))
                     throw std::invalid_argument("TQ expert bank row count differs");
                 for (int expert = 0; expert < layer.experts; ++expert) {
                     const auto span = bank.rows->packed_rows(std::int64_t(expert) * shape[1], shape[1]);
@@ -242,9 +268,10 @@ struct MlxTqExpertCache::Impl {
             auto temporary = array(allocator::malloc(words * 4), Shape{int(words)}, uint32);
             for (auto& layer : layers) {
                 auto& bank = layer.banks[projection];
-                const auto shape = shapes.at(bank.name).get<std::vector<int>>();
                 const std::vector<std::uint64_t> offsets(layer.experts, 0);
-                bank.weight.emplace(MlxTqWeight::from_pool(bank.mapping.view(), temporary, offsets, shape[2]));
+                bank.weight.emplace(bank.rows->expert_container()
+                    ? MlxTqWeight::from_expert_rows(*bank.rows, layer.experts, &temporary, offsets)
+                    : MlxTqWeight::from_pool(bank.mapping.view(), temporary, offsets, bank.rows->width()));
                 metadata += bank.weight->descriptors_.nbytes() + bank.weight->scales_.nbytes();
             }
         }
@@ -312,6 +339,7 @@ struct MlxTqExpertCache::Impl {
         pool_residency.reset();
         for (auto& pool : pools) {
             pool.words = array(0, uint32); pool.data = nullptr; pool.capacity = 0;
+            pool.storage.reset();
             pool.free.clear(); pool.sizes.clear();
         }
         bind_pools();
@@ -356,6 +384,52 @@ struct MlxTqExpertCache::Impl {
             return 0;
         }
         finish_pending();
+        bool reusable = true;
+        for (int p = 0; p < 3; ++p)
+            reusable &= pools[p].storage && capacities[p] <= pools[p].storage->bytes;
+        if (reusable) {
+            const auto before = allocated.load();
+            for (auto entry = entries.begin(); entry != entries.end();) {
+                bool outside = false;
+                for (int p = 0; p < 3; ++p) {
+                    const auto range = entry->second.allocations[p];
+                    outside = outside || range.offset > capacities[p] || range.bytes > capacities[p] - range.offset;
+                }
+                if (outside) {
+                    const auto victim = entry++;
+                    erase(victim);
+                    evictions.fetch_add(1, std::memory_order_relaxed);
+                } else ++entry;
+            }
+            pool_residency.reset();
+            for (auto& layer : layers) {
+                layer.weights.reset();
+                for (auto& bank : layer.banks) bank.weight->words_ = array(0, uint32);
+            }
+            for (auto& pool : pools) pool.words = array(0, uint32);
+            try {
+                for (int p = 0; p < 3; ++p) pools[p].bind_storage(capacities[p]);
+                bind_pools();
+                pool_residency = MlxWeightResidency::retain_arrays(
+                    {pools[0].words, pools[1].words, pools[2].words}, budget);
+            } catch (...) {
+                const auto failure = std::current_exception();
+                for (int p = 0; p < 3; ++p) pools[p].bind_storage(previous[p]);
+                bind_pools();
+                pool_residency = MlxWeightResidency::retain_arrays(
+                    {pools[0].words, pools[1].words, pools[2].words}, before);
+                rebuild_free_ranges();
+                std::rethrow_exception(failure);
+            }
+            rebuild_free_ranges();
+            for (int p = 0; p < 3; ++p) if (capacities[p] < previous[p])
+                madvise(pools[p].data + capacities[p], previous[p] - capacities[p], MADV_FREE_REUSABLE);
+            allocated = metadata + std::accumulate(capacities.begin(), capacities.end(), std::size_t{0});
+            resources.set({0, 0, allocated.load(), backing, 0});
+            if (!preserve_ceiling) requested_limit = budget;
+            preload_complete();
+            return before > allocated ? before - allocated : 0;
+        }
         while (!entries.empty()) erase(entries.begin());
         const auto before = allocated.load();
         release_pools();
@@ -368,6 +442,22 @@ struct MlxTqExpertCache::Impl {
         }
         if (!preserve_ceiling) requested_limit = budget;
         return before > allocated ? before - allocated : 0;
+    }
+
+    void rebuild_free_ranges() {
+        for (int p = 0; p < 3; ++p) {
+            std::vector<Range> live;
+            for (const auto& [key, entry] : entries) live.push_back(entry.allocations[p]);
+            std::sort(live.begin(), live.end(), [](const auto a, const auto b) { return a.offset < b.offset; });
+            auto& pool = pools[p];
+            pool.free.clear(); pool.sizes.clear();
+            std::size_t offset = 0;
+            for (const auto range : live) {
+                if (range.offset > offset) pool.insert_free(offset, range.offset - offset);
+                offset = range.offset + range.bytes;
+            }
+            if (offset < pool.capacity) pool.insert_free(offset, pool.capacity - offset);
+        }
     }
 
     void erase(std::unordered_map<std::uint64_t, Entry>::iterator entry) {
@@ -470,6 +560,7 @@ struct MlxTqExpertCache::Impl {
             || (route_ids.dtype() != int32 && route_ids.dtype() != uint32))
             throw std::invalid_argument("invalid TQ expert cache route window");
         auto& layer = layers[index];
+        const bool scan = !preload && route_ids.shape(0) > 16;
         drain_completed();
         if (!preload && layer.cached == layer.experts && layer.experts <= 1024
             && route_ids.dtype() == int32 && route_ids.flags().row_contiguous
@@ -538,8 +629,8 @@ struct MlxTqExpertCache::Impl {
                     erase(entries.find(*victim));
                     evictions.fetch_add(1, std::memory_order_relaxed);
                 }
-                order.push_front(key);
-                Entry entry{index, expert, {}, order.begin()};
+                const auto position = order.insert(scan ? order.end() : order.begin(), key);
+                Entry entry{index, expert, {}, position};
                 int taken = 0;
                 try {
                     for (; taken < 3; ++taken) {
@@ -553,7 +644,7 @@ struct MlxTqExpertCache::Impl {
                         pools[p].release(entry.allocations[p]);
                         used.fetch_sub(sizes[p], std::memory_order_relaxed);
                     }
-                    order.pop_front();
+                    order.erase(position);
                     throw;
                 }
                 added.push_back(key);

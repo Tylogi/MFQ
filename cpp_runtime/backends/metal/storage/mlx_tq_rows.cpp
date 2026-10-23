@@ -35,6 +35,37 @@ const std::array<float, 16>& relative_scales() {
 
 MlxMappedTqRows::MlxMappedTqRows(std::span<const std::uint8_t> blob, int width)
     : blob_(blob) {
+    if (blob.size() >= 64 && !std::memcmp(blob.data(), "RTQEXP01", 8)) {
+        const auto count = load<std::uint32_t>(blob, 12), out = load<std::uint32_t>(blob, 16),
+            logical = load<std::uint32_t>(blob, 20);
+        if (load<std::uint32_t>(blob, 8) != 1 || !count || !out || !logical || logical > INT_MAX
+            || std::uint64_t(count) * out > INT_MAX || count > (blob.size() - 64) / 16
+            || load<std::uint32_t>(blob, 24) != 16 || load<std::uint32_t>(blob, 28)
+            || (width && width != int(logical))
+            || std::any_of(blob.begin() + 32, blob.begin() + 64, [](auto b) { return b != 0; }))
+            throw std::runtime_error("invalid TQ expert container header");
+        std::size_t end = 64 + std::size_t(count) * 16;
+        experts_.reserve(count);
+        expert_offsets_.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto offset = load<std::uint64_t>(blob, 64 + index * 16),
+                size = load<std::uint64_t>(blob, 72 + index * 16);
+            if (offset != end || offset > blob.size() || size < 64 || size > blob.size() - offset
+                || std::memcmp(blob.data() + offset, "RTRELL05", 8))
+                throw std::runtime_error("invalid TQ expert container span");
+            experts_.emplace_back(blob.subspan(offset, size), logical);
+            if (experts_.back().rows() != out || (index && experts_.back().stored_width() != experts_.front().stored_width()))
+                throw std::runtime_error("TQ expert container dimensions differ");
+            expert_offsets_.push_back(offset);
+            end = offset + size;
+        }
+        if (end != blob.size()) throw std::runtime_error("TQ expert container length differs");
+        rows_ = count * out; width_ = logical;
+        stored_width_ = experts_.front().stored_width(); group_size_ = experts_.front().group_size();
+        columns_ = experts_.front().columns();
+        groups_ = scales_offset_ = packed_offset_ = 0;
+        return;
+    }
     if (blob.size() < 64 || std::memcmp(blob.data(), "RTRELL05", 8)
         || load<std::uint32_t>(blob, 8) != 5)
         throw std::runtime_error("invalid TQ row table header");
@@ -64,7 +95,20 @@ MlxMappedTqRows::MlxMappedTqRows(std::span<const std::uint8_t> blob, int width)
     }
 }
 
+const MlxMappedTqRows& MlxMappedTqRows::expert(std::size_t index) const {
+    if (experts_.empty()) {
+        if (index) throw std::out_of_range("TQ expert index is outside the tensor");
+        return *this;
+    }
+    return experts_.at(index);
+}
+
 std::size_t MlxMappedTqRows::selected_row_nbytes_bound() const noexcept {
+    if (!experts_.empty()) {
+        std::size_t bound = 0;
+        for (const auto& expert : experts_) bound = std::max(bound, expert.selected_row_nbytes_bound());
+        return bound;
+    }
     return 16 + stored_width_ + (columns_ ? std::size_t(stored_width_) : groups_) * 4;
 }
 
@@ -84,6 +128,13 @@ std::uint64_t MlxMappedTqRows::descriptor(std::int64_t row) const {
 MlxMappedTqRows::PackedRows MlxMappedTqRows::packed_rows(std::int64_t first, std::size_t count) const {
     if (first < 0 || first >= rows_ || count == 0 || count > std::size_t(rows_ - first))
         throw std::out_of_range("TQ row span is outside the table");
+    if (!experts_.empty()) {
+        const auto rows = experts_.front().rows(), index = first / rows, local = first % rows;
+        if (count > std::size_t(rows - local)) throw std::out_of_range("TQ packed span crosses expert records");
+        auto result = experts_[index].packed_rows(local, count);
+        result.offset += expert_offsets_[index];
+        return result;
+    }
     const auto begin = std::uint32_t(descriptor(first)) * 4ull;
     auto end = begin;
     for (std::size_t row = 0; row < count; ++row) {
@@ -97,6 +148,14 @@ MlxMappedTqRows::PackedRows MlxMappedTqRows::packed_rows(std::int64_t first, std
 
 void MlxMappedTqRows::write_descriptors(std::int64_t first, std::uint32_t word_base,
         std::span<std::uint64_t> destination) const {
+    if (!experts_.empty()) {
+        if (first < 0 || first >= rows_) throw std::out_of_range("TQ row index is outside the expert bank");
+        const auto rows = experts_.front().rows(), index = first / rows, local = first % rows;
+        if (destination.empty() || destination.size() > std::size_t(rows - local))
+            throw std::out_of_range("TQ descriptor span crosses expert records");
+        experts_[index].write_descriptors(local, word_base, destination);
+        return;
+    }
     const auto range = packed_rows(first, destination.size());
     if (range.bytes / 4 > std::uint64_t(std::numeric_limits<std::uint32_t>::max()) + 1 - word_base)
         throw std::overflow_error("TQ destination word offsets are too large");
@@ -109,6 +168,12 @@ void MlxMappedTqRows::write_descriptors(std::int64_t first, std::uint32_t word_b
 }
 
 void MlxMappedTqRows::append_row(std::int64_t row, MlxTqRowBatch& batch) const {
+    if (!experts_.empty()) {
+        if (row < 0 || row >= rows_) throw std::out_of_range("TQ row index is outside the expert bank");
+        const auto rows = experts_.front().rows();
+        experts_[row / rows].append_row(row % rows, batch);
+        return;
+    }
     const auto descriptor = this->descriptor(row);
     const std::size_t bytes = std::size_t(stored_width_) * (((descriptor >> 32) & 7) + 1) / 8;
     const std::size_t begin = std::uint32_t(descriptor) * 4ull;
