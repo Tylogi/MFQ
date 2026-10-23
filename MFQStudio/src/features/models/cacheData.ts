@@ -15,6 +15,13 @@ export function quantizedCacheProfile(profile: ModelCacheProfile, settings: KvQu
   }) };
 }
 
+/** Scale per-request cache budgets without multiplying resident model weights. */
+export function concurrentCacheProfile(profile: ModelCacheProfile, requests: number): ModelCacheProfile {
+  return { ...profile, fixed_bytes: profile.fixed_bytes * requests,
+    fixed_components: profile.fixed_components?.map(item => ({ ...item, bytes: item.bytes * requests })),
+    components: profile.components.map(item => ({ ...item, bytes_per_row: item.bytes_per_row * requests })) };
+}
+
 export interface CacheBreakdown {
   id: string;
   name: string;

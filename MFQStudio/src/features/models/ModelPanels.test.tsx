@@ -5,6 +5,7 @@ import type { useModelCatalog } from './useModelCatalog';
 import { LoadedModels } from './LoadedModels';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { DEFAULT_CONCURRENCY } from './concurrencySettings';
 import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 vi.mock('../settings/SettingsProvider', () => ({
@@ -26,6 +27,9 @@ function catalog() {
     loadPinned: false,
     loadIdleTtl: null,
     loadContext: DEFAULT_LOAD_CONTEXT,
+    loadConcurrency: DEFAULT_CONCURRENCY,
+    concurrencyPolicy: null,
+    setLoadConcurrency: vi.fn(),
     setLoadContext: vi.fn(),
     chooseModelDirectory: vi.fn(),
     selectModel: vi.fn(),

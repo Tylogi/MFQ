@@ -258,7 +258,30 @@ export interface RuntimeDeviceMemory {
   memory_available_bytes?: number | null;
 }
 
+/** Server defaults and per-model overrides use seconds for queue timeouts. */
+export interface RuntimeConcurrencySettings {
+  max_requests: number;
+  max_queued_requests: number;
+  queue_timeout_seconds: number;
+}
+
+export type RuntimeConcurrencyLimits = Omit<RuntimeConcurrencySettings, 'queue_timeout_seconds'> & {
+  queue_timeout_seconds: number | null;
+};
+
+export interface RuntimeConcurrencyPolicy {
+  defaults: RuntimeConcurrencySettings;
+  limits: RuntimeConcurrencyLimits;
+}
+
+export interface RuntimeConcurrency {
+  requested: RuntimeConcurrencySettings;
+  effective: RuntimeConcurrencySettings;
+  limits: RuntimeConcurrencyLimits;
+}
+
 export interface RuntimeInstance {
+  concurrency?: RuntimeConcurrency | null;
   id: string;
   model: string;
   state: 'loading' | 'ready' | 'busy' | 'unloading' | 'failed';
