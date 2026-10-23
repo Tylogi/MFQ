@@ -2,7 +2,11 @@
 
 Enable an explicit request capacity with `mfq serve --max-requests-per-runtime N`
 or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
-from 1 to 32 on one CUDA device. The managed server's default remains one request.
+from 1 to the configured sequence limit on one CUDA device. The limit defaults
+to 32 and can be reduced with `MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES`. Values above
+32 are rejected in both the native worker and Python server. The managed server's
+default remains one request. The 64-row paths are not validated; GDN independent
+batch preparation currently accepts at most 32 rows.
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded
@@ -21,16 +25,60 @@ departures, pauses and row reordering update these inputs before replay. A new
 row bucket, length bucket or cache capacity can require capture.
 Padding rows cannot commit request KV, recurrent or PLE state, ngram history,
 token counts or expert routes; their outputs are discarded.
-QSA allocations grow with the actual context; selecting a large context limit
-does not allocate that entire limit for every slot. Request-owned KV and
-recurrent state are included in the runtime's KV memory metrics.
+With dynamic KV allocation, extra request contexts reserve stable virtual
+addresses and map physical QSA pages only for admitted prefill/decode tokens.
+The initial exclusive context retains its existing warm mapping.
+Managed preallocated KV retains its configured full-context allocation policy;
+admission charges that physical allocation before starting another request.
+Managed KV bytes are counted through `KvMemoryManager`; request-owned recurrent
+state and other KV buffers are included in the runtime's request KV metrics.
 
-Before growing caches, the runtime checks actual available VRAM, including the
-transient expansion workspace, and can evict prefix hot-cache entries. A prefill
-capacity failure rejects that request. If the active decode group cannot grow,
-the newest eligible request receives a context-capacity error and existing
-requests retain their state. Unexpected CUDA failures still fail the backend.
+Before starting a prefill, the shared engine scheduler reserves the uncached
+prompt and expected remaining decode for each admitted request, including paused
+and partially prefilled requests. Expected decode is
+`ceil(min(max_new_tokens - produced, decode_token_clip) * new_token_ratio)`.
+CUDA converts these tokens to KV bytes using cache geometry and allocation
+rounding, including VMM mapping granularity and full-context indexer storage.
+Preallocated storage is charged up front; already allocated decode capacity
+requires no additional reservation. The memory gate uses actual available bytes
+plus reclaimable prefix hot-cache and optional expert workspace bytes; paged KV
+also includes allocated free pages. Devices have separate budgets. A 1 GiB device
+workspace allowance plus expert transfer workspace stays outside the KV budget.
+Cache owners release hot entries before allocating the admitted prefill.
+
+Requests that do not fit stay queued and are retried on subsequent steps.
+Cancellation still releases a queued or partially prefilled request. With no
+other admitted request, a prompt plus one decode token may start even when its
+expected future decode does not fit, so a long output limit cannot prevent the
+only request from making progress. The complete uncached prompt must still fit.
+An optional `MFQ_CONTINUOUS_BATCH_KV_BUDGET_BYTES` caps the batch's KV budget
+(default zero: use actual device capacity); it never increases physical capacity.
+
+Flash-Next checks growth before decode and retracts requests under pressure.
+Shortest generation is retracted first, with longest prompt breaking ties. At
+least one running request and one eligible decode row are retained. Retraction
+retires graphs and frees the request's KV directly, without inserting it into
+the prefix cache. The request returns to the prefill queue and reconstructs KV
+from its prompt and accepted tokens, excluding the pending decode input. Replay
+is chunked and publishes no tokens; sampler/RNG, penalties, accepted output and
+generation limits survive. If the last request cannot grow, the existing
+context-capacity error remains. Qwen continuous batching uses the admission gate
+but retains its existing decode-capacity failure behavior; it does not retract
+shared stable-slot state. Unexpected CUDA failures still fail the backend.
 This does not resize the resident expert cache or automatically enable KV offload.
+
+The ratio follows SGLang's scheduler policy: initial
+`min(0.7 * schedule_conservativeness, 1)`, minimum `0.14 * initial`, and linear
+decay `(initial - minimum) / 600` after every successful decode step. Retraction
+recomputes it from the surviving requests as
+`min((sum(produced) + 20 * running_count) / (sum(max_new_tokens) + 1), 1)`.
+The next decode decay applies the minimum; an idle batch resets to the initial
+value. Environment overrides are `MFQ_INIT_NEW_TOKEN_RATIO`,
+`MFQ_MIN_NEW_TOKEN_RATIO_FACTOR`, `MFQ_SCHEDULE_CONSERVATIVENESS`,
+`MFQ_NEW_TOKEN_RATIO_DECAY_STEPS`, `MFQ_RETRACT_DECODE_STEPS` and
+`MFQ_ADMISSION_DECODE_TOKEN_CLIP` (default 4096). Ratios/factors must be in
+`(0, 1]`, conservativeness positive, and step counts/clip positive integers.
+These values also have fields in `ContinuousBatchConfig::admission`.
 
 Explicit continuous batching currently runs ordinary token decoding. Batched
 requests do not use MTP or persistent prefix reuse. Explicit session IDs and
@@ -67,7 +115,11 @@ checking that inactive recurrent state stays byte-identical. The existing
 by membership changes and remains zero. `continuous_batching_cuda_graph_bucket_reuses`
 counts subsequent replays of an existing bucket, including changed members or row order.
 `continuous_batching_cuda_graph_capture_ms` accumulates graph warmup and capture
-time, including instantiation.
+time, including instantiation. `continuous_batching_admission_deferred` counts
+candidate memory-gate deferrals (a request may be counted on multiple steps),
+`continuous_batching_retractions` counts requests returned for KV replay, and
+`continuous_batching_new_token_ratio` reports the current estimate. These are
+reported through the existing runtime metrics snapshot.
 
 ## Allocator and cache growth
 
@@ -100,8 +152,9 @@ Request decode counters are prepared after prefill, before graph recording,
 and are included in the growth reservation. `MFQ_TRACE_GDN_BATCH=1` reports
 state eligibility, projection dtypes and actual batch core selection.
 
-Quota errors during prefill or graph capture reject the affected request
-without poisoning the backend. Other CUDA failures retain their existing
+Unexpected quota changes after the admission gate can still reject a prefill
+without poisoning the backend. Decode growth failures before numerical execution
+can retract a row; a single remaining row retains the context-capacity error. Other CUDA failures retain their existing
 fatal-error behavior. Native tests inject failures after transfer submission
 and during graph recording, then check subsequent execution and state.
 

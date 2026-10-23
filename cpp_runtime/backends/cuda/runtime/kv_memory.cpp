@@ -78,17 +78,17 @@ tb::Tensor host_tensor(const std::vector<int64_t>& shape, const tb::TensorOption
 
 struct KvMemoryAllocation::Virtual {
     kv_vmm::VmmRange range;
-    int64_t maximum, heads, width, committed = 0;
+    int64_t maximum, heads, width, committed = 0, mapping_chunk;
     std::size_t element;
-    Virtual(int64_t maximum, int64_t heads, int64_t width, std::size_t element)
-        : maximum(maximum), heads(heads), width(width), element(element) {
+    Virtual(int64_t maximum, int64_t heads, int64_t width, std::size_t element, int64_t mapping_chunk)
+        : maximum(maximum), heads(heads), width(width), mapping_chunk(mapping_chunk), element(element) {
         if (!range.reserve(std::size_t(maximum)*heads*width*element))
             throw std::runtime_error("kv_dynamic_unavailable: CUDA virtual memory reservation failed");
     }
     ~Virtual() { (void)cudaDeviceSynchronize(); }
     std::set<int64_t> missing(int64_t tokens) const {
         std::set<int64_t> result;
-        tokens=std::min(maximum,((tokens+8191)/8192)*8192);
+        tokens=std::min(maximum,((tokens+mapping_chunk-1)/mapping_chunk)*mapping_chunk);
         if (tokens <= committed) return result;
         const auto g = kv_vmm::vmm_granularity();
         for (int64_t head=0; head<heads; ++head) {
@@ -100,7 +100,7 @@ struct KvMemoryAllocation::Virtual {
         return result;
     }
     void ensure(int64_t tokens) {
-        tokens=std::min(maximum,((tokens+8191)/8192)*8192);
+        tokens=std::min(maximum,((tokens+mapping_chunk-1)/mapping_chunk)*mapping_chunk);
         const auto fresh = missing(tokens);
         if (!fresh.empty()) MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
         for (const auto page : fresh) {
@@ -290,11 +290,17 @@ void KvMemoryManager::finalize(std::size_t minimum_experts) {
         a->pooled=tb::zeros({1,(a->maximum+a->pool-1)/a->pool,a->index_width},index_options);
         a->host=options_.placement=="ram" || automatic_ram_ || exclusive || raw_host_only;a->offload=offload_;
         if(options_.dynamic) {
-            a->virtual_keys=std::make_shared<KvMemoryAllocation::Virtual>(a->maximum,a->heads,a->key_width,width_bytes(a->options));
-            a->virtual_values=std::make_shared<KvMemoryAllocation::Virtual>(a->maximum,a->heads,a->value_width,width_bytes(a->options));
+            const auto mapping_chunk = options_.additional_request ? int64_t(1) : int64_t(8192);
+            a->virtual_keys = std::make_shared<KvMemoryAllocation::Virtual>(
+                a->maximum, a->heads, a->key_width, width_bytes(a->options), mapping_chunk);
+            a->virtual_values = std::make_shared<KvMemoryAllocation::Virtual>(
+                a->maximum, a->heads, a->value_width, width_bytes(a->options), mapping_chunk);
             a->keys=external(a->virtual_keys->range.base(),a->virtual_keys,shape(a->key_width),a->options);
             a->values=external(a->virtual_values->range.base(),a->virtual_values,shape(a->value_width),a->options);
-            a->ensure(std::min<int64_t>(a->maximum,16384));
+            // Additional dynamic requests map only admitted prefill/decode
+            // pages. A 16K warm allocation would bypass the KV admission gate.
+            const auto initial = options_.additional_request ? int64_t(0) : std::min<int64_t>(a->maximum,16384);
+            a->ensure(initial);
         } else if(exclusive) {
             auto cold_shape=[&](int64_t width){return std::vector<int64_t>{1,a->heads,a->maximum-cells,width};};
             a->hot=HotKvCache::allocate(a->heads,a->maximum,cells,a->key_width,a->value_width,a->options);
@@ -339,10 +345,36 @@ void KvMemoryManager::finalize(std::size_t minimum_experts) {
     if(tiered_budget)std::cerr<<"runtime_kv_tier_budget gpu_bytes="<<index+gpu<<" raw_ram_required="<<raw-std::min(raw,gpu)
         <<" ram_preallocated="<<options_.ram_preallocated<<" exclusive="<<exclusive<<"\n";
 }
+std::optional<std::size_t> KvMemoryManager::additional_preallocated_gpu_bytes(
+        int64_t maximum, int64_t heads, std::size_t key_row_bytes, std::size_t value_row_bytes,
+        int64_t index_width, int64_t pool) const {
+    if (!ready_ || options_.dynamic) return std::nullopt;
+    for (const auto& weak : allocations_) {
+        const auto allocation = weak.lock();
+        if (!allocation || allocation->maximum != maximum || allocation->heads != heads ||
+            allocation->key_width * width_bytes(allocation->options) != key_row_bytes ||
+            allocation->value_width * width_bytes(allocation->options) != value_row_bytes ||
+            allocation->index_width != index_width || allocation->pool != pool) continue;
+        if (!automatic_ram_ && !options_.budget_policy &&
+            (options_.placement == "auto" || options_.placement == "auto_ssd"))
+            return allocation->raw_bytes() + allocation->index_bytes();
+        auto bytes = allocation->gpu_bytes();
+        if (allocation->offload) bytes += allocation->offload->config().gpu_budget_bytes;
+        return bytes;
+    }
+    return std::nullopt;
+}
+
+std::size_t KvMemoryManager::growth_bytes(int64_t tokens) const {
+    std::size_t growth = 0;
+    for (const auto& weak : allocations_)
+        if (const auto allocation = weak.lock())
+            growth += allocation->growth_bytes(std::min(allocation->maximum, tokens));
+    return growth;
+}
 void KvMemoryManager::ensure(int64_t tokens) {
     if(expert_loan_)expert_loan_->ensure(tokens);
-    std::size_t growth=0;
-    for(auto& weak:allocations_)if(auto a=weak.lock())growth+=a->growth_bytes(std::min(a->maximum,tokens));
+    const auto growth = growth_bytes(tokens);
     if(growth && reserve_)reserve_(growth+(64ULL<<20));
     for(auto& weak:allocations_)if(auto a=weak.lock())a->ensure(std::min(a->maximum,tokens));
 }

@@ -4,6 +4,7 @@
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
+#include "runtime/kv_admission.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen4_exp/ops.h"
 #include <type_traits>
@@ -39,13 +40,18 @@ class QwenBatchOperations {
         Tensor logits, greedy_tokens;
     };
 
-    QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig);
+    QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig,
+                        BatchMemoryProvider = {});
     ~QwenBatchOperations();
     QwenBatchOperations(const QwenBatchOperations &) = delete;
     QwenBatchOperations &operator=(const QwenBatchOperations &) = delete;
     int64_t vocab_size() const;
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
+    mfq::engine::KvAdmissionConfig admission_config() const { return config_.admission; }
+    mfq::engine::KvAdmissionBytes admission_available() const;
+    mfq::engine::KvAdmissionBytes admission_cost(const std::shared_ptr<Request>&, int64_t expected) const;
+    void reclaim_prefill_memory(const std::shared_ptr<Request>&);
     void suspend_decode();
     void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
@@ -67,7 +73,10 @@ class QwenBatchOperations {
     qwen35::Qwen35BatchStateAdapter state_adapter_;
     CudaExecutionContext &execution_;
     const CudaContinuousBatchConfig config_;
+    BatchMemoryProvider memory_;
     int32_t max_sequences_ = 0;
+    std::vector<std::weak_ptr<Request>> requests_;
+    bool admission_storage_ready_ = false;
     bool moe_enabled_ = false;
     bool cached_moe_enabled_ = false;
     int64_t decode_batches_{0};
@@ -93,11 +102,16 @@ class FlashNextBatchOperations {
     using State = mfq::engine::BatchState<Request>;
     using Sample = QwenBatchOperations::Sample;
     struct Decoded { Tensor logits, greedy_tokens; };
-    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig);
+    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig,
+                             BatchMemoryProvider = {});
     ~FlashNextBatchOperations();
     int64_t vocab_size() const;
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
+    mfq::engine::KvAdmissionConfig admission_config() const { return config_.admission; }
+    mfq::engine::KvAdmissionBytes admission_available() const;
+    mfq::engine::KvAdmissionBytes admission_cost(const std::shared_ptr<Request>&, int64_t expected) const;
+    void reclaim_prefill_memory(const std::shared_ptr<Request>&);
     void suspend_decode();
     void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
@@ -114,14 +128,20 @@ class FlashNextBatchOperations {
     Sample sample(const std::shared_ptr<Request>&, const Decoded&);
     void accept(const std::shared_ptr<Request>&, const Sample&);
     void recover(State&);
+    bool decode_has_capacity(const State&) const;
+    void retract(const std::shared_ptr<Request>&);
+    void replay_prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     static constexpr bool isolate_prefill_failures = true;
     static constexpr bool isolate_context_growth_failures = true;
   private:
+    std::size_t managed_kv_bytes() const;
+    std::size_t admission_base_kv_bytes_ = 0;
     void initialize_prefill(const std::shared_ptr<Request>&,mfq::engine::PrefillChunk);
     Sample finish_prefill(const std::shared_ptr<Request>&,Tensor next);
     Qwen4CausalLm& model_;
     CudaExecutionContext& execution_;
     CudaContinuousBatchConfig config_;
+    BatchMemoryProvider memory_;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
