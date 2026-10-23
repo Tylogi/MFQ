@@ -428,6 +428,8 @@ Send `POST /api/v1/sessions/{session_id}/responses` with:
 | `input` | `ContentPart[]` | Yes | — | At least one input part. |
 | `input_role` | String | No | `user` | `user` or `tool`. |
 | `sampling` | `SamplingParams` | No | Schema defaults | Sampling controls. |
+| `priority` | Integer | No | `0` | Scheduling priority; larger values leave the queue first. |
+| `timeout_seconds` | Number or null | No | `null` | Whole-request deadline in seconds; see [3.6](#36-request-scheduling). |
 | `system_prompt` | String or null | No | `null` | At most 32,768 characters. |
 | `include_reasoning_history` | Boolean | No | `true` | Include prior reasoning in model context. |
 | `tools` | `ToolDefinition[]` | No | `[]` | At most 128 function tools. |
@@ -484,6 +486,28 @@ an SSE `error` followed by the final `session.state`, without a
 | `seed` | `null` | Non-negative when set. |
 | `enable_thinking` | `true` | Boolean. |
 | `reasoning_effort` | `null` | 1–32 characters when set. |
+
+### 3.6 Request scheduling
+
+`priority` and `timeout_seconds` are optional extensions that control when the
+request runs, not how it samples. Omitting both keeps the previous behavior:
+the request joins the end of the queue at priority `0` and waits indefinitely.
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `priority` | Integer | `0` | 32-bit signed integer. Higher values leave the server queue and the native scheduler first. |
+| `timeout_seconds` | Number or null | `null` | Greater than `0` and at most `86400`. |
+
+The server turns `timeout_seconds` into one absolute deadline when it accepts
+the request. Queueing consumes that deadline first, so a large queue wait never
+extends the total time. A waiter whose deadline has already passed fails with
+`504 runtime_deadline_exceeded` and never reaches a runtime; a runtime that
+reaches the deadline while generating reports `504 deadline_exceeded`. Both are
+`retryable: false` because the client-supplied bound is absolute. Equal
+priorities are served first-come-first-served.
+
+See [concurrency.md](../runtime/concurrency.md#admission-and-queueing) for queue
+capacity, `--queue-timeout`, and the full error classification.
 
 ## 4. Content, tools, and media
 
@@ -696,6 +720,14 @@ stream opens, and retryable backend failures set `Retry-After: 1`.
 Token counting is not supported, so `count_tokens` always answers `501`.
 Errors use the error envelope of the selected protocol, not the common
 `error` envelope.
+
+`/v1/chat/completions` accepts the same optional `priority` and
+`timeout_seconds` extensions described in
+[3.6](#36-request-scheduling). `/v1/messages` accepts them as top-level fields
+alongside the other MFQ Message extensions (`mfq_session_id`, `enable_mtp`),
+not inside `metadata`, which stays reserved for application data. Values outside
+the documented ranges are rejected with HTTP `422` and the offending parameter
+name.
 
 ## 9. Contract maintenance
 

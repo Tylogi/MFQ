@@ -87,6 +87,50 @@ def test_response_request_validates_tool_choice_and_json_schema() -> None:
         )
 
 
+def test_response_request_accepts_engine_priority_and_deadline() -> None:
+    request = CreateResponseRequest(
+        request_id=REQUEST_ID,
+        expected_revision=0,
+        input=[{"type": "text", "text": "hello"}],
+        priority=7,
+        timeout_seconds=12.5,
+    )
+    assert request.priority == 7
+    assert request.timeout_seconds == 12.5
+    defaults = CreateResponseRequest(
+        request_id=REQUEST_ID,
+        expected_revision=0,
+        input=[{"type": "text", "text": "hello"}],
+    )
+    assert defaults.priority == 0
+    assert defaults.timeout_seconds is None
+    for field, value in (
+        ("priority", 2**31),
+        ("priority", -(2**31) - 1),
+        ("timeout_seconds", 0),
+        ("timeout_seconds", 86400.5),
+    ):
+        with pytest.raises(ValidationError):
+            CreateResponseRequest.model_validate(
+                {
+                    "request_id": str(REQUEST_ID),
+                    "expected_revision": 0,
+                    "input": [{"type": "text", "text": "hello"}],
+                    field: value,
+                }
+            )
+    extremes = CreateResponseRequest.model_validate(
+        {
+            "request_id": str(REQUEST_ID),
+            "expected_revision": 0,
+            "input": [{"type": "text", "text": "hello"}],
+            "priority": -(2**31),
+            "timeout_seconds": 86400,
+        }
+    )
+    assert extremes.priority == -(2**31)
+
+
 def test_realtime_frames_cover_audio_text_state_and_sequence() -> None:
     timestamp = datetime(2026, 8, 10, tzinfo=timezone.utc)
     frames = [

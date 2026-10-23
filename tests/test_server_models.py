@@ -44,6 +44,7 @@ from mfq.server.runtime.runtime_pool import (
     RuntimeConflictError,
     RuntimePool,
     _CachedLoadFailure,
+    _RequestSlotGate,
     _Runtime,
 )
 from mfq.server.services.service import ServerService
@@ -2185,7 +2186,7 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
             context_size=4096,
             state=RuntimeInstanceState.READY,
             resident_bytes=101,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(
             catalog,
@@ -2625,7 +2626,7 @@ def test_stream_revives_after_unexpected_exit_within_cooldown(
             port=0,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         loads: list[str] = []
 
@@ -3595,7 +3596,7 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
             port=1,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         second = _Runtime(
             id=uuid4(),
@@ -3605,7 +3606,7 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
             port=2,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool._instances = {first.id: first, second.id: second}
         session_id = uuid4()
@@ -3647,7 +3648,7 @@ def test_artifact_id_request_waits_on_the_canonical_model_load(
             port=1,
             context_size=4096,
             state=RuntimeInstanceState.LOADING,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool._instances[instance.id] = instance
         waited: list[str] = []
@@ -3689,7 +3690,7 @@ def test_runtime_preflight_rejects_an_exited_worker_before_streaming(
             port=1,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
@@ -3733,7 +3734,7 @@ def test_runtime_sampling_defaults_apply_only_to_omitted_request_fields(
             context_size=4096,
             sampling_defaults=SamplingParams(enable_mtp=False, temperature=0.4),
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
@@ -3773,7 +3774,7 @@ def test_request_driven_load_rejects_a_changed_artifact_behind_a_loaded_name(
             port=1,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         pool._instances[instance.id] = instance
@@ -3822,7 +3823,7 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
             port=0,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(
             catalog,
@@ -3896,7 +3897,7 @@ def test_managed_runtime_closes_backend_stream_when_consumer_stops(
             port=0,
             context_size=4096,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
@@ -3914,7 +3915,7 @@ def test_managed_runtime_closes_backend_stream_when_consumer_stops(
         assert instance.active_requests == 0
         assert instance.state == RuntimeInstanceState.READY
         assert instance.request_slots is not None
-        assert not instance.request_slots.locked()
+        assert instance.request_slots.available == 1
 
     asyncio.run(run())
 
@@ -3934,7 +3935,7 @@ def test_runtime_instance_policy_updates_without_reload(tmp_path: Path) -> None:
             context_size=4096,
             idle_ttl_seconds=300,
             state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1),
+            request_slots=_RequestSlotGate(1),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance

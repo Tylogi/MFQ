@@ -110,6 +110,18 @@ private:
     bool completed_ = false;
 };
 
+// Optional scheduling controls of one generation request. The engine sorts
+// pending work by priority and cancels a request at its deadline, so the
+// transports must hand both values to the request structure unchanged.
+struct RequestSchedule {
+    int priority = 0;
+    std::optional<mfq::engine::Clock::time_point> deadline;
+};
+
+// A long timeout is indistinguishable from "no deadline" and hides request
+// mistakes, so client-supplied timeouts share one documented upper bound.
+constexpr double max_request_timeout_seconds = 86400.0;
+
 int64_t unix_time_seconds();
 std::string request_id(const char * prefix);
 int64_t integer_field(
@@ -141,6 +153,7 @@ RequestInput parse_input(
     const json & body,
     bool chat,
     const MfqSamplingParams & defaults);
+RequestSchedule parse_schedule(const json & body);
 RequestMetricValues request_metric_values(
     const CompletionResult & result,
     const RequestMetrics & metrics);
@@ -180,7 +193,8 @@ std::vector<float> decode_audio_features(
 namespace mfq::transport_detail {
 class CompletionStream {
 public:
-    CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id);
+    CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id,
+                     RequestSchedule schedule = {});
     ~CompletionStream();
     std::optional<std::vector<common_chat_msg_diff>> next();
     void cancel();

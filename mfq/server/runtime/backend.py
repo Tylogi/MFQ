@@ -82,6 +82,8 @@ class ChatBackend(Protocol):
         tools: Sequence[ToolDefinition] = (),
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]: ...
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool: ...
@@ -268,6 +270,8 @@ class OpenAIChatBackend:
         tools: Sequence[ToolDefinition] = (),
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
         output_protocol = output_protocol_for_architecture(
             self._model_type or model
@@ -367,6 +371,13 @@ class OpenAIChatBackend:
             payload["response_format"] = response_format.model_dump(mode="json", by_alias=True)
         if session_id is not None:
             payload["mfq_session_id"] = str(session_id)
+        if priority != 0:
+            payload["priority"] = priority
+        if timeout_seconds is not None:
+            # The deadline is relative so clock drift between the server and a
+            # worker cannot move it; the server already subtracted its queue
+            # wait from the client timeout.
+            payload["mfq_timeout_seconds"] = timeout_seconds
         if multimodal is not None:
             payload["mfq_multimodal"] = multimodal
         preformatted_prompt = render_preformatted_prompt(
@@ -709,9 +720,16 @@ class OpenAIChatBackend:
         if "error" in event:
             detail = event["error"]
             if isinstance(detail, dict):
+                raw_status = detail.get("status_code")
                 raise BackendError(
                     str(detail.get("code") or detail.get("type") or "backend_error"),
                     str(detail.get("message") or "backend request failed"),
+                    retryable=detail.get("retryable") is True,
+                    status_code=(
+                        raw_status
+                        if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+                        else None
+                    ),
                 )
             raise BackendError("backend_error", str(detail))
 

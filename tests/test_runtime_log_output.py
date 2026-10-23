@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from mfq.server.protocol.models import JobEventType, RuntimeInstanceState
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 from mfq.server.services.jobs import JobContext
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import InvalidJobStateError, JobNotFoundError, SessionStore
@@ -32,7 +32,7 @@ def test_oversized_runtime_log_lines_are_truncated_without_stopping_pipe_drain(t
         process = SimpleNamespace(stdout=stream if transport == "http" else None,
             stderr=stream if transport == "stdio" else None, returncode=None)
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
-            process=process, port=0, context_size=512, state=state, request_slots=asyncio.Semaphore(1))
+            process=process, port=0, context_size=512, state=state, request_slots=_RequestSlotGate(1))
         messages = []
 
         async def log(message, **options):
@@ -64,7 +64,7 @@ def test_runtime_output_preserves_utf8_prefix_and_final_unterminated_line(tmp_pa
         payload = (message + ("\n" if newline else "")).encode()
         process = SimpleNamespace(stdout=stream, stderr=None, returncode=None)
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
-            process=process, port=0, context_size=512, state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            process=process, port=0, context_size=512, state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         pumping = asyncio.create_task(pool._pump_output(instance, SimpleNamespace()))
         for offset in range(0, len(payload), 16381):
             stream.feed_data(payload[offset:offset + 16381])
@@ -90,7 +90,7 @@ def test_real_runtime_pipe_drains_a_line_larger_than_the_production_frame_limit(
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, limit=64 * 1024 * 1024)
         try:
             instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
-                process=process, port=0, context_size=512, state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+                process=process, port=0, context_size=512, state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
             await asyncio.wait_for(pool._pump_output(instance, SimpleNamespace()), 10)
             assert await asyncio.wait_for(process.wait(), 3) == 0
             assert [item.message for item in pool.store.list_runtime_logs()] == ["log-start:" + "x" * (4096 - 10), "after-wide-log"]
@@ -114,7 +114,7 @@ def test_runtime_log_fragments_preserve_loading_progress_and_ignore_blank_lines(
         stream = asyncio.StreamReader()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=stream, stderr=None), port=0, context_size=512,
-            state=RuntimeInstanceState.LOADING, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.LOADING, request_slots=_RequestSlotGate(1))
         messages, progress = [], []
 
         async def log(message, **options):
@@ -150,7 +150,7 @@ def test_incomplete_runtime_log_line_remains_cancellable(tmp_path):
         stream = asyncio.StreamReader()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=stream, stderr=None), port=0, context_size=512,
-            state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         pumping = asyncio.create_task(pool._pump_output(instance, SimpleNamespace()))
         stream.feed_data(b"x" * 100_000)
         await asyncio.sleep(0)
@@ -186,7 +186,7 @@ def test_native_diagnostics_keep_the_same_severity_in_runtime_and_load_job_logs(
         stream.feed_eof()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=None, stderr=stream), port=0, context_size=512,
-            state=RuntimeInstanceState.LOADING, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.LOADING, request_slots=_RequestSlotGate(1))
         await pool._pump_output(instance, JobContext(pool.store, job.id, asyncio.Event()))
         records = pool.store.list_runtime_logs()
         events = [item for item in pool.store.list_job_events(job.id) if item.type == JobEventType.LOG]
@@ -209,7 +209,7 @@ def test_stopping_an_exited_runtime_drains_pending_output_before_cancelling_read
         stream.feed_eof()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=stream, stderr=None, returncode=2), port=0, context_size=512,
-            state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         instance.output_task = asyncio.create_task(pool._pump_output(instance, SimpleNamespace()))
         await asyncio.sleep(0)
         await asyncio.wait_for(pool._stop_process(instance), 3)
@@ -237,7 +237,7 @@ def test_load_failure_cleanup_keeps_logs_after_progress_or_job_lifetime_ends(tmp
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=None, stderr=stream, returncode=2), port=0, context_size=512,
             state=RuntimeInstanceState.UNLOADING if phase == "retiring" else RuntimeInstanceState.LOADING,
-            log_to_load_job=True, request_slots=asyncio.Semaphore(1))
+            log_to_load_job=True, request_slots=_RequestSlotGate(1))
         messages = []
 
         async def log(message, **options):
@@ -268,7 +268,7 @@ def test_runtime_output_drain_has_a_deadline_and_reports_incomplete_output(tmp_p
         pool.store = SessionStore(tmp_path / "server.sqlite3")
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(stdout=asyncio.StreamReader(), stderr=None, returncode=0), port=0,
-            context_size=512, state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            context_size=512, state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         instance.output_task = asyncio.create_task(pool._pump_output(instance, SimpleNamespace()))
         await asyncio.wait_for(pool._stop_process(instance), 1)
         assert instance.output_task.cancelled()

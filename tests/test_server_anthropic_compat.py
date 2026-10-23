@@ -75,6 +75,23 @@ def test_messages_convert_system_images_tool_results_and_thinking():
     assert "temperature" not in request.chat.sampling.model_fields_set
 
 
+def test_messages_forward_engine_priority_and_deadline():
+    request = parse_messages_request(body(priority=6, timeout_seconds=3.5))
+    assert request.chat.priority == 6
+    assert request.chat.timeout_seconds == 3.5
+    default = parse_messages_request(body())
+    assert default.chat.priority == 0
+    assert default.chat.timeout_seconds is None
+
+
+def test_messages_reject_out_of_range_scheduling_with_422():
+    for updates in ({"priority": 2**31}, {"priority": "high"}, {"timeout_seconds": 0},
+                    {"timeout_seconds": 86400.5}):
+        with pytest.raises(OpenAIRequestError) as raised:
+            parse_messages_request(body(**updates))
+        assert raised.value.status_code == 422
+
+
 @pytest.mark.parametrize("updates", [
     {"max_tokens": None}, {"max_tokens": True}, {"max_tokens": 0}, {"temperature": 2},
     {"messages": [{"role": "system", "content": "x"}]},

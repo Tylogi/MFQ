@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from mfq.server.runtime.native import (
     MAX_RUNTIME_CONCURRENCY,
     native_request_capacity,
 )
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 
 
 def _artifact(name: str = "model") -> DiscoveredModel:
@@ -82,7 +83,7 @@ class _FakeBackend:
 def _instance(
     *,
     capacity: int,
-    backend: _FakeBackend | None = None,
+    backend: Any = None,
 ) -> _Runtime:
     return _Runtime(
         id=uuid4(),
@@ -92,7 +93,7 @@ def _instance(
         port=43123,
         context_size=4096,
         state=RuntimeInstanceState.READY,
-        request_slots=asyncio.Semaphore(capacity),
+        request_slots=_RequestSlotGate(capacity),
         request_capacity=capacity,
         batch_capacity=capacity,
     )
@@ -151,7 +152,7 @@ def test_worker_reported_capacity_shrinks_idle_admission(
 
     assert instance.request_capacity == 3
     assert instance.batch_capacity == 3
-    assert instance.request_slots is not None and instance.request_slots._value == 3
+    assert instance.request_slots is not None and instance.request_slots.capacity == 3
 
 
 def test_reported_capacity_never_grows_or_interrupts_pending_work(
@@ -257,5 +258,179 @@ def test_full_queue_counts_rejections(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(run())
 
 
+class _RecordingBackend:
+    """Hold every admitted stream until the test releases it one at a time."""
+
+    def __init__(self) -> None:
+        self.order: list[str] = []
+        self.scheduling: list[dict[str, Any]] = []
+        self.gates: list[asyncio.Event] = []
+
+    async def stream(self, **options: Any) -> AsyncIterator[BackendDelta]:
+        self.order.append(options["messages"][0]["content"])
+        self.scheduling.append(
+            {
+                "priority": options.get("priority", 0),
+                "timeout_seconds": options.get("timeout_seconds"),
+            }
+        )
+        gate = asyncio.Event()
+        self.gates.append(gate)
+        await gate.wait()
+        yield BackendDelta(content_delta="a", finish_reason="stop")
+
+    async def runtime_status(self) -> dict[str, Any]:
+        return {}
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _wait_until(predicate: Any, description: str) -> None:
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
+def _drain(pool: RuntimePool, label: str, **options: Any) -> asyncio.Task[None]:
+    async def consume() -> None:
+        async for _delta in pool.stream(
+            model="model",
+            messages=[{"role": "user", "content": label}],
+            sampling=SamplingParams(),
+            **options,
+        ):
+            pass
+
+    return asyncio.create_task(consume())
+
+
+def test_higher_priority_service_queue_waiter_leaves_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        backend = _RecordingBackend()
+        pool = _pool(monkeypatch)
+        instance = _instance(capacity=1, backend=backend)
+        _attach(pool, instance)
+        monkeypatch.setattr(pool, "_select", lambda model, *, session_id=None: _resolved(instance))
+
+        running = _drain(pool, "running")
+        await _wait_until(lambda: len(backend.order) == 1, "the first request to start")
+        queued = _drain(pool, "queued", priority=1)
+        await _wait_until(lambda: instance.queued_requests == 1, "the queued request")
+        urgent = _drain(pool, "urgent", priority=9)
+        await _wait_until(lambda: instance.queued_requests == 2, "the urgent request")
+
+        backend.gates[0].set()
+        await _wait_until(lambda: len(backend.order) == 2, "the second request to start")
+        assert backend.order[1] == "urgent"
+        backend.gates[1].set()
+        await _wait_until(lambda: len(backend.order) == 3, "the third request to start")
+        assert backend.order[2] == "queued"
+        backend.gates[2].set()
+        await asyncio.gather(running, queued, urgent)
+        assert instance.active_requests == instance.queued_requests == 0
+
+    asyncio.run(run())
+
+
+def test_equal_priority_service_queue_waiters_stay_fifo(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        backend = _RecordingBackend()
+        pool = _pool(monkeypatch)
+        instance = _instance(capacity=1, backend=backend)
+        _attach(pool, instance)
+        monkeypatch.setattr(pool, "_select", lambda model, *, session_id=None: _resolved(instance))
+
+        running = _drain(pool, "running", priority=4)
+        await _wait_until(lambda: len(backend.order) == 1, "the first request to start")
+        first = _drain(pool, "first", priority=4)
+        await _wait_until(lambda: instance.queued_requests == 1, "the first waiter")
+        second = _drain(pool, "second", priority=4)
+        await _wait_until(lambda: instance.queued_requests == 2, "the second waiter")
+
+        for index in range(2):
+            backend.gates[index].set()
+            await _wait_until(
+                lambda started=index: len(backend.order) == started + 2,
+                f"waiter {index + 1} to start",
+            )
+        assert backend.order == ["running", "first", "second"]
+        backend.gates[2].set()
+        await asyncio.gather(running, first, second)
+
+    asyncio.run(run())
+
+
+def test_expired_client_deadline_never_reaches_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        backend = _RecordingBackend()
+        pool = _pool(monkeypatch)
+        instance = _instance(capacity=1, backend=backend)
+        _attach(pool, instance)
+        monkeypatch.setattr(pool, "_select", lambda model, *, session_id=None: _resolved(instance))
+
+        running = _drain(pool, "running")
+        await _wait_until(lambda: len(backend.order) == 1, "the first request to start")
+        with pytest.raises(BackendError) as expired:
+            await _drain(pool, "expired", timeout_seconds=0.05)
+        assert expired.value.code == "runtime_deadline_exceeded"
+        assert expired.value.status_code == 504
+        assert expired.value.retryable is False
+        assert backend.order == ["running"]
+        assert instance.queued_requests == 0
+
+        backend.gates[0].set()
+        await running
+        assert instance.active_requests == 0
+
+    asyncio.run(run())
+
+
+def test_worker_receives_priority_and_the_remaining_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        backend = _RecordingBackend()
+        pool = _pool(monkeypatch)
+        instance = _instance(capacity=1, backend=backend)
+        _attach(pool, instance)
+        monkeypatch.setattr(pool, "_select", lambda model, *, session_id=None: _resolved(instance))
+
+        request = _drain(pool, "scheduled", priority=7, timeout_seconds=5.0)
+        await _wait_until(lambda: len(backend.order) == 1, "the request to start")
+        backend.gates[0].set()
+        await request
+        assert backend.scheduling[0]["priority"] == 7
+        remaining = backend.scheduling[0]["timeout_seconds"]
+        assert remaining is not None and 0.0 < remaining <= 5.0
+
+        unscheduled = _drain(pool, "default")
+        await _wait_until(lambda: len(backend.order) == 2, "the default request to start")
+        backend.gates[1].set()
+        await unscheduled
+        assert backend.scheduling[1] == {"priority": 0, "timeout_seconds": None}
+
+    asyncio.run(run())
+
+
 async def _resolved(instance: _Runtime) -> _Runtime:
     return instance
+
+
+def test_slot_gate_skips_a_waiter_cancelled_before_its_handler_runs():
+    """Cancelling a task cancels its awaited future at once, but the waiter's own
+    cleanup runs on a later tick; a release in between must hand the slot on."""
+
+    async def run():
+        gate = _RequestSlotGate(1)
+        await gate.acquire()
+        waiting = asyncio.create_task(gate.acquire(priority=0))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        gate.release()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert gate.available == 1
+        await asyncio.wait_for(gate.acquire(), 1)
+
+    asyncio.run(run())

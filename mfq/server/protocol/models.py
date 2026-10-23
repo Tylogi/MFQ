@@ -10,6 +10,13 @@ from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, S
 
 PROTOCOL_VERSION: Final[Literal["1.0"]] = "1.0"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
+# The engine stores the request priority in a C++ ``int`` and compares larger
+# values first, so the public contract uses the same type, default, and order.
+REQUEST_PRIORITY_MIN: Final[int] = -(2**31)
+REQUEST_PRIORITY_MAX: Final[int] = 2**31 - 1
+# A longer client timeout is indistinguishable from "no deadline" and only
+# hides a request mistake.
+MAX_REQUEST_TIMEOUT_SECONDS: Final[float] = 86400.0
 
 
 class ProtocolModel(BaseModel):
@@ -424,6 +431,11 @@ class CreateResponseRequest(ProtocolModel):
     input: list[ContentPart] = Field(min_length=1)
     input_role: Literal["user", "tool"] = "user"
     sampling: SamplingParams = Field(default_factory=SamplingParams)
+    # Scheduling controls. A higher priority leaves the server queue and the
+    # native scheduler first; the timeout bounds the whole request, queue wait
+    # included, and expires with ``runtime_deadline_exceeded``.
+    priority: int = Field(default=0, ge=REQUEST_PRIORITY_MIN, le=REQUEST_PRIORITY_MAX)
+    timeout_seconds: float | None = Field(default=None, gt=0.0, le=MAX_REQUEST_TIMEOUT_SECONDS)
     system_prompt: str | None = Field(default=None, max_length=32768)
     include_reasoning_history: bool = True
     tools: list[ToolDefinition] = Field(default_factory=list, max_length=128)

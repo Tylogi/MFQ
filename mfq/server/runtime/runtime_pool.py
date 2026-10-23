@@ -158,6 +158,81 @@ def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecut
     return JobExecutionError(ErrorDetail(code=code, message=message, retryable=retryable))
 
 
+def _request_deadline_exceeded(model: str) -> BackendError:
+    """A client deadline that elapsed: absolute, so retrying cannot help."""
+
+    return BackendError(
+        "runtime_deadline_exceeded",
+        f"request deadline expired before the runtime started it: {model}",
+        retryable=False,
+        status_code=504,
+    )
+
+
+@dataclass
+class _SlotWaiter:
+    priority: int
+    granted: asyncio.Future[None]
+
+
+class _RequestSlotGate:
+    """Admission gate for one runtime's concurrent request slots.
+
+    Waiters leave in descending priority order and FIFO inside one priority,
+    which mirrors the native scheduler's stable sort on the request priority.
+    Capacity changes replace the whole gate instead of mutating a live one, so a
+    released slot never has to rediscover which generation it belonged to.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("request capacity must be positive")
+        self.capacity = capacity
+        self._granted = 0
+        self._waiters: list[_SlotWaiter] = []
+
+    @property
+    def available(self) -> int:
+        return max(0, self.capacity - self._granted)
+
+    async def acquire(self, priority: int = 0) -> None:
+        """Take one slot, waiting in priority order behind earlier arrivals."""
+
+        if self._granted < self.capacity and not self._waiters:
+            self._granted += 1
+            return
+        waiter = _SlotWaiter(priority, asyncio.get_running_loop().create_future())
+        # Insert after everything of equal or higher priority so one priority
+        # stays first-come-first-served.
+        position = len(self._waiters)
+        while position > 0 and self._waiters[position - 1].priority < priority:
+            position -= 1
+        self._waiters.insert(position, waiter)
+        try:
+            await waiter.granted
+        except asyncio.CancelledError:
+            if waiter.granted.done() and not waiter.granted.cancelled():
+                # A release granted this slot just before the cancellation was
+                # delivered; hand it to the next waiter instead of losing it.
+                self.release()
+            elif waiter in self._waiters:
+                self._waiters.remove(waiter)
+            raise
+
+    def release(self) -> None:
+        if self._granted <= 0:
+            raise RuntimeError("request slot released without a matching acquire")
+        self._granted -= 1
+        while self._granted < self.capacity and self._waiters:
+            waiter = self._waiters.pop(0)
+            if waiter.granted.done():
+                # Cancelling a task cancels its awaited future immediately, but the
+                # waiter's own cleanup runs on a later tick; skip it here.
+                continue
+            self._granted += 1
+            waiter.granted.set_result(None)
+
+
 class _Runtime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -180,7 +255,7 @@ class _Runtime(BaseModel):
     serving_refreshing: bool = False
     control_leases: int = 0
     read_control_leases: int = 0
-    request_slots: asyncio.Semaphore | None = None
+    request_slots: SkipValidation[_RequestSlotGate] | None = None
     request_capacity: int = 1
     batch_capacity: int = 1
     queue_wait_ms_total: float = 0.0
@@ -553,7 +628,7 @@ class RuntimePool:
                 else self.default_idle_ttl_seconds
             ),
             pinned=canonical_request.pin,
-            request_slots=asyncio.Semaphore(request_capacity),
+            request_slots=_RequestSlotGate(request_capacity),
             request_capacity=request_capacity,
             batch_capacity=request_capacity,
             reserved_bytes=self._estimated_load_bytes(
@@ -971,7 +1046,7 @@ class RuntimePool:
                 else self.default_idle_ttl_seconds
             ),
             pinned=request.pin,
-            request_slots=asyncio.Semaphore(request_capacity),
+            request_slots=_RequestSlotGate(request_capacity),
             request_capacity=request_capacity,
             batch_capacity=request_capacity,
             reserved_bytes=incoming_bytes,
@@ -1943,7 +2018,7 @@ class RuntimePool:
 
         The worker owns model/state compatibility, so its report is
         authoritative. Shrinking is only safe while nothing is in flight: a new
-        semaphore would lose the count held by running requests.
+        gate would lose the slots held by running or waiting requests.
         """
 
         if reported < 1:
@@ -1956,7 +2031,7 @@ class RuntimePool:
         ):
             return
         instance.request_capacity = reported
-        instance.request_slots = asyncio.Semaphore(reported)
+        instance.request_slots = _RequestSlotGate(reported)
         logger.info(
             "runtime concurrency reduced to %d for %s (worker reported capacity)",
             reported,
@@ -2051,7 +2126,16 @@ class RuntimePool:
         tools: Sequence[ToolDefinition] = (),
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
+        # One deadline covers the server queue and the native request, so a
+        # client timeout can never be extended by queueing.
+        deadline = (
+            None
+            if timeout_seconds is None
+            else asyncio.get_running_loop().time() + timeout_seconds
+        )
         instance = await self._select(model, session_id=session_id)
         if instance is not None and instance.state == RuntimeInstanceState.LOADING:
             await self._wait_for_model_ready(instance.artifact.resource.name)
@@ -2070,6 +2154,8 @@ class RuntimePool:
                     tools=tools,
                     tool_choice=tool_choice,
                     response_format=response_format,
+                    priority=priority,
+                    timeout_seconds=timeout_seconds,
                 )
             ) as fallback_stream:
                 async for delta in fallback_stream:
@@ -2097,24 +2183,21 @@ class RuntimePool:
             await self._reject_full_queue(instance, model)
         queued = True
         try:
-            if self.queue_timeout_seconds > 0:
-                try:
-                    await asyncio.wait_for(
-                        instance.request_slots.acquire(),
-                        timeout=self.queue_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    raise BackendError(
-                        "runtime_queue_timeout",
-                        f"request waited more than {self.queue_timeout_seconds:g}s "
-                        f"for a runtime slot: {model}",
-                        retryable=True,
-                        status_code=503,
-                    ) from None
-            else:
-                await instance.request_slots.acquire()
+            await self._acquire_request_slot(
+                instance,
+                model=model,
+                priority=priority,
+                deadline=deadline,
+            )
             acquired = True
             queue_wait_ms = (time.monotonic() - enqueued_at) * 1000.0
+            remaining_timeout = (
+                None
+                if deadline is None
+                else deadline - asyncio.get_running_loop().time()
+            )
+            if remaining_timeout is not None and remaining_timeout <= 0.0:
+                raise _request_deadline_exceeded(model)
             async with self._lock:
                 await self._wait_for_runtime_maintenance_locked(instance)
                 instance.queued_requests = max(0, instance.queued_requests - 1)
@@ -2143,6 +2226,10 @@ class RuntimePool:
                     tools=tools,
                     tool_choice=tool_choice,
                     response_format=response_format,
+                    priority=priority,
+                    # Only the time left after queueing: the worker arms its own
+                    # deadline, so an absolute bound stays absolute end to end.
+                    timeout_seconds=remaining_timeout,
                 )
             ) as backend_stream:
                 async for delta in backend_stream:
@@ -2176,6 +2263,44 @@ class RuntimePool:
                 self._finish_request(instance, queued=queued, active=active, acquired=acquired),
                 name=f"mfq-server-request-release-{instance.id}",
             )
+
+    async def _acquire_request_slot(
+        self,
+        instance: _Runtime,
+        *,
+        model: str,
+        priority: int,
+        deadline: float | None,
+    ) -> None:
+        """Wait for one runtime slot, then fail if the deadline already passed."""
+
+        queue_deadline = (
+            asyncio.get_running_loop().time() + self.queue_timeout_seconds
+            if self.queue_timeout_seconds > 0
+            else None
+        )
+        bounds = [value for value in (queue_deadline, deadline) if value is not None]
+        wait_until = min(bounds) if bounds else None
+        if wait_until is None:
+            await instance.request_slots.acquire(priority)
+            return
+        try:
+            await asyncio.wait_for(
+                instance.request_slots.acquire(priority),
+                timeout=max(0.0, wait_until - asyncio.get_running_loop().time()),
+            )
+        except asyncio.TimeoutError:
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                # An elapsed client deadline is absolute, so retrying cannot
+                # help; keep 429 for a full queue and 503 for --queue-timeout.
+                raise _request_deadline_exceeded(model) from None
+            raise BackendError(
+                "runtime_queue_timeout",
+                f"request waited more than {self.queue_timeout_seconds:g}s "
+                f"for a runtime slot: {model}",
+                retryable=True,
+                status_code=503,
+            ) from None
 
     async def _finish_request(self, instance: _Runtime, *, queued: bool, active: bool, acquired: bool) -> None:
         async with self._lock:

@@ -106,6 +106,10 @@ def _runtime_generate_params(payload: dict[str, Any]) -> dict[str, Any]:
         params["media"] = payload["mfq_multimodal"]
     if "mfq_prefix_cache_enabled" in payload:
         params["cache"] = {"enabled": payload["mfq_prefix_cache_enabled"]}
+    if "priority" in payload:
+        params["priority"] = payload["priority"]
+    if "mfq_timeout_seconds" in payload:
+        params["timeout_seconds"] = payload["mfq_timeout_seconds"]
     return params
 
 
@@ -113,6 +117,10 @@ def _openai_generation_event(event: dict[str, Any]) -> dict[str, Any]:
     """Adapt a runtime generation event at the Python-owned API boundary."""
 
     if "choices" in event:  # Compatibility with older private runtimes.
+        return event
+    if "error" in event:
+        # Stream errors keep the native code, status, and retryability so a
+        # worker-side deadline is not flattened into a protocol failure.
         return event
     request_id = event.get("request_id")
     base: dict[str, Any] = {

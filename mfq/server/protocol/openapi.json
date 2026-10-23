@@ -1794,6 +1794,13 @@
             ],
             "title": "Model"
           },
+          "priority": {
+            "default": 0,
+            "maximum": 2147483647.0,
+            "minimum": -2147483648.0,
+            "title": "Priority",
+            "type": "integer"
+          },
           "request_id": {
             "format": "uuid",
             "title": "Request Id",
@@ -1840,6 +1847,19 @@
               }
             ],
             "title": "System Prompt"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 86400.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Seconds"
           },
           "tool_choice": {
             "anyOf": [
@@ -5085,10 +5105,19 @@
             "type": "boolean"
           },
           "prefill_chunk_size": {
-            "default": 2048,
-            "minimum": 1.0,
-            "title": "Prefill Chunk Size",
-            "type": "integer"
+            "anyOf": [
+              {
+                "const": "auto",
+                "type": "string"
+              },
+              {
+                "maximum": 8192.0,
+                "minimum": 1.0,
+                "type": "integer"
+              }
+            ],
+            "default": "auto",
+            "title": "Prefill Chunk Size"
           },
           "prefix_cache_block_tokens": {
             "anyOf": [
@@ -7434,7 +7463,7 @@
         "properties": {
           "batch_capacity": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "Batch Capacity",
             "type": "integer"
           },
@@ -7889,7 +7918,7 @@
           },
           "batch_capacity": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "Batch Capacity",
             "type": "integer"
           },
@@ -8057,13 +8086,13 @@
           },
           "rejected_requests": {
             "default": 0,
-            "minimum": 0,
+            "minimum": 0.0,
             "title": "Rejected Requests",
             "type": "integer"
           },
           "request_capacity": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "Request Capacity",
             "type": "integer"
           },

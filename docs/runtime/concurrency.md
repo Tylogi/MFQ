@@ -56,6 +56,28 @@ requests are bounded by `--max-queued-requests-per-runtime` (default
   so client-observed time to first token splits into server queueing and native
   prefill.
 
+### Priority and deadlines
+
+A request may carry `priority` (32-bit signed integer, default `0`, larger runs
+first) and `timeout_seconds` (`0 < value ≤ 86400`, default: no deadline). Both
+are optional; without them admission stays plain FIFO.
+
+- The server queue releases waiters by priority and FIFO inside one priority,
+  matching the engine's stable sort on the request priority. The worker sorts
+  again, so a request that reaches the native scheduler late still keeps its
+  rank.
+- The server converts `timeout_seconds` into a single absolute deadline when it
+  accepts the request. Queue wait consumes it, and only the remainder is handed
+  to the worker, so the total request time is bounded regardless of queueing.
+- An expired deadline while queued fails the request with
+  `504 runtime_deadline_exceeded`; it never enters a worker. An expired deadline
+  inside the worker ends the request with `504 deadline_exceeded`. Both errors
+  are `retryable: false` because the deadline is absolute.
+- Classification is unchanged for the existing bounds: a full queue is
+  `429 runtime_queue_full`, and `--queue-timeout` expiry stays
+  `503 runtime_queue_timeout` with `retryable: true`. Whichever of the request
+  deadline and `--queue-timeout` is closer wins.
+
 ## Scheduling behavior in the runtime
 
 The shared engine (`cpp_runtime/engine/`) owns request lifecycle, queueing, and
