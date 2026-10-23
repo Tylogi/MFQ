@@ -1,12 +1,13 @@
 #pragma once
 #include "generation_step.h"
+#include "kv_admission.h"
 #include <deque>
 #include <memory>
 #include <unordered_map>
 
 namespace mfq::engine {
 
-// Physical row metadata only. Request lifecycle and output belong to the executor.
+// Physical row state and replay inputs. Lifecycle and output publication belong to the executor.
 struct BatchRequest {
     BatchRequest(std::string id, const InferenceRequest& input)
         : id(std::move(id)), prompt(input.prompt), sampling(input.sampling),
@@ -18,6 +19,9 @@ struct BatchRequest {
     int32_t generation_limit = 0, produced = 0;
     int64_t pending_token = 0;
     bool eligible = false;
+    std::vector<int64_t> accepted_tokens;
+    int64_t replay_offset = -1;
+    int64_t replay_length() const { return prompt.size() + std::max<int64_t>(0, produced - 1); }
     int64_t prefill_offset = 0, cache_length = 0;
 };
 
@@ -39,16 +43,71 @@ template <class Ops> class ContinuousBatch {
     using State = BatchState<Request>;
     struct Work {
         std::shared_ptr<Request> request;
-        std::optional<PrefillChunk> prefill;
+        std::optional<PrefillChunk> prefill, completed_prefill;
         std::optional<Sample> result;
         std::exception_ptr failure;
-        bool decode = false, active = false;
+        bool decode = false, active = false, admitted = false;
     };
     int64_t prefill_chunk_size, prefill_token_budget;
     Ops operations;
     State state;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
     bool decode_next = true;
+    NewTokenRatioTracker ratio;
+    int64_t admission_deferrals = 0, retractions = 0;
+
+    bool can_admit(const Work& candidate) {
+        if constexpr (requires { operations.admission_available(); }) {
+            if (candidate.admitted) return true;
+            KvAdmissionBudget budget(operations.admission_available());
+            bool occupied = false;
+            for (const auto& [id, work] : requests) {
+                if (!work->admitted || work->failure) continue;
+                occupied = true;
+                const auto& request = work->request;
+                if (!budget.reserve(operations.admission_cost(request,
+                        ratio.expected(request->generation_limit, request->produced)))) {
+                    ++admission_deferrals;
+                    return false;
+                }
+            }
+            const auto& request = candidate.request;
+            if (budget.reserve(operations.admission_cost(request,
+                    ratio.expected(request->generation_limit, request->produced)))) return true;
+            // One request must make progress when only its speculative decode
+            // estimate is too large. The entire uncached prompt still must fit.
+            if (!occupied) {
+                KvAdmissionBudget solitary(operations.admission_available());
+                if (solitary.reserve(operations.admission_cost(request, 1))) return true;
+            }
+            ++admission_deferrals;
+            return false;
+        }
+        return true;
+    }
+    bool retract_one() {
+        if constexpr (requires { operations.retract(state.active.front()); }) {
+            if (state.active.size() <= 1) return false;
+            for (const auto& request : retraction_order(state.active)) {
+                auto& work = *requests.at(request->id);
+                if (!work.decode) continue;
+                const auto eligible_rows = std::count_if(state.active.begin(), state.active.end(),
+                    [](const auto& row) { return row->eligible; });
+                if (request->eligible && eligible_rows <= 1) continue;
+                operations.retract(request);
+                std::erase(state.active, request);
+                work.active = work.admitted = false;
+                request->eligible = false;
+                request->replay_offset = 0;
+                request->cache_length = 0;
+                work.prefill = PrefillChunk{0, std::min(prefill_chunk_size, request->replay_length())};
+                ++retractions;
+                ratio.after_retraction(state.active);
+                return true;
+            }
+        }
+        return false;
+    }
     int64_t admissions = 0, prefill_chunks = 0, prefill_yields = 0;
 
     int64_t cache_position() const {
@@ -86,16 +145,26 @@ template <class Ops> class ContinuousBatch {
             std::rethrow_exception(error);
         }
         requests.erase(work.request->id);
+        if (requests.empty()) ratio.reset();
     }
     struct SequenceOps {
         ContinuousBatch& batch;
         Work& work;
         PrefillChunk prefill_chunk(PrefillChunk chunk) {
-            if constexpr (requires { batch.operations.prefill_chunk(work.request, chunk); })
-                return batch.operations.prefill_chunk(work.request, chunk);
+            if constexpr (!requires { batch.operations.admission_available(); }) {
+                if constexpr (requires { batch.operations.prefill_chunk(work.request, chunk); })
+                    return batch.operations.prefill_chunk(work.request, chunk);
+            }
             return chunk;
         }
-        void schedule_prefill(PrefillChunk chunk) { work.result.reset(); work.prefill = chunk; }
+        void schedule_prefill(PrefillChunk chunk) {
+            work.result.reset();
+            work.completed_prefill.reset();
+            work.prefill = chunk;
+        }
+        PrefillChunk completed_prefill_chunk(PrefillChunk chunk) const {
+            return work.completed_prefill.value_or(chunk);
+        }
         void schedule_decode() { work.result.reset(); work.decode = true; }
         bool ready() const { return work.result.has_value() || work.failure; }
         const Sample& sample() const {
@@ -117,6 +186,8 @@ template <class Ops> class ContinuousBatch {
             auto& request = *work.request;
             // activate() initializes counts for the first sample.
             if (request.produced) batch.operations.accept(work.request, sample());
+            if constexpr (requires { batch.operations.retract(work.request); })
+                request.accepted_tokens.push_back(token);
             request.pending_token = token;
             ++request.produced;
         }
@@ -138,6 +209,8 @@ template <class Ops> class ContinuousBatch {
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
         : prefill_chunk_size(std::min(chunk_size, token_budget)), prefill_token_budget(token_budget),
           operations(std::forward<Args>(args)...) {
+        if constexpr (requires { operations.admission_config(); })
+            ratio = NewTokenRatioTracker(operations.admission_config());
         if (prefill_chunk_size <= 0)
             throw std::invalid_argument("continuous batching requires a positive prefill chunk");
     }
@@ -153,6 +226,7 @@ template <class Ops> class ContinuousBatch {
         int64_t reused = 0, prefix = 0;
         if constexpr (requires { operations.prepare(work->request); })
             reused = operations.prepare(work->request);
+        work->request->prefill_offset = reused;
         if constexpr (requires { operations.prefix_tokens(work->request); })
             prefix = operations.prefix_tokens(work->request);
         auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);
@@ -169,7 +243,10 @@ template <class Ops> class ContinuousBatch {
         auto prefill = requests.end();
         for (const auto& id : eligible) {
             auto it = requests.find(id);
-            if (it != requests.end() && it->second->prefill) { prefill = it; break; }
+            if (it != requests.end() && it->second->prefill && can_admit(*it->second)) {
+                prefill = it;
+                break;
+            }
         }
         const bool rows_ready = std::all_of(state.active.begin(), state.active.end(),
             [&](const auto& request) {
@@ -190,9 +267,15 @@ template <class Ops> class ContinuousBatch {
         try {
             if constexpr (requires { operations.synchronize(state); }) operations.synchronize(state);
             if (run_decode) {
+                if constexpr (requires { operations.decode_has_capacity(state); }) {
+                    while (!operations.decode_has_capacity(state)) {
+                        if (!retract_one()) break;
+                    }
+                }
                 decoding_operation = true;
                 auto decoded = operations.decode(state);
                 decoding_operation = false;
+                ratio.decay_step();
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
@@ -202,7 +285,16 @@ template <class Ops> class ContinuousBatch {
                     work.decode = false;
                 }
             } else if (prefill != requests.end()) {
+                operations.suspend_decode();
+                prefilling_operation = true;
                 prefill_work.push_back(prefill->second);
+                prefill->second->admitted = true;
+                if constexpr (requires { operations.admission_available(); }) {
+                    if (prefill->second->request->replay_offset < 0)
+                        prefill->second->prefill = operations.prefill_chunk(
+                            prefill->second->request, *prefill->second->prefill);
+                }
+                const bool replaying = prefill->second->request->replay_offset >= 0;
                 using Item = std::pair<std::shared_ptr<Request>, PrefillChunk>;
                 std::vector<Item> items{{prefill->second->request, *prefill->second->prefill}};
                 if constexpr (requires { operations.prefill_batch(items); }) {
@@ -219,20 +311,28 @@ template <class Ops> class ContinuousBatch {
                         auto it = requests.find(id);
                         if (it == requests.end() || !it->second->prefill ||
                             std::find(prefill_work.begin(),prefill_work.end(),it->second) != prefill_work.end()) continue;
-                        const auto chunk = *it->second->prefill;
-                        if (items.size() >= limit || chunk.count > remaining) continue;
+                        if (replaying || it->second->request->replay_offset >= 0) continue;
+                        auto chunk = *it->second->prefill;
+                        if (items.size() >= limit || chunk.count > remaining || !can_admit(*it->second)) continue;
+                        it->second->admitted = true;
+                        if constexpr (requires { operations.admission_available(); })
+                            chunk = operations.prefill_chunk(it->second->request, chunk);
                         remaining -= chunk.count;
                         prefill_work.push_back(it->second);
                         items.emplace_back(it->second->request,chunk);
                     }
                 }
-                operations.suspend_decode();
                 PrefillActivity prefill_activity;
-                prefilling_operation = true;
                 std::vector<PrefillBatchResult<Sample>> samples;
+                if constexpr (requires { operations.replay_prefill(items.front().first, items.front().second); }) {
+                    if (replaying) {
+                        operations.replay_prefill(items.front().first, items.front().second);
+                        samples.push_back({Sample{}, {}});
+                    }
+                }
                 if constexpr (requires { operations.prefill_batch(items); }) {
                     const bool use_batch = items.size() > 1 || !requires { operations.prefill_batch_limit(); };
-                    if (use_batch) {
+                    if (use_batch && !replaying) {
                         auto results = operations.prefill_batch(items);
                         for (auto& result : results) {
                             if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
@@ -251,6 +351,22 @@ template <class Ops> class ContinuousBatch {
                     auto& request = work.request;
                     auto& result = samples[row];
                     const auto chunk = items[row].second;
+                    if (replaying && !result.failure) {
+                        request->replay_offset = chunk.offset + chunk.count;
+                        request->cache_length = request->replay_offset;
+                        ++prefill_chunks;
+                        if (request->replay_offset == request->replay_length()) {
+                            request->replay_offset = -1;
+                            state.active.push_back(request);
+                            work.active = true;
+                            work.prefill.reset();
+                        } else {
+                            work.prefill = PrefillChunk{request->replay_offset,
+                                std::min(prefill_chunk_size, request->replay_length() - request->replay_offset)};
+                            ++prefill_yields;
+                        }
+                        continue;
+                    }
                     if (result.failure) {
                         work.failure = result.failure;
                         operations.discard_prefill(request);
@@ -264,6 +380,7 @@ template <class Ops> class ContinuousBatch {
                             work.active = true;
                             ++admissions;
                         } else ++prefill_yields;
+                        work.completed_prefill = chunk;
                         work.result = std::move(result.sample);
                     }
                     work.prefill.reset();
@@ -279,6 +396,7 @@ template <class Ops> class ContinuousBatch {
                     capacity_failure = error.code == InferenceInputErrorCode::ContextLength;
                 } catch (...) {}
                 if (Ops::isolate_context_growth_failures && decoding_operation && capacity_failure) {
+                    if (retract_one()) return;
                     // Capacity checks run before numerical decode. Release the
                     // newest eligible request while preserving established rows.
                     const auto victim = std::find_if(state.active.rbegin(),state.active.rend(),
@@ -335,6 +453,11 @@ template <class Ops> class ContinuousBatch {
 
     Metrics metrics() const {
         auto result = operations.metrics();
+        if constexpr (requires { operations.admission_available(); }) {
+            result.emplace_back("continuous_batching_admission_deferred", admission_deferrals);
+            result.emplace_back("continuous_batching_retractions", retractions);
+            result.emplace_back("continuous_batching_new_token_ratio", ratio.current());
+        }
         result.emplace_back("continuous_batching_active", state.active.size());
         result.emplace_back("continuous_batching_prefilling", requests.size() - state.active.size());
         result.emplace_back("continuous_batching_requests", admissions);

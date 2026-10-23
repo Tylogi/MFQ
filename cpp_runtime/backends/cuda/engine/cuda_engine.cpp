@@ -256,7 +256,27 @@ struct CudaEngineState {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
-                    language, *execution, config.continuous_batch);
+                    language, *execution, config.continuous_batch, BatchMemoryProvider{
+                        [this] {
+                            auto evictable = cache.device_hot_bytes();
+                            auto& primary = evictable[execution->layer_placement.primary_device()];
+                            primary = prefill_budget_add(primary, workspace_expert_capacity());
+                            if (graph_expert_storage.defined())
+                                primary = prefill_budget_add(primary, graph_expert_storage.nbytes());
+                            return evictable;
+                        },
+                        [this](const KvAdmissionBytes& required) {
+                            for (const auto& [device, bytes] : required) {
+                                MfqCudaGuard guard(device);
+                                auto context = mfq::cuda::default_context(device);
+                                if (device == execution->layer_placement.primary_device())
+                                    reclaim_prefix_workspace(bytes);
+                                else if (context->available_memory() < bytes) {
+                                    cache.trim_hot(0);
+                                    context->reclaim_idle_memory();
+                                }
+                            }
+                        }});
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
