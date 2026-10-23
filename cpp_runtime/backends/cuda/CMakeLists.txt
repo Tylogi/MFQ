@@ -91,6 +91,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qsa_scores.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
@@ -409,6 +410,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
     ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/qsa_scores.cpp
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
 )
 
@@ -678,6 +680,7 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
+    add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
     add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)

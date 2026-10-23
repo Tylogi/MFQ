@@ -1249,6 +1249,8 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-scalar-history-chain-check")qsa_scalar_history_chain_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
+    else if(argc==5 && std::string(argv[1])=="--qsa-prefill-score-bench")
+        qsa_prefill_score_benchmark(std::atoi(argv[2]),std::atoi(argv[3]),std::atoi(argv[4])!=0);
     else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-pool-write-check")qsa_live_pool_write_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
