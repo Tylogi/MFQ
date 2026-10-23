@@ -554,7 +554,7 @@ struct BlockLoader : weight_loader::Loader {
                         std::move(sg), std::move(su), std::move(sd), c, prefetch_capture);
     }
     auto embedding(const std::string &name) const {
-        if(require_tensor(source,name).dtype=="TQ") {
+        if(is_tq_row_table(source,name)) {
             auto table=std::make_shared<TqRowTable>(source,name);
             Embedding lookup{[table](const Tensor& ids){return table->lookup(ids);},{},table};
             return std::pair{std::move(lookup),std::array<int64_t,2>{static_cast<int64_t>(table->rows()),table->width()}};

@@ -190,14 +190,43 @@ tb::Tensor projection_workspace(const TqWeight& weight,int tokens,tb::ScalarType
 }
 std::vector<std::int64_t> logical_shape(const mfq::ModelSource& source,const std::string& name) {
     const auto* record=source.find_tensor(name);
-    if(!record || record->dtype!="TQ")throw std::invalid_argument("expected TQ tensor: "+name);
-    if(record->shape)return *record->shape;
-    const auto metadata=source.metadata().find("tensor_shapes");
-    if(metadata!=source.metadata().end()) {
+    if(record && record->dtype!="TQ")throw std::invalid_argument("expected TQ tensor: "+name);
+    std::vector<std::int64_t> shape;
+    bool found=false;
+    for(const auto* key:{"tq_shapes","tensor_shapes"}) {
+        const auto metadata=source.metadata().find(key);
+        if(metadata==source.metadata().end())continue;
         const auto shapes=nlohmann::json::parse(metadata->second);
-        if(shapes.contains(name))return shapes.at(name).get<std::vector<std::int64_t>>();
+        if(!shapes.is_object())throw std::invalid_argument("invalid TQ shape metadata");
+        if(shapes.contains(name)) {
+            shape=shapes.at(name).get<std::vector<std::int64_t>>();found=true;break;
+        }
     }
-    throw std::invalid_argument("TQ logical tensor shape is missing: "+name);
+    if(!found && record && record->shape)shape=*record->shape;
+    if(shape.size()!=2 && shape.size()!=3)
+        throw std::invalid_argument("TQ logical tensor shape must have rank 2 or 3: "+name);
+    std::uint64_t count=1;
+    for(const auto dimension:shape) {
+        if(dimension<1 || count>UINT64_MAX/std::uint64_t(dimension))
+            throw std::invalid_argument("invalid TQ logical tensor shape: "+name);
+        count*=dimension;
+    }
+    return shape;
+}
+std::vector<std::string> row_parts(const mfq::ModelSource& source,const std::string& name) {
+    for(const auto* key:{"tq_row_shards","tq.segments"}) {
+        const auto entry=source.metadata().find(key);
+        if(entry==source.metadata().end())continue;
+        const auto tables=nlohmann::json::parse(entry->second);
+        if(!tables.is_object())throw std::invalid_argument("invalid TQ row-shard manifest");
+        if(!tables.contains(name))continue;
+        if(std::string_view(key)=="tq_row_shards" && source.find_tensor(name))
+            throw std::invalid_argument("ambiguous TQ row table: "+name);
+        const auto names=tables.at(name).get<std::vector<std::string>>();
+        if(names.empty())throw std::invalid_argument("empty TQ row table: "+name);
+        return names;
+    }
+    return {name};
 }
 std::vector<std::uint8_t> join_rows(const std::vector<std::vector<std::uint8_t>>& blobs) {
     if(blobs.empty())throw std::invalid_argument("empty TQ row selection");
@@ -494,21 +523,37 @@ tb::Tensor TqProjectionGroup::swiglu(tb::Tensor input)const {
     return output;
 }
 
+bool is_tq_row_table(const mfq::ModelSource& source,const std::string& name) {
+    const auto* record=source.find_tensor(name);
+    for(const auto* key:{"tq_row_shards","tq.segments"}) {
+        const auto entry=source.metadata().find(key);
+        if(entry!=source.metadata().end()) {
+            const auto tables=nlohmann::json::parse(entry->second);
+            if(!tables.is_object())throw std::invalid_argument("invalid TQ row-shard manifest");
+            if(tables.contains(name)) {
+                if(std::string_view(key)=="tq_row_shards" && record)
+                    throw std::invalid_argument("ambiguous TQ row table: "+name);
+                return true;
+            }
+        }
+    }
+    return record && record->dtype=="TQ";
+}
 TqRowTable::TqRowTable(const mfq::ModelSource& source,const std::string& name) {
     const auto shape=logical_shape(source,name);
     columns_=shape.back();
-    std::vector<std::string> names{name};
-    const auto mapping=source.metadata().find("tq.segments");
-    if(mapping!=source.metadata().end()) {
-        const auto segments=nlohmann::json::parse(mapping->second);
-        if(segments.contains(name))names=segments.at(name).get<std::vector<std::string>>();
-    }
+    const auto names=row_parts(source,name);
+    std::unordered_set<std::string> unique;
     std::uint64_t end=0;
     for(const auto& part:names) {
         const auto* record=source.find_tensor(part);
-        if(!record || record->dtype!="TQ")throw std::invalid_argument("TQ row segment is missing: "+part);
+        if(!unique.insert(part).second || !record || record->dtype!="TQ")
+            throw std::invalid_argument("invalid TQ row segment: "+part);
         auto rows=std::make_shared<mfq::TqRows>(record->nbytes,source.tensor_reader(part));
         if(columns_<1 || columns_>rows->layout().width)throw std::invalid_argument("TQ table logical width differs");
+        if(end>UINT64_MAX-rows->layout().rows || storage_bytes_>UINT64_MAX-record->nbytes)
+            throw std::overflow_error("TQ row table size exceeds bounds");
+        storage_bytes_+=record->nbytes;
         end+=rows->layout().rows;ends_.push_back(end);segments_.push_back(std::move(rows));
     }
     std::uint64_t expected=1;
@@ -547,29 +592,63 @@ tb::Tensor TqRowTable::lookup(const std::int64_t* ids,std::size_t count,const tb
     // Shared table IDs occur across tokens and heads. Read each compressed
     // row once, coalesce adjacent rows, then restore the caller's order on GPU.
     // Sorting also groups metadata reads without fetching intervening weights.
-    std::vector<std::vector<std::uint8_t>> pieces;pieces.reserve(selected.size());
-    for(std::size_t begin=0;begin<selected.size();) {
-        auto end=begin+1;
-        while(end<selected.size() && selected[end]==selected[end-1]+1)++end;
-        pieces.push_back(slice_rows(selected[begin],selected[end-1]+1));begin=end;
-    }
-    const auto weight=to_device_tq(join_rows(pieces),columns_,device.index);
     const MfqCudaGuard guard(device);
+    const auto gather=[&](std::size_t segment,std::size_t begin,std::size_t end) {
+        const auto start=segment?ends_[segment-1]:0;
+        std::vector<std::vector<std::uint8_t>> pieces;
+        for(auto run=begin;run<end;) {
+            auto next=run+1;
+            while(next<end && selected[next]==selected[next-1]+1)++next;
+            pieces.push_back(segments_[segment]->slice_rows(selected[run]-start,selected[next-1]+1-start));
+            run=next;
+        }
+        return to_device_tq(join_rows(pieces),columns_,device.index);
+    };
+    const auto first=std::upper_bound(ends_.begin(),ends_.end(),selected.front())-ends_.begin();
+    const auto last=std::upper_bound(ends_.begin(),ends_.end(),selected.back())-ends_.begin();
+    if(first==last) {
+        // Preserve the single-segment path: decode duplicates directly in
+        // caller order, without an intermediate table or gather kernel.
+        const auto weight=gather(first,0,selected.size());
+        if(selected.size()!=count || !std::equal(selected.begin(),selected.end(),ids)) {
+            std::vector<std::int64_t> inverse;inverse.reserve(count);
+            for(std::size_t i=0;i<count;++i)
+                inverse.push_back(std::lower_bound(selected.begin(),selected.end(),ids[i])-selected.begin());
+            const auto index=tb::from_blob(inverse.data(),{static_cast<std::int64_t>(count)},tb::TensorOptions().dtype(tb::kInt64))
+                .clone().to(device,false,false);
+            return weight.embedding(index);
+        }
+        if(count>65535)return weight.embedding(tb::arange(count,weight.image.options().dtype(tb::kInt64)));
+        auto result=tb::empty({static_cast<std::int64_t>(count),columns_},weight.image.options().dtype(tb::kFloat16));
+        status(mfq_tq_embedding(weight.view,nullptr,static_cast<int>(count),result.data_ptr(),0,mfq_current_cuda_stream()));
+        return result;
+    }
+    auto result=tb::empty({static_cast<std::int64_t>(selected.size()),columns_},
+        tb::TensorOptions().device(device).dtype(tb::kFloat16));
+    std::size_t begin=0;
+    // Decode each physical segment separately: its padding, group size and
+    // column scales need not match the other segments of this logical table.
+    for(std::size_t segment=0;segment<segments_.size() && begin<selected.size();++segment) {
+        const auto end=std::lower_bound(selected.begin()+begin,selected.end(),ends_[segment])-selected.begin();
+        if(std::size_t(end)>begin) {
+            const auto weight=gather(segment,begin,end);
+            const auto count=end-begin;
+            if(count>65535) {
+                const auto index=tb::arange(count,weight.image.options().dtype(tb::kInt64));
+                result.slice(0,begin,end).copy_(weight.embedding(index));
+            } else status(mfq_tq_embedding(weight.view,nullptr,static_cast<int>(count),
+                static_cast<std::uint8_t*>(result.data_ptr())+begin*columns_*sizeof(std::uint16_t),
+                0,mfq_current_cuda_stream()));
+        }
+        begin=end;
+    }
     if(selected.size()!=count || !std::equal(selected.begin(),selected.end(),ids)) {
         std::vector<std::int64_t> inverse;inverse.reserve(count);
         for(std::size_t i=0;i<count;++i)inverse.push_back(std::lower_bound(selected.begin(),selected.end(),ids[i])-selected.begin());
         const auto index=tb::from_blob(inverse.data(),{static_cast<std::int64_t>(count)},tb::TensorOptions().dtype(tb::kInt64))
             .clone().to(device,false,false);
-        return weight.embedding(index);
+        return result.index_select(0,index);
     }
-    auto result=tb::empty({static_cast<std::int64_t>(count),columns_},weight.image.options().dtype(tb::kFloat16));
-    // A table selection can exceed grid.y; keep each decode within its limit.
-    // Callers use chunked prefill so the normal path is one launch.
-    if(count>65535) {
-        auto index=tb::arange(static_cast<std::int64_t>(count),weight.image.options().dtype(tb::kInt64));
-        return weight.embedding(index);
-    }
-    status(mfq_tq_embedding(weight.view,nullptr,static_cast<int>(count),result.data_ptr(),0,mfq_current_cuda_stream()));
     return result;
 }
 tb::Tensor TqRowTable::lookup(tb::Tensor ids)const {
@@ -1215,9 +1294,7 @@ TqRoutedWeight::TqRoutedWeight(CudaExecutionContext& execution,const mfq::ModelS
         execution.tq_expert_cache=std::make_shared<TqExpertCache>(
             moe_expert_cache_budget_bytes(execution.moe_expert_cache),execution.config.moe_host_cache_bytes,
             execution.config.moe_host_physical_bytes);
-    const auto* record=source.find_tensor(name);
-    if(!record)throw std::invalid_argument("missing TQ routed projection: "+name);
-    cache=execution.tq_expert_cache;source_id=cache->register_source(record->nbytes);
+    cache=execution.tq_expert_cache;source_id=cache->register_source(table->storage_bytes());
 }
 std::shared_ptr<TqRoutedWeight> load_tq_routed_weight(CudaExecutionContext& execution,
         const mfq::ModelSource& source,const std::string& name) {

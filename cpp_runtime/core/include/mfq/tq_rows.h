@@ -62,7 +62,7 @@ public:
             const auto descriptor=TqLayout::integer(record,8);
             const auto bits=((descriptor>>32)&7)+1;
             const auto anchor=(descriptor>>40)&0xffff;
-            if((descriptor & ~0x00ffff3fffffffffULL) || anchor>0x7bff ||
+            if((descriptor & ~0x00ffff07ffffffffULL) || anchor>0x7bff ||
                TqLayout::integer(record,4)!=expected)
                 throw std::invalid_argument("invalid TQ row descriptor");
             TqLayout::integer(record,expected-first,4);

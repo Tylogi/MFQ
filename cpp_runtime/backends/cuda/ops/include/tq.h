@@ -17,6 +17,7 @@ struct TqWeight {
 };
 TqWeight to_device_tq(const std::vector<std::uint8_t>&,std::int64_t input_columns,int device,bool cuda=true);
 TqWeight load_tq_weight(const mfq::ModelSource&,const std::string&,int device,bool cuda=true);
+bool is_tq_row_table(const mfq::ModelSource&,const std::string&);
 
 // Device row plan only; compressed weights retain their original storage.
 class TqProjectionGroup {
@@ -41,10 +42,12 @@ class TqRowTable {
     std::vector<std::shared_ptr<mfq::TqRows>> segments_;
     std::vector<std::uint64_t> ends_;
     std::int64_t columns_=0;
+    std::uint64_t storage_bytes_=0;
 public:
     TqRowTable(const mfq::ModelSource&,const std::string&);
     std::uint64_t rows()const noexcept{return ends_.back();}
     std::int64_t width()const noexcept{return columns_;}
+    std::uint64_t storage_bytes()const noexcept{return storage_bytes_;}
     std::size_t row_image_bytes_bound()const;
     std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end)const;
     mfq_tensor_backend::Tensor lookup(const std::int64_t*,std::size_t,const mfq_tensor_backend::Device&)const;
