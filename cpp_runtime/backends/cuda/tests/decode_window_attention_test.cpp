@@ -1176,6 +1176,7 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 #include "kv_quantization_test.h"
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
+#include "qsa_independent_batch_test.h"
 int main(int argc,char** argv)try {
     auto context=default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
@@ -1245,6 +1246,8 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-decay-check")gdn_prefill_pipeline_case(false,true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-bench")gdn_prefill_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-columns-bench")gdn_short_columns_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--qsa-independent-batch-check")qsa_independent_batch_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-independent-batch-bench")qsa_independent_batch_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-scalar-history-chain-check")qsa_scalar_history_chain_case();

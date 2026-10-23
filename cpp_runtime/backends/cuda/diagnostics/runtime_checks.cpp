@@ -8,6 +8,7 @@
 #include "engine/cuda_batching.h"
 #include "models/qwen35/linear_attention.h"
 #include "batch_graph_membership_check.h"
+#include "batch_decode_benchmark.h"
 
 #include <cuda_profiler_api.h>
 
@@ -150,6 +151,8 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
         growth_prompt[i] = (137 + i*41) % model.vocab_size();
     const auto growth_reference = requests > 2 ? serial(growth_prompt) : std::vector<int64_t>{};
     graph.invalidate(); // Physical batch slots replace the serial graph's storage.
+    if constexpr (std::is_same_v<Model, Qwen4CausalLm>)
+        benchmark_batch_decode(model, config.continuous_batch, first_prompt, first_reference);
     check_batch_graph_membership(model, config.continuous_batch, second_prompt, second_reference);
     {
         struct Execution {
