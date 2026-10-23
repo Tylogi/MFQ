@@ -1140,6 +1140,10 @@ std::optional<bool> mfe_token_groups() {
     if (const auto* value = std::getenv("MFQ_MFE_TOKEN_GROUPS")) return value[0] != '0';
     return std::nullopt;
 }
+std::optional<bool> mfe_expert_plan() {
+    if (const auto* value = std::getenv("MFQ_MFE_EXPERT_PLAN")) return value[0] != '0';
+    return std::nullopt;
+}
 std::optional<bool> mfe_token_compact_plan() {
     if (const auto* value = std::getenv("MFQ_MFE_TOKEN_COMPACT_PLAN")) return value[0] != '0';
     return std::nullopt;
