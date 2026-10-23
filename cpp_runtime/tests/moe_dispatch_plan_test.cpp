@@ -29,6 +29,15 @@ int main() try {
     try { mfq::plan_moe_dispatch(std::vector<std::int32_t>{2, -1}, 5, 5, hot, all); }
     catch (const std::out_of_range&) { failed = true; }
     if (!failed) throw std::runtime_error("invalid route accepted");
+    const std::vector<std::int32_t> padded_ids{2, -1, 0, -1, 2};
+    const auto padded = mfq::plan_moe_dispatch(padded_ids, 5, 0, hot, all, true);
+    mfq::MoeDispatchPlan padded_reused;
+    mfq::MoeDispatchWorkspace padded_workspace;
+    mfq::plan_moe_dispatch_reuse(padded_reused, padded_workspace, padded_ids, 5, 0, hot, all, true);
+    if (padded.groups.size() != 2 || padded.groups[0].positions != std::vector<std::size_t>{0, 4} ||
+        padded.kinds != std::vector<K>{K::GpuResident, K::Inactive, K::Cpu, K::Inactive, K::GpuResident} ||
+        padded_reused.kinds != padded.kinds)
+        throw std::runtime_error("padding consumed an expert route or changed original row indices");
     if (!mfq::plan_moe_dispatch({}, 5, 0, hot, all).groups.empty()) throw std::runtime_error("empty route differs");
     const auto skipped = mfq::plan_moe_dispatch(std::vector<std::int32_t>{0, 1, 3}, 5, 1,
         [](int) { return false; }, [](int e) { return e == 1; });

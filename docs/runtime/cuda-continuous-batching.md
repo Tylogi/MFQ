@@ -13,11 +13,17 @@ Eligible rows wait for their peers to schedule the next decode, so requests
 with different prefill lengths form a batch instead of alternating single-row
 decodes. A request paused by output backpressure does not hold up other rows.
 
-The decode window captures CUDA Graphs for the active request group. A change in
-membership or cache capacity rebuilds the graph. QSA allocations grow with the
-actual context; selecting a large context limit does not allocate that entire
-limit for every slot. Request-owned KV and recurrent state are included in the
-runtime's KV memory metrics.
+The native CUDA decode window caches CUDA Graphs in row buckets of 1, 2, 4, 8,
+16 and 32, capped by the configured request capacity. It selects the smallest
+bucket that fits the eligible requests. The Qwen and Flash-Next adapters share
+this policy, static row metadata and device state-pointer tables. Arrivals,
+departures, pauses and row reordering update these inputs before replay. A new
+row bucket, length bucket or cache capacity can require capture.
+Padding rows cannot commit request KV, recurrent or PLE state, ngram history,
+token counts or expert routes; their outputs are discarded.
+QSA allocations grow with the actual context; selecting a large context limit
+does not allocate that entire limit for every slot. Request-owned KV and
+recurrent state are included in the runtime's KV memory metrics.
 
 Before growing caches, the runtime checks actual available VRAM, including the
 transient expansion workspace, and can evict prefix hot-cache entries. A prefill
@@ -30,6 +36,10 @@ Explicit continuous batching currently runs ordinary token decoding. Batched
 requests do not use MTP or persistent prefix reuse. Explicit session IDs and
 multimodal requests remain exclusive. The default single-request path retains
 MTP and prefix caching. Configured QSA KV offload uses the eager batch path.
+Cached Qwen MoE retains its eager fallback. This graph cache is specific to
+native CUDA; Metal and HIP retain their existing batching and sampling paths.
+Entering an exclusive request retires the batch graph cache before its decode
+workspace is borrowed.
 
 Run the state check with the native diagnostics executable:
 
@@ -48,13 +58,26 @@ checks staggered request scheduling. The stdio chat-client integration test
 compares simultaneous generations with serial output and verifies that the
 decoder actually processes multiple tokens per batch.
 
+The diagnostics also exercise arrivals, departures, paused rows and reordered
+rows within one bucket, comparing generated tokens with serial generation and
+checking that inactive recurrent state stays byte-identical. The existing
+`continuous_batching_cuda_graph_captures` and
+`continuous_batching_cuda_graph_replays` counters remain available.
+`continuous_batching_cuda_graph_membership_captures` counts captures caused only
+by membership changes and remains zero. `continuous_batching_cuda_graph_bucket_reuses`
+counts subsequent replays of an existing bucket, including changed members or row order.
+`continuous_batching_cuda_graph_capture_ms` accumulates graph warmup and capture
+time, including instantiation.
+
 ## Allocator and cache growth
 
 CUDA Graph scratch uses a separate asynchronous device pool from resident
-weights and reusable quantization workspaces. Request GDN state is allocated
-on first use in a resident pool. Retiring a graph trims its unused pages;
-pool telemetry includes every live and retired pool. Pool handles are reclaimed
-when their remaining tensors are released.
+weights and reusable quantization workspaces. All row buckets borrow the same
+pool and execute serially, allowing their temporary allocations to reuse its
+scratch. Request GDN state is allocated on first use in a resident pool.
+Retiring the bucket cache trims its unused pages; pool telemetry includes every
+live and retired pool. Pool handles are reclaimed when their remaining tensors
+are released.
 
 QSA keeps one KV layout while a graph is active. It releases the previous
 sequence layout after preparing graph KV, and reconstructs that layout only
@@ -67,8 +90,10 @@ Eligible GDN layers process independent requests in one decode core launch.
 A small address table points to each request's existing convolution, recurrent
 state and counters; recurrence stays in those allocations. One subsequent
 kernel commits convolution rows after all readers finish. Membership changes
-rebuild the table with the graph. No second full batch of recurrent state is
-allocated. `MFQ_GDN_INDEPENDENT_BATCH=0` restores the per-request core calls.
+update the table before replay; null entries skip recurrent and convolution
+commits for inactive rows. The fused path keeps recurrence in request allocations.
+Other recurrent paths use shared staging slots for indirect loads and commits.
+`MFQ_GDN_INDEPENDENT_BATCH=0` restores the per-request core calls.
 This dispatch requires batched attention projections and supported fused GDN
 geometry. Unsupported layers retain their per-request path.
 Request decode counters are prepared after prefill, before graph recording,

@@ -129,7 +129,10 @@ template <class Ops> class ContinuousBatch {
     }
     void release_idle_buffers() {
         if(!empty())throw std::runtime_error("cannot release active batch buffers");
-        operations.suspend_decode();
+        if constexpr (requires { operations.release_idle_buffers(); })
+            operations.release_idle_buffers();
+        else
+            operations.suspend_decode();
     }
     template <class... Args>
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)

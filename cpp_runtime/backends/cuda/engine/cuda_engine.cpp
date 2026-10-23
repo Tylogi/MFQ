@@ -385,12 +385,12 @@ struct CudaEngineState {
         const auto previous_limit=context->memory_stats().limit;
         const auto previous_experts=moe_expert_cache_budget_bytes(execution->moe_expert_cache);
         const auto before=context->resident_memory_usage();
+        if(batching)batching->release_idle_buffers();
         release_graph_expert_space();
         finish_moe_expert_exchanges(execution->moe_expert_cache);
         graph.invalidate();
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
             qwen4_release_decode_graphs(language,components.mtp.get());
-        if(batching)batching->release_idle_buffers();
         if(components.mtp)components.mtp->reset(1);
         language.reset(1);
         release_moe_decode_buffers(execution->moe_expert_cache);
@@ -460,6 +460,8 @@ struct CudaEngineState {
                 qwen4_release_decode_graphs(language,components.mtp.get());
                 if (components.mtp) components.mtp->reset(1);
             }
+        } else if (batching) {
+            batching->release_idle_buffers();
         }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }

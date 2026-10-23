@@ -135,6 +135,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
     ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
+    ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
@@ -387,6 +388,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/nemotron_h/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/batch_graph_state.cpp
 )
 
 set(MFQ_CUDA_TRANSFORMER_SOURCES
@@ -447,6 +449,8 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/storage/deepseek_v41_paged_session.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/reference.cpp
@@ -655,6 +659,13 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-moe-ffn-pipeline-test PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-batch-decode-graph-test ${MFQ_CUDA_ROOT}/tests/batch_decode_graph_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-batch-decode-graph-test)
+    target_compile_definitions(mfq-cuda-batch-decode-graph-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-batch-decode-graph-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-batch-decode-graph-test COMMAND mfq-cuda-batch-decode-graph-test)
+    set_tests_properties(mfq-cuda-batch-decode-graph-test PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(mfq-cuda-dma-batch-test ${MFQ_CUDA_ROOT}/tests/dma_copy_batch_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-dma-batch-test)
     target_compile_definitions(mfq-cuda-dma-batch-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

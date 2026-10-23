@@ -800,7 +800,11 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
                 for(const auto expert:ids)if(unsigned(expert)>=s.observations[b].size())
                     throw std::out_of_range("speculative expert route is out of range");
                 auto& record=s.speculative_routes[b];record.ids=ids;record.rows=tokens;
-            }else for(int expert:ids){s.observations[b].at(expert)+=1.0f;++s.observed_routes;}
+            }else for(int expert:ids) {
+                if (expert < 0 && independent_sequences) continue;
+                s.observations[b].at(expert)+=1.0f;
+                ++s.observed_routes;
+            }
         }
     if(!s.cache->config_.moe_residency_adapt)return;
     if(layer!=s.last || s.work_pending.load(std::memory_order_acquire))return;

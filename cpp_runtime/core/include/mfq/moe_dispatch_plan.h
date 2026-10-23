@@ -8,7 +8,7 @@
 #include <vector>
 
 namespace mfq {
-enum class MoeDispatchKind { Cpu = -1, GpuResident = 0, GpuTransfer = 1 };
+enum class MoeDispatchKind { Cpu = -1, GpuResident = 0, GpuTransfer = 1, Inactive = 2 };
 struct MoeDispatchGroup {
     std::int32_t expert = -1;
     MoeDispatchKind kind = MoeDispatchKind::Cpu;
@@ -99,15 +99,17 @@ struct MoeDispatchWorkspace {
 template<class Resident, class TransferEligible>
 void plan_moe_dispatch_reuse(MoeDispatchPlan& plan, MoeDispatchWorkspace& workspace,
         const std::vector<std::int32_t>& ids, int experts, std::size_t transfer_quota,
-        Resident resident, TransferEligible transfer_eligible) {
+        Resident resident, TransferEligible transfer_eligible, bool allow_padding = false) {
     if (experts < 1) throw std::invalid_argument("expert count must be positive");
     for (const auto id : ids)
-        if (id < 0 || id >= experts) throw std::out_of_range("MoE expert ID is out of range");
-    plan.kinds.resize(ids.size());
+        if ((id < 0 || id >= experts) && !(allow_padding && id == -1))
+            throw std::out_of_range("MoE expert ID is out of range");
+    plan.kinds.assign(ids.size(), MoeDispatchKind::Inactive);
     workspace.group_for.assign(static_cast<std::size_t>(experts), ids.size());
     plan.groups.reserve(std::min(ids.size(), static_cast<std::size_t>(experts)));
     std::size_t count = 0;
     for (std::size_t position = 0; position < ids.size(); ++position) {
+        if (ids[position] == -1 && allow_padding) continue;
         auto& index = workspace.group_for[static_cast<std::size_t>(ids[position])];
         if (index == ids.size()) {
             index = count++;
@@ -128,15 +130,17 @@ void plan_moe_dispatch_reuse(MoeDispatchPlan& plan, MoeDispatchWorkspace& worksp
 template<class Resident, class TransferEligible>
 MoeDispatchPlan plan_moe_dispatch(const std::vector<std::int32_t>& ids,
         int experts, std::size_t transfer_quota, Resident resident,
-        TransferEligible transfer_eligible) {
+        TransferEligible transfer_eligible, bool allow_padding = false) {
     if (experts < 1) throw std::invalid_argument("expert count must be positive");
     // Validate the complete input before invoking placement callbacks.
     for (const auto id : ids)
-        if (id < 0 || id >= experts) throw std::out_of_range("MoE expert ID is out of range");
+        if ((id < 0 || id >= experts) && !(allow_padding && id == -1))
+            throw std::out_of_range("MoE expert ID is out of range");
     MoeDispatchPlan plan;
-    plan.kinds.resize(ids.size(), MoeDispatchKind::Cpu);
+    plan.kinds.resize(ids.size(), MoeDispatchKind::Inactive);
     std::vector<std::size_t> group_for(static_cast<std::size_t>(experts), ids.size());
     for (std::size_t position = 0; position < ids.size(); ++position) {
+        if (ids[position] == -1 && allow_padding) continue;
         auto& group = group_for[static_cast<std::size_t>(ids[position])];
         if (group == ids.size()) {
             group = plan.groups.size();

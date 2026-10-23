@@ -7,6 +7,7 @@
 #include "mfq_cuda_norm_ops.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/moe_ffn_pipeline.h"
+#include "runtime/batch_decode_graph.h"
 
 #include <algorithm>
 #include <array>
@@ -42,7 +43,7 @@ Tensor dense_routed_projection(const Tensor &bank, const Tensor &input, const Te
     auto project = [&](const Tensor &chunk_ids, const Tensor &chunk_input) {
         const int64_t count = chunk_ids.size(0);
         auto selected =
-            bank.index_select(0, chunk_ids.reshape({-1}).to(mfq_tensor_backend::kInt64))
+            bank.index_select(0, chunk_ids.reshape({-1}).clamp_min(0).to(mfq_tensor_backend::kInt64))
                 .reshape({count, routes, output, width});
         auto source = chunk_input.dim() == 2
                           ? chunk_input.unsqueeze(1).expand({count, routes, width})
@@ -510,6 +511,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             1e-20, moe_router_scale);
                     });
                 }
+                mfq::cuda::mask_batch_routes(execution, selected);
                 if (!use_pipeline) {
                     // Dense (source-precision) banks are not MFE cohorts, so
                     // their expert count comes from the bank itself.
