@@ -73,6 +73,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const reloads = useRef(new Set<string>());
   const mounted = useRef(false);
   const requestVersion = useRef(0);
+  const inFlightRefresh = useRef<Promise<boolean> | null>(null);
   const jobRequestVersion = useRef(0);
   const initializationVersion = useRef(0);
   const selectedRef = useRef(selectedModel);
@@ -84,6 +85,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const requireAuthentication = useCallback(() => {
     ++requestVersion.current;
     ++jobRequestVersion.current;
+    inFlightRefresh.current = null;
     setAuthenticationRequired(true);
     setReady(false);
     setLoading(false);
@@ -96,59 +98,71 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => onAuthenticationRequired(requireAuthentication), [requireAuthentication]);
 
   const refreshRuntime = useCallback(async (quiet = true): Promise<boolean> => {
-    const version = ++requestVersion.current;
-    const jobVersion = ++jobRequestVersion.current;
-    if (!quiet) setLoading(true);
-    try {
-      const [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
-      if (!mounted.current || version !== requestVersion.current) return false;
-      const instance = nextInstances.find(
-        (item) => item.model === selectedRef.current && item.state !== 'failed',
-      );
-      const [statusResult, voiceResult] = await Promise.allSettled([
-        runtimeApi.runtimeStatus(instance?.id),
-        runtimeApi.voiceOutputComponent(),
-      ]);
-      if (statusResult.status !== 'fulfilled') throw statusResult.reason;
-      const status = statusResult.value;
-      if (!mounted.current || version !== requestVersion.current) return false;
-      const [modelResult, capabilityResult, realtimeResult] = await Promise.allSettled([
-        isRuntimeReady(status.runtime_state)
-          ? runtimeApi.runtimeModels()
-          : Promise.resolve<RuntimeModel[]>([]),
-        isRuntimeReady(status.runtime_state)
-          ? runtimeApi.runtimeCapabilities(instance?.id)
-          : Promise.resolve(null),
-        isRuntimeReady(status.runtime_state) ? runtimeApi.realtimeCapabilities() : Promise.resolve(null),
-      ]);
-      if (!mounted.current || version !== requestVersion.current) return false;
-      const nextModels = modelResult.status === 'fulfilled' ? modelResult.value : [];
-      setInstances(nextInstances);
-      if (jobVersion === jobRequestVersion.current) useJobStore.getState().setJobs(nextJobs);
-      setRuntime(status);
-      setModels(nextModels);
-      setCapabilities(capabilityResult.status === 'fulfilled' ? capabilityResult.value : null);
-      setRealtime(realtimeResult.status === 'fulfilled' ? realtimeResult.value : null);
-      if (voiceResult.status === 'fulfilled') setVoiceComponent(voiceResult.value);
-      const names = runtimeSelectionNames(nextModels, nextInstances, useJobStore.getState().jobs);
-      setSelectedModel((current) =>
-        names.includes(current)
-          ? current
-          : typeof status.model === 'string' && names.includes(status.model)
-            ? status.model
-            : (names[0] ?? ''),
-      );
-      setAuthenticationRequired(false);
-      setRefreshError(null);
-      return true;
-    } catch (cause) {
-      if (mounted.current && version === requestVersion.current) {
-        if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
-        else setRefreshError(errorMessage(cause));
+    // Several independent timers (job sync, models page, allocation panel) call
+    // this. Sharing one in-flight wave removes duplicate six-request bursts and
+    // keeps the browser connection pool free for streaming responses.
+    if (inFlightRefresh.current) return inFlightRefresh.current;
+    const task = (async (): Promise<boolean> => {
+      const version = ++requestVersion.current;
+      const jobVersion = ++jobRequestVersion.current;
+      if (!quiet) setLoading(true);
+      try {
+        const [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
+        if (!mounted.current || version !== requestVersion.current) return false;
+        const instance = nextInstances.find(
+          (item) => item.model === selectedRef.current && item.state !== 'failed',
+        );
+        const [statusResult, voiceResult] = await Promise.allSettled([
+          runtimeApi.runtimeStatus(instance?.id),
+          runtimeApi.voiceOutputComponent(),
+        ]);
+        if (statusResult.status !== 'fulfilled') throw statusResult.reason;
+        const status = statusResult.value;
+        if (!mounted.current || version !== requestVersion.current) return false;
+        const [modelResult, capabilityResult, realtimeResult] = await Promise.allSettled([
+          isRuntimeReady(status.runtime_state)
+            ? runtimeApi.runtimeModels()
+            : Promise.resolve<RuntimeModel[]>([]),
+          isRuntimeReady(status.runtime_state)
+            ? runtimeApi.runtimeCapabilities(instance?.id)
+            : Promise.resolve(null),
+          isRuntimeReady(status.runtime_state) ? runtimeApi.realtimeCapabilities() : Promise.resolve(null),
+        ]);
+        if (!mounted.current || version !== requestVersion.current) return false;
+        const nextModels = modelResult.status === 'fulfilled' ? modelResult.value : [];
+        setInstances(nextInstances);
+        if (jobVersion === jobRequestVersion.current) useJobStore.getState().setJobs(nextJobs);
+        setRuntime(status);
+        setModels(nextModels);
+        setCapabilities(capabilityResult.status === 'fulfilled' ? capabilityResult.value : null);
+        setRealtime(realtimeResult.status === 'fulfilled' ? realtimeResult.value : null);
+        if (voiceResult.status === 'fulfilled') setVoiceComponent(voiceResult.value);
+        const names = runtimeSelectionNames(nextModels, nextInstances, useJobStore.getState().jobs);
+        setSelectedModel((current) =>
+          names.includes(current)
+            ? current
+            : typeof status.model === 'string' && names.includes(status.model)
+              ? status.model
+              : (names[0] ?? ''),
+        );
+        setAuthenticationRequired(false);
+        setRefreshError(null);
+        return true;
+      } catch (cause) {
+        if (mounted.current && version === requestVersion.current) {
+          if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
+          else setRefreshError(errorMessage(cause));
+        }
+        return false;
+      } finally {
+        if (mounted.current && version === requestVersion.current) setLoading(false);
       }
-      return false;
+    })();
+    inFlightRefresh.current = task;
+    try {
+      return await task;
     } finally {
-      if (mounted.current && version === requestVersion.current) setLoading(false);
+      if (inFlightRefresh.current === task) inFlightRefresh.current = null;
     }
   }, [requireAuthentication]);
 
@@ -180,6 +194,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const version = ++initializationVersion.current;
     ++requestVersion.current;
     ++jobRequestVersion.current;
+    inFlightRefresh.current = null;
     setReady(false);
     setLoading(true);
     setConnectionError(null);

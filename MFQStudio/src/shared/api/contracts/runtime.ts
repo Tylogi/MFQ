@@ -175,6 +175,9 @@ export interface ServingStatistics {
   activity: {
     instance_id: string; model: string; state: string; active_requests: number;
     queued_requests: number; sample_age_seconds: number | null;
+    request_capacity?: number; batch_capacity?: number;
+    queue_wait_ms_avg?: number; queue_wait_ms_max?: number;
+    rejected_requests?: number;
     requests: { id: string; phase: string; processed_tokens: number;
       generated_tokens: number; prefill_tps: number; decode_tps: number;
       elapsed_seconds: number; updated_at: number }[];
@@ -262,6 +265,11 @@ export interface RuntimeInstance {
   devices: string[];
   active_sessions: number;
   queued_requests: number;
+  request_capacity?: number;
+  batch_capacity?: number;
+  queue_wait_ms_avg?: number;
+  queue_wait_ms_max?: number;
+  rejected_requests?: number;
   resident_bytes?: number | null;
   kv_bytes?: number | null;
   memory?: RuntimeMemoryResources | null;

@@ -132,13 +132,15 @@ describe('useModelCatalog', () => {
     expect(result.current.busy).toBe(false);
   });
 
-  it('removes deleted checkpoints on the next fresh scan without a job change', async () => {
+  it('removes deleted checkpoints on the next catalog poll without a job change', async () => {
     vi.useFakeTimers();
     try {
       state.ready = true;
       const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
       await act(async () => { await Promise.resolve(); });
-      expect(modelsApi.modelArtifacts).toHaveBeenLastCalledWith(true);
+      // Polling reuses the server's cached catalog; only explicit user actions
+      // force a full rescan.
+      expect(modelsApi.modelArtifacts).toHaveBeenLastCalledWith(false);
       expect(result.current.artifacts).toEqual([artifact]);
       vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });

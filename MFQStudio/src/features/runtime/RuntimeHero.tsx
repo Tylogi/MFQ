@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { memo, useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useJobStore } from '../../stores/jobStore';
@@ -11,7 +11,9 @@ import { getApiBaseUrl } from '../../shared/api/client';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from '../models/ModelLoadProgress';
 
-export function RuntimeHero() {
+// The overview page re-renders on the 500 ms serving poll; the hero only
+// depends on runtime context, so memo keeps that tick out of it.
+export const RuntimeHero = memo(function RuntimeHero() {
   const { runtime, instances, studio } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
   const { tr } = useSettings();
@@ -124,4 +126,4 @@ export function RuntimeHero() {
       </div>
     </TMPanel>
   );
-}
+});
