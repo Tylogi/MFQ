@@ -11,6 +11,7 @@
 namespace mfq::metal {
 class MfqContainer;
 class MlxTqExpertCache;
+class MlxMappedTqRows;
 struct MlxTqRoutePlan {
     mlx::core::array block_meta, block_count;
     int max_blocks, block_rows, route_count, experts;
@@ -63,19 +64,24 @@ private:
     static MlxTqWeight from_blob_impl(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const mlx::core::array* words,
         std::span<const std::uint64_t> expert_offsets);
+    static MlxTqWeight from_expert_blob(std::span<const std::uint8_t> blob,
+        int input_columns, int experts, const mlx::core::array* words,
+        std::span<const std::uint64_t> expert_offsets);
+    static MlxTqWeight from_expert_rows(const MlxMappedTqRows& rows, int experts,
+        const mlx::core::array* words, std::span<const std::uint64_t> expert_offsets);
     void set_expert_word_offset(int expert, std::uint64_t word_offset);
     static std::vector<mlx::core::array> matmul_many_impl(
         std::span<const MlxTqWeight> weights, const mlx::core::array& input);
     MlxTqWeight(mlx::core::array words, mlx::core::array descriptors,
         mlx::core::array scales, int rows, int width, int input_columns,
-        int experts, int group_size, bool columns, std::size_t bytes, bool pooled = false);
+        int experts, int group_size, int columns, std::size_t bytes, bool pooled = false);
     mlx::core::array project(const mlx::core::array& input,
         const mlx::core::array& ids, const MlxTqWeight* up,
         float limit, bool gelu, int split = 0, const mlx::core::array* reuse = nullptr) const;
     static MlxTqWeight concatenate(const std::vector<MlxTqWeight>& weights, bool projections);
     mlx::core::array words_, descriptors_, scales_;
-    int rows_, width_, input_columns_, experts_, group_size_;
-    bool columns_, pooled_;
+    int rows_, width_, input_columns_, experts_, group_size_, columns_;
+    bool pooled_;
     std::size_t nbytes_;
 };
 } // namespace mfq::metal

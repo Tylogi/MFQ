@@ -27,7 +27,22 @@ inline float tq_group_scale(constant const float* scales, device const half*, ui
     return scales[group];
 }
 
-template <bool COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
+template <typename S>
+inline float4 tq_column_scale4(S scales, uint at) {
+    return float4(scales[at], scales[at + 1u], scales[at + 2u], scales[at + 3u]);
+}
+
+template <typename S>
+inline float4 tq_column_scale4(device const S* scales, uint at) {
+    return float4(*(device const vec<S, 4>*)(scales + at));
+}
+
+template <typename S>
+inline float4 tq_column_scale4(constant const S* scales, uint at) {
+    return float4(*(constant const vec<S, 4>*)(scales + at));
+}
+
+template <uint COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
 inline half4 tq_decode4(device const uint* words, ulong descriptor,
         ScalePtr scales, device const half* relative, uint row, uint col) {
     uint bits = (uint(descriptor >> 32) & 7u) + 1u;
@@ -45,7 +60,10 @@ inline half4 tq_decode4(device const uint* words, ulong descriptor,
     uint4 state = uint4(pair0 >> bits, pair0, pair1 >> bits, pair1) & 65535u;
     float anchor = float(as_type<half>(ushort(descriptor >> 40)));
     float4 factor;
-    if constexpr (COLUMNS) factor = float4(scales[col], scales[col + 1u], scales[col + 2u], scales[col + 3u]) * anchor;
+    if constexpr (COLUMNS) {
+        uint at = col + (COLUMNS == 2u ? row / GS * WIDTH : 0u);
+        factor = tq_column_scale4(scales, at) * anchor;
+    }
     else {
         uint group = row * ((WIDTH + GS - 1u) / GS) + col / GS;
         factor = float4(tq_group_scale(scales, relative, group, anchor));
@@ -119,7 +137,7 @@ struct TqDecoded8 {
     half4 first, second;
 };
 
-template <bool COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
+template <uint COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
 inline TqDecoded8 tq_decode8(device const uint* words, ulong descriptor,
         ScalePtr scales, device const half* relative, uint row, uint col) {
     uint bits = (uint(descriptor >> 32) & 7u) + 1u;
@@ -135,8 +153,9 @@ inline TqDecoded8 tq_decode8(device const uint* words, ulong descriptor,
     uint4 states1 = uint4(second >> bits, second, third >> bits, third) & 65535u;
     float4 scale0, scale1;
     if constexpr (COLUMNS) {
-        scale0 = anchor * float4(scales[col], scales[col + 1u], scales[col + 2u], scales[col + 3u]);
-        scale1 = anchor * float4(scales[col + 4u], scales[col + 5u], scales[col + 6u], scales[col + 7u]);
+        uint at = col + (COLUMNS == 2u ? row / GS * WIDTH : 0u);
+        scale0 = anchor * tq_column_scale4(scales, at);
+        scale1 = anchor * tq_column_scale4(scales, at + 4u);
     } else {
         uint group = row * ((WIDTH + GS - 1u) / GS) + col / GS;
         scale0 = scale1 = float4(tq_group_scale(scales, relative, group, anchor));
@@ -156,7 +175,7 @@ inline TqWindow tq_projection_window(TqWindow plan, uint bits, uint col) {
     } else return tq_window(bits, col);
 }
 
-template <bool COLUMNS, uint WIDTH, uint K, uint GS, typename ScalePtr, typename Input>
+template <uint COLUMNS, uint WIDTH, uint K, uint GS, typename ScalePtr, typename Input>
 inline float4 tq_accum8(device const uint* ring,
         ScalePtr scales, device const half* relative, uint row, uint col,
         TqWindow plan, float anchor, Input input, float4 acc) {
@@ -178,14 +197,17 @@ inline float4 tq_accum8(device const uint* ring,
         uint4 state = part == 0u ? states0 : states1;
         uint at = col + part * 4u;
         float4 factor = scale;
-        if constexpr (COLUMNS) factor = anchor * float4(scales[at], scales[at + 1u], scales[at + 2u], scales[at + 3u]);
+        if constexpr (COLUMNS) {
+            uint sc = at + (COLUMNS == 2u ? row / GS * WIDTH : 0u);
+            factor = anchor * tq_column_scale4(scales, sc);
+        }
         float4 weight = float4(half4(float4(tq_book(state)) * factor));
         acc = fma(weight, tq_input4<K>(input, col, part), acc);
     }
     return acc;
 }
 
-template <typename T, uint LANES, bool COLUMNS, uint WIDTH, uint K, uint GS, typename ScalePtr, typename Input>
+template <typename T, uint LANES, uint COLUMNS, uint WIDTH, uint K, uint GS, typename ScalePtr, typename Input>
 inline float tq_dot(device const uint* words, ulong descriptor,
         ScalePtr scales, device const half* relative, uint row,
         Input x, uint lane, uint begin = 0u, uint end = K) {
@@ -220,7 +242,7 @@ inline float tq_dot(device const uint* words, ulong descriptor,
     return acc.x + acc.y + acc.z + acc.w;
 }
 
-template <typename T, uint LANES, bool CG, bool CU, uint WG, uint WU, uint K,
+template <typename T, uint LANES, uint CG, uint CU, uint WG, uint WU, uint K,
           uint GG, uint GU, typename SG, typename SU>
 inline float2 tq_dot_pair(device const uint* words_g, ulong desc_g, SG scales_g,
         device const uint* words_u, ulong desc_u, SU scales_u, device const half* relative,
@@ -257,7 +279,7 @@ inline float2 tq_dot_pair(device const uint* words_g, ulong desc_g, SG scales_g,
     return float2(gate.x + gate.y + gate.z + gate.w, up.x + up.y + up.z + up.w);
 }
 
-template <typename T, bool COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES, bool COMPACT = false, typename ScalePtr, typename Sources>
+template <typename T, uint COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES, bool COMPACT = false, typename ScalePtr, typename Sources>
 inline void tq_dot_batch_accumulate(device const uint* words, ulong descriptor, ScalePtr scales,
         device const half* relative, uint row, device const T* x, Sources sources, uint lane,
         thread float4 (&acc)[BM],
@@ -289,10 +311,11 @@ inline void tq_dot_batch_accumulate(device const uint* words, ulong descriptor, 
     }
 }
 
-template <typename T, bool COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES = 16, typename ScalePtr>
+template <typename T, uint COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES = 16, typename ScalePtr>
 inline float4 tq_dot_batch(device const uint* words, ulong descriptor, ScalePtr scales,
         device const half* relative, uint row, device const T* x, int4 sources, uint lane,
         uint begin = 0u, uint end = K) {
+    static_assert(BM <= 4, "TQ vector batch supports at most four rows");
     float4 acc[BM];
     tq_dot_batch_accumulate<T, COLUMNS, WIDTH, K, GS, BM, LANES>(
         words, descriptor, scales, relative, row, x, sources, lane, acc, begin, end);
@@ -302,7 +325,7 @@ inline float4 tq_dot_batch(device const uint* words, ulong descriptor, ScalePtr 
     return result;
 }
 
-template <typename T, bool CG, bool CU, uint WG, uint WU, uint K, uint GG, uint GU,
+template <typename T, uint CG, uint CU, uint WG, uint WU, uint K, uint GG, uint GU,
           uint BM, typename SG, typename SU, typename Sources>
 inline void tq_dot_pair_batch_accumulate(device const uint* words_g, ulong desc_g, SG scales_g,
         device const uint* words_u, ulong desc_u, SU scales_u, device const half* relative,

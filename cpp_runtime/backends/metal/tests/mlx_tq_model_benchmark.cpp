@@ -15,6 +15,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace mlx::core;
@@ -279,15 +280,39 @@ static void check_cache_resize(MlxQwen4CausalLm& model, int vocabulary, int prom
 }
 
 template <typename Model>
+static auto benchmark_cache(Model& model) { return model.make_request_cache(); }
+
+static std::nullptr_t benchmark_cache(MlxDeepseekV41CausalLm&) { return nullptr; }
+
+template <typename Model, typename Cache>
+static array benchmark_prefill(Model& model, Cache& cache, const std::vector<std::int64_t>& prompt) {
+    return model.prefill_request(*cache, prompt, false);
+}
+
+static array benchmark_prefill(MlxDeepseekV41CausalLm& model, std::nullptr_t&,
+        const std::vector<std::int64_t>& prompt) {
+    return model.prefill(array(prompt.begin(), Shape{1, int(prompt.size())}, int64), 4096, false);
+}
+
+template <typename Model, typename Cache>
+static array benchmark_decode(Model& model, Cache& cache, std::int64_t token) {
+    return model.decode_requests({cache}, {token});
+}
+
+static array benchmark_decode(MlxDeepseekV41CausalLm& model, std::nullptr_t&, std::int64_t token) {
+    return model.decode(array({token}, Shape{1, 1}, int64));
+}
+
+template <typename Model>
 static void benchmark(Model& model, int vocabulary, int prompt_tokens, int generated_tokens, bool profile) {
     std::vector<std::int64_t> prompt(prompt_tokens);
     for (int i = 0; i < prompt_tokens; ++i) prompt[i] = (std::int64_t(i) * 7919 + 1234) % vocabulary;
     for (int repeat = 0; repeat < 3; ++repeat) {
         model.reset_cache();
-        auto cache = model.make_request_cache();
+        auto cache = benchmark_cache(model);
         const auto before = model.ssd_expert_cache_stats();
         const auto started = Clock::now();
-        auto logits = model.prefill_request(*cache, prompt, false);
+        auto logits = benchmark_prefill(model, cache, prompt);
         logits.eval();
         const auto prefilled = Clock::now();
         const auto after_prefill = model.ssd_expert_cache_stats();
@@ -298,7 +323,7 @@ static void benchmark(Model& model, int vocabulary, int prompt_tokens, int gener
         token.eval();
         const auto decoding = Clock::now();
         for (int step = 0; step < generated_tokens; ++step) {
-            logits = model.decode_requests({cache}, {token.template item<std::uint32_t>()});
+            logits = benchmark_decode(model, cache, token.template item<std::uint32_t>());
             token = argmax(reshape(logits, {1, vocabulary}), -1);
             token.eval();
         }
@@ -313,7 +338,9 @@ static void benchmark(Model& model, int vocabulary, int prompt_tokens, int gener
             {"decode_seconds", decode}, {"decode_tokens_per_second", generated_tokens / decode},
             {"sampling", "greedy"}, {"mtp", false}, {"prefix_reuse", false},
             {"prefill_logits", "last_position"},
-            {"boundary", "native serving request prefill/decode, argmax, token readback and one completion wait per step"}};
+            {"boundary", std::is_same_v<Model, MlxDeepseekV41CausalLm>
+                ? "native backbone prefill/decode, argmax, token readback and one completion wait per step"
+                : "native serving request prefill/decode, argmax, token readback and one completion wait per step"}};
         if (const auto after = model.ssd_expert_cache_stats(); after && before && after_prefill) {
             const auto requests = after->requests - after_prefill->requests;
             result["expert_cache"] = {
@@ -332,11 +359,11 @@ static void benchmark(Model& model, int vocabulary, int prompt_tokens, int gener
     }
     if (profile) {
         model.reset_cache();
-        auto cache = model.make_request_cache();
+        auto cache = benchmark_cache(model);
         detail::ComponentProfile components;
         {
             detail::ScopedComponentProfile scope(&components);
-            auto logits = model.prefill_request(*cache, prompt, false);
+            auto logits = benchmark_prefill(model, cache, prompt);
             logits.eval();
         }
         for (const auto& [name, timing] : components.timings())
@@ -345,7 +372,7 @@ static void benchmark(Model& model, int vocabulary, int prompt_tokens, int gener
         detail::ComponentProfile decode_components;
         {
             detail::ScopedComponentProfile scope(&decode_components);
-            auto logits = model.decode_requests({cache}, {1234});
+            auto logits = benchmark_decode(model, cache, 1234);
             logits.eval();
         }
         for (const auto& [name, timing] : decode_components.timings())
@@ -404,6 +431,15 @@ int main(int argc, char** argv) {
                 if (prompt_tokens < 22) throw std::invalid_argument("concurrent benchmark needs at least 22 prompt tokens");
                 benchmark_concurrent(model, model.config().vocab_size, prompt_tokens, generated_tokens, requested_batch);
             } else benchmark(model, model.config().vocab_size, prompt_tokens, generated_tokens, profile);
+        } else if (source.header().architecture == "deepseek_v41") {
+            if (concurrent || resident_check || resize_check)
+                throw std::invalid_argument("DeepSeek TQ benchmark requires the single-backbone mode");
+            auto model = MlxDeepseekV41CausalLm::load(source, prompt_tokens + generated_tokens + 16, expert_cache_bytes);
+            auto residency = MlxWeightResidency::finish_load(MlxMemoryResidency::configured_limit());
+            std::cout << nlohmann::json{{"loaded", true}, {"architecture", source.header().architecture},
+                {"layers", model.layer_count()}, {"expert_cache_bytes", model.expert_cache_limit_bytes()},
+                {"load_seconds", std::chrono::duration<double>(Clock::now() - started).count()}} << std::endl;
+            benchmark(model, model.config().vocab, prompt_tokens, generated_tokens, profile);
         } else {
             throw std::invalid_argument("unsupported model benchmark architecture");
         }

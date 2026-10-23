@@ -86,7 +86,7 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
             f"MFQ shard count mismatch in filename/metadata: {filename_count} != {count}: {path}"
         )
     expected = [format_shard_path(base, index, count) for index in range(1, count + 1)]
-    if all(candidate.is_file() for candidate in expected):
+    if Path(path).suffix in MFQ_SUFFIXES and all(candidate.is_file() for candidate in expected):
         return expected
     available: dict[int, Path] = {}
     for candidate in matching_shard_paths(base):
