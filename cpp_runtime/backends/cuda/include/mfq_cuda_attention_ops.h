@@ -9,7 +9,9 @@ void qsa_pool_rotary_cache_cuda(
     const mfq_tensor_backend::Tensor& index, const mfq_tensor_backend::Tensor& weight,
     const mfq_tensor_backend::Tensor& positions, const mfq_tensor_backend::Tensor& cache_positions,
     const mfq_tensor_backend::Tensor& frequencies, const mfq_tensor_backend::Tensor& axes,
-    const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps);
+    const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps,
+    bool group_range = false, const mfq_tensor_backend::Tensor& stored_positions = {},
+    const mfq_tensor_backend::Tensor& processed_rows = {});
 
 mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor positions,
