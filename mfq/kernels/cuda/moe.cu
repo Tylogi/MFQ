@@ -689,7 +689,78 @@ __global__ void count_experts_kernel(
     }
 }
 
-__global__ void scan_expert_counts_kernel(
+// Expert offsets are one compact prefix sum per tile width. A block scan keeps
+// the four sums (pairs plus up to three tile widths) in registers so one pass
+// over the experts fills every bounds array, and warp shuffles plus a per-warp
+// shared carry let any expert count finish in ceil(experts / blockDim) chunks
+// instead of one thread walking every expert.
+constexpr int kMoeExpertScanThreads = 256;
+constexpr int kMoeExpertScanWarps = kMoeExpertScanThreads / 32;
+
+struct MoeExpertScanSums {
+    int pairs;
+    int tiles;
+    int secondary_tiles;
+    int tertiary_tiles;
+};
+
+__device__ __forceinline__ MoeExpertScanSums moe_expert_scan_add(
+        const MoeExpertScanSums & left,
+        const MoeExpertScanSums & right) {
+    return {
+        left.pairs + right.pairs,
+        left.tiles + right.tiles,
+        left.secondary_tiles + right.secondary_tiles,
+        left.tertiary_tiles + right.tertiary_tiles,
+    };
+}
+
+// Inclusive scan inside one warp; lanes below the offset keep their own value.
+__device__ __forceinline__ MoeExpertScanSums moe_expert_warp_scan(
+        MoeExpertScanSums value) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const MoeExpertScanSums shifted{
+            __shfl_up_sync(0xffffffffu, value.pairs, offset),
+            __shfl_up_sync(0xffffffffu, value.tiles, offset),
+            __shfl_up_sync(0xffffffffu, value.secondary_tiles, offset),
+            __shfl_up_sync(0xffffffffu, value.tertiary_tiles, offset),
+        };
+        if (lane >= offset) {
+            value = moe_expert_scan_add(shifted, value);
+        }
+    }
+    return value;
+}
+
+// Inclusive block scan: warp scans, a scan of the per-warp totals in the first
+// warp, then the exclusive warp prefix added back to every lane.
+__device__ __forceinline__ MoeExpertScanSums moe_expert_block_scan(
+        MoeExpertScanSums value,
+        MoeExpertScanSums * warp_totals) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    value = moe_expert_warp_scan(value);
+    if (lane == 31) {
+        warp_totals[warp] = value;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        MoeExpertScanSums total = lane < kMoeExpertScanWarps
+            ? warp_totals[lane] : MoeExpertScanSums{};
+        total = moe_expert_warp_scan(total);
+        if (lane < kMoeExpertScanWarps) {
+            warp_totals[lane] = total;
+        }
+    }
+    __syncthreads();
+    const MoeExpertScanSums warp_prefix = warp == 0
+        ? MoeExpertScanSums{} : warp_totals[warp - 1];
+    return moe_expert_scan_add(warp_prefix, value);
+}
+
+__global__ void __launch_bounds__(kMoeExpertScanThreads) scan_expert_counts_kernel(
         const int32_t * __restrict__ counts,
         int32_t * __restrict__ cursors,
         int32_t * __restrict__ expert_bounds,
@@ -700,39 +771,49 @@ __global__ void scan_expert_counts_kernel(
         int tile_m,
         int secondary_tile_m,
         int tertiary_tile_m) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    int pair_offset = 0;
-    int tile_offset = 0;
-    int secondary_tile_offset = 0;
-    int tertiary_tile_offset = 0;
-    expert_bounds[0] = 0;
-    tile_bounds[0] = 0;
-    if (secondary_tile_bounds != nullptr) {
-        secondary_tile_bounds[0] = 0;
-    }
-    if (tertiary_tile_bounds != nullptr) {
-        tertiary_tile_bounds[0] = 0;
-    }
-    for (int expert = 0; expert < experts; ++expert) {
-        const int count = counts[expert];
-        const int tiles = (count + tile_m - 1) / tile_m;
-        cursors[expert] = 0;
-        pair_offset += count;
-        tile_offset += tiles;
-        expert_bounds[expert + 1] = pair_offset;
-        tile_bounds[expert + 1] = tile_offset;
+    __shared__ MoeExpertScanSums warp_totals[kMoeExpertScanWarps];
+    __shared__ MoeExpertScanSums chunk_total;
+    if (threadIdx.x == 0) {
+        expert_bounds[0] = 0;
+        tile_bounds[0] = 0;
         if (secondary_tile_bounds != nullptr) {
-            secondary_tile_offset +=
-                (count + secondary_tile_m - 1) / secondary_tile_m;
-            secondary_tile_bounds[expert + 1] = secondary_tile_offset;
+            secondary_tile_bounds[0] = 0;
         }
         if (tertiary_tile_bounds != nullptr) {
-            tertiary_tile_offset +=
-                (count + tertiary_tile_m - 1) / tertiary_tile_m;
-            tertiary_tile_bounds[expert + 1] = tertiary_tile_offset;
+            tertiary_tile_bounds[0] = 0;
         }
+    }
+    MoeExpertScanSums carry{};
+    for (int base = 0; base < experts; base += kMoeExpertScanThreads) {
+        const int expert = base + static_cast<int>(threadIdx.x);
+        const int count = expert < experts ? counts[expert] : 0;
+        const MoeExpertScanSums local{
+            count,
+            (count + tile_m - 1) / tile_m,
+            secondary_tile_bounds != nullptr
+                ? (count + secondary_tile_m - 1) / secondary_tile_m : 0,
+            tertiary_tile_bounds != nullptr
+                ? (count + tertiary_tile_m - 1) / tertiary_tile_m : 0,
+        };
+        const MoeExpertScanSums scanned = moe_expert_scan_add(
+            carry, moe_expert_block_scan(local, warp_totals));
+        if (expert < experts) {
+            cursors[expert] = 0;
+            expert_bounds[expert + 1] = scanned.pairs;
+            tile_bounds[expert + 1] = scanned.tiles;
+            if (secondary_tile_bounds != nullptr) {
+                secondary_tile_bounds[expert + 1] = scanned.secondary_tiles;
+            }
+            if (tertiary_tile_bounds != nullptr) {
+                tertiary_tile_bounds[expert + 1] = scanned.tertiary_tiles;
+            }
+        }
+        // The last lane always sees the chunk total, including a short tail.
+        if (static_cast<int>(threadIdx.x) == kMoeExpertScanThreads - 1) {
+            chunk_total = scanned;
+        }
+        __syncthreads();
+        carry = chunk_total;
     }
 }
 
@@ -1614,7 +1695,7 @@ void build_expert_map(
     const int grid = std::min((pairs + block - 1) / block, 65535);
     count_experts_kernel<<<grid, block, 0, stream>>>(
         ids.data_ptr<int32_t>(), counts.data_ptr<int32_t>(), pairs, experts);
-    scan_expert_counts_kernel<<<1, 1, 0, stream>>>(
+    scan_expert_counts_kernel<<<1, kMoeExpertScanThreads, 0, stream>>>(
         counts.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),
         secondary_bounds_ptr, tertiary_bounds_ptr, experts, tile_m,
