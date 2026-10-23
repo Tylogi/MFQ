@@ -9,6 +9,7 @@
 #include "models/qwen35/linear_attention.h"
 #include "batch_graph_membership_check.h"
 #include "batch_decode_benchmark.h"
+#include "batch_mtp_check.h"
 
 #include <cuda_profiler_api.h>
 
@@ -127,12 +128,14 @@ int run_qwen35_mtp_bench(
 }
 
 template<class Model>
-int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& runtime_config, int requests = 2) {
+int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& runtime_config,
+        int requests = 2, MtpModule* predictor = nullptr) {
     using namespace mfq::engine;
     auto config = runtime_config;
     config.generation.prefill_chunk_size = 64;
     MFQ_RUNTIME_CHECK(requests >= 2 && requests <= 32,"batching check supports 2..32 requests");
     config.continuous_batch.max_sequences = std::max(4,requests);
+    if (predictor) check_batch_mtp(model, *predictor, config, requests);
     MfqSamplingParams sampling;
     sampling.max_tokens = 20; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
     std::vector<int64_t> first_prompt(193), second_prompt(17);
@@ -333,12 +336,12 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
 }
 
 int run_cuda_continuous_batching_check(
-        mfq::cuda::Qwen35CausalLm& model,int requests) {
+        mfq::cuda::Qwen35CausalLm& model,int requests,MtpModule* predictor) {
     return run_qwen_continuous_batching_check(
-        model, resolve_cuda_runtime_config({}),requests);
+        model, resolve_cuda_runtime_config({}),requests,predictor);
 }
-int run_cuda_continuous_batching_check(mfq::cuda::Qwen4CausalLm& model,int requests) {
-    return run_qwen_continuous_batching_check(model,resolve_cuda_runtime_config({}),requests);
+int run_cuda_continuous_batching_check(mfq::cuda::Qwen4CausalLm& model,int requests,MtpModule* predictor) {
+    return run_qwen_continuous_batching_check(model,resolve_cuda_runtime_config({}),requests,predictor);
 }
 
 int run_cuda_engine_isolation_check(CudaEngineOptions options) {

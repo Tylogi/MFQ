@@ -32,14 +32,50 @@ the newest eligible request receives a context-capacity error and existing
 requests retain their state. Unexpected CUDA failures still fail the backend.
 This does not resize the resident expert cache or automatically enable KV offload.
 
-Explicit continuous batching currently runs ordinary token decoding. Batched
-requests do not use MTP or persistent prefix reuse. Explicit session IDs and
-multimodal requests remain exclusive. The default single-request path retains
-MTP and prefix caching. Configured QSA KV offload uses the eager batch path.
+With `MFQ_CONTINUOUS_BATCH_MTP=1`, CUDA continuous batching runs greedy MTP
+requests inside the batch with the Qwen and Flash-Next predictors, including
+token penalties and grammar constraints. Each request owns independent
+predictor history and a depth controller. Draft work groups
+equal history widths, then batches the rows still drafting at each chain
+position. Target verification runs once with width `1 + max(K_i)`; shorter
+chains use padding. Each row commits only the prefix emitted after EOS, stop
+and output-limit handling. Rejected suffixes restore GDN/PLE checkpoints and
+truncate QSA history. Paused rows keep their pending transaction; cancellation
+releases it without committing a draft suffix. Greedy sampling consumes no RNG
+draws. Parked rows accumulate teacher-forced history and flush it at 16 pairs
+or before re-entering speculation.
+
+Without that setting, MTP requests stay on the exclusive single-request path,
+as before. The batched path is opt-in because this first stage uses eager
+draft and verify execution, while the exclusive path replays CUDA Graphs.
+It reports
+`continuous_batching_mtp_supported=1`,
+`continuous_batching_mtp_stochastic_supported=0`, and
+`continuous_batching_mtp_graph_supported=0` when a supported predictor is loaded.
+Ordinary decode retains the row-bucket graphs described above. MTP graph replay
+and row-bucket × verify-width graph keys remain unimplemented. Stochastic MTP
+requests remain exclusive and use the existing single-request implementation;
+they are not silently converted to ordinary decoding. Batched requests do not
+use persistent prefix reuse. Explicit session IDs and multimodal requests
+remain exclusive. The default single-request path retains MTP and prefix
+caching. Configured QSA KV offload uses the eager batch path.
 Cached Qwen MoE retains its eager fallback. This graph cache is specific to
-native CUDA; Metal and HIP retain their existing batching and sampling paths.
+native CUDA. HIP reports `continuous_batching_mtp_supported=0` and keeps MTP
+requests exclusive. Metal reports its existing `supports_batch_mtp()` result
+(a single predictor layer without MTP LoRA); unsupported MTP requests remain
+exclusive. Neither backend uses the CUDA uniform-width implementation.
 Entering an exclusive request retires the batch graph cache before its decode
 workspace is borrowed.
+
+For a synthetic fixture containing predictor weights, set `MFQ_BATCH_MTP_CHECK=1`
+with `--check-continuous-batching` to compare batched MTP against ordinary
+single-request greedy decoding. `MFQ_BATCH_MTP_BENCH=1` also measures 1, 4, 8,
+16 and 32 requests with MTP off/on. The benchmark uses eager execution for both,
+17-token prompts, 48 generated tokens and seed `919 + row`; loading and serial
+oracles are outside the timer. `stream_tok_s` averages the per-request rates
+after its first token; `total_tok_s` includes prefill and draining the batch.
+It reports accepted/drafted counts with each sample. The random small fixture's
+acceptance rate is not representative of trained predictor weights.
 
 Run the state check with the native diagnostics executable:
 

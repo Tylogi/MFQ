@@ -5,6 +5,7 @@
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
 #include "runtime/batch_sampling.h"
+#include "runtime/batch_mtp.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen4_exp/ops.h"
 #include <type_traits>
@@ -22,6 +23,7 @@ struct QwenBatchRequest : mfq::engine::BatchRequest {
     mfq_tensor_backend::Tensor prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     qwen35::QwenBatchRequestState cache;
+    std::unique_ptr<BatchMtpRow> mtp;
     int64_t decode_row = -1;
 };
 
@@ -40,7 +42,7 @@ class QwenBatchOperations {
         Tensor logits, greedy_tokens, sampled_next, sampled_tokens;
     };
 
-    QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig);
+    QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig, MtpModule* = nullptr);
     ~QwenBatchOperations();
     QwenBatchOperations(const QwenBatchOperations &) = delete;
     QwenBatchOperations &operator=(const QwenBatchOperations &) = delete;
@@ -56,11 +58,15 @@ class QwenBatchOperations {
     void discard_prefill(const std::shared_ptr<Request> &);
     void retire(const std::vector<std::shared_ptr<Request>> &, int64_t cache_position);
     Decoded decode(State &);
+    std::optional<mfq::engine::Generation> generate_decode(const std::shared_ptr<Request>&,
+        mfq::engine::InferenceOutput&, std::function<void()>, std::function<bool()>, std::function<void()>);
+    int64_t cache_length(const std::shared_ptr<Request>& request) const;
     Sample sample(const std::shared_ptr<Request> &, const Decoded &);
     void accept(const std::shared_ptr<Request> &, const Sample &);
     void recover(State &);
 
   private:
+    Decoded decode_mtp(State&);
     void initialize_sampling(Request &, const Tensor &prompt_ids);
     void invalidate_decode_graph();
 
@@ -77,6 +83,8 @@ class QwenBatchOperations {
     int64_t packed_metadata_batches_{0};
     BatchSampling sampling_;
     std::unique_ptr<BatchDecodeGraphCache> decode_graphs_;
+    MtpModule* predictor_ = nullptr;
+    int64_t mtp_batches_ = 0, mtp_drafted_ = 0, mtp_accepted_ = 0;
 };
 
 struct FlashNextBatchRequest : mfq::engine::BatchRequest {
@@ -85,6 +93,7 @@ struct FlashNextBatchRequest : mfq::engine::BatchRequest {
     mfq_tensor_backend::Tensor counts, prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     std::unique_ptr<Qwen4BatchRequestState> cache;
+    std::unique_ptr<BatchMtpRow> mtp;
     int64_t decode_row = -1;
     double packed_prefill_ms = 0;
 };
@@ -95,7 +104,7 @@ class FlashNextBatchOperations {
     using State = mfq::engine::BatchState<Request>;
     using Sample = QwenBatchOperations::Sample;
     struct Decoded { Tensor logits, greedy_tokens, sampled_next, sampled_tokens; };
-    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig);
+    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig, MtpModule* = nullptr);
     ~FlashNextBatchOperations();
     int64_t vocab_size() const;
     int64_t max_context() const;
@@ -113,12 +122,16 @@ class FlashNextBatchOperations {
     void discard_prefill(const std::shared_ptr<Request>&);
     void retire(const std::vector<std::shared_ptr<Request>>&, int64_t);
     Decoded decode(State&);
+    std::optional<mfq::engine::Generation> generate_decode(const std::shared_ptr<Request>&,
+        mfq::engine::InferenceOutput&, std::function<void()>, std::function<bool()>, std::function<void()>);
+    int64_t cache_length(const std::shared_ptr<Request>& request) const;
     Sample sample(const std::shared_ptr<Request>&, const Decoded&);
     void accept(const std::shared_ptr<Request>&, const Sample&);
     void recover(State&);
     static constexpr bool isolate_prefill_failures = true;
     static constexpr bool isolate_context_growth_failures = true;
   private:
+    Decoded decode_mtp(State&);
     void initialize_prefill(const std::shared_ptr<Request>&,mfq::engine::PrefillChunk);
     Sample finish_prefill(const std::shared_ptr<Request>&,Tensor next);
     Qwen4CausalLm& model_;
@@ -129,6 +142,8 @@ class FlashNextBatchOperations {
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
     int64_t packed_prefill_batches_ = 0, packed_prefill_requests_ = 0, packed_prefill_tokens_ = 0;
+    MtpModule* predictor_ = nullptr;
+    int64_t mtp_batches_ = 0, mtp_drafted_ = 0, mtp_accepted_ = 0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<
     std::is_same_v<Model,Qwen4CausalLm>, FlashNextBatchOperations, QwenBatchOperations>;

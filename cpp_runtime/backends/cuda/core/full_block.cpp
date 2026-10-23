@@ -584,7 +584,29 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         cuda.dtype(mfq_tensor_backend::kFloat32));
                                 }
                             };
-                            if (cache.is_paged()) {
+                            if (T > 1 && !sliding && !attention_mask.has_value()) {
+                                // Independent chains have different physical query positions.
+                                // Read each causal prefix directly from the existing KV pages;
+                                // projections and FFN still run once over the complete window.
+                                std::vector<mfq_tensor_backend::Tensor> attended;
+                                for (int64_t token = 0; token < T; ++token) {
+                                    auto lengths = write_positions.dim() == 1
+                                        ? (write_positions.narrow(0, token, 1) + 1).expand({B}).contiguous()
+                                        : (write_positions.select(1, token) + 1).contiguous();
+                                    auto valid = seq_len.value().to(lengths.device(), mfq_tensor_backend::kInt64);
+                                    lengths = mfq_tensor_backend::where(lengths < valid, lengths, valid).contiguous();
+                                    auto query = qh.narrow(2, token, 1).contiguous();
+                                    attended.push_back(cache.is_paged()
+                                        ? attention_paged_cache_decode_cuda(query, cache.k_chunk_ptrs,
+                                            cache.v_chunk_ptrs, cache.page_table, lengths, attn_scale,
+                                            cache.page_size, cache.pages_per_chunk, cache.paged_heads,
+                                            decode_partial_o.narrow(0, 0, B * nh),
+                                            decode_partial_m.narrow(0, 0, B * nh),
+                                            decode_partial_l.narrow(0, 0, B * nh), 1, false)
+                                        : attention_cache_decode_cuda(query, cache.k, cache.v, lengths, attn_scale));
+                                }
+                                a = mfq_tensor_backend::cat(attended, 2);
+                            } else if (cache.is_paged()) {
                                 const bool split_enabled =
                                     execution.config.attention_decode_split_k;
                                 int64_t parts =

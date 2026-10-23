@@ -10,6 +10,10 @@
 // Qwen3.5's predictor shares the main embedding/output head and owns only
 // its fusion/norm/attention/FFN weights and an independent attention history.
 struct Qwen35Mtp final : MtpModule {
+    bool supports_batch() const noexcept override { return true; }
+    std::unique_ptr<MtpBatchState> make_batch_state() const override;
+    MtpStep batch_step(const MtpTarget&, const std::vector<MtpBatchState*>&,
+        mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor) override;
     mfq::cuda::qwen35::Config config;
     QuantLinear fusion;
     mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;

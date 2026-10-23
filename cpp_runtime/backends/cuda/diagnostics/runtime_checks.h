@@ -47,8 +47,9 @@ int run_qwen35_mtp_bench(
     int generated_tokens,
     int repetitions);
 int run_cuda_continuous_batching_check(
-    mfq::cuda::Qwen35CausalLm& model,int requests = 2);
-int run_cuda_continuous_batching_check(mfq::cuda::Qwen4CausalLm& model,int requests = 2);
+    mfq::cuda::Qwen35CausalLm& model,int requests = 2,MtpModule* predictor = nullptr);
+int run_cuda_continuous_batching_check(mfq::cuda::Qwen4CausalLm& model,int requests = 2,
+    MtpModule* predictor = nullptr);
 int run_cuda_engine_isolation_check(CudaEngineOptions options);
 
 template <typename Model>

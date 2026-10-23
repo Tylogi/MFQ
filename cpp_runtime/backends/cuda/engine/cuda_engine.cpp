@@ -256,7 +256,7 @@ struct CudaEngineState {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
-                    language, *execution, config.continuous_batch);
+                    language, *execution, config.continuous_batch, components.mtp.get());
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
@@ -352,10 +352,12 @@ struct CudaEngineState {
         restore_graph_expert_space();
     }
     bool can_batch(const EngineRequest& request) const {
+        const bool exclusive_mtp = request.input.sampling.enable_mtp && components.mtp &&
+            !batch_mtp_supported(components.mtp.get(), request.input.sampling);
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
             return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
-                !(request.input.sampling.enable_mtp && components.mtp);
-        return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
+                !exclusive_mtp;
+        return batching && batch_compatible(request, cache.persistent_prefix_enabled(), exclusive_mtp);
     }
     ~CudaEngineState() {
         language.restore_decode_workspace={};
@@ -457,8 +459,10 @@ struct CudaEngineState {
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
                 // Exclusive MTP generation has ended before a batch starts.
                 // Its graph consumers must retire before idle batch buffers.
-                qwen4_release_decode_graphs(language,components.mtp.get());
-                if (components.mtp) components.mtp->reset(1);
+                if (batching->empty()) {
+                    qwen4_release_decode_graphs(language,components.mtp.get());
+                    if (components.mtp) components.mtp->reset(1);
+                }
             }
         } else if (batching) {
             batching->release_idle_buffers();

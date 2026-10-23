@@ -12,6 +12,9 @@ struct Qwen4MtpGraph;
 
 struct Qwen4ExpMtp final : MtpModule {
     using Tensor = mfq_tensor_backend::Tensor;
+    bool supports_batch() const noexcept override { return true; }
+    std::unique_ptr<MtpBatchState> make_batch_state() const override;
+    MtpStep batch_step(const MtpTarget&, const std::vector<MtpBatchState*>&, Tensor, Tensor) override;
 
     mfq::models::qwen4_exp::Config config;
     Tensor embedding_norm, hidden_norm;

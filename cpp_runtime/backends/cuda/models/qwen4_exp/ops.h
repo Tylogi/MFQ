@@ -23,11 +23,13 @@ class Qwen4BatchRequestState {
     ~Qwen4BatchRequestState();
     Qwen4BatchRequestState(const Qwen4BatchRequestState&) = delete;
     Qwen4BatchRequestState& operator=(const Qwen4BatchRequestState&) = delete;
-    mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor);
+    mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor,
+        mfq_tensor_backend::Tensor* raw = nullptr);
     int64_t position() const;
     std::vector<mfq_tensor_backend::Tensor> recurrent_state_tensors() const;
     std::size_t resident_bytes() const;
     std::size_t prefill_growth_bytes(int64_t tokens) const;
+    void resolve_verified(int64_t retained_tokens);
   private:
     struct Impl;
     std::unique_ptr<Impl> state_;
@@ -37,14 +39,16 @@ class Qwen4BatchRequestState {
         const std::vector<mfq_tensor_backend::Tensor>&);
     friend mfq_tensor_backend::Tensor qwen4_batch_decode(
         Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
-        mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&);
+        mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&,
+        mfq_tensor_backend::Tensor*, const std::vector<int>&, bool);
 };
 std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
     Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
     const std::vector<mfq_tensor_backend::Tensor>&);
 mfq_tensor_backend::Tensor qwen4_batch_decode(
     Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
-    mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids);
+    mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids,
+    mfq_tensor_backend::Tensor* raw = nullptr, const std::vector<int>& widths = {}, bool speculative = false);
 class Qwen4BatchDecodeGraph {
   public:
     explicit Qwen4BatchDecodeGraph(Qwen4CausalLm&);

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from mfq.formats import io
-from mfq.formats.assets import MODEL_CONFIG_ASSET
+from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
 from tests.test_cuda_kv_quantization_native import write_qwen35_fixture
 from tests.test_native_nint_ple import _fresh_idle_status, _models, _worker_tokenizer
 
@@ -41,6 +41,202 @@ def _recurrent_model(path):
     weights[root + "a"] = -np.ones(2, np.float32)
     weights[root + "dt_bias"] = np.zeros(2, np.float32)
     io.save(path, header, weights)
+
+
+def _mtp_recurrent_model(path):
+    _recurrent_model(path)
+    header, weights = io.load(path)
+    config = json.loads(weights[MODEL_CONFIG_ASSET])
+    config.update(mtp_num_hidden_layers=1, mtp_use_dedicated_embeddings=False)
+    weights[MODEL_CONFIG_ASSET] = json.dumps(config).encode()
+    rng = np.random.default_rng(9167)
+    weights["predictor.fusion.weight"] = rng.normal(0, .03, (32, 64)).astype(np.float32)
+    for name in ("hidden_norm", "embedding_norm", "output_norm"):
+        weights[f"predictor.{name}.weight"] = np.zeros(32, np.float32)
+    for name, value in list(weights.items()):
+        if name.startswith("model.block.1."):
+            weights[name.replace("model.block.1.", "predictor.block.0.")] = value.copy()
+    graph = json.loads(weights[MODEL_GRAPH_ASSET])
+    graph["canonical_naming"]["component_roots"].append("predictor")
+    graph["topology"]["predictor_layers"] = 1
+    graph["capabilities"].append("mtp")
+    graph["components"].append(dict(kind="predictor", tensor_root="predictor",
+                                  implementation="next_token_prediction", policy="optional"))
+    weights[MODEL_GRAPH_ASSET] = json.dumps(graph).encode()
+    io.save(path, header, weights)
+
+
+@pytest.mark.parametrize("family,paged,requests", [
+    ("qwen35", False, 4), ("qwen35", True, 4), ("qwen35", True, 32),
+    ("qwen35_homogeneous", True, 32),
+    ("flash_next", False, 4), ("flash_next", False, 32),
+    ("flash_next_cached", False, 4), ("flash_next_cached", False, 32),
+])
+def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, paged, requests):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    model = tmp_path / "mtp.mfq"
+    from tests.test_native_nint_ple import _worker_tokenizer
+
+    tokenizer = _worker_tokenizer(tmp_path)
+    environment = dict(os.environ, MFQ_CONTINUOUS_PAGED_KV=str(int(paged)),
+                       MFQ_BATCH_MTP_TEST_TOKENIZER=str(tokenizer), MFQ_BATCH_MTP_CHECK="1",
+                       MFQ_CONTINUOUS_BATCH_MTP="1")
+    if family.startswith("qwen35"):
+        _mtp_recurrent_model(model)
+        if family == "qwen35_homogeneous":
+            environment["MFQ_BATCH_MTP_HOMOGENEOUS"] = "1"
+    else:
+        from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
+
+        config, weights = mtp_fixture("qwen", 1, hidden=32)
+        config["text_config"]["max_position_embeddings"] = 512
+        if family == "flash_next_cached":
+            from mfq.formats.mfe import MfePool, MfeTensor
+            from mfq.formats.nint import NintSpec
+            from mfq.quantize.nint_quant import quantize
+
+            for name, value in list(weights.items()):
+                if name.endswith(".experts.gate_up.weight"):
+                    for role, matrix in zip(("gate", "up"), np.split(value, 2, axis=1)):
+                        weights[name.replace("gate_up", role)] = matrix.copy()
+                    del weights[name]
+            for name, value in list(weights.items()):
+                if ".experts." in name:
+                    experts, output, width = value.shape
+                    packed = quantize(value.reshape(experts * output, width), NintSpec(4, 8, 6))
+                    pool = MfePool(np.arange(experts, dtype=np.int32), packed)
+                    weights[name] = MfeTensor(value.shape, (pool,))
+                elif ".ngram.shard." in name:
+                    weights[name] = quantize(value, NintSpec(4, 8, 6))
+            environment.update(MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                               MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="1048576")
+        write_qwen_fixture(model, config, weights, True)
+    result = subprocess.run(
+        [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+         "--continuous-batching-check-requests", str(requests), "--moe-gpu-cache-gb",
+         ".01" if family == "flash_next_cached" else "0"],
+        env=environment,
+        text=True, capture_output=True, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_mtp_check "))
+    metrics = dict(field.split("=", 1) for field in line.split()[1:])
+    assert metrics["greedy"] == "PASS"
+    assert metrics["mtp"] == "1"
+    lifecycle = "0" if family == "qwen35_homogeneous" else "1"
+    assert metrics["paused"] == metrics["cancelled"] == lifecycle
+    if family == "qwen35_homogeneous":
+        assert int(metrics["tokens"]) == 32 * 48
+    assert metrics["grammar"] == "1"
+    assert int(metrics["drafted"]) > 0
+
+
+@pytest.mark.parametrize("opt_in", [True, False])
+@pytest.mark.parametrize("family", ["qwen35", "flash_next"])
+def test_mtp_capability_and_seeded_stochastic_exclusion(tmp_path, family, opt_in):
+    executable = os.environ.get("MFQ_CUDA_RESOURCE_TEST_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_CUDA_RESOURCE_TEST_RUNTIME must point to CUDA mfq-runtime")
+    from mfq.server.runtime.client import StdioRuntimeClient
+    from tests.test_native_nint_ple import _worker_tokenizer
+    from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
+
+    model = tmp_path / "mtp.mfq"
+    if family == "qwen35":
+        _mtp_recurrent_model(model)
+    else:
+        config, weights = mtp_fixture("qwen", 1, hidden=32)
+        config["text_config"]["max_position_embeddings"] = 512
+        write_qwen_fixture(model, config, weights, True)
+    tokenizer = _worker_tokenizer(tmp_path)
+
+    async def run():
+        with (tmp_path / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(
+                executable, "--model", str(model), "--tokenizer", str(tokenizer),
+                "--transport", "stdio", "--ctx-size", "512", "--continuous-batching", "2",
+                "--moe-gpu-cache-gb", "0", stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=log,
+                env=dict(os.environ, MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
+                         MFQ_CONTINUOUS_BATCH_MTP=str(int(opt_in))))
+            client = StdioRuntimeClient(process, control_timeout_seconds=30)
+            try:
+                status = await client.status()
+                assert status["continuous_batching_mtp_supported"] == int(opt_in)
+                assert status["continuous_batching_mtp_stochastic_supported"] == 0
+                assert status["continuous_batching_mtp_graph_supported"] == 0
+
+                async def generate(stochastic, mtp=True):
+                    params = dict(messages=[dict(role="user", content="ab" * 10)],
+                                  mfq_preformatted_prompt="ab" * 10, temperature=.7 if stochastic else 0,
+                                  top_k=4 if stochastic else 1, top_p=.9, seed=731, max_tokens=12,
+                                  enable_mtp=mtp, stream=True)
+                    async with client.generate(params) as events:
+                        chunks = [event async for event in events if event]
+                    return "".join(choice.get("delta", {}).get("content", "")
+                                   for event in chunks for choice in event.get("choices", []))
+
+                assert await generate(True) == await generate(True)
+                await asyncio.sleep(.3)
+                assert (await client.status()).get("continuous_batching_admissions", 0) == 0
+                expected = await generate(False, False)
+                assert await asyncio.gather(generate(False), generate(False)) == [expected, expected]
+                if not opt_in:
+                    # Without the opt-in, greedy MTP requests stay exclusive.
+                    assert (await client.status()).get("continuous_batching_mtp_batches", 0) == 0
+                    return
+                for _ in range(30):
+                    status = await client.status()
+                    if status.get("continuous_batching_mtp_batches", 0) > 0:
+                        break
+                    await asyncio.sleep(.02)
+                assert status["continuous_batching_mtp_batches"] > 0
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), 5)
+
+    try:
+        asyncio.run(run())
+    except Exception as error:
+        raise AssertionError((tmp_path / "worker.log").read_text(errors="replace")) from error
+
+
+@pytest.mark.parametrize("family", ["qwen35", "flash_next"])
+def test_batched_mtp_all_accepted_windows_commit(tmp_path, family):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    model = tmp_path / "accept.mfq"
+    if family == "qwen35":
+        _mtp_recurrent_model(model)
+        header, weights = io.load(model)
+        weights["model.output.weight"][:] = 0
+        io.save(model, header, weights)
+    else:
+        from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
+
+        config, weights = mtp_fixture("qwen", 1, hidden=32)
+        config["text_config"]["max_position_embeddings"] = 512
+        weights["model.output.weight"][:] = 0
+        write_qwen_fixture(model, config, weights, True)
+    result = subprocess.run(
+        [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+         "--continuous-batching-check-requests", "4", "--moe-gpu-cache-gb", "0"],
+        env=dict(os.environ, MFQ_BATCH_MTP_CHECK="1", MFQ_CONTINUOUS_BATCH_MTP="1"),
+        text=True, capture_output=True, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_mtp_check "))
+    metrics = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(metrics["drafted"]) > 0
+    assert metrics["accepted"] == metrics["drafted"]
 
 
 @pytest.mark.parametrize("paged", [False, True])
