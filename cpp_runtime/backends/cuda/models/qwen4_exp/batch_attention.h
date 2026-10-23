@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/batch_decode_graph.h"
+#include "batch_selected_attention.h"
 
 namespace mfq::cuda::qwen4_exp {
 
@@ -13,6 +14,22 @@ inline void Qsa::bind_decode_state(BatchDecodeInputs& inputs, int64_t field, int
 
 inline int64_t Qsa::decode_graph_capacity() const {
     return graph_keys_.defined() ? graph_keys_.size(2) : 0;
+}
+
+inline Tensor Qsa::forward_independent_graph(CudaExecutionContext& execution, const Tensor& hidden,
+        const Tensor& positions, const BatchDecodeInputs& inputs, int64_t field, int64_t capacity,
+        std::vector<Tensor> projections) {
+    auto p = project(execution, hidden, positions, capacity > c_.budget, {}, {}, {}, std::move(projections));
+    const auto transform = [&](const Tensor& pooled, const Tensor& block_positions) {
+        if (rotary_->fused())
+            return rotary_->forward_normalized(pooled.unsqueeze(2), w_.index_key_norm,
+                                               block_positions, c_.eps).squeeze(2);
+        auto normalized = rms_norm(pooled, w_.index_key_norm + 1, c_.eps);
+        return rotary_->forward(normalized.unsqueeze(1), block_positions).squeeze(1);
+    };
+    auto output = batch_selected_attention(inputs, field, p.query, encode_key(p.key), encode_value(p.value),
+        p.gate, p.raw, p.iq, positions, {c_.pool, c_.budget, capacity, quantization_}, transform);
+    return output.to(hidden.scalar_type()).reshape({inputs.rows(), 1, c_.heads * c_.width});
 }
 
 inline Tensor Qsa::forward_indirect_graph(CudaExecutionContext& execution, const Tensor& hidden,

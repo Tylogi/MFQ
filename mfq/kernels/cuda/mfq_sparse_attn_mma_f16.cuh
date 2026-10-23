@@ -32,6 +32,7 @@ struct RuntimeInput {
     bool wide_positions = false;
     bool direct_query = false;
     mfq::cuda::HotKvView hot{};
+    mfq::cuda::IndirectKvView indirect{};
 };
 
 inline uint3 sparse_fastdiv_values(uint32_t divisor) {
@@ -99,14 +100,21 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     const float2 * q_f2 = input.direct_query ? nullptr : reinterpret_cast<const float2 *>(q) +
         (static_cast<int64_t>(sequence) * heads * M +
          static_cast<int64_t>(zt_q) * M) * (DKQ / 2);
-    const int64_t physical_seq=use_hot && input.hot.cold_mapping?input.hot.cold_cells:max_seq;
+    const bool row_cache = input.indirect.states && input.indirect.active(sequence);
+    const int64_t physical_seq = row_cache ? input.indirect.capacity(sequence) :
+        (use_hot && input.hot.cold_mapping ? input.hot.cold_cells : max_seq);
+    if (row_cache) {
+        k = static_cast<const half*>(input.indirect.address(sequence));
+        v = static_cast<const half*>(input.indirect.address(sequence, 1));
+    }
+    const int cache_batch = input.indirect.states ? 0 : sequence;
     const half2 * k_h2 = reinterpret_cast<const half2 *>(k) +
-        (static_cast<int64_t>(sequence) * kv_heads * physical_seq +
+        (static_cast<int64_t>(cache_batch) * kv_heads * physical_seq +
          static_cast<int64_t>(z_kv) * physical_seq) * (DKQ / 2);
     const half2 * v_h2 = V_is_K_view
         ? k_h2
         : reinterpret_cast<const half2 *>(v) +
-            (static_cast<int64_t>(sequence) * kv_heads * physical_seq +
+            (static_cast<int64_t>(cache_batch) * kv_heads * physical_seq +
              static_cast<int64_t>(z_kv) * physical_seq) * (DV / 2);
     float2 * dst = reinterpret_cast<float2 *>(out) +
         (static_cast<int64_t>(sequence) * M * heads + zt_q) * (DV / 2);
@@ -250,7 +258,8 @@ Tensor launch(
     const Tensor& gate = Tensor{},
     bool half_output = false,
     const Tensor& positions = Tensor{},
-    int64_t causal_columns = 0, mfq::cuda::HotKvView hot = {}) {
+    int64_t causal_columns = 0, mfq::cuda::HotKvView hot = {},
+    mfq::cuda::IndirectKvView indirect = {}) {
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
     constexpr int ncols = ncols1 * ncols2;
@@ -273,8 +282,8 @@ Tensor launch(
         heads % kv_heads == 0 && max_seq > 0 && selected > 0,
         name, ": invalid attention geometry");
     MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(3) == DKQ &&
-        k.dim() == 4 && k.size(0) == B && k.size(3) == DKQ &&
-        v.dim() == 4 && v.size(0) == B && v.size(1) == kv_heads &&
+        k.dim() == 4 && (k.size(0) == B || indirect.states) && k.size(3) == DKQ &&
+        v.dim() == 4 && (v.size(0) == B || indirect.states) && v.size(1) == kv_heads &&
         v.size(2) == max_seq &&
         v.size(3) == (V_is_K_view ? DKQ : DV) &&
         (causal || (indices.dim() == 3 && indices.size(0) == B && indices.size(1) == M)),
@@ -412,7 +421,7 @@ Tensor launch(
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
         causal && positions.scalar_type() == mfq_tensor_backend::kInt64,
-        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16, hot};
+        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16, hot, indirect};
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),

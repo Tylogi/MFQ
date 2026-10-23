@@ -2,6 +2,7 @@
 
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_kv_hot_cache.h"
+#include "mfq_cuda_indirect_kv.h"
 
 #include <initializer_list>
 
@@ -14,7 +15,9 @@ Tensor dots(const Tensor& query, const Tensor& keys);
 Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
     int64_t offset, double scale, mfq::cuda::HotKvView hot = {});
 Tensor sparse(const Tensor& query, const Tensor& key, const Tensor& value,
-    const Tensor& indices, double scale, bool key_is_cache, mfq::cuda::HotKvView hot = {});
+    const Tensor& indices, double scale, bool key_is_cache, mfq::cuda::HotKvView hot = {},
+    mfq::cuda::IndirectKvView indirect = {});
+Tensor live_topk_blocks(const Tensor& scores, const Tensor& positions, int64_t pool, int64_t count);
 Tensor sparse_gated(const Tensor& query, const Tensor& key, const Tensor& value,
     const Tensor& indices, const Tensor& gate, double scale, bool half_output, mfq::cuda::HotKvView hot = {});
 Tensor block_indices_to_tokens(const Tensor& blocks, const Tensor& positions,

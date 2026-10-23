@@ -1073,6 +1073,8 @@ class Qsa {
     }
     void bind_decode_state(BatchDecodeInputs&, int64_t field, int64_t row) const;
     int64_t decode_graph_capacity() const;
+    Tensor forward_independent_graph(CudaExecutionContext&, const Tensor& hidden, const Tensor& positions,
+        const BatchDecodeInputs&, int64_t field, int64_t capacity, std::vector<Tensor> projections);
     Tensor forward_indirect_graph(CudaExecutionContext&, const Tensor& hidden, const Tensor& positions,
         const Tensor& cache_positions, const BatchDecodeInputs&, int64_t field, int64_t row,
         int64_t capacity, std::vector<Tensor> projections = {}, bool output_projection = true);

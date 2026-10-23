@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
-#include <cub/block/block_radix_sort.cuh>
 
 namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
@@ -431,85 +430,8 @@ Tensor live_block_scores(const Tensor& query,const Tensor& pooled,const Tensor& 
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }
 
-namespace {
-template<int Items>
-__device__ void live_topk_sort(const float* source,const int64_t* ids,float* output,int64_t* out_ids,
-        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary) {
-    using Sort=cub::BlockRadixSort<float,256,Items,int64_t>;
-    float keys[Items];int64_t indices[Items];
-#pragma unroll
-    for(int i=0;i<Items;++i) {
-        const int column=begin+threadIdx.x*Items+i;
-        const auto at=int64_t(row)*columns+column;
-        keys[i]=column<live?source[at]:-1e30f;
-        indices[i]=column<live?(ids?ids[at]:column):pools;
-    }
-    Sort(*reinterpret_cast<typename Sort::TempStorage*>(temporary)).SortDescending(keys,indices);
-#pragma unroll
-    for(int i=0;i<Items;++i) {
-        const int rank=threadIdx.x*Items+i;
-        if(rank<count){output[out+rank]=keys[i];out_ids[out+rank]=indices[i];}
-    }
-}
-__global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
-        float* output,int64_t* out_ids,const int64_t* positions,int columns,
-        int pools,int pool,int count,int stage,bool compact) {
-    constexpr int tile=4096;
-    extern __shared__ __align__(16) unsigned char temporary[];
-    const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=(columns+tile-1)/tile;
-    int live=int(min(int64_t(pools),max(int64_t(0),(positions[row]+1)/pool)));
-    for(int s=0;s<stage;++s)live=live/tile*count+min(count,live%tile);
-    const int available=min(tile,max(0,live-begin));
-    const int64_t out=(int64_t(row)*tiles+blockIdx.x)*count;
-    // Entirely unused tiles and already reduced candidate lists need no sort.
-    if(available<=count) {
-        for(int i=threadIdx.x;i<count;i+=256) {
-            const auto at=int64_t(row)*columns+begin+i;
-            output[out+i]=i<available?source[at]:-1e30f;
-            out_ids[out+i]=i<available?(ids?ids[at]:begin+i):pools;
-        }
-        return;
-    }
-    // The graph reserves the maximum context, while each replay has a much
-    // shorter live prefix. Keep the reduction tiles and output layout fixed,
-    // but sort only the power-of-two range containing this tile's live rows.
-    // CUB's stable ordering is unchanged because input column order is kept.
-    if(compact && available<=1024)
-        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
-    else if(compact && available<=2048)
-        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
-    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
-}
-}
-
-Tensor live_topk_blocks(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t count) {
-    const auto* option=std::getenv("MFQ_QSA_LIVE_TOPK");
-    if((option && option[0]=='0') || count>1024)
-        return std::get<1>(tb::topk(scores,count,-1,true,false));
-    MFQ_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
-        scores.scalar_type()==tb::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
-        positions.scalar_type()==tb::kInt64 && positions.numel()==scores.size(1) && pool>0 &&
-        count>0 && count<=scores.size(2),"invalid live QSA top-k geometry");
-    MfqCudaGuard guard(scores.device());
-    const int rows=int(scores.size(1)),pools=int(scores.size(2));
-    const auto* compact_option=std::getenv("MFQ_QSA_TOPK_LIVE_TILE");
-    const bool compact=!compact_option || compact_option[0]!='0';
-    int columns=pools,stage=0;
-    auto keys=scores;Tensor ids;
-    constexpr auto bytes=sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
-    if constexpr(bytes>49152)MFQ_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,int(bytes)));
-    do {
-        const int tiles=(columns+4095)/4096;
-        auto next=tb::empty({1,rows,tiles*count},scores.options());
-        auto next_ids=tb::empty(next.sizes(),scores.options().dtype(tb::kInt64));
-        live_topk_blocks_kernel<<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
-            keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
-            next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
-            columns,pools,int(pool),int(count),stage++,compact);
-        MFQ_CUDA_KERNEL_LAUNCH_CHECK();keys=std::move(next);ids=std::move(next_ids);columns=tiles*int(count);
-    } while(columns>count);
-    return ids;
+Tensor live_topk_blocks(const Tensor& scores, const Tensor& positions, int64_t pool, int64_t count) {
+    return mfq_selected_attention::live_topk_blocks(scores, positions, pool, count);
 }
 
 std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,
