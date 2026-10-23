@@ -128,6 +128,7 @@ include = ["mfq*"]
 "mfq.calibration" = ["recipes/*.json", "recipes/*/*.json"]
 "mfq.quantize.cuda" = ["*.cu", "*.cpp", "*.h"]
 "mfq.kernels.cuda" = ["tq_ops.cu", "tq_ops.h", "tq_*.cuh"]
+"mfq.kernels.hip" = ["tq_ops.hip", "mfq_hip_compat.h"]
 "mfq.quantize.hip" = ["*.hip", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",

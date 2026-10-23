@@ -12,10 +12,15 @@ from mfq.formats.tq import RELATIVE, fixed_codebook
 def _library():
     from torch.utils.cpp_extension import load
 
+    hip = bool(torch.version.hip)
+    source = (Path(__file__).parents[1] / "hip/tq_fitter.hip" if hip
+              else Path(__file__).with_suffix(".cu"))
     path = load(
-        name="mfq_tq_fitter_v1",
-        sources=[str(Path(__file__).with_suffix(".cu"))],
-        extra_cuda_cflags=["-O3", "--fmad=false"],
+        name="mfq_tq_fitter_hip" if hip else "mfq_tq_fitter_v1",
+        sources=[str(source)],
+        extra_cuda_cflags=(["-O3", "-ffp-contract=off", "-U__HIP_NO_HALF_OPERATORS__",
+                           "-U__HIP_NO_HALF_CONVERSIONS__"] if hip
+                          else ["-O3", "--fmad=false"]),
         is_python_module=False,
     )
     lib = ct.CDLL(path)
@@ -23,7 +28,7 @@ def _library():
     I = ct.c_int
     lib.half_wave.argtypes = [I] * 2
     lib.half_wave.restype = I
-    lib.half_encode.argtypes = [P] * 6 + [I] * 4 + [P]
+    lib.half_encode.argtypes = [P] * 6 + [I] * 4 + [P] * (2 if hip else 1)
     lib.half_encode.restype = I
     lib.fit_refine.argtypes = [P] * 9 + [I] * 3 + [P]
     lib.fit_refine.restype = I
@@ -51,6 +56,12 @@ def encode(x, metric, bits):
     y = torch.empty_like(x)
     states = torch.empty_like(x, dtype=torch.int16)
     bounds = torch.empty(n, device=x.device, dtype=torch.int32)
+    scratch_args = []
+    if torch.version.hip:
+        edges = 1 << (16 - bits)
+        scratch = torch.empty((wave, edges * (1 if bits == 1 else 2) if bits <= 2 else 1),
+                              device=x.device, dtype=torch.float16)
+        scratch_args.append(scratch.data_ptr())
     _status(
         lib.half_encode(
             *(v.data_ptr() for v in (x, metric, y, states, history, bounds)),
@@ -58,6 +69,7 @@ def encode(x, metric, bits):
             bits,
             wave,
             16,
+            *scratch_args,
             torch.cuda.current_stream().cuda_stream,
         )
     )

@@ -91,3 +91,40 @@ also be a physical record. Row stores resolve and cache only the requested rows
 across shards; they do not concatenate or expand the full table in memory.
 
 Tests: `pytest tests/test_formats/test_tq.py tests/test_tq_cuda.py tests/test_tq_metal.py`.
+
+## ROCm kernels
+
+`mfq.kernels.hip.tq.Projection` operates on the same `RTRELL05` payload on
+MI300X. A vector uses the decode kernel; batched inputs use tiled prefill.
+Both read compressed weights directly and accumulate in FP32, with FP16
+weight reconstruction and FP16, BF16 or FP32 activations. Prefill shares
+decoded tiles across tokens without storing a full decoded weight matrix.
+
+```python
+from mfq.kernels.hip.tq import Projection
+
+projection = Projection(tensor, input_columns=weight.shape[1])
+x = torch.randn(17, weight.shape[1], device="cuda", requires_grad=True)
+y = projection(x)
+y.square().mean().backward()
+```
+
+PyTorch uses the `cuda` device name on ROCm. Autograd computes first-order input gradients
+through the fixed compressed matrix; codes, row anchors, subgroup selectors,
+column scales and bias remain fixed. `projection.backward(dy, out=dx)` runs
+the input-gradient kernel directly. `projection.forward(x, out=y)` and the
+explicit backward method accept preallocated buffers for graph capture.
+The HIP `SwiGLU` and `SwiGLUFFN` helpers compose these projections with
+PyTorch activations, including their input gradients.
+
+`mfq.quantize.tq.quantize` selects HIP fitting kernels on a ROCm PyTorch
+build. Both the full FP32 Viterbi encoder and adaptive paired-FP16 search
+retain the full Trellis state space. The 1-bit and 2-bit search costs use
+global scratch memory to fit MI300X shared-memory limits. The wire format
+and the CUDA fitting path stay the same.
+
+These are tensor-level HIP operators. They do not add TQ model loading to
+the native HIP inference runtime. CUDA-specific launch tuning, routed MoE
+operators and quantized-activation paths are not exposed by this HIP API.
+
+Tests: `pytest tests/test_tq_hip.py tests/test_formats/test_tq.py`.

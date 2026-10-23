@@ -12,9 +12,13 @@ import torch
 def _library():
     from torch.utils.cpp_extension import load
 
-    path = load(name="mfq_tq_encoder",
-                sources=[str(Path(__file__).with_suffix(".cu"))],
-                extra_cuda_cflags=["-O3", "--fmad=false"], is_python_module=False)
+    hip = bool(torch.version.hip)
+    source = (Path(__file__).parents[1] / "hip/tq_encoder.hip" if hip
+              else Path(__file__).with_suffix(".cu"))
+    path = load(name="mfq_tq_encoder_hip" if hip else "mfq_tq_encoder",
+                sources=[str(source)],
+                extra_cuda_cflags=(["-O3", "-ffp-contract=off"] if hip
+                                  else ["-O3", "--fmad=false"]), is_python_module=False)
     lib = ct.CDLL(path)
     lib.mfq_tq_encoder_wave.argtypes = [ct.c_int, ct.c_int]
     lib.mfq_tq_encoder_wave.restype = ct.c_int
@@ -43,7 +47,8 @@ def encode(x: torch.Tensor, metric: torch.Tensor, table: torch.Tensor, bits: int
             raise RuntimeError(f"Trellis encoder occupancy failed: {wave}")
         edges = 1 << (16 - bits)
         history = torch.empty((wave, 256, edges), dtype=torch.uint8, device=x.device)
-        cost = torch.empty((wave, edges if bits == 1 else 1), device=x.device)
+        global_cost = bits <= 2 if torch.version.hip else bits == 1
+        cost = torch.empty((wave, edges if global_cost else 1), device=x.device)
         values = torch.empty_like(x)
         states = torch.empty_like(x, dtype=torch.int16)
         boundaries = torch.empty(x.shape[0], dtype=torch.int32, device=x.device)

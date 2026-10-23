@@ -152,6 +152,8 @@ def weighted_reduce(expert_output, weights, out=None):
 
 
 class Projection:
+    _library = staticmethod(library)
+
     def __init__(self, data, input_columns=None, bias=None, device='cuda'):
         if isinstance(data, (str, Path)):
             data = TQTensor.load(data)
@@ -190,7 +192,7 @@ class Projection:
             self.rows, self.stored_columns, self.input_columns,
             0 if columns else gs.bit_length() - 1, int(columns))
         with torch.cuda.device(self.device):
-            self.lib = library()
+            self.lib = self._library()
 
     def gemv(self, x, out=None, *, warps=0, rows_per_block=0):
         _vector(x, self.input_columns, self.device)
