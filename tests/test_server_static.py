@@ -68,7 +68,7 @@ def test_navigation_and_refresh_return_entry(client: TestClient, path: str) -> N
 @pytest.mark.parametrize('path', [
   '/assets/missing.js', '/assets/missing', '/static/missing',
   '/missing.css', '/missing.png', '/missing.js/', '/favicon.ico',
-  '/openapi-missing.json', '/health/missing', '/docs/missing',
+  '/openapi-missing.json', '/health/missing', '/metrics/missing', '/docs/missing',
   '/realtime/missing', '/%2e%2e/secret.txt',
 ])
 def test_missing_resources_stay_404(client: TestClient, path: str) -> None:
