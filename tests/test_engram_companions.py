@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 
-from mfq.formats.companions import with_engram_shards
+from mfq.formats.companions import is_engram_table, with_engram_shards
 from mfq.formats.header import FileHeader
 from mfq.formats.io import open_mmap, save
 from mfq.server.protocol.models import CreateJobRequest, HubModelFile, HubModelInfo, HubSystemProfile
@@ -23,6 +23,16 @@ from tests.test_server_service import FakeBackend
 
 TABLE = 'model.block.1.associative_memory.embedding.weight'
 SHARED = 'Engram/model-EW-Engram-MXFP8-00002-of-00003.mfq'
+
+
+@pytest.mark.parametrize('name, expected', [
+    (TABLE, True), (TABLE + '.tq_row_shard.00000', True),
+    ('model.block.1.engram.embed.weight.tq_row_shard.2', True),
+    (TABLE + '.tq_row_shard.', False), (TABLE + '.tq_row_shard.invalid', False),
+    ('model.output.weight.tq_row_shard.00000', False),
+])
+def test_engram_tq_row_shard_names(name, expected):
+    assert is_engram_table(name) is expected
 
 
 def checkpoint(root, precision='Q3'):

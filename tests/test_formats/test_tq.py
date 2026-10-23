@@ -86,3 +86,25 @@ def test_odd_subgroup_selector_count():
     tensor = TQTensor(3, 256, 512, False, desc, np.array([0x10, 0x02]), np.zeros(96, dtype=np.uint8))
     decoded = TQTensor.from_bytes(tensor.to_bytes()).dequantize()
     np.testing.assert_array_equal(decoded[:, 0], (fixed_codebook()[0].astype(np.float32) * RELATIVE[:3].astype(np.float32)).astype(np.float16))
+
+
+@pytest.mark.parametrize("bit", [*range(35, 40), *range(56, 64)])
+def test_reject_reserved_row_descriptor_bits(bit):
+    raw = bytearray(tensor_fixture().to_bytes())
+    descriptor = struct.unpack_from("<Q", raw, 64)[0]
+    struct.pack_into("<Q", raw, 64, descriptor | (1 << bit))
+    with pytest.raises(ValueError, match="Reserved row descriptor"):
+        TQTensor.from_bytes(raw)
+
+
+def test_model_container_roundtrip(tmp_path):
+    from mfq.formats.header import FileHeader
+    from mfq.formats.io import open_mmap, save
+    t = tensor_fixture()
+    path = tmp_path / "tq.mfq"
+    save(path, FileHeader(version=2, model_arch="tq_test",
+        extra={"tq_shapes": {"projection": [t.rows, 513]}}), {"projection": t})
+    with open_mmap(path) as model:
+        assert model.records["projection"].dtype == "TQ"
+        assert model["projection"].to_bytes() == t.to_bytes()
+        assert model.header.extra["tq_shapes"]["projection"] == [t.rows, 513]

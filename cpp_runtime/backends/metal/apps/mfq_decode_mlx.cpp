@@ -467,6 +467,11 @@ std::optional<std::size_t> native_hf_source_bytes(
 }
 
 bool is_independently_streamed_record(std::string_view name) noexcept {
+    constexpr std::string_view marker = ".tq_row_shard.";
+    const auto shard = name.rfind(marker);
+    if (shard != std::string_view::npos && shard + marker.size() < name.size()
+        && std::all_of(name.begin() + shard + marker.size(), name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        name = name.substr(0, shard);
     return name.ends_with(".associative_memory.embedding.weight") ||
         name.ends_with(".engram.embed.weight");
 }

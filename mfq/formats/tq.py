@@ -3,8 +3,8 @@
 Each row selects 1..8 bits per weight. Independent 256-element tail-biting
 rings address a procedural 65536-state Gaussian book. A row has an FP16
 anchor and either 4-bit subgroup selectors or shared FP16 column scales.
-No rotation is applied. Model containers retain the logical matrix dimensions
-separately from this ordinary 2D packed payload.
+No rotation is applied. Model containers store this payload as ``TQ``;
+their ``tq_shapes`` metadata retains logical 2-D or expert-bank dimensions.
 
 The payload stores the padded width; callers retain the logical input width
 in their model metadata and pass it to ``Projection(input_columns=...)``.
@@ -84,7 +84,7 @@ class TQTensor:
         if len(self.descriptors) != self.rows:
             raise ValueError("Row descriptor count differs")
         # Book IDs are reserved; the fixed book is shared by all precisions.
-        allowed = np.uint64(0x00FFFF3FFFFFFFFF)
+        allowed = np.uint64(0x00FFFF07FFFFFFFF)
         if np.any(self.descriptors & ~allowed):
             raise ValueError("Reserved row descriptor bits must be zero")
         bits = self.bits.astype(np.uint64)

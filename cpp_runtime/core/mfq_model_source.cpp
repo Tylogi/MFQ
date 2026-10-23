@@ -621,7 +621,12 @@ MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mod
             static const std::regex shared_name(R"(^.*-Engram-.+-[0-9]{5}-of-[0-9]{5}\.[mM][fF][qQ]$)", std::regex::icase);
             if (std::regex_match(paths[index].filename().string(), shared_name)) {
                 const auto table = [](const MfqStoredRecord& record) {
-                    const auto& name = record.tensor.name;
+                    std::string_view name = record.tensor.name;
+                    constexpr std::string_view marker = ".tq_row_shard.";
+                    const auto shard = name.rfind(marker);
+                    if (shard != std::string_view::npos && shard + marker.size() < name.size()
+                        && std::all_of(name.begin() + shard + marker.size(), name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                        name = name.substr(0, shard);
                     for (const std::string_view suffix : {".associative_memory.embedding.weight", ".engram.embed.weight"})
                         if (name.size() >= suffix.size() &&
                             name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
