@@ -154,6 +154,62 @@ def test_openai_tools_accept_standard_strict_field_and_null_choice() -> None:
     assert request.tool_choice == "auto"
 
 
+def test_scheduling_extensions_are_forwarded_to_the_backend() -> None:
+    async def run() -> None:
+        backend = _Backend()
+        await collect_chat_completion(backend, _request(priority=5, timeout_seconds=2.5))
+        await collect_chat_completion(backend, _request())
+        scheduled, default = backend.requests
+        assert scheduled["priority"] == 5
+        assert scheduled["timeout_seconds"] == 2.5
+        assert default["priority"] == 0
+        assert default["timeout_seconds"] is None
+
+    asyncio.run(run())
+
+
+def test_scheduling_extensions_accept_the_engine_bounds() -> None:
+    highest = _request(priority=2**31 - 1, timeout_seconds=86400)
+    lowest = _request(priority=-(2**31))
+    assert highest.priority == 2**31 - 1
+    assert highest.timeout_seconds == 86400.0
+    assert lowest.priority == -(2**31)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("priority", "high"),
+        ("priority", 1.5),
+        ("priority", True),
+        ("priority", 2**31),
+        ("priority", -(2**31) - 1),
+        ("timeout_seconds", "1"),
+        ("timeout_seconds", 0),
+        ("timeout_seconds", -1),
+        ("timeout_seconds", 86400.5),
+    ],
+)
+def test_out_of_range_scheduling_extensions_return_422(field: str, value: Any) -> None:
+    async def run() -> None:
+        app = create_app(_Service(_Backend()))
+        body = {
+            "model": "DeepSeek-V4-Flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            field: value,
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["param"] == field
+
+    asyncio.run(run())
+
+
 def test_nonstream_response_keeps_reasoning_out_of_visible_content() -> None:
     async def run() -> None:
         result = await collect_chat_completion(_Backend(), _request())

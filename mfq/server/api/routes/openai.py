@@ -103,7 +103,7 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
         parsed = parse_chat_request(body)
     except OpenAIRequestError as error:
         return JSONResponse(
-            status_code=400,
+            status_code=error.status_code,
             content=openai_error_body(str(error), param=error.param),
         )
     backend = service.backend

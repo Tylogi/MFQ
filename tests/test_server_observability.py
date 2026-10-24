@@ -13,7 +13,7 @@ import mfq.server.state.storage as storage_module
 from mfq.server.api import create_app
 from mfq.server.protocol.models import ResponsePerformance, RuntimeInstanceState, RuntimeLogLevel, SamplingParams, TokenUsage
 from mfq.server.runtime.backend import BackendDelta, BackendError
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
@@ -139,7 +139,7 @@ def test_completed_requests_are_persisted_without_status_polling(tmp_path: Path)
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path),
             backend=Backend(), process=SimpleNamespace(returncode=None), port=0,
             context_size=4096, state=RuntimeInstanceState.READY,
-            request_slots=asyncio.Semaphore(1))
+            request_slots=_RequestSlotGate(1))
         pool._instances[instance.id] = instance
         for _ in range(3):
             assert len([delta async for delta in pool.stream(model="model-a", messages=[],
@@ -153,7 +153,7 @@ def test_completed_requests_are_persisted_without_status_polling(tmp_path: Path)
         assert all(row.values["last_request"]["generation_ms"] == 55 for row in rows)
         assert all("complete_generation_ms" not in row.values["last_request"] for row in rows)
         assert instance.active_requests == 0
-        assert instance.request_slots._value == 1
+        assert instance.request_slots.available == 1
 
     asyncio.run(run())
 
@@ -173,13 +173,15 @@ def test_cancelled_requests_release_slots_even_if_cancelled_again_during_cleanup
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         pool = RuntimePool(catalog, tmp_path / "runtime", automatic_memory_budget=False)
         pool.store = SessionStore(tmp_path / "state.sqlite3")
-        class AdmissionSemaphore(asyncio.Semaphore):
-            async def acquire(self):
-                result = await super().acquire()
+        class AdmissionGate(_RequestSlotGate):
+            async def acquire(self, priority: int = 0) -> None:
+                await super().acquire(priority)
                 await pool._lock.acquire()
                 acquired.set()
-                return result
-        slots = AdmissionSemaphore(1) if phase == "admitting" else asyncio.Semaphore(0 if phase == "queued" else 1)
+        slots = AdmissionGate(1) if phase == "admitting" else _RequestSlotGate(1)
+        if phase == "queued":
+            # Another request owns the only slot, so this one has to queue.
+            await slots.acquire()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=Backend(),
             process=SimpleNamespace(returncode=None), port=0, context_size=4096,
             state=RuntimeInstanceState.READY, request_slots=slots)
@@ -206,7 +208,7 @@ def test_cancelled_requests_release_slots_even_if_cancelled_again_during_cleanup
             await request
         await pool._drain_control_lease_releases()
         assert instance.active_requests == instance.queued_requests == 0
-        assert slots._value == (0 if phase == "queued" else 1)
+        assert slots.available == (0 if phase == "queued" else 1)
         assert instance.state == RuntimeInstanceState.READY
         pool._instances.clear()
         await pool.aclose()
@@ -238,7 +240,7 @@ def test_read_only_runtime_monitoring_does_not_reject_inference_or_allow_evictio
         pool = RuntimePool(catalog, tmp_path / "runtime", automatic_memory_budget=False)
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=Backend(),
             process=SimpleNamespace(returncode=None), port=0, context_size=4096,
-            state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         pool._instances[instance.id] = instance
         monitoring = asyncio.create_task(getattr(pool, operation)(instance.id))
         try:
@@ -254,7 +256,7 @@ def test_read_only_runtime_monitoring_does_not_reject_inference_or_allow_evictio
             release.set()
             await monitoring
         assert instance.control_leases == instance.read_control_leases == 0
-        assert instance.request_slots._value == 1
+        assert instance.request_slots.available == 1
     asyncio.run(run())
 
 
@@ -269,7 +271,7 @@ def test_inference_waits_for_exclusive_maintenance_but_not_read_only_monitoring(
         pool = RuntimePool(catalog, tmp_path / "runtime", automatic_memory_budget=False)
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=Backend(),
             process=SimpleNamespace(returncode=None), port=0, context_size=4096,
-            state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         pool._instances[instance.id] = instance
         async def request():
             return [delta async for delta in pool.stream(model="model-a", messages=[], sampling=SamplingParams())]
@@ -288,7 +290,7 @@ def test_inference_waits_for_exclusive_maintenance_but_not_read_only_monitoring(
             assert instance.control_leases == instance.read_control_leases == 1
         assert instance.control_leases == instance.read_control_leases == 0
         assert instance.active_requests == instance.queued_requests == 0
-        assert instance.request_slots._value == 1
+        assert instance.request_slots.available == 1
     asyncio.run(run())
 
 
@@ -338,7 +340,7 @@ def test_queue_rejections_are_observable_without_logging_prompts_or_changing_err
         pool.store = store
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path), backend=IdleBackend(),
             process=SimpleNamespace(returncode=None), port=0, context_size=4096,
-            state=RuntimeInstanceState.BUSY, request_slots=asyncio.Semaphore(0), active_requests=1, queued_requests=1)
+            state=RuntimeInstanceState.BUSY, request_slots=_RequestSlotGate(1), active_requests=1, queued_requests=1)
         pool._instances[instance.id] = instance
         if logging_fails:
             def fail(*args, **kwargs):

@@ -80,6 +80,7 @@ private:
     void publish(Request& request, mfq::engine::EngineEvent event);
     void flush(Request& request);
     void cancel(Request& request);
+    void expire(Request& request);
     void refresh_snapshot(bool healthy, bool blocked, bool metrics);
 
     mfq::engine::Engine& engine_;
