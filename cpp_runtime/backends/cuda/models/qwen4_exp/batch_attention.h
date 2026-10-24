@@ -9,6 +9,8 @@ inline void Qsa::bind_decode_state(BatchDecodeInputs& inputs, int64_t field, int
     inputs.state(row, field + 1, graph_values_, 2);
     inputs.state(row, field + 2, index_.storage(), 1);
     inputs.state(row, field + 3, graph_pooled_, 1);
+    if (managed_memory() && memory_->hot.exclusive())
+        memory_->hot.bind_decode_state(inputs, field + 4, row);
 }
 
 inline int64_t Qsa::decode_graph_capacity() const {
@@ -20,8 +22,16 @@ inline Tensor Qsa::forward_indirect_graph(CudaExecutionContext& execution, const
         int64_t field, int64_t row, int64_t capacity, std::vector<Tensor> projections, bool output_projection) {
     auto p = project(execution, hidden, positions, capacity > c_.budget, cache_positions,
                      {}, {}, std::move(projections));
-    batch_state_scatter(inputs, field, row, cache_positions, encode_key(p.key).permute({0, 2, 1, 3}));
-    batch_state_scatter(inputs, field + 1, row, cache_positions, encode_value(p.value).permute({0, 2, 1, 3}));
+    const bool exclusive = managed_memory() && memory_->hot.exclusive();
+    auto keys_to_append = encode_key(p.key).permute({0, 2, 1, 3});
+    auto values_to_append = encode_value(p.value).permute({0, 2, 1, 3});
+    if (exclusive) {
+        MFQ_RUNTIME_CHECK(memory_->hot.append_decode(keys_to_append, values_to_append, cache_positions,
+            {}, {}, false, &inputs, field + 4, row), "unsupported indirect KV append geometry");
+    } else {
+        batch_state_scatter(inputs, field, row, cache_positions, keys_to_append);
+        batch_state_scatter(inputs, field + 1, row, cache_positions, values_to_append);
+    }
     batch_state_scatter(inputs, field + 2, row, cache_positions,
                         p.raw.to(index_.storage().scalar_type()).reshape({1, 1, 1, c_.index_width}));
     Tensor selected;
@@ -55,8 +65,11 @@ inline Tensor Qsa::forward_indirect_graph(CudaExecutionContext& execution, const
         selected = mfq_qwen4_exp::qsa_selected_tokens(blocks, cache_positions, c_.pool, c_.budget).to(tb::kInt64);
     }
     auto flat = selected.reshape({-1}).contiguous();
-    auto keys = batch_state_gather(inputs, field, row, flat, c_.kv_heads, key_width(), graph_keys_.options());
-    auto values = batch_state_gather(inputs, field + 1, row, flat, c_.kv_heads, value_width(), graph_values_.options());
+    const auto hot_field = exclusive ? field + 4 : -1;
+    auto keys = batch_state_gather(inputs, field, row, flat, c_.kv_heads, key_width(),
+                                   graph_keys_.options(), hot_field);
+    auto values = batch_state_gather(inputs, field + 1, row, flat, c_.kv_heads, value_width(),
+                                     graph_values_.options(), hot_field, true);
     auto local = tb::arange(flat.numel(), cache_positions.options()).reshape(selected.sizes());
     local = tb::where(selected >= 0, local, tb::full_like(local, -1)).to(tb::kInt32).contiguous();
     Tensor attended;

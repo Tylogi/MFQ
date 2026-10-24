@@ -4,6 +4,7 @@
 // is defined in ops.cpp; all request-dependent GPU reads use BatchDecodeInputs.
 struct Qwen4BatchDecodeGraph::Impl {
     using Tensor = mfq_tensor_backend::Tensor;
+    static constexpr int64_t fields_per_layer = 8 + HotKvStateFields::Count;
     struct Layer {
         std::vector<std::unique_ptr<qwen4_exp::Gdn>> gdn;
         std::vector<std::unique_ptr<qwen4_exp::Ple>> ple;
@@ -96,7 +97,7 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
     }
     const BatchDecodeGraphKey key{batch, decode_graph_bucket(required, model.max_position_embeddings()),
                                   capacity, {}};
-    auto& graph = owner.cache.get(key, 8 * model.blocks.size(), ids.get_device());
+    auto& graph = owner.cache.get(key, Impl::fields_per_layer * model.blocks.size(), ids.get_device());
     auto& input = *graph.inputs;
     auto& prepared = owner.prepared;
     std::vector<BatchDecodeRow> rows;
@@ -143,7 +144,7 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         const bool enabled = row < active;
         const auto* request = enabled ? requests[row] : nullptr;
         for (std::size_t i = 0; i < model.blocks.size(); ++i) {
-            const auto field = int64_t(8 * i);
+            const auto field = int64_t(Impl::fields_per_layer * i);
             auto& working = prepared.layers[i];
             if (enabled) {
                 auto& layer = request->state_->layers[i];
@@ -195,7 +196,7 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                 for (std::size_t i = 0; i < model.blocks.size(); ++i) {
                     auto& block = static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
                     auto& working = prepared.layers[i];
-                    const auto field = int64_t(8 * i);
+                    const auto field = int64_t(Impl::fields_per_layer * i);
                     graph.window->mark(i, "block_begin");
                     graph.window->set_profile_layer_kind(i, block.gdn ? "gdn" : "qsa");
                     if (block.ple) {
