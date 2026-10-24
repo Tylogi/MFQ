@@ -203,12 +203,12 @@ class Gdn {
         // Only recurrence is split at the confirmation boundary. Both parts
         // share the input projections and one output projection.
         std::vector<Tensor> projected;if(grouped)projected=w_.input_projection(execution,x);
-        const auto* window_option=std::getenv("MFQ_MTP_GDN_REGISTER_WINDOW");
+        const auto window_option = mfq::cuda::runtime_options::mtp_gdn_register_window();
         const auto inplace_option=mfq::cuda::runtime_options::gdn_inplace_state();
-        const auto* checkpoint_option=std::getenv("MFQ_MTP_GDN_FUSED_CHECKPOINT");
+        const auto checkpoint_option = mfq::cuda::runtime_options::mtp_gdn_fused_checkpoint();
         if(grouped && confirmed==1 && x.size(0)==1 && x.size(1)>=2 && x.size(1)<=8 &&
-            (window_option?window_option[0]!='0':nk_==16 && nv_==48) &&
-            (!inplace_option || *inplace_option) && (!checkpoint_option || checkpoint_option[0]!='0') &&
+            (window_option?*window_option:nk_==16 && nv_==48) &&
+            (!inplace_option || *inplace_option) && (!checkpoint_option || *checkpoint_option) &&
             d_==128 && kernel_==4 && fused_core_ && fused_decode_ && fused_preparation_ &&
             fused_output_ && transposed_state_ && conv_.defined() && state_.defined() &&
             projected.size()==4 && projected[0].scalar_type()==tb::kFloat16 &&
@@ -327,9 +327,9 @@ class Gdn {
                     x.scalar_type()==tb::kFloat16,true,core_workspace_,
                     [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
                 };
-                const auto* checkpoint_option=std::getenv("MFQ_MTP_GDN_FUSED_CHECKPOINT");
+                const auto checkpoint_option = mfq::cuda::runtime_options::mtp_gdn_fused_checkpoint();
                 const bool fused_snapshot=checkpoint_conv.defined() && checkpoint_state.defined() &&
-                    (!checkpoint_option || checkpoint_option[0]!='0') &&
+                    (!checkpoint_option || *checkpoint_option) &&
                     [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}();
                 auto decoded=decode(fused_snapshot);
                 if(snapshot_written)*snapshot_written=fused_snapshot;
@@ -654,7 +654,8 @@ class NgramEmbedding {
     Context context_;
     std::shared_ptr<NintRowPipeline> pipeline_;
     bool reuse_hashes_=[] {
-        const auto* option=std::getenv("MFQ_PLE_HASH_REUSE");return !option || option[0]!='0';
+        const auto option = mfq::cuda::runtime_options::ple_hash_reuse();
+        return !option || *option;
     }();
     bool hash_ready_=false,hash_reported_=false;
     int cached_tokens_=0;
@@ -1115,8 +1116,8 @@ class Qsa {
             return project_output?w_.output(execution,output):output;
         };
         bool index_written=false;
-        const auto* prepare_option=std::getenv("MFQ_KV_PREPARE_FUSED");
-        const bool begin_prepare=!prepare_option || prepare_option[0]!='0';
+        const auto prepare_option = mfq::cuda::runtime_options::kv_prepare_fused();
+        const bool begin_prepare=!prepare_option || *prepare_option;
         if(exclusive) {
             const auto keys=(quantization_.enabled()?encode_key(p.key):p.key).permute({0,2,1,3});
             const auto values=(quantization_.enabled()?encode_value(p.value):p.value).permute({0,2,1,3});

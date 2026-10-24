@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/moe.h"
+#include "grid_vision.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -149,6 +150,15 @@ struct Config {
                                 : eos.get<int64_t>();
         return c;
     }
+};
+
+// Optional grid-ViT configuration, parsed only when the component is loaded.
+struct VisionConfig {
+    GridVisionConfig grid;
+    std::int64_t image_token_id = 0;
+    std::int64_t video_token_id = 0;
+
+    static VisionConfig from_json(std::string_view payload, const Config& text);
 };
 
 } // namespace mfq::models::qwen4_exp

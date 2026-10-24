@@ -94,9 +94,14 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "bool defer_moe_cache_finalize = false" in DECODE
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
     assert "bool load_optional_components" in CUDA_RUNTIME
-    assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
-        "finalize_moe_expert_cache(execution.moe_expert_cache);"
-    )
+    loader = (CUDA_ROOT / "storage/model_loader.h").read_text(encoding="utf-8")
+    loading = loader.split("auto load = [&]<typename Model>()", 1)[1]
+    model_load = loading.index("Model model = load_causal_lm<Model>(")
+    components = loading.index("load_runtime_components(model, load_optional_components)")
+    finalize = loading.index("finalize_moe_expert_cache(execution.moe_expert_cache,")
+    dispatch = loading.index("return run(model, runtime_components,")
+    assert model_load < components < finalize < dispatch
+    assert "!moe_expert_cache_finalized(execution.moe_expert_cache)" in loading[components:finalize]
 
 
 def test_reload_and_request_registration_use_scheduler_mailbox() -> None:
@@ -141,10 +146,17 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
             stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
     assert stdin_users == {
         "backends/cuda/commands/minicpmo45.cpp",
+        "backends/hip/commands/minicpmo45.cpp",
         "transport/src/stdio.cpp",
     }
-    assert "if (minicpmo_eval_batch)" in CUDA_RUNTIME
-    assert "MiniCPM-o eval mode cannot be combined with" in CUDA_RUNTIME
+    for backend in ("cuda", "hip"):
+        command = (ROOT / "cpp_runtime/backends" / backend / "commands/diagnostics.cpp").read_text(encoding="utf-8")
+        assert "if (minicpmo_eval_batch)" in command
+        assert "MiniCPM-o eval mode cannot be combined with" in command
+        evaluation = command.split("if (minicpmo_eval_batch)", 1)[1]
+        assert evaluation.index("if (!ids_arg.empty() || !ids_file.empty())") < evaluation.index("run_eval_batch(")
+        runtime = (ROOT / "cpp_runtime/backends" / backend / "commands/runtime.cpp").read_text(encoding="utf-8")
+        assert "--minicpmo-eval-batch" not in runtime
 
 
 def test_metal_jsc_rejects_partial_code_vectors() -> None:

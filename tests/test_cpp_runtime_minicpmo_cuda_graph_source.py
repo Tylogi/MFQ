@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -157,7 +158,11 @@ def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
 
 def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
     assert "run_backend_bf16_add_check" in SOURCE
-    assert 'option == "--check-backend-bf16-add"' in SOURCE
+    assert re.search(
+        r'\{"--check-backend-bf16-add",\s*&DiagnosticsCommandOptions::check_backend_bf16_add\}', SOURCE
+    )
+    assert "if (check_backend_bf16_add) return run_backend_bf16_add_check(" in SOURCE
+    assert "result.*field = true;" in SOURCE
     check = BACKEND_CHECKS.split("int run_backend_bf16_add_check", 1)[1].split(
         "int run_backend_argmax_check", 1
     )[0]
@@ -288,8 +293,9 @@ def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> N
     assert '"MFQ_PROFILE_CUDA_FILTER"' in SOURCE
     assert "profiler.filter = config.profile_filter" in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
-    eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
-        "mfq_cuda_synchronize();", 1
+    generation = (CUDA_ROOT / "diagnostics/token_generation.h").read_text(encoding="utf-8")
+    eager_path = generation.split("} else if (!hit_eos) {", 1)[1].split(
+        "auto t3 =", 1
     )[0]
     assert 'profiler.measure("decode.eager_model"' in eager_path
     assert 'profiler.measure("decode.eager_commit"' in eager_path

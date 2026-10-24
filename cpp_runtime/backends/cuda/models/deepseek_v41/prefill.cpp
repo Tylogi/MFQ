@@ -1,3 +1,4 @@
+#include "runtime/execution_options.h"
 #include "ops.h"
 #include "storage/moe_expert_cache.h"
 #include <cstring>
@@ -44,8 +45,8 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
     auto scope = model.execution_scope();
     ids = model.device_ids(std::move(ids));
     const auto batch = ids.size(0), tokens = ids.size(1);
-    const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
-    const bool trace=profile && profile[0]=='1';
+    const auto profile = mfq::cuda::runtime_options::profile_ssd_experts();
+    const bool trace=profile && *profile;
     if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=prepare tokens="<<tokens<<'\n';
     MFQ_RUNTIME_CHECK(model.shared && batch > 0 && tokens > 0 && compute_chunk > 0 &&
                           model.speculative_start < 0 &&
@@ -66,10 +67,10 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
         model.reset(batch);
         return true;
     };
-    const auto* profile_layer=std::getenv("MFQ_PROFILE_DSV41_LAYER");
+    const auto profile_layer = mfq::cuda::runtime_options::profile_dsv41_layer();
     const auto apply_layer=[&](auto& ops,int64_t layer,Tensor hidden) {
         auto& profiler=model.execution->profiler;
-        const bool selected=profile_layer && layer==std::atoi(profile_layer);
+        const bool selected=profile_layer && layer==*profile_layer;
         const bool previous=profiler.enabled;
         if(selected) {profiler.reset();profiler.enabled=true;}
         try {

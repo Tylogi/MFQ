@@ -1319,3 +1319,324 @@ std::optional<std::int64_t> moe_ram_pin_reserve_bytes() {
     return std::nullopt;
 }
 } // namespace mfq::cuda::runtime_options
+
+namespace mfq::cuda::runtime_options {
+namespace {
+std::optional<bool> not_zero_option(const char* name) {
+    if (const auto* value = std::getenv(name)) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> one_option(const char* name) {
+    if (const auto* value = std::getenv(name)) return value[0] == '1';
+    return std::nullopt;
+}
+} // namespace
+
+bool cuda_workspace_reserve_gib_set() {
+    return std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB") != nullptr;
+}
+
+std::optional<bool> kv_prepare_fused() {
+    return not_zero_option("MFQ_KV_PREPARE_FUSED");
+}
+
+std::optional<bool> kv_stream_graphs() {
+    return not_zero_option("MFQ_KV_STREAM_GRAPHS");
+}
+
+std::optional<bool> mfe_prepare_publish() {
+    return not_zero_option("MFQ_MFE_PREPARE_PUBLISH");
+}
+
+std::optional<bool> mfe_prepare_warp() {
+    return not_zero_option("MFQ_MFE_PREPARE_WARP");
+}
+
+std::optional<bool> mfe_shared_early() {
+    return not_zero_option("MFQ_MFE_SHARED_EARLY");
+}
+
+std::optional<bool> mfe_shared_gate_view() {
+    return not_zero_option("MFQ_MFE_SHARED_GATE_VIEW");
+}
+
+std::optional<bool> mfe_shared_short() {
+    return not_zero_option("MFQ_MFE_SHARED_SHORT");
+}
+
+std::optional<bool> mfe_split_shared_groups() {
+    return not_zero_option("MFQ_MFE_SPLIT_SHARED_GROUPS");
+}
+
+std::optional<bool> mfe_token_wide_compact() {
+    return not_zero_option("MFQ_MFE_TOKEN_WIDE_COMPACT");
+}
+
+std::optional<bool> mfe_transfer_hidden_fused() {
+    return not_zero_option("MFQ_MFE_TRANSFER_HIDDEN_FUSED");
+}
+
+std::optional<bool> mfe_transfer_route_list() {
+    return not_zero_option("MFQ_MFE_TRANSFER_ROUTE_LIST");
+}
+
+std::optional<bool> mfe_transfer_route_packet() {
+    return not_zero_option("MFQ_MFE_TRANSFER_ROUTE_PACKET");
+}
+
+std::optional<bool> moe_auto_cache_profile() {
+    return not_zero_option("MFQ_MOE_AUTO_CACHE_PROFILE");
+}
+
+std::optional<long long> moe_direct_expert_cache_bytes() {
+    if (const auto* value = std::getenv("MFQ_MOE_DIRECT_EXPERT_CACHE_BYTES")) return std::stoll(value);
+    return std::nullopt;
+}
+
+std::optional<bool> moe_empty_transfer() {
+    return not_zero_option("MFQ_MOE_EMPTY_TRANSFER");
+}
+
+std::optional<bool> moe_fused_transfer_copy() {
+    return not_zero_option("MFQ_MOE_FUSED_TRANSFER_COPY");
+}
+
+std::optional<bool> moe_gu_build_mapped_views() {
+    return not_zero_option("MFQ_MOE_GU_BUILD_MAPPED_VIEWS");
+}
+
+std::optional<bool> moe_gu_build_overlap() {
+    return not_zero_option("MFQ_MOE_GU_BUILD_OVERLAP");
+}
+
+std::optional<bool> moe_kv_direct_read() {
+    return not_zero_option("MFQ_MOE_KV_DIRECT_READ");
+}
+
+std::optional<bool> moe_kv_early_gu() {
+    return one_option("MFQ_MOE_KV_EARLY_GU");
+}
+
+std::optional<bool> moe_kv_gpu_resident() {
+    return one_option("MFQ_MOE_KV_GPU_RESIDENT");
+}
+
+std::optional<bool> moe_kv_host_packet() {
+    return one_option("MFQ_MOE_KV_HOST_PACKET");
+}
+
+std::string moe_kv_host_packet_label() {
+    const auto* value = std::getenv("MFQ_MOE_KV_HOST_PACKET");
+    return value ? value : "unset";
+}
+
+std::optional<bool> moe_kv_lookup_first() {
+    return one_option("MFQ_MOE_KV_LOOKUP_FIRST");
+}
+
+std::optional<bool> moe_kv_projection_cache() {
+    return one_option("MFQ_MOE_KV_PROJECTION_CACHE");
+}
+
+std::optional<bool> moe_mtp_committed_heat() {
+    return not_zero_option("MFQ_MOE_MTP_COMMITTED_HEAT");
+}
+
+std::optional<bool> moe_mtp_kv_lru() {
+    return not_zero_option("MFQ_MOE_MTP_KV_LRU");
+}
+
+std::optional<bool> moe_native_direct_packet() {
+    return not_zero_option("MFQ_MOE_NATIVE_DIRECT_PACKET");
+}
+
+std::optional<int> moe_native_dma_batch() {
+    if (const auto* value = std::getenv("MFQ_MOE_NATIVE_DMA_BATCH")) return std::atoi(value);
+    return std::nullopt;
+}
+
+std::optional<bool> moe_packed_transfer_stage() {
+    return not_zero_option("MFQ_MOE_PACKED_TRANSFER_STAGE");
+}
+
+std::optional<bool> moe_poll_transfer_ready() {
+    return one_option("MFQ_MOE_POLL_TRANSFER_READY");
+}
+
+std::optional<bool> moe_predictor_transfer_cache() {
+    return not_zero_option("MFQ_MOE_PREDICTOR_TRANSFER_CACHE");
+}
+
+bool moe_prefill_group_size_set() {
+    return std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE") != nullptr;
+}
+
+std::optional<int> moe_preload_threads() {
+    if (const auto* value = std::getenv("MFQ_MOE_PRELOAD_THREADS")) return std::atoi(value);
+    return std::nullopt;
+}
+
+std::optional<bool> moe_shared_stream() {
+    return not_zero_option("MFQ_MOE_SHARED_STREAM");
+}
+
+std::optional<bool> moe_skip_gpu_only_input_copy() {
+    return not_zero_option("MFQ_MOE_SKIP_GPU_ONLY_INPUT_COPY");
+}
+
+std::optional<bool> moe_ssd_experts() {
+    return one_option("MFQ_MOE_SSD_EXPERTS");
+}
+
+std::optional<bool> moe_ssd_experts_not_disabled() {
+    return not_zero_option("MFQ_MOE_SSD_EXPERTS");
+}
+
+std::optional<bool> moe_ssd_gu_io_overlap() {
+    return not_zero_option("MFQ_MOE_SSD_GU_IO_OVERLAP");
+}
+
+std::optional<bool> moe_ssd_phased_compute() {
+    return not_zero_option("MFQ_MOE_SSD_PHASED_COMPUTE");
+}
+
+std::optional<bool> moe_window_route_fence() {
+    return not_zero_option("MFQ_MOE_WINDOW_ROUTE_FENCE");
+}
+
+std::optional<bool> moe_wire_fallback() {
+    return not_zero_option("MFQ_MOE_WIRE_FALLBACK");
+}
+
+std::optional<bool> mtp_gdn_fused_checkpoint() {
+    return not_zero_option("MFQ_MTP_GDN_FUSED_CHECKPOINT");
+}
+
+std::optional<bool> mtp_gdn_register_window() {
+    return not_zero_option("MFQ_MTP_GDN_REGISTER_WINDOW");
+}
+
+std::optional<bool> mtp_history_chain() {
+    return not_zero_option("MFQ_MTP_HISTORY_CHAIN");
+}
+
+std::optional<bool> mtp_resident_experts() {
+    return one_option("MFQ_MTP_RESIDENT_EXPERTS");
+}
+
+std::optional<int> nint_q8_decode() {
+    if (const auto* value = std::getenv("MFQ_NINT_Q8_DECODE")) return std::atoi(value);
+    return std::nullopt;
+}
+
+std::optional<bool> nint_q8_ordered() {
+    return not_zero_option("MFQ_NINT_Q8_ORDERED");
+}
+
+std::optional<bool> nint_q8_small_warps() {
+    return not_zero_option("MFQ_NINT_Q8_SMALL_WARPS");
+}
+
+std::optional<bool> ple_batch_read() {
+    return not_zero_option("MFQ_PLE_BATCH_READ");
+}
+
+std::optional<bool> ple_early_issue() {
+    return not_zero_option("MFQ_PLE_EARLY_ISSUE");
+}
+
+std::optional<bool> ple_hash_reuse() {
+    return not_zero_option("MFQ_PLE_HASH_REUSE");
+}
+
+std::optional<bool> prefill_backup_cache() {
+    return not_zero_option("MFQ_PREFILL_BACKUP_CACHE");
+}
+
+std::optional<bool> prefill_backup_pinned() {
+    return not_zero_option("MFQ_PREFILL_BACKUP_PINNED");
+}
+
+std::optional<bool> prefill_backup_pressure() {
+    return not_zero_option("MFQ_PREFILL_BACKUP_PRESSURE");
+}
+
+std::optional<bool> prefill_borrow() {
+    return not_zero_option("MFQ_PREFILL_BORROW");
+}
+
+bool prefill_borrow_force() {
+    const auto* value = std::getenv("MFQ_PREFILL_BORROW");
+    return value && std::string_view(value) == "force";
+}
+
+std::optional<bool> prefill_cpu_prefetch() {
+    return not_zero_option("MFQ_PREFILL_CPU_PREFETCH");
+}
+
+std::optional<bool> prefill_restore_all() {
+    return one_option("MFQ_PREFILL_RESTORE_ALL");
+}
+
+std::optional<int> profile_dsv41_layer() {
+    if (const auto* value = std::getenv("MFQ_PROFILE_DSV41_LAYER")) return std::atoi(value);
+    return std::nullopt;
+}
+
+std::optional<bool> profile_mtp() {
+    return one_option("MFQ_PROFILE_MTP");
+}
+
+std::optional<bool> profile_prefill_once() {
+    return one_option("MFQ_PROFILE_PREFILL_ONCE");
+}
+
+std::optional<long long> profile_prefill_skip() {
+    if (const auto* value = std::getenv("MFQ_PROFILE_PREFILL_SKIP")) return std::atoll(value);
+    return std::nullopt;
+}
+
+std::optional<bool> profile_ssd_experts() {
+    return one_option("MFQ_PROFILE_SSD_EXPERTS");
+}
+
+std::optional<bool> qsa_independent_batch() {
+    return not_zero_option("MFQ_QSA_INDEPENDENT_BATCH");
+}
+
+std::optional<bool> qwen4_reuse_graphs() {
+    return not_zero_option("MFQ_QWEN4_REUSE_GRAPHS");
+}
+
+std::optional<bool> qwen4_warmup_graphs() {
+    return not_zero_option("MFQ_QWEN4_WARMUP_GRAPHS");
+}
+
+std::optional<bool> runtime_trace_cuda_graph() {
+    return one_option("MFQ_RUNTIME_TRACE_CUDA_GRAPH");
+}
+
+std::optional<bool> shared_gate_nint() {
+    return not_zero_option("MFQ_SHARED_GATE_NINT");
+}
+
+std::optional<bool> shared_gate_prepare() {
+    return not_zero_option("MFQ_SHARED_GATE_PREPARE");
+}
+
+std::optional<bool> shared_gate_reuse() {
+    return not_zero_option("MFQ_SHARED_GATE_REUSE");
+}
+
+bool trace_host_cache_packet_set() {
+    return std::getenv("MFQ_TRACE_HOST_CACHE_PACKET") != nullptr;
+}
+
+bool trace_residency_memory_set() {
+    return std::getenv("MFQ_TRACE_RESIDENCY_MEMORY") != nullptr;
+}
+
+std::optional<bool> verify_mtp_history_chain() {
+    return one_option("MFQ_VERIFY_MTP_HISTORY_CHAIN");
+}
+} // namespace mfq::cuda::runtime_options
