@@ -1,4 +1,4 @@
-import { useRef, type ReactNode } from 'react';
+import { memo, useRef, type ReactNode } from 'react';
 import { QuestionIcon } from '@phosphor-icons/react';
 import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 import { formatBytes, formatNumber } from '../../app/formatters';
@@ -13,7 +13,11 @@ const modelCount = (count: number) => `${count} ${count === 1 ? 'model' : 'model
 const resourceBytes = (bytes: number) => bytes < 1024 ? `${formatNumber(bytes)} B` :
   formatBytes(bytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
 
-export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, connectionRevision = 0, detailed = false, summary }: {
+// Rendered inside the overview page, which re-renders on the 500 ms serving
+// poll. The memory picture only changes when instances or runtime do.
+export const MemoryHierarchy = memo(function MemoryHierarchy({
+  instances, memoryCapacityBytes, runtime, connectionRevision = 0, detailed = false, summary,
+}: {
   instances: RuntimeInstance[];
   runtime?: RuntimeStatus | null;
   memoryCapacityBytes?: number | null;
@@ -250,4 +254,4 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
       </div>
     </TMPanel>
   );
-}
+});

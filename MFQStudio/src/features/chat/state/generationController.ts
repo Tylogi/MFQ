@@ -68,6 +68,10 @@ interface GenerationRun {
   completed: boolean;
   error: string | null;
   output: LiveOutput;
+  // SSE deltas append here and are joined once per flush. Copying the whole
+  // answer on every delta is quadratic on long code-heavy responses.
+  textChunks: string[];
+  reasoningChunks: string[];
 }
 
 const services: GenerationServices = {
@@ -135,6 +139,14 @@ export class GenerationController {
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     if (this.active !== run) return;
+    if (run.textChunks.length) {
+      run.output.text += run.textChunks.join('');
+      run.textChunks.length = 0;
+    }
+    if (run.reasoningChunks.length) {
+      run.output.reasoning += run.reasoningChunks.join('');
+      run.reasoningChunks.length = 0;
+    }
     this.publish({ live: { ...run.output, tools: [...run.output.tools] } });
   }
 
@@ -148,8 +160,8 @@ export class GenerationController {
     }
     if (payload.type === 'response.interrupted') run.cancelled = true;
     if (payload.type === 'response.completed') run.completed = true;
-    if (payload.type === 'response.text.delta') run.output.text += payload.delta;
-    else if (payload.type === 'response.reasoning.delta') run.output.reasoning += payload.delta;
+    if (payload.type === 'response.text.delta') run.textChunks.push(payload.delta);
+    else if (payload.type === 'response.reasoning.delta') run.reasoningChunks.push(payload.delta);
     else if (payload.type === 'response.tool_call.delta') {
       run.output.tools[payload.index] =
         (run.output.tools[payload.index] ?? '') + payload.arguments_delta;
@@ -182,6 +194,8 @@ export class GenerationController {
       completed: false,
       error: null,
       output: { text: '', reasoning: '', tools: [] },
+      textChunks: [],
+      reasoningChunks: [],
     };
     this.active = run;
     this.publish({
@@ -272,7 +286,8 @@ export class GenerationController {
       if (response) this.accept(run);
       this.callbacks.onSynchronized(persisted);
       const hasPartial = Boolean(
-        run.output.text || run.output.reasoning || run.output.tools.length,
+        run.output.text || run.textChunks.length || run.output.reasoning ||
+        run.reasoningChunks.length || run.output.tools.length,
       );
       this.publish({
         phase:
