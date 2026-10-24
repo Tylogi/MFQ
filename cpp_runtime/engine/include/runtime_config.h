@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generation_policy.h"
+#include "kv_admission.h"
 #include "session_snapshot_cache.h"
 
 #include <cstdint>
@@ -25,8 +26,13 @@ struct PrefixCacheConfig {
 };
 
 struct ContinuousBatchConfig {
+    // Raising this ceiling requires validating every native batch path.
+    static constexpr std::size_t validated_max_sequences = 32;
     std::size_t max_sequences = 0;
     std::int64_t prefill_token_budget = 2048;
+    std::size_t sequence_limit = validated_max_sequences;
+    KvAdmissionConfig admission;
+    std::size_t kv_budget_bytes = 0;
 };
 
 struct RuntimeConfig {

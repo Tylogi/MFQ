@@ -62,6 +62,11 @@ target_link_libraries(mfq-text-emitter-test PRIVATE mfq-engine)
 target_compile_features(mfq-text-emitter-test PRIVATE cxx_std_17)
 add_test(NAME mfq-text-emitter-test COMMAND mfq-text-emitter-test)
 
+add_executable(mfq-kv-admission-test kv_admission_test.cpp)
+target_link_libraries(mfq-kv-admission-test PRIVATE mfq-engine)
+target_compile_features(mfq-kv-admission-test PRIVATE cxx_std_20)
+add_test(NAME mfq-kv-admission-test COMMAND mfq-kv-admission-test)
+
 add_executable(mfq-prefill-budget-test prefill_budget_test.cpp)
 target_link_libraries(mfq-prefill-budget-test PRIVATE mfq-engine)
 target_compile_features(mfq-prefill-budget-test PRIVATE cxx_std_17)

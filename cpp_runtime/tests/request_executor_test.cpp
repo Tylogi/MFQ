@@ -290,6 +290,9 @@ struct Environment {
 };
 
 static void check_runtime_config() {
+    const ContinuousBatchConfig positional{2, 16};
+    assert(positional.max_sequences == 2 && positional.prefill_token_budget == 16);
+    assert(positional.sequence_limit == 32);
     Environment sessions("MFQ_RUNTIME_MAX_KV_SESSIONS", "3");
     Environment block("MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS", "512");
     Environment directory("MFQ_RUNTIME_PREFIX_CACHE_DIR", "cache-example");
@@ -315,6 +318,35 @@ static void check_runtime_config() {
     rejects([] { resolve_batch_config(2, 16); });
     budget.set(nullptr);
     assert(resolve_batch_config(2, 16).prefill_token_budget == 16);
+    Environment limit("MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES", "12");
+    assert(resolve_batch_config(12, 16).sequence_limit == 12);
+    rejects([] { resolve_batch_config(13, 16); });
+    for (const char* bad : {"0", "33", "64", "65", "-1", "4x"}) {
+        limit.set(bad);
+        rejects([] { resolve_batch_config(2, 16); });
+    }
+    limit.set(nullptr);
+    assert(resolve_batch_config(32, 16).max_sequences == 32);
+    Environment initial("MFQ_INIT_NEW_TOKEN_RATIO", "0.5");
+    Environment minimum("MFQ_MIN_NEW_TOKEN_RATIO_FACTOR", "0.2");
+    Environment conservativeness("MFQ_SCHEDULE_CONSERVATIVENESS", "0.8");
+    Environment decay("MFQ_NEW_TOKEN_RATIO_DECAY_STEPS", "2");
+    NewTokenRatioTracker ratio(resolve_batch_config(2, 16).admission);
+    assert(std::abs(ratio.current() - .4) < 1e-12);
+    ratio.decay_step();
+    assert(std::abs(ratio.current() - .24) < 1e-12);
+    for (const char* valid : {"0.5", ".5", "5e-1"}) {
+        initial.set(valid);
+        assert(resolve_batch_config(2, 16).admission.initial_ratio == .5);
+    }
+    for (const char* bad : {"0", "-1", "1.1", "nan", "inf", "0.5x",
+                            " 0.5", "0.5 ", "+0.5", "0,5", "0x1p-1", "1e9999"}) {
+        initial.set(bad);
+        rejects([] { resolve_batch_config(2, 16); });
+    }
+    initial.set("0.5");
+    decay.set("0");
+    rejects([] { resolve_batch_config(2, 16); });
     Environment enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE", "false");
     rejects([] { environment_enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE"); });
 }

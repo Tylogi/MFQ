@@ -50,6 +50,10 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
             while (!ops.ready() && !output.stopped()) co_yield StepState::waiting;
             if (output.stopped()) co_return;
         }
+        // A scheduler may reduce the tile after memory admission. Advance the
+        // coroutine by the completed tile rather than its original proposal.
+        if constexpr (requires { ops.completed_prefill_chunk(chunk); })
+            chunk = ops.completed_prefill_chunk(chunk);
         {
             PrefillActivity activity;
             elapsed += ops.prefill(chunk);
