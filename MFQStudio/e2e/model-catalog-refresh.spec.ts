@@ -22,5 +22,5 @@ test('updates deleted and added checkpoints on window focus', async ({ page }) =
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   await expect(checkpoint).toBeVisible();
   expect(scans.length).toBeGreaterThanOrEqual(3);
-  expect(scans.every(url => url.searchParams.get('refresh') === 'true')).toBe(true);
+  expect(scans.every(url => !url.searchParams.has('refresh'))).toBe(true);
 });
