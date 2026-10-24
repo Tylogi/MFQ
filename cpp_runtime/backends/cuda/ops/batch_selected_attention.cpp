@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 
 namespace mfq::cuda {
 namespace tb = mfq_tensor_backend;
@@ -21,6 +22,9 @@ tb::Tensor batch_selected_attention(const BatchDecodeInputs& inputs, int64_t fie
     MFQ_RUNTIME_CHECK(query.dim() == 4 && query.size(0) == inputs.rows() && query.size(2) == 1 &&
         config.pool > 0 && config.budget > 0 && config.budget % config.pool == 0 && config.capacity > 0,
         "invalid independent selected-attention geometry");
+    const auto* trace = std::getenv("MFQ_TRACE_QSA_BATCH");
+    if (trace && trace[0] == '1')
+        std::fprintf(stderr, "qsa_independent_batch rows=%lld\n", static_cast<long long>(inputs.rows()));
     const auto mark = [](const char* phase) {
         if (auto* window = DecodeWindow::recording())
             window->mark_current(phase);
@@ -45,7 +49,7 @@ tb::Tensor batch_selected_attention(const BatchDecodeInputs& inputs, int64_t fie
     auto selected = batch_attention_selection(inputs, field, blocks, config.pool, config.budget, columns);
     mark("qsa_select_end");
     const IndirectKvView indirect{inputs.states().data_ptr<int64_t>(), inputs.enabled().data_ptr<int64_t>(),
-                                  int(inputs.rows()), int(field)};
+                                  int(inputs.rows()), int(field), int(field + 4)};
     // Inactive MMA tiles may load index zero before applying their mask. These
     // tiny zero rows are scratch, independent of any request's allocation lifetime.
     auto zero_keys = tb::zeros({1, key.size(2), 1, key.size(3)}, key.options());
