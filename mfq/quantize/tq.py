@@ -26,11 +26,17 @@ def quantize(
     groupsize: int = 512,
     scale_factors: tuple[float, ...] | None = None,
     search: str = "adaptive",
+    column_scaling: bool = False,
+    repair_scales: bool = True,
 ) -> TQTensor:
     """Fit a CUDA 2D weight tensor; return a standalone host payload.
 
     Adaptive 1..4-bit fitting screens the retained scale grid on sampled rows.
     ``search="full"`` retains the original FP32 all-row scale search.
+    ``column_scaling=True`` shares one FP16 input-scale vector across row
+    precisions. Its ``search="fast"`` mode uses sampled scale selection and
+    sparsely repairs clipped rows; ``repair_scales=False`` retains the initial
+    fitted rows for comparisons. Column fitting retains 16-bit states.
     Logical widths are padded to whole rings and subgroups; retain the
     original width when constructing the CUDA ``Projection``.
     """
@@ -38,8 +44,12 @@ def quantize(
         raise ValueError("Expected a nonempty CUDA 2D weight tensor")
     if groupsize < 16 or groupsize > 2**20 or groupsize & (groupsize - 1):
         raise ValueError("groupsize must be a power of two in [16, 2**20]")
-    if search not in ("adaptive", "full"):
-        raise ValueError("search must be adaptive or full")
+    if search not in ("adaptive", "full", "fast"):
+        raise ValueError("search must be adaptive, full or fast")
+    if search == "fast" and not column_scaling:
+        raise ValueError("fast search requires column_scaling=True")
+    if column_scaling and (search == "full" or scale_factors is not None):
+        raise ValueError("Column fitting requires adaptive/fast search and the default scale grid")
     rows, logical = weight.shape
     widths = np.broadcast_to(np.asarray(bits), (rows,))
     if not np.isin(widths, np.arange(1, 9)).all():
@@ -48,7 +58,8 @@ def quantize(
         not scale_factors or any(not math.isfinite(f) or f <= 0 for f in scale_factors)
     ):
         raise ValueError("Scale factors must be finite and positive")
-    width = math.ceil(logical / max(256, groupsize)) * max(256, groupsize)
+    alignment = 256 if column_scaling else max(256, groupsize)
+    width = math.ceil(logical / alignment) * alignment
     with torch.cuda.device(weight.device):
         w = torch.nn.functional.pad(weight.float(), (0, width - logical))
         if not torch.isfinite(w).all():
@@ -69,12 +80,21 @@ def quantize(
         row_payloads = [None] * rows
         descriptors = np.zeros(rows, dtype=np.uint64)
         selectors = np.zeros((rows, width // groupsize), dtype=np.uint8)
+        column_scales = None
+        if column_scaling:
+            from mfq.quantize.cuda.tq_columns import fit_columns, prepare_columns
+            column_scales = prepare_columns(w)
         for k in np.unique(widths):
             k = int(k)
             host_ids = np.flatnonzero(widths == k)
             ids = torch.tensor(host_ids, device=w.device)
             target = w[ids]
-            if search == "adaptive" and k <= 4 and scale_factors is None:
+            if column_scaling:
+                best_states, best_anchor = fit_columns(
+                    target, k, h, column_scales, fast=search == "fast", repair_scales=repair_scales
+                )
+                codes = None
+            elif search == "adaptive" and k <= 4 and scale_factors is None:
                 best_states, best_anchor, codes = fit_rows(target, k, h, groupsize)
             else:
                 anchor = (target.square().mean(-1).sqrt() / code_rms).clamp_min(2**-24).half()
@@ -115,15 +135,19 @@ def quantize(
             packed = pack(best_states, k).cpu().numpy().reshape(len(ids), -1)
             anchors = best_anchor.cpu().numpy().view(np.uint16).astype(np.uint64)
             descriptors[host_ids] = np.uint64(k - 1) << np.uint64(32) | anchors << np.uint64(40)
-            selectors[host_ids] = codes.byte().cpu().numpy()
+            if codes is not None:
+                selectors[host_ids] = codes.byte().cpu().numpy()
             for i, row in enumerate(host_ids):
                 row_payloads[row] = packed[i]
         lengths = width * widths.astype(np.uint64) // 32
         descriptors |= np.r_[np.uint64(0), np.cumsum(lengths[:-1], dtype=np.uint64)]
-        selectors = selectors.reshape(-1)
-        if len(selectors) & 1:
-            selectors = np.pad(selectors, (0, 1))
-        scales = selectors[::2] | (selectors[1::2] << 4)
+        if column_scaling:
+            scales = column_scales.cpu().numpy()
+        else:
+            selectors = selectors.reshape(-1)
+            if len(selectors) & 1:
+                selectors = np.pad(selectors, (0, 1))
+            scales = selectors[::2] | (selectors[1::2] << 4)
         return TQTensor(
-            rows, width, groupsize, False, descriptors, scales, np.concatenate(row_payloads)
+            rows, width, groupsize, column_scaling, descriptors, scales, np.concatenate(row_payloads)
         )
