@@ -206,3 +206,28 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
         assert await run(4) == reference
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("requests", [2, 8, 16, 32])
+@pytest.mark.parametrize("kv_bits", ["0", "3.5"])
+def test_qsa_independent_graph_heterogeneous_requests_match_serial(tmp_path, requests, kv_bits):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512)
+    result = subprocess.run(
+        [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+         "--continuous-batching-check-requests", str(requests), "--moe-gpu-cache-gb", "0"],
+        env=dict(os.environ, MFQ_QSA_INDEPENDENT_BATCH="1", MFQ_KV_TURBOQUANT_BITS=kv_bits),
+        text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "continuous_batching_check PASS" in result.stdout
+    membership = next(line for line in result.stdout.splitlines()
+                      if line.startswith("continuous_batching_membership_check "))
+    metrics = dict(field.split("=", 1) for field in membership.split()[1:])
+    assert int(metrics["captures"]) == 1
+    assert int(metrics["bucket_reuses"]) > 0
+    assert metrics["serial"] == metrics["inactive_state_bits"] == metrics["padding_routes"] == "PASS"
+    if requests > 2:
+        assert f"continuous_batching_growth_check requests={requests} boundary=256 PASS" in result.stdout
