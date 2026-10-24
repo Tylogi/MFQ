@@ -11,6 +11,7 @@
 #include "prefill_budget.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -287,6 +288,12 @@ FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
     model_.reset(1);
     admission_base_kv_bytes_ = managed_kv_bytes();
     if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
+    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch()) {
+        // As many draft tokens as one exclusive MTP window, unless overridden.
+        int64_t tokens = predictor_->maximum_draft_depth();
+        if (const auto* value = std::getenv("MFQ_BATCH_MTP_DRAFT_TOKENS")) tokens = std::max(0, std::atoi(value));
+        mtp_checkpoints_ = std::make_shared<Qwen4BatchCheckpointPool>(tokens);
+    }
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;
 int64_t FlashNextBatchOperations::vocab_size() const { return model_.vocab_size(); }
@@ -300,6 +307,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
     return {{"continuous_batching_mtp_supported", double(batch_mtp_enabled() && predictor_ && predictor_->supports_batch())},
         {"continuous_batching_mtp_stochastic_supported", 0.0},
         {"continuous_batching_mtp_graph_supported", 0.0},
+        {"continuous_batching_mtp_checkpoint_tokens", double(mtp_checkpoints_ ? mtp_checkpoints_->tokens() : 0)},
         {"continuous_batching_mtp_batches", double(mtp_batches_)},
         {"continuous_batching_mtp_drafted_tokens", double(mtp_drafted_)},
         {"continuous_batching_mtp_accepted_tokens", double(mtp_accepted_)},

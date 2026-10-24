@@ -132,6 +132,11 @@ def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, pag
     assert metrics["grammar"] == "1"
     assert int(metrics["drafted"]) > 0
 
+def test_flash_next_batched_mtp_drafts_within_fixed_checkpoints(tmp_path, monkeypatch):
+    # One checkpoint slot for 32 rows: drafts shrink, memory and outputs do not change.
+    monkeypatch.setenv("MFQ_BATCH_MTP_DRAFT_TOKENS", "1")
+    test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, "flash_next", False, 32)
+
 @pytest.mark.parametrize("opt_in", [True, False])
 @pytest.mark.parametrize("family", ["qwen35", "flash_next"])
 def test_mtp_capability_and_seeded_stochastic_exclusion(tmp_path, family, opt_in):

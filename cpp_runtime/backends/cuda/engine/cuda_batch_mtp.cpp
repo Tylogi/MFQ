@@ -204,13 +204,14 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode_mtp(State& st
     const auto verify = [&](const Tensor& host, const Tensor& ids, const std::vector<int>& widths) {
         BatchDecodeMaskScope mask(execution_, verification_mask(widths, ids.size(1), ids));
         BatchMtpVerification result;
-        result.logits = qwen4_batch_decode(model_, caches, ids, host, &result.raw, widths, true)
+        result.logits = qwen4_batch_decode(model_, caches, ids, host, &result.raw, widths, true, mtp_checkpoints_)
             .reshape({ids.size(0), ids.size(1), -1});
         for (auto* cache : caches)
             result.resolve.push_back([cache](int retained) { cache->resolve_verified(retained); });
         return result;
     };
-    auto tokens = run_batch_mtp(*predictor_, MtpTarget(model_), inputs, max_context(), verify);
+    auto tokens = run_batch_mtp(*predictor_, MtpTarget(model_), inputs, max_context(), verify,
+                                mtp_checkpoints_ ? mtp_checkpoints_->available() : -1);
     ++mtp_batches_;
     ++decode_batches_;
     decode_tokens_ += inputs.size();
