@@ -95,6 +95,7 @@ class ClusterBackend:
         self._sessions: dict[tuple[UUID, UUID], _RemoteSession] = {}
         self._lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        self._refreshed_at = float("-inf")
         self._closed = False
 
     @staticmethod
@@ -110,7 +111,28 @@ class ClusterBackend:
         return {"Authorization": f"Bearer {token}"}
 
     async def refresh(self, *, force: bool = False) -> list[RemoteNodeResource]:
+        # Every request calls this before routing. With no remote nodes the
+        # refresh is still a lock, a thread hop and a SQLite read, so serve the
+        # last snapshot until the health TTL expires.
+        if not force and time.monotonic() - self._refreshed_at < self.health_ttl_seconds:
+            async with self._lock:
+                if self._closed:
+                    raise BackendError(
+                        "backend_closed",
+                        "cluster backend is closed",
+                        status_code=503,
+                    )
+                return [self._public(state) for state in self._states.values()]
         async with self._refresh_lock:
+            if not force and time.monotonic() - self._refreshed_at < self.health_ttl_seconds:
+                async with self._lock:
+                    if self._closed:
+                        raise BackendError(
+                            "backend_closed",
+                            "cluster backend is closed",
+                            status_code=503,
+                        )
+                    return [self._public(state) for state in self._states.values()]
             async with self._lock:
                 if self._closed:
                     raise BackendError(
@@ -152,6 +174,7 @@ class ClusterBackend:
                 )
             )
             async with self._lock:
+                self._refreshed_at = time.monotonic()
                 return [self._public(state) for state in self._states.values()]
 
     async def _probe(self, state: _NodeState, *, force: bool) -> None:

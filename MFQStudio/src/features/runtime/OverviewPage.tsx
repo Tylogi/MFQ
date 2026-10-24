@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import {
@@ -19,6 +19,7 @@ import { residentMemoryCapacity } from './memoryArchitecture';
 import { anthropicEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
+import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
@@ -70,7 +71,56 @@ export function OverviewPage() {
     window.addEventListener('focus', refresh);
     return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
   }, [serviceUrl, connectionRevision]);
-  const availableModelNames = runtimeModelNames(models, instances);
+  const availableModelNames = useMemo(
+    () => runtimeModelNames(models, instances),
+    [models, instances],
+  );
+  // The serving poll re-renders this page twice a second. Keeping the cards as
+  // stable elements lets React skip rebuilding the grid when only the
+  // statistics changed.
+  const modelCards = useMemo(
+    () =>
+      availableModelNames.map((name) => {
+        const instance = instances.find(
+          (candidate) => candidate.model === name && candidate.state !== 'failed',
+        );
+        const selected = name === model;
+        const stateLabel = instance?.state === 'busy' ? tr('使用中', 'Busy') : tr('就绪', 'Ready');
+        const details = [
+          instance?.devices.join(' + '),
+          instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
+          instance
+            ? tr(`${instance.active_sessions} 个会话`, `${instance.active_sessions} sessions`)
+            : null,
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        return (
+          <button
+            aria-pressed={selected}
+            className={`overview-model-card${selected ? ' selected' : ''}`}
+            disabled={busy || selected}
+            key={name}
+            onClick={() => selectModel(name)}
+            type="button"
+          >
+            <ModelMonogram name={name} state="ready" />
+            <span className="overview-model-copy">
+              <strong title={name}>{name}</strong>
+              <small>{details || stateLabel}</small>
+            </span>
+            <span className="model-identity-trailing">
+              <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
+              <span className="runtime-status-pill ready">
+                <i />
+                {selected ? tr('当前', 'Current') : stateLabel}
+              </span>
+            </span>
+          </button>
+        );
+      }),
+    [availableModelNames, instances, model, busy, runtime, selectModel, tr],
+  );
   const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
   const endpoints = [
     { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
@@ -111,51 +161,7 @@ export function OverviewPage() {
             )}
           />
           <TMPanel className="overview-models-panel">
-            <div className="overview-model-grid">
-              {availableModelNames.map((name) => {
-                const instance = instances.find(
-                  (candidate) => candidate.model === name && candidate.state !== 'failed',
-                );
-                const selected = name === model;
-                const stateLabel =
-                  instance?.state === 'busy' ? tr('使用中', 'Busy') : tr('就绪', 'Ready');
-                const details = [
-                  instance?.devices.join(' + '),
-                  instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
-                  instance
-                    ? tr(
-                        `${instance.active_sessions} 个会话`,
-                        `${instance.active_sessions} sessions`,
-                      )
-                    : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ');
-                return (
-                  <button
-                    aria-pressed={selected}
-                    className={`overview-model-card${selected ? ' selected' : ''}`}
-                    disabled={busy || selected}
-                    key={name}
-                    onClick={() => selectModel(name)}
-                    type="button"
-                  >
-                    <ModelMonogram name={name} state="ready" />
-                    <span className="overview-model-copy">
-                      <strong title={name}>{name}</strong>
-                      <small>{details || stateLabel}</small>
-                    </span>
-                    <span className="model-identity-trailing">
-                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
-                      <span className="runtime-status-pill ready">
-                        <i />
-                        {selected ? tr('当前', 'Current') : stateLabel}
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+            <div className="overview-model-grid">{modelCards}</div>
           </TMPanel>
         </>
       )}

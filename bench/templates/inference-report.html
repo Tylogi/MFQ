@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title>
+<meta name="author" content="MFQ benchmark reporter">
+<meta name="description" content="推理吞吐量、延遲、MTP 與 GPU 資源使用的可重現報告。">
+<meta name="keywords" content="benchmark, inference, MTP, GPU">
+<meta name="generator" content="Kami">
+<!-- Adapted from Kami long-doc, with a white palette and screen chart layout.
+MIT License — Copyright (c) 2026 Tw93
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE. -->
+<style>
+:root {
+  color-scheme: light;
+  --paper: #ffffff; --ink: $ink; --muted: $muted; --brand: $brand;
+  --border: #dce3ed; --quiet: #f5f8fc;
+  --serif: "Source Han Serif TC", "Noto Serif CJK TC", "Songti TC", "Songti SC", Georgia, serif;
+  --sans: system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.55 var(--serif); }
+a { color: var(--brand); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--brand); outline-offset: 5px; }
+.wrap { max-width: 1440px; margin: auto; padding: 48px 48px 72px; }
+.cover-eyebrow, .chapter-num { font: 500 12px/1.35 var(--sans); color: var(--brand); letter-spacing: .12em; text-transform: uppercase; }
+h1, h2, h3 { font-weight: 500; line-height: 1.2; }
+h1 { font-size: 44px; margin: 16px 0; }
+h2 { font-size: 28px; margin: 8px 0 12px; }
+h3 { font-size: 20px; margin: 20px 0 10px; }
+p { margin: 0 0 12px; }
+.cover-sub { font-size: 20px; color: var(--muted); margin-bottom: 20px; }
+.cover-meta { font: 13px/1.5 var(--sans); color: var(--muted); overflow-wrap: anywhere; }
+.header { border-bottom: 1px solid var(--border); padding-bottom: 28px; }
+.facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; padding: 26px 0; }
+.metric-value { display: block; font-size: 30px; line-height: 1.2; font-weight: 500; color: var(--brand); font-variant-numeric: tabular-nums; }
+.metric-label { display: block; font: 13px/1.4 var(--sans); color: var(--muted); margin-top: 8px; }
+.downloads { display: flex; flex-wrap: wrap; gap: 12px 24px; font: 14px/1.5 var(--sans); }
+.layout { display: grid; grid-template-columns: 172px minmax(0, 1fr); gap: 40px; }
+nav { position: sticky; top: 24px; align-self: start; padding-top: 32px; font: 13px/1.5 var(--sans); }
+nav a { display: block; color: var(--muted); padding: 7px 0; }
+nav a:hover { color: var(--brand); }
+nav .nav-label { margin-bottom: 12px; color: var(--ink); font-size: 11px; letter-spacing: .1em; }
+main { min-width: 0; }
+section { padding: 32px 0; border-bottom: 1px solid var(--border); scroll-margin-top: 24px; }
+section:last-child { border-bottom: none; }
+.prose { max-width: 720px; }
+.lead { font-size: 18px; color: var(--ink); }
+.findings { margin: 20px 0; padding-left: 24px; }
+.findings li { margin: 10px 0; }
+.figure-header { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+.exports { display: flex; gap: 16px; white-space: nowrap; font: 13px/1.4 var(--sans); }
+figure { margin: 20px 0 0; }
+.chart-scroll { overflow-x: auto; overscroll-behavior-inline: contain; }
+.chart-scroll img { display: block; width: 100%; min-width: 760px; height: auto; }
+figcaption, .note { font: 13px/1.5 var(--sans); color: var(--muted); margin-top: 12px; }
+.mobile-hint { display: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px 24px; margin: 24px 0 12px; font: 13px/1.4 var(--sans); }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 7px; }
+details { margin-top: 20px; }
+summary { cursor: pointer; font: 14px/1.5 var(--sans); color: var(--brand); }
+details p { margin-top: 14px; }
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font: 13px/1.5 var(--sans); margin: 16px 0; }
+th { text-align: left; font-weight: 500; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+td { padding: 10px 12px; border-bottom: 1px solid #edf0f5; vertical-align: top; }
+.coverage-table { min-width: 640px; }
+.protocol-table td { overflow-wrap: anywhere; }
+.state { white-space: nowrap; color: var(--brand); }
+.state.not_measured, .state.missing { color: #9c2646; }
+footer { border-top: 1px solid var(--border); margin-top: 28px; padding-top: 20px; font: 12px/1.5 var(--sans); color: var(--muted); }
+@media (max-width: 1080px) {
+  .wrap { padding: 32px 28px 48px; }
+  .layout { display: block; }
+  nav { position: static; display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 22px 0; border-bottom: 1px solid var(--border); }
+  nav .nav-label { width: 100%; margin: 0; }
+  nav a { padding: 4px 0; }
+  .mobile-hint { display: inline; }
+}
+@media (max-width: 600px) {
+  .wrap { padding: 24px 20px 36px; }
+  h1 { font-size: 32px; }
+  h2 { font-size: 24px; }
+  .cover-sub { font-size: 18px; }
+  .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px 14px; }
+  .metric-value { font-size: 26px; }
+  .metric-label { font-size: 12px; }
+  .figure-header { display: block; }
+  .exports { margin-top: 12px; }
+  .downloads { gap: 12px 20px; }
+  section { padding: 28px 0; }
+}
+@media print {
+  @page { size: A4 landscape; margin: 14mm 16mm; }
+  :root { --sans: var(--serif); }
+  .wrap { max-width: none; padding: 0; }
+  .layout { display: block; }
+  nav, .downloads, .exports, .mobile-hint, figcaption, footer { display: none; }
+  h1 { font-size: 30px; }
+  h2 { font-size: 22px; }
+  .header { padding-bottom: 16px; }
+  .facts { padding: 16px 0; }
+  section { padding: 16px 0; }
+  .chart-section, #coverage { break-before: page; }
+  .chart-section { break-inside: avoid; border: 0; padding: 0; }
+  .chart-scroll, .table-scroll { overflow: visible; }
+  .chart-scroll img { min-width: 0; max-height: 140mm; object-fit: contain; }
+}
+</style>
+</head>
+<body><div class="wrap">
+<header class="header" id="top">
+  <div class="cover-eyebrow">MFQ / INFERENCE BENCHMARK</div>
+  <h1>推理基準測試報告</h1>
+  <p class="cover-sub">$model</p>
+  <p class="cover-meta">$hardware · $backend · Revision $revision</p>
+  <div class="facts">$facts</div>
+  <div class="downloads"><a href="charts.pdf">完整圖表 PDF ↓</a><a href="summary.csv">摘要 CSV ↓</a><a href="samples.csv">逐輪 CSV ↓</a><a href="bundle.json">完整資料 JSON ↓</a>$archive_link</div>
+</header>
+<div class="layout">
+<nav aria-label="報告目錄"><div class="nav-label">CONTENTS / 目錄</div><a href="#overview">量測概覽</a>$nav<a href="#coverage">指標覆蓋範圍</a></nav>
+<main>
+<section id="overview">
+  <div class="chapter-num">OVERVIEW</div><h2>先看結果，再核對條件</h2>
+  <div class="prose"><p class="lead">$overview</p><ul class="findings">$findings</ul></div>
+  <div class="legend">$legend</div>
+  <details><summary>測試條件與統計方法</summary><div class="prose"><p>$methods</p></div><div class="table-scroll"><table class="protocol-table"><tbody>$protocol</tbody></table></div></details>
+</section>
+$cards
+<section id="coverage">
+  <div class="chapter-num">METRIC COVERAGE</div><h2>資料覆蓋範圍</h2>
+  <p class="prose">下表列出本次已保存、由量測推導及尚未量測的指標。空缺不以其他模型或實驗的數字補入。</p>
+  <div class="table-scroll" tabindex="0" role="region" aria-label="指標覆蓋表"><table class="coverage-table"><thead><tr><th>指標</th><th>資料狀態</th><th>圖表與說明</th></tr></thead><tbody>$coverage</tbody></table></div>
+  <p class="note">每格 $repetitions 次正式樣本。分佈用於觀察波動，不代表顯著性或逐 token 的 p95/p99。原始匯出未保留 native finish reason，本工具無法重新驗證。</p>
+</section>
+</main></div>
+<footer>資料與圖表來自同一份驗證後的 bundle。圖中暖機不計入統計；SVG、PNG、PDF 與資料表均附於本報告。版面參考 Kami，保留本專案的白底與比較配色。</footer>
+</div></body></html>

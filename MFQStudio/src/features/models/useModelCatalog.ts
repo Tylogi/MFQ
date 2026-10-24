@@ -62,7 +62,6 @@ export function useModelCatalog() {
   const availableModelNames = runtimeModelNames(models, instances);
   const openStudioPage = (_view: string, page: 'models') =>
     navigate(labPath(page));
-  const artifactRevision = jobs.map((job) => job.id + ':' + job.status).join(',');
   function setModelBrowserOpen(open: boolean) {
     if (!open) {
       directoryRequest.current += 1;
@@ -123,7 +122,10 @@ export function useModelCatalog() {
       polling = true;
       const request = ++artifactRequest.current;
       try {
-        const items = await modelsApi.modelArtifacts(true);
+        // The server refreshes its catalog on a background timer. A forced
+        // rescan on every poll would re-walk every model root and re-read
+        // shard headers, so only explicit actions ask for one.
+        const items = await modelsApi.modelArtifacts(false);
         if (active && request === artifactRequest.current) { setArtifacts(items); reported = false; }
       } catch (cause) {
         if (active && request === artifactRequest.current && !reported) { reportError(cause); reported = true; }
@@ -142,7 +144,9 @@ export function useModelCatalog() {
       document.removeEventListener('visibilitychange', visible);
       window.removeEventListener('focus', visible);
     };
-  }, [ready, connectionRevision, artifactRevision]);
+    // Job transitions no longer restart the poll; the terminal handler below
+    // requests one forced rescan per settled load instead.
+  }, [ready, connectionRevision]);
   useEffect(() => {
     for (const job of jobs) {
       if (job.kind !== 'model.load') continue;
@@ -152,7 +156,17 @@ export function useModelCatalog() {
       }
       if (job.status === 'failed' && !job.error?.message) continue;
       const wasActive = observedActiveLoadJobIds.current.delete(job.id);
-      if (wasActive && (job.status === 'failed' || job.status === 'interrupted') && !reportedFailedJobIds.current.has(job.id)) {
+      if (!wasActive) continue;
+      // A settled load changes the catalog; ask for one authoritative rescan
+      // rather than paying for one on every poll.
+      const request = ++artifactRequest.current;
+      void modelsApi
+        .modelArtifacts(true)
+        .then((items) => {
+          if (request === artifactRequest.current) setArtifacts(items);
+        })
+        .catch(() => {});
+      if ((job.status === 'failed' || job.status === 'interrupted') && !reportedFailedJobIds.current.has(job.id)) {
         reportedFailedJobIds.current.add(job.id);
         toast.error(job.status === 'interrupted'
           ? tr('模型加载已中断，请重新加载。', 'Model loading was interrupted. Please load the model again.')

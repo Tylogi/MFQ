@@ -2,6 +2,7 @@
 #include "mfq_cuda_norm_ops.h"
 
 #include "selected_attention.h"
+#include "qsa_scores.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -358,19 +359,7 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
 }
 
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
-    mfq_selected_attention::values({&query, &pooled});
-    MfqCudaGuard guard(query.device());
-    const auto* option=std::getenv("MFQ_QSA_PREFILL_SCORE_GEMM");
-    if(query.size(1)>=32 && option && option[0]=='1') {
-        // Each index head owns a token matrix. This replaces thousands of
-        // four-row GEMMs with a few large GEMMs and retains head reduction.
-        auto q=query.to(tb::kFloat32).permute({0,2,1,3}).contiguous();
-        auto keys=pooled.to(tb::kFloat32).transpose(-1,-2).unsqueeze(1);
-        auto products=tb::matmul(q,keys).permute({0,2,1,3}).clamp_min(0.0);
-        return products.sum(-2)/std::sqrt(double(query.size(-1)));
-    }
-    return mfq_selected_attention::dots(query, pooled).sum(-2) /
-        std::sqrt(double(query.size(-1)));
+    return mfq_qsa::block_scores(query, pooled);
 }
 
 namespace {
