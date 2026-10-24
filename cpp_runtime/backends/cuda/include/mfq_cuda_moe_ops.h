@@ -5,6 +5,13 @@
 #include <cstdint>
 #include <vector>
 
+// Direct dense-bank projection. Large batches consume the existing compact
+// expert map; <=8 token batches read route IDs directly without building a map.
+mfq_tensor_backend::Tensor dense_moe_grouped_matmul_cuda(
+    mfq_tensor_backend::Tensor bank, mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts, int64_t tile_m);
+
 std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     mfq_tensor_backend::Tensor logits, int64_t top_k, bool use_sigmoid, bool use_sqrt_softplus,
     bool normalize,

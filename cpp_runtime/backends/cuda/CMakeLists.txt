@@ -100,6 +100,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/dense_moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qk_rope_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
@@ -410,6 +411,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
     ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/dense_moe.cpp
     ${MFQ_CUDA_ROOT}/ops/moe.cpp
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
@@ -659,6 +661,13 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
     add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
     set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-moe-route-map-test ${MFQ_CUDA_ROOT}/tests/moe_route_map_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-moe-route-map-test)
+    target_compile_definitions(mfq-moe-route-map-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-moe-route-map-test PRIVATE
+        mfq-cuda-runtime mfq-cuda-native-kernels)
+    add_test(NAME mfq-moe-route-map-test COMMAND mfq-moe-route-map-test)
+    set_tests_properties(mfq-moe-route-map-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-qk-rope-kv-test ${MFQ_CUDA_ROOT}/tests/qk_rope_kv_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-qk-rope-kv-test)
     target_compile_definitions(mfq-qk-rope-kv-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

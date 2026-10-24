@@ -1,11 +1,16 @@
 // Native checks for two shared capabilities:
 // NoPE GQA through FullBlock and a latent MoE with non-gated relu-squared
-// experts. All references are double-precision CPU implementations.
+// experts. CPU references use double precision; dense grouped projections
+// additionally compare with the bounded legacy gather path.
 
 #include "cuda_execution.h"
 #include "core/ffn.h"
 #include "core/full_block.h"
 #include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_activation_ops.h"
+#include <cuda_runtime.h>
+#include <iomanip>
+#include <set>
 #include "mfq_tensor_backend.h"
 
 #include <algorithm>
@@ -525,20 +530,24 @@ void check_dense_routed_chunking() {
     const std::size_t row_bytes = static_cast<std::size_t>(routes * output * width) * sizeof(float);
     const std::size_t unbounded = std::numeric_limits<std::size_t>::max();
     for (const auto& input : {flat, routed}) {
-        const auto whole = host_values(dense_routed_projection(bank, input, ids, unbounded));
+        const auto grouped = host_values(dense_routed_projection(bank, input, ids));
+        const auto whole = host_values(dense_routed_projection_gather(bank, input, ids, unbounded));
         // Four rows per chunk leaves a three-row remainder.
-        const auto chunked = host_values(dense_routed_projection(bank, input, ids, 4 * row_bytes));
-        const auto single = host_values(dense_routed_projection(bank, input, ids, 1));
+        const auto chunked = host_values(dense_routed_projection_gather(bank, input, ids, 4 * row_bytes));
+        const auto single = host_values(dense_routed_projection_gather(bank, input, ids, 1));
         require(whole.size() == static_cast<std::size_t>(rows * routes * output),
                 "dense routed projection returned the wrong shape");
         const std::vector<double> expected(whole.begin(), whole.end());
         const double chunk_difference = max_difference(chunked, expected);
         const double single_difference = max_difference(single, expected);
+        require(max_difference(grouped, expected) <= 1e-6, "grouped F32 tail projection differs");
         require(chunk_difference <= 1e-6 && single_difference <= 1e-6,
                 "chunked dense routed projection differs: " + std::to_string(chunk_difference) +
                     " / " + std::to_string(single_difference));
     }
 }
+
+#include "dense_moe_checks.h"
 
 std::vector<int64_t> reference_topk(const std::vector<float>& logits, const std::vector<float>& bias,
                                     int top_k) {
@@ -589,8 +598,20 @@ void check_topk_512() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 6 && std::string(argv[1]) == "--dense-moe-memory") {
+            const std::string mode = argv[5];
+            require(mode == "grouped" || mode == "gather", "unknown projection mode");
+            measure_dense_workspace(argv[2], std::stoi(argv[3]), std::stoi(argv[4]), mode == "grouped");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--dense-moe-bench") {
+            benchmark_dense_routed();
+            return 0;
+        }
+        check_dense_grouped();
+        check_dense_gated_layouts();
         check_attention_case(true, tb::kFloat16, 4e-3f);
         check_attention_case(false, tb::kFloat16, 4e-3f);
         check_latent_moe(tb::kFloat16, 3e-3f);

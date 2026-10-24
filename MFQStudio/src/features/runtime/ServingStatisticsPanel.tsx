@@ -15,6 +15,8 @@ export function ServingStatisticsPanel({ data, error, scope, onScopeChange }: St
   const active = data?.activity.filter(item => item.active_requests > 0 || item.queued_requests > 0) ?? [];
   const concurrency = data?.activity.reduce((total, item) => total + item.active_requests, 0);
   const queued = data?.activity.reduce((total, item) => total + item.queued_requests, 0);
+  const capacity = data?.activity.reduce((total, item) => total + (item.request_capacity ?? 1), 0) ?? 0;
+  const queueWait = data?.activity.reduce((max, item) => Math.max(max, item.queue_wait_ms_max ?? 0), 0) ?? 0;
   return <>
     <div className="serving-heading">
       <SectionLabel title={tr('服务统计', 'Serving statistics')} subtitle={tr('已完成请求 · 所有模型', 'Completed requests · all models')} />
@@ -34,13 +36,20 @@ export function ServingStatisticsPanel({ data, error, scope, onScopeChange }: St
       <MetricTile label={tr('前缀复用', 'Prefix reuse')} value={totals?.cache_hit_rate == null ? '--' : `${formatNumber(totals.cache_hit_rate, 1)}%`}
         detail={totals?.completed_requests ? tr(`已复用 ${formatNumber(totals.cached_tokens)} tokens`, `${formatNumber(totals.cached_tokens)} tokens reused`) : '--'} icon="reuse" />
       <MetricTile label={tr('并发数', 'Concurrency')} value={formatNumber(concurrency)}
-        detail={queued ? tr(`${formatNumber(queued)} 个排队`, `${formatNumber(queued)} queued`) : tr('当前活动请求', 'Active requests')} icon="queue" />
+        detail={queued
+          ? tr(`${formatNumber(queued)} 个排队 · ${formatNumber(capacity)} 个槽位`, `${formatNumber(queued)} queued · ${formatNumber(capacity)} slots`)
+          : capacity > 1
+            ? tr(`${formatNumber(concurrency)} / ${formatNumber(capacity)} 个并发槽位`, `${formatNumber(concurrency)} of ${formatNumber(capacity)} slots`)
+            : queueWait > 0
+              ? tr(`最长排队 ${formatNumber(queueWait)} ms`, `${formatNumber(queueWait)} ms max queue wait`)
+              : tr('当前活动请求', 'Active requests')} icon="queue" />
     </div>
     {active.length > 0 && <>
       <SectionLabel title={tr('当前请求', 'Current requests')} />
       <TMPanel className="serving-activity-panel">{active.map(item => <div className="serving-model-activity" key={item.instance_id}>
         <div className="serving-model-heading"><strong title={item.model}>{item.model}</strong>
           <span>{tr(`${item.active_requests} 个活动请求`, `${item.active_requests} active`)}</span>
+          {(item.request_capacity ?? 1) > 1 && <span>{tr(`${item.request_capacity} 个槽位`, `${item.request_capacity} slots`)}</span>}
           {item.queued_requests > 0 && <span>{tr(`${item.queued_requests} 个排队`, `${item.queued_requests} queued`)}</span>}
         </div>
         {item.requests.length === 0 && <div className="serving-request"><span>{tr('处理中', 'Processing')}</span></div>}
