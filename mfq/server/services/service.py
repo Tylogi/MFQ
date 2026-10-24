@@ -101,6 +101,7 @@ from mfq.server.protocol.models import (
     ModelDirectoryList,
     ModelDeletionPlan,
     ModelLoadRequest,
+    RuntimeConcurrencyReloadRequest,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
     ConfigureQsaKvOffloadRequest,
@@ -327,6 +328,10 @@ class ServerService:
         self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
+            if hasattr(runtime_manager, "configure_concurrency"):
+                self.jobs.register("runtime.concurrency.configure", TypedJobHandler(
+                    runtime_manager.configure_concurrency, RuntimeConcurrencyReloadRequest,
+                ))
             if hasattr(runtime_manager, "context_policy"):
                 runtime_manager.context_policy = RuntimeContextPolicy.model_validate(store.runtime_context_policy())
                 self.jobs.register("runtime.context.configure", TypedJobHandler(runtime_manager.configure_context, RuntimeReloadRequest))
@@ -1651,6 +1656,11 @@ class ServerService:
             raise ServiceError(
                 501, "model_management_unavailable", "model loading is not available"
             )
+        if hasattr(self.runtime_manager, "resolve_concurrency"):
+            try:
+                self.runtime_manager.resolve_concurrency(request)
+            except BackendError as error:
+                raise ServiceError(error.status_code or 422, error.code, str(error)) from error
         job = await self.create_job(
             CreateJobRequest(kind="model.load", payload=request.model_dump(mode="json", exclude_unset=True))
         )

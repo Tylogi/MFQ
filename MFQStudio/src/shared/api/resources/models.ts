@@ -1,5 +1,6 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
+  RuntimeConcurrencySettings,
   ModelArtifact,
   ModelDeletionPlan,
   ModelCacheProfile,
@@ -112,12 +113,20 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize: number | 'auto' = 'auto',
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
+    policy: Partial<RuntimeConcurrencySettings> & {
+      pin?: boolean;
+      idle_ttl_seconds?: number | null;
+      device_ids?: string[];
+      context_management?: ModelLoadContextSettings;
+    } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
       body: JSON.stringify({
         model,
+        max_requests: policy.max_requests,
+        max_queued_requests: policy.max_queued_requests,
+        queue_timeout_seconds: policy.queue_timeout_seconds,
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
