@@ -15,6 +15,12 @@ struct mfq_fattn_runtime_input {
     int causal_query_offset = 0;
     int causal_row_count = 0;
     bool half_query = false;
+    bool bf16_query = false;
+    // Inline selection: when index_count > 0 the row indices themselves carry
+    // the sentinels (negative, past index_count, or outside [0, index_limit))
+    // instead of a padded index buffer plus a separate FP16 logit mask.
+    int index_count = 0;
+    int index_limit = 0;
     const half2* hot_keys = nullptr;
     const half2* hot_values = nullptr;
     const int32_t* hot_mapping = nullptr;
@@ -376,6 +382,24 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// KV row a selection slot reads. Inline selection clamps padded, negative and
+// out-of-range slots to row 0 so the loader never touches an invalid KV row;
+// the sentinel logit mask then removes those slots from the softmax.
+static __device__ __forceinline__ int flash_attn_ext_f16_slot_row(
+        const int * const __restrict__ row_indices, const int slot,
+        const int implicit_row, const int implicit_row_count,
+        const int slot_count, const int index_limit) {
+    if (index_limit > 0 && slot >= slot_count) {
+        return 0;
+    }
+    const int row = row_indices ? row_indices[slot]
+        : (implicit_row < implicit_row_count ? implicit_row : 0);
+    if (index_limit <= 0) {
+        return row;
+    }
+    return row >= 0 && row < index_limit ? row : 0;
+}
+
 template<int stride_tile, bool swizzled, int nwarps, int nbatch_fa,
          bool use_cp_async, bool oob_check,
          bool use_indirect = false, bool use_hot = false>
@@ -384,7 +408,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const int D2, const int stride_KV, const int i_sup,
         const int * const __restrict__ row_indices = nullptr,
         const int implicit_row_start = 0,
-        const int implicit_row_count = 0, const half2* hot = nullptr, const int32_t* mapping = nullptr, const int32_t* cold_mapping = nullptr) {
+        const int implicit_row_count = 0,
+        const half2* hot = nullptr, const int32_t* mapping = nullptr,
+        const int32_t* cold_mapping = nullptr,
+        const int slot_count = 0, const int index_limit = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity is 16 bytes.
@@ -416,8 +443,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 }
 
                 const int implicit_row = implicit_row_start + i;
-                const int row = use_indirect ? (row_indices ? row_indices[i]
-                    : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
+                const int row = use_indirect ? flash_attn_ext_f16_slot_row(
+                    row_indices, i, implicit_row, implicit_row_count,
+                    slot_count, index_limit) : i;
                 const half2* source_row=KV+int64_t(row)*stride_KV;
                 if constexpr(use_hot) {const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}
 
@@ -469,8 +497,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
                 const bool valid = !oob_check || i < i_sup;
                 const int implicit_row = implicit_row_start + i;
-                const int row = use_indirect && valid ? (row_indices ? row_indices[i]
-                    : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
+                const int row = use_indirect && valid ? flash_attn_ext_f16_slot_row(
+                    row_indices, i, implicit_row, implicit_row_count,
+                    slot_count, index_limit) : i;
                 const half2* source_row=KV+int64_t(row)*stride_KV;
                 if constexpr(use_hot) {if(valid){const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}}
 
@@ -605,6 +634,27 @@ static __device__ __forceinline__ void flash_attn_ext_f16_make_causal_mask(
     }
 }
 
+// Inline selection mask: -inf for padded slots and for indices outside the KV
+// cache, 0 otherwise. Replaces a prepared padded index buffer and FP16 mask.
+template<int ncols1, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_f16_make_sentinel_mask(
+        half * const __restrict__ tile_mask,
+        const int * const __restrict__ row_indices,
+        const int slot_count,
+        const int index_limit) {
+    constexpr int threads = nwarps * ggml_cuda_get_physical_warp_size();
+    constexpr int elements = ncols1 * nbatch_fa;
+    const int thread = threadIdx.y * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int index = thread; index < elements; index += threads) {
+        const int slot = index % nbatch_fa;
+        const int row = slot < slot_count ? row_indices[slot] : -1;
+        const bool valid = row >= 0 && row < index_limit;
+        tile_mask[(index / nbatch_fa) * (nbatch_fa + 8) + slot] =
+            valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_indirect,
     bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
@@ -669,6 +719,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         : ggml_cuda_fattn_smem_swizzle::enabled(nbatch_V2);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+    // Inline selection owns at most nbatch_fa slots per tile starting at k_VKQ_0.
+    const int slot_count = row_indices != nullptr && input.index_count > 0
+        ? min(nbatch_fa, input.index_count - k_VKQ_0) : 0;
+    const bool sentinel_mask = slot_count > 0;
+    const int index_limit = sentinel_mask ? input.index_limit : 0;
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -701,6 +756,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         } else if (implicit_causal) {
             flash_attn_ext_f16_make_causal_mask<ncols1, nwarps, nbatch_fa>(
                 tile_mask, k_VKQ_0, jt*ncols1, query_key_min, input);
+        } else if (sentinel_mask) {
+            flash_attn_ext_f16_make_sentinel_mask<ncols1, nwarps, nbatch_fa>(
+                tile_mask, row_indices + k_VKQ_0, slot_count, input.index_limit);
         }
     }
 
@@ -721,7 +779,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                          use_cp_async, oob_check, use_indirect, use_hot>
                 (K_tile, tile_K, k0_diff, stride_K, k_VKQ_sup,
                  use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
-                 k_VKQ_0, input.causal_row_count, input.hot_keys, input.hot_mapping, input.cold_mapping);
+                 k_VKQ_0, input.causal_row_count, input.hot_keys, input.hot_mapping, input.cold_mapping,
+                 slot_count, index_limit);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -809,7 +868,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (mask_h || implicit_causal) {
+        if (mask_h || implicit_causal || sentinel_mask) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -871,7 +930,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (mask_h || implicit_causal) {
+        if (mask_h || implicit_causal || sentinel_mask) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -1095,7 +1154,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                              use_cp_async, oob_check, use_indirect, use_hot>
                     (V_tile, tile_V, i0_diff/2, stride_V, k_VKQ_sup,
                      use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
-                     k_VKQ_0, input.causal_row_count, input.hot_values, input.hot_mapping, input.cold_mapping);
+                     k_VKQ_0, input.causal_row_count, input.hot_values, input.hot_mapping, input.cold_mapping,
+                     slot_count, index_limit);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1390,7 +1450,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     if (input.query) {
                         const int64_t at = int64_t(jt*ncols1 + j)*input.query_token_stride +
                             int64_t(c)*input.query_head_stride + int64_t(2*k)*input.query_column_stride;
-                        if (input.half_query) {
+                        if (input.bf16_query) {
+                            const auto* source = static_cast<const __nv_bfloat16*>(input.query);
+                            tmp = make_float2(__bfloat162float(source[at]),
+                                __bfloat162float(source[at + input.query_column_stride]));
+                        } else if (input.half_query) {
                             const auto* source = static_cast<const half*>(input.query);
                             tmp = make_float2(__half2float(source[at]),
                                 __half2float(source[at + input.query_column_stride]));

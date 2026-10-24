@@ -77,6 +77,10 @@ Supported operations are `generate`, `count_tokens`, `score`, `health`, `status`
 `cache.clear`, `cache.trim`, `realtime.capabilities`, `realtime.open`,
 `realtime.send`, `realtime.close`, and `shutdown`.
 
+`health` and `status` also return `batch_capacity`: the rows the loaded model can
+batch concurrently. The server adopts that report after the load handshake and
+sizes its admission limit from it (see [concurrency.md](concurrency.md)).
+
 Writes are serialized and response frames are multiplexed by ID. EOF cancels
 unfinished generation and closes realtime state. Large multimodal tensors stay
 out of band in the existing controlled temporary files.

@@ -1,8 +1,10 @@
 """Native CUDA row-bucket graphs with recurrent and full-attention request state."""
 
+import asyncio
 import json
 import os
 import subprocess
+from contextlib import suppress
 
 import numpy as np
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from mfq.formats import io
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from tests.test_cuda_kv_quantization_native import write_qwen35_fixture
+from tests.test_native_nint_ple import _fresh_idle_status, _models, _worker_tokenizer
 
 
 def _recurrent_model(path):
@@ -107,3 +110,74 @@ def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_p
     assert int(metrics["bucket_reuses"]) == int(metrics["steps"]) - 1
     assert all(metrics[name] == "PASS" for name in ("serial", "inactive_state_bits", "inactive_rng", "padding_routes"))
     assert "continuous_batching_sampling_oracle logits=tied" in result.stdout
+
+
+@pytest.mark.parametrize("budget", [32, 2048])
+@pytest.mark.parametrize("cells", [16, 496])
+def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=True)
+    header, weights = io.load(model)
+    config = json.loads(weights[MODEL_CONFIG_ASSET])
+    config["text_config"].update(num_key_value_heads=2, indexer_budget=budget)
+    for role in ("key", "value"):
+        name = f"model.block.1.attention.{role}.weight"
+        weights[name] = np.tile(weights[name], (2, 1))
+    weights[MODEL_CONFIG_ASSET] = json.dumps(config).encode()
+    io.save(model, header, weights)
+    tokenizer = _worker_tokenizer(tmp_path)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="8388608",
+                       MFQ_MEMORY_ARCHITECTURE="discrete", MFQ_KV_RAM_PREALLOCATED="1",
+                       MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * 512))
+    # A small GPU tier exercises eviction and cold reads; a small RAM tier
+    # exposes writes through the logical [heads, 512, width] view immediately.
+    prompts = ["ab" * count for count in (12, 25, 40)]
+
+    async def run(capacity):
+        log_path = tmp_path / f"tiered-{capacity}.log"
+        with log_path.open("wb") as log:
+            process = await asyncio.create_subprocess_exec(
+                executable, "--model", str(model), "--tokenizer", str(tokenizer), "--transport", "stdio",
+                "--ctx-size", "512", "--continuous-batching", str(capacity), "--moe-gpu-cache-gb", "0.00004",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
+                env=dict(environment, MFQ_CONTINUOUS_BATCH_CUDA_GRAPH=str(int(capacity > 1))),
+            )
+            client = StdioRuntimeClient(process, control_timeout_seconds=15)
+            try:
+                await client.status()
+
+                async def generate(prompt):
+                    async with client.generate({"messages": [{"role": "user", "content": prompt}],
+                            "mfq_preformatted_prompt": prompt, "temperature": 0,
+                            "top_k": 1, "max_tokens": 32, "enable_mtp": False, "stream": True}) as events:
+                        output = [event async for event in events if event is not None]
+                    return "".join(choice.get("delta", {}).get("content", "")
+                                   for event in output for choice in event.get("choices", []))
+
+                single = await generate(prompts[0])
+                outputs = (await asyncio.gather(*(generate(prompt) for prompt in prompts)) if capacity > 1
+                           else [await generate(prompt) for prompt in prompts])
+                status = await _fresh_idle_status(client)
+                if capacity > 1:
+                    assert status["continuous_batching_cuda_graph_captures"] > 0
+                    assert status["continuous_batching_cuda_graph_bucket_reuses"] > 0
+                assert "exclusive=1" in log_path.read_text(errors="replace")
+                return single, outputs
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await process.wait()
+
+    async def check():
+        reference = await run(1)
+        assert reference[0] and all(reference[1])
+        assert await run(4) == reference
+
+    asyncio.run(check())

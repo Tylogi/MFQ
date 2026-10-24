@@ -2,7 +2,10 @@
 
 Enable an explicit request capacity with `mfq serve --max-requests-per-runtime N`
 or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
-from 1 to 32 on one CUDA device. The managed server's default remains one request.
+from 1 to 32 on one CUDA device. The managed server defaults to eight requested
+rows and adopts the worker's reported `batch_capacity`; models without
+per-request batch state keep the single-request path and log a warning instead
+of failing the load. See [multi-request concurrency](concurrency.md).
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded

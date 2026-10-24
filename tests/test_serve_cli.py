@@ -16,6 +16,7 @@ from mfq.commands.serve import (
     _server_storage_paths,
 )
 from mfq.server.runtime.native import (
+    MAX_RUNTIME_CONCURRENCY,
     NativeRuntime,
     native_request_capacity,
     native_runtime_environment,
@@ -88,6 +89,8 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
             "9001",
             "--max-queued-requests-per-runtime",
             "7",
+            "--queue-timeout",
+            "45",
             "--max-runtime-memory",
             "12G",
             "--runtime-idle-timeout",
@@ -105,6 +108,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.db is None
     assert defaults.access_log is True
     assert defaults.max_queued_requests_per_runtime is None
+    assert defaults.queue_timeout == 0
     assert defaults.max_runtime_memory is None
     assert defaults.no_memory_guard is False
     assert defaults.moe_gpu_cache_gb is None
@@ -113,6 +117,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert args.host == "0.0.0.0"
     assert args.port == 9001
     assert args.max_queued_requests_per_runtime == 7
+    assert args.queue_timeout == 45
     assert args.max_runtime_memory == 12 * 1024**3
     assert args.runtime_idle_timeout == 300
     assert args.transport == "http"
@@ -140,6 +145,8 @@ def test_serve_accepts_an_explicit_expert_cache_budget() -> None:
         ("--runtime-startup-timeout", "0"),
         ("--max-runtime-instances", "0"),
         ("--max-requests-per-runtime", "0"),
+        ("--max-requests-per-runtime", str(MAX_RUNTIME_CONCURRENCY + 1)),
+        ("--queue-timeout", "-1"),
         ("--max-queued-requests-per-runtime", "-1"),
         ("--max-runtime-memory", "1XB"),
         ("--runtime-idle-timeout", "-1"),
@@ -320,10 +327,39 @@ def test_native_request_capacity_is_backend_based() -> None:
         requested=8,
     ) == 8
     assert native_request_capacity(
+        backend="hip",
+        routed_expert_bytes=0,
+        requested=8,
+    ) == 8
+    assert native_request_capacity(
         backend="cuda",
         routed_expert_bytes=1,
         requested=8,
     ) == 8
+    assert native_request_capacity(
+        backend="cuda",
+        routed_expert_bytes=0,
+        requested=MAX_RUNTIME_CONCURRENCY + 1,
+    ) == MAX_RUNTIME_CONCURRENCY
+    assert native_request_capacity(
+        backend="cpu",
+        routed_expert_bytes=0,
+        requested=8,
+    ) == 1
+
+
+def test_native_worker_accepts_a_hip_concurrency_hint(tmp_path: Path) -> None:
+    runtime = NativeRuntime(
+        executable=tmp_path / "mfq-runtime",
+        model=tmp_path / "model.mfq",
+        model_name="model",
+        backend="hip",
+        continuous_batching=4,
+    )
+
+    command = runtime.command(43123)
+
+    assert command[command.index("--continuous-batching") + 1] == "4"
 
 
 def test_native_metal_worker_receives_continuous_batching(
