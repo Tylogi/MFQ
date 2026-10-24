@@ -89,10 +89,6 @@ void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection pr
             throw std::runtime_error(
                 "CPU-offloaded MoE cannot materialize a dense expert bank at layer " +
                 std::to_string(layer));
-        if (projection == Role::gate_up)
-            throw std::runtime_error(
-                "dense fused Gate/Up expert banks require separate Gate and Up records at layer " +
-                std::to_string(layer));
         auto bank = load_dense_native_gpu(execution, source, name);
         if (bank.dim() != 3)
             throw std::runtime_error(
@@ -101,7 +97,7 @@ void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection pr
             case Role::gate: ffn.moe_dense_gate = std::move(bank); break;
             case Role::up: ffn.moe_dense_up = std::move(bank); break;
             case Role::down: ffn.moe_dense_down = std::move(bank); break;
-            case Role::gate_up: break;
+            case Role::gate_up: ffn.moe_dense_gate_up = std::move(bank); break;
         }
         return;
     }

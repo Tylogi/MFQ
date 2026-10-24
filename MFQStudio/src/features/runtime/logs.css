@@ -72,6 +72,9 @@
 .logs-console button.danger { color: var(--danger); }
 .logs-records { max-height: 650px; min-height: 220px; overflow-y: auto; overscroll-behavior: contain; border-top: 1px solid var(--panel-line); }
 .log-record + .log-record { border-top: 1px solid var(--panel-line); }
+/* Offscreen rows keep their DOM (search/export semantics) but skip layout and
+   paint, so a 500-record backlog no longer costs a full layout per refresh. */
+.log-record { content-visibility: auto; contain-intrinsic-size: auto 64px; }
 .log-record-toggle { display: grid; grid-template-columns: 116px 62px minmax(0, 1fr) 12px; align-items: start; gap: 14px; width: 100%; border: 0; padding: 15px 22px; color: var(--ink-soft); background: transparent; text-align: left; font: inherit; }
 .log-record-toggle:hover, .log-record-toggle[aria-expanded="true"] { background: var(--surface-hover); }
 .log-record-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
