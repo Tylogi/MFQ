@@ -10,6 +10,9 @@ namespace mfq::cuda {
 namespace tb = mfq_tensor_backend;
 
 QwenBatchOperations::Decoded QwenBatchOperations::decode(State& state) {
+    if (std::any_of(state.active.begin(), state.active.end(), [](const auto& request) {
+            return request->eligible && bool(request->mtp);
+        })) return decode_mtp(state);
     const int primary = execution_.layer_placement.primary_device();
     MfqCudaGuard primary_guard(primary);
     std::vector<std::shared_ptr<Request>> requests;

@@ -251,10 +251,21 @@ bool FlashNextBatchOperations::decode_has_capacity(const State& state) const {
     const auto device = execution_.layer_placement.primary_device();
     std::size_t needed = 0;
     int64_t required = 0;
+    int64_t window = 1, headroom = max_context();
+    // Verification pads every participating row to the largest selected draft
+    // width. Charge that transient width before running the target model.
     for (const auto& request : state.active) {
         if (!request->eligible) continue;
-        needed = prefill_budget_add(needed, request->cache->prefill_growth_bytes(1));
-        required = std::max(required, request->cache->position() + 1);
+        headroom = std::min(headroom, max_context() - request->cache_length);
+        if (request->mtp)
+            window = std::max(window, 1 + std::max<int64_t>(0, std::min<int64_t>(
+                request->mtp->depth->depth(), request->generation_limit - request->produced - 1)));
+    }
+    window = std::max<int64_t>(1, std::min(window, headroom));
+    for (const auto& request : state.active) {
+        if (!request->eligible) continue;
+        needed = prefill_budget_add(needed, request->cache->prefill_growth_bytes(window));
+        required = std::max(required, request->cache->position() + window);
     }
     if (graph_ && execution_.kv_memory)
         needed = std::max(needed, execution_.kv_memory->growth_bytes(required));
@@ -268,7 +279,16 @@ void FlashNextBatchOperations::retract(const std::shared_ptr<Request>& request) 
     // Graphs retain scratch and state bindings; retire them before freeing KV.
     if (graph_) graph_->clear();
     mfq_cuda_synchronize();
+    auto mtp = std::move(request->mtp);
+    if (mtp) {
+        mtp->discard();
+        mtp->predictor.reset();
+        mtp->history_hidden = {};
+        mtp->history_ids.clear();
+        mtp->candidates.clear();
+    }
     discard_prefill(request);
+    request->mtp = std::move(mtp);
     default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
 }
 
@@ -279,6 +299,16 @@ void FlashNextBatchOperations::replay_prefill(
     if (!request->cache) {
         request->cache = std::make_unique<Qwen4BatchRequestState>(model_);
         // requests_ already tracks this request. Keep sampler/RNG and counts.
+        if (request->mtp) {
+            auto replay = request->prompt;
+            const auto generated = request->replay_length() - int64_t(replay.size());
+            MFQ_RUNTIME_CHECK(generated >= 0 && generated <= int64_t(request->accepted_tokens.size()),
+                              "MTP replay is missing accepted tokens");
+            replay.insert(replay.end(), request->accepted_tokens.begin(), request->accepted_tokens.begin() + generated);
+            request->prefill_ids = mfq_tensor_backend::tensor(replay, mfq_tensor_backend::TensorOptions()
+                .dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
+                    execution_.layer_placement.primary_device()))).reshape({1, -1});
+        }
     }
     std::vector<int64_t> tokens;
     tokens.reserve(chunk.count);
@@ -288,6 +318,16 @@ void FlashNextBatchOperations::replay_prefill(
     auto ids = mfq_tensor_backend::tensor(tokens, mfq_tensor_backend::TensorOptions()
         .dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
             execution_.layer_placement.primary_device()))).reshape({1, -1});
-    (void)request->cache->prefill(model_, std::move(ids));
+    Tensor raw;
+    (void)request->cache->prefill(model_, std::move(ids), request->mtp ? &raw : nullptr);
+    if (request->mtp) {
+        prime_batch_mtp(*predictor_, MtpTarget(model_), *request->mtp, std::move(raw),
+            request->prefill_ids, chunk.offset, request->replay_length());
+        if (chunk.offset + chunk.count == request->replay_length()) {
+            request->mtp->first_token = request->pending_token;
+            request->mtp->history_ids = {request->pending_token};
+            request->prefill_ids = {};
+        }
+    }
 }
 } // namespace mfq::cuda

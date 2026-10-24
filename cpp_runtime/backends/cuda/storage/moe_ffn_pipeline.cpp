@@ -4479,6 +4479,7 @@ public:
         stream_=current;
         auto* window=mfq::cuda::DecodeWindow::recording();
         const int tokens=static_cast<int>(ids.size(0)),routes=static_cast<int>(ids.size(1));
+        const bool masked_rows = execution.decode_row_mask.defined();
         // Concurrency rows are decode tokens from independent sequences. Keep
         // ordinary short prompts on their existing prefill arithmetic path.
         const bool batch_decode=tokens<=8 || (tokens<=32 && execution.continuous_batch_cache_serial);
@@ -4490,7 +4491,8 @@ public:
         // allocation limits still apply, and decode restores the old threshold.
         if(!window && !batch_decode)retain_prefill_pool(ids);
         const auto layer_prefill=mfq::cuda::runtime_options::moe_prefill_layer();
-        if(!window && !batch_decode && layer_prefill && *layer_prefill!=0 && cache_->pipeline_prefill_layer_layout_ &&
+        if(!window && !batch_decode && !masked_rows && layer_prefill && *layer_prefill!=0 &&
+                cache_->pipeline_prefill_layer_layout_ &&
                 cache_->pipeline_ram_registered_bytes_>0 && execution.kl_mmq.mode==KlMmqMode::Default) {
             if(!cache_->moe_residency_)cache_->moe_residency_=std::make_unique<MoeResidencyManager>(cache_);
             cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
@@ -4500,7 +4502,7 @@ public:
         if(!cache_->moe_residency_)cache_->moe_residency_=std::make_unique<MoeResidencyManager>(cache_);
         if(!window)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
         const auto prefill_groups=mfq::cuda::runtime_options::moe_prefill_groups();
-        if(!window && !batch_decode && prefill_groups.value_or(cache_->ssd_experts()) &&
+        if(!window && !batch_decode && !masked_rows && prefill_groups.value_or(cache_->ssd_experts()) &&
                 (cache_->pipeline_ram_registered_bytes_>0 || cache_->ssd_experts()) && cache_->pipeline_dispatch_replay_.empty() &&
                 execution.kl_mmq.mode==KlMmqMode::Default) {
             try {return streamed_prefill(execution,input,ids,weights);}
@@ -4516,7 +4518,7 @@ public:
             cell=std::make_unique<Cell>(tokens,routes,width_,experts_,stream_,eager);
             initialize(*cell,execution,window!=nullptr);
         }
-        cell->allow_padding = window && execution.decode_row_mask.defined();
+        cell->allow_padding = execution.decode_row_mask.defined();
         // A prefill may have returned the revocable expert cache while keeping
         // this graph. Its descriptors resolve the newly allocated pages.
         if(cell->wire_fallback)cache_->prepare_direct_transfer_cache();
@@ -4625,7 +4627,7 @@ public:
             cell->pending=true;
             serve(*cell);cache_->record_compute_use();
             std::vector<int32_t> routed(cell->host_ids.h<int32_t>(),cell->host_ids.h<int32_t>()+cell->entries);
-            cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,tokens);
+            cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,tokens,false,cell->allow_padding);
         }
         catch(...) {failed_=true;publish(cell->flags.h<uint32_t>()+64);publish(cell->flags.h<uint32_t>()+80);for(int i=1;i<4;++i)publish(cell->flags.h<uint32_t>()+16*i);throw;}
         if(!cell->graph_replay) {

@@ -93,6 +93,9 @@ struct CudaEngineState {
             auto memory = mfq_hip_memory_stats(mfq_current_cuda_device());
             const auto capabilities = components.state();
             Metrics metrics{{"device_free_bytes", double(free)}, {"device_total_bytes", double(total)},
+                {"continuous_batching_mtp_supported", 0.0},
+                {"continuous_batching_mtp_stochastic_supported", 0.0},
+                {"continuous_batching_mtp_graph_supported", 0.0},
                 {"cuda_allocated_bytes", double(memory.allocated_bytes)}, {"cuda_reserved_bytes", double(memory.reserved_bytes)},
                 {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
                 {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},

@@ -12,6 +12,13 @@
 
 struct RopeCache;
 
+// Request-owned predictor history; weights remain on the shared module.
+struct MtpBatchState {
+    virtual ~MtpBatchState() = default;
+    virtual void trim(int64_t position) = 0;
+    int64_t position = 0;
+};
+
 struct MtpTarget {
     std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
         mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
@@ -35,6 +42,14 @@ struct MtpStep {
 // Architecture-specific predictors implement device math and cache state only.
 struct MtpModule {
     virtual ~MtpModule() = default;
+    virtual bool supports_batch() const noexcept { return false; }
+    virtual std::unique_ptr<MtpBatchState> make_batch_state() const {
+        throw std::runtime_error("this CUDA MTP predictor has no independent batch state");
+    }
+    virtual MtpStep batch_step(const MtpTarget&, const std::vector<MtpBatchState*>&,
+            mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor) {
+        throw std::runtime_error("this CUDA MTP predictor has no batched forward");
+    }
     virtual void reset(int64_t batch = 1) = 0;
     virtual mfq_tensor_backend::Tensor forward(
         const MtpTarget& target,

@@ -595,6 +595,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(execution, *this,
             check_qwen35_mtp || check_flash_next_mtp || check_nemotron_h_mtp ||
+                (check_continuous_batching && std::getenv("MFQ_BATCH_MTP_CHECK")) ||
                 check_nemotron_h_vision ||
                 !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
             [&](auto& model, auto& runtime_components,
@@ -603,7 +604,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         if (check_continuous_batching) {
             if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm> ||
                           std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-                return run_cuda_continuous_batching_check(model,check_continuous_batching_requests);
+                return run_cuda_continuous_batching_check(model,check_continuous_batching_requests,
+                    runtime_components.mtp.get());
             }
             throw std::runtime_error(
                 "continuous batching requires Qwen3.5 or Flash-Next");

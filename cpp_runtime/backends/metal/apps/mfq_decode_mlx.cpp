@@ -2700,6 +2700,7 @@ private:
                     runtime_holder->value().reclaimable_expert_bytes()));
             }
         }
+        metrics.emplace_back("continuous_batching_mtp_supported", batch_mtp_enabled ? 1.0 : 0.0);
         if constexpr (requires(Runtime& value) {
                 value.supports_mtp();
             }) {

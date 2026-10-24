@@ -24,7 +24,52 @@ void exact(const Tensor& a,const Tensor& b,const char* label) {
   throw std::runtime_error(std::string(label)+" bytes differ first="+std::to_string(first)+" max="+std::to_string(peak));
  }
 }
+void independent_window_prefixes() {
+    constexpr int tokens = 4, nk = 1, nv = 2, width = 128, channels = (2 * nk + nv) * width;
+    auto convolution = data({3, 3, channels}, 721, .2f);
+    auto recurrent = data({3, nv, width, width}, 722, .1f);
+    auto initial_convolution = convolution.clone();
+    auto initial_recurrent = recurrent.clone();
+    auto qkv = data({2, tokens, channels}, 723, .3f, tb::kFloat16);
+    auto gate = data({2, tokens, nv * width}, 724, .4f, tb::kFloat16);
+    auto alpha = data({2, tokens, nv}, 725, .2f, tb::kFloat16);
+    auto beta = data({2, tokens, nv}, 726, .2f, tb::kFloat16);
+    auto weight = data({channels, 1, 4}, 727, .2f);
+    auto bias = data({nv}, 728, .2f), a = data({nv}, 729, .2f), norm = data({width}, 730, .2f);
+    for (int row : {1, 0}) {
+        auto conv = convolution.narrow(0, row, 1);
+        auto state = recurrent.narrow(0, row, 1);
+        std::vector<Tensor> checkpoints_conv, checkpoints_state;
+        for (int token = 1; token < tokens; ++token) {
+            checkpoints_conv.push_back(tb::empty_like(conv));
+            checkpoints_state.push_back(tb::empty_like(state));
+        }
+        auto output = gdn_decode_window_cuda(qkv.narrow(0,row,1), gate.narrow(0,row,1),
+            alpha.narrow(0,row,1), beta.narrow(0,row,1), conv, state, weight, bias, a, norm,
+            nk, nv, 1, 1e-6, 1e-6, true, true, true, checkpoints_conv, checkpoints_state);
+        conv.copy_(output[1]);
+        const int retained = row ? 3 : 1;
+        conv.copy_(checkpoints_conv[retained - 1]);
+        state.copy_(checkpoints_state[retained - 1]);
+        auto expected_conv = initial_convolution.narrow(0,row,1).clone();
+        auto expected_state = initial_recurrent.narrow(0,row,1).clone();
+        auto workspace = tb::zeros({1,nv,width + 1}, expected_conv.options());
+        for (int token = 0; token < retained; ++token) {
+            auto decoded = gdn_decode_core_cuda(qkv.narrow(0,row,1).narrow(1,token,1),
+                gate.narrow(0,row,1).narrow(1,token,1), alpha.narrow(0,row,1).narrow(1,token,1),
+                beta.narrow(0,row,1).narrow(1,token,1), expected_conv, expected_state, weight, bias, a, norm,
+                nk, nv, width, 1e-6, 1e-6, true, true, true, workspace, true);
+            expected_conv.copy_(decoded[1]);
+        }
+        exact(conv, expected_conv, "independent accepted convolution prefix");
+        exact(state, expected_state, "independent accepted recurrent prefix");
+    }
+    exact(convolution.narrow(0,2,1), initial_convolution.narrow(0,2,1), "paused convolution");
+    exact(recurrent.narrow(0,2,1), initial_recurrent.narrow(0,2,1), "paused recurrence");
+}
+
 int main(int argc,char** argv)try {
+ independent_window_prefixes();
  const bool benchmark=argc==2 && std::string(argv[1])=="--bench";
  const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
  const auto stream=mfq_current_cuda_stream();

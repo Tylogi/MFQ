@@ -460,8 +460,11 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_admission.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_batch_mtp.cpp
     ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp
     ${MFQ_CUDA_ROOT}/runtime/batch_sampling.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_mtp.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_mtp_predictor.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/reference.cpp
