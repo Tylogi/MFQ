@@ -4,6 +4,7 @@
 #include "linear_attention.h"
 #include "ops.h"
 #include "paged_kv.h"
+#include "runtime/batch_decode_inputs.h"
 
 #include <limits>
 #include <stdexcept>
@@ -141,6 +142,11 @@ void Qwen35BatchStateAdapter::clear_model() {
 void Qwen35BatchStateAdapter::finish_retire(int64_t cache_position) {
     if (std::none_of(slots_.begin(), slots_.end(), [](auto *owner) { return owner != nullptr; })) {
         clear_model();
+        for (auto& layer : decode_layers_) {
+            layer.working_first = {};
+            layer.working_second = {};
+            layer.working_graph = false;
+        }
         if (paged_kv_)
             for (auto &sequence : paged_slots_)
                 paged_kv_->release(sequence);
@@ -188,7 +194,6 @@ void Qwen35BatchStateAdapter::bind_paged_slots() {
     std::vector<const QwenPagedKvSequence *> sequences;
     sequences.reserve(paged_slots_.size());
     for (auto &sequence : paged_slots_) {
-        paged_kv_->ensure_tokens(sequence, 1);
         sequences.push_back(&sequence);
     }
     paged_kv_->bind(sequences);

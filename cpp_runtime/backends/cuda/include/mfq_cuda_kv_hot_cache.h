@@ -3,6 +3,13 @@
 #include <cstdint>
 
 namespace mfq::cuda {
+class BatchDecodeInputs;
+
+// Row-table fields for an exclusive cache's physical tiers and allocation maps.
+struct HotKvStateFields {
+    enum { Keys, Values, ColdKeys, ColdValues, Mapping, SlotIds, Epochs,
+           ColdMapping, FreeCold, FreeGpu, ColdControl, Control, Count };
+};
 // Addresses stay fixed across CUDA Graph replays. A negative mapping reads
 // the canonical mapped-RAM row; resident mappings read the GPU copy.
 struct HotKvView {
@@ -32,7 +39,8 @@ struct HotKvCache {
     bool append_decode(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values,
         const mfq_tensor_backend::Tensor& positions,
         const mfq_tensor_backend::Tensor& index_rows = {}, const mfq_tensor_backend::Tensor& index_storage = {},
-        bool begin_prepare = false);
+        bool begin_prepare = false, const BatchDecodeInputs* inputs = nullptr, int64_t field = 0, int64_t row = 0);
+    void bind_decode_state(BatchDecodeInputs&, int64_t field, int64_t row) const;
     std::pair<mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor> gather(int64_t count) const;
     HotKvView view() const;
     std::size_t bytes() const;

@@ -19,6 +19,7 @@
 #include <cstring>
 
 #include "reduce.cuh"
+#include "gdn_prefill_chunk.cuh"
 
 template <int D>
 __global__ void gdn_kernel(
@@ -324,6 +325,19 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state,
     bool inplace_state, bool transposed_state=false, bool tiled_heads=false)
 {
+    if (q.is_cuda() && q.dim() == 4 && (q.size(3) == 32 || q.size(3) == 64 || q.size(3) == 128) &&
+        q.size(2) <= std::numeric_limits<int>::max() && gdn_prefill_chunk_enabled(q.size(2), g.dim() == 3)) {
+        auto result = gdn_prefill_chunk_cuda(q, k, v, g, beta, state, inplace_state, transposed_state, tiled_heads);
+        if (!result.empty()) return result;
+    }
+    // Short low-precision inputs use the established FP32 recurrent kernels.
+    if (q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16) {
+        MFQ_RUNTIME_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+            "GDN CUDA: q/k/v dtype mismatch");
+        q = q.to(mfq_tensor_backend::kFloat32);
+        k = k.to(mfq_tensor_backend::kFloat32);
+        v = v.to(mfq_tensor_backend::kFloat32);
+    }
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "q must be cuda contiguous f32");
     int B = q.size(0), Hq = q.size(1), T = q.size(2), D = q.size(3);
@@ -470,6 +484,13 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     if constexpr(FixedTaps>0)taps=FixedTaps;
     const int bh=blockIdx.x/tiles,tile=blockIdx.x%tiles;
     const int batch=bh/value_heads,head=bh%value_heads;
+    if(state_addresses && !state_addresses[3*batch]) {
+        if(tile==0) {
+            for(int column=threadIdx.x;column<width;column+=blockDim.x)
+                output[(size_t(batch)*value_heads+head)*width+column]=static_cast<Output>(0.f);
+        }
+        return;
+    }
     const int state_batch=state_addresses?0:batch;
     if(state_addresses) {
         convolution_state=reinterpret_cast<const float*>(state_addresses[3*batch]);
@@ -741,7 +762,7 @@ __global__ void gdn_commit_independent_convolution(const float* values,
     const int64_t* state_addresses,int64_t row_elements) {
     const int row=blockIdx.y;
     const int64_t column=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    if(column<row_elements)
+    if(column<row_elements && state_addresses[3*row])
         reinterpret_cast<float*>(state_addresses[3*row])[column]=values[int64_t(row)*row_elements+column];
 }
 
@@ -835,11 +856,13 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_impl(
         }
         gdn_decode_core_kernel<Tiles,Gate,Output,FixedWidth,FixedTaps,InplaceConv,BroadcastNorm,Snapshot><<<unsigned(batch*value_heads*Tiles),threads,0,mfq_current_cuda_stream()>>>(
             reinterpret_cast<const __half*>(qkv.data_ptr<mfq_half>()),output_gate.data_ptr<Gate>(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
-            convolution_state.data_ptr<float>(),recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
+            independent?nullptr:convolution_state.data_ptr<float>(),
+            independent?nullptr:recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
             dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<Output>(),
-            conv.data_ptr<float>(),state.data_ptr<float>(),int(key_heads),int(value_heads),int(width),int(taps),channels_first?0:1,
+            conv.data_ptr<float>(),independent?nullptr:state.data_ptr<float>(),
+            int(key_heads),int(value_heads),int(width),int(taps),channels_first?0:1,
             float(convolution_eps),norm_eps,silu_gate,transposed_state,alpha.stride(0),alpha.stride(2),beta.stride(0),beta.stride(2),
-            workspace.defined()?workspace.data_ptr<float>():nullptr,
+            !independent && workspace.defined()?workspace.data_ptr<float>():nullptr,
             independent?state_addresses.data_ptr<int64_t>():nullptr,qkv.stride(0),output_gate.stride(0),
             [] {const char* option=std::getenv("MFQ_GDN_WARP_REDUCTIONS");return !option || option[0]!='0';}(),
             checkpoint_convolution.defined()?checkpoint_convolution.data_ptr<float>():nullptr,

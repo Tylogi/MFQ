@@ -96,10 +96,12 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/gdn_prefill_chunk.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gdn_decode_window.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/dense_moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qk_rope_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
@@ -137,6 +139,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
     ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
+    ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
@@ -389,6 +392,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/nemotron_h/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/batch_graph_state.cpp
 )
 
 set(MFQ_CUDA_TRANSFORMER_SOURCES
@@ -408,6 +412,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
     ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/dense_moe.cpp
     ${MFQ_CUDA_ROOT}/ops/moe.cpp
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
@@ -451,6 +456,9 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/storage/deepseek_v41_paged_session.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_sampling.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/reference.cpp
@@ -655,6 +663,13 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
     add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
     set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-moe-route-map-test ${MFQ_CUDA_ROOT}/tests/moe_route_map_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-moe-route-map-test)
+    target_compile_definitions(mfq-moe-route-map-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-moe-route-map-test PRIVATE
+        mfq-cuda-runtime mfq-cuda-native-kernels)
+    add_test(NAME mfq-moe-route-map-test COMMAND mfq-moe-route-map-test)
+    set_tests_properties(mfq-moe-route-map-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-qk-rope-kv-test ${MFQ_CUDA_ROOT}/tests/qk_rope_kv_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-qk-rope-kv-test)
     target_compile_definitions(mfq-qk-rope-kv-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -665,6 +680,13 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-moe-ffn-pipeline-test PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-batch-decode-graph-test ${MFQ_CUDA_ROOT}/tests/batch_decode_graph_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-batch-decode-graph-test)
+    target_compile_definitions(mfq-cuda-batch-decode-graph-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-batch-decode-graph-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-batch-decode-graph-test COMMAND mfq-cuda-batch-decode-graph-test)
+    set_tests_properties(mfq-cuda-batch-decode-graph-test PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(mfq-cuda-dma-batch-test ${MFQ_CUDA_ROOT}/tests/dma_copy_batch_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-dma-batch-test)
     target_compile_definitions(mfq-cuda-dma-batch-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -687,6 +709,11 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    add_test(NAME mfq-cuda-gdn-prefill-test COMMAND mfq-window-attention-test --gdn-prefill-check)
+    foreach(check chunk chunk-varlen chunk-graph)
+        add_test(NAME mfq-cuda-gdn-prefill-${check}-test
+            COMMAND mfq-window-attention-test --gdn-prefill-${check}-check)
+    endforeach()
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
     add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
@@ -833,6 +860,8 @@ if(BUILD_TESTING)
     add_test(NAME mfq-cuda-mfe-prepare-test COMMAND mfq-cuda-runtime-state-test --mfe-prepare-check)
     add_test(NAME mfq-cuda-mfe-transfer-test COMMAND mfq-cuda-runtime-state-test --mfe-transfer-check)
     add_test(NAME mfq-cuda-mapped-copy-test COMMAND mfq-cuda-runtime-state-test --mapped-copy-check)
+    add_test(NAME mfq-cuda-batched-sampling-test COMMAND mfq-cuda-runtime-state-test --batched-sampling-check)
+    set_tests_properties(mfq-cuda-batched-sampling-test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME mfq-cuda-sampling-keys-test COMMAND mfq-cuda-runtime-state-test --sampling-check)
     add_test(NAME mfq-cuda-transfer-copy-test COMMAND mfq-cuda-runtime-state-test --transfer-copy-check)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)

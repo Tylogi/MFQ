@@ -358,6 +358,8 @@ struct CudaExecutionContext {
     bool decode_graph_serial_branches = false;
     bool decode_graph_tp_projection_major = false;
     bool continuous_batch_cache_serial = false;
+    mfq_tensor_backend::Tensor decode_row_mask;
+    int64_t decode_row_offset = 0;
     int continuous_batch_ffn_tile = 0;
     int continuous_batch_ffn_tiles = 1;
     int moe_cache_registration_min_slots = 8;

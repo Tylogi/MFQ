@@ -374,7 +374,8 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
             "dense expert tensor shape mismatch: ",name);
         return [w,output,input](CudaExecutionContext&, const Tensor& x,const Tensor& ids) {
             const auto rows=ids.size(0), routes=ids.size(1);
-            auto selected=w.index_select(0,ids.reshape({-1}).to(tb::kInt64)).reshape({rows,routes,output,input});
+            auto selected=w.index_select(0,ids.reshape({-1}).clamp_min(0).to(tb::kInt64))
+                .reshape({rows,routes,output,input});
             auto source=x.dim()==2 ? x.unsqueeze(1).expand({rows,routes,input}) : x;
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
         };

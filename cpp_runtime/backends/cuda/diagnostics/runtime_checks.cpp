@@ -6,6 +6,8 @@
 #include "engine/generation.h"
 #include "storage/text_session_cache.h"
 #include "engine/cuda_batching.h"
+#include "models/qwen35/linear_attention.h"
+#include "batch_graph_membership_check.h"
 
 #include <cuda_profiler_api.h>
 
@@ -148,6 +150,39 @@ int run_qwen_continuous_batching_check(Model& model, const CudaRuntimeConfig& ru
         growth_prompt[i] = (137 + i*41) % model.vocab_size();
     const auto growth_reference = requests > 2 ? serial(growth_prompt) : std::vector<int64_t>{};
     graph.invalidate(); // Physical batch slots replace the serial graph's storage.
+    check_batch_graph_membership(model, config.continuous_batch, second_prompt, second_reference);
+    {
+        // FP16 batch GEMMs can turn nearby logits into ties and reorder top-k
+        // candidates. A tied head isolates seeded sampling from those model
+        // differences; the original head is checked before and after this scope.
+        struct RestoreHead {
+            QuantLinear& target;
+            QuantLinear saved;
+            ~RestoreHead() { target = std::move(saved); }
+        } restore_head{model.lm_head, model.lm_head};
+        const mfq_tensor_backend::Device device{mfq_tensor_backend::kCUDA,
+                                                model.execution->layer_placement.primary_device()};
+        model.lm_head = {};
+        model.lm_head.kind = QuantLinearKind::Dense;
+        model.lm_head.dense = mfq_tensor_backend::zeros({model.vocab_size(), model.hidden_size()},
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16).device(device));
+        std::vector<std::vector<int64_t>> sampling_references;
+        const int sampling_rows = requests >= 32 ? 19 : 5;
+        auto sampling_config = config;
+        sampling_config.decode_graph.enabled = false;
+        for (int row = 0; row < sampling_rows; ++row) {
+            InferenceRequest request;
+            request.prompt = second_prompt;
+            request.sampling = batch_graph_sampling_params(row, sampling.max_tokens);
+            InferenceOutput output(request, nullptr, "serial-sampling");
+            sampling_references.push_back(
+                collect_generation(generate(model, graph, cache, sampling_config, request, output)).tokens);
+        }
+        graph.invalidate();
+        std::cout << "continuous_batching_sampling_oracle logits=tied\n";
+        check_batch_graph_membership(model, config.continuous_batch, second_prompt, second_reference,
+                                     sampling_references);
+    }
     {
         struct Execution {
             Model& model;
