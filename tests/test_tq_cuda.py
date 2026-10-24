@@ -803,7 +803,8 @@ def test_mixed_row_quantization_roundtrip(scale_factors):
     torch.manual_seed(123)
     w = torch.randn(8, 257, device="cuda") * 0.02
     h = torch.linspace(0.1, 2, 257, device="cuda")
-    tensor = quantize(w, np.arange(1, 9), imatrix=h, groupsize=512, scale_factors=scale_factors)
+    tensor = quantize(w, np.arange(1, 9), imatrix=h, groupsize=512,
+                      scale_factors=scale_factors, column_scaling=False, search="adaptive")
     np.testing.assert_array_equal(tensor.bits, np.arange(1, 9))
     assert tensor.to_bytes() == TQTensor.from_bytes(tensor.to_bytes()).to_bytes()
     op = Projection(tensor, input_columns=257)
@@ -831,8 +832,10 @@ def test_adaptive_fitting_precision(bits, groupsize):
     weight[0] = 0
     importance = torch.linspace(0.2, 2, 513, device="cuda")
     importance[::7] = 0
-    exact = quantize(weight, bits, imatrix=importance, groupsize=groupsize, search="full")
-    fast = quantize(weight, bits, imatrix=importance, groupsize=groupsize)
+    exact = quantize(weight, bits, imatrix=importance, groupsize=groupsize,
+                     column_scaling=False, search="full")
+    fast = quantize(weight, bits, imatrix=importance, groupsize=groupsize,
+                    column_scaling=False, search="adaptive")
     assert fast.to_bytes() == TQTensor.from_bytes(fast.to_bytes()).to_bytes()
     scores = []
     for tensor in (exact, fast):

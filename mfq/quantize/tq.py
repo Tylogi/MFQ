@@ -25,18 +25,19 @@ def quantize(
     imatrix: torch.Tensor | None = None,
     groupsize: int = 512,
     scale_factors: tuple[float, ...] | None = None,
-    search: str = "adaptive",
-    column_scaling: bool = False,
+    search: str = "fast",
+    column_scaling: bool = True,
     repair_scales: bool = True,
 ) -> TQTensor:
     """Fit a CUDA 2D weight tensor; return a standalone host payload.
 
-    Adaptive 1..4-bit fitting screens the retained scale grid on sampled rows.
-    ``search="full"`` retains the original FP32 all-row scale search.
+    The default uses fast shared-column fitting with complete source-range
+    coverage. Legacy subgroup fitting remains available with
+    ``column_scaling=False`` and ``search="adaptive"`` or ``search="full"``.
     ``column_scaling=True`` shares one FP16 input-scale vector across row
-    precisions. Its ``search="fast"`` mode uses sampled scale selection and
-    sparsely repairs clipped rows; ``repair_scales=False`` retains the initial
-    fitted rows for comparisons. Column fitting retains 16-bit states.
+    precisions and constrains every row scale to cover the original weights.
+    Its ``search="fast"`` mode uses sampled scale selection. Column fitting
+    retains 16-bit states and protects FP16 path costs from overflow.
     Logical widths are padded to whole rings and subgroups; retain the
     original width when constructing the CUDA ``Projection``.
     """

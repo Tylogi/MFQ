@@ -8,6 +8,44 @@ from pathlib import Path
 import torch
 from mfq.formats.tq import fixed_codebook
 
+_BOOK_BOUND = float(abs(fixed_codebook()).max())
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+
+
+if triton is not None:
+    @triton.jit
+    def _path_metric_kernel(X, M, Out, BOOK_BOUND: tl.constexpr):
+        ring = tl.program_id(0)
+        offsets = ring * 256 + tl.arange(0, 256)
+        x, metric = tl.load(X + offsets), tl.load(M + offsets)
+        peak = tl.max((tl.abs(x) + BOOK_BOUND) * tl.abs(metric), axis=0)
+        exponent = tl.ceil(tl.log2(tl.maximum(peak / 32., 1.)))
+        tl.store(Out + offsets, metric * tl.exp2(-exponent))
+
+
+def _path_metric(x, metric):
+    """Rescale each independent ring's objective to avoid FP16 path overflow.
+
+    Powers of two preserve the mathematical minimizer. A branch residual is
+    bounded by 32; the trellis forgets its initial state within 16 steps and
+    normalizes every 16 steps, keeping reachable costs below FP16 overflow.
+    Normal rings retain their exact input metric. No reconstruction range is
+    imposed and no stored tensor, codebook or state representation changes.
+    """
+    bound = _BOOK_BOUND
+    if x.is_cuda and triton is not None:
+        result = torch.empty_like(metric)
+        _path_metric_kernel[(len(x),)](x, metric, result, bound, num_warps=4)
+        return result
+    peak = ((x.abs() + bound) * metric.abs()).amax(-1, keepdim=True)
+    exponent = torch.ceil(torch.log2((peak / 32.).clamp_min(1.)))
+    return metric * torch.exp2(-exponent)
+
 
 @lru_cache(None)
 def _library():
@@ -33,6 +71,7 @@ def encode(x, metric, bits):
         from .tq_encoder import encode as reference_encode
         table = torch.tensor(fixed_codebook(), device=x.device)
         return reference_encode(x, metric, table, bits)
+    metric = _path_metric(x, metric)
     with torch.cuda.device(x.device):
         lib = _library()
         wave = lib.half_wave(len(x), bits)
@@ -65,25 +104,43 @@ def prepare_columns(weight):
 
 
 @torch.inference_mode()
-def fit_columns(weight, k, h, columns, *, fast=False, repair_scales=True):
-    """Fit row anchors against a fixed, precision-independent column vector."""
+def fit_columns(weight, k, h, columns, *, fast=False, repair_scales=True, allow_clipping=False):
+    """Fit fixed-column TQ rows with full source-range coverage by default."""
     w = weight.float()
     rows, width = w.shape
-    rms = torch.tensor(fixed_codebook(), device=w.device).float().square().mean().sqrt()
+    table = torch.tensor(fixed_codebook(), device=w.device).float()
+    rms = table.square().mean().sqrt()
     row_rms = (w / columns.float()).square().mean(-1).sqrt() / rms
     anchor = row_rms.clamp_min(2**-24).half()
+    floor = None
+    if not allow_clipping:
+        bound = (w.abs() / (torch.where(w >= 0, table.max(), -table.min()) *
+                           columns.float()[None, :])).amax(-1)
+        floor = bound.half()
+        floor = torch.where(floor.float() < bound,
+            torch.nextafter(floor, torch.full_like(floor, torch.inf)), floor)
     factors = ((.65, .7, .75, .8, .85, .9, .95, 1., 1.05, 1.1, 1.2, 1.3)
                if k == 1 else (1., .9, 1.05, 1.1, 1.2, 1.3, 1.4, 1.6, 1.8, 2.))
 
-    def trial(target, a):
+    def trial(target, a, lower=None):
+        if lower is not None:
+            a = torch.maximum(a, lower)
         scale = a.float()[:, None] * columns.float()[None, :]
         metric = scale * h.sqrt()[None, :]
         metric /= metric.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-30)
         y, state, _ = encode((target / scale).reshape(-1, 256).contiguous(),
                              metric.reshape(-1, 256).contiguous(), k)
         basis = y.reshape_as(target) * columns.float()[None, :]
-        proposed = ((target * basis * h).sum(-1) /
-                    (basis.square() * h).sum(-1).clamp_min(1e-30)).clamp_min(2**-24).half()
+        proposal = ((target * basis * h).sum(-1) /
+                    (basis.square() * h).sum(-1).clamp_min(1e-30))
+        proposed = proposal.half()
+        # Invalid or negative LS must not turn a real row into near-zero weights.
+        # Also reject anchors that would overflow FP16 encoder inputs on reuse.
+        minimum = a.float() * (target / scale).abs().amax(-1) / 65504.
+        valid = torch.isfinite(proposed) & (proposed.float() > minimum)
+        proposed = torch.where(valid, proposed, a)
+        if lower is not None:
+            proposed = torch.maximum(proposed, lower)
         old = ((target - (basis * a.float()[:, None]).half().float()).square() * h).sum(-1)
         new = ((target - (basis * proposed.float()[:, None]).half().float()).square() * h).sum(-1)
         return state.reshape_as(target), torch.where(new < old, proposed, a), torch.minimum(new, old)
@@ -91,17 +148,18 @@ def fit_columns(weight, k, h, columns, *, fast=False, repair_scales=True):
     ids = torch.linspace(0, rows - 1, min(rows, 16 if fast else 64), device=w.device).long()
     factor_table = torch.tensor(factors, device=w.device)
     sample_a = (anchor[ids].float()[None, :] * factor_table[:, None]).half().flatten()
-    _, _, loss = trial(w[ids].repeat(len(factors), 1).contiguous(), sample_a)
+    _, _, loss = trial(w[ids].repeat(len(factors), 1).contiguous(), sample_a,
+                       None if floor is None else floor[ids].repeat(len(factors)))
     order = loss.reshape(len(factors), len(ids)).sum(-1).argsort()
     best = torch.full((rows,), torch.inf, device=w.device)
     states = torch.empty_like(w, dtype=torch.int16)
     anchors = anchor.clone()
     for index in order[:1 if fast else 2]:
-        state, a, loss = trial(w, (anchor.float() * factor_table[index]).half().clamp_min(2**-24))
+        state, a, loss = trial(w, (anchor.float() * factor_table[index]).half().clamp_min(2**-24), floor)
         take = loss < best
         best[take], anchors[take], states[take] = loss[take], a[take], state[take]
     if not fast:
-        state, a, loss = trial(w, anchors.clone())
+        state, a, loss = trial(w, anchors.clone(), floor)
         take = loss < best
         best[take], anchors[take], states[take] = loss[take], a[take], state[take]
     if repair_scales:
@@ -109,7 +167,8 @@ def fit_columns(weight, k, h, columns, *, fast=False, repair_scales=True):
         proposals = propose_scales(w, h, columns, anchors, best)
         ids = torch.nonzero(proposals > anchors).flatten()
         if len(ids):
-            state, a, loss = trial(w[ids].contiguous(), proposals[ids])
+            state, a, loss = trial(w[ids].contiguous(), proposals[ids],
+                                  None if floor is None else floor[ids])
             take = loss < best[ids]
             selected = ids[take]
             anchors[selected], states[selected] = a[take], state[take]

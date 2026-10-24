@@ -82,7 +82,8 @@ def test_repair_recovers_an_outlier_outside_the_scale_screen():
     book = torch.tensor(fixed_codebook(), device="cuda").float()
     scores = []
     for enabled in [False, True]:
-        state, anchor = fit_columns(w, 8, h, columns, fast=True, repair_scales=enabled)
+        state, anchor = fit_columns(w, 8, h, columns, fast=True,
+                                    repair_scales=enabled, allow_clipping=True)
         decoded = (book[state.int() & 65535] * (anchor.float()[:, None] * columns.float())).half().float()
         scores.append((w - decoded).square().sum(-1))
     assert bool((scores[1] <= scores[0] * (1 + 1e-6) + 1e-9).all())
