@@ -1,6 +1,7 @@
 #pragma once
 
 #include "quant_linear.h"
+#include "dense_moe.h"
 #include "mfe_weight.h"
 #include "models/common/gated_mlp.h"
 
@@ -8,18 +9,6 @@
 #include <cstdint>
 #include <memory>
 #include <functional>
-
-// Default bound on the expert matrices dense_routed_projection gathers at once.
-inline constexpr std::size_t kDenseRoutedGatherBudgetBytes = std::size_t(512) << 20;
-
-// Apply a dense [experts,out,in] routed bank to every route of every token.
-// `input` is [tokens,in] or [tokens,routes,in]; `ids` is [tokens,routes]. The
-// bank keeps its source precision. Each route gathers its whole expert matrix,
-// so tokens run in chunks whose gathered matrices fit `gather_budget_bytes`.
-mfq_tensor_backend::Tensor dense_routed_projection(
-    const mfq_tensor_backend::Tensor &bank, const mfq_tensor_backend::Tensor &input,
-    const mfq_tensor_backend::Tensor &ids,
-    std::size_t gather_budget_bytes = kDenseRoutedGatherBudgetBytes);
 
 struct FFN {
     QuantLinearGroup gate_up;
@@ -44,6 +33,7 @@ struct FFN {
     std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_down;
     // Dense (F32/F16/BF16) routed expert banks: [experts,out,in].
+    mfq_tensor_backend::Tensor moe_dense_gate_up;
     mfq_tensor_backend::Tensor moe_dense_gate;
     mfq_tensor_backend::Tensor moe_dense_up;
     mfq_tensor_backend::Tensor moe_dense_down;
