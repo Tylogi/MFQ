@@ -204,6 +204,11 @@ update the table before replay. F16 attention retains its Tensor Core path at
 head width 256, and TurboQuant attention reads packed request KV directly.
 `MFQ_QSA_INDEPENDENT_BATCH=0` restores the previous per-request graph core for
 comparisons. Configured KV offload retains the existing eager path.
+Exclusive GPU/RAM KV tiers use the per-request graph core even when independent
+batching is enabled. Its row-table append and gather resolve hot slots and cold
+positions using each physical tier's capacity, including packed TurboQuant KV.
+This adds per-row core launches and selected-KV gathering; batched projections,
+request capacity, context limits, KV budgets and bucket reuse remain unchanged.
 
 `mfq-window-attention-test --qsa-independent-batch-check` checks heterogeneous
 contexts, paused and cancelled requests, row reuse, cache growth and the
