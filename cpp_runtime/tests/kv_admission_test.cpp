@@ -177,18 +177,61 @@ static void queue_and_retraction_test() {
         assert(output.size() == 10);
         for (int i = 0; i < 10; ++i) assert(output[i] == 10 + i);
     }
-    // A deferred request can be cancelled without allocating physical state.
+    // With no admitted row left to free memory, a request that cannot fit fails
+    // instead of waiting forever, and never allocates physical state.
     memory.capacity = 0;
     InferenceRequest input;
     input.prompt.assign(4, 1);
     input.sampling.max_tokens = 2;
-    InferenceOutput output(input, nullptr, "cancel");
-    auto sequence = batch.generate("cancel", input, output);
+    InferenceOutput output(input, nullptr, "alone");
+    auto sequence = batch.generate("alone", input, output);
     assert(sequence.next());
-    batch.step({"cancel"});
+    batch.step({"alone"});
     assert(memory.used == 0);
-    sequence = {};
-    assert(batch.empty() && memory.used == 0);
+    bool rejected = false;
+    try {
+        while (sequence.next()) {}
+    } catch (const InferenceInputError& error) {
+        rejected = error.code == InferenceInputErrorCode::ContextLength;
+    }
+    assert(rejected && batch.empty() && memory.used == 0);
+    assert(metric(batch.metrics(), "continuous_batching_admission_failures") == 1);
+}
+
+static void solitary_reclaim_test() {
+    // Idle allocator pages and released buffers only return on reclaim.
+    struct ReclaimOps : AdmissionOps {
+        std::size_t* idle;
+        int* reclaims;
+        ReclaimOps(Memory& memory, std::size_t& idle, int& reclaims)
+            : AdmissionOps(memory), idle(&idle), reclaims(&reclaims) {}
+        KvAdmissionBytes admission_available() const {
+            return {{0, memory.capacity - memory.used - *idle}};
+        }
+        void release_idle_buffers() {}
+        void reclaim_prefill_memory(const std::shared_ptr<Request>&) { *idle = 0; ++*reclaims; }
+    };
+    AdmissionOps::Memory memory;
+    memory.capacity = 8;
+    std::size_t idle = 6;
+    int reclaims = 0;
+    ContinuousBatch<ReclaimOps> batch(4, 4, memory, idle, reclaims);
+    InferenceRequest input;
+    input.prompt.assign(4, 1);
+    input.sampling.max_tokens = 2;
+    InferenceOutput output(input, nullptr, "idle");
+    auto sequence = batch.generate("idle", input, output);
+    std::vector<int64_t> tokens;
+    for (int tick = 0; tick < 30; ++tick) {
+        batch.step({"idle"});
+        auto step = sequence.next();
+        if (!step) break;
+        if (step.value) if (const auto* delta = std::get_if<OutputDelta>(&*step.value))
+            tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+    }
+    assert(batch.empty() && memory.used == 0 && reclaims == 1);
+    assert(tokens == std::vector<int64_t>({10, 11}));
+    assert(metric(batch.metrics(), "continuous_batching_admission_failures") == 0);
 }
 
 static void prefix_and_single_row_test() {
@@ -254,6 +297,7 @@ static void adaptive_chunk_test() {
 int main() {
     arithmetic_test();
     queue_and_retraction_test();
+    solitary_reclaim_test();
     prefix_and_single_row_test();
     adaptive_chunk_test();
 }
