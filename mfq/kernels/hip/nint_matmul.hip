@@ -142,6 +142,16 @@ __device__ __forceinline__ float nint_activation_value(
                 : __half2float(static_cast<const __half*>(input)[index]);
 }
 
+__device__ __forceinline__ float nint_apply_input_gate(float input, float gate, int mode) {
+    if (mode == 3) {
+        // Match the separate FP16 SiLU and multiply operations.
+        const float activated = __half2float(__float2half_rn(gate / (1.0f + expf(-gate))));
+        return __half2float(__float2half_rn(activated * input));
+    }
+    const float sigmoid = 1.0f / (1.0f + expf(-gate));
+    return input * (mode == 1 ? sigmoid : gate * sigmoid);
+}
+
 __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         const void * __restrict__ input,
         const void * __restrict__ gate,
@@ -167,8 +177,7 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
     if (valid && gate != nullptr) {
         const float gate_value = nint_activation_value(
             gate, static_cast<size_t>(row) * real_width + column, gate_fp32);
-        const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
-        value *= activation_mode == 1 ? sigmoid : gate_value * sigmoid;
+        value = nint_apply_input_gate(value, gate_value, activation_mode);
     }
     float maximum = fabsf(value);
 #pragma unroll
@@ -237,8 +246,7 @@ __global__ void __launch_bounds__(128) nint_quantize_decode_kernel(
             ? nint_activation_value(input, column, input_fp32) : 0.0f;
         if (gate != nullptr && element < GroupSize && column < width) {
             const float g = nint_activation_value(gate, column, gate_fp32);
-            const float sigmoid = 1.0f / (1.0f + expf(-g));
-            value *= mode == 1 ? sigmoid : g * sigmoid;
+            value = nint_apply_input_gate(value, g, mode);
         }
         values[part] = value;
         maximum = fmaxf(maximum, fabsf(value));
@@ -2292,7 +2300,7 @@ mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
         "NINT fused layout tensors are invalid");
     MFQ_RUNTIME_CHECK(
         (!gate.defined() && activation_mode == 0) ||
-            (gate.defined() && (activation_mode == 1 || activation_mode == 2) &&
+            (gate.defined() && (activation_mode >= 1 && activation_mode <= 3) &&
              gate.device() == input.device() && gate.is_contiguous() &&
              gate.sizes() == input.sizes() &&
              (gate.scalar_type() == mfq_tensor_backend::kFloat16 ||
@@ -2408,8 +2416,8 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         "NINT input must be contiguous CUDA fp16/fp32 rank-2");
     if (gate != nullptr) {
         MFQ_RUNTIME_CHECK(
-            activation_mode == 1 || activation_mode == 2,
-            "NINT input gate mode must be sigmoid or SiLU");
+            activation_mode >= 1 && activation_mode <= 3,
+            "NINT input gate mode must be sigmoid, SiLU, or FP16 SiLU");
         MFQ_RUNTIME_CHECK(
             gate->is_cuda() && gate->is_contiguous() &&
             (gate->scalar_type() == mfq_tensor_backend::kFloat16 ||

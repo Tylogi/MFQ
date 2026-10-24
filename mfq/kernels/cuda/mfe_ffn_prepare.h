@@ -1,6 +1,20 @@
 #pragma once
 #include "mfe_ffn.h"
 namespace mfq::cuda {
+// Per-call device scratch. Pairs retain token-major order within each expert;
+// unique_pairs contains one original pair per expert, in unspecified order.
+// Pair arrays have tokens*routes entries; offsets/counts have experts entries,
+// with -1/0 for absent experts. unique_count has one entry. The caller owns all
+// six arrays through prepare completion and subsequent graph replays.
+struct MfeExpertPlan {
+    int32_t* sorted_pairs=nullptr;
+    int32_t* pair_ranks=nullptr;
+    int32_t* expert_offsets=nullptr;
+    int32_t* expert_counts=nullptr;
+    int32_t* unique_pairs=nullptr;
+    int32_t* unique_count=nullptr;
+};
+constexpr int kMfeExpertPlanMaxPairs=1024;
 // Original compressed field addresses, published only after their first reader
 // has completed. Geometry and activation pointers stay in the GPU templates.
 struct alignas(16) MfeCachedExpert {
@@ -31,11 +45,12 @@ struct MfeCachedDispatch {
     bool primary_incomplete=false;
     MfePrepareSharedGate gate{};
 };
-void mfe_ffn_prepare_warp(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,cudaStream_t);
+void mfe_ffn_prepare_warp(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,cudaStream_t,
+    const MfeExpertPlan& plan={});
 void mfe_ffn_prepare_publish(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,
-    int32_t* mapped_ids,uint32_t* ready,cudaStream_t);
+    int32_t* mapped_ids,uint32_t* ready,cudaStream_t,const MfeExpertPlan& plan={});
 void mfe_ffn_prepare_publish_cached(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,
-    int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch&,cudaStream_t);
+    int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch&,cudaStream_t,const MfeExpertPlan& plan={});
 void mfe_ffn_wait_transfer_packet(const MfeFfnBatch&,const int32_t* mapped_plan,cudaStream_t);
 // Optional M1 route output needs routes+2 integers: count, original slots,
 // then the proven all-resident reduction flag.

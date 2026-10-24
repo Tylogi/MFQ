@@ -17,6 +17,8 @@ class MfeFfnRuntime {
     std::map<std::pair<int,int>,std::pair<mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor>> input_quantizers_;
     mfq_tensor_backend::Tensor transferred_,transfer_indices_,aborted_,resident_pairs_;
     mfq_tensor_backend::Tensor token_group_counts_,token_group_slots_,token_group_buckets_;
+    mfq_tensor_backend::Tensor expert_plan_storage_;
+    mfq::cuda::MfeExpertPlan expert_plan_{};
     int quantization_count_=0,quantization_groups_=0;
     bool dispatch_trace_reported_=false;
     bool combined_gate_up_=false;

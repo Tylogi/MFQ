@@ -368,6 +368,11 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-hip-activation-test PRIVATE
         mfq-hip-core mfq-hip-native-kernels)
 
+    mfq_add_hip_test(mfq-hip-sampling-test
+        ${MFQ_HIP_ROOT}/tests/mfq_hip_sampling_test.hip)
+    target_link_libraries(mfq-hip-sampling-test PRIVATE
+        mfq-hip-core mfq-hip-native-kernels)
+
     mfq_add_hip_test(mfq-hip-attention-mma-test
         ${MFQ_HIP_ROOT}/tests/attention_mma_test.cu)
     target_link_libraries(mfq-hip-attention-mma-test PRIVATE
@@ -384,6 +389,8 @@ if(BUILD_TESTING)
 
     mfq_add_hip_test(mfq-hip-nint-q8-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_q8_test.cu)
+    target_include_directories(mfq-hip-nint-q8-test PRIVATE
+        ${MFQ_REPOSITORY_ROOT}/cpp_runtime)
     target_link_libraries(mfq-hip-nint-q8-test PRIVATE
         mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
         mfq-hip-runtime mfq-runtime-communication mfq-model-graph)

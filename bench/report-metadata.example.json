@@ -1,0 +1,5 @@
+{
+  "model": "Example model",
+  "hardware": "AMD Instinct MI300X",
+  "backend": "HIP"
+}
