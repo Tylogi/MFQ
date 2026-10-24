@@ -37,10 +37,11 @@ jobs:
           mfq-prefill-budget-test
           mfq-benchmark-validation-test mfq-tokenizer-identity-test
           mfq-text-processor-test mfq-request-executor-test mfq-runtime-transport-test
+          mfq-kv-admission-test mfq-speculative-sequence-test
       - name: Run Linux regression tests
         run: >-
           ctest --test-dir build/linux-core --output-on-failure
-          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout|prefill-budget|benchmark-validation|tokenizer-identity|text-processor|request-executor|runtime-transport)-test$'
+          -R '^mfq-(file-range-reader|model-source|quant-expert-range|moe-cache-policy|moe-cache-profile|native-tensor|moe-host-memory|model-config|nemotron-vision-config|nemotron-vision-geometry|deepseek-v41-vision-layout|prefill-budget|benchmark-validation|tokenizer-identity|text-processor|request-executor|runtime-transport|kv-admission|speculative-sequence)-test$'
 
   benchmark-regressions:
     name: Benchmark regressions
@@ -61,6 +62,12 @@ jobs:
           tests/test_server_evaluations.py tests/test_scoring_sandbox.py
           tests/test_tokenizer_identity.py tests/test_wt2_reference.py
           tests/test_native_wt2_reference.py tests/test_wikitext_quality_jobs.py
+
+      - name: Check serving concurrency and metrics
+        run: >-
+          uv run python -m pytest -q
+          tests/test_server_concurrency.py tests/test_server_protocol.py
+          tests/test_server_prometheus_metrics.py tests/test_serving_statistics.py
 
   macos-metal:
     name: macOS Metal
