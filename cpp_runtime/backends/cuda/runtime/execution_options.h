@@ -114,6 +114,7 @@ int moe_prefill_group_size();
 
 // Decode and short-batch ablation controls; preserve unset defaults at call sites.
 std::optional<bool> mfe_token_groups();
+std::optional<bool> mfe_expert_plan();
 std::optional<bool> mfe_token_compact_plan();
 std::optional<bool> mfe_token_aligned_gu();
 std::optional<bool> mfe_shared_small_whole();

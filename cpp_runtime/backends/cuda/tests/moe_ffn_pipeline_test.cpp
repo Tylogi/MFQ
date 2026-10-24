@@ -2571,6 +2571,10 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--d4-analytic-scale-memory-check") {verify_d4_analytic_scales(root,false);return 0;}
         if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
         if(std::string(argv[2])=="--prefill-quota-recovery-check") {verify_prefill_quota_recovery(root);return 0;}
+        if(std::string(argv[2])=="--mfe-expert-plan-pipeline-check") {
+            verify_mfe_expert_plan_pipeline(root);return 0;
+        }
+        if(std::string(argv[2])=="--mfe-expert-plan-check") {verify_mfe_expert_plan(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}
         if(std::string(argv[2])=="--speculative-route-prefix-check") {verify_speculative_route_prefix(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-pipeline-check") {

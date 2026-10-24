@@ -298,6 +298,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     batch_.hidden=reinterpret_cast<__half*>(hidden_.data_ptr());batch_.hidden_quantized=quantized_.data_ptr<int8_t>();
     batch_.hidden_scales=scales_.data_ptr<float>();batch_.completion=reinterpret_cast<uint32_t*>(completion_.data_ptr<int32_t>());
     batch_.output=output_.data_ptr();
+    const int pairs=batch_.tokens*batch_.routes;
+    if(pairs<=mfq::cuda::kMfeExpertPlanMaxPairs) {
+        expert_plan_storage_=tb::empty({3*pairs+2*batch_.experts+1},input.options().dtype(tb::kInt32));
+        auto* scratch=expert_plan_storage_.data_ptr<int32_t>();
+        expert_plan_={scratch,scratch+pairs,scratch+2*pairs,scratch+2*pairs+batch_.experts,
+            scratch+2*pairs+2*batch_.experts,scratch+3*pairs+2*batch_.experts};
+    }
     // Pure NINT speculative batches retain the measured faster routed kernels;
     // independent eight-row decode tiles may request expert reuse explicitly.
     const bool has_mxfp4=std::any_of(views.begin(),views.end(),[](const View& view){return view.family==3;});
@@ -610,7 +617,12 @@ void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
     if(const auto setting=mfq::cuda::runtime_options::mfe_token_groups())
         if(!*setting)prepared.token_group_counts=nullptr;
     const auto* warp_prepare=std::getenv("MFQ_MFE_PREPARE_WARP");
-    const auto prepare=!warp_prepare || warp_prepare[0]!='0'?mfq::cuda::mfe_ffn_prepare_warp:mfq::cuda::mfe_ffn_prepare;
+    const bool use_warp=!warp_prepare || warp_prepare[0]!='0';
+    // Small windows retain linear grouping to avoid radix overhead on repeated routes.
+    // The explicit option keeps both paths available for same-process probes.
+    const bool planned=mfq::cuda::runtime_options::mfe_expert_plan().value_or(batch_.tokens*batch_.routes>=128);
+    const auto plan=planned && (prepared.token_group_counts || (ready && cached_dispatch_.mapped))?
+        expert_plan_:mfq::cuda::MfeExpertPlan{};
     const auto* quantization=reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr());
     if(ready && cached_dispatch_.mapped) {
         auto cache=cached_dispatch_;
@@ -618,11 +630,14 @@ void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
         // ordered readout is needed at final combination, after join_shared().
         if(shared_in_flight_ && early_shared_gate_.activation)cache.gate={};
         mfq::cuda::mfe_ffn_prepare_publish_cached(prepared,quantization,quantization_count_,quantization_groups_,
-            published_ids,ready,cache,mfq_current_cuda_stream());
+            published_ids,ready,cache,mfq_current_cuda_stream(),plan);
     }
     else if(ready)mfq::cuda::mfe_ffn_prepare_publish(prepared,quantization,quantization_count_,quantization_groups_,
-        published_ids,ready,mfq_current_cuda_stream());
-    else prepare(prepared,quantization,quantization_count_,quantization_groups_,mfq_current_cuda_stream());
+        published_ids,ready,mfq_current_cuda_stream(),plan);
+    else if(use_warp)mfq::cuda::mfe_ffn_prepare_warp(prepared,quantization,quantization_count_,quantization_groups_,
+        mfq_current_cuda_stream(),plan);
+    else mfq::cuda::mfe_ffn_prepare(prepared,quantization,quantization_count_,quantization_groups_,
+        mfq_current_cuda_stream());
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     if((shared_plan || split_shared_groups_) && prepared.token_group_counts) {
         auto shared_batch=batch_;

@@ -31,6 +31,8 @@ matches what you want to do.
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
 - [HIP runtime validation](runtime/hip-validation.md)
 - [HIP model benchmarks](runtime/hip-model-benchmarks.md)
+- [Benchmark reporting workflow and design](benchmarks/reporting-workflow.md)
+- [Render inference charts from benchmark results](benchmarks/inference-charts.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 
 ## APIs
