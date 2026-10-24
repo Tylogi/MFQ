@@ -1051,8 +1051,11 @@ class Qsa {
             if(graph_prepared_)return;
             const auto n=position();
             memory_->ensure(n);
-            pooled_.update(*rotary_,index_.storage(),w_.index_key_norm,full_positions,n,c_.pool,c_.eps);
-            pooled_.prepare_graph(full_positions,c_.maximum);
+            // A retained window can start a new prompt before any positions exist.
+            const auto positions=full_positions.defined()?full_positions:
+                tb::empty({0},index_.storage().options().dtype(tb::kInt64));
+            pooled_.update(*rotary_,index_.storage(),w_.index_key_norm,positions,n,c_.pool,c_.eps);
+            pooled_.prepare_graph(positions,c_.maximum);
             graph_prepared_=true;return;
         }
         if(graph_keys_.defined())return;

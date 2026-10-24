@@ -16,6 +16,44 @@ void qsa_incremental_pool_case() {
     int cases=0;
     int64_t processed=0,recomputed=0,device_rows=0;
     const bool fused_store=runtime_options::qsa_pool_store_fused();
+    {
+        CudaExecutionContext execution;
+        constexpr int maximum=64,hidden=32,heads=4,kv=2,width=32,iw=8,ih=2,pool=4,budget=16;
+        auto rotary=std::make_shared<RotaryEmbedding>(8,maximum,10000.);
+        auto norm=data({width},1,0),inorm=data({iw},1,0);
+        QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+            linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
+        QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
+        auto memory=std::make_shared<KvMemoryManager>(KvMemoryOptions{});
+        Qsa actual(weights,cfg,rotary,true,true,{},memory),oracle(weights,cfg,rotary);
+        memory->finalize();
+        actual.activate_memory();
+        const auto* pooled_address=actual.pooled_cache().data_ptr();
+        auto inputs=data({1,maximum,hidden},17,.4f);
+        auto positions=tb::arange(maximum,inputs.options().dtype(tb::kInt64));
+        // The first short prefill enters graph execution with no position history.
+        for(int reuse=0;reuse<2;++reuse) {
+            actual.prepare_graph({},maximum);
+            for(int tokens=0;tokens<24;++tokens) {
+                auto x=inputs.narrow(1,tokens,1),pos=positions.narrow(0,tokens,1);
+                Tensor output;
+                DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&] {output=actual.forward_graph(execution,x,pos,pos);},[]{},[&] {output={};});
+                window.run();
+                actual.advance_graph(1);
+                equal(output,oracle.forward(execution,x,pos,positions.narrow(0,0,tokens+1),true),
+                    "managed QSA empty-prefix graph output");
+                if(actual.pooled_groups()!=(tokens+1)/pool || actual.pooled_cache().data_ptr()!=pooled_address)
+                    throw std::runtime_error("managed QSA pooling lost its watermark or preallocated storage");
+                if(tokens+1>=pool && tokens+1>budget)
+                    equal(actual.pooled_cache().narrow(1,0,(tokens+1)/pool),
+                        oracle.pooled_cache().narrow(1,0,(tokens+1)/pool),"managed QSA graph pooled storage");
+                ++cases;
+            }
+            actual.reset();
+            oracle.reset();
+        }
+    }
     for(int width:{8,64,256,512})for(auto dtype:{tb::kFloat16,tb::kFloat32})
     for(int axes:{1,3})for(int batch:{1,2}) {
         constexpr int maximum=128,pool=4;
