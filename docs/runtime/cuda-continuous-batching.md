@@ -4,9 +4,11 @@ Enable an explicit request capacity with `mfq serve --max-requests-per-runtime N
 or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
 from 1 to the configured sequence limit on one CUDA device. The limit defaults
 to 32 and can be reduced with `MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES`. Values above
-32 are rejected in both the native worker and Python server. The managed server's
-default remains one request. The 64-row paths are not validated; GDN independent
-batch preparation currently accepts at most 32 rows.
+32 are rejected in both the native worker and Python server. GDN independent
+batch preparation currently accepts at most 32 rows. The managed server defaults to eight requested
+rows and adopts the worker's reported `batch_capacity`; models without
+per-request batch state keep the single-request path and log a warning instead
+of failing the load. See [multi-request concurrency](concurrency.md).
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,
 QSA caches, token counts and logical position. Pending prefills run in bounded

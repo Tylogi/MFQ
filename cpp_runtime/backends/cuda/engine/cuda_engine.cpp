@@ -277,7 +277,12 @@ struct CudaEngineState {
                                 }
                             }
                         }});
-            else throw std::invalid_argument("continuous batching is unavailable for this model");
+            else
+                // Capacity is a serving hint. A model without per-request batch
+                // state keeps the single-request path and reports capacity one
+                // instead of failing the load for an unrelated reason.
+                std::cerr<<"continuous_batching unavailable model="<<language.model_type()
+                    <<" requested_capacity="<<config.continuous_batch.max_sequences<<'\n';
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if(execution->moe_expert_cache) {
@@ -376,6 +381,11 @@ struct CudaEngineState {
             return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
                 !(request.input.sampling.enable_mtp && components.mtp);
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
+    }
+    // Report the rows this model can batch so the control plane never admits
+    // more concurrent requests than the worker can execute.
+    std::size_t batch_capacity() const {
+        return batching ? std::max<std::size_t>(1, config.continuous_batch.max_sequences) : 1;
     }
     ~CudaEngineState() {
         language.restore_decode_workspace={};
@@ -664,7 +674,8 @@ struct CudaBackend {
             });
         return visit([&](auto& state) {
             EngineInfo info;
-            info.max_requests = std::max<std::size_t>(1, config.continuous_batch.max_sequences);
+            info.batch_capacity = state.batch_capacity();
+            info.max_requests = info.batch_capacity;
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();

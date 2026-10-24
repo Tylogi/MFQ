@@ -332,6 +332,43 @@ bool RotaryEmbedding::pool_normalized_into(const Tensor& index,const Tensor& wei
     return true;
 }
 
+void RotaryEmbedding::pool_groups_into(const Tensor& index,const Tensor& weight,const Tensor& positions,
+        Tensor output,int64_t pool,double eps,const Tensor& cache_positions,
+        const Tensor& stored_positions,const Tensor& processed_rows) const {
+    const bool range=!cache_positions.defined();
+    if(fused_ && runtime_options::qsa_pool_store_fused() && index.size(2)<=256 &&
+        index.size(2)>=dimension_ && (index.scalar_type()==tb::kFloat16 || index.scalar_type()==tb::kFloat32)) {
+        const auto prepared=prepare_parameters(index);
+        qsa_pool_rotary_cache_cuda(index,weight.to(tb::kFloat32).contiguous(),positions.contiguous(),
+            cache_positions,prepared.frequencies,prepared.axes,output,pool,index.size(1),maximum_,eps,
+            range,stored_positions,processed_rows);
+        return;
+    }
+    const auto batch=index.size(0),width=index.size(2);
+    const auto groups=range?index.size(1)/pool:cache_positions.numel();
+    Tensor blocks,raw=index;
+    if(!range) {
+        blocks=cache_positions/pool;
+        auto rows=(blocks.unsqueeze(-1)*pool+tb::arange(pool,blocks.options())).clamp(0,index.size(1)-1);
+        raw=index.index_select(1,rows.reshape({-1}));
+    }
+    auto mean=raw.reshape({batch,groups,pool,width}).to(tb::kFloat32).mean(2).to(index.scalar_type());
+    auto f=mean.to(tb::kFloat32);
+    auto normalized=(f*tb::rsqrt((f*f).mean(-1,true)+eps)*(weight.to(tb::kFloat32)+1)).to(index.scalar_type());
+    auto active_positions=range?positions:stored_positions.index_select(-1,blocks*pool);
+    auto pooled=forward(normalized.unsqueeze(1),active_positions).squeeze(1);
+    if(range)output.copy_(pooled);
+    else {
+        // Capture-safe fallback: incomplete groups retain their previous value.
+        auto old=output.index_select(1,blocks);
+        // Duplicate destinations in a verify tile must all publish the same value.
+        auto ends=blocks*pool+pool-1;
+        auto finished=ends<=cache_positions.narrow(0,cache_positions.numel()-1,1);
+        auto values=tb::where(finished.reshape({1,-1,1}),pooled,old);
+        output.index_copy_(1,blocks,values);
+    }
+}
+
 Tensor RotaryEmbedding::forward_normalized(const Tensor& value, const Tensor& weight,
         const Tensor& positions, double eps, const Tensor& key_cache,
         const Tensor& cache_positions, const Tensor& projected_value, const Tensor& value_cache) const {

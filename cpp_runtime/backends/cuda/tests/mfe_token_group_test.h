@@ -1,5 +1,6 @@
 #pragma once
 #include "mfe_ffn_runtime.h"
+#include "mfe_expert_ffn_test.h"
 #include <cstring>
 
 void verify_mfe_token_groups(const std::filesystem::path& root) {
@@ -165,4 +166,115 @@ void verify_mfe_token_groups(const std::filesystem::path& root) {
     }
     std::cout<<"mfe_token_group_cases="<<cases<<" PASS\n";
     mfq_cuda_synchronize();context->end_graph_pool(stream);
+}
+
+void verify_mfe_expert_plan(const std::filesystem::path& root) {
+    mfe_expert_plan_test::verify(false,mfq_current_cuda_stream());
+    mfe_expert_plan_test::verify_cache(false,mfq_current_cuda_stream());
+    mfe_expert_plan_test::verify_ffn(root,false);
+}
+
+void verify_mfe_expert_plan_pipeline(const std::filesystem::path& root) {
+    mfe_expert_plan_test::Option option;
+    const auto counter=[](const std::shared_ptr<MoeExpertCache>& cache,const char* name) {
+        std::ostringstream output;
+        print_moe_expert_cache_stats(cache,output);
+        std::smatch match;
+        const auto text=output.str();
+        if(!std::regex_search(text,match,std::regex(std::string(name)+"=([0-9]+)")))
+            throw std::runtime_error("missing expert-plan pipeline counter: "+std::string(name));
+        return std::stoll(match[1]);
+    };
+    int cases=0;
+    int64_t dma=0,hits=0,misses=0;
+    for(const char* family:{"nint","nvq","mxfp4"})for(int tokens:{2,8,16,32})for(int routes:{8,22})
+    for(bool graph:{false,true}) {
+        const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
+        std::array<CudaExecutionContext,2> executions;
+        std::array<std::shared_ptr<MoeExpertCache>,2> caches;
+        std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
+        std::array<MoeFfnForward,2> forwards;
+        std::array<mfq::MoeDispatchPlan,2> plans;
+        for(int mode=0;mode<2;++mode) {
+            MfqCudaStreamGuard guard(streams[mode]);
+            auto& config=executions[mode].config;
+            config.moe_two_stage_ffn=true;
+            config.moe_preload_all=true;
+            config.moe_assert_resident=true;
+            config.moe_pipeline=true;
+            config.moe_ram_pcie=true;
+            config.moe_ram_pcie_fraction=1;
+            config.moe_direct_ram=true;
+            config.moe_residency_adapt=false;
+            config.moe_residency_projection_heat=false;
+            executions[mode].continuous_batch_cache_serial=tokens>8;
+            std::size_t bundle=0;
+            for(int p=0;p<3;++p) {
+                sources[mode][p]=source(root/(std::string("plan-")+family+(p==2?"-down.mfq":"-up.mfq")));
+                bundle+=sources[mode][p]->expert_field_bytes(0);
+            }
+            config.moe_host_cache_bytes=768*bundle;
+            caches[mode]=make_moe_expert_cache(2*bundle,config);
+            std::vector<std::shared_ptr<MfeWeight>> gu,down;
+            for(int p=0;p<3;++p) {
+                auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(caches[mode],
+                    std::to_string(p),sources[mode][p],1,0,std::to_string(p)));
+                (p==2?down:gu).push_back(weight);
+            }
+            forwards[mode]=make_moe_ffn_pipeline(gu,down,{},
+                [&,mode](const mfq::MoeDispatchPlan& plan){plans[mode]=plan;});
+            finalize_moe_expert_cache(caches[mode]);
+        }
+        const auto options=tb::TensorOptions().device(tb::kCUDA);
+        auto input=tb::full({tokens,384},.03125,options.dtype(tb::kFloat16));
+        auto ids=tb::zeros({tokens,routes},options.dtype(tb::kInt32));
+        auto weights=tb::full({tokens,routes},1.0/routes,options.dtype(tb::kFloat32));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(streams[1]));
+        std::array<tb::Tensor,2> outputs;
+        std::array<std::unique_ptr<mfq::cuda::DecodeWindow>,2> windows;
+        if(graph)for(int mode=0;mode<2;++mode) {
+            MfqCudaStreamGuard guard(streams[mode]);
+            mfe_expert_plan_test::Option::select(mode?"1":"0");
+            windows[mode]=std::make_unique<mfq::cuda::DecodeWindow>(mfq_current_cuda_stream());
+            windows[mode]->capture([&,mode]{outputs[mode]=forwards[mode](executions[mode],input,ids,weights);},
+                []{},[&,mode]{outputs[mode]={};});
+        }
+        for(int step=0;step<4;++step) {
+            std::vector<int32_t> selected(tokens*routes);
+            for(int pair=0;pair<tokens*routes;++pair)
+                selected[pair]=pair%routes==0?0:2+(pair%(step<2?routes:tokens*routes));
+            ids.copy_(tb::tensor(selected).reshape({tokens,routes}).to(tb::kCUDA));
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(streams[1]));
+            mfe_expert_plan_test::Option::select("0");
+            tb::Tensor expected;
+            {
+                MfqCudaStreamGuard guard(streams[0]);
+                if(graph)windows[0]->run();
+                else outputs[0]=forwards[0](executions[0],input,ids,weights);
+                expected=outputs[0].cpu().contiguous();
+            }
+            mfe_expert_plan_test::Option::select("1");
+            if(graph)windows[1]->run();
+            else outputs[1]=forwards[1](executions[1],input,ids,weights);
+            auto result=outputs[1].cpu().contiguous();
+            if(plans[0].kinds!=plans[1].kinds)
+                throw std::runtime_error("expert plan changed pipeline route ownership");
+            if(result.sizes()!=expected.sizes() || std::memcmp(result.data_ptr(),expected.data_ptr(),result.nbytes()))
+                throw std::runtime_error("expert plan changed pipeline FFN output");
+            for(const char* metric:{"ram_pcie_bytes","pipeline_transfer_cache_hits","pipeline_transfer_cache_misses",
+                    "pipeline_transfer_cache_saved_bytes","residency_committed_projections"})
+                if(counter(caches[0],metric)!=counter(caches[1],metric))
+                    throw std::runtime_error("expert plan changed pipeline "+std::string(metric));
+            ++cases;
+        }
+        dma+=counter(caches[1],"ram_pcie_bytes");
+        hits+=counter(caches[1],"pipeline_transfer_cache_hits");
+        misses+=counter(caches[1],"pipeline_transfer_cache_misses");
+        for(const auto& mode:sources)for(const auto& source:mode)
+            if(source->expert_disk_reads_after_preload())
+                throw std::runtime_error("expert-plan pipeline reread a sealed weight bank");
+    }
+    if(!dma || !hits || !misses)throw std::runtime_error("expert-plan pipeline omitted DMA or cache hit/miss");
+    std::cout<<"mfe_expert_plan_pipeline_cases="<<cases<<" dma_bytes="<<dma<<" hits="<<hits<<" misses="<<misses
+        <<" equal_dma=1 equal_cache=1 equal_ownership=1 PASS\n";
 }

@@ -1461,7 +1461,11 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-cache-bench") {benchmark_decode_kv_cache();return 0;}
     if(argc==2 && std::string(argv[1])=="--route-export-bench") {benchmark_route_export();return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-bench") {benchmark_mapped_copy();return 0;}
-    if(argc==2 && std::string(argv[1])=="--mfe-prepare-bench") {benchmark_mfe_prepare();return 0;}
+    if((argc==2 || argc==3) && std::string(argv[1])=="--mfe-prepare-bench") {
+        benchmark_mfe_prepare();
+        if(argc==3)mfe_expert_plan_test::verify_ffn(argv[2],true);
+        return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--mfe-prepare-check") {benchmark_mfe_prepare(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-check") {benchmark_mapped_copy(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-pcie-bench") {benchmark_mapped_copy(true,true);return 0;}
