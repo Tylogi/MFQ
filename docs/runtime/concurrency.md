@@ -8,8 +8,8 @@ turning a hardware or checkpoint limit into a failed load.
 ## Capacity negotiation
 
 1. `mfq serve` asks each worker for a bounded capacity
-   (`--max-requests-per-runtime`, default `8` on CUDA and Metal; HIP requires an
-   explicit value). The CLI accepts up to `32`; per-model overrides must also
+   (`--max-requests-per-runtime`, default `8` on CUDA, HIP and Metal).
+   The CLI accepts up to `32`; per-model overrides must also
    fit the configured server ceiling.
 2. The worker loads the model and decides whether it can batch at all. A model
    without per-request batch state keeps the single-request path, logs
@@ -33,7 +33,7 @@ no active or queued requests. The effective value is visible in
 | CUDA | Other families | 1 | Loads normally with a warning |
 | Metal | Qwen Flash-Next | up to 32 | Packed prefill and per-request cache; batch MTP when the predictor supports it |
 | Metal | Other families | 1 | Loads normally with a warning |
-| HIP | Qwen3.5 family | explicit capacity only | Implemented and compiled; not yet certified on AMD hardware |
+| HIP | Qwen3.5 family | up to the requested capacity | Implemented and compiled; runtime reports effective capacity |
 | HIP | Other families | 1 | Loads normally with a warning |
 
 Requests that cannot join a batch still execute correctly. They wait in the

@@ -242,8 +242,8 @@ uv run mfq serve \
   Explicit integers from `1` to `8192` set a smaller limit and are always passed
   to the worker. On Metal and HIP, `auto` preserves their native default policy.
 - `--max-requests-per-runtime N` admits up to `N` concurrent requests per worker
-  on supported native paths. The default is `8` on CUDA and Metal; HIP needs an
-  explicit value. The worker reports the capacity its loaded model can actually
+  on supported native paths. The default is `8` on CUDA, HIP and Metal.
+  The worker reports the capacity its loaded model can actually
   batch, and the server adopts that report, so a model without per-request batch
   state keeps a single request and never fails to load. `N` is limited to `32`.
   See [multi-request concurrency](../runtime/concurrency.md).
@@ -288,7 +288,7 @@ unpinned models; instances may override it through the runtime API.
 | `--work-dir PATH` | Workspace boundary for tool jobs. | Current directory |
 | `--api-key-env NAME` | Environment variable containing the administrator API key. | `MFQ_SERVER_API_KEY` |
 | `--max-runtime-instances N` | Maximum managed native workers. | `2` |
-| `--max-requests-per-runtime N` | Concurrent requests per worker; the worker reports the capacity its model can batch. | CUDA/Metal: `8`; HIP: `1` |
+| `--max-requests-per-runtime N` | Concurrent requests per worker; the worker reports the capacity its model can batch. | `8` |
 | `--max-queued-requests-per-runtime N` | Waiting requests per worker. | `max(32, 4 × concurrency)` |
 | `--queue-timeout SECONDS` | Maximum wait for a runtime slot before a retryable error. | `0` (wait indefinitely) |
 | `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
