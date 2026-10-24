@@ -445,10 +445,12 @@ void gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor
         int64_t(Chunk) * D * (sizeof(__half) + sizeof(float)) + int64_t(Chunk) * Chunk * sizeof(__half)
         + int64_t(Chunk + 2) * sizeof(float));
     const int chunks = gdn_chunk_window(tokens, per_chunk_bytes);
-    auto w = tb::empty({batch, hv, chunks, Chunk, D}, g.options().dtype(tb::kFloat16));
-    auto u = tb::empty({batch, hv, chunks, Chunk, D}, g.options());
-    auto a = tb::empty({batch, hv, chunks, Chunk, Chunk}, g.options().dtype(tb::kFloat16));
-    auto prefix = tb::empty({batch, hv, chunks, Chunk + 2}, g.options());
+    // Spelled-out types: MSVC's front end treats auto from a D-dependent shape
+    // as dependent and rejects data_ptr<float>() without a template keyword.
+    tb::Tensor w = tb::empty({batch, hv, chunks, Chunk, D}, g.options().dtype(tb::kFloat16));
+    tb::Tensor u = tb::empty({batch, hv, chunks, Chunk, D}, g.options());
+    tb::Tensor a = tb::empty({batch, hv, chunks, Chunk, Chunk}, g.options().dtype(tb::kFloat16));
+    tb::Tensor prefix = tb::empty({batch, hv, chunks, Chunk + 2}, g.options());
     constexpr int prepare_bytes = (Chunk * ((D < Chunk ? Chunk : D) + 8) + 32 * (Chunk + 8)) * sizeof(__half)
         + (Chunk * (Chunk + 4) + Chunk * Chunk + 3 * Chunk + Warps) * sizeof(float);
     constexpr int StateColumns = D == 128 ? 64 : Columns, StateThreads = D == 128 ? 1024 : Threads;
