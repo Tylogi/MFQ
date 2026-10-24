@@ -1,6 +1,8 @@
 /** 管理界面与推理设置的默认值、本地读取及模型模式继承规则。 */
 import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../shared/api/types';
 
+import { DEFAULT_CONCURRENCY, type ConcurrencyDefaults } from '../models/concurrencySettings';
+
 export type UiLanguage = "system" | "zh-CN" | "en";
 
 export type UiTheme = "system" | "light" | "dark";
@@ -8,6 +10,7 @@ export type UiTheme = "system" | "light" | "dark";
 export type PresetName = "precise" | "balanced" | "creative" | "custom";
 
 export interface GenerationSettings {
+  concurrencyDefaults: ConcurrencyDefaults;
   language: UiLanguage;
   theme: UiTheme;
   inheritModelDefaults: boolean;
@@ -33,6 +36,7 @@ export interface GenerationSettings {
 export const SETTINGS_KEY = "mfq.studio.generation.v1";
 
 export const DEFAULT_SETTINGS: GenerationSettings = {
+  concurrencyDefaults: DEFAULT_CONCURRENCY,
   language: "system",
   theme: "system",
   inheritModelDefaults: true,
@@ -130,6 +134,16 @@ export function loadSettings(): GenerationSettings {
     ] as const) {
       if (settings[key] < minimum || settings[key] > maximum || integer && !Number.isInteger(settings[key])) {
         settings[key] = DEFAULT_SETTINGS[key];
+      }
+    }
+    const concurrency = source.concurrencyDefaults;
+    settings.concurrencyDefaults = { ...DEFAULT_CONCURRENCY };
+    if (concurrency && typeof concurrency === 'object' && !Array.isArray(concurrency)) {
+      for (const field of Object.keys(DEFAULT_CONCURRENCY) as (keyof ConcurrencyDefaults)[]) {
+        const number = (concurrency as Record<string, unknown>)[field];
+        if (typeof number === 'number' && Number.isFinite(number) && number >= (field === 'max_requests' ? 1 : 0)
+            && (field === 'queue_timeout_seconds' || Number.isSafeInteger(number))
+            && (field !== 'max_requests' || number <= 32)) settings.concurrencyDefaults[field] = number;
       }
     }
     settings.seed = typeof source.seed === 'number' && Number.isSafeInteger(source.seed) && source.seed >= 0 ? source.seed : null;

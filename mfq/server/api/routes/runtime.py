@@ -24,6 +24,10 @@ from mfq.server.protocol.models import (
     RuntimeCacheTrimRequest,
     RuntimePrefixCachePurgeRequest,
     RuntimeCapabilitiesResource,
+    RuntimeConcurrencyPolicy,
+    RuntimeConcurrencyReloadRequest,
+    RuntimeConcurrencyUpdate,
+    UpdateRuntimeConcurrencyRequest,
     RuntimeInstanceList,
     RuntimeInstanceResource,
     RuntimeLogLevel,
@@ -46,6 +50,55 @@ from mfq.server.protocol.models import (
 
 profile_router = APIRouter()
 router = APIRouter()
+
+
+@router.get(
+    "/api/v1/runtime/concurrency", response_model=RuntimeConcurrencyPolicy,
+    responses=ERROR_RESPONSES, tags=["runtime"],
+)
+async def concurrency_policy(service: ServiceDependency) -> RuntimeConcurrencyPolicy:
+    from mfq.server.services.service import ServiceError
+
+    if not hasattr(service.runtime_manager, "concurrency_policy"):
+        raise ServiceError(501, "concurrency_unavailable", "managed concurrency settings are unavailable")
+    return service.runtime_manager.concurrency_policy
+
+
+@router.put(
+    "/api/v1/runtime/instances/{instance_id}/concurrency", response_model=RuntimeConcurrencyUpdate,
+    responses=ERROR_RESPONSES, tags=["runtime"],
+)
+async def configure_concurrency(
+    service: ServiceDependency, instance_id: UUID, body: UpdateRuntimeConcurrencyRequest,
+) -> RuntimeConcurrencyUpdate:
+    from mfq.server.runtime.backend import BackendError
+    from mfq.server.services.service import ServiceError
+
+    await concurrency_policy(service)
+    try:
+        return await service.runtime_manager.update_concurrency(instance_id, body)
+    except BackendError as error:
+        raise ServiceError(error.status_code or 400, error.code, str(error), retryable=error.retryable) from error
+
+
+@router.post(
+    "/api/v1/runtime/concurrency/reload", response_model=JobResource, status_code=202,
+    responses=ERROR_RESPONSES, tags=["runtime"],
+)
+async def reload_concurrency(service: ServiceDependency, body: RuntimeConcurrencyReloadRequest) -> JobResource:
+    from mfq.server.protocol.models import CreateJobRequest
+    from mfq.server.runtime.backend import BackendError
+    from mfq.server.runtime.concurrency import resolve_concurrency
+    from mfq.server.services.service import ServiceError
+
+    policy = await concurrency_policy(service)
+    try:
+        resolve_concurrency(policy, body)
+    except BackendError as error:
+        raise ServiceError(error.status_code or 422, error.code, str(error)) from error
+    return await service.create_job(CreateJobRequest(
+        kind="runtime.concurrency.configure", payload=body.model_dump(mode="json", exclude_unset=True),
+    ))
 
 
 @router.get("/api/v1/runtime/context-policy", response_model=RuntimeContextPolicy, responses=ERROR_RESPONSES, tags=["runtime"])

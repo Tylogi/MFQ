@@ -598,10 +598,12 @@ def test_serve_can_disable_web_ui_build() -> None:
     assert _prepare_web_root(None, disabled=True) is None
 
 
+@pytest.mark.parametrize("backend", ["cuda", "hip", "metal"])
 def test_serve_starts_without_loading_an_initial_model(
     tmp_path: Path,
     monkeypatch,
     capsys,
+    backend,
 ) -> None:
     executable = tmp_path / "mfq-decode-metal"
     executable.write_bytes(b"runtime")
@@ -611,7 +613,7 @@ def test_serve_starts_without_loading_an_initial_model(
             "serve",
             "--no-web-ui",
             "--backend",
-            "auto",
+            backend,
             "--running-executable",
             str(executable),
             "--data-dir",
@@ -621,6 +623,14 @@ def test_serve_starts_without_loading_an_initial_model(
         ]
     )
     captured: dict[str, object] = {}
+    from mfq.server.runtime.runtime_pool import RuntimePool
+
+    def capture_pool(*args, **kwargs):
+        captured["max_requests"] = kwargs["max_requests_per_instance"]
+        return RuntimePool(*args, **kwargs)
+
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.RuntimePool", capture_pool)
+    monkeypatch.setattr("mfq.commands.serve._select_backend", lambda *_: backend)
     monkeypatch.setattr(
         "mfq.server.runtime.native.NativeRuntime.start",
         lambda _: (_ for _ in ()).throw(AssertionError("must not start a model runtime")),
@@ -636,6 +646,7 @@ def test_serve_starts_without_loading_an_initial_model(
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8090
     assert captured["access_log"] is True
+    assert captured["max_requests"] == 8
     assert "MFQ Server ready" not in capsys.readouterr().out
     assert (data_dir / "server.sqlite3").is_file()
     assert (data_dir / "media").is_dir()

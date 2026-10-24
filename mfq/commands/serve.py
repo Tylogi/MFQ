@@ -14,7 +14,11 @@ import sys
 from pathlib import Path
 
 from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
-from mfq.server.runtime.native import DEFAULT_RUNTIME_CONCURRENCY, MAX_RUNTIME_CONCURRENCY
+from mfq.server.runtime.native import (
+    DEFAULT_RUNTIME_CONCURRENCY,
+    MAX_RUNTIME_CONCURRENCY,
+    native_request_capacity,
+)
 
 
 def _positive_int(value: str) -> int:
@@ -353,11 +357,11 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
         max_requests_per_instance=(
             args.max_requests_per_runtime
             if args.max_requests_per_runtime is not None
-            # HIP batching is implemented but not yet exercised on certified
-            # hardware, so it needs an explicit capacity.
-            else DEFAULT_RUNTIME_CONCURRENCY
-            if selected_backend in {"cuda", "metal"}
-            else 1
+            else native_request_capacity(
+                backend=selected_backend,
+                routed_expert_bytes=0,
+                requested=DEFAULT_RUNTIME_CONCURRENCY,
+            )
         ),
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
         queue_timeout_seconds=float(args.queue_timeout),
