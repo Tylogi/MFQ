@@ -16,6 +16,27 @@ struct MtpModule;
 namespace mfq::cuda {
 struct Qwen4DecodeGraph;
 class Qwen4BatchDecodeGraph;
+class Qwen4BatchRequestState;
+// Recurrent checkpoints for batched verification, sized once. Its slot count
+// bounds the draft tokens one window may verify, whatever the row count.
+class Qwen4BatchCheckpointPool {
+  public:
+    explicit Qwen4BatchCheckpointPool(int64_t tokens);
+    int64_t tokens() const noexcept { return int64_t(busy_.size()); }
+    int64_t available() const noexcept;
+    std::vector<int64_t> acquire(int64_t count);
+    void release(const std::vector<int64_t>& slots) noexcept;
+  private:
+    void allocate(Qwen4BatchRequestState&);
+    std::vector<bool> busy_;
+    // One [tokens, ...] tensor per layer state; undefined where a layer has none.
+    std::vector<mfq_tensor_backend::Tensor> gdn_conv_, gdn_state_, ple_conv_;
+    friend mfq_tensor_backend::Tensor qwen4_batch_decode(
+        Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
+        mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&,
+        mfq_tensor_backend::Tensor*, const std::vector<int>&, bool,
+        const std::shared_ptr<Qwen4BatchCheckpointPool>&);
+};
 // A request owns recurrent, positional and attention state; weights stay shared.
 class Qwen4BatchRequestState {
   public:
@@ -40,15 +61,20 @@ class Qwen4BatchRequestState {
     friend mfq_tensor_backend::Tensor qwen4_batch_decode(
         Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
         mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&,
-        mfq_tensor_backend::Tensor*, const std::vector<int>&, bool);
+        mfq_tensor_backend::Tensor*, const std::vector<int>&, bool,
+        const std::shared_ptr<Qwen4BatchCheckpointPool>&);
+    friend class Qwen4BatchCheckpointPool;
 };
 std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
     Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
     const std::vector<mfq_tensor_backend::Tensor>&);
+// Speculative verification takes recurrent checkpoints from `checkpoints`
+// when given; the caller keeps the window's draft tokens within its slots.
 mfq_tensor_backend::Tensor qwen4_batch_decode(
     Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
     mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids,
-    mfq_tensor_backend::Tensor* raw = nullptr, const std::vector<int>& widths = {}, bool speculative = false);
+    mfq_tensor_backend::Tensor* raw = nullptr, const std::vector<int>& widths = {}, bool speculative = false,
+    const std::shared_ptr<Qwen4BatchCheckpointPool>& checkpoints = {});
 class Qwen4BatchDecodeGraph {
   public:
     explicit Qwen4BatchDecodeGraph(Qwen4CausalLm&);

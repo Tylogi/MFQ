@@ -50,8 +50,10 @@ void prime_batch_mtp(MtpModule&, const MtpTarget&, BatchMtpRow&,
     mfq_tensor_backend::Tensor raw, const mfq_tensor_backend::Tensor& ids, int64_t offset, int64_t prompt);
 // All eligible requests share one target window. Draft work is batched by
 // history width and then by active chain position; parked rows draft nothing.
+// A non-negative `draft_tokens` bounds the drafts of the whole window, so its
+// verification state stays fixed as rows are added.
 std::vector<int64_t> run_batch_mtp(MtpModule&, const MtpTarget&, const std::vector<BatchMtpInput>&,
-    int64_t max_context, const BatchMtpVerify&);
+    int64_t max_context, const BatchMtpVerify&, int64_t draft_tokens = -1);
 mfq::engine::TokenOutput publish_batch_mtp(BatchMtpInput, mfq::engine::InferenceOutput&);
 void accept_batch_mtp_tokens(BatchMtpInput, const mfq::engine::TokenOutput&);
 

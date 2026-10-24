@@ -1988,6 +1988,15 @@ struct Qwen4BatchRequestState::Impl {
     mfq_tensor_backend::Tensor position_storage;
     int64_t cache_position = 0, batch = 1;
     int64_t verify_start = -1, verify_width = 0;
+    // Slots of the shared pool that hold this window's recurrent checkpoints.
+    std::shared_ptr<Qwen4BatchCheckpointPool> checkpoint_pool;
+    std::vector<int64_t> checkpoint_slots;
+    void release_checkpoints() noexcept {
+        if (checkpoint_pool) checkpoint_pool->release(checkpoint_slots);
+        checkpoint_pool.reset();
+        checkpoint_slots.clear();
+    }
+    ~Impl() { release_checkpoints(); }
     void swap(Qwen4CausalLm& model) {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             auto& block = static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
@@ -2062,6 +2071,56 @@ void Qwen4BatchRequestState::resolve_verified(int64_t retained) {
     state.cache_position = boundary;
     state.verify_start = -1;
     state.verify_width = 0;
+    state.release_checkpoints();
+}
+
+Qwen4BatchCheckpointPool::Qwen4BatchCheckpointPool(int64_t tokens) : busy_(std::max<int64_t>(0, tokens), false) {}
+
+int64_t Qwen4BatchCheckpointPool::available() const noexcept {
+    return std::count(busy_.begin(), busy_.end(), false);
+}
+
+std::vector<int64_t> Qwen4BatchCheckpointPool::acquire(int64_t count) {
+    MFQ_RUNTIME_CHECK(count >= 0 && count <= available(), "batched verification exceeds checkpoint slots");
+    std::vector<int64_t> slots;
+    for (int64_t slot = 0; slot < tokens() && int64_t(slots.size()) < count; ++slot)
+        if (!busy_[slot]) {
+            busy_[slot] = true;
+            slots.push_back(slot);
+        }
+    return slots;
+}
+
+void Qwen4BatchCheckpointPool::release(const std::vector<int64_t>& slots) noexcept {
+    for (const auto slot : slots) busy_[slot] = false;
+}
+
+void Qwen4BatchCheckpointPool::allocate(Qwen4BatchRequestState& request) {
+    namespace tb = mfq_tensor_backend;
+    if (!gdn_conv_.empty() || !tokens()) return;
+    // Rows share one geometry; slot `i` of a layer is rows [i, i + 1).
+    const auto stack = [&](const Tensor& state) {
+        if (!state.defined()) return Tensor{};
+        MFQ_RUNTIME_CHECK(state.size(0) == 1, "batched checkpoints require one-row request state");
+        auto shape = state.sizes().vec();
+        shape[0] = tokens();
+        return tb::empty(shape, state.options());
+    };
+    mfq::cuda::ResidentAllocationScope resident;
+    // Keep the pool empty until every layer succeeds. An allocation failure
+    // must not make a later verification reuse a partially initialized pool.
+    std::vector<Tensor> convolution, recurrent, positional;
+    convolution.reserve(request.state_->layers.size());
+    recurrent.reserve(request.state_->layers.size());
+    positional.reserve(request.state_->layers.size());
+    for (auto& layer : request.state_->layers) {
+        convolution.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[0]) : Tensor{});
+        recurrent.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[1]) : Tensor{});
+        positional.push_back(layer.ple ? stack(layer.ple->conv_state()) : Tensor{});
+    }
+    gdn_conv_.swap(convolution);
+    gdn_state_.swap(recurrent);
+    ple_conv_.swap(positional);
 }
 std::size_t Qwen4BatchRequestState::prefill_growth_bytes(int64_t tokens) const {
     return state_->growth_bytes(tokens);
@@ -2169,7 +2228,8 @@ std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(Qwen4CausalLm& model
 mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
         const std::vector<Qwen4BatchRequestState*>& requests, mfq_tensor_backend::Tensor ids,
         const mfq_tensor_backend::Tensor& host_ids, mfq_tensor_backend::Tensor* raw,
-        const std::vector<int>& widths, bool speculative) {
+        const std::vector<int>& widths, bool speculative,
+        const std::shared_ptr<Qwen4BatchCheckpointPool>& checkpoints) {
     namespace tb = mfq_tensor_backend;
     const auto batch = static_cast<int64_t>(requests.size());
     MFQ_RUNTIME_CHECK(batch > 0 && ids.dim() == 2 && ids.size(0) == batch && ids.size(1) > 0 &&
@@ -2196,6 +2256,21 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
     }
     if (growth && model.reserve_kv_workspace)
         model.reserve_kv_workspace(growth + (std::size_t(64) << 20));
+    const bool pooled = speculative && checkpoints;
+    if (pooled) {
+        checkpoints->allocate(*requests.front());
+        for (int64_t row = 0; row < batch; ++row) {
+            auto& state = *requests[row]->state_;
+            state.checkpoint_slots = checkpoints->acquire(row_width(row) - 1);
+            state.checkpoint_pool = checkpoints;
+        }
+    }
+    // Slot `index` of a row's window, or fresh storage without a pool.
+    using Slots = std::vector<Tensor> Qwen4BatchCheckpointPool::*;
+    const auto checkpoint = [&](Slots pool, std::size_t layer, int64_t row, int64_t index, const Tensor& like) {
+        if (!pooled) return tb::empty_like(like);
+        return ((*checkpoints).*pool)[layer].narrow(0, requests[row]->state_->checkpoint_slots[index], 1);
+    };
     auto& execution = *model.execution;
     auto hidden = model.adapter_prepare_hidden(model.embed_tokens(ids),batch,tokens);
     const auto padded = [&](Tensor value, int64_t width) {
@@ -2216,17 +2291,19 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
                 auto row_host = host_ids.narrow(0,row,1).narrow(1,0,width);
                 Tensor positional_value;
                 if (speculative && width > 1) {
-                    std::vector<Tensor> outputs, checkpoints;
+                    std::vector<Tensor> outputs, saved_conv;
                     std::vector<qwen4_exp::NgramEmbedding::Context> contexts;
                     for (int64_t token = 0; token < width; ++token) {
                         outputs.push_back(layer.ple->forward_chunk(execution, x.narrow(1,token,1),
                             row_ids.narrow(1,token,1), true, row_host.narrow(1,token,1)));
                         if (token + 1 < width) {
-                            checkpoints.push_back(layer.ple->conv_state().clone());
+                            auto saved = checkpoint(&Qwen4BatchCheckpointPool::ple_conv_, i, row, token, layer.ple->conv_state());
+                            saved.copy_(layer.ple->conv_state());
+                            saved_conv.push_back(std::move(saved));
                             contexts.push_back(layer.ple->session_context());
                         }
                     }
-                    layer.ple->bind_graph_checkpoint(checkpoints, std::move(contexts),
+                    layer.ple->bind_graph_checkpoint(saved_conv, std::move(contexts),
                         requests[row]->state_->verify_start + 1);
                     positional_value = tb::cat(outputs,1);
                 } else positional_value = layer.ple->forward(execution,x,row_ids,true,0,row_host);
@@ -2249,8 +2326,10 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
             if (speculative && width > 1 && layer.gdn) {
                 std::vector<Tensor> convolution, recurrent;
                 for (int64_t token = 1; token < width; ++token) {
-                    convolution.push_back(tb::empty_like(*layer.gdn->graph_state()[0]));
-                    recurrent.push_back(tb::empty_like(*layer.gdn->graph_state()[1]));
+                    convolution.push_back(checkpoint(&Qwen4BatchCheckpointPool::gdn_conv_, i, row, token - 1,
+                                                     *layer.gdn->graph_state()[0]));
+                    recurrent.push_back(checkpoint(&Qwen4BatchCheckpointPool::gdn_state_, i, row, token - 1,
+                                                   *layer.gdn->graph_state()[1]));
                 }
                 value = layer.gdn->forward_graph(execution,branch,1,convolution,recurrent);
                 layer.gdn->bind_graph_checkpoint(convolution,recurrent,requests[row]->state_->verify_start + 1);

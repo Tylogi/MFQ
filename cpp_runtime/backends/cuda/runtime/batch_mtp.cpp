@@ -2,8 +2,10 @@
 
 #include "mfq_cuda_sampling_ops.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <numeric>
 #include <string_view>
 
 namespace mfq::cuda {
@@ -73,7 +75,8 @@ static int32_t greedy_sample(BatchMtpInput input, Tensor logits, const Tensor& c
 }
 
 std::vector<int64_t> run_batch_mtp(MtpModule& predictor, const MtpTarget& target,
-        const std::vector<BatchMtpInput>& inputs, int64_t max_context, const BatchMtpVerify& verify) {
+        const std::vector<BatchMtpInput>& inputs, int64_t max_context, const BatchMtpVerify& verify,
+        int64_t draft_tokens) {
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::engine::mtp;
     const auto started = Clock::now();
@@ -105,10 +108,19 @@ std::vector<int64_t> run_batch_mtp(MtpModule& predictor, const MtpTarget& target
         const auto remaining = input.request->generation_limit - input.request->produced;
         depths[row] = std::max<int64_t>(0, std::min<int64_t>(
             mtp.depth->depth(), std::min<int64_t>(remaining - 1, headroom)));
+    }
+    // Shorten the deepest chains first; later rows give up a tied draft.
+    if (draft_tokens >= 0) {
+        for (auto total = std::accumulate(depths.begin(), depths.end(), int64_t(0)); total > draft_tokens; --total)
+            --*std::max_element(depths.rbegin(), depths.rend());
+    }
+    for (std::size_t row = 0; row < batch; ++row) {
+        const auto& input = inputs[row];
+        if (!input.mtp) continue;
         widths[row] += depths[row];
         maximum = std::max(maximum, depths[row]);
-        if (depths[row] > 0 || mtp.history_ids.size() >= 16)
-            histories[mtp.history_ids.size()].push_back(row);
+        if (depths[row] > 0 || input.mtp->history_ids.size() >= 16)
+            histories[input.mtp->history_ids.size()].push_back(row);
         counts[row] = input.counts.defined() ? input.counts.clone() : Tensor{};
     }
     for (const auto& [width, rows] : histories) {

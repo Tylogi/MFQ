@@ -163,6 +163,8 @@ class FlashNextBatchOperations {
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
     int64_t packed_prefill_batches_ = 0, packed_prefill_requests_ = 0, packed_prefill_tokens_ = 0;
     MtpModule* predictor_ = nullptr;
+    // Fixed verification checkpoints shared by all batched MTP rows.
+    std::shared_ptr<Qwen4BatchCheckpointPool> mtp_checkpoints_;
     int64_t mtp_batches_ = 0, mtp_drafted_ = 0, mtp_accepted_ = 0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<
