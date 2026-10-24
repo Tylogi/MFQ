@@ -98,6 +98,7 @@ curl -s http://127.0.0.1:8090/api/v1/runtime/instances
 
 The instance payload reports `request_capacity`, `batch_capacity`,
 `queued_requests`, `queue_wait_ms_avg`, `queue_wait_ms_max`, and
-`rejected_requests`. Throughput claims should use more than one request in
-flight; a single request cannot exercise the batching path even when the
-capacity is greater than one.
+`rejected_requests`. The same accounting is exported for Prometheus through
+`GET /metrics`; see [metrics.md](metrics.md). Throughput claims should use more
+than one request in flight; a single request cannot exercise the batching path
+even when the capacity is greater than one.
