@@ -2107,11 +2107,20 @@ void Qwen4BatchCheckpointPool::allocate(Qwen4BatchRequestState& request) {
         return tb::empty(shape, state.options());
     };
     mfq::cuda::ResidentAllocationScope resident;
+    // Keep the pool empty until every layer succeeds. An allocation failure
+    // must not make a later verification reuse a partially initialized pool.
+    std::vector<Tensor> convolution, recurrent, positional;
+    convolution.reserve(request.state_->layers.size());
+    recurrent.reserve(request.state_->layers.size());
+    positional.reserve(request.state_->layers.size());
     for (auto& layer : request.state_->layers) {
-        gdn_conv_.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[0]) : Tensor{});
-        gdn_state_.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[1]) : Tensor{});
-        ple_conv_.push_back(layer.ple ? stack(layer.ple->conv_state()) : Tensor{});
+        convolution.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[0]) : Tensor{});
+        recurrent.push_back(layer.gdn ? stack(*layer.gdn->graph_state()[1]) : Tensor{});
+        positional.push_back(layer.ple ? stack(layer.ple->conv_state()) : Tensor{});
     }
+    gdn_conv_.swap(convolution);
+    gdn_state_.swap(recurrent);
+    ple_conv_.swap(positional);
 }
 std::size_t Qwen4BatchRequestState::prefill_growth_bytes(int64_t tokens) const {
     return state_->growth_bytes(tokens);
