@@ -25,6 +25,7 @@ matches what you want to do.
 
 - [Runtime support matrix](runtime/support.md)
 - [Multi-request concurrency](runtime/concurrency.md)
+- [Prometheus metrics](runtime/metrics.md)
 - [Python/C++ runtime transport](runtime/transport.md)
 - [CUDA KV memory policies](runtime/cuda-kv-memory.md)
 - [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)

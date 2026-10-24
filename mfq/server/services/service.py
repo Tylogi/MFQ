@@ -51,6 +51,7 @@ from mfq.server.services.jobs import (
     JobManager,
     TypedJobHandler,
 )
+from mfq.server.services.metrics import render_prometheus
 from mfq.server.protocol.analysis import CheckpointAnalysis
 from mfq.server.protocol.models import (
     AppendMessageRequest,
@@ -1465,6 +1466,12 @@ class ServerService:
         activity = getattr(self.runtime_manager, "serving_activity", None)
         return {"scope": scope, "started_at": self._serving_started_at, "totals": totals,
             "activity": await activity() if callable(activity) else []}
+
+    async def prometheus_metrics(self) -> str:
+        """Render runtime and request telemetry for a Prometheus scrape."""
+
+        snapshot = getattr(self.runtime_manager, "metrics_snapshot", None)
+        return render_prometheus(await snapshot() if callable(snapshot) else [])
 
     async def runtime_metrics(
         self,

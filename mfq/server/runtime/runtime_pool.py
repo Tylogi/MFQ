@@ -94,6 +94,7 @@ from mfq.server.services.hardware import (
     host_memory_capacity,
     memory_topology,
 )
+from mfq.server.services.metrics import RequestMetrics, RuntimeMetricsSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,15 @@ _WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
+# Deadline failures keep their own result label so retries stay distinguishable
+# from requests that failed for another reason.
+_TIMEOUT_ERROR_CODES = frozenset({
+    "backend_timeout",
+    "runtime_maintenance_timeout",
+    "runtime_queue_timeout",
+})
+
+
 @dataclass(frozen=True)
 class _ExpertHostBudget:
     """Resident expert allowance together with the limit that produced it."""
@@ -197,6 +207,9 @@ class _Runtime(BaseModel):
     queue_wait_ms_max: float = 0.0
     queue_wait_samples: int = 0
     rejections: int = 0
+    # Prometheus counters and histograms live with the instance so a restart
+    # publishes a new ``instance`` label instead of resetting old series.
+    request_metrics: SkipValidation[RequestMetrics] = Field(default_factory=RequestMetrics)
     mtp_supported: bool = False
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
@@ -2246,6 +2259,10 @@ class RuntimePool:
         if queue_full:
             await self._reject_full_queue(instance, model)
         queued = True
+        request_id = None
+        performance = None
+        usage = None
+        finish_reason = None
         try:
             await self._acquire_request_slot(instance, enqueued_at, model)
             acquired = True
@@ -2264,11 +2281,8 @@ class RuntimePool:
                 if session_id is not None:
                     self._session_routes[session_id] = instance.id
                 self._last_instance_id = instance.id
+            instance.request_metrics.observe_queue_wait(queue_wait_ms / 1000.0)
             effective_sampling = self._apply_inference_policy(self._sampling_for_instance(instance, sampling))
-            request_id = None
-            performance = None
-            usage = None
-            finish_reason = None
             async with closing_backend_stream(
                 instance.backend.stream(
                     model=instance.artifact.resource.name,
@@ -2306,6 +2320,23 @@ class RuntimePool:
                         model=instance.artifact.resource.name)
                 except Exception:
                     logger.exception("Could not persist completed runtime request metrics")
+        except GeneratorExit:
+            # The consumer stopped reading: the client disconnected mid-stream.
+            instance.request_metrics.record_request("cancelled", performance, usage)
+            raise
+        except asyncio.CancelledError:
+            instance.request_metrics.record_request("cancelled", performance, usage)
+            raise
+        except BackendError as error:
+            result = "timeout" if error.code in _TIMEOUT_ERROR_CODES else "error"
+            instance.request_metrics.record_request(result, performance, usage)
+            raise
+        except Exception:
+            instance.request_metrics.record_request("error", performance, usage)
+            raise
+        else:
+            instance.request_metrics.record_request(
+                "cancelled" if finish_reason == "cancelled" else "ok", performance, usage)
         finally:
             await self._release_runtime_lease(
                 self._finish_request(instance, queued=queued, active=active, acquired=acquired),
@@ -2466,6 +2497,55 @@ class RuntimePool:
             "requests": [{"id": key, **value} for key, value in item.serving_snapshot.items()]
                 if item.active_requests else []}
             for item in self._instances.values() if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}]
+
+    async def metrics_snapshot(self) -> list[RuntimeMetricsSnapshot]:
+        """Return the serving runtimes as a Prometheus scrape sees them.
+
+        Usage refresh shares the runtime-pool interval, so scraping never adds
+        NVML work, SQLite reads, or more than one worker status call per
+        interval.
+        """
+
+        async with self._lock:
+            values = [
+                item
+                for item in self._instances.values()
+                if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+            ]
+            now = asyncio.get_running_loop().time()
+            refresh = [
+                item
+                for item in values
+                if now - item.usage_refreshed_at >= self.metric_interval_seconds
+            ]
+            for item in refresh:
+                item.usage_refreshed_at = now
+        if refresh:
+            await asyncio.gather(
+                *(self._refresh_instance_usage(item) for item in refresh)
+            )
+        return [
+            self._metrics_snapshot_of(item)
+            for item in values
+            if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+        ]
+
+    @staticmethod
+    def _metrics_snapshot_of(instance: _Runtime) -> RuntimeMetricsSnapshot:
+        memory = instance.memory
+        return RuntimeMetricsSnapshot(
+            instance=str(instance.id),
+            model=instance.artifact.resource.name,
+            request_capacity=instance.request_capacity,
+            batch_capacity=instance.batch_capacity,
+            active_requests=instance.active_requests,
+            queued_requests=instance.queued_requests,
+            rejected_requests=instance.rejections,
+            resident_bytes=instance.resident_bytes,
+            kv_bytes=instance.kv_bytes,
+            kv_limit_bytes=memory.prefix_cache_limit_bytes if memory is not None else None,
+            requests=instance.request_metrics,
+        )
 
     async def runtime_status(
         self,
