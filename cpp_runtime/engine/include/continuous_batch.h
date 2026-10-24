@@ -54,11 +54,12 @@ template <class Ops> class ContinuousBatch {
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
     bool decode_next = true;
     NewTokenRatioTracker ratio;
-    int64_t admission_deferrals = 0, retractions = 0;
+    int64_t admission_deferrals = 0, admission_failures = 0, retractions = 0;
 
-    bool can_admit(const Work& candidate) {
+    bool can_admit(Work& candidate) {
         if constexpr (requires { operations.admission_available(); }) {
             if (candidate.admitted) return true;
+            if (candidate.failure) return false;
             KvAdmissionBudget budget(operations.admission_available());
             bool occupied = false;
             for (const auto& [id, work] : requests) {
@@ -79,6 +80,20 @@ template <class Ops> class ContinuousBatch {
             if (!occupied) {
                 KvAdmissionBudget solitary(operations.admission_available());
                 if (solitary.reserve(operations.admission_cost(request, 1))) return true;
+                // No admitted row can free memory for this request, so waiting
+                // never ends. Release idle buffers and caches once, then fail.
+                if constexpr (requires { operations.release_idle_buffers(); })
+                    if (state.active.empty()) operations.release_idle_buffers();
+                if constexpr (requires { operations.reclaim_prefill_memory(request); })
+                    operations.reclaim_prefill_memory(request);
+                KvAdmissionBudget reclaimed(operations.admission_available());
+                if (reclaimed.reserve(operations.admission_cost(request, 1))) return true;
+                candidate.failure = std::make_exception_ptr(InferenceInputError(
+                    InferenceInputErrorCode::ContextLength,
+                    "insufficient memory to admit request; reduce concurrent requests or prompt length"));
+                candidate.prefill.reset();
+                ++admission_failures;
+                return false;
             }
             ++admission_deferrals;
             return false;
@@ -455,6 +470,7 @@ template <class Ops> class ContinuousBatch {
         auto result = operations.metrics();
         if constexpr (requires { operations.admission_available(); }) {
             result.emplace_back("continuous_batching_admission_deferred", admission_deferrals);
+            result.emplace_back("continuous_batching_admission_failures", admission_failures);
             result.emplace_back("continuous_batching_retractions", retractions);
             result.emplace_back("continuous_batching_new_token_ratio", ratio.current());
         }
