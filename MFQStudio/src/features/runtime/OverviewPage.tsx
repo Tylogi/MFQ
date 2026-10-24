@@ -22,6 +22,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { RuntimeConcurrencyPanel } from './RuntimeConcurrencyPanel';
 
 export function OverviewPage() {
   const {
@@ -166,6 +167,7 @@ export function OverviewPage() {
         </>
       )}
       <ServingStatisticsPanel data={servingStatistics} error={statisticsError} scope={scope} onScopeChange={setScope} />
+      <RuntimeConcurrencyPanel />
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
         <MemoryHierarchy instances={instances} runtime={runtime} connectionRevision={connectionRevision}

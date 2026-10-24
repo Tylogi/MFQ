@@ -10,7 +10,13 @@ import { studioConfirm } from '../src/studio';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: vi.fn() }));
-vi.mock('../src/shared/api/resources/runtime', () => ({ runtimeApi: { reloadRuntime: vi.fn() } }));
+vi.mock('../src/shared/api/resources/runtime', () => ({ runtimeApi: {
+  reloadRuntime: vi.fn(),
+  concurrencyPolicy: vi.fn().mockResolvedValue({
+    defaults: { max_requests: 8, max_queued_requests: 32, queue_timeout_seconds: 0 },
+    limits: { max_requests: 8, max_queued_requests: 32, queue_timeout_seconds: null },
+  }),
+} }));
 vi.mock('../src/studio', () => ({ studioConfirm: vi.fn() }));
 vi.mock('../src/features/chat/hooks/useActiveSessionMode', () => ({ useActiveSessionMode: () => 'text' }));
 vi.mock('../src/features/settings/useGenerationPresets', () => ({

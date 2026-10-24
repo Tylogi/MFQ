@@ -647,7 +647,9 @@ void gdn_prefill_case() {
             auto input=data({1,tokens,hidden},337+tokens,.13f);
             auto expected=oracle.forward_chunk(execution,input,true);
             auto result=actual.forward_chunk(execution,input,true);
-            equal(result,expected,"GDN fused prefill output");
+            const auto label = "GDN fused prefill output width=" + std::to_string(width)
+                + " heads=" + std::to_string(nv) + " tokens=" + std::to_string(tokens);
+            equal(result,expected,label.c_str());
             equal(actual.conv_state(),oracle.conv_state(),"GDN fused prefill convolution state",0,0);
             equal(actual.recurrent_state(),oracle.recurrent_state(),"GDN fused prefill recurrent state");
             ++cases;
@@ -1177,6 +1179,7 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
 #include "qsa_independent_batch_test.h"
+#include "gdn_prefill_chunk_test.h"
 int main(int argc,char** argv)try {
     auto context=default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
@@ -1236,6 +1239,11 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--ple-hash-lifecycle-check")ple_hash_lifecycle_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-check")gdn_short_preparation_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-chunk-check")gdn_prefill_chunk_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-chunk-varlen-check")gdn_prefill_chunk_varlen_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-chunk-graph-check")gdn_prefill_chunk_graph_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-chunk-shapes-bench")gdn_prefill_chunk_benchmark(true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-chunk-bench")gdn_prefill_chunk_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-check")gdn_prefill_staged_case(false);

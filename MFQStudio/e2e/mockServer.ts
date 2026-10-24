@@ -102,6 +102,10 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
     if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/concurrency' && method === 'GET') return json({
+      defaults: { max_requests: 1, max_queued_requests: 8, queue_timeout_seconds: 300 },
+      limits: { max_requests: 32, max_queued_requests: 64, queue_timeout_seconds: 300 },
+    });
     if (path === '/api/v1/runtime/serving') return json({
       scope: new URL(route.request().url()).searchParams.get('scope') || 'session',
       started_at: Date.now() / 1000, activity: [],

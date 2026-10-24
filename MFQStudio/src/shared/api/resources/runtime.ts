@@ -1,5 +1,8 @@
 /** 封装 runtime 领域资源请求，不保存组件状态。 */
 import type {
+  RuntimeConcurrencyPolicy,
+  RuntimeConcurrencySettings,
+  RuntimeConcurrency,
   RuntimeCapabilities,
   RuntimeStatus,
   RuntimeResources,
@@ -134,6 +137,21 @@ export interface PrefixCacheText {
 }
 
 export const runtimeApi = {
+  concurrencyPolicy(signal?: AbortSignal): Promise<RuntimeConcurrencyPolicy> {
+    return request('/api/v1/runtime/concurrency', { signal });
+  },
+  updateConcurrency(instanceId: string, settings: Partial<RuntimeConcurrencySettings>): Promise<{
+    concurrency: RuntimeConcurrency; reload_required: boolean;
+  }> {
+    return request(`/api/v1/runtime/instances/${encodeURIComponent(instanceId)}/concurrency`, {
+      method: 'PUT', body: JSON.stringify(settings),
+    });
+  },
+  reloadConcurrency(instanceId: string, settings: RuntimeConcurrencySettings): Promise<JobResource> {
+    return request('/api/v1/runtime/concurrency/reload', {
+      method: 'POST', body: JSON.stringify({ instance_id: instanceId, ...settings }),
+    });
+  },
   servingStatistics(scope: 'session' | 'alltime', signal?: AbortSignal): Promise<ServingStatistics> {
     return request(`/api/v1/runtime/serving?scope=${scope}`, { signal });
   },

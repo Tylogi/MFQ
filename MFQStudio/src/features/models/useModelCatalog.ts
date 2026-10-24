@@ -13,6 +13,10 @@ import { STUDIO_PATHS, labPath } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
+import {
+  DEFAULT_CONCURRENCY, concurrencyOverrides, validConcurrency, type ConcurrencyDefaults,
+} from './concurrencySettings';
+import { useConcurrencyPolicy } from './useConcurrencyPolicy';
 import { readLoadContext, saveLoadContext, type LoadContextDefaults } from './loadContextDefaults';
 
 export function useModelCatalog() {
@@ -28,7 +32,12 @@ export function useModelCatalog() {
   } = useRuntime();
   const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
-  const { tr } = useSettings();
+  const { tr, settings } = useSettings();
+  const { policy: concurrencyPolicy, error: concurrencyError } = useConcurrencyPolicy();
+  const [concurrencyOverride, setLoadConcurrency] = useState<ConcurrencyDefaults | null>(null);
+  const loadConcurrency = concurrencyOverride ?? settings?.concurrencyDefaults ?? DEFAULT_CONCURRENCY;
+  const concurrencyValid = concurrencyPolicy ? validConcurrency(loadConcurrency, concurrencyPolicy)
+    : Object.values(loadConcurrency).every(value => value == null);
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const artifactRequest = useRef(0);
@@ -86,6 +95,7 @@ export function useModelCatalog() {
     setBusy(false);
     setModelDeletion(null);
     setLoadDeviceIds([]);
+    setLoadConcurrency(null);
     updateLoadContext(readLoadContext());
   }, [connectionRevision]);
   useEffect(() => {
@@ -184,7 +194,7 @@ export function useModelCatalog() {
   );
   async function loadArtifact(name: string) {
     const current = connectionScope();
-    if (busy) return;
+    if (busy || !concurrencyValid) return;
     setBusy(true);
     try {
       await modelsApi.loadModel(name, loadContext.context_size ?? 32768, 'auto', {
@@ -192,6 +202,7 @@ export function useModelCatalog() {
         device_ids: loadDeviceIds,
         idle_ttl_seconds: loadIdleTtl,
         context_management: loadContext,
+        ...concurrencyOverrides(loadConcurrency),
       });
       if (!current()) return;
       navigate(STUDIO_PATHS.models);
@@ -235,11 +246,13 @@ export function useModelCatalog() {
         instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
         runtime?.model === artifact.name;
       if (!loaded) {
+        if (!concurrencyValid) throw new Error(tr('请检查并发设置。', 'Check the concurrency settings.'));
         await modelsApi.loadModel(artifact.name, loadContext.context_size ?? 32768, 'auto', {
           pin: loadPinned,
           device_ids: loadDeviceIds,
           idle_ttl_seconds: loadIdleTtl,
           context_management: loadContext,
+          ...concurrencyOverrides(loadConcurrency),
         });
         if (!current()) return;
       }
@@ -429,6 +442,7 @@ export function useModelCatalog() {
     setModelFilter,
     filteredInstances,
     filteredArtifacts,
+    loadConcurrency, setLoadConcurrency, concurrencyPolicy, concurrencyError, concurrencyValid,
     loadPinned,
     loadContext,
     setLoadContext,
