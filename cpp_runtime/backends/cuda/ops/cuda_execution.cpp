@@ -1012,14 +1012,16 @@ void record_moe_route_stats(
     }
     auto flat_ids = ids.reshape({-1}).to(mfq_tensor_backend::kInt64);
     auto flat_weights = weights.reshape({-1}).to(mfq_tensor_backend::kFloat64);
-    auto ones = mfq_tensor_backend::ones_like(flat_weights);
+    auto ones = (flat_ids >= 0).to(mfq_tensor_backend::kFloat64);
+    flat_ids = flat_ids.clamp_min(0);
+    flat_weights = flat_weights * ones;
     found->second.counts.scatter_add_(0, flat_ids, ones);
     found->second.weight_sum.scatter_add_(0, flat_ids, flat_weights);
     found->second.weight_sq_sum.scatter_add_(
         0, flat_ids, flat_weights.square());
     if (execution.config.moe_route_output_energy) {
         auto energy = output.reshape({flat_ids.numel(), output.size(-1)})
-            .to(mfq_tensor_backend::kFloat32).square().sum(1).to(mfq_tensor_backend::kFloat64);
+            .to(mfq_tensor_backend::kFloat32).square().sum(1).to(mfq_tensor_backend::kFloat64) * ones;
         found->second.output_energy.scatter_add_(0, flat_ids, energy);
         found->second.weighted_output_energy.scatter_add_(
             0, flat_ids, energy * flat_weights.square());

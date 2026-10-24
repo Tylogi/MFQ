@@ -710,8 +710,10 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                 a = attention_paged_cache_decode_cuda(
                                     qh, cache.k_chunk_ptrs, cache.v_chunk_ptrs, cache.page_table,
                                     seq_len.value(), attn_scale, cache.page_size,
-                                    cache.pages_per_chunk, cache.paged_heads, decode_partial_o,
-                                    decode_partial_m, decode_partial_l, parts, dynamic_parts);
+                                    cache.pages_per_chunk, cache.paged_heads,
+                                    decode_partial_o.narrow(0, 0, B * nh),
+                                    decode_partial_m.narrow(0, 0, B * nh),
+                                    decode_partial_l.narrow(0, 0, B * nh), parts, dynamic_parts);
                             } else if (aten_decode_enabled) {
                                 const int64_t visible_len =
                                     sliding ? std::min<int64_t>(attention_window, cache_pos + T)

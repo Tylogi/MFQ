@@ -12,7 +12,7 @@ namespace mfq::cuda {
 
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &,
                                               const CudaContinuousBatchConfig &);
-struct QwenContinuousDecodeGraph;
+class BatchDecodeGraphCache;
 
 struct QwenBatchRequest : mfq::engine::BatchRequest {
     using BatchRequest::BatchRequest;
@@ -21,6 +21,7 @@ struct QwenBatchRequest : mfq::engine::BatchRequest {
     mfq_tensor_backend::Tensor prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     qwen35::QwenBatchRequestState cache;
+    int64_t decode_row = -1;
 };
 
 // Native operations consumed directly by engine::ContinuousBatch.
@@ -46,6 +47,7 @@ class QwenBatchOperations {
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
+    void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request> &, mfq::engine::PrefillChunk);
     void activate(const std::shared_ptr<Request> &, const Sample &);
@@ -59,7 +61,6 @@ class QwenBatchOperations {
 
   private:
     void initialize_sampling(Request &, const Tensor &prompt_ids);
-    void ensure_decode_metadata_buffers(int primary);
     void invalidate_decode_graph();
 
     Qwen35CausalLm &model_;
@@ -73,11 +74,7 @@ class QwenBatchOperations {
     int64_t decode_tokens_{0};
     int64_t batched_greedy_batches_{0};
     int64_t packed_metadata_batches_{0};
-    int64_t cuda_graph_captures_{0};
-    int64_t cuda_graph_replays_{0};
-    Tensor decode_metadata_host_;
-    Tensor decode_metadata_cuda_;
-    std::vector<std::unique_ptr<QwenContinuousDecodeGraph>> decode_graphs_;
+    std::unique_ptr<BatchDecodeGraphCache> decode_graphs_;
 };
 
 struct FlashNextBatchRequest : mfq::engine::BatchRequest {
@@ -102,6 +99,7 @@ class FlashNextBatchOperations {
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
+    void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     std::size_t prefill_batch_limit() const;

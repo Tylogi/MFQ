@@ -15,6 +15,7 @@
 #include "runtime/kv_offload.h"
 #include "runtime/kv_memory.h"
 #include "runtime/decode_window.h"
+#include "runtime/batch_decode_inputs.h"
 #include "mfq_cuda_kv_quantization.h"
 #include "storage/session_state.h"
 #include <array>
@@ -121,6 +122,7 @@ class Gdn {
         return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
     }
     std::vector<Tensor*> graph_state() { return {&conv_,&state_}; }
+    std::vector<Tensor> indirect_state_tensors() const { return {conv_, state_, core_workspace_}; }
     std::vector<Tensor> project_inputs(CudaExecutionContext& execution,const Tensor& x) const {
         if(grouped_projection_ && w_.input_projection)return w_.input_projection(execution,x);
         return {w_.qkv(execution,x),w_.gate(execution,x),w_.alpha(execution,x),w_.beta(execution,x)};
@@ -901,6 +903,7 @@ class Qsa {
     }
     int64_t position() const { return offload_ && offloaded_kv_ ? offloaded_kv_->position() : keys_.position(); }
     bool managed_memory() const {return memory_ && memory_->ready;}
+    bool has_kv_offload() const {return bool(offload_) || (memory_ && memory_->offload);}
     int64_t graph_capacity() const {return managed_memory()?c_.maximum:0;}
     void activate_memory() {
         if(!managed_memory())return;
@@ -946,7 +949,7 @@ class Qsa {
     std::size_t graph_growth_bytes(int64_t capacity) const {
         if(managed_memory())return memory_->growth_bytes(capacity)+
             (graph_prepared_?0:pooled_.position_bytes(c_.maximum));
-        if (graph_keys_.defined()) return 0;
+        if (graph_keys_.defined() && graph_keys_.size(2) >= capacity) return 0;
         auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
         if (!index_.storage().defined() || index_.storage().size(1) != capacity)
             bytes += std::size_t(capacity) * c_.index_width * 2;
@@ -1078,6 +1081,11 @@ class Qsa {
         graph_keys_=std::move(graph_keys);graph_values_=std::move(graph_values);graph_pooled_=std::move(graph_pooled);
         keys_.release_storage();values_.release_storage();
     }
+    void bind_decode_state(BatchDecodeInputs&, int64_t field, int64_t row) const;
+    int64_t decode_graph_capacity() const;
+    Tensor forward_indirect_graph(CudaExecutionContext&, const Tensor& hidden, const Tensor& positions,
+        const Tensor& cache_positions, const BatchDecodeInputs&, int64_t field, int64_t row,
+        int64_t capacity, std::vector<Tensor> projections = {}, bool output_projection = true);
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
                          const Tensor& positions,const Tensor& cache_positions,
                          std::vector<Tensor> projections={},bool project_output=true,bool history_only=false) {

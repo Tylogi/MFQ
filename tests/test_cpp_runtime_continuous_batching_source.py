@@ -9,8 +9,9 @@ DECODE = "\n".join(
 )
 BATCHING = "\n".join(
     (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
-    for name in ("cuda_batching.h", "cuda_batching.cpp")
+    for name in ("cuda_batching.h", "cuda_batching.cpp", "cuda_batch_decode.cpp")
 )
+ADAPTER_BATCHING = BATCHING
 BATCH_STATE = "\n".join(
     (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
     for name in ("batch_state.h", "batch_state.cpp")
@@ -116,25 +117,26 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "state.active" in BATCHING
     assert "generate_sequence(ops, output" in SHARED_ENGINE
     assert "execution.append(token)" not in BATCHING
-    assert "output.finish(" not in BATCHING
+    assert "output.finish(" not in ADAPTER_BATCHING
     assert "request->eligible" in BATCHING
-    assert "capture_recurrent_slots" in BATCHING
-    assert "restore_recurrent_slots" in BATCHING
+    assert "bind_decode_rows" in BATCHING
+    assert "store_decode_rows" in BATCHING
+    assert "if (!request->eligible)" in BATCHING
     assert "retire_cancelled" not in BATCHING
     assert "ops.generate(it->first, current)" in SHARED_ENGINE
     assert "step_batch(" not in SHARED_ENGINE
     assert "admit_batch(" not in SHARED_ENGINE
     assert "MFQ_CONTINUOUS_BATCH_GREEDY" in RUNTIME_OPTIONS
-    assert "std::getenv(" not in BATCHING
+    assert "std::getenv(" not in ADAPTER_BATCHING
     assert "config_.greedy" in BATCHING
     assert "continuous_batching_batched_greedy_batches" in BATCHING
     assert "sample_greedy_cuda(" in BATCHING
     assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" not in RUNTIME_OPTIONS
     assert "continuous_batching_packed_metadata_batches" in BATCHING
     assert "continuous_batching_stable_slot_releases" in BATCHING
-    assert "ensure_decode_metadata_buffers" in BATCHING
+    assert "input.update_rows(" in BATCHING
     assert "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH" in RUNTIME_OPTIONS
-    assert "QwenContinuousDecodeGraph" in BATCHING
+    assert "BatchDecodeGraphCache" in BATCHING
     assert "continuous_batching_cuda_graph_captures" in BATCHING
     assert "continuous_batching_cuda_graph_replays" in BATCHING
     assert "DecodeGraphTpProjectionScope tp_projection_scope" in BATCHING
@@ -145,6 +147,7 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
     assert "continuous_batching_moe" in BATCHING
     assert "continuous_batching_moe_cached_row_serial" in BATCHING
     assert "continuous batching requires dense Qwen blocks" not in BATCHING
+
     assert "continuous batching cannot use the expert cache" not in BATCHING
     assert "state_adapter_.has_cached_moe()" in BATCHING
     assert "uses_moe_expert_cache()" in DECODE
@@ -155,6 +158,18 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
         "cpu_moe_down||execution.continuous_batch_cache_serial"
         in "".join(DECODE.split())
     )
+
+
+def test_row_bucket_graph_policy_is_shared_and_excludes_membership_from_keys():
+    shared = (CUDA_ROOT / "runtime/batch_decode_graph.h").read_text(encoding="utf-8")
+    key = shared.split("struct BatchDecodeGraphKey {", 1)[1].split("};", 1)[0]
+    assert "rows" in key and "length" in key and "capacity" in key
+    assert "members" not in key and "addresses" not in key and "greedy" not in key
+    flash = (CUDA_ROOT / "models/qwen4_exp/batch_graph.h").read_text(encoding="utf-8")
+    assert "BatchDecodeGraphCache cache" in flash
+    assert "input.update_rows(" in flash and "input.update_rows(" in BATCHING
+    assert "int64_t batch_decode_row_bucket(" not in flash
+    assert "struct BatchDecodeGraphKey" not in flash
 
 
 def test_generic_qwen_loader_constructs_moe_ffns():

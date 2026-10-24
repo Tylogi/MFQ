@@ -25,6 +25,7 @@ class Qwen4BatchRequestState {
     Qwen4BatchRequestState& operator=(const Qwen4BatchRequestState&) = delete;
     mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor);
     int64_t position() const;
+    std::vector<mfq_tensor_backend::Tensor> recurrent_state_tensors() const;
     std::size_t resident_bytes() const;
     std::size_t prefill_growth_bytes(int64_t tokens) const;
   private:
@@ -50,10 +51,15 @@ class Qwen4BatchDecodeGraph {
     ~Qwen4BatchDecodeGraph();
     std::optional<mfq_tensor_backend::Tensor> run(
         const std::vector<Qwen4BatchRequestState*>&,
-        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,bool greedy=false);
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,bool greedy=false,
+        int64_t maximum_rows=32);
     void clear();
+    bool has_graphs() const;
     int64_t captures() const;
     int64_t replays() const;
+    int64_t membership_captures() const;
+    int64_t bucket_reuses() const;
+    double capture_ms() const;
   private:
     struct Impl;
     std::unique_ptr<Impl> graph_;

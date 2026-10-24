@@ -542,6 +542,13 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     ], capture_output=True, text=True, timeout=90, env=environment)
     assert process.returncode == 0, process.stdout + process.stderr
     assert "continuous_batching_check PASS" in process.stdout
+    membership = next(line for line in process.stdout.splitlines()
+                      if line.startswith("continuous_batching_membership_check "))
+    membership_metrics = dict(field.split("=", 1) for field in membership.split()[1:])
+    assert int(membership_metrics["captures"]) == 1
+    assert int(membership_metrics["bucket_reuses"]) > 0
+    assert membership_metrics["serial"] == membership_metrics["inactive_state_bits"] == "PASS"
+    assert membership_metrics["padding_routes"] == "PASS"
     if trace_gdn:
         assert "gdn_batch_state eligible=1" in process.stderr
         assert "gdn_batch_core rows=32" in process.stderr
@@ -614,6 +621,8 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                         return [event async for event in events if event is not None]
                 prompts = ["ab" * (4 + row % 5 * 8) for row in range(requests)]
                 reference = [await generate(prompt,row == 0) for row,prompt in enumerate(prompts)]
+                reference_status = await _fresh_idle_status(client)
+                assert reference_status["continuous_batching_cuda_graph_captures"] == 1
                 parallel = await asyncio.gather(*(generate(prompt,row == 0) for row,prompt in enumerate(prompts)))
                 def text(events):
                     return "".join(choice.get("delta",{}).get("content","")
@@ -624,12 +633,16 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                 (tmp_path / "worker-status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")
                 assert status["continuous_batching_admissions"] == 2 * requests
                 assert status["continuous_batching_cuda_graph_replays"] > 0
+                assert status["continuous_batching_cuda_graph_captures"] <= (2 if requests == 2 else 6)
                 assert status["continuous_batching_batched_greedy_batches"] > 0
                 if requests == 32 and os.environ.get("MFQ_BATCH_PACKED_PREFILL") != "0":
                     assert status["continuous_batching_packed_prefill_batches"] > 0
                 assert status["continuous_batching_decode_tokens"] > status["continuous_batching_decode_batches"]
                 assert status["continuous_batching_active"] == 0
-                assert status["kv_cache_bytes"] == 0
+                assert status["kv_cache_bytes"] == reference_status["kv_cache_bytes"]
+                assert status["continuous_batching_request_kv_bytes"] == 0
+                assert status["continuous_batching_request_contexts"] == 0
+                assert status["kv_cache_contexts"] == 0
             finally:
                 with suppress(Exception):
                     await client.aclose()

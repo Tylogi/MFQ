@@ -1,9 +1,11 @@
 #pragma once
 
 #include "mfq_tensor_backend.h"
+#include "core/kv_cache.h"
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,6 +17,7 @@ template <class Backend> struct CausalLm;
 }
 
 namespace mfq::cuda {
+class BatchDecodeInputs;
 struct Qwen35Model;
 template <typename Model> struct CudaCausalOps;
 using Qwen35CausalLm = mfq::models::qwen35::CausalLm<CudaCausalOps<Qwen35Model>>;
@@ -101,6 +104,12 @@ class Qwen35BatchStateAdapter {
 
     mfq_tensor_backend::Tensor logits_from_last_hidden(mfq_tensor_backend::Tensor hidden);
     std::vector<const void *> decode_state_addresses();
+    std::vector<int64_t> decode_capacities() const;
+    void bind_decode_rows(BatchDecodeInputs&, const std::vector<int32_t>& slots, bool graph);
+    void load_decode_rows(const BatchDecodeInputs&);
+    void store_decode_rows(const BatchDecodeInputs&);
+    void unbind_decode_rows();
+    std::vector<mfq_tensor_backend::Tensor> recurrent_slot_tensors(const std::vector<int32_t>& slots) const;
     QwenBatchState capture_recurrent_slots(const std::vector<std::int32_t> &slots) const;
     void restore_recurrent_slots(const std::vector<std::int32_t> &slots,
                                  const QwenBatchState &state);
@@ -120,6 +129,16 @@ class Qwen35BatchStateAdapter {
     bool page_table_dirty_ = false;
     std::unique_ptr<continuous::QwenPagedKvArena> paged_kv_;
     std::vector<continuous::QwenPagedKvSequence> paged_slots_;
+    struct DecodeLayer {
+        KVCache cache;
+        mfq_tensor_backend::Tensor first, second, working_first, working_second;
+        bool working_graph = false;
+    };
+    std::vector<DecodeLayer> decode_layers_;
+    std::map<std::pair<int64_t, int>, std::unique_ptr<BatchDecodeInputs>> decode_inputs_;
+    bool decode_bound_ = false;
+    bool decode_graph_binding_ = false;
+    std::size_t decode_bound_layers_ = 0;
 };
 
 } // namespace mfq::cuda::qwen35

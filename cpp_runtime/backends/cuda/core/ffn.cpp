@@ -7,6 +7,7 @@
 #include "mfq_cuda_norm_ops.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/moe_ffn_pipeline.h"
+#include "runtime/batch_decode_graph.h"
 
 #include <algorithm>
 #include <array>
@@ -472,6 +473,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             1e-20, moe_router_scale);
                     });
                 }
+                mfq::cuda::mask_batch_routes(execution, selected);
                 if (!use_pipeline) {
                     // Dense (source-precision) banks are not MFE cohorts, so
                     // their expert count comes from the bank itself.

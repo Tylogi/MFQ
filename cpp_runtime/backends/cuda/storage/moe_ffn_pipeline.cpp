@@ -328,6 +328,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         mfq::MoeDispatchWorkspace plan_workspace;
         std::vector<int32_t> plan_ids;
         bool pending=false,in_window=false;
+        bool allow_padding=false;
+        int active_tokens=0;
         StreamFlagWrite ready_writer=nullptr;
         Cell(int t,int k,int width,int experts,cudaStream_t stream,bool eager):tokens(t),routes(k),entries(t*k),
             x(eager?64:std::size_t(t)*width*sizeof(float)),host_ids(eager?64:std::size_t(t)*k*sizeof(int32_t)),flags(6*64),
@@ -2331,8 +2333,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             stage_bytes_ ? stage_ns_/stage_bytes_ : 0,gpu_samples_ ? gpu_ns_/gpu_samples_ : 0,
             cache_->pipeline_cpu_transfer_budget_};
         if(cell.reuse_plan)
-            mfq::plan_moe_dispatch_reuse(cell.plan,cell.plan_workspace,ids,experts_,0,resident,[](int){return true;});
-        else cell.plan=mfq::plan_moe_dispatch(ids,experts_,0,resident,[](int){return true;});
+            mfq::plan_moe_dispatch_reuse(cell.plan,cell.plan_workspace,ids,experts_,0,resident,
+                [](int){return true;},cell.allow_padding);
+        else cell.plan=mfq::plan_moe_dispatch(ids,experts_,0,resident,[](int){return true;},cell.allow_padding);
         std::size_t misses=0;
         for(const auto& group:cell.plan.groups) {
             const bool hot=group.kind==mfq::MoeDispatchKind::GpuResident;misses+=!hot;
@@ -2347,7 +2350,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(!cell.batch_decode || cache_->config_.moe_ram_pcie_fraction) {
             const auto quota=!cell.batch_decode ? misses : static_cast<std::size_t>(misses*cache_->ram_pcie_fraction_);
             if(cell.reuse_plan)mfq::assign_moe_transfer_quota(cell.plan,quota,[](int){return true;});
-            else cell.plan=mfq::plan_moe_dispatch(ids,experts_,quota,resident,[](int){return true;});
+            else cell.plan=mfq::plan_moe_dispatch(ids,experts_,quota,resident,
+                [](int){return true;},cell.allow_padding);
         } else {
             std::vector<std::size_t> cold;
             std::vector<mfq::MoeDispatchCost> costs;
@@ -2517,8 +2521,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto* packet=cell.transfer_route_plan->h<int32_t>();
             for(int pair=0;pair<cell.entries;++pair) {
                 const int expert=ids[pair];
-                packet[pair*2]=cell.kind.h<int32_t>()[expert];
-                packet[pair*2+1]=cell.transfer_index->h<int32_t>()[expert];
+                packet[pair*2]=expert >= 0 ? cell.kind.h<int32_t>()[expert] : -1;
+                packet[pair*2+1]=expert >= 0 ? cell.transfer_index->h<int32_t>()[expert] : -1;
             }
         }
         if(observer_)observer_(cell.plan);
@@ -3989,12 +3993,32 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         std::fflush(stderr);
     }
     void serve(Cell& cell) {
+        // Padding publishes invalid routes. A wholly inactive tile only opens
+        // the graph gates; it does not plan, fetch, observe or count experts.
+        const auto wait_started = std::chrono::steady_clock::now();
+        wait_publication(cell);
+        const auto waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count();
+        cell.active_tokens = 0;
+        for (int row = 0; row < cell.tokens; ++row)
+            cell.active_tokens += cell.host_ids.h<int32_t>()[row * cell.routes] >= 0;
+        if (cell.allow_padding && !cell.active_tokens) {
+            cell.plan.groups.clear();
+            cell.plan.kinds.assign(cell.entries, mfq::MoeDispatchKind::Inactive);
+            std::memset(cell.kind.host, 0, cell.kind.bytes);
+            if (cell.transfer_route_plan)
+                std::memset(cell.transfer_route_plan->host, 0xff, cell.transfer_route_plan->bytes);
+            for (int flag : {16, 32, 48, 80})
+                publish(cell.flags.h<uint32_t>() + flag);
+            return;
+        }
         auto& stats=cache_->stats_;++stats.pipeline_serves;
         stats.pipeline_fused_transfer_copy_serves+=cell.fused_transfer_copy;
         stats.pipeline_two_stage_serves+=cell.two_stage;
         stats.pipeline_window_input_view_serves+=cell.window_input_views;
         stats.pipeline_phased_transfer_serves+=cell.phased_transfer;
         const auto route_started=stats.pipeline_route_wait_ns,plan_started=stats.pipeline_plan_ns;
+        stats.pipeline_route_wait_ns += waited_ns;
         const auto fetch_before=stats.pipeline_fetch_ns,cpu_before=stats.pipeline_cpu_ns;
         const auto time=[](int64_t& total,const auto& fn) {
             struct Sample {
@@ -4160,7 +4184,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // Window finish runs after the complete GPU graph. Join at most its
         // final background sample before any RAM lease can be exchanged.
         if(cell.in_window)cache_->pipeline_cpu_calibration_.collect(cache_->pipeline_cpu_cost_,true);
-        if(cell.skip_gpu_timing)return;
+        if(cell.skip_gpu_timing || !cell.active_tokens)return;
         float hot=0,transfer=0;
         MFQ_CUDA_CHECK(cudaEventElapsedTime(&hot,cell.timing.points[0],cell.timing.points[1]));
         MFQ_CUDA_CHECK(cudaEventElapsedTime(&transfer,cell.timing.points[2],cell.timing.points[3]));
@@ -4492,6 +4516,7 @@ public:
             cell=std::make_unique<Cell>(tokens,routes,width_,experts_,stream_,eager);
             initialize(*cell,execution,window!=nullptr);
         }
+        cell->allow_padding = window && execution.decode_row_mask.defined();
         // A prefill may have returned the revocable expert cache while keeping
         // this graph. Its descriptors resolve the newly allocated pages.
         if(cell->wire_fallback)cache_->prepare_direct_transfer_cache();
@@ -4526,13 +4551,14 @@ public:
                     if(grouped) {
                         grouped->ids.insert(grouped->ids.end(),captured->host_ids.h<int32_t>(),
                             captured->host_ids.h<int32_t>()+captured->entries);
-                        grouped->tokens+=captured->tokens;
+                        grouped->tokens+=captured->active_tokens;
                     }
                     if(final_tile && cache_->moe_residency_->prepare_during_window()) {
 
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
                         cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
-                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,true,independent);
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->active_tokens,
+                            true,independent);
 
                     }
                 },
@@ -4548,7 +4574,8 @@ public:
                         cache_->record_compute_use();
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
                         cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
-                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,false,independent);
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->active_tokens,
+                            false,independent);
                     }
 
                 },
