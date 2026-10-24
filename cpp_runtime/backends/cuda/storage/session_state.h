@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq_tensor_backend.h"
+#include "core/pooled_cache.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +97,7 @@ struct HybridBlockSessionState {
 
 struct Qwen4BlockSessionState {
     mfq_tensor_backend::Tensor keys, values, index;
+    mfq::cuda::PooledCacheState pooled;
     mfq_tensor_backend::Tensor convolution, recurrent, ple_convolution;
     int64_t ple_batch = 0;
     std::vector<int64_t> ple_tokens;

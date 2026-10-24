@@ -605,6 +605,24 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         [&](const Tensor &input, Activation activation, double limit) -> std::optional<Tensor> {
             if (activation != Activation::silu || limit > 0.0)
                 return {};
+            if (input.is_cuda() && execution.config.ffn_swiglu_fusion &&
+                execution.kl_mmq.mode == KlMmqMode::Default &&
+                input.numel() / input.size(-1) == 1 && gate_up.nint_grouped &&
+                gate_up.nint.split_w.empty() && gate_up.outs.size() == 2 &&
+                gate_up.outs[0] == gate_up.outs[1] && down.is_nint() &&
+                !down.tensor_parallel() && !down.nint.q8_zero &&
+                gate_up.outs[0] == down.nint.neuron_len) {
+                auto parts = profiler.measure("ffn.gate_up", [&] {
+                    return gate_up.forward(execution, input);
+                });
+                auto shape = input.sizes().vec();
+                shape.back() = down.nint.out;
+                return profiler.measure("ffn.down", [&] {
+                    return nint_matmul_input_swiglu_f16(profiler, down.nint,
+                        parts[1].reshape({1, down.nint.neuron_len}),
+                        parts[0].reshape({1, down.nint.neuron_len})).reshape(shape);
+                });
+            }
             if (nvq_fusion_enabled(execution.config) && input.numel() / input.size(-1) == 1 &&
                 gate_up.nvq_prefix2 && gate_up.layers.size() == 2 && gate_up.layers[0].is_nvq() &&
                 gate_up.layers[1].is_nvq() && down.is_nvq() && gate_up.outs.size() == 2 &&

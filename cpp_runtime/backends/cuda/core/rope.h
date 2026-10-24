@@ -53,18 +53,20 @@ namespace mfq::cuda {
 // Uses FP32 for F32 inputs and FP16 otherwise, without a resident table.
 class RotaryEmbedding {
 public:
+    using Tensor = mfq_tensor_backend::Tensor;
     RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
                     std::vector<int64_t> sections = {}, bool interleaved = false,
                     std::optional<bool> fused = std::nullopt, mfq::models::YarnScaling yarn = {});
-    mfq_tensor_backend::Tensor forward(const mfq_tensor_backend::Tensor& value,
-                                       const mfq_tensor_backend::Tensor& positions) const;
+    Tensor forward(const Tensor& value,const Tensor& positions) const;
     // Switch only after execution and captured graphs using this module finish.
     void set_fused(bool enabled) { fused_ = enabled && !yarn_.enabled(); }
     bool fused() const { return fused_; }
-    bool pool_normalized_into(const mfq_tensor_backend::Tensor& index,
-        const mfq_tensor_backend::Tensor& weight,const mfq_tensor_backend::Tensor& positions,
-        const mfq_tensor_backend::Tensor& cache_positions,const mfq_tensor_backend::Tensor& output,
-        int64_t pool,int64_t maximum,double eps) const;
+    bool pool_normalized_into(const Tensor& index,const Tensor& weight,const Tensor& positions,
+        const Tensor& cache_positions,const Tensor& output,int64_t pool,int64_t maximum,double eps) const;
+    // A range contains complete groups; live updates write only group-ending rows.
+    void pool_groups_into(const Tensor& index,const Tensor& weight,const Tensor& positions,
+        Tensor output,int64_t pool,double eps,const Tensor& cache_positions = {},
+        const Tensor& stored_positions = {},const Tensor& processed_rows = {}) const;
     mfq_tensor_backend::Tensor forward_normalized(
         const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions, double eps,
