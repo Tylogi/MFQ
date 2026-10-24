@@ -139,7 +139,8 @@ def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_p
 
 @pytest.mark.parametrize("budget", [32, 2048])
 @pytest.mark.parametrize("cells", [16, 496])
-def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells):
+@pytest.mark.parametrize("kv_bits", ["0", "3.5"])
+def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells, kv_bits):
     from mfq.server.runtime.client import StdioRuntimeClient
 
     executable = os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
@@ -155,10 +156,13 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
     weights[MODEL_CONFIG_ASSET] = json.dumps(config).encode()
     io.save(model, header, weights)
     tokenizer = _worker_tokenizer(tmp_path)
+    # Packed rows include one norm word per head: K uses 3 bits and V uses 4.
+    cell_bytes = 512 if kv_bits == "0" else 2 * ((1 + 6) + (1 + 8)) * 4
     environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
                        MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="8388608",
                        MFQ_MEMORY_ARCHITECTURE="discrete", MFQ_KV_RAM_PREALLOCATED="1",
-                       MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * 512))
+                       MFQ_QSA_INDEPENDENT_BATCH="1", MFQ_KV_TURBOQUANT_BITS=kv_bits,
+                       MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * cell_bytes))
     # A small GPU tier exercises eviction and cold reads; a small RAM tier
     # exposes writes through the logical [heads, 512, width] view immediately.
     prompts = ["ab" * count for count in (12, 25, 40)]
@@ -188,6 +192,8 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
                 outputs = (await asyncio.gather(*(generate(prompt) for prompt in prompts)) if capacity > 1
                            else [await generate(prompt) for prompt in prompts])
                 status = await _fresh_idle_status(client)
+                assert status["kv_memory_resident_cells"] == cells
+                assert status["kv_memory_ram_bytes"] > 0
                 if capacity > 1:
                     assert status["continuous_batching_cuda_graph_captures"] > 0
                     assert status["continuous_batching_cuda_graph_bucket_reuses"] > 0

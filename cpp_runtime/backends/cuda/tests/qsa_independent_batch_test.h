@@ -227,8 +227,13 @@ void qsa_independent_batch_benchmark() {
                     output = tb::cat(parts, 0);
                 }
                 cudaStreamCaptureStatus status;
+#if CUDART_VERSION >= 13000
+                MFQ_CUDA_CHECK(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(), &status,
+                    nullptr, &native, nullptr, nullptr, nullptr));
+#else
                 MFQ_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(), &status,
                     nullptr, &native, nullptr, nullptr));
+#endif
             };
             {
                 GraphWarmupScope warmup(default_context(), mfq_current_cuda_stream());
