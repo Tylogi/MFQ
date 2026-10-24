@@ -350,6 +350,8 @@ class JobManager:
                 semaphore = self._semaphore
             async with semaphore:
                 job = await asyncio.to_thread(self.store.get_job, job_id)
+                if job.status == JobStatus.CANCELLING:
+                    raise JobCancelledError()
                 if job.status != JobStatus.QUEUED:
                     return
                 handler = self.handlers.get(job.kind)
@@ -365,6 +367,8 @@ class JobManager:
                     )
                     return
                 job = await asyncio.to_thread(self.store.claim_job, job_id)
+                if job.status == JobStatus.CANCELLING:
+                    raise JobCancelledError()
                 if job.status != JobStatus.RUNNING:
                     return
                 result = await handler(context, dict(job.payload))
