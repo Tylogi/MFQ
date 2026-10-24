@@ -548,15 +548,12 @@ mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
     });
 }
 
-mfq_tensor_backend::Tensor nint_matmul_input_mul(
+static mfq_tensor_backend::Tensor nint_matmul_input_mul_impl(
         CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
         int mode) {
-    MFQ_RUNTIME_CHECK(
-        mode == 1 || mode == 2,
-        "NINT input gate mode must be sigmoid or SiLU");
     if (!x.is_cuda()) {
         x = x.contiguous().to(mfq_tensor_backend::kFloat16);
         gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
@@ -610,6 +607,31 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     }
     return nint_matmul(
         profiler, w, x * mfq_tensor_backend::silu(gate));
+}
+
+mfq_tensor_backend::Tensor nint_matmul_input_mul(
+        CudaProfiler& profiler,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,
+        int mode) {
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+        "NINT input gate mode must be sigmoid or SiLU");
+    return nint_matmul_input_mul_impl(profiler, w, x, gate, mode);
+}
+
+mfq_tensor_backend::Tensor nint_matmul_input_swiglu_f16(
+        CudaProfiler& profiler,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor up,
+        mfq_tensor_backend::Tensor gate) {
+    MFQ_RUNTIME_CHECK(up.is_cuda() && gate.is_cuda() && up.dim() == 2 &&
+        up.size(0) == 1 && up.sizes() == gate.sizes() &&
+        up.is_contiguous() && gate.is_contiguous() &&
+        up.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        gate.scalar_type() == mfq_tensor_backend::kFloat16,
+        "NINT rounded SwiGLU requires one contiguous CUDA FP16 row");
+    return nint_matmul_input_mul_impl(profiler, w, up, gate, 3);
 }
 
 mfq_tensor_backend::Tensor nint_matmul_swiglu(

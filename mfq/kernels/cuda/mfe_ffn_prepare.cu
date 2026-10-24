@@ -1,11 +1,65 @@
 #include "mfe_ffn_prepare.h"
 #include <cuda/atomic>
+#include <cub/block/block_radix_sort.cuh>
 #include <cstdlib>
 #include <atomic>
 #include <cstdio>
 
 namespace mfq::cuda {
 namespace {
+template<int Items>
+__device__ void build_expert_plan(const MfeFfnBatch& b,const MfeExpertPlan& plan) {
+    using Sort=cub::BlockRadixSort<uint32_t,64,Items,int32_t>;
+    __shared__ typename Sort::TempStorage scratch;
+    __shared__ uint32_t sorted_experts[64*Items];
+    const int thread=threadIdx.x,entries=b.tokens*b.routes;
+    uint32_t experts[Items];
+    int32_t pairs[Items];
+    for(int expert=thread;expert<b.experts;expert+=64) {
+        plan.expert_offsets[expert]=-1;
+        plan.expert_counts[expert]=0;
+    }
+    if(!thread)*plan.unique_count=0;
+#pragma unroll
+    for(int item=0;item<Items;++item) {
+        const int pair=thread*Items+item;
+        const int expert=pair<entries?b.ids[pair]:-1;
+        experts[item]=unsigned(expert)<unsigned(b.experts)?uint32_t(expert):~uint32_t(0);
+        pairs[item]=pair;
+    }
+    // CUB's stable radix sort preserves original pair order for equal experts.
+    // Only expert bits participate; invalid IDs sort after every valid expert.
+    Sort(scratch).Sort(experts,pairs,0,32-__clz(unsigned(b.experts)));
+#pragma unroll
+    for(int item=0;item<Items;++item) {
+        const int index=thread*Items+item;
+        sorted_experts[index]=experts[item];
+        if(index<entries)plan.sorted_pairs[index]=experts[item]<unsigned(b.experts)?pairs[item]:-1;
+    }
+    __syncthreads();
+#pragma unroll
+    for(int item=0;item<Items;++item) {
+        const int index=thread*Items+item;
+        const unsigned expert=experts[item];
+        if(expert>=unsigned(b.experts))continue;
+        if(!index || sorted_experts[index-1]!=expert) {
+            plan.expert_offsets[expert]=index;
+            plan.unique_pairs[atomicAdd(plan.unique_count,1)]=pairs[item];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for(int item=0;item<Items;++item) {
+        const int index=thread*Items+item;
+        const unsigned expert=experts[item];
+        if(expert<unsigned(b.experts)) {
+            plan.pair_ranks[pairs[item]]=index-plan.expert_offsets[expert];
+            if(index+1==entries || sorted_experts[index+1]!=expert)
+                plan.expert_counts[expert]=index+1-plan.expert_offsets[expert];
+        }else if(pairs[item]<entries)plan.pair_ranks[pairs[item]]=-1;
+    }
+    __syncthreads();
+}
 template<bool Ordered>
 __device__ void prepare_shared_gate(const MfePrepareSharedGate& gate,int token,int group) {
     const int lane=threadIdx.x&31;
@@ -156,10 +210,10 @@ __global__ void transfer_packet(MfeFfnBatch b,const int32_t* packet,
         if(!threadIdx.x && (descriptor_words&1))device_descriptors[descriptor_words-1]=host_descriptors[descriptor_words-1];
     }
 }
-template<bool Publish,bool Cached=false,bool Gate=false,bool StableSnapshot=false,bool EarlyTags=false>
+template<bool Publish,bool Cached=false,bool Gate=false,bool StableSnapshot=false,bool EarlyTags=false,int PlanItems=0>
 __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
         const MfeInputQuantization* inputs,int count,int32_t* mapped_ids,uint32_t* ready,bool local_control,
-        MfeCachedDispatch cache={}) {
+        MfeCachedDispatch cache={},MfeExpertPlan expert_plan={}) {
     const int thread=threadIdx.x,lane=thread&31;
     __shared__ int cached_kinds[Cached?256:1];
     if(Publish && blockIdx.x==0) {
@@ -177,6 +231,7 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
     const auto flat=int64_t(blockIdx.x)*64+thread;
     const int slots=b.tokens*(b.routes+(b.shared?1:0));
     if(flat<int64_t(slots)*b.scale_stride)b.completion[flat]=0;
+    if constexpr(PlanItems)if(blockIdx.x==0)build_expert_plan<PlanItems>(b,expert_plan);
     if(b.token_group_counts && blockIdx.x==0) {
         const int entries=b.tokens*b.routes,all_routes=b.routes+int(b.shared!=nullptr);
         if(b.token_group_buckets) {
@@ -189,8 +244,18 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
                 const int expert=b.ids[entry];
                 if(unsigned(expert)<unsigned(b.experts)) {
                     int rank=0;
-                    for(int previous=0;previous<entry;++previous)rank+=b.ids[previous]==expert;
-                    if(rank%b.token_group_capacity==0)
+                    if constexpr(PlanItems)rank=expert_plan.pair_ranks[entry];
+                    else for(int previous=0;previous<entry;++previous)rank+=b.ids[previous]==expert;
+                    if constexpr(PlanItems) {
+                        if(rank%b.token_group_capacity==0) {
+                            length=min(b.token_group_capacity,expert_plan.expert_counts[expert]-rank);
+                            const int first=expert_plan.expert_offsets[expert]+rank;
+                            for(int i=0;i<length;++i) {
+                                const int pair=expert_plan.sorted_pairs[first+i];
+                                b.token_group_slots[entry*8+i]=(pair/b.routes)*all_routes+pair%b.routes;
+                            }
+                        }
+                    }else if(rank%b.token_group_capacity==0)
                         for(int next=entry;next<entries && length<b.token_group_capacity;++next)
                             if(b.ids[next]==expert)b.token_group_slots[entry*8+length++]=
                                 (next/b.routes)*all_routes+next%b.routes;
@@ -216,16 +281,34 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
             const int entries=b.tokens*b.routes;
             auto* mapping=const_cast<int32_t*>(b.cohort_by_expert);
             bool needs_refresh=false;
-            for(int pair=thread/4;pair<entries;pair+=16) {
+            if constexpr(PlanItems) {
+                for(int pair=thread;pair<entries;pair+=64) {
+                    selected[pair]=0;
+                    refresh[pair]=0;
+                    tags[pair]=0;
+                    cached_kinds[pair]=-2;
+                }
+                __syncthreads();
+            }
+            const int lookups=PlanItems?*expert_plan.unique_count:entries;
+            for(int lookup=thread/4;lookup<lookups;lookup+=16) {
+                const int pair=PlanItems?expert_plan.unique_pairs[lookup]:lookup;
                 const int projection=thread&3;
                 const unsigned mask=0xfu<<((thread&31)&~3);
-                if(!projection){selected[pair]=0;refresh[pair]=0;tags[pair]=0;cached_kinds[pair]=-2;}
+                if constexpr(!PlanItems)
+                    if(!projection) {
+                        selected[pair]=0;
+                        refresh[pair]=0;
+                        tags[pair]=0;
+                        cached_kinds[pair]=-2;
+                    }
                 const int expert=b.ids[pair];if(unsigned(expert)>=unsigned(b.experts))continue;
                 bool duplicate=false;
                 // The route's four lanes inspect disjoint prior positions.
                 // Their vote preserves one writer per expert, including routes
                 // repeated in another warp or an earlier loop iteration.
-                for(int prior=projection;prior<pair;prior+=4)duplicate|=b.ids[prior]==expert;
+                if constexpr(!PlanItems)
+                    for(int prior=projection;prior<pair;prior+=4)duplicate|=b.ids[prior]==expert;
                 duplicate=__any_sync(mask,duplicate);
                 if(duplicate)continue;
                 // The snapshot publication below still protects this read.
@@ -372,31 +455,53 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
         else prepare_shared_gate<false>(cache.gate,token,group);
     }
 }
+template<bool Publish,bool Cached=false,bool Gate=false,bool StableSnapshot=false,bool EarlyTags=false>
+void launch_prepare(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,
+        int32_t* mapped_ids,uint32_t* ready,bool local_control,const MfeCachedDispatch& cache,
+        const MfeExpertPlan& plan,int blocks,cudaStream_t stream) {
+    if(plan.sorted_pairs && b.tokens*b.routes<=kMfeExpertPlanMaxPairs) {
+        const int pairs=b.tokens*b.routes;
+        if(pairs<=256)
+            prepare_warp<Publish,Cached,Gate,StableSnapshot,EarlyTags,4><<<blocks,64,0,stream>>>(
+                b,inputs,count,mapped_ids,ready,local_control,cache,plan);
+        else if(pairs<=512)
+            prepare_warp<Publish,Cached,Gate,StableSnapshot,EarlyTags,8><<<blocks,64,0,stream>>>(
+                b,inputs,count,mapped_ids,ready,local_control,cache,plan);
+        else
+            prepare_warp<Publish,Cached,Gate,StableSnapshot,EarlyTags,16><<<blocks,64,0,stream>>>(
+                b,inputs,count,mapped_ids,ready,local_control,cache,plan);
+    }else prepare_warp<Publish,Cached,Gate,StableSnapshot,EarlyTags><<<blocks,64,0,stream>>>(
+        b,inputs,count,mapped_ids,ready,local_control,cache);
+}
 }
 void mfe_ffn_prepare_publish(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,int groups,
-        int32_t* mapped_ids,uint32_t* ready,cudaStream_t stream) {
+        int32_t* mapped_ids,uint32_t* ready,cudaStream_t stream,const MfeExpertPlan& plan) {
     int blocks=(b.tokens*groups+1)/2;
     blocks=std::max(blocks,(b.tokens*(b.routes+(b.shared?1:0))*b.scale_stride+63)/64);
     const auto* control=std::getenv("MFQ_MFE_PREPARE_LOCAL_CONTROL");
-    if(ready)prepare_warp<true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,!control || control[0]!='0');
-    else prepare_warp<false><<<blocks,64,0,stream>>>(b,inputs,count,nullptr,nullptr,!control || control[0]!='0');
+    if(ready)launch_prepare<true>(b,inputs,count,mapped_ids,ready,!control || control[0]!='0',{},plan,blocks,stream);
+    else launch_prepare<false>(b,inputs,count,nullptr,nullptr,!control || control[0]!='0',{},plan,blocks,stream);
 }
-void mfe_ffn_prepare_warp(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,int groups,cudaStream_t stream) {
-    mfe_ffn_prepare_publish(b,inputs,count,groups,nullptr,nullptr,stream);
+void mfe_ffn_prepare_warp(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,int groups,
+        cudaStream_t stream,const MfeExpertPlan& plan) {
+    mfe_ffn_prepare_publish(b,inputs,count,groups,nullptr,nullptr,stream,plan);
 }
 void mfe_ffn_prepare_publish_cached(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,int groups,
-        int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch& cache,cudaStream_t stream) {
+        int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch& cache,cudaStream_t stream,
+        const MfeExpertPlan& plan) {
     static std::atomic<bool> cooperative_reported{false};
     if(!cooperative_reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
-        "mfe_prepare_cooperative_dispatch scope=first_cached_prepare enabled=1 route_lanes=4 snapshot_publish=after_mapped_reads duplicate_check=quad tokens=%d\n",b.tokens);
+        "mfe_prepare_cooperative_dispatch scope=first_cached_prepare enabled=1 route_lanes=4 "
+        "snapshot_publish=after_mapped_reads duplicate_check=%s tokens=%d\n",
+        plan.sorted_pairs?"expert_plan":"quad",b.tokens);
     int blocks=std::max((b.tokens*groups+1)/2,
         (b.tokens*(b.routes+(b.shared?1:0))*b.scale_stride+63)/64);
     const auto* stable=std::getenv("MFQ_MFE_CACHE_PREPARE_SYNC");
     const auto* tag_overlap=std::getenv("MFQ_MFE_TAG_OVERLAP");
     if(cache.primary_incomplete && (!tag_overlap || tag_overlap[0]!='0') && (!stable || stable[0]!='0')) {
         if(cache.gate.activation)
-            prepare_warp<true,true,true,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
-        else prepare_warp<true,true,false,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
+            launch_prepare<true,true,true,true,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
+        else launch_prepare<true,true,false,true,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
         static std::atomic<bool> reported{false};
         if(!reported.exchange(true,std::memory_order_relaxed)) {
             std::fprintf(stderr,"mfe_prepare_tag_overlap_dispatch scope=first_cached_prepare enabled=1 tokens=%d gate=%d\n",
@@ -408,8 +513,8 @@ void mfe_ffn_prepare_publish_cached(const MfeFfnBatch& b,const MfeInputQuantizat
     }
     if(!stable || stable[0]!='0') {
         if(cache.gate.activation)
-            prepare_warp<true,true,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
-        else prepare_warp<true,true,false,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
+            launch_prepare<true,true,true,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
+        else launch_prepare<true,true,false,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
         static std::atomic<bool> reported{false};
         if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
             "mfe_cache_prepare_sync_dispatch scope=first_cached_prepare enabled=1 tokens=%d gate=%d\n",
@@ -417,8 +522,8 @@ void mfe_ffn_prepare_publish_cached(const MfeFfnBatch& b,const MfeInputQuantizat
         return;
     }
     if(cache.gate.activation)
-        prepare_warp<true,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
-    else prepare_warp<true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
+        launch_prepare<true,true,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
+    else launch_prepare<true,true>(b,inputs,count,mapped_ids,ready,true,cache,plan,blocks,stream);
 }
 void mfe_ffn_wait_transfer_packet(const MfeFfnBatch& b,const int32_t* packet,cudaStream_t stream) {
     transfer_packet<false><<<1,32,0,stream>>>(b,packet,nullptr,nullptr,0);

@@ -1,5 +1,344 @@
 #pragma once
 #include <filesystem>
+#include <chrono>
+
+Tensor qsa_pool_reference(const Tensor& raw,const Tensor& weight,const Tensor& positions,
+        const RotaryEmbedding& rotary,int64_t tokens,int64_t pool) {
+    const auto groups=tokens/pool;
+    auto mean=raw.narrow(1,0,groups*pool).reshape({raw.size(0),groups,pool,raw.size(2)})
+        .to(tb::kFloat32).mean(2).to(raw.scalar_type());
+    auto starts=tb::arange(groups,positions.options().dtype(tb::kInt64))*pool;
+    return rotary.forward(attention_ops::rms_norm(mean,weight+1,1e-6).unsqueeze(1),
+        positions.index_select(-1,starts)).squeeze(1);
+}
+
+void qsa_incremental_pool_case() {
+    int cases=0;
+    int64_t processed=0,recomputed=0,device_rows=0;
+    const bool fused_store=runtime_options::qsa_pool_store_fused();
+    {
+        CudaExecutionContext execution;
+        constexpr int maximum=64,hidden=32,heads=4,kv=2,width=32,iw=8,ih=2,pool=4,budget=16;
+        auto rotary=std::make_shared<RotaryEmbedding>(8,maximum,10000.);
+        auto norm=data({width},1,0),inorm=data({iw},1,0);
+        QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+            linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
+        QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
+        auto memory=std::make_shared<KvMemoryManager>(KvMemoryOptions{});
+        Qsa actual(weights,cfg,rotary,true,true,{},memory),oracle(weights,cfg,rotary);
+        memory->finalize();
+        actual.activate_memory();
+        const auto* pooled_address=actual.pooled_cache().data_ptr();
+        auto inputs=data({1,maximum,hidden},17,.4f);
+        auto positions=tb::arange(maximum,inputs.options().dtype(tb::kInt64));
+        // The first short prefill enters graph execution with no position history.
+        for(int reuse=0;reuse<2;++reuse) {
+            actual.prepare_graph({},maximum);
+            for(int tokens=0;tokens<24;++tokens) {
+                auto x=inputs.narrow(1,tokens,1),pos=positions.narrow(0,tokens,1);
+                Tensor output;
+                DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&] {output=actual.forward_graph(execution,x,pos,pos);},[]{},[&] {output={};});
+                window.run();
+                actual.advance_graph(1);
+                equal(output,oracle.forward(execution,x,pos,positions.narrow(0,0,tokens+1),true),
+                    "managed QSA empty-prefix graph output");
+                if(actual.pooled_groups()!=(tokens+1)/pool || actual.pooled_cache().data_ptr()!=pooled_address)
+                    throw std::runtime_error("managed QSA pooling lost its watermark or preallocated storage");
+                if(tokens+1>=pool && tokens+1>budget)
+                    equal(actual.pooled_cache().narrow(1,0,(tokens+1)/pool),
+                        oracle.pooled_cache().narrow(1,0,(tokens+1)/pool),"managed QSA graph pooled storage");
+                ++cases;
+            }
+            actual.reset();
+            oracle.reset();
+        }
+    }
+    for(int width:{8,64,256,512})for(auto dtype:{tb::kFloat16,tb::kFloat32})
+    for(int axes:{1,3})for(int batch:{1,2}) {
+        constexpr int maximum=128,pool=4;
+        auto raw=data({batch,maximum,width+8},13,.4f).to(dtype).narrow(2,0,width);
+        auto weight=data({width},19,.1f).to(tb::kFloat32);
+        std::vector<int64_t> p(axes*batch*maximum);
+        for(int a=0;a<axes;++a)for(int b=0;b<batch;++b)for(int t=0;t<maximum;++t)
+            p[(a*batch+b)*maximum+t]=(t*t+3*t+17*a+5*b)%maximum;
+        auto positions=tb::tensor(p).reshape({axes,batch,maximum}).to(tb::kCUDA);
+        RotaryEmbedding rotary(8,maximum,10000.,axes==3?std::vector<int64_t>{2,1,1}:
+            std::vector<int64_t>{},axes==3,true);
+        PooledCache cache;
+        auto counter=tb::zeros({1},positions.options());
+        if(width<=256 && fused_store)cache.count_group_rows(counter);
+        int64_t tokens=0;
+        for(int chunk:{3,1,2,7,16,5,31}) {
+            tokens+=chunk;
+            auto result=cache.update(rotary,raw.narrow(1,0,tokens),weight,
+                positions.narrow(-1,0,tokens),tokens,pool,1e-6);
+            if(tokens>=pool)equal(result,qsa_pool_reference(raw,weight,positions,rotary,tokens,pool),
+                "incremental pooled prefix");
+            if(cache.completed()!=tokens/pool || cache.processed_groups()!=tokens/pool)
+                throw std::runtime_error("incremental pooling processed old or incomplete groups");
+            recomputed+=tokens/pool;
+            ++cases;
+        }
+        auto snapshot=cache.capture(tokens,pool);
+        if(width<=256 && fused_store) {
+            const auto actual=counter.item<int64_t>();
+            if(actual!=batch*(tokens/pool))throw std::runtime_error("kernel processed extra group rows");
+            device_rows+=actual;
+        }
+        cache.truncate(13,pool);
+        const auto before=cache.processed_groups();
+        // Change the discarded suffix so stale cached groups cannot pass.
+        auto replacement=raw.clone();
+        replacement.narrow(1,13,maximum-13).copy_(raw.narrow(1,13,maximum-13)*-.7);
+        auto result=cache.update(rotary,replacement,weight,positions,49,pool,1e-6);
+        equal(result,qsa_pool_reference(replacement,weight,positions,rotary,49,pool),"pool truncate replay");
+        if(cache.processed_groups()-before!=49/pool-13/pool)
+            throw std::runtime_error("pool truncate watermark differs");
+        cache.reset();
+        cache.restore(snapshot,tokens,pool);
+        result=cache.update(rotary,raw,weight,positions,73,pool,1e-6);
+        equal(result,qsa_pool_reference(raw,weight,positions,rotary,73,pool),"pool session restore");
+        if(cache.processed_groups()!=73/pool-tokens/pool)
+            throw std::runtime_error("restored pool recomputed a saved prefix");
+        processed+=cache.processed_groups();
+        cache.reset();
+        result=cache.update(rotary,replacement,weight,positions,21,pool,1e-6);
+        equal(result,qsa_pool_reference(replacement,weight,positions,rotary,21,pool),"pool cancel and reuse");
+        cases+=3;
+    }
+    // Captured graphs replay with changing, non-affine three-axis positions.
+    for(int rows:{1,2,6}) {
+        constexpr int maximum=128,pool=4,width=64;
+        auto raw=data({1,maximum,width},13,.4f),weight=data({width},19,.1f).to(tb::kFloat32);
+        std::vector<int64_t> p(3*maximum);
+        for(int a=0;a<3;++a)for(int t=0;t<maximum;++t)p[a*maximum+t]=(t*t+11*a)%maximum;
+        auto positions=tb::tensor(p).reshape({3,1,maximum}).to(tb::kCUDA);
+        RotaryEmbedding rotary(8,maximum,10000.,{2,1,1},true,true);
+        PooledCache cache;
+        auto counter=tb::zeros({1},positions.options());
+        cache.count_group_rows(counter);
+        int64_t tokens=7;
+        cache.reserve(raw,maximum/pool);
+        cache.update(rotary,raw,weight,positions,tokens,pool,1e-6);
+        cache.prepare_graph(positions.narrow(-1,0,tokens),maximum);
+        auto cp=tb::zeros({rows},positions.options()),pos=tb::zeros({3,1,rows},positions.options());
+        const auto upload=[&] {
+            cp.copy_(tb::arange(tokens,tokens+rows,positions.options()));
+            pos.copy_(positions.narrow(-1,tokens,rows));
+        };
+        upload();
+        DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&] {cache.update_graph(rotary,raw,weight,pos,cp,pool,1e-6);},[]{},[]{});
+        counter.zero_();
+        for(int replay=0;replay<8;++replay) {
+            upload();
+            window.run();
+            tokens+=rows;
+            cache.advance_graph(tokens,pool);
+            equal(cache.storage().narrow(1,0,tokens/pool),
+                qsa_pool_reference(raw,weight,positions,rotary,tokens,pool),"graph completed pooling MRoPE");
+            if(cache.processed_groups()!=tokens/pool)throw std::runtime_error("graph pool group count differs");
+            ++cases;
+        }
+        const auto actual=counter.item<int64_t>();
+        if(fused_store && actual!=tokens/pool-7/pool)
+            throw std::runtime_error("graph kernel pooled an incomplete or repeated group");
+        device_rows+=actual;
+        cache.truncate(13,pool);
+        tokens=13;
+        upload();
+        window.run();
+        tokens+=rows;
+        cache.advance_graph(tokens,pool);
+        equal(cache.storage().narrow(1,0,tokens/pool),qsa_pool_reference(raw,weight,positions,rotary,tokens,pool),
+            "graph pool truncate and replay");
+        ++cases;
+    }
+    {
+        CudaExecutionContext execution;
+        constexpr int maximum=128,hidden=32,heads=4,kv=2,width=32,iw=8,ih=2,pool=4,budget=16;
+        auto rotary=std::make_shared<RotaryEmbedding>(8,maximum,10000.,std::vector<int64_t>{2,1,1},true,true);
+        auto norm=data({width},1,0),weight=data({iw},1,0);
+        QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+            linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,weight,weight};
+        QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
+        Qsa actual(weights,cfg,rotary),oracle(weights,cfg,rotary);
+        oracle.set_incremental_pooling(false);
+        auto inputs=data({1,maximum,hidden},17,.4f);
+        std::vector<int64_t> p(3*maximum);
+        for(int a=0;a<3;++a)for(int t=0;t<maximum;++t)p[a*maximum+t]=(t*t+11*a)%maximum;
+        auto positions=tb::tensor(p).reshape({3,1,maximum}).to(tb::kCUDA);
+        int64_t tokens=0;
+        const auto eager=[&](int count) {
+            auto pos=positions.narrow(-1,tokens,count),full=positions.narrow(-1,0,tokens+count);
+            auto x=inputs.narrow(1,tokens,count);
+            equal(actual.forward(execution,x,pos,full,true),oracle.forward(execution,x,pos,full,true),
+                "QSA incremental eager MRoPE");
+            tokens+=count;
+            ++cases;
+        };
+        for(int count:{3,1,7,17,5})eager(count);
+        if(actual.pooled_processed_groups()!=tokens/pool)
+            throw std::runtime_error("QSA eager adapter repeated old groups");
+        Qwen4BlockSessionState state;
+        std::size_t bytes=0;
+        actual.capture_session(state,tokens,bytes);
+        actual.reset();
+        actual.restore_session(state,tokens);
+        if(actual.pooled_groups()!=state.pooled.completed)throw std::runtime_error("QSA session lost watermark");
+        eager(4);
+        if(actual.pooled_processed_groups()!=1)throw std::runtime_error("QSA restored pooling repeated prefix");
+        actual.prepare_graph(positions.narrow(-1,0,tokens),maximum);
+        for(int count:{1,3,6}) {
+            auto pos=positions.narrow(-1,tokens,count);
+            auto cp=tb::arange(tokens,tokens+count,positions.options());
+            auto x=inputs.narrow(1,tokens,count);
+            Tensor output;
+            DecodeWindow window(mfq_current_cuda_stream());
+            window.capture([&] {
+                output=actual.forward_graph(execution,x,pos,cp);
+            },[]{},[&] {
+                output={};
+            });
+            window.run();
+            actual.advance_graph(count);
+            equal(output,oracle.forward(execution,x,pos,positions.narrow(-1,0,tokens+count),true),
+                "QSA prefill to graph MRoPE");
+            tokens+=count;
+            equal(actual.pooled_cache().narrow(1,0,tokens/pool),oracle.pooled_cache().narrow(1,0,tokens/pool),
+                "QSA graph pooled cache");
+            ++cases;
+        }
+        actual.leave_graph();
+        actual.truncate(13);
+        oracle.truncate(13);
+        tokens=13;
+        eager(8);
+        actual.reset();
+        oracle.reset();
+        tokens=0;
+        eager(21);
+        actual.capture_session(state,tokens,bytes);
+        TextSessionState saved;
+        saved.cache_pos=tokens;
+        saved.tokens.resize(tokens,1);
+        saved.qwen4_positions=positions.narrow(-1,0,tokens);
+        saved.payload=std::vector<Qwen4BlockSessionState>{state};
+        std::vector<CudaPagedPayload> blocks;
+        for(std::size_t i=0;i<(saved.tokens.size()+7)/8;++i)
+            blocks.push_back(encode_cuda_qwen4_paged_block(saved,8,i));
+        auto decoded=decode_cuda_qwen4_paged_session(blocks,saved.tokens,8);
+        auto restored=std::get<std::vector<Qwen4BlockSessionState>>(decoded.payload).front();
+        equal(restored.pooled.values,state.pooled.values,"paged pooled cache snapshot",0,0);
+        if(restored.pooled.completed!=state.pooled.completed)throw std::runtime_error("paged watermark differs");
+        actual.reset();
+        actual.restore_session(restored,tokens);
+        eager(4);
+        actual.capture_session(state,tokens,bytes);
+        // Encode the old schema independently: it has no pooled value or watermark fields.
+        CudaPagedWriter legacy;
+        constexpr std::array<uint8_t,8> magic{'M','F','Q','C','U','D','2',0};
+        legacy.raw(magic.data(),magic.size());
+        legacy.scalar<uint32_t>(1);
+        legacy.scalar<uint32_t>(0);
+        legacy.scalar<uint32_t>(uint32_t(tokens));
+        legacy.scalar<uint32_t>(1);
+        legacy.scalar<uint32_t>(1);
+        for(const auto* tensor:{&state.keys,&state.values,&state.index}) {
+            legacy.scalar<uint32_t>(1);
+            legacy.tensor(*tensor);
+        }
+        for(int field=0;field<3;++field)legacy.scalar<uint32_t>(0);
+        legacy.scalar<int64_t>(0);
+        legacy.scalar<uint32_t>(0);
+        legacy.scalar<uint32_t>(1);
+        legacy.tensor(positions.narrow(-1,0,tokens));
+        legacy.scalar<uint32_t>(0);
+        auto old=decode_cuda_qwen4_paged_session({std::move(legacy).finish()},std::vector<int64_t>(tokens,1),maximum);
+        restored=std::get<std::vector<Qwen4BlockSessionState>>(old.payload).front();
+        actual.reset();
+        actual.restore_session(restored,tokens);
+        if(actual.pooled_groups()!=0)throw std::runtime_error("uncached session restored a stale watermark");
+        eager(4);
+    }
+    std::cout<<"QSA incremental pool cases="<<cases<<" device_group_rows="<<device_rows
+        <<" restored_new_groups="<<processed
+        <<" full_recompute_groups="<<recomputed<<" boundary/MRoPE/truncate/session/graph/cancel/reuse PASS\n";
+}
+
+void qsa_incremental_pool_benchmark() {
+    constexpr int maximum=16384,pool=32,iw=128,hidden=64,width=64,heads=4,kv=2,ih=2,budget=256;
+    const auto stream=mfq_current_cuda_stream();
+    auto raw=data({1,maximum,iw},13,.4f),weight=data({iw},19,.1f).to(tb::kFloat32);
+    auto positions=tb::arange(maximum,raw.options().dtype(tb::kInt64));
+    auto rotary=std::make_shared<RotaryEmbedding>(64,maximum,10000.);
+    auto inputs=data({1,maximum,hidden},17,.4f),norm=data({width},1,0);
+    QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+        linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,weight,weight};
+    QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
+    const std::string old=std::getenv("MFQ_QSA_POOL_WRITE_FUSED")?std::getenv("MFQ_QSA_POOL_WRITE_FUSED"):"";
+    const auto fusion=[](const char* value) {
+#ifdef _WIN32
+        _putenv_s("MFQ_QSA_POOL_WRITE_FUSED",value);
+#else
+        if(*value)setenv("MFQ_QSA_POOL_WRITE_FUSED",value,1);
+        else unsetenv("MFQ_QSA_POOL_WRITE_FUSED");
+#endif
+    };
+    const auto measure=[&](auto&& run) {
+        cudaEvent_t begin,end;
+        MFQ_CUDA_CHECK(cudaEventCreate(&begin));
+        MFQ_CUDA_CHECK(cudaEventCreate(&end));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto start=std::chrono::steady_clock::now();
+        MFQ_CUDA_CHECK(cudaEventRecord(begin,stream));
+        run();
+        MFQ_CUDA_CHECK(cudaEventRecord(end,stream));
+        MFQ_CUDA_CHECK(cudaEventSynchronize(end));
+        const auto wall=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        float ms=0;
+        MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,begin,end));
+        MFQ_CUDA_CHECK(cudaEventDestroy(begin));
+        MFQ_CUDA_CHECK(cudaEventDestroy(end));
+        return std::pair<float,double>{ms,wall};
+    };
+    for(int chunk:{512,2048})for(int arm:{0,1,0}) {
+        const bool incremental=arm==1;
+        fusion(incremental?"1":"0");
+        PooledCache cache;
+        cache.set_incremental(incremental);
+        // Warm the same geometry and parameter preparation before timing.
+        cache.update(*rotary,raw,weight,positions,maximum,pool,1e-6);
+        cache.reset();
+        Tensor result;
+        const auto pooling=measure([&] {
+            for(int repeat=0;repeat<10;++repeat) {
+                cache.reset();
+                for(int end=chunk;end<=maximum;end+=chunk)
+                    result=cache.update(*rotary,raw,weight,positions,end,pool,1e-6);
+            }
+        });
+        equal(result,qsa_pool_reference(raw,weight,positions,*rotary,maximum,pool),"pool benchmark prefix");
+        CudaExecutionContext execution;
+        Qsa model(weights,cfg,rotary);
+        model.set_incremental_pooling(incremental);
+        model.forward(execution,inputs.narrow(1,0,chunk),positions.narrow(0,0,chunk),
+            positions.narrow(0,0,chunk),true);
+        model.reset();
+        const auto prefill=measure([&] {
+            for(int start=0;start<maximum;start+=chunk)
+                result=model.forward(execution,inputs.narrow(1,start,chunk),positions.narrow(0,start,chunk),
+                    positions.narrow(0,0,start+chunk),true);
+        });
+        std::cout<<"QSA pooling benchmark tokens="<<maximum<<" chunk="<<chunk<<" incremental="<<incremental
+            <<" pooling_ms="<<pooling.first/10<<" pooling_wall_ms="<<pooling.second/10
+            <<" groups="<<cache.processed_groups()<<" prefill_ms="<<prefill.first
+            <<" prefill_wall_ms="<<prefill.second<<" dtype=fp16 pool=32 index_width=128 heads=4 kv_heads=2\n";
+    }
+    fusion(old.c_str());
+}
+
 
 void qsa_scalar_history_chain_case() {
     int cases=0,scalar_replays=0,chain_replays=0;

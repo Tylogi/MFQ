@@ -105,6 +105,8 @@ def test_live_request_snapshots_coalesce_pollers_and_never_wait_for_generation(t
         backend = Backend()
         instance = SimpleNamespace(id=uuid4(), artifact=SimpleNamespace(resource=SimpleNamespace(name='model')),
             state=RuntimeInstanceState.BUSY, active_requests=1, queued_requests=2,
+            request_capacity=8, batch_capacity=4, queue_wait_ms_total=30.0, queue_wait_ms_max=20.0,
+            queue_wait_samples=2, rejections=1,
             serving_snapshot={}, serving_sampled_at=0, serving_refreshing=False, backend=backend)
         pool = object.__new__(RuntimePool)
         pool._instances = {instance.id: instance}
@@ -117,6 +119,9 @@ def test_live_request_snapshots_coalesce_pollers_and_never_wait_for_generation(t
         assert rows[0]['requests'][0]['id'] == 'native-id'
         assert rows[0]['requests'][0]['generated_tokens'] == 24
         assert rows[0]['queued_requests'] == 2
+        assert (rows[0]['request_capacity'], rows[0]['batch_capacity']) == (8, 4)
+        assert rows[0]['queue_wait_ms_avg'] == 15.0
+        assert rows[0]['rejected_requests'] == 1
         await pool.serving_activity()
         assert backend.calls == 1
         instance.active_requests = 0

@@ -241,9 +241,15 @@ uv run mfq serve \
   buffers before growing the tile. Ordinary and MTP prefill share this policy.
   Explicit integers from `1` to `8192` set a smaller limit and are always passed
   to the worker. On Metal and HIP, `auto` preserves their native default policy.
-- `--max-requests-per-runtime N` enables continuous batching on supported
-  native paths; capacity limits and scheduling behavior are documented in
-  [Flash-Next continuous batching](../runtime/cuda-continuous-batching.md).
+- `--max-requests-per-runtime N` admits up to `N` concurrent requests per worker
+  on supported native paths. The default is `8` on CUDA and Metal; HIP needs an
+  explicit value. The worker reports the capacity its loaded model can actually
+  batch, and the server adopts that report, so a model without per-request batch
+  state keeps a single request and never fails to load. `N` is limited to `32`.
+  See [multi-request concurrency](../runtime/concurrency.md).
+- `--queue-timeout SECONDS` bounds how long a request may wait for a runtime
+  slot before failing with the retryable `runtime_queue_timeout` error. `0`, the
+  default, waits indefinitely.
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 Persistent Session KV caching is configured with `--prefix-cache-dir`,
@@ -282,8 +288,9 @@ unpinned models; instances may override it through the runtime API.
 | `--work-dir PATH` | Workspace boundary for tool jobs. | Current directory |
 | `--api-key-env NAME` | Environment variable containing the administrator API key. | `MFQ_SERVER_API_KEY` |
 | `--max-runtime-instances N` | Maximum managed native workers. | `2` |
-| `--max-requests-per-runtime N` | Concurrent requests per worker. | CUDA/HIP: `1`; Metal: `8` |
+| `--max-requests-per-runtime N` | Concurrent requests per worker; the worker reports the capacity its model can batch. | CUDA/Metal: `8`; HIP: `1` |
 | `--max-queued-requests-per-runtime N` | Waiting requests per worker. | `max(32, 4 × concurrency)` |
+| `--queue-timeout SECONDS` | Maximum wait for a runtime slot before a retryable error. | `0` (wait indefinitely) |
 | `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
 | `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic where supported |
 | `--no-memory-guard` | Disable the automatic Metal model-residency budget. | Off |

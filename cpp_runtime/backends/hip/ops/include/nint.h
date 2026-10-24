@@ -90,6 +90,11 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor gate,
     int mode);
+mfq_tensor_backend::Tensor nint_matmul_input_swiglu_f16(
+    CudaProfiler& profiler,
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor up,
+    mfq_tensor_backend::Tensor gate);
 mfq_tensor_backend::Tensor nint_matmul_input_mul_f32(
     CudaProfiler& profiler,
     const NintWeight& weight,

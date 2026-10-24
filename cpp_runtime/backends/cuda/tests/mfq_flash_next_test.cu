@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -130,6 +131,142 @@ void check_shared_sparse_attention() {
             dsv_q, dsv_kv, indices, all_invalid_mask,
             all_invalid_sinks, meta, 1.0),
         0.0f, 0.0f, "fully masked DSV4 sparse attention");
+}
+
+// Shared MLA (D = 512, V reuses the K cache) reads the query and the selection
+// in place: the tile rejects sentinel indices and casts a strided query itself.
+// It must match the prepared padded-index/FP16-mask path, which is still the
+// fallback for QSA tiles and is selected by MFQ_MLA_SPARSE_INLINE_SELECTION=0.
+void check_mla_inline_selection() {
+    const auto float_cuda = TensorOptions{}.dtype(kFloat32).device(kCUDA);
+    const auto int_cuda = TensorOptions{}.dtype(kInt32).device(kCUDA);
+    constexpr int64_t heads = 64, width = 512, cache = 128;
+    const double scale = 1.0 / std::sqrt(16.0);
+    auto kv = ((arange(cache * width, float_cuda).remainder(251) - 125.0) / 128.0)
+        .reshape({1, cache, width}).to(kFloat16);
+    const auto run = [&](const Tensor& query, const Tensor& indices) {
+        return mfq_glm5_next::sparse_mla_attention(query, kv, indices, scale);
+    };
+    const auto prepared = [&](const Tensor& query, const Tensor& indices) {
+#ifdef _WIN32
+        _putenv_s("MFQ_MLA_SPARSE_INLINE_SELECTION", "0");
+#else
+        setenv("MFQ_MLA_SPARSE_INLINE_SELECTION", "0", 1);
+#endif
+        auto output = run(query, indices);
+#ifdef _WIN32
+        _putenv_s("MFQ_MLA_SPARSE_INLINE_SELECTION", "");
+#else
+        unsetenv("MFQ_MLA_SPARSE_INLINE_SELECTION");
+#endif
+        return output;
+    };
+    for (int64_t rows : {1, 4}) {
+        for (int64_t selected : {71, 100}) {
+            auto query = ((arange(rows * heads * width, float_cuda).remainder(97) - 48.0) / 64.0)
+                .reshape({1, heads, rows, width});
+            std::vector<int32_t> values(static_cast<size_t>(rows * selected));
+            for (int64_t row = 0; row < rows; ++row) {
+                for (int64_t slot = 0; slot < selected; ++slot) {
+                    // Row 0 stays valid, row 1 mixes negatives, row 2 is empty and
+                    // row 3 mixes indices past the cache length.
+                    int32_t value = static_cast<int32_t>((slot * 37 + row * 11) % cache);
+                    if (row % 4 == 1 && slot % 3 == 0) value = -1;
+                    if (row % 4 == 2) value = -1;
+                    if (row % 4 == 3 && slot % 5 == 0) value = static_cast<int32_t>(cache + slot);
+                    values[static_cast<size_t>(row * selected + slot)] = value;
+                }
+            }
+            auto indices = tensor(values).reshape({1, rows, selected}).to(int_cuda);
+            for (auto dtype : {kFloat32, kFloat16, kBFloat16}) {
+                // A strided query keeps the [B,H,T,D] shape the tile expects.
+                const auto strided = query.to(dtype).transpose(-1, -2).contiguous()
+                    .transpose(-1, -2);
+                const auto expected = prepared(strided.to(kFloat32), indices).cpu();
+                const auto actual = run(strided, indices).cpu();
+                float magnitude = 1.0f;
+                float error = 0.0f;
+                for (int64_t index = 0; index < actual.numel(); ++index) {
+                    magnitude = std::max(magnitude, std::abs(expected.data_ptr<float>()[index]));
+                    error = std::max(error, std::abs(actual.data_ptr<float>()[index] -
+                        expected.data_ptr<float>()[index]));
+                }
+                if (error > 5.0e-3f * magnitude)
+                    throw std::runtime_error(
+                        "inline MLA selection differs from the prepared path, max_abs=" +
+                        std::to_string(error));
+            }
+            if (rows > 2) {
+                require_constant(run(query, indices).narrow(1, 2, 1), 0.0f, 0.0f,
+                    "inline MLA empty selection");
+                require_constant(prepared(query, indices).narrow(1, 2, 1), 0.0f, 0.0f,
+                    "prepared MLA empty selection");
+            }
+        }
+    }
+}
+
+// Reports the shared MLA sparse-attention entry cost for decode (M = 1) and MTP
+// verify (M = 4) rows. The selection path follows MFQ_MLA_SPARSE_INLINE_SELECTION,
+// so one binary measures either the inline tile or the prepared fallback.
+void bench_mla_sparse_attention(int reps) {
+    const auto float_cuda = TensorOptions{}.dtype(kFloat32).device(kCUDA);
+    const auto int_cuda = TensorOptions{}.dtype(kInt32).device(kCUDA);
+    constexpr int64_t heads = 64, width = 512, cache = 2112, selected = 2048;
+    const double scale = 1.0 / std::sqrt(256.0);
+    const char* selection = std::getenv("MFQ_MLA_SPARSE_INLINE_SELECTION");
+    const bool inline_selection = !selection || selection[0] != '0';
+    auto kv = ((arange(cache * width, float_cuda).remainder(251) - 125.0) / 128.0)
+        .reshape({1, cache, width}).to(kFloat16);
+    const auto time_ms = [&](const auto& run) {
+        const auto stream = current_stream(0).stream();
+        cudaEvent_t start, stop;
+        MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&start));
+        MFQ_NATIVE_CUDA_CHECK(cudaEventCreate(&stop));
+        MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int rep = 0; rep < reps; ++rep) run();
+        MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(stop, stream));
+        MFQ_NATIVE_CUDA_CHECK(cudaEventSynchronize(stop));
+        float elapsed = 0.0f;
+        MFQ_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+        MFQ_NATIVE_CUDA_CHECK(cudaEventDestroy(start));
+        MFQ_NATIVE_CUDA_CHECK(cudaEventDestroy(stop));
+        return elapsed / reps;
+    };
+    for (int64_t rows : {1, 4}) {
+        // Token-major projection followed by the model's head permute, so the
+        // prepared path pays the FP32 contiguous copy it pays in production.
+        auto query = ((arange(rows * heads * width, float_cuda).remainder(97) - 48.0) / 64.0)
+            .reshape({1, rows, heads, width}).permute({0, 2, 1, 3});
+        std::vector<int32_t> values(static_cast<size_t>(rows * selected));
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t slot = 0; slot < selected; ++slot) {
+                values[static_cast<size_t>(row * selected + slot)] =
+                    static_cast<int32_t>((slot * 37 + row * 11) % cache);
+            }
+        }
+        auto indices = tensor(values).reshape({1, rows, selected}).to(int_cuda);
+        const auto run = [&]() {
+            return mfq_glm5_next::sparse_mla_attention(query, kv, indices, scale);
+        };
+        for (int warmup = 0; warmup < 5; ++warmup) run();
+        const float elapsed_ms = time_ms(run);
+        // Graph replay drops the host launch overhead, so it reports the GPU
+        // side of the same launch sequence instead of the CPU cost per op.
+        const auto stream = current_stream(0).stream();
+        Graph graph;
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream));
+        graph.prepare_memory();
+        run();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream));
+        graph.capture_begin();
+        run();
+        graph.capture_end();
+        const float replay_ms = time_ms([&]() { graph.replay(); });
+        std::cout << "mla_sparse_m=" << rows << " selected=" << selected
+                  << " path=" << (inline_selection ? "inline" : "prepared")
+                  << " cuda_ms=" << elapsed_ms << " replay_ms=" << replay_ms << "\n";
+    }
 }
 
 Tensor input(const Json& j) {
@@ -566,6 +703,10 @@ int main(int argc, char** argv) {
         if(argc==2 && std::string(argv[1])=="--rotary-fused-check") {check_rotary_fusion();return 0;}
         if(argc==2 && std::string(argv[1])=="--rotary-normalized-check") {check_rotary_normalized_fusion();return 0;}
         if(argc==2 && std::string(argv[1])=="--attention-fused-check") {check_attention_fusion();return 0;}
+        if(argc>=2 && std::string(argv[1])=="--mla-sparse-bench") {
+            bench_mla_sparse_attention(argc>2?std::stoi(argv[2]):50);
+            return 0;
+        }
         if (argc == 1) {
             auto q = mfq::cuda::ones({1,1,2,4}, mfq::cuda::TensorOptions{}.device(mfq::cuda::kCUDA));
             auto k = mfq::cuda::ones({1,3,4}, q.options());
@@ -573,6 +714,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 3; ++i)
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
             check_shared_sparse_attention();
+            check_mla_inline_selection();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
