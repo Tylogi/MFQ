@@ -62,8 +62,9 @@ the backbone from loading.
   responses, model-pool lifecycle management, and per-model capability
   reporting.
 - Prefix reuse and tiered RAM/SSD cache storage are shared serving features.
-  Continuous Batching is active on supported native paths and is being expanded
-  across the remaining model graphs.
+  Continuous batching is active on supported native paths, and newly loaded
+  workers report the capacity their model can batch so the server sizes
+  admission from it. See [multi-request concurrency](concurrency.md).
 - Metal supports bounded resident expert caches and SSD-streamed expert access
   for supported large-MoE runtimes.
 - One backend-wide MTP engine owns sampling, verification, cache snapshots,

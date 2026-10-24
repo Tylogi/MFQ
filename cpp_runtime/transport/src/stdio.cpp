@@ -193,6 +193,7 @@ public:
                 {"vision_enabled_default", sampling_defaults.enable_vision},
                 {"mtp_enabled_default", sampling_defaults.enable_mtp},
                 {"max_context", active_context.load()},
+                {"batch_capacity", scheduler.info().batch_capacity},
                 {"duplex_available", static_cast<bool>(duplex)},
                 {"duplex_active", duplex_active()},
                 {"sampling_defaults", sampling_params_json(sampling_defaults)},
@@ -224,6 +225,7 @@ public:
             value["vision_enabled_default"] =
                 sampling_defaults.enable_vision;
             value["mtp_enabled_default"] = sampling_defaults.enable_mtp;
+            value["batch_capacity"] = scheduler.info().batch_capacity;
             value["duplex_available"] = static_cast<bool>(duplex);
             value["duplex_active"] = duplex_active();
             add_runtime_metrics(value);

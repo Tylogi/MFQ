@@ -13,7 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -182,6 +182,11 @@ class _Runtime(BaseModel):
     read_control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
     request_capacity: int = 1
+    batch_capacity: int = 1
+    queue_wait_ms_total: float = 0.0
+    queue_wait_ms_max: float = 0.0
+    queue_wait_samples: int = 0
+    rejections: int = 0
     mtp_supported: bool = False
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
@@ -322,6 +327,7 @@ class RuntimePool:
         max_instances: int = 2,
         max_requests_per_instance: int = 1,
         max_queued_requests_per_instance: int | None = None,
+        queue_timeout_seconds: float = 0.0,
         max_runtime_memory_bytes: int | None = None,
         default_idle_ttl_seconds: int | None = None,
         load_failure_cooldown_seconds: float = 30.0,
@@ -343,6 +349,8 @@ class RuntimePool:
             and max_queued_requests_per_instance < 0
         ):
             raise ValueError("max_queued_requests_per_instance must be non-negative")
+        if queue_timeout_seconds < 0:
+            raise ValueError("queue_timeout_seconds must be non-negative")
         if max_runtime_memory_bytes is not None and max_runtime_memory_bytes < 1:
             raise ValueError("max_runtime_memory_bytes must be positive")
         if default_idle_ttl_seconds is not None and default_idle_ttl_seconds < 0:
@@ -360,6 +368,7 @@ class RuntimePool:
             if max_queued_requests_per_instance is None
             else max_queued_requests_per_instance
         )
+        self.queue_timeout_seconds = max(0.0, queue_timeout_seconds)
         automatic_budget = (
             self._default_runtime_memory_budget(backend)
             if automatic_memory_budget and max_runtime_memory_bytes is None
@@ -546,6 +555,7 @@ class RuntimePool:
             pinned=canonical_request.pin,
             request_slots=asyncio.Semaphore(request_capacity),
             request_capacity=request_capacity,
+            batch_capacity=request_capacity,
             reserved_bytes=self._estimated_load_bytes(
                 artifact,
                 canonical_request,
@@ -963,6 +973,7 @@ class RuntimePool:
             pinned=request.pin,
             request_slots=asyncio.Semaphore(request_capacity),
             request_capacity=request_capacity,
+            batch_capacity=request_capacity,
             reserved_bytes=incoming_bytes,
             resident_budget_limit=int(process_environment.get("MFQ_SERVER_RESIDENT_BUDGET_BYTES", "0")),
             # Keep TTL and memory-pressure eviction out of the load
@@ -1042,6 +1053,7 @@ class RuntimePool:
                 )
             instance.mtp_supported = capabilities.model_capabilities.features.mtp
             instance.mtp_available = capabilities.mtp_available
+            self._apply_batch_capacity(instance, capabilities.batch_capacity)
             break
         else:
             raise _job_error(
@@ -1815,6 +1827,11 @@ class RuntimePool:
                     devices=[f"cuda:{device}" for device in item.device_ids] if item.device_ids else [self.backend],
                     active_sessions=route_counts.get(item.id, 0),
                     queued_requests=item.queued_requests,
+                    request_capacity=item.request_capacity,
+                    batch_capacity=item.batch_capacity,
+                    queue_wait_ms_avg=self._concurrency_status(item)["queue_wait_ms_avg"],
+                    queue_wait_ms_max=item.queue_wait_ms_max,
+                    rejected_requests=item.rejections,
                     resident_bytes=item.resident_bytes,
                     kv_bytes=item.kv_bytes,
                     memory=item.memory,
@@ -1908,6 +1925,7 @@ class RuntimePool:
         return resource
 
     async def _reject_full_queue(self, instance: _Runtime, model: str) -> NoReturn:
+        instance.rejections += 1
         error = BackendError("runtime_queue_full", f"model runtime queue is full: {model}",
             retryable=True, status_code=429)
         if self.store is not None:
@@ -1919,6 +1937,45 @@ class RuntimePool:
             except Exception:
                 logger.exception("Could not persist runtime admission error")
         raise error
+
+    def _apply_batch_capacity(self, instance: _Runtime, reported: int) -> None:
+        """Adopt the worker's real batch capacity without disturbing requests.
+
+        The worker owns model/state compatibility, so its report is
+        authoritative. Shrinking is only safe while nothing is in flight: a new
+        semaphore would lose the count held by running requests.
+        """
+
+        if reported < 1:
+            return
+        instance.batch_capacity = reported
+        if (
+            reported >= instance.request_capacity
+            or instance.active_requests
+            or instance.queued_requests
+        ):
+            return
+        instance.request_capacity = reported
+        instance.request_slots = asyncio.Semaphore(reported)
+        logger.info(
+            "runtime concurrency reduced to %d for %s (worker reported capacity)",
+            reported,
+            instance.artifact.resource.name,
+        )
+
+    @staticmethod
+    def _concurrency_status(instance: _Runtime) -> dict[str, Any]:
+        samples = instance.queue_wait_samples
+        return {
+            "request_capacity": instance.request_capacity,
+            "batch_capacity": instance.batch_capacity,
+            "queue_wait_ms_avg": (
+                instance.queue_wait_ms_total / samples if samples else 0.0
+            ),
+            "queue_wait_ms_max": instance.queue_wait_ms_max,
+            "queue_wait_samples": samples,
+            "rejected_requests": instance.rejections,
+        }
 
     async def _wait_for_runtime_maintenance_locked(self, instance: _Runtime, *, global_only: bool = False) -> None:
         deadline = asyncio.get_running_loop().time() + _RUNTIME_MAINTENANCE_WAIT_SECONDS
@@ -2025,6 +2082,8 @@ class RuntimePool:
         await self._rebalance_resident_budget(instance.id, wait=False)
         acquired = False
         active = False
+        enqueued_at = time.monotonic()
+        queue_wait_ms = 0.0
         async with self._lock:
             await self._wait_for_runtime_maintenance_locked(instance, global_only=True)
             queue_full = (
@@ -2038,8 +2097,24 @@ class RuntimePool:
             await self._reject_full_queue(instance, model)
         queued = True
         try:
-            await instance.request_slots.acquire()
+            if self.queue_timeout_seconds > 0:
+                try:
+                    await asyncio.wait_for(
+                        instance.request_slots.acquire(),
+                        timeout=self.queue_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    raise BackendError(
+                        "runtime_queue_timeout",
+                        f"request waited more than {self.queue_timeout_seconds:g}s "
+                        f"for a runtime slot: {model}",
+                        retryable=True,
+                        status_code=503,
+                    ) from None
+            else:
+                await instance.request_slots.acquire()
             acquired = True
+            queue_wait_ms = (time.monotonic() - enqueued_at) * 1000.0
             async with self._lock:
                 await self._wait_for_runtime_maintenance_locked(instance)
                 instance.queued_requests = max(0, instance.queued_requests - 1)
@@ -2048,6 +2123,9 @@ class RuntimePool:
                 active = True
                 instance.state = RuntimeInstanceState.BUSY
                 instance.last_used_at = datetime.now(timezone.utc)
+                instance.queue_wait_samples += 1
+                instance.queue_wait_ms_total += queue_wait_ms
+                instance.queue_wait_ms_max = max(instance.queue_wait_ms_max, queue_wait_ms)
                 if session_id is not None:
                     self._session_routes[session_id] = instance.id
                 self._last_instance_id = instance.id
@@ -2072,11 +2150,18 @@ class RuntimePool:
                     performance = delta.performance or performance
                     usage = delta.usage or usage
                     finish_reason = delta.finish_reason or finish_reason
+                    if queue_wait_ms and delta.performance is not None:
+                        delta = replace(
+                            delta,
+                            performance=delta.performance.model_copy(
+                                update={"server_queue_wait_ms": queue_wait_ms}
+                            ),
+                        )
                     yield delta
             if self.store is not None and performance is not None and request_id is not None:
                 request = performance.model_dump(mode="json", exclude_unset=True)
                 request.update(id=request_id, finish_reason=finish_reason,
-                    completed_at=time.time())
+                    completed_at=time.time(), queue_wait_ms=queue_wait_ms)
                 if usage is not None:
                     request.update(prompt_tokens=usage.prompt_tokens,
                         completion_tokens=usage.completion_tokens)
@@ -2241,6 +2326,7 @@ class RuntimePool:
         return [{"instance_id": str(item.id), "model": item.artifact.resource.name,
             "state": item.state.value, "active_requests": item.active_requests,
             "queued_requests": item.queued_requests,
+            **self._concurrency_status(item),
             "sample_age_seconds": now - item.serving_sampled_at if item.serving_sampled_at else None,
             "requests": [{"id": key, **value} for key, value in item.serving_snapshot.items()]
                 if item.active_requests else []}
@@ -2352,6 +2438,10 @@ class RuntimePool:
             if instance is not None:
                 status["instance_id"] = str(instance.id)
                 status["runtime_state"] = instance.state.value
+                reported_capacity = status.get("batch_capacity")
+                if isinstance(reported_capacity, int) and reported_capacity > 0:
+                    self._apply_batch_capacity(instance, reported_capacity)
+                status.update(self._concurrency_status(instance))
                 if instance.sampling_defaults is not None:
                     status["sampling_defaults"] = (
                         instance.sampling_defaults.model_dump(mode="json")

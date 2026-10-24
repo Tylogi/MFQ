@@ -87,6 +87,16 @@ def append_native_prefill_chunk_override(
     command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
 
 
+# Capacity is a serving hint: the native worker reports the rows the loaded
+# model can actually batch after its state-compatibility checks, and the
+# control plane reconciles its admission limit with that report. Asking for a
+# bounded capacity up front therefore cannot make an unsupported model fail to
+# load; it only tells a batch-capable worker how many rows to prepare for.
+DEFAULT_RUNTIME_CONCURRENCY = 8
+MAX_RUNTIME_CONCURRENCY = 32
+_BATCHING_BACKENDS = frozenset({"cuda", "hip", "metal"})
+
+
 def native_request_capacity(
     *,
     backend: str,
@@ -101,7 +111,9 @@ def native_request_capacity(
     # batch requests.  The native worker owns model/state compatibility and
     # its MoE implementation handles both resident and cached experts.
     _ = routed_expert_bytes
-    return requested if backend in {"cuda", "metal"} else 1
+    if backend not in _BATCHING_BACKENDS:
+        return 1
+    return min(requested, MAX_RUNTIME_CONCURRENCY)
 
 
 def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:
@@ -201,8 +213,10 @@ class NativeRuntime:
     def command(self, port: int) -> list[str]:
         if self.continuous_batching < 0:
             raise NativeRuntimeError("continuous batching must be non-negative")
-        if self.continuous_batching > 0 and self.backend not in {"cuda", "metal"}:
-            raise NativeRuntimeError("continuous batching currently requires CUDA or Metal")
+        if self.continuous_batching > 0 and self.backend not in _BATCHING_BACKENDS:
+            raise NativeRuntimeError(
+                "continuous batching requires a CUDA, HIP or Metal worker"
+            )
         if self.moe_gpu_cache_gb is not None and (
             not math.isfinite(self.moe_gpu_cache_gb) or self.moe_gpu_cache_gb < 0
         ):
