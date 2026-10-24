@@ -326,8 +326,10 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     bool inplace_state, bool transposed_state=false, bool tiled_heads=false)
 {
     if (q.is_cuda() && q.dim() == 4 && (q.size(3) == 32 || q.size(3) == 64 || q.size(3) == 128) &&
-        q.size(2) <= std::numeric_limits<int>::max() && gdn_prefill_chunk_enabled(q.size(2), g.dim() == 3))
-        return gdn_prefill_chunk_cuda(q, k, v, g, beta, state, inplace_state, transposed_state, tiled_heads);
+        q.size(2) <= std::numeric_limits<int>::max() && gdn_prefill_chunk_enabled(q.size(2), g.dim() == 3)) {
+        auto result = gdn_prefill_chunk_cuda(q, k, v, g, beta, state, inplace_state, transposed_state, tiled_heads);
+        if (!result.empty()) return result;
+    }
     // Short low-precision inputs use the established FP32 recurrent kernels.
     if (q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16) {
         MFQ_RUNTIME_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),

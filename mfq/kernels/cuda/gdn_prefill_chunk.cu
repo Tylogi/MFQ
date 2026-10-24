@@ -1,4 +1,5 @@
 #include "gdn_prefill_chunk.cuh"
+#include "mfq_cuda_linear_attention_ops.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <algorithm>
@@ -420,22 +421,20 @@ __global__ __launch_bounds__((D == 128 ? 1024 : Threads), (D == 128 ? 1 : 2)) vo
 // allocate; windows carry the full FP32 state, so the window size does not
 // change the result.
 int gdn_chunk_window(int tokens, int64_t per_chunk_bytes) {
-    int wanted = std::min(WorkspaceChunks, (tokens + Chunk - 1) / Chunk);
+    int wanted = std::min(WorkspaceChunks, 1 + (tokens - 1) / Chunk);
     // MFQ_GDN_PREFILL_CHUNK_WINDOW caps the window in chunks, for tuning and tests.
-    if (const char* option = std::getenv("MFQ_GDN_PREFILL_CHUNK_WINDOW"); option && std::atoi(option) > 0)
+    if (const char* option = std::getenv("MFQ_GDN_PREFILL_CHUNK_WINDOW"); option && std::atoi(option) >= 0)
         wanted = std::min(wanted, std::atoi(option));
+    if (wanted == 0) return 0;
     size_t free_bytes = 0;
     size_t total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
-        cudaGetLastError();
-        return wanted;
-    }
+    MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     const int64_t budget = int64_t(free_bytes) / 4;
-    return int(std::clamp<int64_t>(budget / per_chunk_bytes, 1, wanted));
+    return int(std::min<int64_t>(budget / per_chunk_bytes, wanted));
 }
 
 template<class Input, int D>
-void gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor& v,
+bool gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor& v,
                       const tb::Tensor& g, const tb::Tensor& beta, const tb::Tensor& lengths,
                       const tb::Tensor& initial, tb::Tensor& output, tb::Tensor& state,
                       bool transposed, bool tiled) {
@@ -445,6 +444,7 @@ void gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor
         int64_t(Chunk) * D * (sizeof(__half) + sizeof(float)) + int64_t(Chunk) * Chunk * sizeof(__half)
         + int64_t(Chunk + 2) * sizeof(float));
     const int chunks = gdn_chunk_window(tokens, per_chunk_bytes);
+    if (chunks == 0) return false;
     // Spelled-out types: MSVC's front end treats auto from a D-dependent shape
     // as dependent and rejects data_ptr<float>() without a template keyword.
     tb::Tensor w = tb::empty({batch, hv, chunks, Chunk, D}, g.options().dtype(tb::kFloat16));
@@ -458,6 +458,10 @@ void gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor
         + StateColumns * (D + 8) + StateColumns * (Chunk + 8)) * sizeof(__half)
         + ((D < Chunk ? Chunk : D) * (StateColumns + 2) + 3 * Chunk + StateThreads / 32) * sizeof(float);
     static_assert(prepare_bytes <= 99 * 1024 && state_bytes <= 99 * 1024);
+    int shared_limit = 0;
+    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                        mfq_current_cuda_device()));
+    if (shared_limit < std::max(prepare_bytes, state_bytes)) return false;
     const auto prepare = gdn_chunk_prepare_kernel<Input, D>;
     // Scaling protects FP32 state range at the Tensor Core boundary;
     // the persistent state remains in FP32 registers.
@@ -490,24 +494,23 @@ void gdn_chunk_launch(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor
             output.data_ptr<float>(), state.data_ptr<float>(), hq, hv, tokens, chunks, int(first), transposed, tiled);
         MFQ_CUDA_CHECK(cudaGetLastError());
     }
+    return true;
 }
 
 template<class Input>
-void gdn_chunk_width(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor& v,
+bool gdn_chunk_width(const tb::Tensor& q, const tb::Tensor& k, const tb::Tensor& v,
                      const tb::Tensor& g, const tb::Tensor& beta, const tb::Tensor& lengths,
                      const tb::Tensor& initial, tb::Tensor& output, tb::Tensor& state,
                      bool transposed, bool tiled) {
     switch (q.size(3)) {
     case 32:
-        gdn_chunk_launch<Input, 32>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
-        break;
+        return gdn_chunk_launch<Input, 32>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
     case 64:
-        gdn_chunk_launch<Input, 64>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
-        break;
+        return gdn_chunk_launch<Input, 64>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
     case 128:
-        gdn_chunk_launch<Input, 128>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
-        break;
+        return gdn_chunk_launch<Input, 128>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
     }
+    return false;
 }
 } // namespace
 
@@ -562,12 +565,12 @@ std::vector<tb::Tensor> gdn_prefill_chunk_cuda(
     MFQ_RUNTIME_CHECK(!inplace || initial.defined(), "GDN chunk: inplace state is required");
     auto output = tb::empty({batch, hv, tokens, width}, g.options());
     auto state = inplace ? initial : tb::empty({batch, hv, width, width}, g.options());
-    if (dtype == tb::kBFloat16)
-        gdn_chunk_width<__nv_bfloat16>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
-    else if (dtype == tb::kFloat16)
-        gdn_chunk_width<__half>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
-    else
-        gdn_chunk_width<float>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
+    const bool launched = dtype == tb::kBFloat16
+        ? gdn_chunk_width<__nv_bfloat16>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled)
+        : dtype == tb::kFloat16
+        ? gdn_chunk_width<__half>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled)
+        : gdn_chunk_width<float>(q, k, v, g, beta, lengths, initial, output, state, transposed, tiled);
+    if (!launched) return {};
     return {output, state};
 }
 
@@ -582,5 +585,25 @@ std::vector<tb::Tensor> gdn_prefill_varlen_cuda(
     MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, mfq_current_cuda_device()));
     MFQ_RUNTIME_CHECK(major >= 8, "GDN varlen chunk prefill requires SM80 or newer");
     auto metadata = tb::tensor(lengths).to(q.device());
-    return gdn_prefill_chunk_cuda(q, k, v, g, beta, state, inplace, transposed, tiled, metadata);
+    auto result = gdn_prefill_chunk_cuda(q, k, v, g, beta, state, inplace, transposed, tiled, metadata);
+    if (!result.empty()) return result;
+    // A resource-limited chunk call has not changed state. Preserve varlen,
+    // padding and in-place semantics through the existing recurrent operator.
+    auto output = tb::zeros(v.sizes(), g.options());
+    const auto width = q.size(3);
+    const bool has_state = state.has_value() && state->defined() && state->numel();
+    auto final_state = has_state ? (inplace ? state.value() : state->contiguous().clone())
+        : tb::zeros({q.size(0), v.size(1), width, width}, g.options());
+    const auto recurrent = tiled ? (transposed ? gdn_inplace_transposed_tiled_cuda : gdn_inplace_tiled_cuda)
+                                : (transposed ? gdn_inplace_transposed_cuda : gdn_inplace_cuda);
+    for (size_t row = 0; row < lengths.size(); ++row) {
+        if (!lengths[row]) continue;
+        const auto part = [&](const tb::Tensor& tensor) {
+            return tensor.narrow(0, row, 1).narrow(2, 0, lengths[row]).contiguous();
+        };
+        auto row_state = final_state.narrow(0, row, 1);
+        auto values = recurrent(part(q), part(k), part(v), part(g), part(beta), row_state);
+        output.narrow(0, row, 1).narrow(2, 0, lengths[row]).copy_(values[0]);
+    }
+    return {output, final_state};
 }

@@ -102,6 +102,20 @@ void gdn_prefill_chunk_case() {
             check(small_windows, true, false, true, false);
         }
     }
+    {
+        // No workspace budget must decline the chunk path before touching
+        // in-place state, then produce the recurrent result.
+        GdnPipelineScope window(0, "MFQ_GDN_PREFILL_CHUNK_WINDOW");
+        for (auto dtype : {tb::kFloat32, tb::kBFloat16}) {
+            GdnChunkInputs no_workspace(2, 2, 6, 129, 128, dtype);
+            auto before = no_workspace.state.clone();
+            auto result = gdn_prefill_chunk_cuda(no_workspace.q, no_workspace.k, no_workspace.v,
+                no_workspace.g, no_workspace.beta, no_workspace.state, true, true, false);
+            if (!result.empty()) throw std::runtime_error("GDN chunk exceeded zero workspace budget");
+            equal(no_workspace.state, before, "GDN declined chunk modified state", 0, 0);
+            check(no_workspace, true, false, true, true);
+        }
+    }
     std::cout << "GDN chunk output/state cases=" << cases << " FP32/FP16/BF16 PASS\n";
 }
 
@@ -109,6 +123,8 @@ void gdn_prefill_chunk_varlen_case() {
     GdnPipelineScope option(0, "MFQ_GDN_PREFILL_CHUNK");
     const std::vector<int64_t> lengths = {0, 1, 8, 63, 64, 65, 129, 257};
     int cases = 0;
+    for (int window_chunks : {-1, 0}) {
+    GdnPipelineScope window(window_chunks, "MFQ_GDN_PREFILL_CHUNK_WINDOW");
     for (auto dtype : {tb::kFloat32, tb::kFloat16, tb::kBFloat16})
     for (bool transposed : {false, true}) for (bool tiled : {false, true}) for (bool initial : {false, true}) {
         GdnChunkInputs input(lengths.size(), 2, 6, 257, 128, dtype);
@@ -138,6 +154,7 @@ void gdn_prefill_chunk_varlen_case() {
             }
             ++cases;
         }
+    }
     }
     // Requests which finish in the first workspace window must retain their
     // final state while another request advances beyond the window boundary.

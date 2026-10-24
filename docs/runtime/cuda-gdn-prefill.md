@@ -31,8 +31,8 @@ Widths 32, 64 and 128, grouped and tiled key-head mappings, ordinary and
 transposed state storage, optional initial state and in-place state updates
 share this implementation. State CTAs own disjoint value columns. The largest
 preparation CTA requests 56,640 bytes of dynamic shared memory; state
-propagation requests 79,744 bytes at width 128. Both fit the SM120 per-block
-limit of 99 KiB. Workspace is capped at 256 chunks (16,384 tokens) per request:
+propagation requests 79,744 bytes at width 128. Dispatch checks the device's
+actual opt-in shared-memory limit. Workspace is capped at 256 chunks (16,384 tokens) per request:
 a scaled FP16 `[B,Hv,chunks,64,D]` W buffer, an FP32 U buffer of the same
 shape, a scaled FP16 `[B,Hv,chunks,64,64]` attention buffer, and local gate
 prefixes with the two packed-matrix exponents. These are the same FP16 operands
@@ -40,6 +40,12 @@ that enter MMA; packing them once avoids repeated casts and global reads.
 Longer prompts reuse these buffers in consecutive windows, carrying the full
 FP32 state between windows. No per-token recurrent states or quadratic
 full-sequence matrices are stored.
+
+The window uses at most a quarter of free VRAM after allocating the required
+output and state. If even one chunk cannot fit, uniform and variable-length
+calls use the recurrent operator without modifying input state first.
+`MFQ_GDN_PREFILL_CHUNK_WINDOW` can lower the chunk count; zero disables the
+transient workspace and selects this fallback.
 
 `gdn_prefill_varlen_cuda` accepts padded `[B,H,T,D]` requests and host lengths
 in `[0,T]`. Requests have independent states; output padding is zero and a
