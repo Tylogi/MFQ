@@ -101,6 +101,8 @@ std::optional<bool> ple_file_map();
 std::optional<bool> prefill_expert_batch_audit();
 std::optional<bool> prefill_layer_major_trace();
 std::optional<bool> qsa_prefill_fused();
+bool qsa_pool_store_fused();
+bool qsa_pool_incremental();
 std::optional<bool> qsa_select_fused();
 std::optional<bool> qsa_sparse_gate_fused();
 std::optional<bool> shared_gate_fused();
@@ -112,6 +114,7 @@ int moe_prefill_group_size();
 
 // Decode and short-batch ablation controls; preserve unset defaults at call sites.
 std::optional<bool> mfe_token_groups();
+std::optional<bool> mfe_expert_plan();
 std::optional<bool> mfe_token_compact_plan();
 std::optional<bool> mfe_token_aligned_gu();
 std::optional<bool> mfe_shared_small_whole();
