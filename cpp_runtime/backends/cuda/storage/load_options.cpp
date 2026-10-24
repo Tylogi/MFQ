@@ -1,3 +1,4 @@
+#include "runtime/execution_options.h"
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
@@ -424,9 +425,9 @@ void setup_cuda_load(
             "--moe-gpu-cache-gb cannot be combined with "
             "tensor/expert parallelism");
     }
-    const auto* auto_profile=std::getenv("MFQ_MOE_AUTO_CACHE_PROFILE");
+    const auto auto_profile = mfq::cuda::runtime_options::moe_auto_cache_profile();
     const auto profile_path=mfq::resolve_moe_cache_profile_path(options.moe_cache_profile_path,
-        options.moe_gpu_cache_gb>0.0?options.model_path:std::string{},!auto_profile || auto_profile[0]!='0');
+        options.moe_gpu_cache_gb>0.0?options.model_path:std::string{},!auto_profile || *auto_profile);
     if (!profile_path.empty() &&
             options.moe_gpu_cache_gb <= 0.0) {
         throw std::runtime_error(

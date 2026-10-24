@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -20,6 +21,51 @@ void set_option(const char* name, const char* value) {
 int main() {
     using namespace mfq::cuda::runtime_options;
     // Presence, first-character and exact-value controls have distinct meanings.
+    set_option("MFQ_QSA_INDEPENDENT_BATCH", nullptr);
+    if (!qsa_independent_batch().value_or(true)) return 1;
+    set_option("MFQ_QSA_INDEPENDENT_BATCH", "0");
+    if (qsa_independent_batch().value_or(true)) return 1;
+    set_option("MFQ_QSA_INDEPENDENT_BATCH", "2");
+    if (!qsa_independent_batch().value_or(false)) return 1;
+    set_option("MFQ_QSA_INDEPENDENT_BATCH", nullptr);
+    set_option("MFQ_MOE_WINDOW_ROUTE_FENCE", "0");
+    if (!moe_window_route_fence().has_value() || *moe_window_route_fence()) return 1;
+    set_option("MFQ_MOE_WINDOW_ROUTE_FENCE", nullptr);
+    if (moe_window_route_fence().has_value()) return 1;
+    set_option("MFQ_PROFILE_SSD_EXPERTS", "10");
+    if (!profile_ssd_experts().value_or(false)) return 1;
+    set_option("MFQ_PROFILE_SSD_EXPERTS", "2");
+    if (profile_ssd_experts().value_or(true)) return 1;
+    set_option("MFQ_PROFILE_SSD_EXPERTS", nullptr);
+    set_option("MFQ_MOE_SSD_EXPERTS", "2");
+    if (moe_ssd_experts().value_or(true) || !moe_ssd_experts_not_disabled().value_or(false)) return 1;
+    set_option("MFQ_MOE_SSD_EXPERTS", "0");
+    if (moe_ssd_experts().value_or(true) || moe_ssd_experts_not_disabled().value_or(true)) return 1;
+    set_option("MFQ_MOE_SSD_EXPERTS", nullptr);
+    set_option("MFQ_PREFILL_BORROW", "force");
+    if (!prefill_borrow_force() || !prefill_borrow().value_or(false)) return 1;
+    set_option("MFQ_PREFILL_BORROW", "forcefully");
+    if (prefill_borrow_force()) return 1;
+    set_option("MFQ_PREFILL_BORROW", nullptr);
+    set_option("MFQ_TRACE_RESIDENCY_MEMORY", "0");
+    if (!trace_residency_memory_set()) return 1;
+    set_option("MFQ_TRACE_RESIDENCY_MEMORY", nullptr);
+    if (trace_residency_memory_set()) return 1;
+    set_option("MFQ_MOE_NATIVE_DMA_BATCH", "2suffix");
+    if (moe_native_dma_batch().value_or(0) != 2) return 1;
+    set_option("MFQ_MOE_NATIVE_DMA_BATCH", nullptr);
+    set_option("MFQ_PROFILE_DSV41_LAYER", "-1");
+    if (profile_dsv41_layer().value_or(0) != -1) return 1;
+    set_option("MFQ_PROFILE_DSV41_LAYER", nullptr);
+    set_option("MFQ_MOE_DIRECT_EXPERT_CACHE_BYTES", "8589934592");
+    if (moe_direct_expert_cache_bytes().value_or(0) != 8589934592LL) return 1;
+    set_option("MFQ_MOE_DIRECT_EXPERT_CACHE_BYTES", "invalid");
+    try {
+        (void)moe_direct_expert_cache_bytes();
+        return 1;
+    } catch (const std::invalid_argument&) {
+    }
+    set_option("MFQ_MOE_DIRECT_EXPERT_CACHE_BYTES", nullptr);
     set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", nullptr);
     if (nint_route_row_workspace()) return 1;
     set_option("MFQ_NINT_ROUTE_ROW_WORKSPACE", "0");

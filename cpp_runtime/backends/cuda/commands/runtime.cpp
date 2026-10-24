@@ -16,6 +16,7 @@
 #include <vector>
 
 namespace mfq::cuda::commands {
+int run_reference(int argc, char** argv);
 namespace {
 
 void print_help() {
@@ -231,6 +232,8 @@ int execute_runtime(RuntimeCommandOptions options) {
 } // namespace
 
 int run_runtime(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "--wt2-reference")
+        return run_reference(argc, argv);
     try {
         ArgCursor args(argc, argv);
         auto options = parse_runtime(args);

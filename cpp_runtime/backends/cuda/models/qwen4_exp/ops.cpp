@@ -38,8 +38,8 @@
 namespace mfq::cuda {
 static bool streamed_decode_graphs(const CudaExecutionContext& execution) {
     if(!execution.qsa_kv_store)return true;
-    const auto* option=std::getenv("MFQ_KV_STREAM_GRAPHS");
-    return execution.kv_memory && execution.kv_memory->offload() && (!option || option[0]!='0');
+    const auto option = mfq::cuda::runtime_options::kv_stream_graphs();
+    return execution.kv_memory && execution.kv_memory->offload() && (!option || *option);
 }
 static mfq_tensor_backend::Tensor join_request_outputs(
         const std::vector<mfq_tensor_backend::Tensor>& outputs,int64_t axis) {
@@ -360,8 +360,8 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     shared_weights.scalar_gate=shared_gate_weight;
     shared_weights.gate=[shared_gate,shared_gate_weight](CudaExecutionContext& execution,const Tensor& input) {
         const auto option=mfq::cuda::runtime_options::shared_gate_fused();
-        const auto* nint_option=std::getenv("MFQ_SHARED_GATE_NINT");
-        if((!option || *option) && (!nint_option || nint_option[0]!='0') && shared_gate_weight &&
+        const auto nint_option = mfq::cuda::runtime_options::shared_gate_nint();
+        if((!option || *option) && (!nint_option || *nint_option) && shared_gate_weight &&
                 shared_gate_weight->is_nint() && !shared_gate_weight->tensor_parallel())
             if(auto output=try_nint_shared_gate_sigmoid_cuda(input,shared_gate_weight->nint))return *output;
         if((!option || *option) && shared_gate_weight && shared_gate_weight->is_dense() &&
@@ -905,8 +905,8 @@ struct Qwen4MtpGraph {
             predictor.positions[0]=append_decode_positions(predictor.positions[0],cell.positions,
                 position_storage,predictor.config.maximum,"MFQ_MTP_POSITION_BUFFER");
             predictor.lengths[0]=required;predictor.batch=1;
-            const auto* profile_option=std::getenv("MFQ_PROFILE_MTP");
-            if(profile_option && profile_option[0]=='1' && ++cell.profile_replays<=(history_only?2:16)) {
+            const auto profile_option = mfq::cuda::runtime_options::profile_mtp();
+            if(profile_option && *profile_option && ++cell.profile_replays<=(history_only?2:16)) {
                 const auto ms=[](auto begin,auto end){return std::chrono::duration<double,std::milli>(end-begin).count();};
                 std::fprintf(stderr,"runtime_mtp_predictor_profile rows=%lld history=%d replay=%d release_ms=%.4f setup_ms=%.4f exchange_ms=%.4f prepare_ms=%.4f run_ms=%.4f tail_ms=%.4f transfer_mb=%.4f\n",
                     static_cast<long long>(tokens),int(history_only),cell.profile_replays,
@@ -1402,7 +1402,7 @@ struct Qwen4DecodeGraph {
             while(kv_capacity<planned)
                 kv_capacity=std::min(model.max_position_embeddings(),kv_capacity>model.max_position_embeddings()/2
                     ? model.max_position_embeddings() : kv_capacity*2);
-            if(const auto* trace=std::getenv("MFQ_RUNTIME_TRACE_CUDA_GRAPH");trace && trace[0]=='1')
+            if(const auto trace = mfq::cuda::runtime_options::runtime_trace_cuda_graph();trace && *trace)
                 std::cerr<<"runtime_qwen4_graph_capacity position="<<model.cache_pos
                     <<" required="<<required<<" planned="<<planned<<" capacity="<<kv_capacity<<'\n';
         }
@@ -1430,8 +1430,8 @@ struct Qwen4DecodeGraph {
             // rather than leaving that CPU interval outside the I/O overlap.
             // Task reset repeats issue() idempotently; it never advances the
             // context, which is still committed by upload_graph().
-            const auto* early_ple=std::getenv("MFQ_PLE_EARLY_ISSUE");
-            if(!early_ple || early_ple[0]!='0')
+            const auto early_ple = mfq::cuda::runtime_options::ple_early_issue();
+            if(!early_ple || *early_ple)
                 for(const auto& stage:cell.ple)stage->ple->prefetch_tokens(cell.host_ids);
             finish_moe_expert_exchanges(model.execution->moe_expert_cache);
             // Prefix restoration and eager prefill update the same KV/index
@@ -1675,9 +1675,9 @@ void qwen4_release_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp) {
 
 std::size_t qwen4_mtp_graph_reserve(const Qwen4CausalLm& model,const MtpModule* mtp,int maximum_draft_depth) {
     const auto* predictor=dynamic_cast<const qwen4_exp::Qwen4ExpMtp*>(mtp);
-    const auto* reuse=std::getenv("MFQ_QWEN4_REUSE_GRAPHS");
-    const auto* warmup=std::getenv("MFQ_QWEN4_WARMUP_GRAPHS");
-    if(!predictor || (reuse && reuse[0]=='0') || (warmup && warmup[0]=='0') ||
+    const auto reuse = mfq::cuda::runtime_options::qwen4_reuse_graphs();
+    const auto warmup = mfq::cuda::runtime_options::qwen4_warmup_graphs();
+    if(!predictor || (reuse && !*reuse) || (warmup && !*warmup) ||
             !model.execution->config.moe_pipeline || !streamed_decode_graphs(*model.execution))return 0;
     // The common decode allowance covers verification through four rows.
     // Wider windows retain extra shared recurrent checkpoints and per-shape
@@ -1692,12 +1692,12 @@ std::size_t qwen4_mtp_graph_reserve(const Qwen4CausalLm& model,const MtpModule* 
 }
 
 void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_draft_depth) {
-    const auto* reuse=std::getenv("MFQ_QWEN4_REUSE_GRAPHS");
-    model.reuse_decode_graphs=!reuse || reuse[0]!='0';
+    const auto reuse = mfq::cuda::runtime_options::qwen4_reuse_graphs();
+    model.reuse_decode_graphs=!reuse || *reuse;
     auto* predictor=dynamic_cast<qwen4_exp::Qwen4ExpMtp*>(mtp);
     if(predictor)predictor->reuse_decode_graphs=model.reuse_decode_graphs;
-    const auto* warmup=std::getenv("MFQ_QWEN4_WARMUP_GRAPHS");
-    if(!model.reuse_decode_graphs || (warmup && warmup[0]=='0') ||
+    const auto warmup = mfq::cuda::runtime_options::qwen4_warmup_graphs();
+    if(!model.reuse_decode_graphs || (warmup && !*warmup) ||
         model.max_position_embeddings()<32 || !streamed_decode_graphs(*model.execution) ||
         !model.execution->config.moe_pipeline || !model.execution->moe_expert_cache)return;
     for(const auto& block:model.blocks) {
@@ -1726,7 +1726,7 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     for(std::size_t i=0;i<warm_ids.size();++i)warm_ids[i]=int64_t((i*7919+17)%model.vocab_size());
     auto ids=tb::tensor(warm_ids,options.device(tb::kCPU)).to(tb::kCUDA).reshape({1,16});
     model.reset(1);
-    if(std::getenv("MFQ_TRACE_RESIDENCY_MEMORY"))std::cerr<<"warmup_memory phase=bootstrap\n";
+    if(mfq::cuda::runtime_options::trace_residency_memory_set())std::cerr<<"warmup_memory phase=bootstrap\n";
     // Bootstrap with single-token rows. A sixteen-row eager forward otherwise
     // materializes a whole expert layer just to initialize graph state, before
     // the prompt's workspace loan exists, and defeats tight expert residency.
@@ -1745,7 +1745,7 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     // staging and captured scratch before preparing predictor windows.
     release_moe_decode_buffers(model.execution->moe_expert_cache);
     default_context(model.execution->layer_placement.primary_device())->reclaim_idle_memory();
-    if(std::getenv("MFQ_TRACE_RESIDENCY_MEMORY"))std::cerr<<"warmup_memory phase=predictor\n";
+    if(mfq::cuda::runtime_options::trace_residency_memory_set())std::cerr<<"warmup_memory phase=predictor\n";
     // Capture the normal greedy path and the common MTP verification widths.
     // Synthetic state is cleared afterwards; no prompt or sampling history is saved.
     if(predictor) {
@@ -1767,10 +1767,10 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
             predictor->trim_cache_to(16);
             predictor->history_step(target,raw.narrow(1,0,rows),ids.narrow(1,0,rows));
         }
-        const auto* chain_option=std::getenv("MFQ_MTP_HISTORY_CHAIN");
-        const bool history_chain=!chain_option || chain_option[0]!='0';
-        const auto* chain_check=std::getenv("MFQ_VERIFY_MTP_HISTORY_CHAIN");
-        const bool verify_chain=chain_check && chain_check[0]=='1' && predictor->layers[0]->qsa->supports_session();
+        const auto chain_option = mfq::cuda::runtime_options::mtp_history_chain();
+        const bool history_chain=!chain_option || *chain_option;
+        const auto chain_check = mfq::cuda::runtime_options::verify_mtp_history_chain();
+        const bool verify_chain=chain_check && *chain_check && predictor->layers[0]->qsa->supports_session();
         if(history_chain)for(int rows=2;rows<=std::min(4,verification_rows-1);++rows) {
             Qwen4BlockSessionState expected;
             if(verify_chain) {
@@ -2441,11 +2441,11 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto tokens=ids.size(1);
     const auto cache_start=model.cache_pos;
     auto& profiler=model.execution->profiler;
-    const auto* profile_once=std::getenv("MFQ_PROFILE_PREFILL_ONCE");
+    const auto profile_once = mfq::cuda::runtime_options::profile_prefill_once();
     static std::atomic<uint64_t> profile_requests{0};
-    const bool profile_enabled=profile_once && profile_once[0]=='1';
-    const auto* profile_skip=std::getenv("MFQ_PROFILE_PREFILL_SKIP");
-    const auto skipped=profile_skip?std::max<long long>(0,std::atoll(profile_skip)):0;
+    const bool profile_enabled=profile_once && *profile_once;
+    const auto profile_skip = mfq::cuda::runtime_options::profile_prefill_skip();
+    const auto skipped=profile_skip?std::max<long long>(0,*profile_skip):0;
     const auto profile_request=profile_enabled?profile_requests.fetch_add(1):0;
     const bool collect=profile_enabled && profile_request==uint64_t(skipped);
     if(profile_enabled)std::cerr<<"prefill_profile_request index="<<profile_request

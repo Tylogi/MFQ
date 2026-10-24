@@ -63,8 +63,8 @@ std::size_t expert_fields_bytes(const MixedMoePool& pool) {
 MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStore> store)
     :store_(std::move(store)),metadata_(std::make_shared<MixedMoeRuntime>()) {
     if (!store_) throw std::invalid_argument("missing quantized expert range source");
-    const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
-    profile_ssd_=profile && profile[0]=='1';
+    const auto profile = mfq::cuda::runtime_options::profile_ssd_experts();
+    profile_ssd_=profile && *profile;
     const auto dense=mfq::cuda::runtime_options::moe_nvq_dense();
     const auto preload=mfq::cuda::runtime_options::moe_preload_all();
     const auto sealed=mfq::cuda::runtime_options::moe_assert_resident();

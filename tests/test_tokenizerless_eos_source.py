@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -11,8 +12,15 @@ def test_raw_cli_loads_eos_without_changing_tokenized_or_fixed_input_paths(backe
     assert "if (!ignore_eos && tokenizer_model.empty() && decode_inputs.empty())" in source
     assert "mfq::engine::model_stop_token_ids(" in source
     assert "mfq::cuda::load_model_config_json(*model.source, config_path), model.vocab_size()" in source
-    assert "t0, t1,decode_inputs,stop_ids)" in source
-    assert 'option == "--ignore-eos"' in source
+    assert re.search(
+        r"execution,\s*model,\s*ids,\s*gen,\s*profile,\s*t0,\s*t1,\s*decode_inputs,\s*stop_ids"
+        r"(?:,\s*!router_lookahead_audit.empty\(\))?\s*\)",
+        source,
+    )
+    assert (
+        'option == "--ignore-eos"' in source
+        or re.search(r'\{"--ignore-eos",\s*&DiagnosticsCommandOptions::ignore_eos\}', source)
+    )
     assert "warning: no model EOS token IDs" in source
     engine = (ROOT / "backends" / backend / "engine/cuda_engine.cpp").read_text()
     assert "load_model_config_json(*state.language.source, options.config_path)" in engine

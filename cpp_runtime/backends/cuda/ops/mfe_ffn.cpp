@@ -312,8 +312,8 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
        (batch_.nvq_format_mask || has_mxfp4 || batch_.tokens>8 || token_group_capacity_hint>=4)) {
         // Three/four-row compact batches reuse decoded weights across the
         // complete small window. Other shapes retain their previous capacity.
-        const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
-        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && grouped_math &&
+        const auto wide_compact = mfq::cuda::runtime_options::mfe_token_wide_compact();
+        const bool wide_default=(!wide_compact || *wide_compact) && grouped_math &&
             (batch_.tokens==3 || batch_.tokens==4);
         batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
@@ -325,9 +325,9 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             else if(batch_.tokens>=3 && batch_.tokens<=6)
                 batch_.token_group_capacity=batch_.tokens<=4?4:8;
         }
-        const auto* split_shared=std::getenv("MFQ_MFE_SPLIT_SHARED_GROUPS");
+        const auto split_shared = mfq::cuda::runtime_options::mfe_split_shared_groups();
         split_shared_groups_=shared[0] && batch_.token_group_capacity==4 && batch_.tokens<=8 &&
-            split_shared && split_shared[0]!='0';
+            split_shared && *split_shared;
         const int plan_capacity=split_shared_groups_ || batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
             2:batch_.token_group_capacity;
         batch_.token_groups=batch_.tokens*batch_.routes+
@@ -371,11 +371,11 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
         resident_pairs_=tb::empty({batch_.tokens,batch_.routes+(shared[0]?1:0),batch_.output_width},input.options());
         batch_.resident_pairs=reinterpret_cast<__half*>(resident_pairs_.data_ptr());
-        const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
-        const auto* enabled=std::getenv("MFQ_MFE_TOKEN_GROUPS");
-        const auto* group_dot=std::getenv("MFQ_MFE_GROUP_DOT");
-        if(profile && profile[0]=='1' && grouped_math && (!enabled || enabled[0]!='0') &&
-                (!group_dot || group_dot[0]!='0') && std::any_of(views.begin(),views.end(),[](const View& d) {
+        const auto profile = mfq::cuda::runtime_options::profile_ssd_experts();
+        const auto enabled = mfq::cuda::runtime_options::mfe_token_groups();
+        const auto group_dot = mfq::cuda::runtime_options::mfe_group_dot();
+        if(profile && *profile && grouped_math && (!enabled || *enabled) &&
+                (!group_dot || *group_dot) && std::any_of(views.begin(),views.end(),[](const View& d) {
                     return d.family==2 && (compact_formats&(1u<<d.format)) &&
                         !d.e8_dense_groups && !d.d4_dense_groups;
                 })) {
@@ -583,9 +583,10 @@ bool MfeFfnRuntime::try_fuse_prepare_shared_gate(const NintWeight& w,const tb::T
         w.neuron_len!=batch_.input_width || w.neuron_len>w.ng*48 || !output.is_cuda() ||
         output.scalar_type()!=tb::kFloat16 || !output.is_contiguous() || output.numel()!=batch_.tokens ||
         output.device()!=input_.device())return false;
-    if(const auto* option=std::getenv("MFQ_SHARED_GATE_PREPARE");option && option[0]=='0')return false;
-    if(const auto* option=std::getenv("MFQ_NINT_Q8_DECODE");option && std::atoi(option)!=2)return false;
-    if(const auto* option=std::getenv(batch_.tokens==1?"MFQ_NINT_Q8_ORDERED":"MFQ_NINT_Q8_SMALL_WARPS");option && option[0]=='0')return false;
+    if(const auto option = mfq::cuda::runtime_options::shared_gate_prepare();option && !*option)return false;
+    if(const auto option = mfq::cuda::runtime_options::nint_q8_decode();option && *option!=2)return false;
+    if (batch_.tokens == 1 ? !mfq::cuda::runtime_options::nint_q8_ordered().value_or(true) :
+        !mfq::cuda::runtime_options::nint_q8_small_warps().value_or(true)) return false;
     for(const auto* field:{&w.q_packed,&w.row_q_bit_offsets,&w.sub_scale,&w.sub_min,&w.neuron_scale,&w.neuron_min})
         if(!field->is_cuda() || !field->is_contiguous() || field->device()!=input_.device())return false;
     const auto [qx,xs]=reserve_input_quantization(int(w.ng),48);
@@ -616,8 +617,8 @@ void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
     if(shared_plan)prepared.token_group_capacity=2;
     if(const auto setting=mfq::cuda::runtime_options::mfe_token_groups())
         if(!*setting)prepared.token_group_counts=nullptr;
-    const auto* warp_prepare=std::getenv("MFQ_MFE_PREPARE_WARP");
-    const bool use_warp=!warp_prepare || warp_prepare[0]!='0';
+    const auto warp_prepare = mfq::cuda::runtime_options::mfe_prepare_warp();
+    const bool use_warp=!warp_prepare || *warp_prepare;
     // Small windows retain linear grouping to avoid radix overhead on repeated routes.
     // The explicit option keeps both paths available for same-process probes.
     const bool planned=mfq::cuda::runtime_options::mfe_expert_plan().value_or(batch_.tokens*batch_.routes>=128);
@@ -675,10 +676,10 @@ void MfeFfnRuntime::resident(){
 void MfeFfnRuntime::start_shared(bool early){
     if(shared_in_flight_)return;
     if(early) {
-        const auto* setting=std::getenv("MFQ_MFE_SHARED_EARLY");
-        if(batch_.tokens!=1 || !batch_.plan_ready || (setting && setting[0]=='0'))return;
+        const auto setting = mfq::cuda::runtime_options::mfe_shared_early();
+        if(batch_.tokens!=1 || !batch_.plan_ready || (setting && !*setting))return;
     }
-    const auto* option=std::getenv("MFQ_MOE_SHARED_STREAM");
+    const auto option = mfq::cuda::runtime_options::moe_shared_stream();
     const auto grouped=mfq::cuda::runtime_options::mfe_group_dot();
     const auto token_groups=mfq::cuda::runtime_options::mfe_token_groups();
     const int shared_capacity=split_shared_groups_?2:batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
@@ -686,7 +687,7 @@ void MfeFfnRuntime::start_shared(bool early){
     const bool grouped_shared=batch_.token_group_counts && shared_capacity>0 && shared_capacity<=8 &&
         (!token_groups || *token_groups);
     if((batch_.tokens==1 || grouped_shared) && batch_.shared && batch_.resident_pairs && batch_.default_math && (!grouped || *grouped) &&
-            (!option || option[0]!='0')) {
+            (!option || *option)) {
         if(early && !early_shared_descriptors_.defined()) {
             cudaStreamCaptureStatus capture;
             MFQ_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
@@ -743,9 +744,9 @@ void MfeFfnRuntime::start_shared(bool early){
                 early_shared_quantizer_count_,early_shared_groups_,shared_stream_->get());
         }
         if(split_shared_groups_)shared_batch.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+2;
-        const auto* short_option=std::getenv("MFQ_MFE_SHARED_SHORT");
+        const auto short_option = mfq::cuda::runtime_options::mfe_shared_short();
         const bool scalar_gate=early && early_shared_gate_.activation;
-        const bool short_shared=!scalar_gate && shared_short_encoding_ && (!short_option || short_option[0]!='0') &&
+        const bool short_shared=!scalar_gate && shared_short_encoding_ && (!short_option || *short_option) &&
             mfq::cuda::mfe_ffn_shared_short_resident(shared_batch,shared_stream_->get());
         if(scalar_gate)mfq::cuda::mfe_ffn_shared_resident_with_gate(shared_batch,early_shared_gate_,shared_stream_->get());
         else if(!short_shared)mfq::cuda::mfe_ffn_shared_resident(shared_batch,shared_stream_->get());
@@ -774,11 +775,11 @@ void MfeFfnRuntime::join_shared(){
 }
 void MfeFfnRuntime::wait_transfer(const void* mapped_table,void* snapshot,uint64_t capacity,
         const void* mapped_descriptors,uint64_t descriptor_capacity_words){
-    const auto* route_list=std::getenv("MFQ_MFE_TRANSFER_ROUTE_LIST");
-    const auto* fused_hidden=std::getenv("MFQ_MFE_TRANSFER_HIDDEN_FUSED");
+    const auto route_list = mfq::cuda::runtime_options::mfe_transfer_route_list();
+    const auto fused_hidden = mfq::cuda::runtime_options::mfe_transfer_hidden_fused();
     cached_transfer_routes_ready_=cached_transfer_routes_.defined() && snapshot && mapped_table &&
-        transfer_route_plan_ && mapped_descriptors && (!route_list || route_list[0]!='0') &&
-        (!fused_hidden || fused_hidden[0]!='0');
+        transfer_route_plan_ && mapped_descriptors && (!route_list || *route_list) &&
+        (!fused_hidden || *fused_hidden);
     if(snapshot && (!transfer_route_plan_ || !mapped_table))
         throw std::invalid_argument("MFE transfer snapshot requires its mapped route packet and table");
     if(snapshot && transfer_route_plan_)mfq::cuda::mfe_ffn_wait_transfer_packet_snapshot(batch_,transfer_route_plan_,

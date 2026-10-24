@@ -244,6 +244,79 @@ int main() {
             require(rejected, "invalid active predictor configuration was accepted");
         }
 
+        for (const auto* wrapper : {"text_config", "language_config"}) {
+            auto definition = nlohmann::json{{wrapper, {
+                {"max_position_embeddings", 128},
+                {"rope_scaling", {{"type", "yarn"}, {"factor", 4.0},
+                    {"original_max_position_embeddings", 64}, {"beta_fast", 16.0}, {"beta_slow", 2.0}}}
+            }}}.dump();
+            const auto scaling = mfq::models::extend_qwen_context(definition, "qwen4_exp", 256);
+            require(scaling.original_context == 64 && scaling.factor == 4.0 &&
+                    scaling.beta_fast == 16.0 && scaling.beta_slow == 2.0,
+                "shared YaRN parser lost scaling metadata");
+            require(nlohmann::json::parse(definition).at(wrapper).at("max_position_embeddings") == 256,
+                "shared YaRN parser did not extend the text context");
+            rejected = false;
+            try {
+                (void)mfq::models::extend_qwen_context(definition, "qwen4_exp", 257);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            require(rejected, "shared YaRN parser accepted a context beyond its configured factor");
+        }
+        std::string native_definition = R"({"max_position_embeddings":64})";
+        require(!mfq::models::extend_qwen_context(native_definition, "qwen3_5", 32).enabled(),
+            "short context unexpectedly enabled YaRN");
+        require(nlohmann::json::parse(native_definition).at("max_position_embeddings") == 64,
+            "short context changed the model's native capacity");
+        std::string nested_rope = R"({"max_position_embeddings":64,
+            "rope_parameters":{"full_attention":{"rope_type":"default","factor":2}}})";
+        require(mfq::models::extend_qwen_context(nested_rope, "qwen3_5", 128).factor == 2.0,
+            "shared YaRN parser lost nested full-attention scaling");
+        for (const auto* invalid : {
+                R"({"max_position_embeddings":0})",
+                R"({"max_position_embeddings":64,"rope_parameters":{"rope_type":"linear"}})",
+                R"({"max_position_embeddings":64,"rope_parameters":{"factor":0.5}})"}) {
+            std::string definition = invalid;
+            rejected = false;
+            try {
+                (void)mfq::models::extend_qwen_context(definition, "qwen3_5", 128);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            require(rejected, "shared YaRN parser accepted unsupported positional metadata");
+        }
+        auto vision = nlohmann::json::parse(R"({
+            "image_token_id":5,"video_token_id":6,"vision_config":{
+                "hidden_size":8,"intermediate_size":16,"depth":1,"num_heads":2,
+                "patch_size":2,"temporal_patch_size":1,"out_hidden_size":32,
+                "num_position_embeddings":16,"rope_parameters":{"rope_theta":20000}}})");
+        auto text = mfq::models::qwen4_exp::Config{};
+        text.hidden = 32;
+        text.vocab = 128;
+        text.sections = {1, 1, 2};
+        const auto grid = mfq::models::qwen4_exp::VisionConfig::from_json(vision.dump(), text);
+        require(grid.grid.in_channels == 3 && grid.grid.spatial_merge_size == 2 &&
+                grid.grid.rope_theta == 20000 && grid.grid.layer_norm_eps == 1e-6 &&
+                grid.image_token_id == 5 && grid.video_token_id == 6,
+            "shared Qwen4 vision parser lost defaults or placeholder IDs");
+        for (const auto* invalid : {"hidden_act", "deepstack_visual_indexes", "out_hidden_size",
+                                   "num_position_embeddings", "video_token_id"}) {
+            auto invalid_vision = vision;
+            if (std::string(invalid) == "hidden_act") invalid_vision["vision_config"][invalid] = "gelu";
+            else if (std::string(invalid) == "deepstack_visual_indexes")
+                invalid_vision["vision_config"][invalid] = std::vector<int>{0};
+            else if (std::string(invalid) == "video_token_id") invalid_vision[invalid] = 5;
+            else invalid_vision["vision_config"][invalid] = 17;
+            rejected = false;
+            try {
+                (void)mfq::models::qwen4_exp::VisionConfig::from_json(invalid_vision.dump(), text);
+            } catch (const std::exception&) {
+                rejected = true;
+            }
+            require(rejected, "shared Qwen4 vision parser accepted unsupported component metadata");
+        }
+
         std::cout << "model config tests passed\n";
         return 0;
     } catch (const std::exception& error) {

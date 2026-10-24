@@ -456,6 +456,12 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "${MFQ_CUDA_ROOT}/commands/eval.cpp" in cmake
     assert ("mfq-" + "decode") not in cmake
     assert "execute_runtime" in CUDA_RUNTIME_COMMAND
+    dispatch = CUDA_RUNTIME_COMMAND.split("int run_runtime(int argc, char** argv)", 1)[1]
+    assert re.search(
+        r'if\s*\(argc\s*>\s*1\s*&&\s*std::string_view\(argv\[1\]\)\s*==\s*"--wt2-reference"\)'
+        r'\s*return run_reference\(argc, argv\);',
+        dispatch,
+    )
     assert "RuntimeExecution" not in CUDA_RUNTIME_SOURCE
     assert "run_runtime(RuntimeOptions" not in CUDA_RUNTIME_SOURCE
     assert '"--server"' not in CUDA_RUNTIME_SOURCE
@@ -664,7 +670,10 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "ContinuousBatch<CudaBatchOperations<Model>>" in CUDA_ENGINE_SOURCE
     assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
     assert "current.generation.next()" in SHARED_EXECUTOR
-    assert "EngineInstance<CudaBackend>" in CUDA_ENGINE_SOURCE
+    assert re.search(
+        r"std::make_unique<EngineInstance<(?:\w+::)*CudaBackend>>\(std::move\(options\)\)",
+        CUDA_ENGINE_SOURCE,
+    )
     assert "requests_.step(eligible, ops)" in SHARED_EXECUTOR
     assert "qwen35::QwenBatchExecutor" not in CUDA_ENGINE_SOURCE
     assert "mfq::engine::Engine& engine_" in scheduler
@@ -739,7 +748,9 @@ def test_native_mx_activation_boundaries_are_operator_owned() -> None:
 
 def test_engram_streaming_reuses_the_generic_quantized_row_store() -> None:
     assert "MlxQuantizedRowStore" in DSV41_ENGRAM
-    assert "WorkerPool" in QUANTIZED_ROW_STORE
+    assert "mfq::HostParallelPool workers" in QUANTIZED_ROW_STORE
+    assert "workers.run(0, groups.size(), 1, worker_count," in QUANTIZED_ROW_STORE
+    assert "model.read_range_into(record," in QUANTIZED_ROW_STORE
     assert "mfq::NintRows" in QUANTIZED_ROW_STORE
     assert "MlxQuantizedRowBatch::decode" in QUANTIZED_ROW_STORE
     assert "table->prepare_rows(rows)" in DSV41_ENGRAM
@@ -1200,6 +1211,8 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert "resolved_config_json" not in CUDA_BACKEND_SOURCE
     assert "nlohmann::json" not in CUDA_REGISTRY + CUDA_CAUSAL_LM_LOADER
     assert "Config::from_json" not in CUDA_REGISTRY
+    assert "mfq::models::extend_qwen_context(" in CUDA_CAUSAL_LM_LOADER
+    assert "mfq::models::qwen4_exp::VisionConfig::from_json(" in CUDA_CAUSAL_LM_LOADER
 
     qwen_config = (CORE.parent / "models" / "qwen35" / "config.h").read_text(
         encoding="utf-8"
@@ -1220,11 +1233,14 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     ):
         assert field in qwen_config
 
-    assert "Config::from_json" not in CUDA_CAUSAL_LM_LOADER
-    assert "if constexpr" not in CUDA_CAUSAL_LM_LOADER
-    assert "if constexpr" not in (
-        CUDA_RUNTIME.parent / "storage/model_loader.cpp"
-    ).read_text(encoding="utf-8")
+    config_parsers = re.findall(r"\b(?:\w+::)*\w*Config::from_json\s*\(", CUDA_CAUSAL_LM_LOADER)
+    assert config_parsers
+    assert all(parser.startswith("mfq::models::") for parser in config_parsers)
+    definition = CUDA_CAUSAL_LM_LOADER.split("Model mfq::cuda::load_causal_lm(", 1)[1].split(
+        "model.adapter_validate_load_options();", 1
+    )[0]
+    assert "model.load_definition(definition, model.graph, source," in definition
+    assert "if constexpr" not in definition
     model_names = (
         "minicpmo45",
         "glm5_next",

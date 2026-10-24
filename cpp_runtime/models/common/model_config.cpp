@@ -2,6 +2,7 @@
 
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -137,6 +138,32 @@ ModelConfig ModelConfig::from_json(std::string_view payload) {
         throw std::runtime_error("invalid model RMSNorm configuration");
     }
     return config;
+}
+
+YarnScaling extend_qwen_context(
+        std::string& definition, std::string_view backbone, std::int64_t context_size) {
+    if (backbone != "qwen3_5" && backbone != "qwen4_exp")
+        throw std::invalid_argument("YaRN extension requires a Qwen model");
+    auto config = json::parse(definition);
+    auto& text = config.contains("text_config") ? config["text_config"] :
+        config.contains("language_config") ? config["language_config"] : config;
+    auto rope = text.value("rope_parameters", text.value("rope_scaling", json::object()));
+    if (rope.contains("full_attention")) rope = rope["full_attention"];
+    auto native = text.value("max_position_embeddings", std::int64_t{0});
+    const auto kind = rope.value("rope_type", rope.value("type", std::string("default")));
+    if (kind == "yarn") native = rope.value("original_max_position_embeddings", native);
+    const auto maximum = rope.value("factor", 4.0);
+    if ((kind != "default" && kind != "yarn") || native <= 0 || !std::isfinite(maximum) || maximum < 1 ||
+            context_size > std::floor(native * maximum))
+        throw std::invalid_argument("context exceeds Qwen YaRN limit");
+    YarnScaling scaling;
+    scaling.original_context = native;
+    scaling.factor = std::max(1.0, double(context_size) / native);
+    scaling.beta_fast = rope.value("beta_fast", 32.0);
+    scaling.beta_slow = rope.value("beta_slow", 1.0);
+    if (scaling.enabled()) text["max_position_embeddings"] = context_size;
+    definition = config.dump();
+    return scaling;
 }
 
 } // namespace mfq::models

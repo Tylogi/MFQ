@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/execution_options.h"
 #include "storage/moe_expert_cache.h"
 
 #include "cuda_execution.h"
@@ -338,8 +339,8 @@ inline int64_t moe_packed_slot_bytes(const std::vector<int64_t>& fields) {
 }
 
 inline bool moe_packed_transfer_stages_enabled() {
-    const auto* value=std::getenv("MFQ_MOE_PACKED_TRANSFER_STAGE");
-    return !value || value[0]!='0';
+    const auto value = mfq::cuda::runtime_options::moe_packed_transfer_stage();
+    return !value || *value;
 }
 
 struct MoePinnedStage {

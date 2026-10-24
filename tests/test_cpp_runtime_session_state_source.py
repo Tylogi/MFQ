@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,7 +127,11 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
     assert "saved.kv_cache = glm->kv_cache.narrow(" in DECODE
     assert "saved.index_cache = glm->index_cache.narrow(" in DECODE
     assert "glm->shared_state->reset()" in DECODE
-    assert 'option == "--check-text-session-state"' in DECODE
+    assert re.search(
+        r'\{"--check-text-session-state",\s*&DiagnosticsCommandOptions::check_text_session_state\}', DECODE
+    )
+    assert "if (check_text_session_state)" in DECODE
+    assert "result.*field = true;" in DECODE
     assert '"text_session_state_check dsv4=1 glm_dsa=1\\n"' in DECODE
 
 
@@ -174,7 +179,11 @@ def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
     assert "MFQ_RUNTIME_MAX_KV_SESSIONS" in DECODE
     assert "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
     assert "MFQ_RUNTIME_KV_SESSION_BYTES" in DECODE
-    assert "MFQ_SERVER_" not in DECODE
+    runtime_config = (ROOT / "cpp_runtime/engine/src/runtime_config.cpp").read_text(encoding="utf-8")
+    session_options = runtime_config.split("auto& sessions = config.session_cache;", 1)[1].split(
+        "auto& prefix", 1
+    )[0]
+    assert "MFQ_SERVER_" not in session_options + CUDA_SESSION_CACHE
 
 
 def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
@@ -275,7 +284,16 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
     assert "std::vector<std::thread> readers" in PAGED_SOURCE
     assert "read_header(input, header)" in PAGED_SOURCE
     assert "release_disk_read_pins_locked(requests)" in PAGED_SOURCE
-    assert "iterator->second.pins != 0" in PAGED_SOURCE
+    eviction = PAGED_SOURCE.split("bool enforce_disk_budget_locked(", 1)[1].split(
+        "return disk_bytes_ > target", 1
+    )[0]
+    assert "pins_.find(iterator->first)" in eviction
+    assert re.search(
+        r"if\s*\(iterator->second.pins\s*>\s*"
+        r"\(config_.spill_hot_on_eviction\s*\?\s*session_pins\s*:\s*0\)\s*\|\|"
+        r"\s*pending_.count\(iterator->first\)\s*!=\s*0\)\s*\{\s*continue;",
+        eviction,
+    )
     assert "return !clearing_" in PAGED_SOURCE
     assert "bool clearing_ = false" in PAGED_SOURCE
 

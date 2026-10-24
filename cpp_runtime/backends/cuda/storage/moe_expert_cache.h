@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/execution_options.h"
 #include "moe_cache_profile.h"
 
 #include <cstdint>
@@ -26,8 +27,8 @@ inline int moe_decode_transfer_slots(int rows, int routes) {
 }
 inline constexpr std::size_t moe_ssd_residency_stage_limit_bytes=std::size_t(256)<<20;
 inline bool moe_predictor_transfer_cache_enabled() {
-    const auto* option=std::getenv("MFQ_MOE_PREDICTOR_TRANSFER_CACHE");
-    return !option || option[0]!='0';
+    const auto option = mfq::cuda::runtime_options::moe_predictor_transfer_cache();
+    return !option || *option;
 }
 inline std::string moe_packed_transfer_prefix(int projection,bool predictor) {
     return std::string("decodepacked:")+(predictor && moe_predictor_transfer_cache_enabled()?"mtp:":"")+

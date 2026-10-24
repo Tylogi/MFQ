@@ -75,7 +75,10 @@ def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None
 def test_prepared_prompt_separates_semantic_and_cache_positions() -> None:
     assert "struct CudaPreparedPrompt" in PREPARED
     assert "prepared->embeddings.narrow(1, chunk.offset, chunk.count)" in CUDA_APP
-    assert "prepared->positions.narrow(-1, chunk.offset, chunk.count)" in CUDA_APP
+    generation = (CUDA_ROOT / "engine/generation.cpp").read_text(encoding="utf-8")
+    prepared = "".join(generation.split()).split("if(prepared&&prepared->transformed()){", 1)[1]
+    assert "prepared->positions.defined()?MfqOptional<Tensor>(" in prepared
+    assert "prepared->positions.narrow(-1,chunk.offset,chunk.count).contiguous()):mfq_nullopt" in prepared
     assert "mfq_nullopt,nullptr,mfq_nullopt,true" in "".join(CUDA_APP.split())
     assert "ops.offset_positions(ops.cache_positions, model.decode_position_delta)" in CUDA_APP
     assert "rope.sections.numel() > 0" in CUDA_APP

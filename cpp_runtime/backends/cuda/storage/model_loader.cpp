@@ -2,6 +2,7 @@
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
 #include "storage/mapped_embedding.h"
+#include "models/common/model_config.h"
 #include "mfq_weight_memory.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
@@ -142,25 +143,9 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
     model.plan = cuda_model_plan(model.graph);
     auto definition=load_model_config_json(source, config_path);
     execution.yarn={};
-    if(execution.yarn_context_extension) {
-        if(model.graph.backbone!="qwen3_5" && model.graph.backbone!="qwen4_exp")
-            throw std::invalid_argument("YaRN extension requires a Qwen model");
-        auto config=nlohmann::json::parse(definition);
-        auto& text=config.contains("text_config") ? config["text_config"] : config.contains("language_config") ? config["language_config"] : config;
-        auto rope=text.value("rope_parameters",text.value("rope_scaling",nlohmann::json::object()));
-        if(rope.contains("full_attention"))rope=rope["full_attention"];
-        auto native=text.value("max_position_embeddings",int64_t(0));
-        const auto kind=rope.value("rope_type",rope.value("type",std::string("default")));
-        if(kind=="yarn")native=rope.value("original_max_position_embeddings",native);
-        const auto maximum=rope.value("factor",4.0);
-        if((kind!="default" && kind!="yarn") || native<=0 || !std::isfinite(maximum) || maximum<1 ||
-            context_size_override>std::floor(native*maximum))throw std::invalid_argument("context exceeds Qwen YaRN limit");
-        execution.yarn.original_context=native;
-        execution.yarn.factor=std::max(1.0,double(context_size_override)/native);
-        execution.yarn.beta_fast=rope.value("beta_fast",32.0);
-        execution.yarn.beta_slow=rope.value("beta_slow",1.0);
-        if(execution.yarn.enabled())text["max_position_embeddings"]=context_size_override;
-        definition=config.dump();
+    if (execution.yarn_context_extension) {
+        execution.yarn = mfq::models::extend_qwen_context(
+            definition, model.graph.backbone, context_size_override);
     }
     model.load_definition(definition, model.graph, source,
                           context_size_override);
@@ -335,36 +320,12 @@ RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
     RuntimeComponents<mfq::cuda::Qwen4CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
     if (result.plan.vision == mfq::cuda::CudaVisionAdapter::grid_vit) {
-        const auto document = nlohmann::json::parse(model.source->model_config_json());
-        const auto& vision = document.at("vision_config");
-        if (vision.value("hidden_act", std::string("gelu_pytorch_tanh")) != "gelu_pytorch_tanh" ||
-                !vision.value("deepstack_visual_indexes", std::vector<int>{}).empty())
-            throw std::runtime_error("unsupported Qwen4 grid-ViT activation or deepstack");
-        mfq::GridVisionConfig config;
-        config.hidden_size = vision.at("hidden_size").get<int64_t>();
-        config.intermediate_size = vision.at("intermediate_size").get<int64_t>();
-        config.depth = vision.at("depth").get<int64_t>();
-        config.num_heads = vision.at("num_heads").get<int64_t>();
-        config.in_channels = vision.value("in_channels", int64_t{3});
-        config.patch_size = vision.at("patch_size").get<int64_t>();
-        config.temporal_patch_size = vision.at("temporal_patch_size").get<int64_t>();
-        config.spatial_merge_size = vision.value("spatial_merge_size", int64_t{2});
-        config.out_hidden_size = vision.at("out_hidden_size").get<int64_t>();
-        config.num_position_embeddings = vision.at("num_position_embeddings").get<int64_t>();
-        config.rope_theta = vision.value("rope_theta", 10000.0);
-        if (vision.contains("rope_parameters"))
-            config.rope_theta = vision.at("rope_parameters").value("rope_theta", config.rope_theta);
-        config.layer_norm_eps = vision.value("layer_norm_eps", 1e-6);
-        config.validate();
-        const auto image = document.at("image_token_id").get<int64_t>();
-        const auto video = document.at("video_token_id").get<int64_t>();
-        if (config.out_hidden_size != model.config.hidden || model.config.sections.size() != 3 ||
-                image < 0 || video < 0 || image >= model.config.vocab || video >= model.config.vocab || image == video)
-            throw std::runtime_error("invalid Qwen4 grid-ViT text geometry or placeholder IDs");
+        const auto vision = mfq::models::qwen4_exp::VisionConfig::from_json(
+            model.source->model_config_json(), model.config);
         const auto* component = result.graph.component("vision");
         result.grid_vision.emplace(
             mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
-                *model.execution, *model.source, config, image, video,
+                *model.execution, *model.source, vision.grid, vision.image_token_id, vision.video_token_id,
                 component->input_contract, component->position_policy));
         result.vision_available = true;
     } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {

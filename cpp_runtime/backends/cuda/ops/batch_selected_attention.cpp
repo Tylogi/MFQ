@@ -1,3 +1,4 @@
+#include "runtime/execution_options.h"
 #include "batch_selected_attention.h"
 #include "selected_attention.h"
 #include "runtime/decode_window.h"
@@ -10,8 +11,8 @@ namespace mfq::cuda {
 namespace tb = mfq_tensor_backend;
 
 bool batch_selected_attention_enabled() {
-    const auto* option = std::getenv("MFQ_QSA_INDEPENDENT_BATCH");
-    return !option || option[0] != '0';
+    const auto option = mfq::cuda::runtime_options::qsa_independent_batch();
+    return !option || *option;
 }
 
 tb::Tensor batch_selected_attention(const BatchDecodeInputs& inputs, int64_t field,

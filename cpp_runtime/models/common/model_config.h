@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mfq/yarn.h"
+
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -32,5 +34,9 @@ struct ModelConfig {
 
     static ModelConfig from_json(std::string_view payload);
 };
+
+// Normalize the requested Qwen context and return its positional scaling.
+YarnScaling extend_qwen_context(
+    std::string& definition, std::string_view backbone, std::int64_t context_size);
 
 } // namespace mfq::models
