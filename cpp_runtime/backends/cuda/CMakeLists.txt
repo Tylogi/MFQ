@@ -100,6 +100,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qk_rope_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
@@ -654,6 +655,12 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
     add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
     set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-qk-rope-kv-test ${MFQ_CUDA_ROOT}/tests/qk_rope_kv_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-qk-rope-kv-test)
+    target_compile_definitions(mfq-qk-rope-kv-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-qk-rope-kv-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-qk-rope-kv-test COMMAND mfq-qk-rope-kv-test)
+    set_tests_properties(mfq-qk-rope-kv-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-moe-ffn-pipeline-test ${MFQ_CUDA_ROOT}/tests/moe_ffn_pipeline_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

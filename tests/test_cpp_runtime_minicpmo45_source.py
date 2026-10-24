@@ -24,6 +24,9 @@ MINICPM_ENGINE = (
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
+QK_ROPE_KV = (ROOT / "mfq" / "kernels" / "cuda" / "qk_rope_kv.cu").read_text(
+    encoding="utf-8"
+)
 ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
     encoding="utf-8"
 )
@@ -154,11 +157,12 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION
-    assert "minicpm_bf16_rope_cache_write_cuda" in DECODE
+    assert "mfq::cuda::qk_norm_rope_kv_cuda" in DECODE
     assert '"MFQ_MINICPM_FUSED_ROPE_KV"' in DECODE
     assert "config.minicpm_fused_rope_kv" in DECODE
-    assert "minicpm_bf16_rope_cache_write_kernel" in ROPE
-    assert "minicpm_qk_norm_rope_cache_write_bf16_kernel" in NORM
+    assert "qk_norm_rope_kv_kernel" in QK_ROPE_KV
+    assert "qk_round" in QK_ROPE_KV
+    assert "qk_from_float" in QK_ROPE_KV
     assert '"MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV"' in DECODE
     assert "config.minicpm_fused_qk_norm_rope_kv" in DECODE
     assert "active_rope.apply_bf16" in DECODE
