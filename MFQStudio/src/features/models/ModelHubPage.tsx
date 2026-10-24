@@ -10,10 +10,13 @@ import { Icon } from '../../app/display';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';
+import { useConcurrencyPolicy } from './useConcurrencyPolicy';
 import { DownloadDirectoryControl } from './DownloadDirectoryControl';
 
 export function ModelHubPage() {
-  const { tr } = useSettings();
+  const { tr, settings } = useSettings();
+  const { policy } = useConcurrencyPolicy();
+  const concurrency = settings?.concurrencyDefaults?.max_requests ?? policy?.defaults.max_requests ?? null;
   const { addJob } = useRuntime();
   const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
@@ -61,6 +64,7 @@ export function ModelHubPage() {
   return (
     <div className="model-download-page" ref={page}>
       <ModelBrowser
+        concurrency={concurrency}
         jobKinds={jobKinds}
         onError={(message) => toast.error(message)}
         onJobCreated={trackDownload}

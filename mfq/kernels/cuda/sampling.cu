@@ -6,6 +6,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
+#include "mfq_cuda_batch_sampling.h"
+
+using mfq::cuda::SamplingKind;
+using mfq::cuda::SamplingRow;
+using mfq::cuda::SamplingPlan;
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
 #include <climits>
@@ -250,14 +255,21 @@ __device__ __forceinline__ void sample_argmax_block_finish(
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool Batched = false>
 __global__ void sample_greedy_kernel(
     const scalar_t* __restrict__ logits,
     int64_t* __restrict__ out,
     int B,
-    int V)
+    int V,
+    const SamplingRow* metadata = nullptr)
 {
     int row = blockIdx.x;
+    if constexpr (Batched) {
+        if (metadata[row].kind != SamplingKind::greedy) {
+            if (metadata[row].kind == SamplingKind::inactive) out[row] = -1;
+            return;
+        }
+    }
     float best = -FLT_MAX;
     int best_i = 0;
     for (int i = threadIdx.x; i < V; i += SAMPLE_BD) {
@@ -348,16 +360,24 @@ __global__ void sample_greedy_chunks_finish_kernel(
     sample_argmax_block_finish(best, best_i, out, row);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool Batched = false>
 __global__ void sample_softmax_kernel(
     const scalar_t* __restrict__ logits,
     const float* __restrict__ random,
     int64_t* __restrict__ out,
     int B,
     int V,
-    float temperature)
+    float temperature,
+    const SamplingRow* metadata = nullptr)
 {
     int row = blockIdx.x;
+    if constexpr (Batched) {
+        if (metadata[row].kind != SamplingKind::softmax) {
+            if (metadata[row].kind == SamplingKind::inactive) out[row] = -1;
+            return;
+        }
+        temperature = metadata[row].temperature;
+    }
     __shared__ float red[SAMPLE_BD];
     __shared__ float row_max;
     __shared__ float row_sum;
@@ -394,7 +414,7 @@ __global__ void sample_softmax_kernel(
     }
     if (threadIdx.x == 0) {
         row_sum = red[0];
-        float u = fminf(fmaxf(random[row], 0.0f), 0.99999994f);
+        float u = fminf(fmaxf((Batched ? metadata[row].random : random[row]), 0.0f), 0.99999994f);
         float target = u * row_sum;
         float cdf = 0.0f;
         int chosen = V - 1;
@@ -410,7 +430,7 @@ __global__ void sample_softmax_kernel(
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool Batched = false>
 __global__ void sample_top_k_top_p_kernel(
     const scalar_t* __restrict__ logits,
     const float* __restrict__ random,
@@ -419,9 +439,19 @@ __global__ void sample_top_k_top_p_kernel(
     int V,
     float temperature,
     int top_k,
-    float top_p)
+    float top_p,
+    const SamplingRow* metadata = nullptr)
 {
     int row = blockIdx.x;
+    if constexpr (Batched) {
+        if (metadata[row].kind != SamplingKind::fallback) {
+            if (metadata[row].kind == SamplingKind::inactive) out[row] = -1;
+            return;
+        }
+        temperature = metadata[row].temperature;
+        top_k = metadata[row].top_k;
+        top_p = metadata[row].top_p;
+    }
     __shared__ float top_vals[SAMPLE_MAX_TOP_K];
     __shared__ int top_idx[SAMPLE_MAX_TOP_K];
     __shared__ float reduce_vals[SAMPLE_BD];
@@ -512,7 +542,7 @@ __global__ void sample_top_k_top_p_kernel(
             }
         }
     }
-    float u = fminf(fmaxf(random[row], 0.0f), 0.99999994f);
+    float u = fminf(fmaxf((Batched ? metadata[row].random : random[row]), 0.0f), 0.99999994f);
     float target = u * keep_sum;
     float cdf = 0.0f;
     int chosen = top_idx[keep - 1];
@@ -832,4 +862,187 @@ mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
             (float)presence_penalty, (float)frequency_penalty, (float)repetition_penalty);
     });
     return logits;
+}
+
+// Round penalties back to the logit dtype before sorting/scaling, exactly as
+// the single-row operator does. Retry rows read the original row independently.
+template <typename Scalar, bool CopyRows>
+__global__ void sample_batch_transform_kernel(
+    const Scalar* logits, Scalar* transformed, const SamplingRow* metadata,
+    int vocabulary, int rows, int32_t* finite_rows)
+{
+    const int row = blockIdx.y;
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= vocabulary) return;
+    const auto params = metadata[row];
+    if (params.kind == SamplingKind::inactive) {
+        if constexpr (CopyRows) transformed[int64_t(row) * vocabulary + token] = Scalar(0.f);
+        return;
+    }
+    const int count = params.counts ? params.counts[token] : 0;
+    if constexpr (!CopyRows) {
+        if (count == 0) return;
+    }
+    float value = float(logits[int64_t(params.source) * vocabulary + token]);
+    if (count != 0) {
+        if (params.repetition != 1.0f) {
+            value = value < 0.0f ? value * params.repetition : value / params.repetition;
+        }
+        value -= params.presence + params.frequency * count;
+        if constexpr (CopyRows) value = float(Scalar(value));
+    }
+    if constexpr (CopyRows) {
+        if (row >= rows) {
+            if (!isfinite(params.mask[token])) value = -INFINITY;
+            const unsigned active = __activemask();
+            const unsigned finite = __ballot_sync(active, isfinite(value));
+            if ((threadIdx.x & 31) == __ffs(active) - 1 && finite) atomicExch(finite_rows + row, 1);
+        }
+    }
+    transformed[int64_t(row) * vocabulary + token] = Scalar(value);
+}
+
+__global__ void sample_batch_resolve_kernel(
+    const int64_t* candidates, int64_t* output, const SamplingRow* metadata,
+    const int32_t* finite_rows, int rows, int vocabulary)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const auto params = metadata[row];
+    if (params.kind == SamplingKind::inactive) {
+        output[row] = -1;
+        output[rows + row] = 0;
+        return;
+    }
+    const int64_t first = candidates[row];
+    const bool retry = params.retry >= 0 &&
+        (first < 0 || first >= vocabulary || !isfinite(params.mask[first]));
+    const bool empty = retry && !finite_rows[params.retry];
+    output[row] = empty ? -1 : retry ? candidates[params.retry] : first;
+    output[rows + row] = empty ? 2 : retry;
+}
+
+mfq_tensor_backend::Tensor sample_batch_cuda(
+    mfq_tensor_backend::Tensor logits, const SamplingRow* metadata, const SamplingPlan& plan)
+{
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
+        "sample_batch: logits must be contiguous CUDA [B,V]");
+    MFQ_RUNTIME_CHECK(logits.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        logits.scalar_type() == mfq_tensor_backend::kBFloat16, "sample_batch: unsupported logit dtype");
+    MFQ_RUNTIME_CHECK(metadata && plan.rows == logits.size(0) && plan.rows > 0 &&
+        plan.candidates >= plan.rows && plan.candidates <= 65535 && logits.size(1) > 0 &&
+        logits.size(1) <= INT_MAX && plan.radix_k >= 0 && plan.radix_k <= SAMPLE_RADIX_MAX_TOP_K &&
+        (plan.candidates == plan.rows || plan.constrained) &&
+        (!plan.constrained || plan.transform), "sample_batch: invalid geometry");
+    const int vocabulary = int(logits.size(1));
+    const auto stream = mfq_current_cuda_stream();
+    mfq_tensor_backend::Tensor finite_rows;
+    if (plan.constrained) {
+        finite_rows = mfq_tensor_backend::empty(
+            {plan.candidates}, logits.options().dtype(mfq_tensor_backend::kInt32));
+        MFQ_CUDA_CHECK(cudaMemsetAsync(finite_rows.data_ptr(), 0, finite_rows.nbytes(), stream));
+    }
+    if (plan.transform) {
+        auto transformed = plan.constrained ?
+            mfq_tensor_backend::empty({plan.candidates, vocabulary}, logits.options()) : logits;
+        MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half, mfq_dispatch_bfloat16,
+            logits.scalar_type(), "sample_batch_transform", [&] {
+            const dim3 grid((vocabulary + SAMPLE_BD - 1) / SAMPLE_BD, plan.candidates);
+            if (plan.constrained) {
+                sample_batch_transform_kernel<scalar_t, true><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), transformed.data_ptr<scalar_t>(), metadata,
+                    vocabulary, plan.rows, finite_rows.data_ptr<int32_t>());
+            } else {
+                sample_batch_transform_kernel<scalar_t, false><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), transformed.data_ptr<scalar_t>(), metadata,
+                    vocabulary, plan.rows, nullptr);
+            }
+        });
+        logits = std::move(transformed);
+    }
+    const bool only_greedy = plan.greedy && !plan.softmax && !plan.radix_k && !plan.fallback;
+    if (only_greedy && !plan.constrained) return sample_greedy_cuda(std::move(logits));
+    auto candidates = mfq_tensor_backend::empty(
+        {plan.candidates}, logits.options().dtype(mfq_tensor_backend::kInt64));
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half, mfq_dispatch_bfloat16,
+        logits.scalar_type(), "sample_batch", [&] {
+        if (plan.greedy) {
+            sample_greedy_kernel<scalar_t, true><<<plan.candidates, SAMPLE_BD, 0, stream>>>(
+                logits.data_ptr<scalar_t>(), candidates.data_ptr<int64_t>(), plan.candidates, vocabulary, metadata);
+        }
+        if (plan.softmax) {
+            sample_softmax_kernel<scalar_t, true><<<plan.candidates, SAMPLE_BD, 0, stream>>>(
+                logits.data_ptr<scalar_t>(), nullptr, candidates.data_ptr<int64_t>(),
+                plan.candidates, vocabulary, 1.0f, metadata);
+        }
+        if (plan.fallback) {
+            sample_top_k_top_p_kernel<scalar_t, true><<<plan.candidates, SAMPLE_BD, 0, stream>>>(
+                logits.data_ptr<scalar_t>(), nullptr, candidates.data_ptr<int64_t>(),
+                plan.candidates, vocabulary, 1.0f, 1, 1.0f, metadata);
+        }
+    });
+    if (!plan.greedy && !plan.softmax && !plan.fallback && !plan.radix_k) {
+        MFQ_CUDA_CHECK(cudaMemsetAsync(candidates.data_ptr(), 0xff, candidates.nbytes(), stream));
+    }
+    if (plan.radix_k) {
+        const char* item_option = std::getenv("MFQ_SAMPLE_RADIX_ITEMS");
+        const int requested = item_option ? std::atoi(item_option) :
+            (vocabulary <= 8192 ? 1 : vocabulary <= 65536 ? 4 : 8);
+        const int items = requested == 8 ? 8 : requested == 1 ? 1 : 4;
+        const char* bitonic_option = std::getenv("MFQ_SAMPLE_KEY_BITONIC");
+        const bool bitonic = !bitonic_option || bitonic_option[0] != '0';
+        const int blocks = (vocabulary + SAMPLE_BD * items - 1) / (SAMPLE_BD * items);
+        const int64_t capacity = int64_t(plan.candidates) * blocks * plan.radix_k;
+        auto a = mfq_tensor_backend::empty({capacity}, candidates.options());
+        auto b = mfq_tensor_backend::empty({capacity}, candidates.options());
+        auto* first = reinterpret_cast<uint64_t*>(a.data_ptr<int64_t>());
+        auto* second = reinterpret_cast<uint64_t*>(b.data_ptr<int64_t>());
+        MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half, mfq_dispatch_bfloat16,
+            logits.scalar_type(), "sample_batch_radix", [&] {
+            const dim3 grid(blocks, plan.candidates);
+            if (items == 8) {
+                sample_radix_keys_first<scalar_t, 8, false, false, true><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), first, vocabulary, plan.radix_k, nullptr, metadata);
+            } else if (items == 4) {
+                sample_radix_keys_first<scalar_t, 4, false, false, true><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), first, vocabulary, plan.radix_k, nullptr, metadata);
+            } else {
+                sample_radix_keys_first<scalar_t, 1, false, false, true><<<grid, SAMPLE_BD, 0, stream>>>(
+                    logits.data_ptr<scalar_t>(), first, vocabulary, plan.radix_k, nullptr, metadata);
+            }
+        });
+        int count = blocks * plan.radix_k;
+        while (count > SAMPLE_BD) {
+            const int next = (count + SAMPLE_BD - 1) / SAMPLE_BD;
+            if (bitonic) {
+                sample_radix_keys_reduce<true, false, false, true>
+                    <<<dim3(next, plan.candidates), SAMPLE_BD, 0, stream>>>(
+                        first, second, count, plan.radix_k, nullptr, metadata);
+            } else {
+                sample_radix_keys_reduce<false, false, false, true>
+                    <<<dim3(next, plan.candidates), SAMPLE_BD, 0, stream>>>(
+                        first, second, count, plan.radix_k, nullptr, metadata);
+            }
+            std::swap(first, second);
+            count = next * plan.radix_k;
+        }
+        if (bitonic) {
+            sample_radix_keys_finish<true, true><<<dim3(1, plan.candidates), SAMPLE_BD, 0, stream>>>(
+                first, nullptr, candidates.data_ptr<int64_t>(), count, plan.radix_k, 1.0f, 1.0f, metadata);
+        } else {
+            sample_radix_keys_finish<false, true><<<dim3(1, plan.candidates), SAMPLE_BD, 0, stream>>>(
+                first, nullptr, candidates.data_ptr<int64_t>(), count, plan.radix_k, 1.0f, 1.0f, metadata);
+        }
+    }
+    if (!plan.constrained) {
+        MFQ_CUDA_CHECK(cudaGetLastError());
+        return candidates;
+    }
+    auto output = mfq_tensor_backend::empty({2 * plan.rows}, candidates.options());
+    sample_batch_resolve_kernel<<<(plan.rows + SAMPLE_BD - 1) / SAMPLE_BD, SAMPLE_BD, 0, stream>>>(
+        candidates.data_ptr<int64_t>(), output.data_ptr<int64_t>(), metadata,
+        finite_rows.data_ptr<int32_t>(), plan.rows, vocabulary);
+    MFQ_CUDA_CHECK(cudaGetLastError());
+    return output;
 }

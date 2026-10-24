@@ -96,6 +96,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/gdn_prefill_chunk.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gdn_decode_window.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
@@ -458,6 +459,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_admission.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
     ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_sampling.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/reference.cpp
@@ -708,6 +710,11 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    add_test(NAME mfq-cuda-gdn-prefill-test COMMAND mfq-window-attention-test --gdn-prefill-check)
+    foreach(check chunk chunk-varlen chunk-graph)
+        add_test(NAME mfq-cuda-gdn-prefill-${check}-test
+            COMMAND mfq-window-attention-test --gdn-prefill-${check}-check)
+    endforeach()
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
     add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
@@ -854,6 +861,8 @@ if(BUILD_TESTING)
     add_test(NAME mfq-cuda-mfe-prepare-test COMMAND mfq-cuda-runtime-state-test --mfe-prepare-check)
     add_test(NAME mfq-cuda-mfe-transfer-test COMMAND mfq-cuda-runtime-state-test --mfe-transfer-check)
     add_test(NAME mfq-cuda-mapped-copy-test COMMAND mfq-cuda-runtime-state-test --mapped-copy-check)
+    add_test(NAME mfq-cuda-batched-sampling-test COMMAND mfq-cuda-runtime-state-test --batched-sampling-check)
+    set_tests_properties(mfq-cuda-batched-sampling-test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME mfq-cuda-sampling-keys-test COMMAND mfq-cuda-runtime-state-test --sampling-check)
     add_test(NAME mfq-cuda-transfer-copy-test COMMAND mfq-cuda-runtime-state-test --transfer-copy-check)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)

@@ -20,7 +20,10 @@ export function availableLoadMemory(runtime?: RuntimeStatus | null, deviceIds: s
   return !deviceIds.length && measured(runtime?.device_free_bytes) ? ram + runtime.device_free_bytes : null;
 }
 
-export function estimateLoadMemory(model: ModelArtifact, profile: ModelCacheProfile, settings: LoadContextDefaults) {
+export function estimateLoadMemory(
+  model: ModelArtifact, profile: ModelCacheProfile, settings: LoadContextDefaults, concurrency: number | null = 1,
+) {
+  if (concurrency == null || !Number.isSafeInteger(concurrency) || concurrency < 1) return null;
   const weights = model.estimated_resident_weight_bytes;
   if (!measured(weights)) return null;
   const requested = settings.context_size ?? 32768;
@@ -30,6 +33,6 @@ export function estimateLoadMemory(model: ModelArtifact, profile: ModelCacheProf
     && profile.components.some(item => item.name === 'raw_kv' && (item.group === 'QSA' || item.group === 'GQA'))
     ? quantizedCacheProfile(profile, settings.kv_quantization) : profile;
   if (!quantized) return null;
-  const caches = estimateCacheBytes(quantized, context);
+  const caches = estimateCacheBytes(quantized, context) * concurrency;
   return { total: weights + caches, weights, caches, context };
 }

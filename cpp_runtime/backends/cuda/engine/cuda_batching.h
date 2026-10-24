@@ -5,6 +5,7 @@
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
 #include "runtime/kv_admission.h"
+#include "runtime/batch_sampling.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen4_exp/ops.h"
 #include <type_traits>
@@ -37,7 +38,7 @@ class QwenBatchOperations {
         MfqPrefillTiming timing;
     };
     struct Decoded {
-        Tensor logits, greedy_tokens;
+        Tensor logits, greedy_tokens, sampled_next, sampled_tokens;
     };
 
     QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig,
@@ -83,6 +84,7 @@ class QwenBatchOperations {
     int64_t decode_tokens_{0};
     int64_t batched_greedy_batches_{0};
     int64_t packed_metadata_batches_{0};
+    BatchSampling sampling_;
     std::unique_ptr<BatchDecodeGraphCache> decode_graphs_;
 };
 
@@ -101,7 +103,7 @@ class FlashNextBatchOperations {
     using Request = FlashNextBatchRequest;
     using State = mfq::engine::BatchState<Request>;
     using Sample = QwenBatchOperations::Sample;
-    struct Decoded { Tensor logits, greedy_tokens; };
+    struct Decoded { Tensor logits, greedy_tokens, sampled_next, sampled_tokens; };
     FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig,
                              BatchMemoryProvider = {});
     ~FlashNextBatchOperations();
@@ -142,6 +144,7 @@ class FlashNextBatchOperations {
     CudaExecutionContext& execution_;
     CudaContinuousBatchConfig config_;
     BatchMemoryProvider memory_;
+    BatchSampling sampling_;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;

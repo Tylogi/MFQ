@@ -13,9 +13,10 @@ interface SettingsPageProps {
   settingsDraft: AppearanceSettings;
   setSettingsDraft: Dispatch<SetStateAction<AppearanceSettings>>;
   actions: SettingsActions;
+  canSave?: boolean;
 }
 
-export function SettingsPage({ tr, settingsDraft, setSettingsDraft, actions }: SettingsPageProps) {
+export function SettingsPage({ tr, settingsDraft, setSettingsDraft, actions, canSave = true }: SettingsPageProps) {
   const { resetSettingsDraft, saveSettings } = actions;
   return (
     <div className="settings-page">
@@ -38,7 +39,8 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, actions }: S
 
       <div className="settings-page-actions">
         <button onClick={resetSettingsDraft} type="button">{tr("恢复默认", "Reset")}</button>
-        <button className="primary" onClick={saveSettings} type="button">{tr("应用设置", "Apply settings")}</button>
+        <button className="primary" disabled={!canSave} onClick={saveSettings} type="button">
+          {tr("应用设置", "Apply settings")}</button>
       </div>
     </div>
   );

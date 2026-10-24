@@ -10,7 +10,8 @@ function gib(bytes: number | null) {
   return bytes == null ? '—' : `${formatNumber(bytes / 2 ** 30, 1)} GiB`;
 }
 
-export function ModelLoadMemoryEstimate({ models, runtime, deviceIds, value, valid, disabled }: {
+export function ModelLoadMemoryEstimate({ models, runtime, deviceIds, value, valid, disabled, concurrency = 1 }: {
+  concurrency?: number | null;
   models: ModelArtifact[]; runtime?: RuntimeStatus | null; deviceIds: string[];
   value: LoadContextDefaults; valid: boolean; disabled: boolean;
 }) {
@@ -32,7 +33,7 @@ export function ModelLoadMemoryEstimate({ models, runtime, deviceIds, value, val
   const available = availableLoadMemory(runtime, deviceIds);
   const loading = !!selected && data?.key !== key;
   const estimate = selected && data?.key === key && data.profile && valid
-    ? estimateLoadMemory(selected, data.profile, value) : null;
+    ? estimateLoadMemory(selected, data.profile, value, concurrency) : null;
   const exceeded = estimate != null && available != null && estimate.total > available;
   return <div className="model-load-memory-estimate">
     <p>{tr('选择模型，比较预计占用与剩余推理预算。自动预算已考虑系统预留和可回收内存。',

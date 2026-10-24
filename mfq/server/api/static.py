@@ -17,7 +17,7 @@ class SPAStaticFiles(StaticFiles):
     headers = Headers(scope=scope)
     # StaticFiles 在 Windows 上传入反斜杠路径，先统一后再判断前缀。
     normalized = path.replace('\\', '/').strip('/')
-    reserved = {'api', 'v1', 'realtime', 'health', 'docs', 'redoc', 'assets', 'static'}
+    reserved = {'api', 'v1', 'realtime', 'health', 'metrics', 'docs', 'redoc', 'assets', 'static'}
     is_navigation = (
       scope['method'] in {'GET', 'HEAD'}
       and 'text/html' in headers.get('accept', '').lower()

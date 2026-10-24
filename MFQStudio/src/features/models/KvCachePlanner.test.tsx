@@ -110,3 +110,13 @@ it('calculates QSA raw KV, indexer and total caches without runtime state or an 
   expect(screen.getByRole('row', { name: /QSA total cache/ })).toHaveTextContent('57.0 MiB');
   expect(screen.queryByRole('row', { name: /GDN|PLE/ })).not.toBeInTheDocument();
 });
+
+it('scales the displayed KV budget and curve when concurrency changes', () => {
+  const profile = analysisFixture().cache_profile!;
+  const view = render(<KvCachePlanner profile={profile} concurrency={1} tr={(_, en) => en} />);
+  fireEvent.click(screen.getByText('KV Cache curve & calculator'));
+  expect(screen.getByRole('row', { name: /QSA total cache/ })).toHaveTextContent('28.5 MiB');
+  view.rerender(<KvCachePlanner profile={profile} concurrency={4} tr={(_, en) => en} />);
+  expect(screen.getByRole('row', { name: /QSA total cache/ })).toHaveTextContent('114.0 MiB');
+  expect(screen.getByText(/for 4 concurrent requests/)).toBeInTheDocument();
+});

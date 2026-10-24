@@ -39,6 +39,7 @@ export type ModelBrowserTab = 'official' | 'community' | 'downloads';
 export type DownloadOrigin = { x: number; y: number };
 
 interface ModelBrowserProps {
+  concurrency?: number | null;
   jobKinds: JobKindResource[];
   onError(message: string): void;
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;
@@ -296,7 +297,10 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
+export function ModelBrowser({
+  concurrency = 1, jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue,
+  downloadDirectory, downloadDirectoryControl, tr,
+}: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -362,14 +366,14 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const officialPlanKey = `official:${selectedOfficial?.id}:${selectedSource?.provider}:${selectedSource?.repo_id}`;
   const officialContext = plannedContexts[officialPlanKey];
   const officialCacheBytes = selectedMetadata?.cache_profile && officialContext != null
-    ? estimateCacheBytes(selectedMetadata.cache_profile, officialContext) : 0;
+    ? estimateCacheBytes(selectedMetadata.cache_profile, officialContext) * (concurrency ?? 0) : 0;
   const plannedOfficialVariants = withCacheMemory(officialVariants, officialCacheBytes);
   const officialConfiguration = selectedOfficial && officialCacheBytes > 0
     ? plannedConfiguration(plannedOfficialVariants, selectedOfficial.configuration, tr) : selectedOfficial?.configuration;
   const communityPlanKey = `community:${communityModel?.provider}:${communityModel?.repo_id}`;
   const communityContext = plannedContexts[communityPlanKey];
   const communityCacheBytes = communityModel?.cache_profile && communityContext != null
-    ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
+    ? estimateCacheBytes(communityModel.cache_profile, communityContext) * (concurrency ?? 0) : 0;
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
     (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
@@ -585,7 +589,9 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(selectedOfficial.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
                 </dl>
-                <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
+                <KvCachePlanner concurrency={concurrency} key={`kv:${officialPlanKey}`}
+                  profile={selectedMetadata?.cache_profile} appliedContext={officialContext}
+                  onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => {
                   if (event.target.value === 'auto') { setOfficialSource(null); return; }
                   const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source);
@@ -633,7 +639,9 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(communityModel.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(communityModel.published_at || communityModel.updated_at)}</dd></div>
                 </dl>
-                <KvCachePlanner key={`kv:${communityPlanKey}`} profile={communityModel.cache_profile} appliedContext={communityContext} onApply={(context) => applyPlan(communityPlanKey, context)} tr={tr} />
+                <KvCachePlanner concurrency={concurrency} key={`kv:${communityPlanKey}`}
+                  profile={communityModel.cache_profile} appliedContext={communityContext}
+                  onApply={(context) => applyPlan(communityPlanKey, context)} tr={tr} />
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
                 <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} reuse={communityReuse} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} system={official?.system} moe={(communityModel.parameter_breakdown?.routed_experts ?? 0) > 0} />
                 <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}

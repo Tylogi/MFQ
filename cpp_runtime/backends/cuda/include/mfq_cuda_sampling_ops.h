@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq_tensor_backend.h"
+#include "mfq_cuda_batch_sampling.h"
 
 #include <cstdint>
 #include <vector>
@@ -8,6 +9,12 @@
 void decode_graph_commit_cuda(mfq_tensor_backend::Tensor next, mfq_tensor_backend::Tensor generated, mfq_tensor_backend::Tensor step,
                               mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor len);
 mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits);
+// Returns tokens followed by retry status when the plan contains constraints:
+// 0 = accepted first candidate, 1 = retry, 2 = no finite masked candidate.
+// metadata and all pointed-to storage must outlive execution/graph replay.
+mfq_tensor_backend::Tensor sample_batch_cuda(
+    mfq_tensor_backend::Tensor logits, const mfq::cuda::SamplingRow* metadata,
+    const mfq::cuda::SamplingPlan& plan);
 mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature);
 mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature, int64_t top_k, double top_p);

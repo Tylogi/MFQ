@@ -3,6 +3,7 @@ import { useSettings } from '../settings/SettingsProvider';
 import { TMPanel, SettingRow } from '../../app/display';
 import { Switch } from '../../shared/ui/Switch';
 import type { useModelCatalog } from './useModelCatalog';
+import { ConcurrencyFields } from './ConcurrencyFields';
 import { ModelLoadContext } from './ModelLoadContext';
 
 /** 展示内存固定和空闲卸载策略设置。 */
@@ -53,7 +54,15 @@ export function ModelLoadPolicy({ catalog }: { catalog: ReturnType<typeof useMod
           }
         />
       </div>
-      <ModelLoadContext key={catalog.connectionRevision} value={catalog.loadContext} onChange={catalog.setLoadContext}
+      <section className="model-load-context" aria-label={tr('并发', 'Concurrency')}>
+        <h3>{tr('并发', 'Concurrency')}</h3>
+        <ConcurrencyFields key={catalog.connectionRevision} value={catalog.loadConcurrency}
+          onChange={catalog.setLoadConcurrency} policy={catalog.concurrencyPolicy} disabled={catalog.busy} />
+        {catalog.concurrencyError && <p role="alert">{catalog.concurrencyError}</p>}
+      </section>
+      <ModelLoadContext
+        concurrency={catalog.loadConcurrency?.max_requests ?? catalog.concurrencyPolicy?.defaults.max_requests ?? null}
+        key={catalog.connectionRevision} value={catalog.loadContext} onChange={catalog.setLoadContext}
         disabled={catalog.busy} models={catalog.artifacts} runtime={catalog.runtime} deviceIds={catalog.loadDeviceIds} />
     </TMPanel>
   );

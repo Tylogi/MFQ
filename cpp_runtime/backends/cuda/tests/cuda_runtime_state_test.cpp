@@ -1434,6 +1434,7 @@ void check_dma_copy_buckets() {
 #include "mfe_prepare_bench.h"
 #include "mfe_transfer_bench.h"
 #include "sampling_bench.h"
+#include "batched_sampling_test.h"
 #include "transfer_copy_bench.h"
 #include "kv_speculative_lru_test.h"
 int main(int argc, char** argv) try {
@@ -1451,6 +1452,23 @@ int main(int argc, char** argv) try {
     }
     if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-bench") {
         const auto context=default_context();benchmark_kv_speculative_lru();return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--batched-sampling-bench") {
+        benchmark_batched_sampling(argv[2]);
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--batched-sampling-cutoff-check") {
+        check_batched_sampling_cutoffs();
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--batched-sampling-check") {
+        check_batched_sampling();
+        check_batched_sampling_cutoffs();
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--batched-sampling-grammar-check") {
+        check_batched_sampling(argv[2]);
+        return 0;
     }
     if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
     if(argc==2 && std::string(argv[1])=="--conditional-compact-sampling-check") {check_conditional_compact_sampling();return 0;}

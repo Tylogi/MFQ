@@ -21,6 +21,7 @@ from mfq.server.api.routes.auth import router as auth_router
 from mfq.server.api.routes.jobs import event_router as job_event_router
 from mfq.server.api.routes.jobs import router as job_router
 from mfq.server.api.routes.media import router as media_router
+from mfq.server.api.routes.metrics import router as metrics_router
 from mfq.server.api.routes.models import hub_router
 from mfq.server.api.routes.models import router as model_router
 from mfq.server.api.routes.quantization import router as quantization_router
@@ -76,7 +77,7 @@ def create_app(
             detail = ErrorDetail(code="server_instance_changed", message="The server instance changed. Reconnect and confirm the new server.")
             return JSONResponse(status_code=409, content=ErrorResponse(error=detail).model_dump(mode="json"))
         policy = app.state.auth_policy
-        if policy.enabled and request.method != "OPTIONS" and request.url.path.startswith(("/api/", "/v1")):
+        if policy.enabled and request.method != "OPTIONS" and request.url.path.startswith(("/api/", "/v1", "/metrics")):
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
             anthropic = is_anthropic_request(request)
@@ -162,6 +163,7 @@ def create_app(
     app.include_router(job_event_router)
     app.include_router(session_router)
     app.include_router(media_router)
+    app.include_router(metrics_router)
     app.include_router(model_router)
     app.include_router(quantization_router)
     app.include_router(runtime_router)
