@@ -152,7 +152,9 @@ __device__ __forceinline__ float load_float<mfq_half>(const mfq_half * ptr, int 
 
 template <>
 __device__ __forceinline__ float load_float<mfq_bfloat16>(const mfq_bfloat16 * ptr, int index) {
-    return __bfloat162float(ptr[index]);
+    // mfq_bfloat16 is the framework's bfloat16 type in the Torch extension, which
+    // does not convert to __nv_bfloat16; reinterpret the storage like the half load.
+    return __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(ptr + index));
 }
 
 template <typename scalar_t>

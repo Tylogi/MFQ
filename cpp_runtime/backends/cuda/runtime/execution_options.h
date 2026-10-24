@@ -101,6 +101,8 @@ std::optional<bool> ple_file_map();
 std::optional<bool> prefill_expert_batch_audit();
 std::optional<bool> prefill_layer_major_trace();
 std::optional<bool> qsa_prefill_fused();
+bool qsa_pool_store_fused();
+bool qsa_pool_incremental();
 std::optional<bool> qsa_select_fused();
 std::optional<bool> qsa_sparse_gate_fused();
 std::optional<bool> shared_gate_fused();
