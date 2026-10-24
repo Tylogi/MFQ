@@ -13,6 +13,8 @@ Generation batched_speculative_sequence(Request& request, InferenceOutput& outpu
         std::function<void(const TokenOutput&)> accept_initial = {}) {
     auto initial = output.append(std::vector<int64_t>{first});
     if (accept_initial) accept_initial(initial);
+    if constexpr (requires { request.accepted_tokens; })
+        request.accepted_tokens.insert(request.accepted_tokens.end(), initial.token_ids.begin(), initial.token_ids.end());
     request.produced += initial.token_ids.size();
     request.pending_token = first;
     co_yield std::move(initial);
@@ -24,6 +26,8 @@ Generation batched_speculative_sequence(Request& request, InferenceOutput& outpu
         check();
         auto delta = publish(output);
         require_execution(!delta.token_ids.empty(), "batched MTP published an empty live window");
+        if constexpr (requires { request.accepted_tokens; })
+            request.accepted_tokens.insert(request.accepted_tokens.end(), delta.token_ids.begin(), delta.token_ids.end());
         request.produced += delta.token_ids.size();
         request.pending_token = delta.token_ids.back();
         co_yield std::move(delta);

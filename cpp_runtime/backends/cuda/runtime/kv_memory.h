@@ -5,6 +5,7 @@
 #include "mfq_cuda_kv_hot_cache.h"
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,11 @@ public:
     // Called after dense weights and predictor load, before expert arenas.
     void finalize(std::size_t minimum_experts = 0);
     void ensure(int64_t tokens);
+    // Match the existing placement policy without allocating a new request.
+    std::optional<std::size_t> additional_preallocated_gpu_bytes(int64_t maximum, int64_t heads,
+        std::size_t key_row_bytes, std::size_t value_row_bytes, int64_t index_width, int64_t pool) const;
+    // Exact next mapping cost, including paused request allocations.
+    std::size_t growth_bytes(int64_t tokens) const;
     void set_reservation(std::function<void(std::size_t)> callback) { reserve_ = std::move(callback); }
     std::shared_ptr<KvOffloadStore> offload() const { return offload_; }
     bool dynamic() const { return options_.dynamic; }

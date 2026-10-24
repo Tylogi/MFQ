@@ -457,6 +457,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/storage/deepseek_v41_paged_session.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_batch_admission.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_mtp.cpp
     ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp

@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace mfq::engine {
 
@@ -31,6 +35,22 @@ bool environment_enabled(const char* name, bool fallback) {
     if (error != std::errc{} || last != end)
         throw std::runtime_error(std::string("invalid ") + name);
     return parsed != 0;
+}
+
+static double environment_double(const char* name, double fallback) {
+    const auto* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    double result = 0;
+    // Floating-point from_chars is unavailable in older supported libc++.
+    // Keep decimal parsing independent of the process locale and reject
+    // whitespace, trailing characters and non-finite values.
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    input >> std::noskipws >> result;
+    if (value[0] == '+' || std::string_view(value).find_first_of("xXpP") != std::string_view::npos
+            || !input || !input.eof() || !std::isfinite(result))
+        throw std::invalid_argument(std::string("invalid ") + name);
+    return result;
 }
 
 static std::filesystem::path default_prefix_cache_directory() {
@@ -120,7 +140,27 @@ ContinuousBatchConfig resolve_batch_config(int capacity, std::int64_t prefill_ch
     if (prefill_chunk_size <= 0)
         throw std::invalid_argument("prefill chunk size must be positive");
     ContinuousBatchConfig config;
+    config.sequence_limit = checked_size(environment_uint64(
+        "MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES", config.sequence_limit), "MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES");
+    if (!config.sequence_limit || config.sequence_limit > ContinuousBatchConfig::validated_max_sequences)
+        throw std::invalid_argument("continuous batching sequence limit must be in [1, 32]; 64 is not validated");
+    if (static_cast<std::size_t>(capacity) > config.sequence_limit)
+        throw std::invalid_argument("continuous batching capacity exceeds MFQ_CONTINUOUS_BATCH_MAX_SEQUENCES");
     config.max_sequences = static_cast<std::size_t>(capacity);
+    auto& admission = config.admission;
+    admission.initial_ratio = environment_double("MFQ_INIT_NEW_TOKEN_RATIO", admission.initial_ratio);
+    admission.minimum_ratio_factor = environment_double(
+        "MFQ_MIN_NEW_TOKEN_RATIO_FACTOR", admission.minimum_ratio_factor);
+    admission.conservativeness = environment_double("MFQ_SCHEDULE_CONSERVATIVENESS", admission.conservativeness);
+    admission.decay_steps = environment_uint64("MFQ_NEW_TOKEN_RATIO_DECAY_STEPS", admission.decay_steps);
+    admission.retract_steps = environment_uint64("MFQ_RETRACT_DECODE_STEPS", admission.retract_steps);
+    const auto clip = environment_uint64("MFQ_ADMISSION_DECODE_TOKEN_CLIP", admission.decode_token_clip);
+    if (clip > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::invalid_argument("MFQ_ADMISSION_DECODE_TOKEN_CLIP exceeds int64");
+    admission.decode_token_clip = static_cast<std::int64_t>(clip);
+    (void)NewTokenRatioTracker(admission);
+    config.kv_budget_bytes = checked_size(environment_uint64(
+        "MFQ_CONTINUOUS_BATCH_KV_BUDGET_BYTES", 0), "MFQ_CONTINUOUS_BATCH_KV_BUDGET_BYTES");
     config.prefill_token_budget = static_cast<std::int64_t>(std::min<std::uint64_t>(
         environment_uint64("MFQ_CONTINUOUS_BATCH_PREFILL_TOKEN_BUDGET", prefill_chunk_size),
         std::numeric_limits<std::int64_t>::max()));

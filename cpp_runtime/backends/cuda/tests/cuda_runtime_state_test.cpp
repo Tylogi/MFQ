@@ -767,6 +767,30 @@ static void check_kv_memory() {
     check(allocation->gpu_bytes()>bytes,"dynamic KV failed to map growth pages");
     auto host=allocation->keys.narrow(2,0,16).to(tb::kCPU,tb::kFloat32).contiguous();
     for(int i=0;i<host.numel();++i)check(host.data_ptr<float>()[i]==3.0f,"dynamic KV growth corrupted existing values");
+    auto child = manager.add(32768,2,128,128,16,4,options);
+    const auto child_bytes = child->gpu_bytes();
+    auto* child_address = child->keys.data_ptr();
+    check(child_bytes == child->index_bytes(), "additional dynamic KV mapped unadmitted raw pages");
+    check(child->growth_bytes(16) > 0 && manager.growth_bytes(16) == child->growth_bytes(16),
+        "additional dynamic KV did not expose the full next mapping cost");
+    manager.ensure(16);
+    check(manager.growth_bytes(16) == 0, "mapped child KV was charged twice");
+    check(child->keys.data_ptr() == child_address && child->gpu_bytes() > child_bytes,
+        "additional dynamic KV failed to map pages at its stable address");
+    child->keys.narrow(2,0,16).copy_(prefix);
+    manager.ensure(24576);
+    host = child->keys.narrow(2,0,16).to(tb::kCPU,tb::kFloat32).contiguous();
+    for (int i = 0; i < host.numel(); ++i)
+        check(host.data_ptr<float>()[i] == 3.0f, "additional dynamic KV growth corrupted existing values");
+    KvMemoryOptions ram_config;
+    ram_config.placement = "ram";
+    KvMemoryManager ram_manager(ram_config);
+    auto ram = ram_manager.add(128,1,32,32,32,2,options);
+    ram_manager.finalize();
+    const auto planned_gpu = ram_manager.additional_preallocated_gpu_bytes(128,1,64,64,32,2);
+    check(planned_gpu && *planned_gpu == ram->index_bytes(), "RAM KV admission charged raw KV to VRAM");
+    const auto ram_child = ram_manager.add(128,1,32,32,32,2,options);
+    check(ram_child->gpu_bytes() == *planned_gpu, "RAM KV admission did not preserve placement");
     // Allocation admission must fail before creating any SSD fallback.
     KvMemoryOptions constrained;constrained.gpu_limit=8192;constrained.ram_limit_set=true;constrained.ram_limit=0;
     KvMemoryManager rejected(constrained);

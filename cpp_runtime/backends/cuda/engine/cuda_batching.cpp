@@ -43,14 +43,16 @@ static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
 }
 
 mfq::engine::PrefillChunk QwenBatchOperations::prefill_chunk(
-        const std::shared_ptr<Request>&,mfq::engine::PrefillChunk chunk) {
+        const std::shared_ptr<Request>& request,mfq::engine::PrefillChunk chunk) {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    reclaim_prefill_memory(request);
     return budget_batch_prefill(model_,execution_,chunk);
 }
 
 mfq::engine::PrefillChunk FlashNextBatchOperations::prefill_chunk(
         const std::shared_ptr<Request>& request,mfq::engine::PrefillChunk chunk) {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    reclaim_prefill_memory(request);
     initialize_prefill(request,chunk);
     return budget_batch_prefill(model_,execution_,chunk,request->cache->prefill_growth_bytes(chunk.count));
 }
@@ -63,13 +65,18 @@ bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &model,
 }
 
 QwenBatchOperations::QwenBatchOperations(Qwen35CausalLm &model, CudaExecutionContext &execution,
-                                         CudaContinuousBatchConfig config, MtpModule* predictor)
+                                         CudaContinuousBatchConfig config, MtpModule* predictor,
+                                         BatchMemoryProvider memory)
     : model_(model), state_adapter_(model, config.max_sequences, config.paged_kv),
-      execution_(execution), config_(std::move(config)),
+      execution_(execution), config_(std::move(config)), memory_(std::move(memory)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(state_adapter_.has_moe()),
       cached_moe_enabled_(state_adapter_.has_cached_moe()),
-      decode_graphs_(std::make_unique<BatchDecodeGraphCache>()), predictor_(predictor) {}
+      decode_graphs_(std::make_unique<BatchDecodeGraphCache>()), predictor_(predictor) {
+    MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= config_.sequence_limit &&
+                      config_.sequence_limit <= mfq::engine::ContinuousBatchConfig::validated_max_sequences,
+                      "continuous batching capacity exceeds the configured or validated sequence limit");
+}
 
 QwenBatchOperations::~QwenBatchOperations() = default;
 
@@ -139,6 +146,8 @@ QwenBatchOperations::Sample QwenBatchOperations::prefill(
     MfqCudaGuard guard(primary);
     state_adapter_.prepare_prefill(request->cache, chunk.offset, request->prompt.size());
     if (chunk.offset == 0) {
+        std::erase_if(requests_, [](const auto& weak) { return weak.expired(); });
+        requests_.push_back(request);
         request->prefill_ids =
             mfq_tensor_backend::tensor(
                 request->prompt,
@@ -202,6 +211,7 @@ void QwenBatchOperations::activate(const std::shared_ptr<Request> &request, cons
         request->mtp->first_token = sample.token;
         request->mtp->history_ids = {sample.token};
     }
+    admission_storage_ready_ = true;
 }
 
 void QwenBatchOperations::resume_decode(int64_t cache_position) {
@@ -225,6 +235,7 @@ void QwenBatchOperations::retire(const std::vector<std::shared_ptr<Request>> &re
         state_adapter_.release(request->cache);
     }
     state_adapter_.finish_retire(cache_position);
+    if (cache_position == 0) admission_storage_ready_ = false;
 }
 
 void QwenBatchOperations::invalidate_decode_graph() {
@@ -261,15 +272,20 @@ void QwenBatchOperations::recover(State &state) {
         caches.push_back(&request->cache);
     }
     state_adapter_.recover(caches);
+    admission_storage_ready_ = false;
     invalidate_decode_graph();
 }
 
 FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
-        CudaExecutionContext& execution, CudaContinuousBatchConfig config, MtpModule* predictor)
-    : model_(model), execution_(execution), config_(std::move(config)), predictor_(predictor) {
-    MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= 32,
-                      "Flash-Next continuous batching supports 1..32 requests");
+        CudaExecutionContext& execution, CudaContinuousBatchConfig config, MtpModule* predictor,
+        BatchMemoryProvider memory)
+    : model_(model), execution_(execution), config_(std::move(config)), memory_(std::move(memory)),
+      predictor_(predictor) {
+    MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= config_.sequence_limit &&
+                      config_.sequence_limit <= mfq::engine::ContinuousBatchConfig::validated_max_sequences,
+                      "continuous batching capacity exceeds the configured or validated sequence limit");
     model_.reset(1);
+    admission_base_kv_bytes_ = managed_kv_bytes();
     if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;

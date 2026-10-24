@@ -881,7 +881,11 @@ void run_continuous_speculative_publication() {
         input.sampling.max_tokens = 4;
         input.stop_token_ids = {2};
         InferenceOutput output(input, nullptr, "batched-publication");
-        struct Row { int produced = 0; int64_t pending_token = 0; } row;
+        struct Row {
+            int produced = 0;
+            int64_t pending_token = 0;
+            std::vector<int64_t> accepted_tokens;
+        } row;
         bool scheduled = false;
         int retained = -1, publications = 0, initial_accepts = 0;
         auto generation = batched_speculative_sequence(row, output, 1,
@@ -894,6 +898,7 @@ void run_continuous_speculative_publication() {
             }, [&](const TokenOutput& delta) { initial_accepts += delta.token_ids.size(); });
         auto first = generation.next();
         assert(first && row.produced == 1 && row.pending_token == 1 && !scheduled && initial_accepts == 1);
+        assert((row.accepted_tokens == std::vector<int64_t>{1}));
         auto scheduling = generation.next();
         assert(scheduling && scheduled && publications == 0);
         if (cancelled) output.result.cancelled = true;
@@ -901,8 +906,12 @@ void run_continuous_speculative_publication() {
         assert(publications == (cancelled ? 0 : 1));
         if (!cancelled) {
             assert(row.produced == 3 && row.pending_token == 2 && retained == 2);
+            assert((row.accepted_tokens == std::vector<int64_t>{1, 1, 2}));
             assert(output.result.finish_reason == "stop");
-        } else assert(row.produced == 1 && retained == -1);
+        } else {
+            assert(row.produced == 1 && retained == -1);
+            assert((row.accepted_tokens == std::vector<int64_t>{1}));
+        }
     }
 }
 
