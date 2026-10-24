@@ -256,15 +256,15 @@ __global__ void minicpm_qk_norm_rope_cache_write_bf16_kernel(
     }
 }
 
-template <int BD>
-__global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
+template <int BD,typename Input=float>
+__global__ void rms_norm_kernel(const Input* __restrict__ x, const float* __restrict__ w,
                                 float* __restrict__ out, int N, int D, float eps, float weight_offset)
 {
     int row = blockIdx.x;
     if (row >= N) {
         return;
     }
-    const float* xr = x + (size_t)row * D;
+    const Input* xr = x + (size_t)row * D;
     float* or_ = out + (size_t)row * D;
     int tid = threadIdx.x;
 
@@ -277,7 +277,7 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
-        or_[i] = xr[i] * rinv * (w[i] + weight_offset);
+        or_[i] = static_cast<float>(xr[i]) * rinv * (w[i] + weight_offset);
     }
 }
 
@@ -422,15 +422,21 @@ mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tenso
 
 mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps, double weight_offset)
 {
-    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
-                "rms_norm_offset: x must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.scalar_type() == mfq_tensor_backend::kFloat32, "weight must be cuda f32");
-    int D = (int)x.size(-1);
-    int N = (int)(x.numel() / D);
-    auto out = mfq_tensor_backend::empty_like(x);
-   hipLaunchKernelGGL(( rms_norm_kernel<NORM_BD>), dim3(N), dim3(NORM_BD), 0, mfq_current_cuda_stream(), 
-        x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(),
-        N, D, (float)eps, (float)weight_offset);
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+        (x.scalar_type()==tb::kFloat32 || x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kBFloat16),
+        "rms_norm_offset: x must be cuda contiguous f16, bf16 or f32");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.scalar_type()==tb::kFloat32,
+        "weight must be cuda f32");
+    const int D=int(x.size(-1)),N=int(x.numel()/D);
+    auto out=tb::empty(x.sizes(),x.options().dtype(tb::kFloat32));
+    const auto launch=[&]<class Input>() {
+        rms_norm_kernel<NORM_BD,Input><<<N,NORM_BD,0,mfq_current_cuda_stream()>>>(
+            x.data_ptr<Input>(),weight.data_ptr<float>(),out.data_ptr<float>(),N,D,float(eps),float(weight_offset));
+    };
+    if(x.scalar_type()==tb::kFloat16)launch.template operator()<mfq_half>();
+    else if(x.scalar_type()==tb::kBFloat16)launch.template operator()<mfq_bfloat16>();
+    else launch.template operator()<float>();
     return out;
 }
 
@@ -738,3 +744,35 @@ mfq_tensor_backend::Tensor l2_norm_cuda(mfq_tensor_backend::Tensor x, double eps
         x.data_ptr<float>(), out.data_ptr<float>(), N, D, (float)eps);
     return out;
 }
+
+__global__ void gdn_rms_silu_decode_kernel(const float* x,const float* gate,
+        const float* weight,float* output,int rows,int width,float eps) {
+    const int row=blockIdx.x,base=row*width;
+    float sum=0;
+    for(int c=threadIdx.x;c<width;c+=NORM_BD) {const float v=x[base+c];sum+=v*v;}
+    sum=block_sum<NORM_BD/32>(sum);
+    const float inverse=rsqrtf(sum/float(width)+eps);
+    for(int c=threadIdx.x;c<width;c+=NORM_BD) {
+        const float normalized=x[base+c]*inverse*weight[c];
+        const float z=gate[base+c],activated=z/(1.f+expf(-z));
+        output[base+c]=normalized*activated;
+    }
+}
+mfq_tensor_backend::Tensor gdn_rms_silu_decode_cuda(mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,mfq_tensor_backend::Tensor weight,double eps) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && gate.is_cuda() && x.device()==gate.device() &&
+        x.scalar_type()==tb::kFloat32 && gate.scalar_type()==tb::kFloat32 &&
+        x.is_contiguous() && gate.is_contiguous() && x.numel()==gate.numel() &&
+        x.dim()==4 && x.size(2)==1 && weight.is_cuda() && weight.device()==x.device() &&
+        weight.is_contiguous() && weight.scalar_type()==tb::kFloat32 && weight.numel()==x.size(-1),
+        "gdn_rms_silu_decode: expected matching FP32 single-token GPU tensors");
+    const int width=int(x.size(-1)),rows=int(x.numel()/width);
+    auto output=tb::empty(gate.sizes(),gate.options());
+    gdn_rms_silu_decode_kernel<<<rows,NORM_BD,0,mfq_current_cuda_stream()>>>(
+        x.data_ptr<float>(),gate.data_ptr<float>(),weight.data_ptr<float>(),output.data_ptr<float>(),rows,width,float(eps));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+#include "l2_norm_pair.h"

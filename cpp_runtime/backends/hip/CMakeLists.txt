@@ -67,6 +67,9 @@ set_target_properties(mfq-hip-core PROPERTIES
 )
 
 set(MFQ_HIP_KERNEL_SOURCES
+    ${MFQ_HIP_KERNEL_ROOT}/tq_projection.hip
+    ${MFQ_HIP_KERNEL_ROOT}/tq_q8.hip
+    ${MFQ_HIP_KERNEL_ROOT}/tq_input_gate.hip
     ${MFQ_HIP_KERNEL_ROOT}/acc.hip
     ${MFQ_HIP_KERNEL_ROOT}/activation.hip
     ${MFQ_HIP_KERNEL_ROOT}/attention.hip
@@ -197,6 +200,7 @@ set(MFQ_HIP_RUNTIME_OP_SOURCES
     ${MFQ_HIP_ROOT}/ops/moe.cpp
     ${MFQ_HIP_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_HIP_ROOT}/ops/nint.cpp
+    ${MFQ_HIP_ROOT}/ops/tq.cpp
     ${MFQ_HIP_ROOT}/ops/quant_linear.cpp
     ${MFQ_HIP_ROOT}/ops/vq.cpp
 )
@@ -325,6 +329,27 @@ set_target_properties(mfq-eval PROPERTIES
 )
 
 if(BUILD_TESTING)
+    add_executable(mfq-hip-decode-test ${MFQ_HIP_ROOT}/tests/decode_hotspots_test.cpp)
+    mfq_configure_hip_backend_target(mfq-hip-decode-test)
+    target_compile_definitions(mfq-hip-decode-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_compile_features(mfq-hip-decode-test PRIVATE cxx_std_20)
+    target_link_libraries(mfq-hip-decode-test PRIVATE
+        mfq-hip-runtime mfq-hip-native-kernels mfq-hip-core mfq-core)
+    add_test(NAME mfq-hip-decode-test COMMAND mfq-hip-decode-test)
+    set_tests_properties(mfq-hip-decode-test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(mfq-hip-tq-test ${MFQ_HIP_ROOT}/tests/tq_projection_test.cpp)
+    mfq_configure_hip_backend_target(mfq-hip-tq-test)
+    target_compile_definitions(mfq-hip-tq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_compile_features(mfq-hip-tq-test PRIVATE cxx_std_20)
+    target_link_libraries(mfq-hip-tq-test PRIVATE
+        mfq-hip-runtime mfq-hip-native-kernels mfq-hip-core mfq-core)
+    add_test(NAME mfq-hip-tq-test COMMAND mfq-hip-tq-test
+        ${MFQ_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-subgroup.bin
+        ${MFQ_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-short-groups.bin
+        ${MFQ_REPOSITORY_ROOT}/tests/fixtures/hip-tq-native-columns.bin)
+    set_tests_properties(mfq-hip-tq-test PROPERTIES SKIP_RETURN_CODE 77)
+
     # The CUDA backend's test sources compile directly as HIP translation
     # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the
     # cuda_* runtime API names onto hip.

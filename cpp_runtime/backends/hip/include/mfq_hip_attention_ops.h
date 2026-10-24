@@ -43,6 +43,9 @@ mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
     mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     int64_t rotary_dim);
 mfq_tensor_backend::Tensor attention_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, bool causal);
+mfq_tensor_backend::Tensor attention_cached_prefill_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, double scale, int64_t prefix);
 mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                  double scale, int64_t window);
 mfq_tensor_backend::Tensor attention_cache_swa_cuda(
@@ -109,3 +112,9 @@ mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
     double scale, mfq_tensor_backend::Tensor partial_o,
     mfq_tensor_backend::Tensor partial_m,
     mfq_tensor_backend::Tensor partial_l, int64_t max_parts);
+mfq_tensor_backend::Tensor attention_cache_decode_grouped_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
+    int64_t planned_length);

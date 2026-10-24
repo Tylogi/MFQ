@@ -41,6 +41,18 @@ def test_exact_weight_reconstruction(columns, groupsize):
     torch.testing.assert_close(op.backward(torch.eye(19, device="cuda")), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("columns", [False, True])
+@pytest.mark.parametrize("dtype,code", [(torch.float16, 0), (torch.float32, 2)])
+def test_vector_materialization_with_partial_tail(columns, dtype, code):
+    tensor = fixture(1025, 1027, columns, groupsize=16)
+    op = Projection(tensor, input_columns=1027)
+    expected = torch.from_numpy(tensor.dequantize(1027)).to(device="cuda", dtype=dtype)
+    result = torch.empty_like(expected)
+    assert op.lib.mfq_tq_materialize(op.view, result.data_ptr(), code,
+        torch.cuda.current_stream().cuda_stream) == 0
+    assert torch.equal(result, expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("tokens", [1, 2, 17, 33])
 @pytest.mark.parametrize("columns,groupsize", [(False, 16), (False, 512), (True, 512)])
@@ -165,10 +177,8 @@ def test_adaptive_fitting(bits, groupsize):
     w[0] = 0
     h = torch.linspace(.2, 2, 273, device="cuda")
     h[::7] = 0
-    exact = quantize(w, bits, imatrix=h, groupsize=groupsize,
-                     column_scaling=False, search="full")
-    adaptive = quantize(w, bits, imatrix=h, groupsize=groupsize,
-                        column_scaling=False, search="adaptive")
+    exact = quantize(w, bits, imatrix=h, groupsize=groupsize, search="full", column_scaling=False)
+    adaptive = quantize(w, bits, imatrix=h, groupsize=groupsize, search="adaptive", column_scaling=False)
     scores = []
     for tensor in (exact, adaptive):
         assert tensor.to_bytes() == TQTensor.from_bytes(tensor.to_bytes()).to_bytes()
@@ -187,3 +197,120 @@ def test_mixed_row_fitting_and_projection():
     x = torch.randn(3, 257, device="cuda")
     op = Projection(tensor, input_columns=257)
     close(op(x), x @ torch.tensor(tensor.dequantize(257), device="cuda").float().T)
+
+
+@pytest.mark.parametrize("columns,groupsize", [(False, 16), (False, 512), (True, 512)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_materialized_weights_are_exact(columns, groupsize, dtype):
+    tensor = fixture(67, 1033, columns, groupsize)
+    op = Projection(tensor, input_columns=1033)
+    output = torch.empty(67, 1033, device="cuda", dtype=dtype)
+    stream = torch.cuda.current_stream().cuda_stream
+    code = op.lib.mfq_tq_materialize(op.view, output.data_ptr(), 0 if dtype == torch.float16 else 2, stream)
+    assert code == 0
+    expected = torch.tensor(tensor.dequantize(1033), device="cuda", dtype=dtype)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("columns,groupsize", [(False, 16), (False, 512), (True, 512)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_calibration_gemm_forward_and_input_gradient(columns, groupsize, dtype):
+    tensor = fixture(67, 1033, columns, groupsize)
+    weights = torch.tensor(tensor.dequantize(1033), device="cuda").float()
+    bias = torch.linspace(-.02, .02, 67, device="cuda")
+    op = Projection(tensor, input_columns=1033, bias=bias)
+    packed = Projection(tensor, input_columns=1033, bias=bias, staging=False)
+    x = torch.randn(3, 11, 1033, device="cuda", dtype=dtype, requires_grad=True)
+    dy = torch.randn(3, 11, 67, device="cuda", dtype=dtype)
+    y = op(x)
+    expected = x.detach().float() @ weights.T + bias
+    close(y, expected)
+    close(y, packed(x.detach()))
+    y.backward(dy)
+    close(x.grad, dy.float() @ weights)
+    close(op.backward(dy), dy.float() @ weights)
+    assert op(torch.empty(0, 1033, device="cuda", dtype=dtype)).shape == (0, 67)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_calibration_gemm_graph_reuses_buffers_and_reads_current_codes(dtype):
+    tensor = fixture(67, 1033)
+    op = Projection(tensor, input_columns=1033)
+    x = torch.randn(33, 1033, device="cuda", dtype=dtype)
+    dy = torch.randn(33, 67, device="cuda", dtype=dtype)
+    output = torch.full((33 * 67 + 2,), 42, device="cuda", dtype=dtype)
+    gradient = torch.full((33 * 1033 + 2,), 42, device="cuda", dtype=dtype)
+    y, dx = output[1:-1].reshape(33, 67), gradient[1:-1].reshape_as(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op.forward(x, y)
+        op.backward(dy, dx)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.forward(x, y)
+        op.backward(dy, dx)
+    # Every replay decodes current compressed data, without a stale dense cache.
+    op.words.bitwise_xor_(torch.full_like(op.words, 0x55))
+    x.add_(.3)
+    dy.mul_(.4)
+    graph.replay()
+    from dataclasses import replace
+    changed = replace(tensor, packed=tensor.packed ^ np.uint8(0x55))
+    weights = torch.tensor(changed.dequantize(1033), device="cuda").float()
+    close(y, x.float() @ weights.T)
+    close(dx, dy.float() @ weights)
+    assert output[0] == 42 and output[-1] == 42
+    assert gradient[0] == 42 and gradient[-1] == 42
+
+
+@pytest.mark.parametrize("columns,groupsize", [(False, 16), (False, 512), (True, 512)])
+@pytest.mark.parametrize("backward", [False, True])
+def test_exact_bf16_components_and_output_guards(columns, groupsize, backward):
+    tensor = fixture(67, 1033, columns, groupsize)
+    op = Projection(tensor, input_columns=1033, split_bf16=True)
+    shape = (134, 1033) if backward else (67, 2066)
+    storage = torch.full((67 * 1033 * 2 + 2,), 42, device="cuda", dtype=torch.bfloat16)
+    matrix = storage[1:-1].reshape(shape)
+    code = op.lib.mfq_tq_materialize_bf16(
+        op.view, matrix.data_ptr(), int(backward), torch.cuda.current_stream().cuda_stream)
+    assert code == 0
+    high, low = matrix.chunk(2, dim=0 if backward else 1)
+    expected = torch.tensor(tensor.dequantize(1033), device="cuda").float()
+    torch.testing.assert_close(high.float() + low.float(), expected, rtol=0, atol=0)
+    assert storage[0] == 42 and storage[-1] == 42
+
+
+def test_bf16_components_autograd_and_graph_read_current_codes():
+    tensor = fixture(67, 1033, True)
+    bias = torch.linspace(-.02, .02, 67, device="cuda")
+    op = Projection(tensor, input_columns=1033, bias=bias, split_bf16=True)
+    x = torch.randn(33, 1033, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dy = torch.randn(33, 67, device="cuda", dtype=torch.bfloat16)
+    expected = torch.tensor(tensor.dequantize(1033), device="cuda").float()
+    y = op(x)
+    y.backward(dy)
+    close(y, x.detach().float() @ expected.T + bias)
+    close(x.grad, dy.float() @ expected)
+    xx = x.detach().clone()
+    out, dx = torch.empty_like(y), torch.empty_like(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op.forward(xx, out)
+        op.backward(dy, dx)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.forward(xx, out)
+        op.backward(dy, dx)
+    op.words.bitwise_xor_(torch.full_like(op.words, 0x55))
+    xx.add_(.3)
+    dy.mul_(.4)
+    graph.replay()
+    from dataclasses import replace
+    changed = replace(tensor, packed=tensor.packed ^ np.uint8(0x55))
+    expected = torch.tensor(changed.dequantize(1033), device="cuda").float()
+    close(out, xx.float() @ expected.T + bias)
+    close(dx, dy.float() @ expected)

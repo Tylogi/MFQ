@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import ctypes as ct
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 
 import torch
 
 from mfq.kernels.cuda.tq import Projection as _Projection, ProjectionView, _dtype, _overlap
+
+_MM_FP32_OUTPUT = "out_dtype" in (torch.mm.__doc__ or "")
 
 
 @lru_cache(None)
@@ -16,8 +19,13 @@ def library():
 
     if not torch.version.hip:
         raise RuntimeError("TQ HIP kernels require a ROCm build of PyTorch")
-    path = load(name="mfq_tq_ops_hip", sources=[str(Path(__file__).with_name("tq_ops.hip"))],
-                extra_cuda_cflags=["-O3", "-ffp-contract=off"], is_python_module=False)
+    source = Path(__file__).with_name("tq_projection.hip")
+    headers = b"".join(source.with_name(name).read_bytes() for name in
+                       ("tq_projection.h", "tq_vector.h", "tq_float_tokens.h", "tq_materialize.h", "tq_fused.h"))
+    path = load(name="mfq_tq_ops_hip", sources=[str(source)],
+                extra_cuda_cflags=["-O3", "-ffp-contract=off",
+                                  "-DMFQ_TQ_HEADERS_SHA=0x" + hashlib.sha256(headers).hexdigest()[:16]],
+                is_python_module=False)
     lib = ct.CDLL(path)
     P, I = ct.c_void_p, ct.c_int
     for name in ("mfq_tq_forward", "mfq_tq_backward"):
@@ -25,6 +33,12 @@ def library():
         getattr(lib, name).restype = I
     lib.mfq_tq_gemv.argtypes = [ProjectionView, P, P, I, I, I, P]
     lib.mfq_tq_gemv.restype = I
+    lib.mfq_tq_materialize.argtypes = [ProjectionView, P, I, P]
+    lib.mfq_tq_materialize.restype = I
+    lib.mfq_tq_materialize_bf16_pair.argtypes = [ProjectionView, P, P, P]
+    lib.mfq_tq_materialize_bf16_pair.restype = I
+    lib.mfq_tq_materialize_bf16.argtypes = [ProjectionView, P, I, P]
+    lib.mfq_tq_materialize_bf16.restype = I
     return lib
 
 
@@ -45,6 +59,62 @@ class Projection(_Projection):
 
     _library = staticmethod(library)
 
+    def __init__(self, data, input_columns=None, bias=None, device="cuda", *, staging=True, split_bf16=None):
+        super().__init__(data, input_columns=input_columns, bias=bias, device=device)
+        self.staging = bool(staging)
+        self.split_bf16 = split_bf16
+
+    def _use_gemm(self, tokens, backward):
+        if not tokens:
+            return False
+        if not backward and (tokens <= 8 or (tokens <= 32 and self.rows <= 64)):
+            return False
+        area = self.rows * self.input_columns
+        reduction = self.rows if backward else self.input_columns
+        # Tiny reductions are cheaper directly from the compressed weights.
+        return (reduction > 64 and area >= 16384 and
+                (reduction >= 512 or tokens * area >= 2**27))
+
+    @torch.no_grad()
+    def _gemm(self, x, out, *, backward):
+        tokens = x.numel() // x.size(-1)
+        work = tokens * self.rows * self.input_columns
+        split = self.split_bf16 is True or (
+            self.split_bf16 is None and tokens >= 128 and work >= 2**30)
+        if split and x.dtype == torch.bfloat16 and _MM_FP32_OUTPUT:
+            # Exact BF16 components expand the reduction dimension, allowing
+            # one BF16 matrix-core GEMM with FP32 accumulation.
+            shape = (self.rows * 2, self.input_columns) if backward else (self.rows, self.input_columns * 2)
+            matrix = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+            stream = torch.cuda.current_stream(self.device).cuda_stream
+            code = self.lib.mfq_tq_materialize_bf16(self.view, matrix.data_ptr(), int(backward), stream)
+            if code:
+                raise RuntimeError(f"TQ HIP materialization returned {code}")
+            activation = x.reshape(-1, x.size(-1))
+            expanded = torch.cat((activation, activation), dim=1)
+            result = torch.mm(expanded, matrix if backward else matrix.T, out_dtype=torch.float32)
+            if not backward and self.bias is not None:
+                result.add_(self.bias)
+            out.copy_(result.reshape_as(out))
+            return out
+        # BF16 inputs use FP32 weights to retain the exact FP16 reconstruction.
+        dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
+        matrix = torch.empty((self.rows, self.input_columns), dtype=dtype, device=self.device)
+        stream = torch.cuda.current_stream(self.device).cuda_stream
+        code = self.lib.mfq_tq_materialize(self.view, matrix.data_ptr(), _dtype(dtype), stream)
+        if code:
+            raise RuntimeError(f"TQ HIP materialization returned {code}")
+        activation = x.reshape(-1, x.size(-1)).to(dtype)
+        weights = matrix if backward else matrix.T
+        if dtype == torch.float16 and _MM_FP32_OUTPUT:
+            result = torch.mm(activation, weights, out_dtype=torch.float32)
+        else:
+            result = torch.mm(activation.float(), weights.float())
+        if not backward and self.bias is not None:
+            result.add_(self.bias)
+        out.copy_(result.reshape_as(out))
+        return out
+
     def _run(self, x, out=None, *, backward=False):
         width, result_width = ((self.rows, self.input_columns) if backward else
                                (self.input_columns, self.rows))
@@ -60,6 +130,9 @@ class Projection(_Projection):
         tokens = x.numel() // width
         function = self.lib.mfq_tq_backward if backward else self.lib.mfq_tq_forward
         with torch.cuda.device(self.device):
+            force_split = self.split_bf16 is True and x.dtype == torch.bfloat16 and tokens > 0
+            if self.staging and (force_split or self._use_gemm(tokens, backward)):
+                return self._gemm(x, out, backward=backward)
             stream = torch.cuda.current_stream(self.device).cuda_stream
             for start in range(0, tokens, 65535 * 16):
                 code = function(self.view, x.data_ptr() + start * width * x.element_size(),

@@ -118,7 +118,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                            ? qwen_rms_norm_bf16(execution.config, x.reshape({B * T, H}), attn_norm,
                                                 rms_norm_eps, norm_weight_offset)
                                  .reshape({B, T, H})
-                           : qwen_rms_norm(x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
+                           : qwen_rms_norm(x.reshape({B * T, H}).contiguous(),
                                            attn_norm, rms_norm_eps, norm_weight_offset)
                                  .reshape({B, T, H});
             });
@@ -158,6 +158,11 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         if (!split_q_kv_projections) {
                             return qkv.forward(execution, xn);
                         }
+                        if(T==1 && !tq_q8_enabled() && q_projection.is_tq() &&
+                           k_projection.is_tq() && v_projection.is_tq() &&
+                           !q_projection.tensor_parallel() && !k_projection.tensor_parallel() &&
+                           !v_projection.tensor_parallel())
+                            return tq_forward_group({&q_projection.tq,&k_projection.tq,&v_projection.tq},xn);
                         std::vector<mfq_tensor_backend::Tensor> result;
                         result.reserve(3);
                         result.push_back(q_projection.forward(execution, xn));
@@ -454,6 +459,12 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         auto qh = q.to(attention_dtype).contiguous();
                         auto kh = k.to(attention_dtype).contiguous();
                         auto vh = v.to(attention_dtype).contiguous();
+                        static const bool disable_mma_attention = [] {
+                            const char* v = std::getenv("MFQ_DISABLE_MMA_ATTENTION");
+                            return v != nullptr && std::atoi(v) != 0;
+                        }();
+                        const bool mma_attention_enabled =
+                            execution.config.mma_attention && !disable_mma_attention;
                         if (cache_pos == 0 && T > 1) {
                             if (official_bf16) {
                                 const bool bf16_flash128 = !sliding && hd == 128 && nh == 4 * nkh &&
@@ -506,13 +517,6 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         attn_scale, false);
                                 }
                             } else {
-                                // Use FMA attention when the override is set.
-                                static const bool disable_mma_attention = [] {
-                                    const char* v = std::getenv("MFQ_DISABLE_MMA_ATTENTION");
-                                    return v != nullptr && std::atoi(v) != 0;
-                                }();
-                                const bool mma_attention_enabled =
-                                    execution.config.mma_attention && !disable_mma_attention;
                                 if (!sliding && T % 256 == 0 && hd == 512 && nh == 8 * nkh &&
                                     mma_attention_enabled) {
                                     a = mfq_attention_mma512_cuda(
@@ -525,6 +529,12 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh,
                                         attn_scale, attention_window);
                                     attention_token_major = true;
+                                } else if (!sliding && T >= 32 && hd == 256 && nh == 4 * nkh &&
+                                           mma_attention_enabled && !seq_len.has_value() &&
+                                           !attention_mask.has_value()) {
+                                    a = attention_cached_prefill_cuda(
+                                        q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh,
+                                        attn_scale, 0);
                                 } else if (!sliding && T >= 32 && hd == 256 &&
                                            (nh == 4 * nkh || nh == 8 * nkh) &&
                                            mma_attention_enabled) {
@@ -540,6 +550,11 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                         qh, kh, vh, std::nullopt, 0.0, true, attn_scale, true);
                                 }
                             }
+                        } else if (!official_bf16 && !sliding && T >= 32 && hd == 256 &&
+                                   nh == 4 * nkh && mma_attention_enabled && !cache.is_paged() &&
+                                   !seq_len.has_value() && !attention_mask.has_value()) {
+                            a = attention_cached_prefill_cuda(qh, cache.k, cache.v,
+                                                              attn_scale, cache_pos);
                         } else if (seq_len.has_value()) {
                             const int64_t planned_len =
                                 planned_kv_length > 0 ? planned_kv_length : cache_pos + T;
@@ -651,7 +666,15 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                     parts = decode_attention_parts;
                                 }
                                 parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
-                                a = decode_attention_parts > 1
+                                const bool grouped_decode = split_enabled && !official_bf16 &&
+                                    hd == 256 && nh == 4 * nkh && planned_len >= 8192 &&
+                                    B == 1;
+                                a = grouped_decode
+                                        ? attention_cache_decode_grouped_cuda(
+                                              qh, cache.k, cache.v, seq_len.value(), attn_scale,
+                                              decode_partial_o, decode_partial_m, decode_partial_l,
+                                              planned_len)
+                                    : decode_attention_parts > 1
                                         ? attention_cache_decode_dynamic_cuda(
                                               qh, cache.k, cache.v, seq_len.value(), attn_scale,
                                               decode_partial_o, decode_partial_m, decode_partial_l,
