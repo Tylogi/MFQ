@@ -65,6 +65,12 @@ struct EngineInfo {
     MfqModelCapabilities capabilities;
     bool probability = false;
     std::unordered_set<std::int64_t> stop_token_ids;
+    // Concurrent rows the loaded model can actually batch after its state
+    // compatibility checks. One means the single-request path; a larger value
+    // is the control plane's admission ceiling for this worker. Declared last
+    // so positional aggregate initialization of the pre-existing fields keeps
+    // its meaning.
+    std::size_t batch_capacity = 1;
 };
 struct EngineStatus {
     std::size_t available = 0;

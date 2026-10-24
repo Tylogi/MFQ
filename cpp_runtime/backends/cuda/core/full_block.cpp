@@ -9,6 +9,7 @@
 #include "mfq_cuda_attention_ops.h"
 #include "mfq_cuda_norm_ops.h"
 #include "mfq_cuda_paged_kv.h"
+#include "mfq_cuda_qk_rope_kv.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +19,23 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+namespace {
+
+// Cache view handed to attention after a fused K/V store. It mirrors what
+// KVCache::append returns for the same destination: the dense rows of a paged
+// store, the whole ring buffer, or the contiguous prefix of a linear cache.
+std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> fused_cache_view(
+        const KVCache &cache, const mfq::cuda::QkRopeKvOutput &fused, int64_t cache_pos,
+        int64_t tokens) {
+    if (cache.is_paged()) return {fused.key, fused.value};
+    if (cache.ring) return {cache.k, cache.v};
+    const auto visible = cache_pos + tokens;
+    return {cache.k.index({Slice(), Slice(), Slice(0, visible), Slice()}),
+            cache.v.index({Slice(), Slice(), Slice(0, visible), Slice()})};
+}
+
+} // namespace
 
 mfq_tensor_backend::Tensor Block::forward_context(CudaExecutionContext &execution,
                                                   mfq_tensor_backend::Tensor x,
@@ -150,16 +168,76 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             // single-image path. B=3 ordinary batching must remain batch-major.
             const bool grid_mrope_positions =
                 B == 1 && cache_positions.has_value() && pos.dim() == 2 && pos.size(0) == 3;
-            const bool fused_qk_rope_kv =
-                apply_rotary && official_bf16 && x.is_cuda() &&
-                write_positions.dim() == 1 && pos.dim() == 1 &&
-                T == 1 && !cache.is_paged() && !cache.ring && !cache.quantization.enabled() && !v_norm.defined() &&
-                q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
-                active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
-                cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
-                execution.config.minicpm_fused_qk_norm_rope_kv;
+            // Eligibility of the shared fused Q/K operator. Head counts, head
+            // width, partial rotary, MRoPE axes, source strides and the cache
+            // destination (linear, ring, paged) are parameters there. Quantized
+            // KV, value normalization, interleaved MRoPE, BF16 multi-axis
+            // rotary, and paged prefixes that the store materializes itself
+            // keep the separate norm/rotary/store stages.
+            const auto store_dtype = cache.scalar_type();
+            const bool stage_trace_required =
+                attention_output_gate && execution.gemma_stage_trace != nullptr &&
+                layer == execution.gemma_trace_layer;
+            const auto norm_weight_supported = [&](const mfq_tensor_backend::Tensor &weight) {
+                return !weight.defined() || (weight.is_cuda() && weight.is_contiguous() &&
+                                             weight.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                                             weight.dim() == 1 && weight.numel() == hd);
+            };
+            const bool fused_store_supported =
+                apply_rotary && x.is_cuda() && !v_norm.defined() && !cache.quantization.enabled() &&
+                !stage_trace_required && (store_dtype == mfq_tensor_backend::kBFloat16 ||
+                                          store_dtype == mfq_tensor_backend::kFloat16) &&
+                active_rope.cos.defined() && active_rope.sin.defined() && active_rope.cos.is_cuda() &&
+                active_rope.cos.is_contiguous() && active_rope.cos.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                active_rope.sin.is_cuda() && active_rope.sin.is_contiguous() &&
+                active_rope.sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                active_rope.cos.sizes() == active_rope.sin.sizes() &&
+                !active_rope.interleaved_order.defined() &&
+                active_rope.rotary_dim > 0 && active_rope.rotary_dim % 2 == 0 &&
+                active_rope.rotary_dim <= hd &&
+                (active_rope.sections.numel() == 0 ||
+                 (active_rope.sections.numel() == 3 && grid_mrope_positions && !official_bf16)) &&
+                norm_weight_supported(q_norm) && norm_weight_supported(k_norm) &&
+                pos.dim() <= 3 &&
+                (pos.scalar_type() == mfq_tensor_backend::kInt32 ||
+                 pos.scalar_type() == mfq_tensor_backend::kInt64) &&
+                (pos.dim() != 2 || pos.size(0) == 1 || pos.size(0) == B) &&
+                (pos.dim() != 3 || pos.size(1) == 1 || pos.size(1) == B) &&
+                // Paged stores materialize a contiguous prefix themselves.
+                (!cache.is_paged() ||
+                 (seq_len.has_value() || cache_pos == 0)) &&
+                (!cache.is_paged() ||
+                 (cache.paged_batch == B && cache.paged_heads == nkh &&
+                  cache.paged_head_dim == hd && cache.paged_dtype == store_dtype));
+            const bool fused_norm_store =
+                fused_store_supported && execution.config.minicpm_fused_qk_norm_rope_kv &&
+                (q_norm.defined() || k_norm.defined());
+            const bool fused_rotary_store =
+                fused_store_supported && execution.config.minicpm_fused_rope_kv;
+            // Attendance paths that consume the new tokens directly need the
+            // dense key/value rows; linear and ring stores read the cache.
+            const bool fused_dense_key_value =
+                (cache_pos == 0 && T > 1) || (cache.is_paged() && !seq_len.has_value());
+            mfq::cuda::QkKvStore fused_store;
+            if (fused_store_supported) {
+                fused_store.positions = write_positions;
+                if (cache.is_paged()) {
+                    fused_store.mode = mfq::cuda::QkKvStoreMode::Paged;
+                    fused_store.page_table = cache.page_table;
+                    fused_store.key_chunks = cache.k_chunk_ptrs;
+                    fused_store.value_chunks = cache.v_chunk_ptrs;
+                    fused_store.page_size = cache.page_size;
+                    fused_store.pages_per_chunk = cache.pages_per_chunk;
+                } else {
+                    fused_store.mode = cache.ring ? mfq::cuda::QkKvStoreMode::Ring
+                                                  : mfq::cuda::QkKvStoreMode::Linear;
+                    fused_store.key_cache = cache.k;
+                    fused_store.value_cache = cache.v;
+                }
+            }
             std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
             bool attention_token_major = false;
+            bool fused_prepare_active = false;
             return mfq::models::full_attention(
                 std::move(xn),
                 [&](mfq_tensor_backend::Tensor xn) {
@@ -201,14 +279,26 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         }
                         return q_raw;
                     });
-                    auto q = profiler.measure("full.q_view",
-                                              [&]() { return q_raw.transpose(1, 2).contiguous(); });
-                    auto k = profiler.measure("full.k_view", [&]() {
-                        return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous();
-                    });
-                    auto v = profiler.measure("full.v_view", [&]() {
-                        return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous();
-                    });
+                    auto q = q_raw;
+                    auto k = k_full.reshape({B, T, nkh, hd});
+                    auto v = v_full.reshape({B, T, nkh, hd});
+                    // A fused norm/rotary/store span reads the projection output
+                    // in its [B,T,H,D] layout and writes the head-major rotated
+                    // heads itself, so the transposed views are only built for
+                    // the separate stages.
+                    fused_prepare_active =
+                        fused_norm_store && q_raw.is_cuda() && q_raw.scalar_type() == store_dtype &&
+                        k_full.scalar_type() == store_dtype && v_full.scalar_type() == store_dtype;
+                    if (!fused_prepare_active) {
+                        q = profiler.measure("full.q_view",
+                                             [&]() { return q_raw.transpose(1, 2).contiguous(); });
+                        k = profiler.measure("full.k_view", [&]() {
+                            return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous();
+                        });
+                        v = profiler.measure("full.v_view", [&]() {
+                            return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous();
+                        });
+                    }
                     return mfq::models::AttentionHeads<mfq_tensor_backend::Tensor>{
                         q, k, v,
                         q_gate.defined() ? std::optional<mfq_tensor_backend::Tensor>(q_gate)
@@ -218,18 +308,32 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     auto &q = heads.query;
                     auto &k = heads.key;
                     auto &v = heads.value;
-                    if (!fused_qk_rope_kv)
+                    if (!fused_prepare_active)
                         return false;
 
-                    q = profiler.measure("full.qk_norm_rope_kv_write", [&]() {
-                        return minicpm_qk_norm_rope_cache_write_bf16_cuda(
-                            q.contiguous(), k.contiguous(), v.contiguous(), q_norm, k_norm,
-                            pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
-                            write_positions, active_rope.cos, active_rope.sin, cache.k, cache.v,
-                            rms_norm_eps, norm_weight_offset);
+                    mfq::cuda::QkRopeKvArgs args;
+                    args.query = q;
+                    args.key = k;
+                    args.value = v;
+                    args.query_weight = q_norm;
+                    args.key_weight = k_norm;
+                    args.eps = rms_norm_eps;
+                    args.weight_offset = norm_weight_offset;
+                    args.positions = pos.to(x.device()).contiguous();
+                    args.cosine = active_rope.cos;
+                    args.sine = active_rope.sin;
+                    args.sections = grid_mrope_positions ? active_rope.sections
+                                                         : mfq_tensor_backend::Tensor();
+                    args.rotary_dim = active_rope.rotary_dim;
+                    args.store = fused_store;
+                    args.dense_key_value = fused_dense_key_value;
+                    auto fused = profiler.measure("full.qk_norm_rope_kv_write", [&]() {
+                        return mfq::cuda::qk_norm_rope_kv_cuda(args);
                     });
-                    kv = {cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
-                          cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+                    q = fused.query;
+                    if (fused.key.defined()) k = fused.key;
+                    if (fused.value.defined()) v = fused.value;
+                    kv = fused_cache_view(cache, fused, cache_pos, T);
                     return true;
                 },
                 [&](auto &heads) {
@@ -300,26 +404,35 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     auto &q = heads.query;
                     auto &k = heads.key;
                     auto &v = heads.value;
-                    const bool fused_rope_kv =
-                        apply_rotary && official_bf16 && x.is_cuda() &&
-                        write_positions.dim() == 1 &&
-                        pos.dim() == 1 && T == 1 && !cache.is_paged() && !cache.ring &&
-                        active_rope.rotary_dim == 128 && active_rope.sections.numel() == 0 &&
-                        nh == 32 && nkh == 8 && hd == 128 &&
-                        cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
-                        execution.config.minicpm_fused_rope_kv;
-                    if (!fused_rope_kv)
+                    // Rotaries only; the norm weights were already applied by
+                    // the separate stage above, so a fused span is limited to
+                    // tensors that already use the cache storage dtype.
+                    if (!fused_rotary_store || q.scalar_type() != store_dtype ||
+                        k.scalar_type() != store_dtype || v.scalar_type() != store_dtype)
                         return false;
 
-                    q = profiler.measure("full.rope_kv_write", [&]() {
-                        return minicpm_bf16_rope_cache_write_cuda(
-                            q.contiguous(), k.contiguous(), v.contiguous(),
-                            pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
-                            write_positions, active_rope.cos, active_rope.sin, cache.k, cache.v,
-                            active_rope.rotary_dim);
+                    mfq::cuda::QkRopeKvArgs args;
+                    args.query = q;
+                    args.key = k;
+                    args.value = v;
+                    // The separate norm stage already handed over head-major
+                    // [B,H,T,D] heads.
+                    args.source_axes = mfq::cuda::kHeadMajorAxes;
+                    args.positions = pos.to(x.device()).contiguous();
+                    args.cosine = active_rope.cos;
+                    args.sine = active_rope.sin;
+                    args.sections = grid_mrope_positions ? active_rope.sections
+                                                         : mfq_tensor_backend::Tensor();
+                    args.rotary_dim = active_rope.rotary_dim;
+                    args.store = fused_store;
+                    args.dense_key_value = fused_dense_key_value;
+                    auto fused = profiler.measure("full.rope_kv_write", [&]() {
+                        return mfq::cuda::qk_norm_rope_kv_cuda(args);
                     });
-                    kv = {cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
-                          cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+                    q = fused.query;
+                    if (fused.key.defined()) k = fused.key;
+                    if (fused.value.defined()) v = fused.value;
+                    kv = fused_cache_view(cache, fused, cache_pos, T);
                     return true;
                 },
                 [&](auto &heads) {

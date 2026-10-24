@@ -91,6 +91,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qsa_scores.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
@@ -99,6 +100,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qk_rope_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
@@ -396,6 +398,7 @@ set(MFQ_CUDA_TRANSFORMER_SOURCES
     ${MFQ_CUDA_ROOT}/core/full_block.cpp
     ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/core/rope.cpp
+    ${MFQ_CUDA_ROOT}/core/pooled_cache.cpp
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
@@ -409,6 +412,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
     ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/qsa_scores.cpp
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
 )
 
@@ -658,6 +662,12 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels)
     add_test(NAME mfq-moe-route-map-test COMMAND mfq-moe-route-map-test)
     set_tests_properties(mfq-moe-route-map-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-qk-rope-kv-test ${MFQ_CUDA_ROOT}/tests/qk_rope_kv_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-qk-rope-kv-test)
+    target_compile_definitions(mfq-qk-rope-kv-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-qk-rope-kv-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-qk-rope-kv-test COMMAND mfq-qk-rope-kv-test)
+    set_tests_properties(mfq-qk-rope-kv-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-moe-ffn-pipeline-test ${MFQ_CUDA_ROOT}/tests/moe_ffn_pipeline_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -685,7 +695,10 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
+    add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
+    add_test(NAME mfq-cuda-qsa-incremental-pool-test COMMAND mfq-window-attention-test --qsa-incremental-pool-check)
+    add_test(NAME mfq-cuda-qsa-prefill-test COMMAND mfq-window-attention-test --qsa-prefill-check)
     add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
     foreach(bits 0 2.5 4)

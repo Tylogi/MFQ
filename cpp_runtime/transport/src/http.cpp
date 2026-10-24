@@ -563,6 +563,7 @@ int run_mfq_http_transport(
             {"vision_enabled_default", sampling_defaults.enable_vision},
             {"mtp_enabled_default", sampling_defaults.enable_mtp},
             {"max_context", active_context.load()},
+            {"batch_capacity", scheduler.info().batch_capacity},
             {"duplex_available", static_cast<bool>(duplex)},
             {"duplex_active", duplex_is_active()},
             {"sampling_defaults", sampling_params_json(sampling_defaults)},
@@ -604,6 +605,7 @@ int run_mfq_http_transport(
         status["mtp_available"] = false;
         status["vision_enabled_default"] = sampling_defaults.enable_vision;
         status["mtp_enabled_default"] = sampling_defaults.enable_mtp;
+        status["batch_capacity"] = scheduler.info().batch_capacity;
         status["duplex_available"] = static_cast<bool>(duplex);
         status["duplex_active"] = duplex_is_active();
         add_runtime_metrics(status);

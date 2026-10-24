@@ -1,10 +1,13 @@
 #pragma once
 #include "mfe_ffn_prepare.h"
+#include "mfe_expert_ffn_test.h"
 #include "runtime/moe_pipeline.h"
 
 static void benchmark_mfe_prepare(bool timings=true) {
     namespace tb=mfq_tensor_backend;
     auto context=default_context();const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    mfe_expert_plan_test::verify(timings,stream);
+    mfe_expert_plan_test::verify_cache(timings,stream);
     int cases=0;
     for(int tokens:{1,2,6,32})for(int width:{31,640,2559,2560})
     for(int gs:{1,4,7,16,24,28,32,33,48,64}) {
@@ -25,8 +28,11 @@ static void benchmark_mfe_prepare(bool timings=true) {
         auto table=descriptor_host.to(tb::kCUDA);
         tb::Tensor reference_codes,reference_scales;
         for(int arm:{0,1,0}) {
-            const auto body=[&]{(arm?mfe_ffn_prepare_warp:mfe_ffn_prepare)(batch,
-                reinterpret_cast<const MfeInputQuantization*>(table.data_ptr()),2,groups+other_groups,stream);};
+            const auto body=[&] {
+                const auto* inputs=reinterpret_cast<const MfeInputQuantization*>(table.data_ptr());
+                if(arm)mfe_ffn_prepare_warp(batch,inputs,2,groups+other_groups,stream);
+                else mfe_ffn_prepare(batch,inputs,2,groups+other_groups,stream);
+            };
             completion.fill_(127);codes.fill_(99);scales.fill_(99);body();
             auto actual_codes=codes.cpu(),actual_scales=scales.cpu(),actual_completion=completion.cpu();
             for(int i=0;i<actual_completion.numel();++i)check(actual_completion.data_ptr<int32_t>()[i]==0,"MFE prepare completion not reset");
