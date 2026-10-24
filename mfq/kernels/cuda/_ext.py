@@ -41,6 +41,7 @@ _SOURCES = [
     os.path.join(_DIR, "activation.cu"),
     os.path.join(_DIR, "embedding.cu"),
     os.path.join(_DIR, "selected_attention.cu"),
+    os.path.join(_DIR, "qsa_scores.cu"),
     os.path.join(_DIR, "qwen4_exp.cu"),
     os.path.join(_DIR, "glm5_next.cu"),
     os.path.join(_DIR, "sampling.cu"),

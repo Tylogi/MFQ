@@ -53,8 +53,9 @@ jobs:
         run: uv sync --extra benchmark --extra dev --python 3.11
       - name: Check benchmark validation and evaluation contracts
         run: >-
-          uv run python -m pytest -q
+          uv run --with-requirements bench/requirements-reporting.txt python -m pytest -q
           tests/test_model_bench.py tests/test_inference_benchmark.py
+          tests/test_benchmark_report.py tests/test_report_workflow.py
           tests/test_mmlu_prompt_sizing.py tests/test_accuracy_benchmark.py
           tests/test_probability_scoring.py tests/test_official_evaluation_datasets.py
           tests/test_server_evaluations.py tests/test_scoring_sandbox.py

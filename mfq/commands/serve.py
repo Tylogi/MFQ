@@ -14,12 +14,22 @@ import sys
 from pathlib import Path
 
 from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
+from mfq.server.runtime.native import DEFAULT_RUNTIME_CONCURRENCY, MAX_RUNTIME_CONCURRENCY
 
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _runtime_concurrency(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MAX_RUNTIME_CONCURRENCY:
+        raise argparse.ArgumentTypeError(
+            f"runtime concurrency must be at most {MAX_RUNTIME_CONCURRENCY}"
+        )
     return parsed
 
 
@@ -340,8 +350,17 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
         max_instances=args.max_runtime_instances,
-        max_requests_per_instance=args.max_requests_per_runtime or (8 if selected_backend == "metal" else 1),
+        max_requests_per_instance=(
+            args.max_requests_per_runtime
+            if args.max_requests_per_runtime is not None
+            # HIP batching is implemented but not yet exercised on certified
+            # hardware, so it needs an explicit capacity.
+            else DEFAULT_RUNTIME_CONCURRENCY
+            if selected_backend in {"cuda", "metal"}
+            else 1
+        ),
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
+        queue_timeout_seconds=float(args.queue_timeout),
         max_runtime_memory_bytes=args.max_runtime_memory or None,
         automatic_memory_budget=(
             not args.no_memory_guard and args.max_runtime_memory is None
@@ -517,11 +536,29 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
-    parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=None)
+    parser.add_argument(
+        "--max-requests-per-runtime",
+        type=_runtime_concurrency,
+        default=None,
+        help=(
+            "concurrent requests admitted per model runtime "
+            f"(default: {DEFAULT_RUNTIME_CONCURRENCY}; the worker reports the "
+            "capacity its model can actually batch)"
+        ),
+    )
     parser.add_argument(
         "--max-queued-requests-per-runtime",
         type=_nonnegative_int,
         help="maximum waiting requests per model runtime (default: max(32, 4x concurrency))",
+    )
+    parser.add_argument(
+        "--queue-timeout",
+        type=_nonnegative_int,
+        default=0,
+        help=(
+            "seconds a request may wait for a runtime slot before it fails with "
+            "a retryable error (default: 0 waits indefinitely)"
+        ),
     )
     parser.add_argument(
         "--max-runtime-memory",

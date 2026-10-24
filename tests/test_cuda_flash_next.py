@@ -289,6 +289,28 @@ def test_sparse_published_widths_invalid_and_duplicate_indices(run, mla, width, 
     np.testing.assert_array_equal(got[1,0], np.zeros_like(got[1,0]))
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_mla_sparse_inline_selection(run, dtype):
+    """MLA reads a strided query and the raw selection in place: MTP verify rows,
+    a selected count that is not a KV tile multiple, sentinel indices and an
+    empty selection."""
+    rng = np.random.default_rng(5813)
+    heads, width, tokens, cache, selected = 64, 512, 4, 128, 100
+    q = rounded(rng.normal(scale=.1, size=(1,heads,tokens,width)).astype(np.float32), dtype)
+    k = rounded(rng.normal(scale=.1, size=(1,1,cache,width)).astype(np.float32), dtype)
+    slots = np.arange(selected)
+    indices = np.full((1,tokens,selected), -1, np.int64)
+    indices[0,0] = (slots*7 + 3) % cache
+    indices[0,1] = np.where(slots % 3 == 0, -1, (slots*5 + 11) % cache)
+    indices[0,3] = np.where(slots % 5 == 0, cache + slots, (slots*13 + 5) % cache)
+    scale = 1/math.sqrt(256)
+    got = run("glm5_sparse_mla_attention", q, k[:,0], indices,
+              dtype=dtype, noncontiguous=True, scale=scale)
+    np.testing.assert_allclose(
+        got, attention_reference(q,k,k,indices=indices,scale=scale), atol=6e-3, rtol=6e-3)
+    np.testing.assert_array_equal(got[0,2], np.zeros_like(got[0,2]))
+
+
 @pytest.mark.parametrize("dilation,kernel", [(3,4), (1,1)])
 def test_ple_cached_chunks(run, dilation, kernel):
     rng = np.random.default_rng(59)

@@ -232,9 +232,19 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         selected.scalar_type() == tb::kInt64, "sparse indices must be integer");
     MFQ_RUNTIME_CHECK(std::isfinite(scale), "attention scale must be finite");
     MfqCudaGuard guard(q.device());
-    const bool direct_query = fused_query && !v_is_k_view && q.size(3) == 256 &&
-        (q.size(1) == 24 || selected.size(2) <= 512) &&
-        (q.scalar_type() == tb::kFloat16 || q.scalar_type() == tb::kFloat32);
+    const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
+    const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
+    // The shared MMA tiles cast every query element to FP16 after applying the
+    // softmax scale, so a strided F32/F16/BF16 query yields the same products in
+    // place as a pre-converted contiguous FP32 copy. MLA (D = 512, V reuses the
+    // K cache) always reads it directly; QSA keeps that behind its fusion
+    // switch. MFQ_MLA_SPARSE_INLINE_SELECTION=0 restores the prepared index and
+    // mask path, which stays the fallback for QSA tiles and every other width.
+    const char* inline_selection = std::getenv("MFQ_MLA_SPARSE_INLINE_SELECTION");
+    const bool inline_mla = use_mla_mma && (!inline_selection || inline_selection[0] != '0');
+    const bool direct_query = inline_mla ||
+        (fused_query && use_qsa_mma && (q.size(1) == 24 || selected.size(2) <= 512) &&
+            (q.scalar_type() == tb::kFloat16 || q.scalar_type() == tb::kFloat32));
     auto query = direct_query ? q : q.to(tb::kFloat32).contiguous();
     auto key = k.to(tb::kFloat16).contiguous();
     auto value = v_is_k_view ? key : v.to(tb::kFloat16).contiguous();
@@ -248,8 +258,18 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             q.options().dtype(tb::kFloat32));
     }
 
-    const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
-    const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
+    if (inline_mla) {
+        // The attention tile rejects negative, out-of-range and padded slots
+        // from their sentinel value, so the selection reaches it unpadded and
+        // without a materialized FP16 mask or FP32 query copy.
+        MFQ_RUNTIME_CHECK(indices.size(2) <= std::numeric_limits<int>::max() &&
+            key.size(2) <= std::numeric_limits<int>::max(),
+            "sparse attention exceeds 32-bit index geometry");
+        return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
+            query, key, key, indices, Tensor{}, Tensor{}, Tensor{}, scale,
+            "glm5_sparse_mla_attention", gate, half_output, Tensor{}, 0, hot,
+            true, key.size(2));
+    }
     if (use_qsa_mma || use_mla_mma) {
         constexpr int index_tile = 32;
         const int64_t source_count = indices.size(2);

@@ -97,7 +97,11 @@ void qsa_kv_offload_case() {
         QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
             linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
         QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
-        config.buffer_bytes=1 << 20;config.gpu_budget_bytes=config.buffer_bytes+(8 << 10);config.ram_budget_bytes=8 << 10;
+        // Packed width-8 history fits in two 8 KiB tiers. Force SSD restoration
+        // for both packed and floating KV instead of relying on block selection.
+        config.buffer_bytes=1 << 20;
+        config.gpu_budget_bytes=config.buffer_bytes+(4 << 10);
+        config.ram_budget_bytes=4 << 10;
         store=std::make_shared<KvOffloadStore>(config);
         Qsa actual(weights,cfg,rotary,true,true,store),oracle(weights,cfg,rotary);
         auto inputs=data({1,maximum,hidden},17,.4f);
@@ -107,6 +111,9 @@ void qsa_kv_offload_case() {
             auto history=tb::arange(offset+tokens,positions.options());
             auto x=inputs.narrow(1,offset,tokens);
             auto expected=oracle.forward(execution,x,positions,history,true);
+            // Pending SSD writes can still serve reads from RAM. Drain the
+            // previous chunk so this check observes actual disk restoration.
+            store->flush();
             auto result=actual.forward(execution,x,positions,history,true);
             equal(result,expected,"QSA streamed dense/sparse prefill and decode");offset+=tokens;
         }
@@ -116,7 +123,9 @@ void qsa_kv_offload_case() {
         equal(actual.forward(execution,x,positions,history,true),oracle.forward(execution,x,positions,history,true),"QSA streamed truncate/replay");
         store->flush();
         if (!metric(store,"qsa_kv_ssd_read_bytes") || !metric(store,"qsa_kv_h2d_bytes"))
-            throw std::runtime_error("QSA parity must exercise RAM and SSD restoration");
+            throw std::runtime_error("QSA parity must exercise RAM and SSD restoration: width=" +
+                std::to_string(width) + " ssd_reads=" + std::to_string(metric(store,"qsa_kv_ssd_read_bytes")) +
+                " h2d=" + std::to_string(metric(store,"qsa_kv_h2d_bytes")));
         actual.reset();store->flush();
         if (metric(store,"qsa_kv_resident_bytes") || metric(store,"qsa_kv_ram_bytes") || metric(store,"qsa_kv_ssd_bytes"))
             throw std::runtime_error("QSA reset leaked stored KV");

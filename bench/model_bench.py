@@ -8,6 +8,7 @@ knobs pass through to the child environment.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -317,6 +318,14 @@ def main():
         help="environment override for the runtime",
     )
     parser.add_argument("--output", type=Path, help="write raw JSON here")
+    parser.add_argument(
+        "--report-root", type=Path, help="archive results and generate charts after the benchmark"
+    )
+    parser.add_argument(
+        "--report-metadata",
+        type=Path,
+        help="public model, hardware and build labels for the report",
+    )
     args = parser.parse_args()
     try:
         args.prefill_lengths = [int(value) for value in args.prefill_lengths.split(",")]
@@ -339,6 +348,52 @@ def main():
         if not sep:
             raise SystemExit(f"--env expects K=V, got {override!r}")
         env[key] = value
+
+    report_metadata = {}
+    if args.report_metadata and not args.report_root:
+        parser.error("--report-metadata requires --report-root")
+    if args.report_root:
+        if len(args.models) != 1:
+            parser.error("--report-root supports one model per run")
+        from bench import report_workflow
+
+        try:
+            report_metadata = (
+                report_workflow.report.read_json(args.report_metadata)
+                if args.report_metadata
+                else {}
+            )
+            protocol = dict(
+                input_tokens=args.prefill_lengths,
+                output_tokens=args.decode_tokens,
+                repetitions=args.repetitions,
+                warmup_runs=args.warmup_runs,
+                temperature=0,
+                seed=1,
+                batch=1,
+                prefix_cache=False,
+                cooldown_seconds=0,
+            )
+            if args.ctx_size is not None:
+                protocol["context_tokens"] = args.ctx_size
+            if env.get("MFQ_DISABLE_MMA_ATTENTION") == "1":
+                protocol["mma_attention"] = False
+            report_workflow.preflight(report_metadata, protocol)
+            declared = report_metadata.get("protocol", {})
+            for key, value in protocol.items():
+                if key in declared and declared[key] != value:
+                    raise ValueError(f"Metadata conflicts with effective {key}")
+            report_metadata["protocol"] = {**declared, **protocol}
+            digest = hashlib.sha256()
+            with runtime_path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            runtime_hash = digest.hexdigest()
+            if report_metadata.get("runtime_sha256", runtime_hash) != runtime_hash:
+                raise ValueError("Metadata conflicts with runtime binary hash")
+            report_metadata["runtime_sha256"] = runtime_hash
+        except (ValueError, OSError, ImportError) as error:
+            parser.error(f"Report preflight failed: {error}")
 
     report = []
     for model in args.models:
@@ -371,6 +426,22 @@ def main():
     ]
     if failed:
         print(f"failed models: {failed}", file=sys.stderr)
+    if args.report_root:
+        try:
+            output = report_workflow.archive_report(
+                document,
+                report_metadata,
+                args.report_root,
+                modes=("decode", "mtp") if args.mtp else ("decode",),
+            )
+            print(f"Report ready: {output / 'index.html'}")
+        except Exception as error:
+            print(
+                f"Report failed ({type(error).__name__}); details remain in the private archive.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+    if failed:
         raise SystemExit(1)
 
 
