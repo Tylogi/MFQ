@@ -165,8 +165,10 @@ def test_adaptive_fitting(bits, groupsize):
     w[0] = 0
     h = torch.linspace(.2, 2, 273, device="cuda")
     h[::7] = 0
-    exact = quantize(w, bits, imatrix=h, groupsize=groupsize, search="full")
-    adaptive = quantize(w, bits, imatrix=h, groupsize=groupsize)
+    exact = quantize(w, bits, imatrix=h, groupsize=groupsize,
+                     column_scaling=False, search="full")
+    adaptive = quantize(w, bits, imatrix=h, groupsize=groupsize,
+                        column_scaling=False, search="adaptive")
     scores = []
     for tensor in (exact, adaptive):
         assert tensor.to_bytes() == TQTensor.from_bytes(tensor.to_bytes()).to_bytes()
