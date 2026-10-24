@@ -244,4 +244,3 @@ void gdn_prefill_chunk_benchmark(bool shapes = false) {
                   << " speedup=" << times.first / times.second << std::endl;
     }
 }
-

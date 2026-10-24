@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <cub/block/block_radix_sort.cuh>
 
 namespace mfq_selected_attention {
 namespace tb = mfq_tensor_backend;
@@ -22,6 +23,98 @@ void values(std::initializer_list<const Tensor*> tensors) {
             dtype == tb::kBFloat16, "selected attention requires F32/F16/BF16 values");
     }
 }
+
+namespace {
+template<int Items>
+__device__ void live_topk_sort(const float* source, const int64_t* ids, float* output, int64_t* out_ids,
+        int row, int columns, int begin, int live, int pools, int count, int64_t out, unsigned char* temporary) {
+    using Sort = cub::BlockRadixSort<float, 256, Items, int64_t>;
+    float keys[Items];
+    int64_t indices[Items];
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int column = begin + threadIdx.x * Items + i;
+        const auto at = int64_t(row) * columns + column;
+        keys[i] = column < live ? source[at] : -1e30f;
+        indices[i] = column < live ? (ids ? ids[at] : column) : pools;
+    }
+    Sort(*reinterpret_cast<typename Sort::TempStorage*>(temporary)).SortDescending(keys, indices);
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int rank = threadIdx.x * Items + i;
+        if (rank < count) {
+            output[out + rank] = keys[i];
+            out_ids[out + rank] = indices[i];
+        }
+    }
+}
+
+__global__ void live_topk_blocks_kernel(const float* source, const int64_t* ids,
+        float* output, int64_t* out_ids, const int64_t* positions, int columns,
+        int pools, int pool, int count, int stage, bool compact) {
+    constexpr int tile = 4096;
+    extern __shared__ __align__(16) unsigned char temporary[];
+    const int row = blockIdx.y, begin = int(blockIdx.x) * tile, tiles = (columns + tile - 1) / tile;
+    int live = int(min(int64_t(pools), max(int64_t(0), (positions[row] + 1) / pool)));
+    for (int s = 0; s < stage; ++s)
+        live = live / tile * count + min(count, live % tile);
+    const int available = min(tile, max(0, live - begin));
+    const int64_t out = (int64_t(row) * tiles + blockIdx.x) * count;
+    // Entirely unused tiles and already reduced candidate lists need no sort.
+    if (available <= count) {
+        for (int i = threadIdx.x; i < count; i += 256) {
+            const auto at = int64_t(row) * columns + begin + i;
+            output[out + i] = i < available ? source[at] : -1e30f;
+            out_ids[out + i] = i < available ? (ids ? ids[at] : begin + i) : pools;
+        }
+        return;
+    }
+    // Sort only the power-of-two range containing live rows, retaining CUB's
+    // stable input order and the graph's fixed reduction/output layout.
+    if (compact && available <= 1024)
+        live_topk_sort<4>(source, ids, output, out_ids, row, columns, begin, live, pools, count, out, temporary);
+    else if (compact && available <= 2048)
+        live_topk_sort<8>(source, ids, output, out_ids, row, columns, begin, live, pools, count, out, temporary);
+    else
+        live_topk_sort<16>(source, ids, output, out_ids, row, columns, begin, live, pools, count, out, temporary);
+}
+} // namespace
+
+Tensor live_topk_blocks(const Tensor& scores, const Tensor& positions, int64_t pool, int64_t count) {
+    const auto* option = std::getenv("MFQ_QSA_LIVE_TOPK");
+    if ((option && option[0] == '0') || count > 1024)
+        return std::get<1>(tb::topk(scores, count, -1, true, false));
+    MFQ_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim() == 3 && scores.size(0) == 1 &&
+        scores.scalar_type() == tb::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
+        positions.scalar_type() == tb::kInt64 && positions.numel() == scores.size(1) && pool > 0 &&
+        count > 0 && count <= scores.size(2), "invalid live selected-attention top-k geometry");
+    MfqCudaGuard guard(scores.device());
+    const int rows = int(scores.size(1)), pools = int(scores.size(2));
+    const auto* compact_option = std::getenv("MFQ_QSA_TOPK_LIVE_TILE");
+    const bool compact = !compact_option || compact_option[0] != '0';
+    int columns = pools, stage = 0;
+    auto keys = scores;
+    Tensor ids;
+    constexpr auto bytes = sizeof(cub::BlockRadixSort<float, 256, 16, int64_t>::TempStorage);
+    if constexpr (bytes > 49152)
+        MFQ_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes)));
+    do {
+        const int tiles = (columns + 4095) / 4096;
+        auto next = tb::empty({1, rows, tiles * count}, scores.options());
+        auto next_ids = tb::empty(next.sizes(), scores.options().dtype(tb::kInt64));
+        live_topk_blocks_kernel<<<dim3(tiles, rows), 256, bytes, mfq_current_cuda_stream()>>>(
+            keys.data_ptr<float>(), ids.defined() ? ids.data_ptr<int64_t>() : nullptr,
+            next.data_ptr<float>(), next_ids.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+            columns, pools, int(pool), int(count), stage++, compact);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        keys = std::move(next);
+        ids = std::move(next_ids);
+        columns = tiles * int(count);
+    } while (columns > count);
+    return ids;
+}
+
 
 Tensor promoted_matmul(const Tensor& left, const Tensor& right) {
     // MLX matmul promotes mixed floating operands, unlike ATen matmul.
@@ -60,7 +153,7 @@ __global__ void prepare_sparse_indices_kernel(
     int64_t rows,
     int source_count,
     int padded_count,
-    int cache_length) {
+    int cache_length, mfq::cuda::IndirectKvView indirect = {}) {
     const int64_t total = rows * padded_count;
     for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          linear < total;
@@ -70,7 +163,8 @@ __global__ void prepare_sparse_indices_kernel(
         const int index = slot < source_count
             ? source[row * source_count + slot]
             : -1;
-        const bool valid = index >= 0 && index < cache_length;
+        const bool valid = index >= 0 && (indirect.states
+            ? indirect.active(row) && index < indirect.capacity(row) : index < cache_length);
         indices[linear] = valid ? index : 0;
         mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
@@ -120,7 +214,7 @@ __global__ void sparse_attention_kernel(
     float* output, int64_t heads, int64_t kv_heads, int64_t tokens,
     int64_t width, int64_t cache_length, int64_t topk, float scale,
     bool half_query, const void* causal_positions, bool wide_positions,
-    AttentionEpilogue epilogue, mfq::cuda::HotKvView hot) {
+    AttentionEpilogue epilogue, mfq::cuda::HotKvView hot, mfq::cuda::IndirectKvView indirect) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -129,6 +223,13 @@ __global__ void sparse_attention_kernel(
     const int64_t token = row % tokens;
     const int64_t batch = row / tokens;
     const int64_t kv_head = head / (heads / kv_heads);
+    const bool active = !indirect.states || indirect.active(batch);
+    if (indirect.states && active) {
+        key = static_cast<const half*>(indirect.address(batch));
+        value = static_cast<const half*>(indirect.address(batch, 1));
+        cache_length = indirect.capacity(batch);
+    }
+    const int64_t cache_batch = indirect.states ? 0 : batch;
     const int64_t qb = ((batch * heads + head) * tokens + token) * width;
     const int64_t ob = ((batch * tokens + token) * heads + head) * width;
     __shared__ float partials[8];
@@ -149,8 +250,8 @@ __global__ void sparse_attention_kernel(
                 : static_cast<const int32_t*>(causal_positions)[token];
             index = selected <= end ? selected : -1;
         } else index = indices[row * topk + selected];
-        const bool valid = index >= 0 && index < cache_length;
-        const int64_t cb = ((batch * kv_heads + kv_head) * cache_length +
+        const bool valid = active && index >= 0 && index < cache_length;
+        const int64_t cb = ((cache_batch * kv_heads + kv_head) * cache_length +
             (valid ? index : 0)) * width;
         const half* source_key=key+cb;
         const half* source_value=value+cb;
@@ -222,8 +323,16 @@ __global__ void sparse_attention_kernel(
 
 static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& selected, double scale, bool v_is_k_view,
-    const Tensor& gate, bool half_output, bool fused_query = false, mfq::cuda::HotKvView hot = {}) {
-    attention_shapes(q, k, v);
+    const Tensor& gate, bool half_output, bool fused_query = false, mfq::cuda::HotKvView hot = {},
+    mfq::cuda::IndirectKvView indirect = {}) {
+    if (indirect.states) {
+        values({&q, &k, &v});
+        MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.sizes() == k.sizes() &&
+            q.size(0) == indirect.rows && q.size(2) == 1 && k.size(0) == 1 &&
+            q.size(1) % k.size(1) == 0 && q.size(3) == k.size(3), "invalid indirect attention geometry");
+    } else {
+        attention_shapes(q, k, v);
+    }
     MFQ_RUNTIME_CHECK(selected.defined() && selected.is_cuda() &&
         selected.device() == q.device() && selected.dim() == 3 &&
         selected.size(0) == q.size(0) && selected.size(1) == q.size(2) &&
@@ -268,7 +377,7 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
             query, key, key, indices, Tensor{}, Tensor{}, Tensor{}, scale,
             "glm5_sparse_mla_attention", gate, half_output, Tensor{}, 0, hot,
-            true, key.size(2));
+            {}, true, key.size(2));
     }
     if (use_qsa_mma || use_mla_mma) {
         constexpr int index_tile = 32;
@@ -298,7 +407,7 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             indices.data_ptr<int32_t>(), safe_indices.data_ptr<int32_t>(),
             reinterpret_cast<half *>(mask.data_ptr<mfq_half>()), rows,
             static_cast<int>(source_count), static_cast<int>(padded_count),
-            static_cast<int>(key.size(2)));
+            static_cast<int>(key.size(2)), indirect);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
             if(hot.mapping)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(
@@ -306,7 +415,7 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 "qwen4_sparse_gqa_attention_hot",gate,half_output,Tensor{},0,hot);
             return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
-                scale, "qwen4_sparse_gqa_attention", gate, half_output);
+                scale, "qwen4_sparse_gqa_attention", gate, half_output, Tensor{}, 0, {}, indirect);
         }
         return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
             query, key, key, safe_indices, mask, Tensor{}, Tensor{},
@@ -324,7 +433,7 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         query.data_ptr<float>(), reinterpret_cast<const half*>(key.data_ptr()), \
         reinterpret_cast<const half*>(value.data_ptr()), indices.data_ptr<int32_t>(), \
         output.data_ptr<float>(), q.size(1), k.size(1), q.size(2), q.size(3), \
-        k.size(2), selected.size(2), static_cast<float>(scale), false, nullptr, false, AttentionEpilogue{},hot)
+        k.size(2), selected.size(2), static_cast<float>(scale), false, nullptr, false, AttentionEpilogue{},hot,indirect)
     if (q.size(3) <= 256) { if(hot.mapping){MFQ_LAUNCH_SPARSE(1,true);}else{MFQ_LAUNCH_SPARSE(1,false);} }
     else if (q.size(3) <= 512) { if(hot.mapping){MFQ_LAUNCH_SPARSE(2,true);}else{MFQ_LAUNCH_SPARSE(2,false);} }
     else if (q.size(3) <= 1024) { if(hot.mapping){MFQ_LAUNCH_SPARSE(4,true);}else{MFQ_LAUNCH_SPARSE(4,false);} }
@@ -335,8 +444,9 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& selected, double scale, bool v_is_k_view, mfq::cuda::HotKvView hot) {
-    return sparse_impl(q, k, v, selected, scale, v_is_k_view, Tensor{}, false, false, hot);
+    const Tensor& selected, double scale, bool v_is_k_view, mfq::cuda::HotKvView hot,
+    mfq::cuda::IndirectKvView indirect) {
+    return sparse_impl(q, k, v, selected, scale, v_is_k_view, Tensor{}, false, false, hot, indirect);
 }
 
 __global__ void attention_gated_kernel(const void* attended, bool half_input,
@@ -685,7 +795,7 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
         query.data_ptr(), reinterpret_cast<const half*>(key.data_ptr()), reinterpret_cast<const half*>(value.data_ptr()), \
         nullptr, scratch.defined() ? scratch.data_ptr<float>() : nullptr, q.size(1), k.size(1), q.size(2), q.size(3), \
         k.size(2), columns, float(scale), q.scalar_type() == tb::kFloat16, cache_positions.data_ptr(), \
-        cache_positions.scalar_type() == tb::kInt64, epilogue,hot)
+        cache_positions.scalar_type() == tb::kInt64, epilogue,hot,{})
     if (q.size(3) <= 256) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(1,true);}else{MFQ_LAUNCH_CAUSAL(1,false);} }
     else if (q.size(3) <= 512) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(2,true);}else{MFQ_LAUNCH_CAUSAL(2,false);} }
     else if (q.size(3) <= 1024) { if(hot.mapping){MFQ_LAUNCH_CAUSAL(4,true);}else{MFQ_LAUNCH_CAUSAL(4,false);} }
