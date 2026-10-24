@@ -18,6 +18,7 @@ struct MlxTqRoutePlan {
 };
 std::optional<mlx::core::array> make_tq_reuse_plan(std::span<const int> ids,
     int tokens, int routes, int experts);
+std::optional<mlx::core::array> make_tq_reuse_plan(const mlx::core::array& ids, int experts);
 
 class MlxTqWeight {
 public:
@@ -72,6 +73,14 @@ private:
     void set_expert_word_offset(int expert, std::uint64_t word_offset);
     static std::vector<mlx::core::array> matmul_many_impl(
         std::span<const MlxTqWeight> weights, const mlx::core::array& input);
+    bool use_column_inputs(const mlx::core::array& input, int tokens, int routes) const;
+    mlx::core::array prepare_column_inputs(const mlx::core::array& input,
+        const mlx::core::array& ids) const;
+    std::vector<mlx::core::array> prepare_column_pair_inputs(const MlxTqWeight& up,
+        const mlx::core::array& input, const mlx::core::array& ids) const;
+    mlx::core::array project_column_inputs(const mlx::core::array& input,
+        const mlx::core::array& ids, const MlxTqWeight* up = nullptr,
+        float limit = 0.f, bool gelu = false) const;
     MlxTqWeight(mlx::core::array words, mlx::core::array descriptors,
         mlx::core::array scales, int rows, int width, int input_columns,
         int experts, int group_size, int columns, std::size_t bytes, bool pooled = false);

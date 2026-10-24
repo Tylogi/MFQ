@@ -21,6 +21,8 @@ struct MlxTqExpertCacheStats {
     std::uint64_t bytes_read = 0, read_calls = 0;
     std::size_t cached_experts = 0, cached_bytes = 0, allocated_bytes = 0;
     double io_seconds = 0, route_sync_seconds = 0, prepare_seconds = 0, graph_seconds = 0;
+    std::size_t metadata_bytes = 0;
+    std::uint64_t overlapped_read_batches = 0;
 };
 
 class MlxTqExpertCache {
@@ -32,6 +34,12 @@ public:
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
         const std::function<mlx::core::array(const MlxTqExpertWeights&,
             const mlx::core::array*)>& operation);
+    mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
+        const std::function<mlx::core::array(const MlxTqExpertWeights&,
+            const mlx::core::array*)>& gate_up,
+        const std::function<mlx::core::array(const MlxTqExpertWeights&,
+            const mlx::core::array&, const mlx::core::array*)>& down,
+        const mlx::core::array* parallel = nullptr);
     MlxTqExpertCacheStats stats() const;
     std::size_t limit_bytes() const noexcept;
     std::size_t backing_bytes() const noexcept;

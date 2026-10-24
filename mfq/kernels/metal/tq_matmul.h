@@ -177,7 +177,7 @@ template <typename T, uint K, uint OUT, uint BM, uint TM, bool DIRECT_A = false,
 inline void tq_nax_shared_matmul(device const T* x, device T* y, uint rows, uint m0, uint n0,
         uint local, Decode decode, InputRow input_row, OutputRow output_row,
         threadgroup half* shared_a, threadgroup half* shared_b) {
-    constexpr uint BN = 64, BK = DIRECT_A ? 64 : 32, THREADS = BM * 2, LOAD_M = TM == 16 ? 32 : BM;
+    constexpr uint BN = 64, BK = DIRECT_A ? 64 : 32, THREADS = BM * 2, LOAD_M = TM == 16 ? BM / 2 : BM;
     short2 coord = mlx::steel::BaseNAXFrag::get_coord();
     uint sm = (local / 32u) / 2u, sn = (local / 32u) % 2u;
     uint offsets[TM / 16][2];

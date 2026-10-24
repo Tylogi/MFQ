@@ -373,6 +373,17 @@ target_include_directories(mfq-metal-tq-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
 target_compile_features(mfq-metal-tq-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-tq-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 
+if(BUILD_TESTING)
+    add_test(NAME mfq-metal-tq-container-test COMMAND mfq-metal-tq-test unused --expert-containers)
+    add_test(NAME mfq-metal-tq-prefill-reduction-test COMMAND mfq-metal-tq-test --prefill-reduction)
+    add_test(NAME mfq-metal-tq-projection-cache-test COMMAND mfq-metal-tq-test --projection-cache)
+    add_test(NAME mfq-metal-tq-expansion-vector-test COMMAND mfq-metal-tq-test --expansion-vectors)
+    add_test(NAME mfq-metal-tq-column-input-test COMMAND mfq-metal-tq-test --column-inputs)
+    add_test(NAME mfq-metal-tq-compact-reuse-test COMMAND mfq-metal-tq-test --compact-reuse)
+    add_test(NAME mfq-metal-tq-streamed-experts-test COMMAND mfq-metal-tq-test --streamed-experts)
+    add_test(NAME mfq-metal-tq-routed-tiles-test COMMAND mfq-metal-tq-test unused --routed-tiles)
+endif()
+
 if(TARGET mfq-paged-prefix-cache)
     add_executable(mfq-metal-tq-model-benchmark tests/mlx_tq_model_benchmark.cpp)
     target_link_libraries(mfq-metal-tq-model-benchmark PRIVATE mfq-metal-runtime mfq-paged-prefix-cache)

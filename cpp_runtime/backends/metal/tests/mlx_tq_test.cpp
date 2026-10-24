@@ -9,6 +9,7 @@
 #include "mlx_tq_expert_cache.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_eval_timing.h"
 #include "mlx_platform.h"
 #include "mfq_tq_embedded.h"
 #include "qwen4_ops.h"
@@ -140,6 +141,79 @@ static MlxTqWeight random_weight(int rows, int logical_width, std::uint32_t seed
     return MlxTqWeight::from_blob(random_blob(rows, logical_width, seed), logical_width);
 }
 
+static void check_expansion_vectors() {
+    for (int width : {513, 2304, 4097}) for (int layout : {0, 1, 2}) {
+        const int outputs = width * 2 + 3;
+        const auto op = MlxTqWeight::from_blob(random_blob(outputs, width, 3941, layout == 0 ? 16 : 512, layout == 2), width);
+        const auto dense = astype(op.embedding(arange(outputs, int32)), float32);
+        for (auto dtype : {float16, bfloat16, float32}) for (int tokens : {1, 2, 6}) {
+            const auto input = reshape(astype(sin(arange(tokens * width, float32)) * .1f, dtype), {tokens, width});
+            const auto expected = matmul(astype(input, float32), transpose(dense));
+            const auto routed = reshape(op.routed_matmul(input, zeros({tokens, 1}, int32)), {tokens, outputs});
+            const auto source = contiguous(astype(input, float32));
+            eval({source, dense});
+            int path = 0;
+            for (const auto& actual : {op.matmul(input), routed}) {
+                const auto values = astype(actual, float32);
+                const auto error = reshape(abs(values - expected), {-1});
+                const auto worst = argmax(error).item<std::uint32_t>();
+                const int token = worst / outputs, row = worst % outputs;
+                double oracle = 0.;
+                for (int col = 0; col < width; ++col)
+                    oracle += double(source.data<float>()[token * width + col]) * dense.data<float>()[row * width + col];
+                const double tolerance = (dtype == bfloat16 ? .008 : dtype == float16 ? .003 : .00001) * std::abs(oracle) + .000001;
+                if (!allclose(actual, expected, dtype == bfloat16 ? .008 : .003, .00001).item<bool>()
+                    || std::abs(double(values.data<float>()[worst]) - oracle) > tolerance)
+                    throw std::runtime_error("TQ expanding vector projection differs from decoded reference: K="
+                        + std::to_string(width) + ", M=" + std::to_string(tokens) + ", layout=" + std::to_string(layout)
+                        + ", dtype=" + (dtype == float16 ? "f16" : dtype == bfloat16 ? "bf16" : "f32") + ", path=" + std::to_string(path)
+                        + ", error=" + std::to_string(max(error).item<float>())
+                        + ", oracle_error=" + std::to_string(std::abs(double(values.data<float>()[worst]) - oracle)));
+                ++path;
+            }
+        }
+    }
+    std::cout << "TQ expanding vector projection checks passed\n";
+}
+
+static void check_prefill_reduction() {
+    constexpr int experts = 7, outputs = 257, width = 640, routes = 4;
+    for (bool columns : {false, true}) {
+        const auto weight = MlxTqWeight::from_blob(random_blob(experts * outputs, width, 3821, 16, columns), width, experts);
+        for (auto dtype : {float16, bfloat16, float32}) for (int tokens : {1, 6, 7, 16, 33, 257}) {
+            auto ids = reshape(remainder(arange(tokens * routes, int32), array(experts)), {tokens, routes});
+            auto scales = full({tokens, routes}, 1.f / routes, float32);
+            auto input = reshape(astype(sin(arange(tokens * routes * width, float32)) * .1f, dtype), {tokens, routes, width});
+            auto pairs = weight.routed_matmul(input, ids);
+            if (dtype == bfloat16) pairs = astype(pairs, float32);
+            check(weight.routed_matmul_reduce(input, ids, scales), astype(moe_weighted_reduce(pairs, scales), dtype), 0.f);
+        }
+    }
+    std::cout << "TQ narrow-input prefill reduction checks passed\n";
+}
+
+static MlxTqWeight pooled_weight(const std::vector<std::uint8_t>& blob, int width, int experts);
+
+static void check_projection_cache() {
+    for (int width : {321, 1025, 2560, 4097}) {
+        std::vector<MlxTqWeight> weights;
+        std::vector<array> dense;
+        for (const auto [rows, layout] : {std::pair{17, 0}, std::pair{65, 1}, std::pair{129, 2}}) {
+            const auto blob = random_blob(rows, width, 3823 + rows, layout == 0 ? 16 : 512, layout == 2);
+            weights.push_back(layout == 1 ? pooled_weight(blob, width, 1) : MlxTqWeight::from_blob(blob, width));
+            dense.push_back(astype(weights.back().embedding(arange(rows, int32)), float32));
+        }
+        for (int tokens : {7, 8, 12, 16, 17, 32}) {
+            const auto input = reshape(astype(sin(arange(tokens * width, float32)) * .1f, float16), {tokens, width});
+            const auto result = MlxTqWeight::matmul_many(weights, input);
+            for (std::size_t i = 0; i < weights.size(); ++i)
+                if (!allclose(result[i], matmul(astype(input, float32), transpose(dense[i])), .003, .000001).item<bool>())
+                    throw std::runtime_error("TQ grouped projection cache differs from decoded reference");
+        }
+    }
+    std::cout << "TQ mixed grouped projection cache checks passed\n";
+}
+
 static std::vector<std::uint8_t> expert_blob(const std::vector<std::vector<std::uint8_t>>& experts,
         int rows, int width) {
     std::size_t size = 64 + experts.size() * 16;
@@ -157,6 +231,117 @@ static std::vector<std::uint8_t> expert_blob(const std::vector<std::vector<std::
         offset += bytes;
     }
     return blob;
+}
+
+static MlxTqWeight pooled_weight(const std::vector<std::uint8_t>& blob, int width, int experts);
+
+static void check_column_inputs() {
+    for (const auto geometry : {std::array{4097, 1, 8193}, std::array{4097, 4, 2049}, std::array{513, 64, 1025}}) {
+        const int width = geometry[0], experts = geometry[1], outputs = geometry[2];
+        const int stored = (width + 255) / 256 * 256;
+        std::vector<std::vector<std::uint8_t>> children, up_children;
+        for (int expert = 0; expert < experts; ++expert) {
+            auto blob = random_blob(outputs, width, 3981 + expert, 512, true);
+            auto up_blob = random_blob(outputs, width, 4081 + expert, 512, true);
+            for (auto* image : {&blob, &up_blob}) for (int row = 0; row < outputs; ++row) {
+                std::uint64_t descriptor;
+                std::memcpy(&descriptor, image->data() + 64 + row * 8, 8);
+                descriptor = (descriptor & ~(std::uint64_t{0xffff} << 40))
+                    | (std::uint64_t(std::bit_cast<std::uint16_t>(float16_t(.01f))) << 40);
+                std::memcpy(image->data() + 64 + row * 8, &descriptor, 8);
+            }
+            for (int col = 0; col < stored; ++col) {
+                const auto scale = float16_t(.25f + expert * .125f + (col % 17) * .03125f);
+                const auto up_scale = float16_t(.375f + expert * .0625f + (col % 13) * .015625f);
+                std::memcpy(blob.data() + 64 + outputs * 8 + col * 2, &scale, 2);
+                std::memcpy(up_blob.data() + 64 + outputs * 8 + col * 2, &up_scale, 2);
+            }
+            children.push_back(std::move(blob));
+            up_children.push_back(std::move(up_blob));
+        }
+        const auto blob = experts == 1 ? children[0] : expert_blob(children, outputs, width);
+        const auto up_blob = experts == 1 ? up_children[0] : expert_blob(up_children, outputs, width);
+        auto weight = MlxTqWeight::from_blob(blob, width, experts);
+        auto up = MlxTqWeight::from_blob(up_blob, width, experts);
+        const auto pool = pooled_weight(blob, width, experts), up_pool = pooled_weight(up_blob, width, experts);
+        auto dense = astype(weight.embedding(arange(experts * outputs, int32)), float32);
+        auto up_dense = astype(up.embedding(arange(experts * outputs, int32)), float32);
+        const auto counts = experts == 64 ? std::vector{64, 128} : std::vector{1, 2, 4, 5, 6, 7, 8, 12, 16};
+        for (bool shared : {false, true}) for (int tokens : counts) {
+            const int routes = experts == 64 ? 1 : experts;
+            auto ids = broadcast_to(reshape(arange(routes, int32), {1, routes}), {tokens, routes});
+            std::optional<array> reuse;
+            if (experts > 1 && tokens >= 2 && tokens <= 16) {
+                std::vector<int> selected(tokens * routes);
+                for (int row = 0; row < int(selected.size()); ++row) selected[row] = row % routes;
+                reuse = make_tq_reuse_plan(selected, tokens, routes, experts);
+                if (!reuse) throw std::runtime_error("TQ column reuse fixture has no repeated routes");
+            }
+            auto input = reshape(astype(sin(arange(tokens * (shared ? 1 : routes) * width, float32)) * .1f, float16),
+                shared ? Shape{tokens, width} : Shape{tokens, routes, width});
+            eval({input, ids, dense, up_dense});
+            if (experts == 1 && !shared && tokens == 1) {
+                MlxKernelPreparation preparation(32, 32);
+                preparation.collect([&] { preparation.add(weight.routed_matmul(input, ids)); });
+                if (preparation.size() != 2) throw std::runtime_error("TQ column input kernels were not selected");
+                preparation.finish();
+                preparation.collect([&] { preparation.add(weight.swiglu(up, input, ids)); });
+                if (preparation.size() != 2) throw std::runtime_error("TQ Gate/Up input preparation was not fused");
+                preparation.finish();
+            }
+            std::vector<array> expected, expected_up;
+            for (int expert = 0; expert < routes; ++expert) {
+                auto source = shared ? input : reshape(slice(input, {0, expert, 0}, {tokens, expert + 1, width}), {tokens, width});
+                auto selected = slice(dense, {expert * outputs, 0}, {(expert + 1) * outputs, width});
+                expected.push_back(matmul(astype(source, float32), transpose(selected)));
+                auto selected_up = slice(up_dense, {expert * outputs, 0}, {(expert + 1) * outputs, width});
+                expected_up.push_back(matmul(astype(source, float32), transpose(selected_up)));
+            }
+            auto reference = stack(expected, 1);
+            auto actual = astype(weight.routed_matmul(input, ids), float32);
+            check(astype(pool.routed_matmul(input, ids), float32), actual, 0.f);
+            const float relative = sqrt(sum(square(actual - reference)) / maximum(sum(square(reference)), array(1e-20f))).item<float>();
+            if (!std::isfinite(relative) || relative > .0015f)
+                throw std::runtime_error("TQ column input factorization exceeds numerical tolerance");
+            if (reuse) {
+                const auto reused = astype(weight.routed_matmul(input, ids, &*reuse), float32);
+                check(astype(pool.routed_matmul(input, ids, &*reuse), float32), reused, 0.f);
+                const float error = sqrt(sum(square(reused - reference))
+                    / maximum(sum(square(reference)), array(1e-20f))).item<float>();
+                if (!std::isfinite(error) || error > .0015f)
+                    throw std::runtime_error("TQ compact column reuse exceeds numerical tolerance");
+            }
+            if (experts == 1 && tokens == 1)
+                check(reshape(weight.matmul(input), actual.shape()), actual, 0.f);
+            for (bool gelu : {false, true}) for (float limit : {0.f, .05f}) {
+                auto g = astype(astype(reference, float16), float32);
+                auto u = astype(astype(stack(expected_up, 1), float16), float32);
+                if (limit > 0.f) { g = minimum(g, array(limit)); u = clip(u, array(-limit), array(limit)); }
+                auto activated = gelu ? array(.5f) * g * (array(1.f) + tanh(array(.7978845608028654f)
+                    * g * (array(1.f) + array(.044715f) * g * g))) : g * sigmoid(g);
+                auto expected_pair = astype(astype(activated * u, float16), float32);
+                auto actual_pair = astype(weight.swiglu(up, input, ids, limit, gelu), float32);
+                check(astype(pool.swiglu(up_pool, input, ids, limit, gelu), float32), actual_pair, 0.f);
+                const float pair_error = sqrt(sum(square(actual_pair - expected_pair))
+                    / maximum(sum(square(expected_pair)), array(1e-20f))).item<float>();
+                if (!std::isfinite(pair_error) || pair_error > .0025f)
+                    throw std::runtime_error("TQ column Gate/Up factorization exceeds numerical tolerance");
+                if (reuse) {
+                    const auto reused = astype(weight.swiglu(up, input, ids, limit, gelu, &*reuse), float32);
+                    check(astype(pool.swiglu(up_pool, input, ids, limit, gelu, &*reuse), float32), reused, 0.f);
+                    const float error = sqrt(sum(square(reused - expected_pair))
+                        / maximum(sum(square(expected_pair)), array(1e-20f))).item<float>();
+                    if (!std::isfinite(error) || error > .0025f)
+                        throw std::runtime_error("TQ compact column Gate/Up reuse exceeds numerical tolerance");
+                }
+            }
+        }
+        const auto invalid = array({-1, experts, experts, -1}, {2, 2}, int32);
+        const auto input = ones({2, width}, float16);
+        check(weight.routed_matmul(input, invalid), zeros({2, 2, outputs}, float16), 0.f);
+        check(pool.swiglu(up_pool, input, invalid), zeros({2, 2, outputs}, float16), 0.f);
+    }
+    std::cout << "TQ column input factorization checks passed\n";
 }
 
 static MlxTqWeight pooled_weight(const std::vector<std::uint8_t>& blob, int width, int experts) {
@@ -234,8 +419,14 @@ static void check_expert_containers() {
                 dense, floor_divide(arange(tokens * 2, int32), array(2)), reshape(ids, {-1})),
                 {tokens, 2, outputs}), dtype);
             const auto actual = weight.routed_matmul(input, ids);
-            if (!allclose(astype(actual, float32), astype(expected, float32), dtype == bfloat16 ? .01 : .005, .000002).item<bool>())
-                throw std::runtime_error("TQ expert container projection differs from decoded GEMM");
+            if (!allclose(astype(actual, float32), astype(expected, float32), dtype == bfloat16 ? .01 : .005, .000002).item<bool>()) {
+                const auto difference = astype(actual, float32) - astype(expected, float32);
+                const float rms = sqrt(sum(square(difference)) / maximum(sum(square(astype(expected, float32))), array(1e-20f))).item<float>();
+                throw std::runtime_error("TQ expert container projection differs from decoded GEMM: width="
+                    + std::to_string(width) + " columns=" + std::to_string(columns) + " tokens=" + std::to_string(tokens)
+                    + " dtype=" + (dtype == float16 ? "F16" : dtype == bfloat16 ? "BF16" : "F32")
+                    + " max_abs=" + std::to_string(max(abs(difference)).item<float>()) + " relative_rms=" + std::to_string(rms));
+            }
             check(pool.routed_matmul(input, ids), actual, 0.f);
             const auto hidden = weight.swiglu(up, input, ids);
             check(pool.swiglu(up_pool, input, ids), hidden, 0.f);
@@ -545,6 +736,139 @@ static void check_repeated_routes() {
     }
 }
 
+static void check_device_reuse_plans() {
+    for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17}) for (int routes : {1, 3, 16})
+        for (int pattern : {0, 1, 2}) {
+            constexpr int experts = 1024;
+            std::vector<int> selected(tokens * routes);
+            for (int index = 0; index < int(selected.size()); ++index)
+                selected[index] = pattern == 0 ? index : pattern == 1 ? 0
+                    : index % 7 == 0 ? -1 : index % 11 == 0 ? experts : index % 5;
+            const auto ids = add(array(selected.begin(), {tokens, routes}, int32), array(0));
+            const auto plan = make_tq_reuse_plan(ids, experts);
+            if (ids.is_available()) throw std::runtime_error("TQ device reuse planning evaluates routes on the host");
+            if (tokens < 3 || tokens > 16) {
+                if (plan) throw std::runtime_error("TQ device planning changes single/pair or long-token dispatch");
+                continue;
+            }
+            if (!plan || plan->shape() != Shape{tokens * routes, 18})
+                throw std::runtime_error("TQ device reuse plan geometry differs");
+            eval({*plan});
+            std::vector<bool> seen(selected.size(), false);
+            const auto* values = plan->data<int>();
+            for (int row = 0; row < plan->shape(0); ++row) {
+                const int count = values[row * 18 + 1];
+                if (count < 0 || count > 16) throw std::runtime_error("TQ device group exceeds its capacity");
+                for (int member = 0; member < count; ++member) {
+                    const int index = values[row * 18 + member + 2];
+                    if (index < 0 || index >= int(selected.size()) || seen[index]
+                        || selected[index] != values[row * 18])
+                        throw std::runtime_error("TQ device plan duplicates or mixes expert routes");
+                    seen[index] = true;
+                }
+                for (int member = count; member < 16; ++member)
+                    if (values[row * 18 + member + 2] != -1)
+                        throw std::runtime_error("TQ device plan leaves live padding");
+            }
+            if (!std::all_of(seen.begin(), seen.end(), [](bool value) { return value; }))
+                throw std::runtime_error("TQ device plan lost expert routes");
+        }
+    constexpr int experts = 20, width = 2305, outputs = 1027, routes = 2;
+    for (int layout : {0, 1, 2}) {
+        const auto blob = random_blob(experts * outputs, width, 5471, layout == 0 ? 16 : 512, layout == 2);
+        const auto up_blob = random_blob(experts * outputs, width, 5472, layout == 0 ? 16 : 512, layout == 2);
+        const auto weight = MlxTqWeight::from_blob(blob, width, experts), up = MlxTqWeight::from_blob(up_blob, width, experts);
+        const auto pooled = pooled_weight(blob, width, experts);
+        for (int tokens : {3, 6, 8, 12, 16}) {
+            std::vector<int> selected(tokens * routes);
+            for (int token = 0; token < tokens; ++token) {
+                selected[token * routes] = 0;
+                selected[token * routes + 1] = token % 4 == 0 ? -1 : token + 1;
+            }
+            const auto ids = array(selected.begin(), {tokens, routes}, int32);
+            const auto plan = make_tq_reuse_plan(ids, experts);
+            for (auto dtype : {float16, bfloat16, float32}) for (bool shared : {true, false}) {
+                const auto input = reshape(astype(sin(arange(tokens * (shared ? 1 : routes) * width, float32)) * .1f, dtype),
+                    shared ? Shape{tokens, width} : Shape{tokens, routes, width});
+                const auto expected = weight.routed_matmul(input, ids);
+                const auto actual = weight.routed_matmul(input, ids, &*plan);
+                if (!allclose(actual, expected, .003, .0001).item<bool>())
+                    throw std::runtime_error("TQ device repeated projection differs from ordinary projection");
+                check(pooled.routed_matmul(input, ids, &*plan), actual, 0.f);
+                for (bool gelu : {false, true}) {
+                    const auto result = weight.swiglu(up, input, ids, .01f, gelu, &*plan);
+                    if (!allclose(result, weight.swiglu(up, input, ids, .01f, gelu), .003, .0001).item<bool>())
+                        throw std::runtime_error("TQ device repeated Gate/Up differs from ordinary projection");
+                }
+            }
+        }
+    }
+}
+
+static void check_compact_repeated_routes() {
+    constexpr int experts = 3, width = 1537, routes = 2;
+    for (int outputs : {129, 1025}) for (int layout : {0, 1, 2}) {
+        const int gs = layout == 0 ? 16 : 512;
+        const auto blob = random_blob(experts * outputs, width, 5291, gs, layout == 2);
+        const auto up_blob = random_blob(experts * outputs, width, 5292, gs, layout == 2);
+        const auto weight = MlxTqWeight::from_blob(blob, width, experts);
+        const auto up = MlxTqWeight::from_blob(up_blob, width, experts);
+        const auto pool = pooled_weight(blob, width, experts), up_pool = pooled_weight(up_blob, width, experts);
+        for (int tokens : {4, 5, 6}) for (auto dtype : {float16, bfloat16, float32}) {
+            std::vector<int> selected(tokens * routes);
+            for (int token = 0; token < tokens; ++token) {
+                selected[token * routes] = 0;
+                selected[token * routes + 1] = token % 2 ? 1 : -1;
+            }
+            const auto ids = array(selected.begin(), {tokens, routes}, int32);
+            const auto plan = make_tq_reuse_plan(selected, tokens, routes, experts);
+            if (!plan) throw std::runtime_error("TQ compact reuse fixture has no plan");
+            for (bool shared : {true, false}) {
+                const auto input = reshape(astype(sin(arange(tokens * (shared ? 1 : routes) * width, float32)) * .1f, dtype),
+                    shared ? Shape{tokens, width} : Shape{tokens, routes, width});
+                const auto expected = weight.routed_matmul(input, ids);
+                const auto actual = weight.routed_matmul(input, ids, &*plan);
+                if (!allclose(actual, expected, .003, .0001).item<bool>())
+                    throw std::runtime_error("TQ compact repeated projection differs from ordinary projection");
+                check(pool.routed_matmul(input, ids, &*plan), actual, 0.f);
+                for (bool gelu : {false, true}) for (float limit : {0.f, .01f}) {
+                    const auto reference = weight.swiglu(up, input, ids, limit, gelu);
+                    const auto result = weight.swiglu(up, input, ids, limit, gelu, &*plan);
+                    if (!allclose(result, reference, .003, .0001).item<bool>())
+                        throw std::runtime_error("TQ compact repeated Gate/Up differs from ordinary projection");
+                    check(pool.swiglu(up_pool, input, ids, limit, gelu, &*plan), result, 0.f);
+                }
+            }
+        }
+    }
+    const bool hardware_nax = !mlx_metal_nax_disabled() && mlx_apple_chip_starts_with("Apple M5");
+    for (const auto geometry : {std::array{1024, 512, 2, 16}, std::array{1024, 1024, 7, 16},
+            std::array{1024, 1024, 8, 8}, std::array{1024, 2048, 1, 8}}) {
+        const int k = geometry[0], n = geometry[1], selected_routes = geometry[2];
+        const auto gate = MlxTqWeight::from_blob(random_blob(selected_routes * n, k, 5381), k, selected_routes);
+        const auto up = MlxTqWeight::from_blob(random_blob(selected_routes * n, k, 5382), k, selected_routes);
+        for (int tokens : {8, 16}) {
+            std::vector<int> selected(tokens * selected_routes);
+            for (int row = 0; row < int(selected.size()); ++row) selected[row] = row % selected_routes;
+            const auto ids = array(selected.begin(), {tokens, selected_routes}, int32);
+            const auto plan = make_tq_reuse_plan(selected, tokens, selected_routes, selected_routes);
+            if (!plan) throw std::runtime_error("TQ NAX dispatch fixture has no reuse plan");
+            detail::ComponentProfile profile;
+            {
+                detail::ScopedComponentProfile scope(&profile);
+                (void)gate.swiglu(up, zeros({tokens, k}, float16), ids, 0.f, false, &*plan);
+            }
+            const std::string marker = hardware_nax && tokens >= geometry[3]
+                ? "tq.dispatch.routed_reuse_nax." : "tq.dispatch.routed_pair_reuse.";
+            if (!std::any_of(profile.timings().begin(), profile.timings().end(),
+                    [&](const auto& entry) { return entry.first.starts_with(marker); }))
+                throw std::runtime_error("TQ repeated NAX dispatch ignores projection parallelism: K="
+                    + std::to_string(k) + ", N=" + std::to_string(n) + ", routes="
+                    + std::to_string(selected_routes) + ", M=" + std::to_string(tokens));
+        }
+    }
+}
+
 static void check_tiled_repeated_routes() {
     constexpr int experts = 4, width = 1027, hidden = 513, routes = 2;
     for (int layout : {0, 1, 2}) {
@@ -558,7 +882,7 @@ static void check_tiled_repeated_routes() {
         const auto pooled_gate = pooled_weight(gate_blob, width, experts);
         const auto pooled_up = pooled_weight(up_blob, width, experts);
         const auto pooled_down = pooled_weight(down_blob, hidden, experts);
-        for (int tokens : {8, 16}) for (int pattern : {0, 1, 2, 3}) {
+        for (int tokens : {8, 9, 12, 15, 16}) for (int pattern : {0, 1, 2, 3}) {
             std::vector<int> selected(tokens * routes);
             for (int token = 0; token < tokens; ++token) {
                 selected[token * routes] = pattern == 3 ? -1 : 0;
@@ -595,6 +919,61 @@ static void check_tiled_repeated_routes() {
             const auto reference = mlx::core::concatenate(expected, 0);
             check_close(down.routed_matmul(down_input, ids, &*plan), reference);
             check_close(pooled_down.routed_matmul(down_input, ids, &*plan), reference);
+            if (pattern == 0 && (tokens == 8 || tokens == 9)) {
+                const auto padded = mlx::core::concatenate({*plan,
+                    full({3, plan->shape(1)}, -1, int32)}, 0);
+                check(down.routed_matmul(down_input, ids, &padded),
+                    down.routed_matmul(down_input, ids, &*plan), 0.f);
+                check(gate.swiglu(up, input, ids, 0.f, false, &padded),
+                    gate.swiglu(up, input, ids, 0.f, false, &*plan), 0.f);
+            }
+        }
+    }
+}
+
+static void check_partial_route_tiles() {
+    constexpr int experts = 3, width = 1025, outputs = 257, routes = 3;
+    for (int layout : {0, 1, 2, 3}) {
+        auto blob = random_blob(experts * outputs, width, 3201, layout == 0 ? 16 : 512, layout >= 2);
+        if (layout == 3) {
+            std::vector<std::vector<std::uint8_t>> children;
+            for (int expert = 0; expert < experts; ++expert)
+                children.push_back(random_blob(outputs, width, 3202 + expert, 512, true));
+            blob = expert_blob(children, outputs, width);
+        }
+        const auto weight = MlxTqWeight::from_blob(blob, width, experts);
+        const auto pooled = pooled_weight(blob, width, experts);
+        for (int tokens : {32, 33, 63, 64, 65, 96, 127, 128, 129}) {
+            std::vector<int> selected(tokens * routes), order(tokens * routes), blocks;
+            for (int token = 0; token < tokens; ++token) {
+                selected[token * routes] = 0;
+                selected[token * routes + 1] = 1;
+                selected[token * routes + 2] = -1;
+            }
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return selected[a] < selected[b]; });
+            for (int first = 0; first < int(order.size());) {
+                int last = first + 1;
+                while (last < int(order.size()) && selected[order[last]] == selected[order[first]]) ++last;
+                for (int row = first; row < last; row += 128)
+                    blocks.insert(blocks.end(), {row, selected[order[first]], std::min(128, last - row)});
+                first = last;
+            }
+            const int count = blocks.size() / 3;
+            const auto ids = array(selected.begin(), {tokens, routes}, int32);
+            const auto permutation = array(order.begin(), {tokens * routes}, int32);
+            const MlxTqRoutePlan plan{array(blocks.begin(), {count, 3}, int32), array({count}, int32),
+                count, 128, tokens * routes, experts};
+            for (bool shared : {false, true}) {
+                const int rows = shared ? tokens : tokens * routes;
+                const auto input = astype(reshape(sin(arange(rows * width, float32)) * array(.1f),
+                    shared ? Shape{tokens, width} : Shape{tokens, routes, width}), float16);
+                const auto expected = weight.routed_matmul(input, ids);
+                const auto actual = weight.routed_matmul_sorted(input, ids, permutation, plan);
+                if (!all(isfinite(actual)).item<bool>() || !allclose(actual, expected, .003, .0001).item<bool>())
+                    throw std::runtime_error("TQ partial routed tile differs from projection reference");
+                check(pooled.routed_matmul_sorted(input, ids, permutation, plan), actual, 0.f);
+            }
         }
     }
 }
@@ -990,10 +1369,40 @@ static void check_expert_cache(const MfqContainer& model) {
         });
         check(actual, expected, 0.f);
     }
+    cache.clear();
+    for (int tokens : {1, 2, 6, 8, 16, 17}) for (int first : {0, 0, 2, 4, 6, 0}) {
+        auto x = astype(reshape(sin(arange(tokens * 256, float32)), {tokens, 256}), float16);
+        auto ids = broadcast_to(array({first, first + 1}, {1, 2}, int32), {tokens, 2});
+        auto weights = full({tokens, 2}, .5f, float32);
+        auto expected = down.routed_matmul_reduce(gate.swiglu(up, x, ids), ids, weights);
+        int gate_calls = 0, down_calls = 0;
+        auto parallel = cos(x);
+        auto actual = cache.apply(0, ids, [&](const auto& bank, const array* reuse) {
+            ++gate_calls;
+            return bank.gate.swiglu(bank.up, x, ids, 0.f, false, reuse);
+        }, [&](const auto& bank, const array& hidden, const array* reuse) {
+            ++down_calls;
+            return bank.down.routed_matmul_reduce(hidden, ids, weights, reuse);
+        }, &parallel);
+        check(actual, expected, 0.f);
+        check(parallel, cos(x), 0.f);
+        if (gate_calls != 1 || down_calls != 1)
+            throw std::runtime_error("TQ streamed pipeline repeats a projection");
+    }
+    cache.clear();
+    bool stage_failed = false;
+    try {
+        cache.apply(0, array({0, 1}, {1, 2}, int32), [](const auto&, const array*) -> array {
+            throw std::runtime_error("intentional TQ Gate/Up stage failure");
+        }, [](const auto&, const array&, const array*) { return array(0); });
+    } catch (const std::runtime_error&) { stage_failed = true; }
+    if (!stage_failed || cache.stats().cached_experts || cache.stats().cached_bytes)
+        throw std::runtime_error("TQ failed streamed stage leaves incomplete experts cached");
+    cache.apply(0, array({0, 1}, {1, 2}, int32), [](const auto&) { return array(0); }).eval();
     const auto stats = cache.stats();
     if (!stats.hits || !stats.misses || !stats.evictions || !stats.bytes_read || stats.cached_experts == 0
-        || stats.allocated_bytes > (256 << 10) || stats.cached_bytes > stats.allocated_bytes
-        || stats.read_calls > stats.misses * 3)
+        || stats.allocated_bytes > (256 << 10) || stats.cached_bytes + stats.metadata_bytes > stats.allocated_bytes
+        || stats.read_calls > stats.misses * 3 || !stats.overlapped_read_batches)
         throw std::runtime_error("TQ expert cache accounting differs");
     cache.clear();
     if (cache.stats().cached_experts || cache.stats().cached_bytes)
@@ -1063,6 +1472,11 @@ static void check_expert_cache(const MfqContainer& model) {
         return bank.down.routed_matmul_reduce(bank.gate.swiglu(bank.up, x, ids), ids,
             full({1, 2}, .5f, float32));
     }), zeros({1, 256}, float16), 0.f);
+    check(cache.apply(0, ids, [&](const auto& bank, const array* reuse) {
+        return bank.gate.swiglu(bank.up, x, ids, 0.f, false, reuse);
+    }, [&](const auto& bank, const array& hidden, const array* reuse) {
+        return bank.down.routed_matmul_reduce(hidden, ids, full({1, 2}, .5f, float32), reuse);
+    }), zeros({1, 256}, float16), 0.f);
     MlxTqExpertCache prefill(model, {"unit"}, 2 << 20, 4);
     auto prompt = astype(reshape(sin(arange(257 * 256, float32)), {257, 256}), float16);
     auto all_ids = broadcast_to(arange(8, int32), {257, 8});
@@ -1111,6 +1525,46 @@ static void check_expert_cache(const MfqContainer& model) {
     check(cached_projection(retained_ids), resident_projection(retained_ids), 0.f);
     if (prefill.stats().bytes_read != hot_stats.bytes_read)
         throw std::runtime_error("TQ budget trim discarded experts inside the retained pool");
+    {
+        MlxTqExpertCache relocated(model, {"unit"}, 2 << 20, 4);
+        const auto hot = array({6, 7}, {1, 2}, int32);
+        const auto project = [&](const auto& bank) {
+            return bank.down.routed_matmul_reduce(bank.gate.swiglu(bank.up, x, hot), hot,
+                full({1, 2}, .5f, float32));
+        };
+        auto pending = relocated.apply(0, hot, project);
+        const auto before = relocated.stats();
+        const auto ceiling = relocated.limit_bytes();
+        if (!relocated.trim(256 << 10) || relocated.limit_bytes() != ceiling)
+            throw std::runtime_error("TQ hot-relocation trim did not reduce capacity");
+        check(pending, resident_projection(hot), 0.f);
+        check(relocated.apply(0, hot, project), resident_projection(hot), 0.f);
+        if (relocated.stats().bytes_read != before.bytes_read || relocated.stats().allocated_bytes > (256 << 10))
+            throw std::runtime_error("TQ shrink evicted a hot expert because of its physical address");
+        for (const auto selected : {array({0, 1}, {1, 2}, int32), hot}) {
+            check(relocated.apply(0, selected, [&](const auto& bank) {
+                return bank.down.routed_matmul_reduce(bank.gate.swiglu(bank.up, x, selected), selected,
+                    full({1, 2}, .5f, float32));
+            }), resident_projection(selected), 0.f);
+        }
+        for (int cycle = 0; cycle < 8; ++cycle) {
+            relocated.set_limit(cycle % 2 ? 2 << 20 : 512 << 10);
+            const auto selected = array({cycle % 8, (cycle + 3) % 8}, {1, 2}, int32);
+            const auto operation = [&](const auto& bank) {
+                return bank.down.routed_matmul_reduce(bank.gate.swiglu(bank.up, x, selected), selected,
+                    full({1, 2}, .5f, float32));
+            };
+            auto output = relocated.apply(0, selected, operation);
+            const auto reads = relocated.stats().bytes_read;
+            relocated.trim(256 << 10);
+            check(output, resident_projection(selected), 0.f);
+            check(relocated.apply(0, selected, operation), resident_projection(selected), 0.f);
+            if (relocated.stats().bytes_read != reads)
+                throw std::runtime_error("TQ repeated budget trims lost the most recent experts at cycle "
+                    + std::to_string(cycle) + ": " + std::to_string(reads) + " -> "
+                    + std::to_string(relocated.stats().bytes_read));
+        }
+    }
     std::size_t scan_budget = 0;
     for (const auto* projection : {"gate", "up", "down"})
         scan_budget += 2 * model.record(std::string("unit.mlp.experts.") + projection + ".weight").nbytes;
@@ -1181,7 +1635,8 @@ static void check_expert_cache_containers() {
             for (const auto& blob : blobs) stream.write(reinterpret_cast<const char*>(blob.data()), blob.size());
             if (!stream) throw std::runtime_error("cannot write TQ expert test fixture");
         }
-        check_expert_cache(MfqContainer(path));
+        const MfqContainer fixture(path);
+        check_expert_cache(fixture);
     } catch (...) { std::filesystem::remove(path); throw; }
     std::filesystem::remove(path);
 }
@@ -1211,12 +1666,39 @@ static void paired(const RoutedBenchmarkCall& weight, const array& input,
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--column-inputs") {
+            check_column_inputs(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--compact-reuse") {
+            check_compact_repeated_routes(); check_device_reuse_plans(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--expansion-vectors") {
+            check_expansion_vectors(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--projection-cache") {
+            check_projection_cache(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--prefill-reduction") {
+            check_prefill_reduction(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--streamed-experts") {
+            check_expert_cache_containers();
+            std::cout << "TQ streamed expert checks passed\n"; return 0;
+        }
+        if (argc == 3 && std::string(argv[2]) == "--expert-cache") {
+            check_expert_cache(MfqContainer(argv[1]));
+            std::cout << "TQ expert cache checks passed\n"; return 0;
+        }
         if (argc == 3 && std::string(argv[2]) == "--topk") { check_topk(true); return 0; }
         if (argc == 3 && std::string(argv[2]) == "--expert-containers") {
             check_expert_containers(); check_expert_cache_containers(); return 0;
         }
         if (argc == 3 && std::string(argv[2]) == "--repeated-routes") {
-            check_repeated_routes(); check_tiled_repeated_routes(); check_routed_preparation(); return 0;
+            check_repeated_routes(); check_compact_repeated_routes(); check_tiled_repeated_routes();
+            check_routed_preparation(); return 0;
+        }
+        if (argc == 3 && std::string(argv[2]) == "--routed-tiles") {
+            check_partial_route_tiles(); check_small_sorted_routes(); check_shared_expansion_tiles(); return 0;
         }
         const bool matrix_bench = argc >= 3 && std::string(argv[argc - 1]) == "--matrix";
         if (matrix_bench) --argc;
@@ -1495,7 +1977,9 @@ int main(int argc, char** argv) {
         check_dense_pair_dispatch();
         check_dispatch_preparation();
         check_repeated_routes();
+        check_compact_repeated_routes();
         check_tiled_repeated_routes();
+        check_partial_route_tiles();
         check_large_row_offsets();
         check_unaligned_inputs();
         check_grouped_projections();

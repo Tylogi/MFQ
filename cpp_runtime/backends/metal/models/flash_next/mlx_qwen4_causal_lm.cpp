@@ -981,19 +981,23 @@ public:
         std::optional<array> inverse_route_order;
         bool pairs_are_sorted = false;
         bool routed_is_reduced = false;
+        std::optional<array> parallel_shared;
         array pairs = [&] {
             const int tokens = source.shape(0);
             if (tq_expert_cache_) {
                 routed_is_reduced = tokens <= 6;
+                if (routed_is_reduced) parallel_shared = shared_(source);
                 return tq_expert_cache_->apply(expert_cache_layer_, routes.ids, [&](const auto& weights, const array* reuse) {
                     auto intermediate = weights.gate.swiglu(weights.up, source, routes.ids, 0.f, false, reuse);
                     detail::profile_eval("qwen4.moe.routed_gate_up", intermediate);
+                    return intermediate;
+                }, [&](const auto& weights, const array& intermediate, const array* reuse) {
                     auto output = routed_is_reduced
                         ? weights.down.routed_matmul_reduce(intermediate, routes.ids, routes.weights, reuse)
                         : weights.down.routed_matmul(intermediate, routes.ids, reuse);
                     detail::profile_eval("qwen4.moe.routed_down", output);
                     return output;
-                });
+                }, parallel_shared ? &*parallel_shared : nullptr);
             }
             const int route_count = checked_int(
                 static_cast<std::size_t>(tokens)
@@ -1282,7 +1286,7 @@ public:
                     shared_gate),
                 value.shape());
         }
-        auto shared = shared_(source);
+        auto shared = parallel_shared ? *parallel_shared : shared_(source);
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.shared", shared);
         }
@@ -6357,8 +6361,11 @@ MlxQwen4CausalLm::ssd_expert_cache_stats() const {
         result.route_sync_seconds = cache.route_sync_seconds;
         result.prepare_seconds = cache.prepare_seconds;
         result.routed_graph_seconds = cache.graph_seconds;
+        result.overlapped_read_batches = cache.overlapped_read_batches;
         result.resident_experts = cache.cached_experts;
         result.resident_bytes = cache.allocated_bytes;
+        result.cached_payload_bytes = cache.cached_bytes;
+        result.cache_metadata_bytes = cache.metadata_bytes;
         return result;
     }
     if (impl_->ssd_expert_cache) {

@@ -311,13 +311,14 @@ inline void tq_dot_batch_accumulate(device const uint* words, ulong descriptor, 
     }
 }
 
-template <typename T, uint COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES = 16, typename ScalePtr>
+template <typename T, uint COLUMNS, uint WIDTH, uint K, uint GS, uint BM, uint LANES = 16,
+          bool COMPACT = false, typename ScalePtr>
 inline float4 tq_dot_batch(device const uint* words, ulong descriptor, ScalePtr scales,
         device const half* relative, uint row, device const T* x, int4 sources, uint lane,
         uint begin = 0u, uint end = K) {
     static_assert(BM <= 4, "TQ vector batch supports at most four rows");
     float4 acc[BM];
-    tq_dot_batch_accumulate<T, COLUMNS, WIDTH, K, GS, BM, LANES>(
+    tq_dot_batch_accumulate<T, COLUMNS, WIDTH, K, GS, BM, LANES, COMPACT>(
         words, descriptor, scales, relative, row, x, sources, lane, acc, begin, end);
     float4 result = 0.f;
     #pragma unroll

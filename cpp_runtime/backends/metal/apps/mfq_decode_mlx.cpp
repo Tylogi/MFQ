@@ -2810,6 +2810,8 @@ private:
                         static_cast<double>(stats->bytes_read));
                     metrics.emplace_back("ssd_expert_read_calls", static_cast<double>(stats->read_calls));
                     metrics.emplace_back("ssd_expert_prepare_seconds", stats->prepare_seconds);
+                    metrics.emplace_back("ssd_expert_route_sync_seconds", stats->route_sync_seconds);
+                    metrics.emplace_back("ssd_expert_graph_seconds", stats->routed_graph_seconds);
                     metrics.emplace_back("ssd_expert_view_seconds", stats->view_seconds);
                     metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
                     metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);

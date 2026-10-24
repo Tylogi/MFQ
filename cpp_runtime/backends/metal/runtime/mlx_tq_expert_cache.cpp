@@ -111,12 +111,18 @@ struct Pool {
         data = reinterpret_cast<std::byte*>(words.data<std::uint32_t>());
     }
 
-    bool fits(std::size_t bytes) const {
-        return sizes.lower_bound(bytes) != sizes.end();
+    bool fits(std::size_t bytes, std::size_t limit = SIZE_MAX) const {
+        auto it = sizes.lower_bound(bytes);
+        if (limit == SIZE_MAX) return it != sizes.end();
+        for (; it != sizes.end(); ++it)
+            if (it->second <= limit && bytes <= limit - it->second) return true;
+        return false;
     }
 
-    Range take(std::size_t bytes) {
-        const auto it = sizes.lower_bound(bytes);
+    Range take(std::size_t bytes, std::size_t limit = SIZE_MAX) {
+        auto it = sizes.lower_bound(bytes);
+        if (limit != SIZE_MAX) while (it != sizes.end()
+            && (it->second > limit || bytes > limit - it->second)) ++it;
         if (it == sizes.end()) throw std::runtime_error("TQ expert pool has no contiguous range");
         const Range result{it->second, bytes};
         const auto remaining = it->first - bytes;
@@ -147,6 +153,26 @@ struct Pool {
             erase_free(next);
         }
         insert_free(range.offset, range.bytes);
+    }
+
+    std::optional<Range> relocate(Range range, std::size_t limit) {
+        if (fits(range.bytes, limit)) {
+            const auto target = take(range.bytes, limit);
+            std::memmove(data + target.offset, data + range.offset, range.bytes);
+            release(range);
+            return target;
+        }
+        const auto next = free.lower_bound(range.offset);
+        if (next == free.begin()) return std::nullopt;
+        const auto previous = std::prev(next);
+        if (previous->first + previous->second.bytes != range.offset
+            || previous->first > limit || range.bytes > limit - previous->first)
+            return std::nullopt;
+        const Range target{previous->first, range.bytes};
+        std::memmove(data + target.offset, data + range.offset, range.bytes);
+        erase_free(previous);
+        release({target.offset + target.bytes, range.offset - target.offset});
+        return target;
     }
 };
 }
@@ -389,17 +415,37 @@ struct MlxTqExpertCache::Impl {
             reusable &= pools[p].storage && capacities[p] <= pools[p].storage->bytes;
         if (reusable) {
             const auto before = allocated.load();
-            for (auto entry = entries.begin(); entry != entries.end();) {
-                bool outside = false;
+            const std::vector<std::uint64_t> priority(order.begin(), order.end());
+            for (const auto key : priority) {
+                auto entry = entries.find(key);
+                if (entry == entries.end()) continue;
                 for (int p = 0; p < 3; ++p) {
                     const auto range = entry->second.allocations[p];
-                    outside = outside || range.offset > capacities[p] || range.bytes > capacities[p] - range.offset;
+                    if (range.offset <= capacities[p] && range.bytes <= capacities[p] - range.offset) continue;
+                    auto target = pools[p].relocate(range, capacities[p]);
+                    while (!target) {
+                        const auto victim = entries.find(order.back());
+                        const bool current = victim == entry;
+                        if (current) {
+                            std::size_t occupied = 0;
+                            for (const auto& [cached_key, cached_entry] : entries)
+                                occupied += cached_entry.allocations[p].bytes;
+                            if (occupied <= capacities[p]) {
+                                compact(p);
+                                target = entry->second.allocations[p];
+                                break;
+                            }
+                        }
+                        erase(victim);
+                        evictions.fetch_add(1, std::memory_order_relaxed);
+                        if (current) { entry = entries.end(); break; }
+                        target = pools[p].relocate(range, capacities[p]);
+                    }
+                    if (entry == entries.end()) break;
+                    entry->second.allocations[p] = *target;
+                    layers[entry->second.layer].banks[p].weight->set_expert_word_offset(
+                        entry->second.expert, target->offset / 4);
                 }
-                if (outside) {
-                    const auto victim = entry++;
-                    erase(victim);
-                    evictions.fetch_add(1, std::memory_order_relaxed);
-                } else ++entry;
             }
             pool_residency.reset();
             for (auto& layer : layers) {
@@ -549,13 +595,17 @@ struct MlxTqExpertCache::Impl {
     }
 
     array apply(std::size_t index, const array& route_ids,
-            const std::function<array(const MlxTqExpertWeights&, const array*)>& operation) {
+            const std::function<array(const MlxTqExpertWeights&, const array*)>& operation,
+            const std::function<void(const MlxTqExpertWeights&, const array*)>* stage = nullptr,
+            const array* parallel = nullptr) {
         std::lock_guard lock(execution);
-        return apply_locked(index, route_ids, operation, false);
+        return apply_locked(index, route_ids, operation, false, stage, parallel);
     }
 
     array apply_locked(std::size_t index, const array& route_ids,
-            const std::function<array(const MlxTqExpertWeights&, const array*)>& operation, bool preload) {
+            const std::function<array(const MlxTqExpertWeights&, const array*)>& operation, bool preload,
+            const std::function<void(const MlxTqExpertWeights&, const array*)>* stage = nullptr,
+            const array* parallel = nullptr) {
         if (index >= layers.size() || route_ids.ndim() != 2 || route_ids.size() == 0
             || (route_ids.dtype() != int32 && route_ids.dtype() != uint32))
             throw std::invalid_argument("invalid TQ expert cache route window");
@@ -602,6 +652,7 @@ struct MlxTqExpertCache::Impl {
         added.reserve(active.size());
         std::array<std::vector<Read>, 3> pending;
         std::optional<array> reuse;
+        bool stage_started = false;
         try {
             for (const int expert : active) {
                 if (!preload) requests.fetch_add(1, std::memory_order_relaxed);
@@ -658,6 +709,7 @@ struct MlxTqExpertCache::Impl {
                 }
             }
             std::vector<Read> reads;
+            std::size_t gate_up_reads = 0;
             for (auto& bank : pending) for (auto& read : bank) {
                 if (!reads.empty() && reads.back().record == read.record
                     && reads.back().offset + reads.back().bytes == read.offset) {
@@ -665,28 +717,60 @@ struct MlxTqExpertCache::Impl {
                     reads.back().bytes += read.bytes;
                 } else reads.push_back(std::move(read));
             }
-            const auto started = Clock::now();
-            prepare_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(started-prepared_from).count());
-            if (!reads.empty()) workers.run(0, reads.size(), 1, io_workers, [&](auto begin, auto end) {
-                for (auto r = begin; r < end; ++r) {
-                    const auto& read = reads[r];
-                    source.readv_range(read.record, read.offset, read.destinations);
-                    bytes_read.fetch_add(read.bytes, std::memory_order_relaxed);
-                    read_calls.fetch_add(1, std::memory_order_relaxed);
-                }
-            });
-            const auto read_done = Clock::now();
-            io_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-started).count());
-            for (const auto key : added) {
-                const auto& entry = entries.at(key);
-                for (int p = 0; p < 3; ++p)
-                    layer.banks[p].weight->set_expert_word_offset(entry.expert, entry.allocations[p].offset / 4);
-            }
-            cached.store(entries.size(), std::memory_order_relaxed);
+            for (const auto& read : reads) if (read.record != layer.banks[2].name) ++gate_up_reads;
             if (!preload) reuse = make_tq_reuse_plan(
                 {host.data<int>(), host.size()}, route_ids.shape(0), route_ids.shape(1), layer.experts);
+            const auto started = Clock::now();
+            prepare_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(started-prepared_from).count());
+            const auto read_range = [&](std::size_t begin, std::size_t end) {
+                const auto read_started = Clock::now();
+                workers.run(begin, end, 1, io_workers, [&](auto first, auto last) {
+                    for (auto r = first; r < last; ++r) {
+                        const auto& read = reads[r];
+                        source.readv_range(read.record, read.offset, read.destinations);
+                        bytes_read.fetch_add(read.bytes, std::memory_order_relaxed);
+                        read_calls.fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+                io_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_started).count());
+            };
+            const auto publish_offsets = [&](int first, int last) {
+                for (const auto key : added) {
+                    const auto& entry = entries.at(key);
+                    for (int p = first; p < last; ++p)
+                        layer.banks[p].weight->set_expert_word_offset(entry.expert, entry.allocations[p].offset / 4);
+                }
+            };
+            if (stage && !preload && !scan && gate_up_reads < reads.size()) {
+                if (parallel && !parallel->is_available()) {
+                    stage_started = true;
+                    const auto graph_started = Clock::now();
+                    async_eval({*parallel});
+                    graph_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-graph_started).count());
+                }
+                read_range(0, gate_up_reads);
+                publish_offsets(0, 2);
+                stage_started = true;
+                const auto graph_started = Clock::now();
+                (*stage)(*layer.weights, reuse ? &*reuse : nullptr);
+                graph_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-graph_started).count());
+                overlapped_read_batches.fetch_add(1, std::memory_order_relaxed);
+                read_range(gate_up_reads, reads.size());
+                publish_offsets(2, 3);
+            } else {
+                read_range(0, reads.size());
+                publish_offsets(0, 3);
+            }
+            const auto read_done = Clock::now();
+            cached.store(entries.size(), std::memory_order_relaxed);
             prepare_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count());
         } catch (...) {
+            if (stage_started) {
+                const auto failure = std::current_exception();
+                try { synchronize(default_stream(Device::gpu)); } catch (...) {}
+                for (auto key : added) if (auto found = entries.find(key); found != entries.end()) erase(found);
+                std::rethrow_exception(failure);
+            }
             for (auto key : added) if (auto found = entries.find(key); found != entries.end()) erase(found);
             throw;
         }
@@ -705,7 +789,7 @@ struct MlxTqExpertCache::Impl {
 
     MfqContainer source;
     int io_workers;
-    mfq::HostParallelPool workers;
+    mfq::HostParallelPool workers{{}, false};
     std::mutex execution;
     std::vector<Layer> layers;
     std::array<Pool, 3> pools;
@@ -719,6 +803,7 @@ struct MlxTqExpertCache::Impl {
     std::unique_ptr<MlxWeightResidency> pool_residency;
     std::atomic<std::size_t> allocated{0}, requested_limit{0};
     std::atomic<std::uint64_t> requests{0}, hits{0}, misses{0}, evictions{0}, bytes_read{0}, read_calls{0};
+    std::atomic<std::uint64_t> overlapped_read_batches{0};
     std::atomic<std::uint64_t> io_ns{0}, route_ns{0}, prepare_ns{0}, graph_ns{0};
     std::atomic<std::size_t> used{0}, cached{0};
     MlxResourceTelemetry resources;
@@ -737,13 +822,29 @@ array MlxTqExpertCache::apply(std::size_t layer, const array& ids,
     return impl_->apply(layer, ids, operation);
 }
 
+array MlxTqExpertCache::apply(std::size_t layer, const array& ids,
+        const std::function<array(const MlxTqExpertWeights&, const array*)>& gate_up,
+        const std::function<array(const MlxTqExpertWeights&, const array&, const array*)>& down,
+        const array* parallel) {
+    std::optional<array> intermediate;
+    const std::function<void(const MlxTqExpertWeights&, const array*)> stage = [&](const auto& weights, const array* reuse) {
+        intermediate = gate_up(weights, reuse);
+        async_eval({*intermediate});
+    };
+    return impl_->apply(layer, ids, [&](const auto& weights, const array* reuse) {
+        auto hidden = intermediate ? *intermediate : gate_up(weights, reuse);
+        return down(weights, hidden, reuse);
+    }, &stage, parallel);
+}
+
 MlxTqExpertCacheStats MlxTqExpertCache::stats() const {
     std::lock_guard lock(impl_->execution);
     impl_->drain_completed();
     return {impl_->requests.load(), impl_->hits.load(), impl_->misses.load(), impl_->evictions.load(),
         impl_->bytes_read.load(), impl_->read_calls.load(), impl_->cached.load(), impl_->used.load(),
         impl_->allocated.load(), impl_->io_ns.load() * 1e-9, impl_->route_ns.load() * 1e-9,
-        impl_->prepare_ns.load() * 1e-9, impl_->graph_ns.load() * 1e-9};
+        impl_->prepare_ns.load() * 1e-9, impl_->graph_ns.load() * 1e-9, impl_->metadata,
+        impl_->overlapped_read_batches.load()};
 }
 std::size_t MlxTqExpertCache::limit_bytes() const noexcept { return impl_->requested_limit.load(); }
 std::size_t MlxTqExpertCache::backing_bytes() const noexcept { return impl_->backing; }
