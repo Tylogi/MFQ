@@ -1,3 +1,4 @@
+#include "runtime/execution_options.h"
 #include "batch_selected_attention.h"
 #include "selected_attention.h"
 #include "runtime/decode_window.h"
@@ -22,8 +23,7 @@ tb::Tensor batch_selected_attention(const BatchDecodeInputs& inputs, int64_t fie
     MFQ_RUNTIME_CHECK(query.dim() == 4 && query.size(0) == inputs.rows() && query.size(2) == 1 &&
         config.pool > 0 && config.budget > 0 && config.budget % config.pool == 0 && config.capacity > 0,
         "invalid independent selected-attention geometry");
-    const auto* trace = std::getenv("MFQ_TRACE_QSA_BATCH");
-    if (trace && trace[0] == '1')
+    if (runtime_options::qsa_independent_batch_trace())
         std::fprintf(stderr, "qsa_independent_batch rows=%lld\n", static_cast<long long>(inputs.rows()));
     const auto mark = [](const char* phase) {
         if (auto* window = DecodeWindow::recording())
