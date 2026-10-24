@@ -13,6 +13,14 @@ std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, m
 std::vector<mfq_tensor_backend::Tensor> gdn_transposed_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
+// Independent padded requests [B,H,T,D] with lengths in [0,T]. Padding produces
+// zero output; an empty request preserves its initial state. FP16/BF16/FP32 QKV,
+// FP32 gates, output and state. Requires CUDA SM80 or newer. State is [B,Hv,D,D];
+// transposed swaps its last two axes, tiled maps hv to hv % Hq.
+std::vector<mfq_tensor_backend::Tensor> gdn_prefill_varlen_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, const std::vector<int64_t>& lengths,
+    MfqOptional<mfq_tensor_backend::Tensor> state, bool transposed = false, bool tiled = false, bool inplace = false);
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
     mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
     mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
