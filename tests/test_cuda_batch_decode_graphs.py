@@ -206,5 +206,3 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
         assert await run(4) == reference
 
     asyncio.run(check())
-
-
