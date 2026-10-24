@@ -37,7 +37,8 @@ async def messages(service: ServiceDependency, request: Request) -> Response:
     try:
         parsed = parse_messages_request(await request.json())
     except (ValueError, OpenAIRequestError) as error:
-        return JSONResponse(status_code=400, content=error_body(str(error)))
+        status = error.status_code if isinstance(error, OpenAIRequestError) else 400
+        return JSONResponse(status_code=status, content=error_body(str(error), error_type(status)))
     parsed = replace(parsed, chat=replace(parsed.chat, routing_model=service.resolve_model_alias(parsed.chat.model)))
     try:
         if parsed.chat.stream:

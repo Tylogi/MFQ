@@ -1807,6 +1807,8 @@ class ServerService:
                 tools=prepared.request.tools,
                 tool_choice=prepared.request.tool_choice,
                 response_format=prepared.request.response_format,
+                priority=prepared.request.priority,
+                timeout_seconds=prepared.request.timeout_seconds,
             ):
                 accumulator.apply(delta)
             finish_reason = self._require_finish_reason(accumulator)
@@ -1835,7 +1837,7 @@ class ServerService:
             raise ServiceError(
                 error.status_code
                 if error.status_code
-                in {400, 404, 409, 413, 415, 422, 429, 501, 502, 503}
+                in {400, 404, 409, 413, 415, 422, 429, 501, 502, 503, 504}
                 else 502,
                 error.code,
                 str(error),
@@ -1948,6 +1950,8 @@ class ServerService:
                     tools=prepared.request.tools,
                     tool_choice=prepared.request.tool_choice,
                     response_format=prepared.request.response_format,
+                    priority=prepared.request.priority,
+                    timeout_seconds=prepared.request.timeout_seconds,
                 )
             ) as backend_stream:
                 iterator = backend_stream.__aiter__()

@@ -60,6 +60,8 @@ class FakeBackend:
         tools: Sequence[Any] = (),
         tool_choice: Any = "auto",
         response_format: Any = None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
         self.calls.append(
             {
@@ -70,6 +72,8 @@ class FakeBackend:
                 "tools": tools,
                 "tool_choice": tool_choice,
                 "response_format": response_format,
+                "priority": priority,
+                "timeout_seconds": timeout_seconds,
             }
         )
         if self.error is not None:
@@ -219,6 +223,23 @@ def test_old_chat_model_is_only_a_legacy_default_not_a_binding(tmp_path: Path) -
         assert backend.calls[0]["model"] == "loaded-model"
         assert service.store.get_session(session.id).id == session.id
         assert len(service.store.list_sessions()) == 1
+    asyncio.run(run())
+
+
+def test_response_scheduling_reaches_the_backend(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend((BackendDelta(content_delta="answer", finish_reason="stop"),))
+        service = make_service(tmp_path, backend)
+        session = await service.create_session(CreateSessionRequest(model="model-a"))
+        request = CreateResponseRequest(
+            request_id=REQUEST_ID, model="model-a", expected_revision=0,
+            input=[{"type": "text", "text": "question"}], stream=False,
+            priority=8, timeout_seconds=4.0,
+        )
+        prepared = await service.prepare_response(session.id, request)
+        await service.collect_response(prepared)
+        assert backend.calls[0]["priority"] == 8
+        assert backend.calls[0]["timeout_seconds"] == 4.0
     asyncio.run(run())
 
 
@@ -662,6 +683,36 @@ def test_service_failure_is_persisted_and_reported(tmp_path: Path) -> None:
         stored = service.store.get_response(prepared.begin.response.id)
         assert stored.status == ResponseStatus.FAILED
         assert service.store.get_session(SESSION_ID).state == SessionState.ERROR
+
+    asyncio.run(run())
+
+
+def test_service_reports_a_worker_deadline_as_504(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend(
+            error=BackendError("deadline_exceeded", "request deadline expired", status_code=504)
+        )
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=False,
+                timeout_seconds=2.0,
+            ),
+        )
+        with pytest.raises(ServiceError) as caught:
+            await service.collect_response(prepared)
+        assert caught.value.status_code == 504
+        assert caught.value.detail.code == "deadline_exceeded"
+        assert caught.value.detail.retryable is False
 
     asyncio.run(run())
 

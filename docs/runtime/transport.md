@@ -62,6 +62,13 @@ runtime logs. Every request has a string `id`, an `op`, and an object `params`:
 {"v":1,"id":"2","op":"generate","params":{"model":"...","input":{"messages":[{"role":"user","content":"hi"}]},"sampling":{"max_new_tokens":128},"stream":true,"include_usage":true}}
 ```
 
+`generate` also accepts the optional scheduling fields `priority` (integer,
+larger wins) and `timeout_seconds` (relative seconds, `0 < value ≤ 86400`). The
+transport converts the timeout into an engine deadline, and an elapsed deadline
+ends the request with the `deadline_exceeded` error (`status_code: 504`,
+`retryable: false`) instead of a plain cancellation. Without both fields,
+generation keeps the previous FIFO, no-deadline behavior.
+
 Responses use the same ID:
 
 ```json

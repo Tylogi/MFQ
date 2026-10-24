@@ -749,3 +749,70 @@ def test_backend_stream_rejects_incomplete_or_failed_responses(
             assert isinstance(caught.value, BackendProtocolError)
 
     asyncio.run(run())
+
+
+def test_backend_forwards_scheduling_to_the_runtime_contract() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        body = 'data: {"id":"run-1","choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=body,
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
+        async for _delta in backend.stream(
+            model="model-a",
+            messages=[{"role": "user", "content": "hello"}],
+            sampling=SamplingParams(),
+            priority=5,
+            timeout_seconds=2.5,
+        ):
+            pass
+        await client.aclose()
+
+    asyncio.run(run())
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["priority"] == 5
+    assert payload["timeout_seconds"] == 2.5
+
+
+def test_worker_deadline_expiry_surfaces_as_a_timeout() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        event = {
+            "error": {
+                "code": "deadline_exceeded",
+                "message": "request deadline expired before the engine completed the request",
+                "status_code": 504,
+                "retryable": False,
+            }
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\n",
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
+        with pytest.raises(BackendError) as raised:
+            async for _delta in backend.stream(
+                model="model-a",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+                timeout_seconds=1.0,
+            ):
+                pass
+        await client.aclose()
+        assert raised.value.code == "deadline_exceeded"
+        assert raised.value.status_code == 504
+        assert raised.value.retryable is False
+
+    asyncio.run(run())

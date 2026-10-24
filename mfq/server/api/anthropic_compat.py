@@ -33,8 +33,8 @@ def is_anthropic_request(request: Any) -> bool:
 
 def error_type(status: int) -> str:
     return {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
-            404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
-            503: "overloaded_error", 529: "overloaded_error"}.get(status, "api_error")
+            404: "not_found_error", 413: "request_too_large", 422: "invalid_request_error",
+            429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error"}.get(status, "api_error")
 
 
 def _string(value: Any, field: str, *, empty: bool = False) -> str:
@@ -162,9 +162,12 @@ def parse_messages_request(body: Any) -> MessagesRequest:
         raise OpenAIRequestError("tool_choice requires tools")
     if choice["type"] == "tool" and choice["name"] not in {tool["function"]["name"] for tool in converted_tools}:
         raise OpenAIRequestError("tool_choice names an undefined tool")
+    # Scheduling extensions follow the same top-level convention as the other
+    # MFQ Message fields; ``metadata`` stays reserved for application data.
     converted = {key: body[key] for key in (
         "model", "max_tokens", "temperature", "top_p", "top_k", "stream",
         "mfq_session_id", "enable_mtp", "enable_thinking", "seed",
+        "priority", "timeout_seconds",
     ) if key in body}
     if "temperature" in body and (isinstance(body["temperature"], bool) or not isinstance(body["temperature"], (int, float)) or not 0 <= body["temperature"] <= 1):
         raise OpenAIRequestError("temperature must be between 0 and 1")

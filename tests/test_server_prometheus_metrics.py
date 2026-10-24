@@ -23,7 +23,7 @@ from mfq.server.protocol.models import (
     TokenUsage,
 )
 from mfq.server.runtime.backend import BackendDelta, BackendError
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 from mfq.server.services.metrics import (
     PROMETHEUS_CONTENT_TYPE,
     Histogram,
@@ -227,7 +227,7 @@ def _instance(
         port=43123,
         context_size=4096,
         state=RuntimeInstanceState.READY,
-        request_slots=asyncio.Semaphore(capacity),
+        request_slots=_RequestSlotGate(capacity),
         request_capacity=capacity,
         batch_capacity=capacity,
     )
