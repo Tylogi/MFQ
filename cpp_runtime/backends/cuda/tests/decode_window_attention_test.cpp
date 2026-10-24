@@ -1249,9 +1249,13 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-independent-batch-check")qsa_independent_batch_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-independent-batch-bench")qsa_independent_batch_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-incremental-pool-check")qsa_incremental_pool_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-incremental-pool-bench")qsa_incremental_pool_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-scalar-history-chain-check")qsa_scalar_history_chain_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
+    else if(argc==5 && std::string(argv[1])=="--qsa-prefill-score-bench")
+        qsa_prefill_score_benchmark(std::atoi(argv[2]),std::atoi(argv[3]),std::atoi(argv[4])!=0);
     else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-pool-write-check")qsa_live_pool_write_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();

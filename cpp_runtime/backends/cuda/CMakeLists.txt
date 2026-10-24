@@ -91,6 +91,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qsa_scores.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
@@ -99,6 +100,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qk_rope_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
@@ -399,6 +401,7 @@ set(MFQ_CUDA_TRANSFORMER_SOURCES
     ${MFQ_CUDA_ROOT}/core/full_block.cpp
     ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/core/rope.cpp
+    ${MFQ_CUDA_ROOT}/core/pooled_cache.cpp
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
@@ -413,6 +416,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/mfe_ffn.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
     ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/qsa_scores.cpp
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
 )
 
@@ -453,6 +457,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batch_decode.cpp
     ${MFQ_CUDA_ROOT}/runtime/batch_decode_graph.cpp
+    ${MFQ_CUDA_ROOT}/runtime/batch_sampling.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/reference.cpp
@@ -657,6 +662,12 @@ if(BUILD_TESTING)
         mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
     add_test(NAME mfq-nope-latent-moe-test COMMAND mfq-nope-latent-moe-test)
     set_tests_properties(mfq-nope-latent-moe-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-qk-rope-kv-test ${MFQ_CUDA_ROOT}/tests/qk_rope_kv_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-qk-rope-kv-test)
+    target_compile_definitions(mfq-qk-rope-kv-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-qk-rope-kv-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-qk-rope-kv-test COMMAND mfq-qk-rope-kv-test)
+    set_tests_properties(mfq-qk-rope-kv-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-moe-ffn-pipeline-test ${MFQ_CUDA_ROOT}/tests/moe_ffn_pipeline_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -697,7 +708,10 @@ if(BUILD_TESTING)
             ENVIRONMENT "MFQ_KV_TURBOQUANT_BITS=${bits}")
     endforeach()
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
+    add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
+    add_test(NAME mfq-cuda-qsa-incremental-pool-test COMMAND mfq-window-attention-test --qsa-incremental-pool-check)
+    add_test(NAME mfq-cuda-qsa-prefill-test COMMAND mfq-window-attention-test --qsa-prefill-check)
     add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
     foreach(bits 0 2.5 4)
@@ -839,6 +853,8 @@ if(BUILD_TESTING)
     add_test(NAME mfq-cuda-mfe-prepare-test COMMAND mfq-cuda-runtime-state-test --mfe-prepare-check)
     add_test(NAME mfq-cuda-mfe-transfer-test COMMAND mfq-cuda-runtime-state-test --mfe-transfer-check)
     add_test(NAME mfq-cuda-mapped-copy-test COMMAND mfq-cuda-runtime-state-test --mapped-copy-check)
+    add_test(NAME mfq-cuda-batched-sampling-test COMMAND mfq-cuda-runtime-state-test --batched-sampling-check)
+    set_tests_properties(mfq-cuda-batched-sampling-test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME mfq-cuda-sampling-keys-test COMMAND mfq-cuda-runtime-state-test --sampling-check)
     add_test(NAME mfq-cuda-transfer-copy-test COMMAND mfq-cuda-runtime-state-test --transfer-copy-check)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)

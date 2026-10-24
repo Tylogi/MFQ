@@ -31,6 +31,11 @@ struct RuntimeInput {
     bool half_query = false;
     bool wide_positions = false;
     bool direct_query = false;
+    bool bf16_query = false;
+    // Inline selection: indices may hold sentinels (negative, out of range or
+    // padding) and no separate FP16 logit mask is supplied.
+    bool inline_indices = false;
+    int index_limit = 0;
     mfq::cuda::HotKvView hot{};
     mfq::cuda::IndirectKvView indirect{};
 };
@@ -127,11 +132,18 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     if (input.direct_query) {
         const int64_t query_offset = int64_t(sequence)*input.query_batch_stride +
             int64_t(zt_q)*input.query_head_stride;
-        tile_input.query = static_cast<const char*>(q) + query_offset*(input.half_query ? sizeof(half) : sizeof(float));
+        const int64_t query_element = input.half_query || input.bf16_query
+            ? sizeof(half) : sizeof(float);
+        tile_input.query = static_cast<const char*>(q) + query_offset*query_element;
         tile_input.query_token_stride = input.query_token_stride;
         tile_input.query_head_stride = input.query_head_stride;
         tile_input.query_column_stride = input.query_column_stride;
         tile_input.half_query = input.half_query;
+        tile_input.bf16_query = input.bf16_query;
+    }
+    if (input.inline_indices) {
+        tile_input.index_count = selected;
+        tile_input.index_limit = input.index_limit;
     }
     if (input.positions) {
         int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[jt]
@@ -259,7 +271,8 @@ Tensor launch(
     bool half_output = false,
     const Tensor& positions = Tensor{},
     int64_t causal_columns = 0, mfq::cuda::HotKvView hot = {},
-    mfq::cuda::IndirectKvView indirect = {}) {
+    mfq::cuda::IndirectKvView indirect = {},
+    bool inline_indices = false, int64_t index_limit = 0) {
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
     constexpr int ncols = ncols1 * ncols2;
@@ -277,6 +290,9 @@ Tensor launch(
         name, ": causal selection exceeds 32-bit indexing");
     const int selected = causal ? static_cast<int>(((causal_columns + 31) / 32) * 32)
         : static_cast<int>(indices.size(2));
+    MFQ_RUNTIME_CHECK(!inline_indices || (!causal && !mask.defined() &&
+        index_limit > 0 && index_limit <= max_seq),
+        name, ": invalid inline selection");
 
     MFQ_RUNTIME_CHECK(B > 0 && M > 0 && heads > 0 && kv_heads > 0 &&
         heads % kv_heads == 0 && max_seq > 0 && selected > 0,
@@ -295,8 +311,10 @@ Tensor launch(
     MFQ_RUNTIME_CHECK(k.is_contiguous() &&
         v.is_contiguous() && (causal || indices.is_contiguous()),
         name, ": tensors must be contiguous");
+    const bool bf16_query = q.scalar_type() == mfq_tensor_backend::kBFloat16;
     MFQ_RUNTIME_CHECK((q.scalar_type() == mfq_tensor_backend::kFloat32 ||
-        q.scalar_type() == mfq_tensor_backend::kFloat16) &&
+        q.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        (bf16_query && inline_indices)) &&
         k.scalar_type() == mfq_tensor_backend::kFloat16 &&
         v.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (causal || indices.scalar_type() == mfq_tensor_backend::kInt32),
@@ -330,6 +348,11 @@ Tensor launch(
     const int cc = properties.major * 100 + properties.minor * 10;
     MFQ_RUNTIME_CHECK(turing_mma_available(cc),
         name, ": requires Turing-class tensor cores or newer");
+    // Inline selection rewrites the logit mask inside the synchronous loader
+    // path; the multi-stage pipeline owns a different mask preload.
+    MFQ_RUNTIME_CHECK(!inline_indices ||
+        ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc) <= 1,
+        name, ": inline selection requires the synchronous KV loader");
     const auto config = ampere_mma_available(cc)
         ? ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols)
         : ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
@@ -417,11 +440,13 @@ Tensor launch(
 
     Tensor out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options().dtype(mfq_tensor_backend::kFloat32));
     const auto stream = mfq_current_cuda_stream();
+    const bool direct_query = causal || inline_indices || bf16_query ||
+        q.scalar_type() == mfq_tensor_backend::kFloat16 || !q.is_contiguous();
     const RuntimeInput input{causal ? positions.data_ptr() : nullptr,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
         causal && positions.scalar_type() == mfq_tensor_backend::kInt64,
-        causal || !q.is_contiguous() || q.scalar_type() == mfq_tensor_backend::kFloat16, hot, indirect};
+        direct_query, bf16_query, inline_indices, static_cast<int>(index_limit), hot, indirect};
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),

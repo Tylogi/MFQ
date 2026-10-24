@@ -1410,6 +1410,7 @@ void check_dma_copy_buckets() {
 #include "mfe_prepare_bench.h"
 #include "mfe_transfer_bench.h"
 #include "sampling_bench.h"
+#include "batched_sampling_test.h"
 #include "transfer_copy_bench.h"
 #include "kv_speculative_lru_test.h"
 int main(int argc, char** argv) try {
@@ -1428,6 +1429,23 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-bench") {
         const auto context=default_context();benchmark_kv_speculative_lru();return 0;
     }
+    if (argc == 3 && std::string(argv[1]) == "--batched-sampling-bench") {
+        benchmark_batched_sampling(argv[2]);
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--batched-sampling-cutoff-check") {
+        check_batched_sampling_cutoffs();
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--batched-sampling-check") {
+        check_batched_sampling();
+        check_batched_sampling_cutoffs();
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--batched-sampling-grammar-check") {
+        check_batched_sampling(argv[2]);
+        return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
     if(argc==2 && std::string(argv[1])=="--conditional-compact-sampling-check") {check_conditional_compact_sampling();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-fallback-check") {check_sampling_fallback();return 0;}
@@ -1437,7 +1455,11 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-cache-bench") {benchmark_decode_kv_cache();return 0;}
     if(argc==2 && std::string(argv[1])=="--route-export-bench") {benchmark_route_export();return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-bench") {benchmark_mapped_copy();return 0;}
-    if(argc==2 && std::string(argv[1])=="--mfe-prepare-bench") {benchmark_mfe_prepare();return 0;}
+    if((argc==2 || argc==3) && std::string(argv[1])=="--mfe-prepare-bench") {
+        benchmark_mfe_prepare();
+        if(argc==3)mfe_expert_plan_test::verify_ffn(argv[2],true);
+        return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--mfe-prepare-check") {benchmark_mfe_prepare(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-check") {benchmark_mapped_copy(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-pcie-bench") {benchmark_mapped_copy(true,true);return 0;}

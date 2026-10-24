@@ -280,7 +280,10 @@ loops in `nint_matmul.hip`.
 - MoE grouped-GEMM kernels at runtime (build only).
 - DeepSeek DSV4 compression/HC, GLM DSA/MLA, MiniCPM paths: stubbed with
   runtime errors until ported.
-- Continuous batching beyond single requests, multimodal, duplex.
+- Continuous batching beyond single requests, multimodal, duplex. The Qwen3.5
+  HIP batcher compiles and the managed server accepts an explicit
+  `--max-requests-per-runtime` for it, but end-to-end multi-request execution
+  has not been certified on AMD hardware.
 
 ## Environment notes
 

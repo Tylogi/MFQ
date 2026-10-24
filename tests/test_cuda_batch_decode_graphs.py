@@ -1,8 +1,10 @@
 """Native CUDA row-bucket graphs with recurrent and full-attention request state."""
 
+import asyncio
 import json
 import os
 import subprocess
+from contextlib import suppress
 
 import numpy as np
 import pytest
@@ -10,7 +12,7 @@ import pytest
 from mfq.formats import io
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from tests.test_cuda_kv_quantization_native import write_qwen35_fixture
-from tests.test_native_nint_ple import _models
+from tests.test_native_nint_ple import _fresh_idle_status, _models, _worker_tokenizer
 
 
 def _recurrent_model(path):
@@ -63,6 +65,13 @@ def test_qwen_continuous_graph_reuses_bucket_and_preserves_inactive_state(tmp_pa
     assert int(metrics["bucket_reuses"]) > 0
     assert metrics["serial"] == metrics["inactive_state_bits"] == "PASS"
     assert metrics["padding_routes"] == "PASS"
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_sampling_membership_check "))
+    sampling = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(sampling["captures"]) == 1
+    assert int(sampling["bucket_reuses"]) > 0
+    assert sampling["serial"] == sampling["inactive_state_bits"] == sampling["inactive_rng"] == "PASS"
+    assert sampling["padding_routes"] == "PASS"
     assert "continuous_batching_check PASS" in result.stdout
     if requests == 32:
         assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in result.stdout
@@ -91,3 +100,109 @@ def test_qsa_independent_graph_heterogeneous_requests_match_serial(tmp_path, req
     assert metrics["serial"] == metrics["inactive_state_bits"] == metrics["padding_routes"] == "PASS"
     if requests > 2:
         assert f"continuous_batching_growth_check requests={requests} boundary=256 PASS" in result.stdout
+
+
+@pytest.mark.parametrize("family,requests", [("qwen35", 2), ("flash_next", 2), ("flash_next", 32)])
+def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_path, family, requests):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    environment = dict(os.environ)
+    if family == "qwen35":
+        model = tmp_path / "recurrent.mfq"
+        _recurrent_model(model)
+    else:
+        from tests.test_native_nint_ple import _models
+
+        _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=requests == 2)
+        if requests == 2:
+            environment.update(MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PRELOAD_ALL="1",
+                               MFQ_MOE_ASSERT_RESIDENT="1", MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    arguments = [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+                 "--continuous-batching-check-requests", str(requests)]
+    if family == "flash_next" and requests == 32:
+        arguments += ["--moe-gpu-cache-gb", "0"]
+    result = subprocess.run(
+        arguments,
+        env=environment,
+        text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_sampling_membership_check "))
+    metrics = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(metrics["captures"]) == 1
+    assert int(metrics["bucket_reuses"]) == int(metrics["steps"]) - 1
+    assert all(metrics[name] == "PASS" for name in ("serial", "inactive_state_bits", "inactive_rng", "padding_routes"))
+    assert "continuous_batching_sampling_oracle logits=tied" in result.stdout
+
+
+@pytest.mark.parametrize("budget", [32, 2048])
+@pytest.mark.parametrize("cells", [16, 496])
+def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=True)
+    header, weights = io.load(model)
+    config = json.loads(weights[MODEL_CONFIG_ASSET])
+    config["text_config"].update(num_key_value_heads=2, indexer_budget=budget)
+    for role in ("key", "value"):
+        name = f"model.block.1.attention.{role}.weight"
+        weights[name] = np.tile(weights[name], (2, 1))
+    weights[MODEL_CONFIG_ASSET] = json.dumps(config).encode()
+    io.save(model, header, weights)
+    tokenizer = _worker_tokenizer(tmp_path)
+    environment = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+                       MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="8388608",
+                       MFQ_MEMORY_ARCHITECTURE="discrete", MFQ_KV_RAM_PREALLOCATED="1",
+                       MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * 512))
+    # A small GPU tier exercises eviction and cold reads; a small RAM tier
+    # exposes writes through the logical [heads, 512, width] view immediately.
+    prompts = ["ab" * count for count in (12, 25, 40)]
+
+    async def run(capacity):
+        log_path = tmp_path / f"tiered-{capacity}.log"
+        with log_path.open("wb") as log:
+            process = await asyncio.create_subprocess_exec(
+                executable, "--model", str(model), "--tokenizer", str(tokenizer), "--transport", "stdio",
+                "--ctx-size", "512", "--continuous-batching", str(capacity), "--moe-gpu-cache-gb", "0.00004",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
+                env=dict(environment, MFQ_CONTINUOUS_BATCH_CUDA_GRAPH=str(int(capacity > 1))),
+            )
+            client = StdioRuntimeClient(process, control_timeout_seconds=15)
+            try:
+                await client.status()
+
+                async def generate(prompt):
+                    async with client.generate({"messages": [{"role": "user", "content": prompt}],
+                            "mfq_preformatted_prompt": prompt, "temperature": 0,
+                            "top_k": 1, "max_tokens": 32, "enable_mtp": False, "stream": True}) as events:
+                        output = [event async for event in events if event is not None]
+                    return "".join(choice.get("delta", {}).get("content", "")
+                                   for event in output for choice in event.get("choices", []))
+
+                single = await generate(prompts[0])
+                outputs = (await asyncio.gather(*(generate(prompt) for prompt in prompts)) if capacity > 1
+                           else [await generate(prompt) for prompt in prompts])
+                status = await _fresh_idle_status(client)
+                if capacity > 1:
+                    assert status["continuous_batching_cuda_graph_captures"] > 0
+                    assert status["continuous_batching_cuda_graph_bucket_reuses"] > 0
+                assert "exclusive=1" in log_path.read_text(errors="replace")
+                return single, outputs
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await process.wait()
+
+    async def check():
+        reference = await run(1)
+        assert reference[0] and all(reference[1])
+        assert await run(4) == reference
+
+    asyncio.run(check())

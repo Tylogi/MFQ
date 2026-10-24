@@ -12,6 +12,7 @@
 
 #include <hip/hip_runtime_api.h>
 #include <algorithm>
+#include <iostream>
 #include <variant>
 
 namespace mfq::cuda {
@@ -45,11 +46,18 @@ struct CudaEngineState {
                 batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
                     language, *execution, config.continuous_batch);
-            else throw std::invalid_argument("continuous batching is unavailable for this model");
+            else
+                // Capacity is advisory on HIP too: keep the single-request path
+                // and report capacity one rather than failing the load.
+                std::cerr<<"continuous_batching unavailable model="<<language.model_type()
+                    <<" requested_capacity="<<config.continuous_batch.max_sequences<<'\n';
         }
     }
     bool can_batch(const EngineRequest& request) const {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
+    }
+    std::size_t batch_capacity() const {
+        return batching ? std::max<std::size_t>(1, config.continuous_batch.max_sequences) : 1;
     }
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
@@ -143,7 +151,8 @@ struct CudaBackend {
             });
         return visit([&](auto& state) {
             EngineInfo info;
-            info.max_requests = std::max<std::size_t>(1, config.continuous_batch.max_sequences);
+            info.batch_capacity = state.batch_capacity();
+            info.max_requests = info.batch_capacity;
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();

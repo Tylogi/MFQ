@@ -39,7 +39,7 @@ void batch_state_store(const BatchDecodeInputs&, int64_t field, int64_t row,
                        const mfq_tensor_backend::Tensor& input);
 mfq_tensor_backend::Tensor batch_state_gather(const BatchDecodeInputs&, int64_t field, int64_t row,
     const mfq_tensor_backend::Tensor& indices, int64_t heads, int64_t width,
-    const mfq_tensor_backend::TensorOptions& options);
+    const mfq_tensor_backend::TensorOptions& options, int64_t hot_field = -1, bool values = false);
 void batch_state_scatter(const BatchDecodeInputs&, int64_t field, int64_t row,
     const mfq_tensor_backend::Tensor& indices, const mfq_tensor_backend::Tensor& values);
 void mask_decode_routes(const mfq_tensor_backend::Tensor& routes,

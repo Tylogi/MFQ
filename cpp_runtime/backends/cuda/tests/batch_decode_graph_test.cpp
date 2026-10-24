@@ -1,4 +1,5 @@
 #include "runtime/batch_decode_graph.h"
+#include "mfq_cuda_kv_hot_cache.h"
 
 #include <cstring>
 #include <iostream>
@@ -12,12 +13,87 @@ static void check(bool value, const char* message) {
         throw std::runtime_error(message);
 }
 
+static void check_exclusive_tiers() {
+    const auto options = tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32);
+    const auto integers = options.dtype(tb::kInt64);
+    BatchDecodeGraphCache graphs;
+    MfqCudaStreamGuard guard(graphs.stream());
+    std::vector<HotKvCache> caches;
+    for (int request = 0; request < 4; ++request) {
+        auto cache = HotKvCache::allocate(2, 8, 3, 4, 4, options);
+        cache.set_cold_storage(tb::zeros({1, 2, 5, 4}, options), tb::zeros({1, 2, 5, 4}, options));
+        auto keys = tb::full({1, 2, 6, 4}, 10 + request, options);
+        cache.append(keys, keys + 100, tb::arange(6, integers));
+        caches.push_back(std::move(cache));
+    }
+    auto& graph = graphs.get({4, 8, 8, {}}, 2 + HotKvStateFields::Count, 0);
+    auto& inputs = *graph.inputs;
+    std::vector<tb::Tensor> outputs;
+    for (const auto members : {std::vector<int>{0, 1, 2}, std::vector<int>{3, 2, 0}}) {
+        const auto position = graphs.has_graphs() ? 7 : 6;
+        inputs.update_rows({{20, position, members[0]}, {21, position, members[1]}, {22, position, members[2]}});
+        for (int row = 0; row < 3; ++row) {
+            auto& cache = caches[members[row]];
+            // The gather's logical extent is eight; each physical tier is smaller.
+            inputs.state(row, 0, cache.mapping);
+            inputs.state(row, 1, cache.mapping);
+            cache.bind_decode_state(inputs, 2, row);
+        }
+        inputs.upload();
+        const auto body = [&] {
+            outputs.clear();
+            for (int row = 0; row < 4; ++row) {
+                auto value = inputs.ids().narrow(0, row, 1).to(tb::kInt32).reshape({1, 1, 1, 1});
+                auto keys = (tb::ones({1, 2, 1, 4}, options) * value).contiguous();
+                auto positions = inputs.positions().narrow(0, row, 1);
+                check(caches.front().append_decode(keys, keys + 100, positions, {}, {}, false, &inputs, 2, row),
+                      "exclusive indirect append was rejected");
+                outputs.push_back(batch_state_gather(inputs, 0, row, tb::arange(8, integers), 2, 4, options, 2));
+                outputs.push_back(batch_state_gather(inputs, 1, row, tb::arange(8, integers), 2, 4, options, 2, true));
+            }
+        };
+        if (!graph.valid) {
+            graphs.prepare_pool({}, {});
+            graph.window = std::make_unique<DecodeWindow>(graphs.stream().stream());
+            graph.window->capture(body, [] {}, [&] { outputs.clear(); });
+            graphs.captured(graph, 0);
+        }
+        graph.window->run();
+        graphs.replayed(graph);
+        for (int row = 0; row < 4; ++row) {
+            for (int value = 0; value < 2; ++value) {
+                auto actual = outputs[2 * row + value].cpu();
+                for (int head = 0; head < 2; ++head) {
+                    for (int token = 0; token < 8; ++token) {
+                        int expected = 0;
+                        if (row < 3) {
+                            const auto request = members[row];
+                            if (token < 6)
+                                expected = 10 + request + value * 100;
+                            else if (token == position)
+                                expected = 20 + row + value * 100;
+                            else if (token == 6 && position == 7 && request != 3)
+                                expected = (request == 0 ? 20 : 22) + value * 100;
+                        }
+                        for (int column = 0; column < 4; ++column)
+                            check(actual.data_ptr<int32_t>()[(head * 8 + token) * 4 + column] == expected,
+                                  "exclusive gather read the wrong physical row");
+                    }
+                }
+            }
+        }
+    }
+    check(graphs.captures == 1 && graphs.bucket_reuses == 1, "exclusive tiers captured membership changes");
+    std::cout << "batch_decode_exclusive_tiers PASS eviction=1 cold_reads=1 reorder=1 padding=1 captures=1\n";
+}
+
 int main() {
     try {
         int devices = 0;
         MFQ_CUDA_CHECK(cudaGetDeviceCount(&devices));
         if (!devices)
             return 77;
+        check_exclusive_tiers();
         for (int maximum : {1, 2, 3, 6, 16, 32}) {
             for (int rows = 1; rows <= maximum; ++rows) {
                 const auto bucket = batch_decode_row_bucket(rows, maximum);

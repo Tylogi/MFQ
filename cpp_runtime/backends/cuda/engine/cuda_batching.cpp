@@ -216,10 +216,7 @@ QwenBatchOperations::Sample QwenBatchOperations::sample(
     MFQ_RUNTIME_CHECK(slot >= 0, "continuous batching sampled an inactive row");
     if (decoded.greedy_tokens.defined())
         return {{}, decoded.greedy_tokens.data_ptr<int64_t>()[slot], {}};
-    auto next = mfq::cuda::sample_logits(*request->sampler, decoded.logits.narrow(0, slot, 1),
-                                         request->counts, request->token_constraint);
-    const auto token = next.item<int64_t>();
-    return {std::move(next), token, {}};
+    return {decoded.sampled_next.narrow(0, slot, 1), decoded.sampled_tokens.data_ptr<int64_t>()[slot], {}};
 }
 
 void QwenBatchOperations::accept(const std::shared_ptr<Request> &request, const Sample &sample) {
@@ -487,16 +484,24 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
         ++greedy_batches_;
     }
     ++decode_batches_; decode_tokens_ += tokens.size();
-    return {std::move(logits),std::move(greedy_tokens)};
+    BatchSamplingResult sampled;
+    if (!greedy_tokens.defined()) {
+        std::vector<BatchSamplingInput> inputs(tokens.size());
+        for (const auto& request : state.active) {
+            if (!request->eligible) continue;
+            inputs[request->decode_row] = {&*request->sampler, request->counts, request->token_constraint};
+        }
+        sampling_.reserve(int(config_.max_sequences), int(vocab_size()), logits.device());
+        sampled = sampling_.sample(logits.contiguous().view({int64_t(tokens.size()), -1}), inputs);
+    }
+    return {std::move(logits), std::move(greedy_tokens), std::move(sampled.next), std::move(sampled.host)};
 }
 FlashNextBatchOperations::Sample FlashNextBatchOperations::sample(
         const std::shared_ptr<Request>& request,const Decoded& decoded) {
     MFQ_RUNTIME_CHECK(request->decode_row >= 0,"Flash-Next sampled an inactive row");
     if(decoded.greedy_tokens.defined())return {{},decoded.greedy_tokens.data_ptr<int64_t>()[request->decode_row],{}};
-    auto next = sample_logits(*request->sampler,decoded.logits.narrow(0,request->decode_row,1),
-                             request->counts,request->token_constraint);
-    const auto token = next.item<int64_t>();
-    return {std::move(next),token,{}};
+    return {decoded.sampled_next.narrow(0, request->decode_row, 1),
+        decoded.sampled_tokens.data_ptr<int64_t>()[request->decode_row], {}};
 }
 void FlashNextBatchOperations::accept(const std::shared_ptr<Request>& request,const Sample& sampled) {
     if (request->counts.defined()) sample_token_counts_add_cuda(request->counts,sampled.next.contiguous());

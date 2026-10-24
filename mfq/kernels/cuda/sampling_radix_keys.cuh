@@ -2,13 +2,14 @@
 
 // The low 32 bits of each sort key already encode the token ID. Keeping only
 // keys removes the duplicate radix payload and the inter-stage re-encoding.
-template<typename Scalar,int Items,bool CompactRows=false,bool Conditional=false>
+template<typename Scalar,int Items,bool CompactRows=false,bool Conditional=false,bool Batched=false>
 __global__ void sample_radix_keys_first(const Scalar* logits,uint64_t* output,int vocab,int top_k,
-        const volatile int32_t* enabled=nullptr) {
+        const volatile int32_t* enabled=nullptr,const SamplingRow* metadata=nullptr) {
     if constexpr(Conditional)if(!*enabled)return;
+    if constexpr(Batched)if(metadata[blockIdx.y].kind!=SamplingKind::radix)return;
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,Items>;
     __shared__ typename Sort::TempStorage temporary;
-    if constexpr(CompactRows) {
+    if constexpr(CompactRows || Batched) {
         logits+=int64_t(blockIdx.y)*vocab;
         output+=int64_t(blockIdx.y)*gridDim.x*top_k;
     }
@@ -52,13 +53,14 @@ __device__ __forceinline__ uint64_t sample_bitonic_key(uint64_t key,uint64_t* sh
     return key;
 }
 
-template<bool Bitonic,bool CompactRows=false,bool Conditional=false>
+template<bool Bitonic,bool CompactRows=false,bool Conditional=false,bool Batched=false>
 __global__ void sample_radix_keys_reduce(const uint64_t* input,uint64_t* output,int count,int top_k,
-        const volatile int32_t* enabled=nullptr) {
+        const volatile int32_t* enabled=nullptr,const SamplingRow* metadata=nullptr) {
     if constexpr(Conditional)if(!*enabled)return;
+    if constexpr(Batched)if(metadata[blockIdx.y].kind!=SamplingKind::radix)return;
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,1>;
     __shared__ typename Sort::TempStorage temporary;
-    if constexpr(CompactRows) {
+    if constexpr(CompactRows || Batched) {
         input+=int64_t(blockIdx.y)*count;
         output+=int64_t(blockIdx.y)*gridDim.x*top_k;
     }
@@ -71,9 +73,21 @@ __global__ void sample_radix_keys_reduce(const uint64_t* input,uint64_t* output,
     if(threadIdx.x<top_k)output[blockIdx.x*top_k+threadIdx.x]=key[0];
 }
 
-template<bool Bitonic>
+template<bool Bitonic,bool Batched=false>
 __global__ void sample_radix_keys_finish(const uint64_t* input,const float* random,int64_t* out,
-        int count,int top_k,float temperature,float top_p) {
+        int count,int top_k,float temperature,float top_p,const SamplingRow* metadata=nullptr) {
+    if constexpr(Batched) {
+        const int row=blockIdx.y;
+        if(metadata[row].kind!=SamplingKind::radix) {
+            if(metadata[row].kind==SamplingKind::inactive)out[row]=-1;
+            return;
+        }
+        input+=int64_t(row)*count;
+        out+=row;
+        temperature=metadata[row].temperature;
+        top_p=metadata[row].top_p;
+        top_k=metadata[row].top_k;
+    }
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,1>;
     __shared__ typename Sort::TempStorage temporary;
     __shared__ float top_vals[SAMPLE_RADIX_MAX_TOP_K];
@@ -106,7 +120,7 @@ __global__ void sample_radix_keys_finish(const uint64_t* input,const float* rand
             if(cumulative>=cutoff){keep=j+1;keep_sum=cumulative;break;}
         }
     }
-    const float u=fminf(fmaxf(random[0],0.f),0.99999994f);
+    const float u=fminf(fmaxf((Batched?metadata[blockIdx.y].random:random[0]),0.f),0.99999994f);
     const float target=u*keep_sum;
     float cumulative=0.f;
     int chosen=top_idxs[keep-1];

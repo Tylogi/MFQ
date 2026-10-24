@@ -1,5 +1,6 @@
 #include "mfq_cuda_kv_hot_cache.h"
 #include "mfq_cuda_resident_allocations.h"
+#include "../runtime/batch_decode_inputs.h"
 #include <algorithm>
 #include <limits>
 #include <cassert>
@@ -86,7 +87,27 @@ template<class Word> __global__ void append_exclusive_decode(
         int64_t khs,int64_t kts,int64_t vhs,int64_t vts,int32_t* mapping,int32_t* ids,Stamp* epochs,
         int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,Stamp* hot_control,
         const void* index_rows,void* index_storage,int index_width,int64_t index_stride,
-        bool index_input_half,bool index_output_half,bool begin_prepare,bool float_keys,bool float_values) {
+        bool index_input_half,bool index_output_half,bool begin_prepare,bool float_keys,bool float_values,
+        const int64_t* states,const int64_t* enabled,int rows,int field,int row) {
+    if(states) {
+        if(!enabled[row])return;
+        const auto at=[&](int offset){return 2*(int64_t(field+offset)*rows+row);};
+        keys=reinterpret_cast<Word*>(states[at(HotKvStateFields::Keys)]);
+        values=reinterpret_cast<Word*>(states[at(HotKvStateFields::Values)]);
+        cold_keys=reinterpret_cast<Word*>(states[at(HotKvStateFields::ColdKeys)]);
+        cold_values=reinterpret_cast<Word*>(states[at(HotKvStateFields::ColdValues)]);
+        cells=int(states[at(HotKvStateFields::Keys)+1]);
+        cold_cells=int(states[at(HotKvStateFields::ColdKeys)+1]);
+        maximum=int(states[at(HotKvStateFields::Mapping)+1]);
+        mapping=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::Mapping)]);
+        ids=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::SlotIds)]);
+        epochs=reinterpret_cast<Stamp*>(states[at(HotKvStateFields::Epochs)]);
+        cold_map=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::ColdMapping)]);
+        free_rows=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::FreeCold)]);
+        free_gpu=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::FreeGpu)]);
+        control=reinterpret_cast<int32_t*>(states[at(HotKvStateFields::ColdControl)]);
+        hot_control=reinterpret_cast<Stamp*>(states[at(HotKvStateFields::Control)]);
+    }
     __shared__ int slots[32],old_rows[32],cold_rows[32];
     const int tid=threadIdx.x;
     const int team=count==1?128:count==2?64:32;
@@ -302,11 +323,14 @@ void HotKvCache::append(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor& positions,
-        const tb::Tensor& index_rows,const tb::Tensor& index_storage,bool begin_prepare) {
+        const tb::Tensor& index_rows,const tb::Tensor& index_storage,bool begin_prepare,
+        const BatchDecodeInputs* inputs,int64_t field,int64_t row) {
     const auto* option=std::getenv("MFQ_KV_APPEND_FUSED");
-    if((option && option[0]=='0') || !exclusive() || positions.numel()<1 || positions.numel()>32 ||
+    if((!inputs && option && option[0]=='0') || !exclusive() || positions.numel()<1 || positions.numel()>32 ||
         positions.numel()>keys.size(2) || positions.scalar_type()!=tb::kInt64 || !positions.is_contiguous())return false;
-    if(!option && positions.numel()>8)return false;
+    if(!inputs && !option && positions.numel()>8)return false;
+    MFQ_RUNTIME_CHECK(!inputs || (!index_rows.defined() && !index_storage.defined() && !begin_prepare),
+        "indirect KV append requires separate index updates");
     const int count=int(positions.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),
         kw=int(keys.size(3)),vw=int(values.size(3));
     const auto compatible=[&](const tb::Tensor& source,const tb::Tensor& target,int width) {
@@ -340,10 +364,19 @@ bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb:
             index_width?index_rows.stride(1):0,index_width && index_rows.scalar_type()==tb::kFloat16,
             index_width && index_storage.scalar_type()==tb::kFloat16,begin_prepare,
             k.scalar_type()==tb::kFloat32 && keys.scalar_type()==tb::kFloat16,
-            v.scalar_type()==tb::kFloat32 && values.scalar_type()==tb::kFloat16);
+            v.scalar_type()==tb::kFloat32 && values.scalar_type()==tb::kFloat16,
+            inputs?inputs->states().data_ptr<int64_t>():nullptr,
+            inputs?inputs->enabled().data_ptr<int64_t>():nullptr,inputs?int(inputs->rows()):0,int(field),int(row));
     };
     if(keys.element_size()==2)launch(uint16_t{});else if(keys.element_size()==4)launch(uint32_t{});else return false;
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return true;
+}
+void HotKvCache::bind_decode_state(BatchDecodeInputs& inputs,int64_t field,int64_t row) const {
+    MFQ_RUNTIME_CHECK(exclusive(),"indirect KV state requires exclusive tiers");
+    const tb::Tensor* tensors[]={&keys,&values,&cold_keys,&cold_values,&mapping,&slot_ids,&epochs,
+        &cold_mapping,&free_cold,&free_gpu,&cold_control,&control};
+    for(int offset=0;offset<HotKvStateFields::Count;++offset)
+        inputs.state(row,field+offset,*tensors[offset],offset<HotKvStateFields::Mapping?2:-1);
 }
 std::pair<tb::Tensor,tb::Tensor> HotKvCache::gather(int64_t count) const {
     MFQ_RUNTIME_CHECK(exclusive() && count>0 && count<=mapping.numel(),"invalid exclusive KV read");

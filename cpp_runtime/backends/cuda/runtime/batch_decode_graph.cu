@@ -1,4 +1,5 @@
 #include "batch_decode_inputs.h"
+#include "mfq_cuda_kv_hot_cache.h"
 
 #include <algorithm>
 
@@ -24,7 +25,7 @@ __global__ void transfer_state(const int64_t* table, const int64_t* enabled, int
 
 __global__ void transfer_sequence(const int64_t* table, const int64_t* enabled, int rows,
         int field, int row, const int64_t* indices, int64_t columns, int64_t heads,
-        int64_t width_bytes, unsigned char* local, bool store) {
+        int64_t width_bytes, unsigned char* local, bool store, int hot_field = -1, bool values = false) {
     const auto entry = 2 * (int64_t(field) * rows + row);
     auto* state = reinterpret_cast<unsigned char*>(table[entry]);
     const auto capacity = table[entry + 1];
@@ -35,12 +36,27 @@ __global__ void transfer_sequence(const int64_t* table, const int64_t* enabled, 
         const auto column = (index / width_bytes) % columns;
         const auto head = index / (width_bytes * columns);
         const auto position = indices[column];
-        const bool active = enabled[row] && state && position >= 0 && position < capacity;
+        bool active = enabled[row] && state && position >= 0 && position < capacity;
+        auto* physical = state;
+        auto physical_capacity = capacity;
+        auto physical_position = position;
+        if (active && hot_field >= 0) {
+            const auto at = [&](int offset) { return 2 * (int64_t(hot_field + offset) * rows + row); };
+            const auto* mapping = reinterpret_cast<const int32_t*>(table[at(HotKvStateFields::Mapping)]);
+            const auto slot = mapping[position];
+            const auto source = slot >= 0 ? (values ? HotKvStateFields::Values : HotKvStateFields::Keys)
+                : (values ? HotKvStateFields::ColdValues : HotKvStateFields::ColdKeys);
+            physical = reinterpret_cast<unsigned char*>(table[at(source)]);
+            physical_capacity = table[at(source) + 1];
+            physical_position = slot >= 0 ? slot :
+                reinterpret_cast<const int32_t*>(table[at(HotKvStateFields::ColdMapping)])[position];
+            active = physical && physical_position >= 0 && physical_position < physical_capacity;
+        }
         if (store) {
             if (active)
-                state[(head * capacity + position) * width_bytes + byte] = local[index];
+                physical[(head * physical_capacity + physical_position) * width_bytes + byte] = local[index];
         } else {
-            local[index] = active ? state[(head * capacity + position) * width_bytes + byte] : 0;
+            local[index] = active ? physical[(head * physical_capacity + physical_position) * width_bytes + byte] : 0;
         }
     }
 }
@@ -79,12 +95,13 @@ void batch_state_store(const BatchDecodeInputs& inputs, int64_t field, int64_t r
 }
 
 tb::Tensor batch_state_gather(const BatchDecodeInputs& inputs, int64_t field, int64_t row,
-        const tb::Tensor& indices, int64_t heads, int64_t width, const tb::TensorOptions& options) {
+        const tb::Tensor& indices, int64_t heads, int64_t width, const tb::TensorOptions& options,
+        int64_t hot_field, bool values) {
     auto output = tb::empty({1, heads, indices.numel(), width}, options);
     transfer_sequence<<<blocks(output.nbytes()), 256, 0, mfq_current_cuda_stream()>>>(
         inputs.states().data_ptr<int64_t>(), inputs.enabled().data_ptr<int64_t>(), inputs.rows(),
         field, row, indices.data_ptr<int64_t>(), indices.numel(), heads, width * output.element_size(),
-        static_cast<unsigned char*>(output.data_ptr()), false);
+        static_cast<unsigned char*>(output.data_ptr()), false, hot_field, values);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
