@@ -65,9 +65,51 @@ def test_qwen_continuous_graph_reuses_bucket_and_preserves_inactive_state(tmp_pa
     assert int(metrics["bucket_reuses"]) > 0
     assert metrics["serial"] == metrics["inactive_state_bits"] == "PASS"
     assert metrics["padding_routes"] == "PASS"
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_sampling_membership_check "))
+    sampling = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(sampling["captures"]) == 1
+    assert int(sampling["bucket_reuses"]) > 0
+    assert sampling["serial"] == sampling["inactive_state_bits"] == sampling["inactive_rng"] == "PASS"
+    assert sampling["padding_routes"] == "PASS"
     assert "continuous_batching_check PASS" in result.stdout
     if requests == 32:
         assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in result.stdout
+
+
+@pytest.mark.parametrize("family,requests", [("qwen35", 2), ("flash_next", 2), ("flash_next", 32)])
+def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_path, family, requests):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    environment = dict(os.environ)
+    if family == "qwen35":
+        model = tmp_path / "recurrent.mfq"
+        _recurrent_model(model)
+    else:
+        from tests.test_native_nint_ple import _models
+
+        _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=requests == 2)
+        if requests == 2:
+            environment.update(MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PRELOAD_ALL="1",
+                               MFQ_MOE_ASSERT_RESIDENT="1", MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    arguments = [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+                 "--continuous-batching-check-requests", str(requests)]
+    if family == "flash_next" and requests == 32:
+        arguments += ["--moe-gpu-cache-gb", "0"]
+    result = subprocess.run(
+        arguments,
+        env=environment,
+        text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_sampling_membership_check "))
+    metrics = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(metrics["captures"]) == 1
+    assert int(metrics["bucket_reuses"]) == int(metrics["steps"]) - 1
+    assert all(metrics[name] == "PASS" for name in ("serial", "inactive_state_bits", "inactive_rng", "padding_routes"))
+    assert "continuous_batching_sampling_oracle logits=tied" in result.stdout
 
 
 @pytest.mark.parametrize("budget", [32, 2048])
@@ -139,3 +181,38 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
         assert await run(4) == reference
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("family,requests", [("qwen35", 2), ("flash_next", 2), ("flash_next", 32)])
+def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_path, family, requests):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    environment = dict(os.environ)
+    if family == "qwen35":
+        model = tmp_path / "recurrent.mfq"
+        _recurrent_model(model)
+    else:
+        from tests.test_native_nint_ple import _models
+
+        _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=requests == 2)
+        if requests == 2:
+            environment.update(MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PRELOAD_ALL="1",
+                               MFQ_MOE_ASSERT_RESIDENT="1", MFQ_MOE_HOST_CACHE_BYTES="8388608")
+    arguments = [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+                 "--continuous-batching-check-requests", str(requests)]
+    if family == "flash_next" and requests == 32:
+        arguments += ["--moe-gpu-cache-gb", "0"]
+    result = subprocess.run(
+        arguments,
+        env=environment,
+        text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(line for line in result.stdout.splitlines()
+                if line.startswith("continuous_batching_sampling_membership_check "))
+    metrics = dict(field.split("=", 1) for field in line.split()[1:])
+    assert int(metrics["captures"]) == 1
+    assert int(metrics["bucket_reuses"]) == int(metrics["steps"]) - 1
+    assert all(metrics[name] == "PASS" for name in ("serial", "inactive_state_bits", "inactive_rng", "padding_routes"))
+    assert "continuous_batching_sampling_oracle logits=tied" in result.stdout
