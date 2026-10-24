@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/ngram.h"
 #include "core/attention.h"
 #include "core/rope.h"
+#include "core/pooled_cache.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "mfq/kernels/cuda/ple_fused.h"
 #include "runtime/nint_row_pipeline.h"
@@ -904,7 +905,8 @@ class Qsa {
     void activate_memory() {
         if(!managed_memory())return;
         if(!index_.storage().defined())index_.replace_storage(memory_->index);
-        graph_pooled_=memory_->pooled;
+        pooled_.bind(memory_->pooled);
+        graph_pooled_=pooled_.storage();
         if(memory_->offload) {
             offload_=memory_->offload;
             if(!offloaded_kv_)offloaded_kv_=std::make_unique<KvOffloadSequence>(offload_,
@@ -938,22 +940,26 @@ class Qsa {
             const auto width = cache == &index_ ? c_.index_width : c_.kv_heads * (cache == &keys_ ? key_width() : value_width());
             bytes += std::size_t(capacity) * width * (cache != &index_ && quantization_.enabled() ? 4 : 2);
         }
+        if(required>c_.budget)bytes+=pooled_.growth_bytes(required,c_.pool,c_.index_width,2);
         return bytes;
     }
     std::size_t graph_growth_bytes(int64_t capacity) const {
-        if(managed_memory())return memory_->growth_bytes(capacity);
+        if(managed_memory())return memory_->growth_bytes(capacity)+
+            (graph_prepared_?0:pooled_.position_bytes(c_.maximum));
         if (graph_keys_.defined()) return 0;
         auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
         if (!index_.storage().defined() || index_.storage().size(1) != capacity)
             bytes += std::size_t(capacity) * c_.index_width * 2;
         bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
+        bytes += pooled_.position_bytes(capacity);
         return bytes;
     }
     bool supports_session() const { return !offload_ && !(memory_ && memory_->offload); }
     std::size_t session_bytes(int64_t count) const {
         if(count<=0)return 0;
         return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+
-            c_.index_width*index_.storage().element_size());
+            c_.index_width*index_.storage().element_size())+
+            std::size_t(std::min(pooled_.completed(),count/c_.pool))*c_.index_width*index_.storage().element_size();
     }
     void capture_session(Qwen4BlockSessionState& state,int64_t count,std::size_t& bytes) const {
         MFQ_RUNTIME_CHECK(!offload_ && count>0 && count<=position(),"invalid Qwen4 QSA session boundary");
@@ -972,6 +978,8 @@ class Qsa {
             state.values=save(values_.storage().narrow(1,0,count));
         }
         state.index=save(index_.storage().narrow(1,0,count));
+        state.pooled=pooled_.capture(count,c_.pool);
+        bytes+=session_tensor_bytes(state.pooled.values);
     }
     void restore_session(const Qwen4BlockSessionState& state,int64_t count) {
         MFQ_RUNTIME_CHECK(!offload_ && state.keys.defined() && state.values.defined() && state.index.defined() &&
@@ -994,10 +1002,12 @@ class Qsa {
             }
             keys_.advance_fixed(count);values_.advance_fixed(count);index_.append(state.index);graph_prepared_=false;
         } else {keys_.append(state.keys);values_.append(state.values);index_.append(state.index);}
+        pooled_.restore(state.pooled,count,c_.pool);
     }
     std::vector<Tensor> resident_cache_tensors() const {
-        if(managed_memory())return {}; // Count physical GPU/RAM tiers through KvMemoryManager.
-        return {keys_.storage(),values_.storage(),index_.storage(),graph_keys_,graph_values_,graph_pooled_};
+        if(managed_memory())return {pooled_.positions()}; // KV tiers are counted through KvMemoryManager.
+        return {keys_.storage(),values_.storage(),index_.storage(),graph_keys_,graph_values_,
+            pooled_.storage(),pooled_.positions()};
     }
     void set_grouped_projection(bool enabled) {
         MFQ_RUNTIME_CHECK(!graph_keys_.defined() && position()==0,"reset QSA before switching projection execution");
@@ -1016,6 +1026,10 @@ class Qsa {
         values_.replace_storage(graph_values_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*value_width()}));
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
+    int64_t pooled_groups() const { return pooled_.completed(); }
+    int64_t pooled_processed_groups() const { return pooled_.processed_groups(); }
+    const Tensor& pooled_cache() const { return pooled_.storage(); }
+    void set_incremental_pooling(bool enabled) { pooled_.set_incremental(enabled); }
     void reset() {
         if (offload_) {
             if(offloaded_kv_)offloaded_kv_->reset();
@@ -1025,6 +1039,7 @@ class Qsa {
         keys_.reset();
         values_.reset();
         index_.reset();
+        pooled_.reset();
         graph_prepared_=false;
         if(managed_memory()){memory_->hot.reset();activate_memory();return;}
         graph_keys_={};graph_values_={};graph_pooled_={};
@@ -1034,14 +1049,13 @@ class Qsa {
         MFQ_RUNTIME_CHECK(!offload_ || managed_memory(), "streamed QSA graphs require a resident indexer");
         if(managed_memory()) {
             if(graph_prepared_)return;
-            const auto n=position(),pools=n/c_.pool;
+            const auto n=position();
             memory_->ensure(n);
-            if(pools) {
-                auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-                pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
-                auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
-                graph_pooled_.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
-            }
+            // A retained window can start a new prompt before any positions exist.
+            const auto positions=full_positions.defined()?full_positions:
+                tb::empty({0},index_.storage().options().dtype(tb::kInt64));
+            pooled_.update(*rotary_,index_.storage(),w_.index_key_norm,positions,n,c_.pool,c_.eps);
+            pooled_.prepare_graph(positions,c_.maximum);
             graph_prepared_=true;return;
         }
         if(graph_keys_.defined())return;
@@ -1055,13 +1069,9 @@ class Qsa {
         graph_values.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}));
         index_.prepare_fixed(capacity);
         auto graph_pooled=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
-        const auto pools=n/c_.pool;
-        if(pools) {
-            auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
-            auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
-            graph_pooled.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
-        }
+        pooled_.bind(graph_pooled);
+        pooled_.update(*rotary_,index_.storage(),w_.index_key_norm,full_positions,n,c_.pool,c_.eps);
+        pooled_.prepare_graph(full_positions,capacity);
         // Commit only after all allocation/copy submissions succeed. Replay
         // reads graph KV; retaining the old layout duplicates the full prefix
         // at every growth boundary. leave_graph recreates it when needed.
@@ -1146,26 +1156,7 @@ class Qsa {
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32));
             return finish(gated.to(hidden.scalar_type()));
         }
-        Tensor block,pooled;
-        const auto* pool_fusion=std::getenv("MFQ_QSA_POOL_FUSED");
-        const auto* pool_write=std::getenv("MFQ_QSA_POOL_WRITE_FUSED");
-        const bool pool_written=(!pool_fusion || pool_fusion[0]!='0') && (!pool_write || pool_write[0]!='0') &&
-            index_.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(index_.storage(),w_.index_key_norm,
-                positions,cache_positions,graph_pooled_,c_.pool,c_.maximum,c_.eps);
-        if(!pool_written && rotary_->fused() && (!pool_fusion || pool_fusion[0]!='0') && index_.storage().size(1)>=c_.maximum) {
-            auto prepared=mfq_qwen4_exp::live_index_pool(index_.storage(),positions,cache_positions,c_.pool,c_.maximum);
-            block=prepared[1];
-            pooled=rotary_->forward_normalized(prepared[0].unsqueeze(2),w_.index_key_norm,prepared[2],c_.eps).squeeze(1);
-        }else if(!pool_written) {
-            block=(cache_positions/c_.pool).to(tb::kInt64);
-            auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
-            pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
-            auto delta=positions-cache_positions;
-            auto block_positions=block*c_.pool+delta;
-            pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
-        }
-        if(!pool_written)graph_pooled_.index_copy_(1,block,pooled);
+        pooled_.update_graph(*rotary_,index_.storage(),w_.index_key_norm,positions,cache_positions,c_.pool,c_.eps);
         mark("qsa_pool_end");
         if(history_only)return {};
         auto ranked=mfq_qwen4_exp::live_block_scores(p.iq,graph_pooled_,cache_positions,c_.pool);
@@ -1225,10 +1216,13 @@ class Qsa {
     void advance_graph(int64_t tokens) {
         if(!offload_){keys_.advance_fixed(tokens);values_.advance_fixed(tokens);}
         index_.advance_fixed(tokens);
+        if((offload_?c_.maximum:graph_keys_.size(2))>c_.budget)
+            pooled_.advance_graph(index_.position(),c_.pool);
     }
     void truncate(int64_t keep) {
         if (offload_) {
             MFQ_RUNTIME_CHECK(keep >= 0 && keep <= position(), "invalid offloaded QSA truncation");
+            pooled_.truncate(keep,c_.pool);
             offloaded_kv_->truncate(keep);
             if(managed_memory())index_.truncate(keep);
             else {offloaded_index_->truncate(keep);offloaded_pooled_->truncate(keep/c_.pool);}
@@ -1237,6 +1231,7 @@ class Qsa {
         MFQ_RUNTIME_CHECK(keep >= 0 && keep <= keys_.position() && keep <= values_.position() &&
                               keep <= index_.position(),
                           "invalid Qwen4 QSA cache truncation");
+        pooled_.truncate(keep,c_.pool);
         keys_.truncate(keep);
         values_.truncate(keep);
         index_.truncate(keep);
@@ -1346,18 +1341,8 @@ class Qsa {
                 return attend(p.query, p.key.permute({0,2,1,3}), p.value.permute({0,2,1,3}), {}, offset);
             },
             [&](const Projection &p) {
-                const auto &raw = p.raw;
-                const auto pools = (offset + t) / c_.pool;
-                auto pooled = raw.narrow(1, 0, pools * c_.pool)
-                                  .reshape({b, pools, c_.pool, c_.index_width})
-                                  .to(tb::kFloat32)
-                                  .mean(2)
-                                  .to(raw.scalar_type());
-                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
-                auto starts = tb::arange(pools, raw.options().dtype(tb::kInt64)) * c_.pool;
-                auto positions = full_positions.index_select(-1, starts);
-                pooled = rotary_->forward(pooled.unsqueeze(1), positions).squeeze(1);
-                return pooled;
+                return pooled_.update(*rotary_,p.raw,w_.index_key_norm,full_positions,
+                    offset+t,c_.pool,c_.eps,use_cache);
             },
             [](const Projection &p, const Tensor &pooled) {
                 return mfq_qwen4_exp::block_scores(p.iq, pooled);
@@ -1467,7 +1452,7 @@ class Qsa {
         const Tensor& positions, const Tensor& full_positions, std::vector<Tensor>* trace,
         std::vector<Tensor> projections={},bool project_output=true,bool history_only=false) {
         const auto offset = position(), tokens = hidden.size(1), length = offset + tokens;
-        const auto pool_position=[&]{return managed_memory()?index_.position()/c_.pool:offloaded_pooled_->position();};
+        const auto pool_position=[&]{return pooled_.completed();};
         const auto pool_range=[&](int64_t start,int64_t count){return managed_memory()
             ? graph_pooled_.narrow(1,start,count).reshape({count,c_.index_width}) : offloaded_pooled_->range(start,count);};
         MFQ_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
@@ -1486,14 +1471,17 @@ class Qsa {
             else offloaded_index_->append(p.raw.reshape({tokens,c_.index_width}));
             const auto new_pools = length / c_.pool - first_pool;
             if (new_pools) {
-                auto raw = managed_memory()?index_.storage().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width})
-                    : offloaded_index_->range(first_pool * c_.pool, new_pools * c_.pool);
-                auto pooled = raw.reshape({1, new_pools, c_.pool, c_.index_width}).to(tb::kFloat32).mean(2).to(tb::kFloat16);
-                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
-                auto starts = (tb::arange(new_pools, positions.options().dtype(tb::kInt64)) + first_pool) * c_.pool;
-                pooled = rotary_->forward(pooled.unsqueeze(1), full_positions.index_select(-1, starts)).squeeze(1);
-                if(managed_memory())graph_pooled_.narrow(1,first_pool,new_pools).copy_(pooled);
-                else offloaded_pooled_->append(pooled.reshape({new_pools, c_.index_width}));
+                if(managed_memory()) {
+                    pooled_.update(*rotary_,index_.storage(),w_.index_key_norm,full_positions,
+                        length,c_.pool,c_.eps);
+                } else {
+                    auto raw=offloaded_index_->range(first_pool*c_.pool,new_pools*c_.pool)
+                        .reshape({1,new_pools*c_.pool,c_.index_width});
+                    auto pooled=pooled_.update_range(*rotary_,raw,w_.index_key_norm,full_positions,
+                        first_pool,new_pools,c_.pool,c_.eps);
+                    offloaded_pooled_->append(pooled.reshape({new_pools,c_.index_width}));
+                    pooled_.advance_graph(length,c_.pool);
+                }
             }
             if(history_only)return {};
             // When one layer fits in staging, reuse that layer across the
@@ -1647,6 +1635,7 @@ class Qsa {
     SequenceCache keys_, values_, index_;
     std::shared_ptr<KvOffloadStore> offload_;
     std::unique_ptr<KvOffloadSequence> offloaded_kv_, offloaded_index_, offloaded_pooled_;
+    PooledCache pooled_;
     Tensor graph_keys_,graph_values_,graph_pooled_;
     std::shared_ptr<KvMemoryAllocation> memory_;
     std::shared_ptr<KvMemoryManager> memory_manager_;

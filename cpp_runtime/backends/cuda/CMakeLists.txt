@@ -396,6 +396,7 @@ set(MFQ_CUDA_TRANSFORMER_SOURCES
     ${MFQ_CUDA_ROOT}/core/full_block.cpp
     ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/core/rope.cpp
+    ${MFQ_CUDA_ROOT}/core/pooled_cache.cpp
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
@@ -679,6 +680,8 @@ if(BUILD_TESTING)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
+    add_test(NAME mfq-cuda-qsa-incremental-pool-test COMMAND mfq-window-attention-test --qsa-incremental-pool-check)
+    add_test(NAME mfq-cuda-qsa-prefill-test COMMAND mfq-window-attention-test --qsa-prefill-check)
     add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
     foreach(bits 0 2.5 4)
