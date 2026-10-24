@@ -96,6 +96,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/gdn_prefill_chunk.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gdn_decode_window.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
@@ -696,6 +697,11 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    add_test(NAME mfq-cuda-gdn-prefill-test COMMAND mfq-window-attention-test --gdn-prefill-check)
+    foreach(check chunk chunk-varlen chunk-graph)
+        add_test(NAME mfq-cuda-gdn-prefill-${check}-test
+            COMMAND mfq-window-attention-test --gdn-prefill-${check}-check)
+    endforeach()
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
     add_test(NAME mfq-cuda-qsa-prefill-scores-test COMMAND mfq-window-attention-test --qsa-prefill-score-check)
     add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
