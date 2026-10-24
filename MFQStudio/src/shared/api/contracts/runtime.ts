@@ -175,6 +175,9 @@ export interface ServingStatistics {
   activity: {
     instance_id: string; model: string; state: string; active_requests: number;
     queued_requests: number; sample_age_seconds: number | null;
+    request_capacity?: number; batch_capacity?: number;
+    queue_wait_ms_avg?: number; queue_wait_ms_max?: number;
+    rejected_requests?: number;
     requests: { id: string; phase: string; processed_tokens: number;
       generated_tokens: number; prefill_tps: number; decode_tps: number;
       elapsed_seconds: number; updated_at: number }[];
@@ -255,13 +258,41 @@ export interface RuntimeDeviceMemory {
   memory_available_bytes?: number | null;
 }
 
+/** Server defaults and per-model overrides use seconds for queue timeouts. */
+export interface RuntimeConcurrencySettings {
+  max_requests: number;
+  max_queued_requests: number;
+  queue_timeout_seconds: number;
+}
+
+export type RuntimeConcurrencyLimits = Omit<RuntimeConcurrencySettings, 'queue_timeout_seconds'> & {
+  queue_timeout_seconds: number | null;
+};
+
+export interface RuntimeConcurrencyPolicy {
+  defaults: RuntimeConcurrencySettings;
+  limits: RuntimeConcurrencyLimits;
+}
+
+export interface RuntimeConcurrency {
+  requested: RuntimeConcurrencySettings;
+  effective: RuntimeConcurrencySettings;
+  limits: RuntimeConcurrencyLimits;
+}
+
 export interface RuntimeInstance {
+  concurrency?: RuntimeConcurrency | null;
   id: string;
   model: string;
   state: 'loading' | 'ready' | 'busy' | 'unloading' | 'failed';
   devices: string[];
   active_sessions: number;
   queued_requests: number;
+  request_capacity?: number;
+  batch_capacity?: number;
+  queue_wait_ms_avg?: number;
+  queue_wait_ms_max?: number;
+  rejected_requests?: number;
   resident_bytes?: number | null;
   kv_bytes?: number | null;
   memory?: RuntimeMemoryResources | null;

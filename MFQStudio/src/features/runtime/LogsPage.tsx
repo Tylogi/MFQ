@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { PauseIcon, PlayIcon } from '@phosphor-icons/react';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import type { JobResource } from '../../shared/api/types';
@@ -46,38 +46,49 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
   const refreshPending = useRef(false);
   const history = useLogHistory(paused);
   const error = [history.error, manualError || (manualRefreshFailed ? refreshError : '')].filter(Boolean).join(' · ');
-  const sourceNames = new Map(instances.map((item) => [item.id, item.model]));
-  history.requests.forEach((item) => { if (item.instance_id && item.model) sourceNames.set(item.instance_id, item.model); });
-  history.logs.forEach((item) => {
-    if (item.instance_id && typeof item.fields.model === 'string' && item.fields.model && !sourceNames.has(item.instance_id))
-      sourceNames.set(item.instance_id, item.fields.model);
-  });
-  history.jobs.forEach((job) => {
-    const model = jobModelName(job);
-    if (!model) return;
-    for (const id of [job.payload.instance_id, job.result?.instance_id]) {
-      if (typeof id === 'string' && id && !sourceNames.has(id)) sourceNames.set(id, model);
-    }
-  });
-  [...history.logs.map((item) => item.instance_id),
-    ...history.jobs.flatMap((job) => [job.payload.instance_id, job.result?.instance_id])].forEach((id) => {
-    if (typeof id === 'string' && id && !sourceNames.has(id)) sourceNames.set(id,
-      `${tr('历史实例', 'Past instance')} · ${id.slice(0, 8)}`);
-  });
+  const sourceNames = useMemo(() => {
+    const names = new Map(instances.map((item) => [item.id, item.model]));
+    history.requests.forEach((item) => { if (item.instance_id && item.model) names.set(item.instance_id, item.model); });
+    history.logs.forEach((item) => {
+      if (item.instance_id && typeof item.fields.model === 'string' && item.fields.model && !names.has(item.instance_id))
+        names.set(item.instance_id, item.fields.model);
+    });
+    history.jobs.forEach((job) => {
+      const model = jobModelName(job);
+      if (!model) return;
+      for (const id of [job.payload.instance_id, job.result?.instance_id]) {
+        if (typeof id === 'string' && id && !names.has(id)) names.set(id, model);
+      }
+    });
+    [...history.logs.map((item) => item.instance_id),
+      ...history.jobs.flatMap((job) => [job.payload.instance_id, job.result?.instance_id])].forEach((id) => {
+      if (typeof id === 'string' && id && !names.has(id)) names.set(id,
+        `${tr('历史实例', 'Past instance')} · ${id.slice(0, 8)}`);
+    });
+    return names;
+  }, [instances, history.requests, history.logs, history.jobs, tr]);
   const search = query.trim().toLocaleLowerCase();
   const cutoff = range ? (paused ? history.updatedAt ?? Date.now() : Date.now()) - Number(range) * 3600000 : 0;
-  const inRange = (time: string | number) => (typeof time === 'number' ? time * 1000 : Date.parse(time)) >= cutoff;
-  const matches = (value: unknown) => !search || JSON.stringify(value).toLocaleLowerCase().includes(search);
-  const events = history.logs.filter((item) => (!source || item.instance_id === source) && (!filter || item.level === filter)
-    && inRange(item.created_at) && matches([item.message, item.fields, sourceNames.get(item.instance_id || ''), item.instance_id]));
-  const requests = history.requests.filter((item) => (!source || item.instance_id === source) && (!filter || item.request.finish_reason === filter)
-    && inRange(item.request.completed_at ?? item.captured_at) && matches(item));
-  const jobs = history.jobs.filter((item) => {
-    const targets = [item.payload.instance_id, item.result?.instance_id].filter((id): id is string => typeof id === 'string' && !!id);
-    return (!source || (targets.length ? targets.includes(source) : jobModelName(item) === sourceNames.get(source)))
-      && (!filter || (filter === 'active' ? !isTerminalJob(item) : item.status === filter)) && inRange(item.updated_at) && matches(item);
-  })
-    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  // Filters re-scan up to 1100 records; memoizing them keeps an unrelated
+  // render (a selected row, a manual refresh) from repeating that work.
+  const filtered = useMemo(() => {
+    const inRange = (time: string | number) => (typeof time === 'number' ? time * 1000 : Date.parse(time)) >= cutoff;
+    const matches = (value: unknown) => !search || JSON.stringify(value).toLocaleLowerCase().includes(search);
+    const events = history.logs.filter((item) => (!source || item.instance_id === source) && (!filter || item.level === filter)
+      && inRange(item.created_at) && matches([item.message, item.fields, sourceNames.get(item.instance_id || ''), item.instance_id]));
+    const requests = history.requests.filter((item) => (!source || item.instance_id === source) && (!filter || item.request.finish_reason === filter)
+      && inRange(item.request.completed_at ?? item.captured_at) && matches(item));
+    const jobs = history.jobs.filter((item) => {
+      const targets = [item.payload.instance_id, item.result?.instance_id].filter((id): id is string => typeof id === 'string' && !!id);
+      return (!source || (targets.length ? targets.includes(source) : jobModelName(item) === sourceNames.get(source)))
+        && (!filter || (filter === 'active' ? !isTerminalJob(item) : item.status === filter)) && inRange(item.updated_at) && matches(item);
+    })
+      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    return { events, requests, jobs };
+  }, [history.logs, history.requests, history.jobs, sourceNames, source, filter, search, cutoff]);
+  const events = filtered.events;
+  const requests = filtered.requests;
+  const jobs = filtered.jobs;
   const visible = tab === 'events' ? events : tab === 'requests' ? requests : jobs;
   const total = tab === 'events' ? history.logs.length : tab === 'requests' ? history.requests.length : history.jobs.length;
   const statusLabel = (status: string) => ({ queued: tr('排队中', 'Queued'), running: tr('运行中', 'Running'), cancelling: tr('取消中', 'Cancelling'),

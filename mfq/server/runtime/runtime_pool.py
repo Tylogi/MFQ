@@ -44,6 +44,13 @@ from mfq.server.protocol.models import (
     KvQuantizationSettings,
     ResponseFormat,
     RuntimeCapabilitiesResource,
+    RuntimeConcurrencyLimits,
+    RuntimeConcurrencyPolicy,
+    RuntimeConcurrencyResource,
+    RuntimeConcurrencySettings,
+    RuntimeConcurrencyReloadRequest,
+    RuntimeConcurrencyUpdate,
+    UpdateRuntimeConcurrencyRequest,
     RuntimeInstanceList,
     RuntimeInstanceResource,
     RuntimeInstanceState,
@@ -67,6 +74,7 @@ from mfq.server.runtime.backend import (
     preflight_backend_request,
 )
 from mfq.server.runtime.client import HttpRuntimeClient, StdioRuntimeClient
+from mfq.server.runtime.concurrency import resolve_concurrency
 from mfq.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget, inspect_prefix_cache, purge_prefix_cache, read_prefix_cache_tokens, prefix_cache_identity
 from mfq.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
 from mfq.server.runtime.qsa_kv_policy import QSA_KV_BUFFER_BYTES, qsa_index_requirement
@@ -86,6 +94,7 @@ from mfq.server.services.hardware import (
     host_memory_capacity,
     memory_topology,
 )
+from mfq.server.services.metrics import RequestMetrics, RuntimeMetricsSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +148,15 @@ _WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
+# Deadline failures keep their own result label so retries stay distinguishable
+# from requests that failed for another reason.
+_TIMEOUT_ERROR_CODES = frozenset({
+    "backend_timeout",
+    "runtime_maintenance_timeout",
+    "runtime_queue_timeout",
+})
+
+
 @dataclass(frozen=True)
 class _ExpertHostBudget:
     """Resident expert allowance together with the limit that produced it."""
@@ -258,10 +276,15 @@ class _Runtime(BaseModel):
     request_slots: SkipValidation[_RequestSlotGate] | None = None
     request_capacity: int = 1
     batch_capacity: int = 1
+    concurrency_settings: RuntimeConcurrencySettings | None = None
+    concurrency_changed: asyncio.Event = Field(default_factory=asyncio.Event)
     queue_wait_ms_total: float = 0.0
     queue_wait_ms_max: float = 0.0
     queue_wait_samples: int = 0
     rejections: int = 0
+    # Prometheus counters and histograms live with the instance so a restart
+    # publishes a new ``instance`` label instead of resetting old series.
+    request_metrics: SkipValidation[RequestMetrics] = Field(default_factory=RequestMetrics)
     mtp_supported: bool = False
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
@@ -602,10 +625,11 @@ class RuntimePool:
         )
         if active_count >= self.max_instances:
             raise RuntimeConflictError("managed runtime instance limit reached")
+        concurrency = self.resolve_concurrency(load_request)
         request_capacity = native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,
-            requested=self.max_requests_per_instance,
+            requested=concurrency.max_requests,
         )
         canonical_request = load_request.model_copy(
             update={"model": artifact.resource.name,
@@ -631,6 +655,7 @@ class RuntimePool:
             request_slots=_RequestSlotGate(request_capacity),
             request_capacity=request_capacity,
             batch_capacity=request_capacity,
+            concurrency_settings=concurrency,
             reserved_bytes=self._estimated_load_bytes(
                 artifact,
                 canonical_request,
@@ -654,6 +679,7 @@ class RuntimePool:
 
     async def _load(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = ModelLoadRequest.model_validate(payload)
+        concurrency = self.resolve_concurrency(request)
         await self._maintain_prefix_disk_budget(force=not self._prefix_disk_status)
         if self.backend == "metal" and request.device_ids not in ([], ["metal"]):
             raise _job_error("unsupported_device", "the Metal runtime accepts device 'metal'")
@@ -783,7 +809,7 @@ class RuntimePool:
         request_capacity = native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,
-            requested=self.max_requests_per_instance,
+            requested=self.resolve_concurrency(request).max_requests,
         )
         model_name = artifact.resource.name
         incoming_bytes = self._estimated_load_bytes(
@@ -1049,6 +1075,7 @@ class RuntimePool:
             request_slots=_RequestSlotGate(request_capacity),
             request_capacity=request_capacity,
             batch_capacity=request_capacity,
+            concurrency_settings=concurrency,
             reserved_bytes=incoming_bytes,
             resident_budget_limit=int(process_environment.get("MFQ_SERVER_RESIDENT_BUDGET_BYTES", "0")),
             # Keep TTL and memory-pressure eviction out of the load
@@ -1871,6 +1898,147 @@ class RuntimePool:
                 or item.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.FAILED}
                 for item in self._instances.values())}
 
+    @property
+    def concurrency_policy(self) -> RuntimeConcurrencyPolicy:
+        """Expose configured defaults and ceilings, including an unlimited timeout."""
+        defaults = RuntimeConcurrencySettings(
+            max_requests=min(32, self.max_requests_per_instance),
+            max_queued_requests=self.max_queued_requests_per_instance,
+            queue_timeout_seconds=self.queue_timeout_seconds,
+        )
+        return RuntimeConcurrencyPolicy(
+            defaults=defaults,
+            limits=RuntimeConcurrencyLimits(
+                max_requests=defaults.max_requests,
+                max_queued_requests=defaults.max_queued_requests,
+                queue_timeout_seconds=defaults.queue_timeout_seconds or None,
+            ),
+        )
+
+    def resolve_concurrency(self, request: ModelLoadRequest) -> RuntimeConcurrencySettings:
+        """Validate overrides before accepting a model load job."""
+        return resolve_concurrency(self.concurrency_policy, request)
+
+    def _instance_concurrency(self, instance: _Runtime) -> RuntimeConcurrencySettings:
+        return instance.concurrency_settings or self.concurrency_policy.defaults
+
+    def concurrency_resource(self, instance: _Runtime) -> RuntimeConcurrencyResource:
+        """Describe requested policy, server ceilings and negotiated admission."""
+        requested = self._instance_concurrency(instance)
+        return RuntimeConcurrencyResource(
+            requested=requested,
+            limits=self.concurrency_policy.limits,
+            effective=requested.model_copy(update={"max_requests": instance.request_capacity}),
+        )
+
+    async def update_concurrency(
+        self, instance_id: UUID, request: UpdateRuntimeConcurrencyRequest,
+    ) -> RuntimeConcurrencyUpdate:
+        """Apply queue changes without replacing a worker or its active semaphore."""
+        async with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None:
+                raise BackendError("runtime_instance_not_found", "runtime instance was not found", status_code=404)
+            if instance.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}:
+                raise BackendError("runtime_busy", "runtime is changing state", status_code=409, retryable=True)
+            current = self._instance_concurrency(instance)
+            candidate = resolve_concurrency(self.concurrency_policy, request, current)
+            reload_required = candidate.max_requests != current.max_requests
+            applied = candidate.model_copy(update={"max_requests": current.max_requests})
+            instance.concurrency_settings = applied
+            previous_event = instance.concurrency_changed
+            instance.concurrency_changed = asyncio.Event()
+            previous_event.set()
+            name = instance.artifact.resource.name
+            if name in self._load_requests:
+                self._load_requests[name] = self._load_requests[name].model_copy(update=applied.model_dump())
+            return RuntimeConcurrencyUpdate(
+                concurrency=self.concurrency_resource(instance), reload_required=reload_required,
+            )
+
+    async def configure_concurrency(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        """Explicitly restart one idle model, restoring its prior request on failure."""
+        settings = RuntimeConcurrencyReloadRequest.model_validate(payload)
+        context.raise_if_cancelled()
+        async with self._lock:
+            instance = self._instances.get(settings.instance_id)
+            if instance is None:
+                raise _job_error("runtime_instance_not_found", "runtime instance was not found")
+            candidate = resolve_concurrency(self.concurrency_policy, settings, self._instance_concurrency(instance))
+            if (instance.state != RuntimeInstanceState.READY or instance.active_requests
+                    or instance.queued_requests or instance.control_leases or instance.context_job):
+                raise _job_error("runtime_busy", "wait for model requests to finish before reloading", retryable=True)
+            name = instance.artifact.resource.name
+            previous = self._load_requests[name].model_copy(deep=True)
+            updated = previous.model_copy(update={
+                **candidate.model_dump(), "pin": instance.pinned, "idle_ttl_seconds": instance.idle_ttl_seconds,
+            })
+            self._mark_instance_unloading_locked(instance)
+        try:
+            await context.progress(0.01, message="Applying concurrency settings", data={"phase": "reloading"})
+            await self._retire_instance(instance)
+            return await self.load(context, updated.model_dump(mode="json"))
+        except BaseException:
+            for item in list(self._instances.values()):
+                if item.artifact.resource.name == name:
+                    await self._retire_instance(item)
+            self._load_requests[name] = previous
+            try:
+                await self.load(_MemoryPlanContext(context, recovery=True), previous.model_dump(mode="json"))
+            except BaseException as error:
+                await context.log(f"Could not restore previous concurrency settings: {type(error).__name__}")
+            raise
+
+    async def _acquire_request_slot(
+        self, instance: _Runtime, enqueued_at: float, model: str,
+        *, priority: int = 0, deadline: float | None = None,
+    ) -> None:
+        """Keep queue rank while applying live timeouts and the client deadline."""
+        assert instance.request_slots is not None
+
+        def remaining_wait() -> float | None:
+            timeout = self._instance_concurrency(instance).queue_timeout_seconds
+            queue_left = enqueued_at + timeout - time.monotonic() if timeout else None
+            client_left = deadline - asyncio.get_running_loop().time() if deadline is not None else None
+            bounds = [value for value in (queue_left, client_left) if value is not None]
+            remaining = min(bounds) if bounds else None
+            if remaining is not None and remaining <= 0:
+                instance.rejections += 1
+                if client_left is not None and (queue_left is None or client_left <= queue_left):
+                    raise _request_deadline_exceeded(model)
+                raise BackendError(
+                    "runtime_queue_timeout", f"request waited more than {timeout:g}s for a runtime slot: {model}",
+                    retryable=True, status_code=503,
+                )
+            return remaining
+
+        acquire = asyncio.create_task(instance.request_slots.acquire(priority))
+        transferred = False
+        try:
+            while True:
+                remaining = remaining_wait()
+                changed = asyncio.create_task(instance.concurrency_changed.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (acquire, changed), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    changed.cancel()
+                    await asyncio.gather(changed, return_exceptions=True)
+                if acquire in done:
+                    await acquire
+                    remaining_wait()
+                    transferred = True
+                    return
+                if changed in done:
+                    continue
+        finally:
+            if not transferred:
+                acquire.cancel()
+                await asyncio.gather(acquire, return_exceptions=True)
+                if not acquire.cancelled() and acquire.exception() is None:
+                    instance.request_slots.release()
+
     async def instances(self) -> RuntimeInstanceList:
         async with self._lock:
             values = list(self._instances.values())
@@ -1904,6 +2072,7 @@ class RuntimePool:
                     queued_requests=item.queued_requests,
                     request_capacity=item.request_capacity,
                     batch_capacity=item.batch_capacity,
+                    concurrency=self.concurrency_resource(item),
                     queue_wait_ms_avg=self._concurrency_status(item)["queue_wait_ms_avg"],
                     queue_wait_ms_max=item.queue_wait_ms_max,
                     rejected_requests=item.rejections,
@@ -1977,6 +2146,12 @@ class RuntimePool:
                 devices=[f"cuda:{device}" for device in instance.device_ids] if instance.device_ids else [self.backend],
                 active_sessions=active_sessions,
                 queued_requests=instance.queued_requests,
+                request_capacity=instance.request_capacity,
+                batch_capacity=instance.batch_capacity,
+                concurrency=self.concurrency_resource(instance),
+                queue_wait_ms_avg=self._concurrency_status(instance)["queue_wait_ms_avg"],
+                queue_wait_ms_max=instance.queue_wait_ms_max,
+                rejected_requests=instance.rejections,
                 resident_bytes=instance.resident_bytes,
                 kv_bytes=instance.kv_bytes,
                 memory=instance.memory,
@@ -2111,7 +2286,7 @@ class RuntimePool:
             queue_full = (
                 instance.active_requests + instance.queued_requests
                 >= instance.request_capacity
-                + self.max_queued_requests_per_instance
+                + self._instance_concurrency(instance).max_queued_requests
             )
         if queue_full:
             await self._reject_full_queue(instance, model)
@@ -2175,17 +2350,22 @@ class RuntimePool:
             queue_full = (
                 instance.active_requests + instance.queued_requests
                 >= instance.request_capacity
-                + self.max_queued_requests_per_instance
+                + self._instance_concurrency(instance).max_queued_requests
             )
             if not queue_full:
                 instance.queued_requests += 1
         if queue_full:
             await self._reject_full_queue(instance, model)
         queued = True
+        request_id = None
+        performance = None
+        usage = None
+        finish_reason = None
         try:
             await self._acquire_request_slot(
                 instance,
-                model=model,
+                enqueued_at,
+                model,
                 priority=priority,
                 deadline=deadline,
             )
@@ -2212,11 +2392,8 @@ class RuntimePool:
                 if session_id is not None:
                     self._session_routes[session_id] = instance.id
                 self._last_instance_id = instance.id
+            instance.request_metrics.observe_queue_wait(queue_wait_ms / 1000.0)
             effective_sampling = self._apply_inference_policy(self._sampling_for_instance(instance, sampling))
-            request_id = None
-            performance = None
-            usage = None
-            finish_reason = None
             async with closing_backend_stream(
                 instance.backend.stream(
                     model=instance.artifact.resource.name,
@@ -2258,49 +2435,28 @@ class RuntimePool:
                         model=instance.artifact.resource.name)
                 except Exception:
                     logger.exception("Could not persist completed runtime request metrics")
+        except GeneratorExit:
+            # The consumer stopped reading: the client disconnected mid-stream.
+            instance.request_metrics.record_request("cancelled", performance, usage)
+            raise
+        except asyncio.CancelledError:
+            instance.request_metrics.record_request("cancelled", performance, usage)
+            raise
+        except BackendError as error:
+            result = "timeout" if error.code in _TIMEOUT_ERROR_CODES else "error"
+            instance.request_metrics.record_request(result, performance, usage)
+            raise
+        except Exception:
+            instance.request_metrics.record_request("error", performance, usage)
+            raise
+        else:
+            instance.request_metrics.record_request(
+                "cancelled" if finish_reason == "cancelled" else "ok", performance, usage)
         finally:
             await self._release_runtime_lease(
                 self._finish_request(instance, queued=queued, active=active, acquired=acquired),
                 name=f"mfq-server-request-release-{instance.id}",
             )
-
-    async def _acquire_request_slot(
-        self,
-        instance: _Runtime,
-        *,
-        model: str,
-        priority: int,
-        deadline: float | None,
-    ) -> None:
-        """Wait for one runtime slot, then fail if the deadline already passed."""
-
-        queue_deadline = (
-            asyncio.get_running_loop().time() + self.queue_timeout_seconds
-            if self.queue_timeout_seconds > 0
-            else None
-        )
-        bounds = [value for value in (queue_deadline, deadline) if value is not None]
-        wait_until = min(bounds) if bounds else None
-        if wait_until is None:
-            await instance.request_slots.acquire(priority)
-            return
-        try:
-            await asyncio.wait_for(
-                instance.request_slots.acquire(priority),
-                timeout=max(0.0, wait_until - asyncio.get_running_loop().time()),
-            )
-        except asyncio.TimeoutError:
-            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-                # An elapsed client deadline is absolute, so retrying cannot
-                # help; keep 429 for a full queue and 503 for --queue-timeout.
-                raise _request_deadline_exceeded(model) from None
-            raise BackendError(
-                "runtime_queue_timeout",
-                f"request waited more than {self.queue_timeout_seconds:g}s "
-                f"for a runtime slot: {model}",
-                retryable=True,
-                status_code=503,
-            ) from None
 
     async def _finish_request(self, instance: _Runtime, *, queued: bool, active: bool, acquired: bool) -> None:
         async with self._lock:
@@ -2456,6 +2612,55 @@ class RuntimePool:
             "requests": [{"id": key, **value} for key, value in item.serving_snapshot.items()]
                 if item.active_requests else []}
             for item in self._instances.values() if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}]
+
+    async def metrics_snapshot(self) -> list[RuntimeMetricsSnapshot]:
+        """Return the serving runtimes as a Prometheus scrape sees them.
+
+        Usage refresh shares the runtime-pool interval, so scraping never adds
+        NVML work, SQLite reads, or more than one worker status call per
+        interval.
+        """
+
+        async with self._lock:
+            values = [
+                item
+                for item in self._instances.values()
+                if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+            ]
+            now = asyncio.get_running_loop().time()
+            refresh = [
+                item
+                for item in values
+                if now - item.usage_refreshed_at >= self.metric_interval_seconds
+            ]
+            for item in refresh:
+                item.usage_refreshed_at = now
+        if refresh:
+            await asyncio.gather(
+                *(self._refresh_instance_usage(item) for item in refresh)
+            )
+        return [
+            self._metrics_snapshot_of(item)
+            for item in values
+            if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+        ]
+
+    @staticmethod
+    def _metrics_snapshot_of(instance: _Runtime) -> RuntimeMetricsSnapshot:
+        memory = instance.memory
+        return RuntimeMetricsSnapshot(
+            instance=str(instance.id),
+            model=instance.artifact.resource.name,
+            request_capacity=instance.request_capacity,
+            batch_capacity=instance.batch_capacity,
+            active_requests=instance.active_requests,
+            queued_requests=instance.queued_requests,
+            rejected_requests=instance.rejections,
+            resident_bytes=instance.resident_bytes,
+            kv_bytes=instance.kv_bytes,
+            kv_limit_bytes=memory.prefix_cache_limit_bytes if memory is not None else None,
+            requests=instance.request_metrics,
+        )
 
     async def runtime_status(
         self,
@@ -4865,7 +5070,7 @@ class RuntimePool:
         request_capacity = native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,
-            requested=self.max_requests_per_instance,
+            requested=self.resolve_concurrency(request).max_requests,
         )
         command = [
             str(self.executable),
@@ -4887,7 +5092,7 @@ class RuntimePool:
         if (self.backend in {"cuda", "metal"} and yarn_enabled
             and artifact.resource.yarn_context_capacity is not None):
             command.append("--yarn-context-extension")
-        if self.backend in {"cuda", "metal"} and request_capacity > 1:
+        if self.backend in {"cuda", "hip", "metal"} and request_capacity > 1:
             command.extend(
                 [
                     "--continuous-batching",

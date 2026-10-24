@@ -389,6 +389,15 @@ std::optional<bool> qsa_prefill_fused() {
     const auto* value=std::getenv("MFQ_QSA_PREFILL_FUSED");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
+bool qsa_pool_store_fused() {
+    const auto* pool=std::getenv("MFQ_QSA_POOL_FUSED");
+    const auto* write=std::getenv("MFQ_QSA_POOL_WRITE_FUSED");
+    return (!pool || pool[0]!='0') && (!write || write[0]!='0');
+}
+bool qsa_pool_incremental() {
+    const auto* value=std::getenv("MFQ_QSA_POOL_INCREMENTAL");
+    return !value || value[0]!='0';
+}
 
 QsaKvOffloadOptions qsa_kv_offload() {
     return {environment_size("MFQ_QSA_KV_BUDGET_BYTES", 0),
@@ -1138,6 +1147,10 @@ void report_cuda_memory(
 namespace mfq::cuda::runtime_options {
 std::optional<bool> mfe_token_groups() {
     if (const auto* value = std::getenv("MFQ_MFE_TOKEN_GROUPS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_expert_plan() {
+    if (const auto* value = std::getenv("MFQ_MFE_EXPERT_PLAN")) return value[0] != '0';
     return std::nullopt;
 }
 std::optional<bool> mfe_token_compact_plan() {

@@ -102,7 +102,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                           ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid')}
                     </em>
                   ) : (
-                    <button disabled={busy} aria-describedby={streamsExperts ? `expert-streaming-${item.id}` : undefined}
+                    <button disabled={busy || catalog.concurrencyValid === false}
+                      aria-describedby={streamsExperts ? `expert-streaming-${item.id}` : undefined}
                       onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>

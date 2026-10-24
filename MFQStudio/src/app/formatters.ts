@@ -71,12 +71,22 @@ export function errorMessage(error: unknown, tr?: (chinese: string, english: str
   return "Unknown error";
 }
 
+const numberFormatters = new Map<number, Intl.NumberFormat>();
+
+function numberFormatter(digits: number): Intl.NumberFormat {
+  const key = Math.max(0, Math.min(20, Math.trunc(digits)));
+  let formatter = numberFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: key });
+    numberFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
 /** 格式化有限数值，缺失或无效时返回占位符。 */
 export function formatNumber(value: unknown, digits = 0): string {
   const number = Number(value);
-  return Number.isFinite(number)
-    ? new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(number)
-    : "--";
+  return Number.isFinite(number) ? numberFormatter(digits).format(number) : "--";
 }
 
 /** 将字节数转换为可读的二进制容量单位。 */

@@ -615,7 +615,69 @@ class ModelLoadContextSettings(ProtocolModel):
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
 
 
+class RuntimeConcurrencySettings(ProtocolModel):
+    """Per-model admission settings; zero timeout means an unlimited wait."""
+
+    max_requests: int = Field(default=1, ge=1, le=32, strict=True)
+    max_queued_requests: int = Field(default=32, ge=0, strict=True)
+    queue_timeout_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+
+
+class RuntimeConcurrencyLimits(ProtocolModel):
+    """Server ceilings; a null timeout permits unlimited waiting."""
+
+    max_requests: int = Field(ge=1, le=32)
+    max_queued_requests: int = Field(ge=0)
+    queue_timeout_seconds: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+
+
+class RuntimeConcurrencyPolicy(ProtocolModel):
+    """Defaults and ceilings available before any model is loaded."""
+
+    defaults: RuntimeConcurrencySettings
+    limits: RuntimeConcurrencyLimits
+
+
+class RuntimeConcurrencyResource(ProtocolModel):
+    """Keep requested rows distinct from negotiated worker admission."""
+
+    requested: RuntimeConcurrencySettings
+    limits: RuntimeConcurrencyLimits
+    effective: RuntimeConcurrencySettings
+
+
+class UpdateRuntimeConcurrencyRequest(ProtocolModel):
+    """Partial edits; row changes are reported as requiring a reload."""
+
+    max_requests: int | None = Field(default=None, ge=1, le=32, strict=True)
+    max_queued_requests: int | None = Field(default=None, ge=0, strict=True)
+    queue_timeout_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> UpdateRuntimeConcurrencyRequest:
+        fields = self.model_fields_set & {"max_requests", "max_queued_requests", "queue_timeout_seconds"}
+        if not fields or any(getattr(self, name) is None for name in fields):
+            raise ValueError("provide at least one non-null concurrency setting")
+        return self
+
+
+class RuntimeConcurrencyUpdate(ProtocolModel):
+    """Live queue update result without an implicit worker restart."""
+
+    concurrency: RuntimeConcurrencyResource
+    reload_required: bool
+
+
+class RuntimeConcurrencyReloadRequest(UpdateRuntimeConcurrencyRequest):
+    """An explicit reload of one idle runtime with the supplied settings."""
+
+    instance_id: UUID
+
+
 class ModelLoadRequest(ProtocolModel):
+    max_requests: int | None = Field(default=None, ge=1, le=32, strict=True)
+    max_queued_requests: int | None = Field(default=None, ge=0, strict=True)
+    queue_timeout_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
     device_ids: list[str] = Field(default_factory=list)
@@ -854,6 +916,7 @@ class RuntimeMemoryResources(ProtocolModel):
 
 
 class RuntimeInstanceResource(ProtocolModel):
+    concurrency: RuntimeConcurrencyResource | None = None
     id: UUID
     model: str
     state: RuntimeInstanceState

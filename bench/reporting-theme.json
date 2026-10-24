@@ -1,0 +1,12 @@
+{
+  "name": "Clear blue and rose",
+  "background": "#ffffff",
+  "ink": "#122544",
+  "muted": "#496483",
+  "grid": "#e4edfa",
+  "decode": "#2563eb",
+  "mtp": "#e11d48",
+  "telemetry": "#0891b2",
+  "warmup": "#7c3aed",
+  "rejected": "#fda4af"
+}

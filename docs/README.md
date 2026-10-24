@@ -25,12 +25,15 @@ matches what you want to do.
 
 - [Runtime support matrix](runtime/support.md)
 - [Multi-request concurrency](runtime/concurrency.md)
+- [Prometheus metrics](runtime/metrics.md)
 - [Python/C++ runtime transport](runtime/transport.md)
 - [CUDA KV memory policies](runtime/cuda-kv-memory.md)
 - [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
 - [HIP runtime validation](runtime/hip-validation.md)
 - [HIP model benchmarks](runtime/hip-model-benchmarks.md)
+- [Benchmark reporting workflow and design](benchmarks/reporting-workflow.md)
+- [Render inference charts from benchmark results](benchmarks/inference-charts.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 
 ## APIs

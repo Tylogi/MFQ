@@ -1,7 +1,9 @@
 import { Fragment, useState } from 'react';
 import type { HubModelVariant, ModelCacheProfile, ModelConfigurationStatus } from '../../shared/api/types';
 import { CaretDownIcon } from '@phosphor-icons/react';
-import { cacheBreakdown, cacheComponentLabel, cacheUsageBytes, estimateCacheBytes, kvOnlyProfile } from './cacheData';
+import {
+  cacheBreakdown, concurrentCacheProfile, cacheComponentLabel, cacheUsageBytes, estimateCacheBytes, kvOnlyProfile,
+} from './cacheData';
 import type { CacheBreakdown } from './cacheData';
 
 export { cacheUsageBytes, estimateCacheBytes } from './cacheData';
@@ -48,13 +50,15 @@ function CacheRows({ items, depth = 0, tr }: { items: CacheBreakdown[]; depth?: 
   </tr>{item.children.length > 0 && <CacheRows items={item.children} depth={depth + 1} tr={tr} />}</Fragment>);
 }
 
-export function KvCachePlanner({ profile: sourceProfile, appliedContext, onApply, tr }: {
+export function KvCachePlanner({ profile: sourceProfile, appliedContext, onApply, tr, concurrency = 1 }: {
+  concurrency?: number | null;
   profile?: ModelCacheProfile | null;
   appliedContext?: number;
   onApply?(context: number | undefined): void;
   tr: Translate;
 }) {
-  const profile = sourceProfile ? kvOnlyProfile(sourceProfile) : null;
+  const profile = sourceProfile && concurrency != null && concurrency >= 1
+    ? concurrentCacheProfile(kvOnlyProfile(sourceProfile), concurrency) : null;
   const [draft, setDraft] = useState(String(appliedContext ?? Math.min(4096, profile?.max_context ?? 4096)));
   const [hoverContext, setHoverContext] = useState<number | null>(null);
   const [selectedGroup, setSelectedGroup] = useState('all');
@@ -153,7 +157,9 @@ export function KvCachePlanner({ profile: sourceProfile, appliedContext, onApply
         {groups.length > 0 && <div className="kv-cache-breakdown"><div className="kv-cache-breakdown-heading"><strong>{tr('缓存明细', 'Cache breakdown')}</strong><span>{context.toLocaleString()} ctx</span></div>
           <div className="kv-cache-table-scroll"><table><thead><tr><th>{tr('组件', 'Component')}</th><th>{tr('理论占用', 'Theoretical usage')}</th><th>{tr('含预分配', 'Including preallocation')}</th></tr></thead>
             <tbody><CacheRows items={selected ? [selected] : groups} tr={tr} /></tbody></table></div></div>}
-        <p>{tr('单个上下文的 KV / Indexer 缓存估算，预算含预分配。点击曲线或刻度选择 ctx。', 'KV / indexer cache estimates for one context; the budget includes preallocation. Click the curve or a tick to select ctx.')}
+        <p>{tr(`${concurrency} 个并发请求的 KV / Indexer 缓存估算，预算含预分配。点击曲线或刻度选择 ctx。`,
+          `KV / indexer cache estimates for ${concurrency} concurrent requests; the budget includes preallocation. `
+          + 'Click the curve or a tick to select ctx.')}
           {onApply && ` ${tr('应用仅更新下载规划。', 'Apply changes download planning only.')}`}</p>
       </div> : <p className="kv-cache-unavailable">{tr('模型缓存结构信息不足，暂无法可靠估算。', 'Insufficient cache structure metadata for a reliable estimate.')}</p>}
     </details>

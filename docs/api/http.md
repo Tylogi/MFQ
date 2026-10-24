@@ -55,7 +55,9 @@ additional scopes:
 | `/v1` compatibility endpoints | `inference` |
 
 The `admin` scope permits every operation. `/health` is outside `/api/` and
-never requires a bearer credential.
+never requires a bearer credential. `/metrics` reports telemetry, so it follows
+the `/api/` rules and requires the `inference` scope whenever a credential is
+configured; see [Prometheus metrics](../runtime/metrics.md).
 
 ### 1.2 Types and strict validation
 
@@ -693,6 +695,9 @@ The stream sends comment keep-alives while idle and ends after the job reaches
 ```
 
 `/health` is not in OpenAPI and never requires authentication.
+
+`GET /metrics` returns Prometheus text exposition for the serving runtimes and is
+described in [Prometheus metrics](../runtime/metrics.md).
 
 ## 8. OpenAI and Anthropic compatibility
 
