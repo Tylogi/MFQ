@@ -335,7 +335,12 @@ static void check_runtime_config() {
     assert(std::abs(ratio.current() - .4) < 1e-12);
     ratio.decay_step();
     assert(std::abs(ratio.current() - .24) < 1e-12);
-    for (const char* bad : {"0", "-1", "1.1", "nan", "inf", "0.5x"}) {
+    for (const char* valid : {"0.5", ".5", "5e-1"}) {
+        initial.set(valid);
+        assert(resolve_batch_config(2, 16).admission.initial_ratio == .5);
+    }
+    for (const char* bad : {"0", "-1", "1.1", "nan", "inf", "0.5x",
+                            " 0.5", "0.5 ", "+0.5", "0,5", "0x1p-1", "1e9999"}) {
         initial.set(bad);
         rejects([] { resolve_batch_config(2, 16); });
     }

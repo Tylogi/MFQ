@@ -5,8 +5,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace mfq::engine {
 
@@ -38,9 +41,14 @@ static double environment_double(const char* name, double fallback) {
     const auto* value = std::getenv(name);
     if (!value || !*value) return fallback;
     double result = 0;
-    const auto end = value + std::char_traits<char>::length(value);
-    const auto [last, error] = std::from_chars(value, end, result);
-    if (error != std::errc{} || last != end || !std::isfinite(result))
+    // Floating-point from_chars is unavailable in older supported libc++.
+    // Keep decimal parsing independent of the process locale and reject
+    // whitespace, trailing characters and non-finite values.
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    input >> std::noskipws >> result;
+    if (value[0] == '+' || std::string_view(value).find_first_of("xXpP") != std::string_view::npos
+            || !input || !input.eof() || !std::isfinite(result))
         throw std::invalid_argument(std::string("invalid ") + name);
     return result;
 }
