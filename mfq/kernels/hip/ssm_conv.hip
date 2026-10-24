@@ -17,6 +17,30 @@ __device__ inline float silu_f32(float x)
     return x / (1.0f + expf(-x));
 }
 
+__global__ void ssm_conv_chunk4_kernel(const float* x,const float* weights,const float* bias,
+        float* output,int tokens,int channels,int layout,int has_bias) {
+    constexpr int Tile=32;
+    const int tiles=(tokens+Tile-1)/Tile,batch=blockIdx.y/tiles,start=(blockIdx.y%tiles)*Tile;
+    const int column=blockIdx.x*128+threadIdx.x;
+    if(column>=channels)return;
+    float w[4],window[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        w[j]=layout==0?weights[size_t(column)*4+j]:weights[size_t(j)*channels+column];
+        window[j]=x[(size_t(batch)*(tokens+3)+start+j)*channels+column];
+    }
+    const float b=has_bias?bias[column]:0.f;
+    const int count=min(Tile,tokens-start);
+    for(int t=0;t<count;++t) {
+        float sum=0.f;
+        #pragma unroll
+        for(int j=0;j<4;++j)sum+=window[(t+j)&3]*w[j];
+        if(has_bias)sum+=b;
+        output[(size_t(batch)*tokens+start+t)*channels+column]=silu_f32(sum);
+        if(t+1<count)window[t&3]=x[(size_t(batch)*(tokens+3)+start+t+4)*channels+column];
+    }
+}
+
 __global__ void ssm_conv_silu_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,
@@ -29,23 +53,22 @@ __global__ void ssm_conv_silu_kernel(
     int weight_layout,
     int has_bias)
 {
-    int b = blockIdx.x;
-    int c = blockIdx.y * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y / T;
+    const int t = blockIdx.y % T;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= B || c >= C) {
         return;
     }
-    for (int t = 0; t < T; ++t) {
-        float sum = 0.0f;
-        for (int j = 0; j < K; ++j) {
-            float xv = x[((size_t)b * (T + K - 1) + t + j) * C + c];
-            float wv = weight_layout == 0 ? w[(size_t)c * K + j] : w[(size_t)j * C + c];
-            sum += xv * wv;
-        }
-        if (has_bias) {
-            sum += bias[c];
-        }
-        out[((size_t)b * T + t) * C + c] = silu_f32(sum);
+    float sum = 0.0f;
+    for (int j = 0; j < K; ++j) {
+        float xv = x[((size_t)b * (T + K - 1) + t + j) * C + c];
+        float wv = weight_layout == 0 ? w[(size_t)c * K + j] : w[(size_t)j * C + c];
+        sum += xv * wv;
     }
+    if (has_bias) {
+        sum += bias[c];
+    }
+    out[((size_t)b * T + t) * C + c] = silu_f32(sum);
 }
 
 mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_input, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, int64_t n_tokens)
@@ -81,7 +104,13 @@ mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_in
     int T = (int)n_tokens;
     MFQ_RUNTIME_CHECK(T > 0 && conv_input.size(1) == T + K - 1, "ssm_conv_silu: conv_input length must be K-1+T");
     auto out = mfq_tensor_backend::empty({B, T, C}, conv_input.options());
-    dim3 blocks(B, (C + SSM_CONV_BD - 1) / SSM_CONV_BD);
+    if(K==4 && T>32) {
+        hipLaunchKernelGGL(ssm_conv_chunk4_kernel,dim3((C+127)/128,B*((T+31)/32)),dim3(128),0,
+            mfq_current_cuda_stream(),conv_input.data_ptr<float>(),weight.data_ptr<float>(),
+            bias.data_ptr<float>(),out.data_ptr<float>(),T,C,layout,has_bias);
+        return out;
+    }
+    dim3 blocks((C + SSM_CONV_BD - 1) / SSM_CONV_BD, B * T);
    hipLaunchKernelGGL(( ssm_conv_silu_kernel), dim3(blocks), dim3(SSM_CONV_BD), 0, mfq_current_cuda_stream(), 
         conv_input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(),
         B, T, C, K, layout, has_bias);

@@ -619,6 +619,13 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             return {};
         },
         [&](const Tensor &input, Activation activation, double limit) -> std::optional<Tensor> {
+            if(limit<=0.0 && activation==Activation::silu && execution.config.ffn_swiglu_fusion &&
+               input.numel()==input.size(-1) && gate_up.layers.size()==2 &&
+               gate_up.layers[0].is_tq() && gate_up.layers[1].is_tq() &&
+               !gate_up.layers[0].tensor_parallel() && !gate_up.layers[1].tensor_parallel())
+                return profiler.measure("ffn.tq_gate_up_swiglu", [&] {
+                    return gate_up.forward_swiglu(execution,input);
+                });
             if (limit > 0.0 || !gate_up.nint_grouped || !gate_up.nint.split_w.empty())
                 return {};
             const auto rows = input.numel() / input.size(-1);
@@ -669,6 +676,18 @@ bool FFN::can_forward_fused_residual(const CudaExecutionConfig &config,
                                      const mfq_tensor_backend::Tensor &residual) const {
     if (config.diagnostic_fp32_residual)
         return false;
+    if(config.ffn_swiglu_fusion && !tq_q8_enabled() && !is_moe && !geglu &&
+       swiglu_limit<=0.0 && !important_neurons && !tensor_parallel_dense_compatible() &&
+       x.is_cuda() && residual.is_cuda() && x.scalar_type()==mfq_tensor_backend::kFloat16 &&
+       residual.scalar_type()==mfq_tensor_backend::kFloat16 && x.is_contiguous() &&
+       residual.is_contiguous() && x.dim()>0 && residual.dim()>0 &&
+       x.numel()==x.size(-1) && residual.numel()==residual.size(-1) &&
+       gate_up.layers.size()==2 && gate_up.layers[0].is_tq() && gate_up.layers[1].is_tq() &&
+       down.is_tq() && !gate_up.layers[0].tensor_parallel() && !gate_up.layers[1].tensor_parallel() &&
+       !down.tensor_parallel() && gate_up.outs.size()==2 && gate_up.outs[0]==gate_up.outs[1] &&
+       gate_up.outs[0]==down.tq.neuron_len && x.size(-1)==gate_up.layers[0].tq.neuron_len &&
+       x.size(-1)==gate_up.layers[1].tq.neuron_len && residual.size(-1)==down.tq.out)
+        return true;
     if (!nvq_fusion_enabled(config) || is_moe || geglu || swiglu_limit > 0.0 || important_neurons ||
         tensor_parallel_dense_compatible() || !x.is_cuda() || !residual.is_cuda() ||
         x.scalar_type() != mfq_tensor_backend::kFloat16 ||
@@ -690,7 +709,15 @@ mfq_tensor_backend::Tensor FFN::forward_fused_residual(CudaProfiler &profiler,
                                                        mfq_tensor_backend::Tensor x,
                                                        mfq_tensor_backend::Tensor residual) const {
     MFQ_RUNTIME_CHECK(can_forward_fused_residual(config, x, residual),
-                      "FFN fused residual requires a compatible single-token NVQ FFN");
+                      "FFN fused residual requires a compatible single-token FFN");
+    if(down.is_tq()) {
+        auto hidden=profiler.measure("ffn.tq_swiglu", [&] {
+            return tq_swiglu(gate_up.layers[0].tq,gate_up.layers[1].tq,x);
+        });
+        return profiler.measure("ffn.tq_down_residual", [&] {
+            return tq_forward_residual(down.tq,hidden,residual);
+        });
+    }
     auto shape = x.sizes().vec();
     shape.back() = down.nvq.out;
     auto output =

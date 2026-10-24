@@ -17,6 +17,7 @@
 
 #include "../hip/reduce.cuh"
 #include "mfq_hip_compat.h"
+#include "gdn_recurrent.h"
 
 template <int D>
 __global__ void gdn_kernel(
@@ -371,7 +372,28 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     const char* col_env = std::getenv("MFQ_GDN_COLUMN");
     const char* warp_env = std::getenv("MFQ_GDN_WARP");
     bool use_warp = transposed_state || !(warp_env && warp_env[0] == '0');
-    if (use_warp) {
+    if (use_warp && D==128 && !kda) {
+        int device=0,sms=0;
+        MFQ_RUNTIME_CHECK(hipGetDevice(&device)==hipSuccess &&
+            hipDeviceGetAttribute(&sms,hipDeviceAttributeMultiprocessorCount,device)==hipSuccess,
+            "GDN: device occupancy unavailable");
+        int waves=4;
+        while(waves>1 && B*Hv*(128/(4*waves))<sms)waves/=2;
+        const auto launch=[&]<int Waves,bool Transposed>() {
+            hipLaunchKernelGGL((mfq_hip_gdn::recurrent4<Waves,Transposed>),
+                dim3(B*Hv,128/(4*Waves)),dim3(64*Waves),0,stream,
+                qd,kd,vd,gd,bd,sd,od,sod,Hq,Hv,T,tiled_heads);
+        };
+        if(transposed_state) {
+            if(waves==1)launch.template operator()<1,true>();
+            else if(waves==2)launch.template operator()<2,true>();
+            else launch.template operator()<4,true>();
+        } else {
+            if(waves==1)launch.template operator()<1,false>();
+            else if(waves==2)launch.template operator()<2,false>();
+            else launch.template operator()<4,false>();
+        }
+    } else if (use_warp) {
         if (tiled_heads) { DISPATCH_GDN_WARP(true); }
         else { DISPATCH_GDN_WARP(false); }
     } else if (T <= 4 && col_env && col_env[0] == '1') {

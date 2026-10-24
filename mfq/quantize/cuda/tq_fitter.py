@@ -8,21 +8,31 @@ import torch
 from mfq.formats.tq import RELATIVE, fixed_codebook
 
 
+def _library(state_bits=16, fast_columns=False, *, columns=False):
+    production = bool(columns or fast_columns) if torch.version.hip else False
+    return _load_library(state_bits, bool(fast_columns), production)
+
+
 @lru_cache(None)
-def _library():
+def _load_library(state_bits, fast_columns, columns):
+    if state_bits != 16:
+        raise ValueError("This backend requires complete 16-bit states")
     from torch.utils.cpp_extension import load
 
     hip = bool(torch.version.hip)
-    source = (Path(__file__).parents[1] / "hip/tq_fitter.hip" if hip
-              else Path(__file__).with_suffix(".cu"))
-    path = load(
-        name="mfq_tq_fitter_hip" if hip else "mfq_tq_fitter_v1",
-        sources=[str(source)],
-        extra_cuda_cflags=(["-O3", "-ffp-contract=off", "-U__HIP_NO_HALF_OPERATORS__",
-                           "-U__HIP_NO_HALF_CONVERSIONS__"] if hip
-                          else ["-O3", "--fmad=false"]),
-        is_python_module=False,
-    )
+    production = columns or fast_columns
+    source = (Path(__file__).parents[1] / "hip" /
+              ("tq_fitter_columns.hip" if production else "tq_fitter.hip")
+              if hip else Path(__file__).with_suffix(".cu"))
+    flags = (["-O3", "-ffp-contract=off", "-U__HIP_NO_HALF_OPERATORS__",
+              "-U__HIP_NO_HALF_CONVERSIONS__"] if hip else ["-O3", "--fmad=false"])
+    flags += [f"-DMFQ_TQ_STATE_BITS={state_bits}",
+              f"-DMFQ_TQ_WARMUP={16 if fast_columns else 128}"]
+    name = ("mfq_tq_fitter_hip" + ("_columns" if production else "") if hip
+            else "mfq_tq_fitter_cuda_production")
+    path = load(name=name + ("_fast" if fast_columns else ""),
+                sources=[str(source)], extra_cuda_cflags=flags,
+                is_python_module=False)
     lib = ct.CDLL(path)
     P = ct.c_void_p
     I = ct.c_int
@@ -39,17 +49,25 @@ def _library():
 
 def _status(code):
     if code:
-        raise RuntimeError(f"TQ fitter returned CUDA error {code}")
+        raise RuntimeError(f"TQ fitter returned GPU error {code}")
 
 
-def encode(x, metric, bits):
-    lib = _library()
+def encode(x, metric, bits, *, state_bits=16, fast_columns=False, column_scaling=False):
+    lib = _library(state_bits, fast_columns and state_bits == 16, columns=column_scaling)
     n = len(x)
     wave = lib.half_wave(n, bits)
     if wave <= 0:
         raise RuntimeError(f"TQ fitter occupancy failed: {wave}")
+    # User ceiling applies inside the native fitting path as well.
+    if not torch.version.hip:
+        wave = min(wave, 4096)
+    trace_divisor = 8 if bits == 1 else (
+        2 if fast_columns and state_bits == 16 and bits in (2, 3) else 1
+    )
+    if torch.version.hip and not (column_scaling or fast_columns) and bits in (2, 3, 4):
+        trace_divisor = 2
     history = torch.empty(
-        (wave, 256 * (1 << (16 - bits)) // (8 if bits == 1 else 1)),
+        (wave, 256 * (1 << (state_bits - bits)) // trace_divisor),
         device=x.device,
         dtype=torch.uint8,
     )
@@ -58,8 +76,7 @@ def encode(x, metric, bits):
     bounds = torch.empty(n, device=x.device, dtype=torch.int32)
     scratch_args = []
     if torch.version.hip:
-        edges = 1 << (16 - bits)
-        scratch = torch.empty((wave, edges * (1 if bits == 1 else 2) if bits <= 2 else 1),
+        scratch = torch.empty((wave, 512 if bits == 1 else 1),
                               device=x.device, dtype=torch.float16)
         scratch_args.append(scratch.data_ptr())
     _status(
@@ -80,7 +97,7 @@ def pack(state, bits):
     state = state.reshape(-1, 256).contiguous()
     out = torch.empty(len(state) * 32 * bits, device=state.device, dtype=torch.uint8)
     _status(
-        _library().pack(
+        _library(16, True).pack(
             state.data_ptr(),
             out.data_ptr(),
             len(state),
@@ -91,9 +108,13 @@ def pack(state, bits):
     return out
 
 
+# Keep the historical entry points on the same search policy as quantize().
+from .tq_columns import ColumnFitter, fit_columns, prepare_columns
+
+
 @torch.inference_mode()
-def fit_rows(weight, k, h, gs):
-    finalists, refine = 0, 1
+def fit_rows(weight, k, h, gs, *, state_bits=16, fast=False):
+    finalists, refine = (1, 0) if fast else (0, 1)
     rows, width = weight.shape
     w = weight.float()
     h = h.float()
@@ -109,9 +130,9 @@ def fit_rows(weight, k, h, gs):
         if k == 1
         else (1.0, 0.9, 1.05, 1.1, 1.2, 1.3, 1.4, 1.6, 1.8, 2.0)
     )
-    lib = _library()
+    lib = _library(state_bits)
     stream = torch.cuda.current_stream().cuda_stream
-    sample_ids = torch.linspace(0, rows - 1, min(rows, 64), device=w.device).long()
+    sample_ids = torch.linspace(0, rows - 1, min(rows, 16 if fast else 64), device=w.device).long()
     count = len(sample_ids)
     nf = len(factors)
     sample_w = w[sample_ids].repeat(nf, 1).contiguous()
@@ -123,14 +144,14 @@ def fit_rows(weight, k, h, gs):
     sample_c = codes[sample_ids].byte().repeat(nf, 1).contiguous()
     screen_best = torch.full((nf * count,), torch.inf, device=w.device)
     screen_state = torch.empty_like(sample_w, dtype=torch.int16)
-    for screen_step in range(2):
+    for screen_step in range(1 if fast else 2):
         expanded = sample_a.float()[:, None] * rel[sample_c.long()].repeat_interleave(gs, -1)
         metric = expanded * h.sqrt()[None, :]
         metric = metric / metric.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-30)
         y, st, _ = encode(
             (sample_w / expanded).reshape(-1, 256).contiguous(),
             metric.reshape(-1, 256).contiguous(),
-            k,
+            k, state_bits=state_bits,
         )
         if screen_step == 0:
             original_loss = (
@@ -176,7 +197,7 @@ def fit_rows(weight, k, h, gs):
     ba = a.clone()
     bc = codes.byte().clone()
     bs = torch.empty_like(w, dtype=torch.int16)
-    lib = _library()
+    lib = _library(state_bits)
     stream = torch.cuda.current_stream().cuda_stream
 
     def full_fit(trial, cs):
@@ -184,7 +205,8 @@ def fit_rows(weight, k, h, gs):
         metric = expanded * h.sqrt()[None, :]
         metric = metric / metric.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-30)
         y, st, _ = encode(
-            (w / expanded).reshape(-1, 256).contiguous(), metric.reshape(-1, 256).contiguous(), k
+            (w / expanded).reshape(-1, 256).contiguous(), metric.reshape(-1, 256).contiguous(), k,
+            state_bits=state_bits,
         )
         loss = ((w - (y.reshape_as(w) * expanded).half().float()).square() * h).sum(-1)
         take = loss < best

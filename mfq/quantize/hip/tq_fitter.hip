@@ -26,13 +26,22 @@ __device__ __forceinline__ half2 book(unsigned s){
 }
 template<int K> __device__ __forceinline__ int choice(const uint8_t*trace,int t,int e){
  if constexpr(K==1){int off=t*(E<K>/32)+(e/64)*2+(e&1);return (reinterpret_cast<const uint32_t*>(trace)[off]>>((e/2)&31))&1;}
- else return trace[int64_t(t)*E<K>+e];
+ else return (trace[(int64_t(t)*E<K>+e)/2]>>(K*(e&1)))&((1<<K)-1);
+}
+// Leave room for block metadata while retaining almost all 1-bit costs in LDS.
+template<int K> __device__ __forceinline__ half cost_read(const half* lds, const half* spill, int i) {
+ if constexpr(K==1) return i<E<K>-512?lds[i]:spill[i-(E<K>-512)];
+ else return lds[i];
+}
+template<int K> __device__ __forceinline__ void cost_write(half* lds, half* spill, int i, half v) {
+ if constexpr(K==1) {if(i<E<K>-512) lds[i]=v;else spill[i-(E<K>-512)]=v;}
+ else lds[i]=v;
 }
 template<int K> __global__ __launch_bounds__(NT,1) void solve(
  const float*x,const float*m,float*y,uint16_t*states,uint8_t*trace,int*bound,half*scratch,int norm){
  constexpr int N=E<K>/(2*NT),C=1<<K;
  int tid=threadIdx.x;int64_t r=blockIdx.x;x+=r*256;m+=r*256;y+=r*256;states+=r*256;
- trace+=r*256*E<K>/(K==1?8:1);
+ trace+=r*256*E<K>/(K==1?8:2);
  extern __shared__ half costs[];
  __shared__ uint32_t minima[32];__shared__ float offset;__shared__ int edge;__shared__ uint16_t symbols[256];
  half2 points[N][C];
@@ -44,45 +53,48 @@ template<int K> __global__ __launch_bounds__(NT,1) void solve(
   }
  }
  for(int pass=0;pass<2;++pass){
-  half*old=K<=2?scratch+r*(K==1?E<K>:2*E<K>):costs;
-  half*next=old+(K==1?0:E<K>);
-  for(int e=tid;e<E<K>;e+=NT)old[e]=__float2half(pass&&e!=edge?INFINITY:0.f);
+  half*spill=K==1?scratch+r*512:scratch;
+  half*old=costs;half*next=costs+(K<=2?0:E<K>);
+  for(int e=tid;e<E<K>;e+=NT)cost_write<K>(old,spill,e,__float2half(pass&&e!=edge?INFINITY:0.f));
   __syncthreads();
   for(int t=0;t<256;++t){int at=pass?t:(t+128)&255;
    half2 target=__half2half2(__float2half_rn(x[at])),metric=__half2half2(__float2half_rn(m[at]));
-   half2 staged[K==1?N:1];
+   half2 staged[K<=2?N:1];
    #pragma unroll
    for(int i=0;i<N;++i){int e=2*(tid+i*NT);uint32_t lo=0x7c00ffffu,hi=0x7c00ffffu;
     #pragma unroll
     for(int j=0;j<C;++j){int s=e+j*E<K>;half2 q=points[i][j];
      half2 d=__hmul2(__hsub2(q,target),metric);
-     half2 v=__hfma2(d,d,__half2half2(old[s>>K]));
+     half2 v=__hfma2(d,d,__half2half2(cost_read<K>(old,spill,s>>K)));
      lo=min(lo,(uint32_t(__half_as_ushort(__low2half(v)))<<16)|j);
      hi=min(hi,(uint32_t(__half_as_ushort(__high2half(v)))<<16)|j);
     }
     half2 best=__halves2half2(__ushort_as_half(lo>>16),__ushort_as_half(hi>>16));
-    if constexpr(K==1)staged[i]=best;else reinterpret_cast<half2*>(next)[e/2]=best;
+    if constexpr(K<=2)staged[i]=best;else reinterpret_cast<half2*>(next)[e/2]=best;
     if(pass||t>=128){
      if constexpr(K==1){unsigned a=__ballot_sync(0xffffffff,lo&1),b=__ballot_sync(0xffffffff,hi&1);
       if(!(tid&31)){int o=t*(E<K>/32)+(e/64)*2;reinterpret_cast<uint32_t*>(trace)[o]=a;reinterpret_cast<uint32_t*>(trace)[o+1]=b;}
-     }else reinterpret_cast<uint16_t*>(trace)[(int64_t(t)*E<K>+e)/2]=uint16_t((lo&255)|((hi&255)<<8));
+     }else trace[(int64_t(t)*E<K>+e)/2]=uint8_t((lo&((1<<K)-1))|((hi&((1<<K)-1))<<K));
     }
    }
-   if constexpr(K==1){__syncthreads();
+   if constexpr(K<=2){__syncthreads();
     #pragma unroll
-    for(int i=0;i<N;++i)reinterpret_cast<half2*>(next)[tid+i*NT]=staged[i];
+    for(int i=0;i<N;++i){int e=2*(tid+i*NT);
+     cost_write<K>(next,spill,e,__low2half(staged[i]));
+     cost_write<K>(next,spill,e+1,__high2half(staged[i]));
+    }
    }
    __syncthreads();half*tmp=old;old=next;next=tmp;
    if(norm&&((t+1)%norm==0)&&t!=255){
-    float v=INFINITY;for(int e=tid;e<E<K>;e+=NT)v=fminf(v,__half2float(old[e]));
+    float v=INFINITY;for(int e=tid;e<E<K>;e+=NT)v=fminf(v,__half2float(cost_read<K>(old,spill,e)));
     for(int d=16;d;d/=2)v=fminf(v,__shfl_down_sync(0xffffffff,v,d));
     if(!(tid&31))minima[tid/32]=__float_as_uint(v);__syncthreads();
     if(!tid){uint32_t b=minima[0];for(int i=1;i<32;++i)b=min(b,minima[i]);offset=__uint_as_float(b);}
-    __syncthreads();for(int e=tid;e<E<K>;e+=NT)old[e]=__float2half_rn(__half2float(old[e])-offset);__syncthreads();
+    __syncthreads();for(int e=tid;e<E<K>;e+=NT)cost_write<K>(old,spill,e,__float2half_rn(__half2float(cost_read<K>(old,spill,e))-offset));__syncthreads();
    }
   }
   if(!pass){uint32_t b=0x7c00ffffu;
-   for(int e=tid;e<E<K>;e+=NT)b=min(b,(uint32_t(__half_as_ushort(old[e]))<<16)|e);
+   for(int e=tid;e<E<K>;e+=NT)b=min(b,(uint32_t(__half_as_ushort(cost_read<K>(old,spill,e)))<<16)|e);
    for(int d=16;d;d/=2)b=min(b,__shfl_down_sync(0xffffffff,b,d));
    if(!(tid&31))minima[tid/32]=b;__syncthreads();
    if(!tid){for(int i=1;i<32;++i)minima[0]=min(minima[0],minima[i]);int e=minima[0]&65535;
@@ -98,7 +110,7 @@ template<int K> __global__ __launch_bounds__(NT,1) void solve(
   }
  }
 }
-template<int K> constexpr int SH=K<=2?0:E<K>*4;
+template<int K> constexpr int SH=K==1?(E<K>-512)*2:E<K>*(K==2?2:4);
 template<int K> int capacity(int n){auto f=solve<K>;int a=0,d=0;auto e=hipFuncSetAttribute(reinterpret_cast<const void*>(f),hipFuncAttributeMaxDynamicSharedMemorySize,SH<K>);if(e)return -int(e);
  e=hipOccupancyMaxActiveBlocksPerMultiprocessor(&a,f,NT,SH<K>);if(e)return -int(e);hipGetDevice(&d);hipDeviceProp_t p;hipGetDeviceProperties(&p,d);return a?std::min(n,a*p.multiProcessorCount):-1;
 }
