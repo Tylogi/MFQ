@@ -121,7 +121,15 @@ struct CacheView {
     const int32_t* hot_mapping=nullptr;
     int64_t hot_cells=0,cold_cells=0;
     const int32_t* cold_mapping=nullptr;
+    IndirectKvView indirect{};
+    int indirect_offset = 0;
     template<bool use_hot=false> __device__ const uint32_t* row(int batch,int head,int token) const {
+        if (indirect.states) {
+            if (!indirect.active(batch) || token >= indirect.capacity(batch, indirect_offset))
+                return nullptr;
+            return static_cast<const uint32_t*>(indirect.address(batch, indirect_offset)) +
+                (int64_t(head) * indirect.capacity(batch, indirect_offset) + token) * packed;
+        }
         if constexpr(use_hot) {const int slot=hot_mapping[token];if(slot>=0)return hot_data+(int64_t(head)*hot_cells+slot)*token_stride;
             if(cold_mapping)return data+(int64_t(head)*cold_cells+cold_mapping[token])*token_stride;}
         if(!page_size)return data+int64_t(batch)*batch_stride+int64_t(head)*head_stride+int64_t(token)*token_stride;
@@ -269,20 +277,26 @@ void cuda_kv_write_paged(const QuantizedKvPages& pages,const tb::Tensor& keys,co
 }
 tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,const tb::Tensor& values,
         KvQuantization quant,const tb::Tensor& selected,const tb::Tensor& positions,int64_t offset,
-        const QuantizedKvPages& pages,int64_t capacity,const tb::Tensor& lengths,const tb::Tensor& mask,double scale,HotKvView hot) {
+        const QuantizedKvPages& pages,int64_t capacity,const tb::Tensor& lengths,const tb::Tensor& mask,
+        double scale,HotKvView hot,IndirectKvView indirect) {
     MFQ_RUNTIME_CHECK(quant.enabled()&&valid_bits(quant.bits)&&query.is_cuda()&&query.dim()==4,"invalid TurboQuant attention");
     MfqCudaGuard guard(query.get_device());
     const int b=int(query.size(0)),h=int(query.size(1)),t=int(query.size(2)),d=int(query.size(3)),w=rotation_width(d);
     if(pages.enabled()) {
         MFQ_RUNTIME_CHECK(pages.table.is_cuda()&&pages.table.scalar_type()==tb::kInt32&&pages.table.dim()==2&&pages.table.size(0)>=b&&pages.table.is_contiguous()&&pages.pages_per_chunk>0,"invalid TurboQuant page table");
         MFQ_RUNTIME_CHECK(pages.keys.is_cuda()&&pages.values.is_cuda()&&pages.keys.scalar_type()==tb::kInt64&&pages.values.scalar_type()==tb::kInt64&&pages.keys.is_contiguous()&&pages.values.is_contiguous()&&pages.keys.numel()==pages.values.numel(),"invalid TurboQuant page pointers");
+    } else if (indirect.states) {
+        MFQ_RUNTIME_CHECK(indirect.rows == b && t == 1 && keys.dim() == 4 && values.dim() == 4 &&
+            keys.size(0) == 1 && values.size(0) == 1 && keys.size(1) == values.size(1),
+            "invalid indirect TurboQuant cache geometry");
     } else {
         MFQ_RUNTIME_CHECK(keys.dim()==4&&values.dim()==4&&keys.size(0)==b&&values.size(0)==b&&keys.size(1)==values.size(1)&&keys.size(2)==values.size(2),"invalid TurboQuant cache geometry");
     }
     const int kh=pages.enabled()?pages.heads:int(keys.size(1));
     const int64_t allocated=pages.enabled()?pages.table.size(1)*pages.page_size:keys.size(2);
     if(!capacity)capacity=allocated;
-    MFQ_RUNTIME_CHECK(capacity<=allocated&&capacity<=std::numeric_limits<int>::max(),"TurboQuant attention capacity exceeds allocation");
+    MFQ_RUNTIME_CHECK((indirect.states || capacity<=allocated)&&capacity<=std::numeric_limits<int>::max(),
+        "TurboQuant attention capacity exceeds allocation");
     const int slots=selected.defined()?int(selected.size(-1)):int(capacity);
     MFQ_RUNTIME_CHECK(b>0&&h>0&&kh>0&&h%kh==0&&t>0&&b*t<=65535&&capacity>0&&slots>0,"invalid TurboQuant attention dimensions");
     if(selected.defined())MFQ_RUNTIME_CHECK(selected.dim()==3&&selected.size(0)==b&&selected.size(1)==t,"invalid TurboQuant selection");
@@ -297,6 +311,8 @@ tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,cons
     const auto kt=tables(w,quant.key_bits(),false,query.device()),vt=tables(w,quant.value_bits(),true,query.device());
     auto kv=view(keys,pages.keys,pages,cuda_kv_packed_width(d,quant.key_bits()));
     auto vv=view(values,pages.values,pages,cuda_kv_packed_width(d,quant.value_bits()));
+    kv.indirect = vv.indirect = indirect;
+    vv.indirect_offset = 1;
     if(hot.mapping){kv.hot_data=static_cast<const uint32_t*>(hot.keys);vv.hot_data=static_cast<const uint32_t*>(hot.values);kv.hot_mapping=vv.hot_mapping=hot.mapping;kv.hot_cells=vv.hot_cells=hot.cells;kv.cold_mapping=vv.cold_mapping=hot.cold_mapping;kv.cold_cells=vv.cold_cells=hot.cold_cells;}
     // Prefill already has enough query rows to fill the GPU. Splitting those rows
     // multiplies scratch storage without adding useful parallelism (GiB at 8K).

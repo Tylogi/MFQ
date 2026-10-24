@@ -154,6 +154,27 @@ Request decode counters are prepared after prefill, before graph recording,
 and are included in the growth reservation. `MFQ_TRACE_GDN_BATCH=1` reports
 state eligibility, projection dtypes and actual batch core selection.
 
+QSA decode also dispatches independent requests together. Shared operators use
+the same device row table for KV, raw index and pooled index addresses and
+capacities. Normalization, RoPE, cache updates, pooling, scores, selection and
+attention launch across rows; attention reads request KV in place. Cache stores
+finish before attention launches. Pooling reads the current index directly from
+projection input. Disabled rows cannot commit any cache state, even when their
+table entries contain valid addresses. Membership changes and cache growth
+update the table before replay. F16 attention retains its Tensor Core path at
+head width 256, and TurboQuant attention reads packed request KV directly.
+`MFQ_QSA_INDEPENDENT_BATCH=0` restores the previous per-request graph core for
+comparisons. Configured KV offload retains the existing eager path.
+
+`mfq-window-attention-test --qsa-independent-batch-check` checks heterogeneous
+contexts, paused and cancelled requests, row reuse, cache growth and the
+dense-to-sparse boundary at 2, 8, 16 and 32 rows. The corresponding
+`--qsa-independent-batch-bench` compares core kernel counts and graph replay
+times at 1, 4, 8, 16 and 32 rows. With a synthetic model,
+`MFQ_QSA_BATCH_BENCH=1 mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching`
+also measures complete decode steps at these batch sizes and verifies their
+tokens against serial generation.
+
 Unexpected quota changes after the admission gate can still reject a prefill
 without poisoning the backend. Decode growth failures before numerical execution
 can retract a row; a single remaining row retains the context-capacity error. Other CUDA failures retain their existing

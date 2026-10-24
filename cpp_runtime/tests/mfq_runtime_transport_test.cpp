@@ -13,6 +13,7 @@ using namespace std::chrono_literals;
 struct FakeEngine final : Engine {
     struct Work { EngineRequest request; int steps = 0; bool cancelled = false; };
     std::map<std::string, Work> active;
+    std::map<std::string, EngineRequest> admitted;
     std::array<std::atomic<int>, 16> advances{};
     std::atomic<int> released{0}, reloads{0};
     std::atomic<bool> blocked{false}, resume{false};
@@ -26,7 +27,9 @@ struct FakeEngine final : Engine {
     Admission admit(EngineRequest request) override {
         check_thread();
         if (active.size() == 2) return Admission::deferred;
-        auto id = request.id; active.emplace(id, Work{std::move(request)});
+        auto id = request.id;
+        admitted.insert_or_assign(id, request);
+        active.emplace(id, Work{std::move(request)});
         return Admission::accepted;
     }
     void cancel(const RequestId& id) override {
@@ -94,7 +97,8 @@ EngineRequest request(int id, int tokens = 12) {
     result.id = std::to_string(id); result.token_ids = {1, 2};
     result.input.sampling.max_tokens = tokens; return result;
 }
-int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = false, bool failed = false) {
+int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = false, bool failed = false,
+        const std::string& code = {}) {
     int terminals = 0;
     while (!handle->done()) for (const auto& event : handle->wait()) {
         if (const auto* delta = std::get_if<OutputDelta>(&event.data))
@@ -103,6 +107,8 @@ int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = f
             ++terminals;
             assert(std::holds_alternative<Cancelled>(event.data) == cancelled);
             assert(std::holds_alternative<Failed>(event.data) == failed);
+            if (const auto* failure = std::get_if<Failed>(&event.data))
+                assert(code.empty() || failure->code == code);
             if (const auto* completed = std::get_if<Completed>(&event.data)) {
                 assert(completed->metrics.mtp.available);
                 assert(completed->metrics.mtp.cycles == std::stoul(event.id));
@@ -219,8 +225,47 @@ void test_live_request_metrics() {
     assert(completion.progress()["generated_tokens"] == 6);
 }
 
+void test_request_schedule_contract() {
+    using namespace mfq::transport_detail;
+    const auto defaults = parse_schedule(json::object());
+    assert(defaults.priority == 0 && !defaults.deadline);
+    const auto explicit_nulls = parse_schedule({{"priority", nullptr}, {"timeout_seconds", nullptr}});
+    assert(explicit_nulls.priority == 0 && !explicit_nulls.deadline);
+    const auto scheduled = parse_schedule({{"priority", -3}, {"timeout_seconds", 1.5}});
+    assert(scheduled.priority == -3 && scheduled.deadline);
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        *scheduled.deadline - Clock::now()).count();
+    assert(remaining > 1000 && remaining <= 1600);
+    for (const auto& invalid : std::vector<json>{
+            {{"priority", "high"}}, {{"priority", 1.5}}, {{"priority", json(2147483648LL)}},
+            {{"priority", json(-2147483649LL)}}, {{"timeout_seconds", 0}}, {{"timeout_seconds", -1}},
+            {{"timeout_seconds", "1"}}, {{"timeout_seconds", 86401}}}) {
+        bool rejected = false;
+        try { (void)parse_schedule(invalid); }
+        catch (const ApiError& error) { rejected = error.status == 400; }
+        assert(rejected);
+    }
+    assert(parse_schedule({{"priority", json(2147483647LL)}}).priority == 2147483647);
+}
+
+void test_completion_stream_passes_schedule() {
+    using namespace mfq::transport_detail;
+    FakeEngine engine;
+    MfqScheduler scheduler(engine);
+    RequestWork work;
+    work.sampling.max_tokens = 1;
+    const auto schedule = parse_schedule({{"priority", 4}, {"timeout_seconds", 2.5}});
+    CompletionStream completion(scheduler, work, "0", schedule);
+    while (completion.next()) {}
+    const auto& submitted = engine.admitted.at("0");
+    assert(submitted.priority == 4);
+    assert(submitted.deadline.has_value());
+}
+
 int main() {
     test_live_request_metrics();
+    test_request_schedule_contract();
+    test_completion_stream_passes_schedule();
     test_probability_contract();
     test_benchmark_input_contract();
     test_token_count_contract();
@@ -284,7 +329,7 @@ int main() {
         auto deadline = request(6, 100); deadline.deadline = Clock::now() + 15ms;
         auto expiring = scheduler.submit(deadline);
         std::this_thread::sleep_for(30ms);
-        drain(expiring, true);
+        drain(expiring, false, true, "deadline_exceeded");
         auto active = scheduler.submit(request(7, 100));
         auto queued = scheduler.submit(request(8, 100));
         auto waiting = scheduler.submit(request(9, 100));

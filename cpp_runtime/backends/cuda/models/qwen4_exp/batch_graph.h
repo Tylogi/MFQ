@@ -216,11 +216,17 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                     auto mix = prior_mix.empty() ? block.attention_gr.pre(execution, hidden)
                         : block.attention_gr.pre_after(execution, hidden, prior_mix);
                     graph.window->mark(i, "attention_core_begin");
-                    const bool project_batch = runtime_options::batch_attention_projections() &&
-                        (batch > 1 || (block.gdn && working.independent_gdn));
+                    const bool independent_qsa = !block.gdn && batch_selected_attention_enabled();
+                    const bool project_batch = independent_qsa || (runtime_options::batch_attention_projections() &&
+                        (batch > 1 || (block.gdn && working.independent_gdn)));
                     auto projections = project_batch ? (block.gdn ? block.gdn->project_inputs(execution, mix[0])
                         : block.qsa->project_inputs(execution, mix[0])) : std::vector<Tensor>{};
                     Tensor attention;
+                    if (independent_qsa) {
+                        auto positions = (input.positions() + model.decode_position_delta).reshape({1, batch, 1});
+                        attention = requests.front()->state_->layers[i].qsa->forward_independent_graph(
+                            execution, mix[0], positions, input, field + 4, capacity, std::move(projections));
+                    }
                     if (block.gdn && working.independent_gdn) {
                         if (!project_batch)
                             projections = block.gdn->project_inputs(execution, mix[0]);

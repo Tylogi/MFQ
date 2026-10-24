@@ -1794,6 +1794,13 @@
             ],
             "title": "Model"
           },
+          "priority": {
+            "default": 0,
+            "maximum": 2147483647.0,
+            "minimum": -2147483648.0,
+            "title": "Priority",
+            "type": "integer"
+          },
           "request_id": {
             "format": "uuid",
             "title": "Request Id",
@@ -1840,6 +1847,19 @@
               }
             ],
             "title": "System Prompt"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 86400.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Seconds"
           },
           "tool_choice": {
             "anyOf": [

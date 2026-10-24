@@ -857,6 +857,38 @@ json likelihood_result_json(const mfq::engine::LikelihoodResult& result) {
     return {{"prompt_tokens", result.prompt_tokens}, {"scores", scores}, {"log_base", "e"}, {"tokenization", "raw-no-special-tokens"}};
 }
 
+RequestSchedule parse_schedule(const json & body) {
+    RequestSchedule result;
+    if (body.contains("priority") && !body["priority"].is_null()) {
+        if (!body["priority"].is_number_integer()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "priority must be an integer", "priority");
+        }
+        const int64_t priority = body["priority"].get<int64_t>();
+        if (priority < std::numeric_limits<int>::min() ||
+            priority > std::numeric_limits<int>::max()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "priority must be a 32-bit integer", "priority");
+        }
+        result.priority = static_cast<int>(priority);
+    }
+    if (body.contains("timeout_seconds") && !body["timeout_seconds"].is_null()) {
+        const double seconds = number_field(body, "timeout_seconds", 0.0);
+        if (!std::isfinite(seconds) || seconds <= 0.0 ||
+            seconds > max_request_timeout_seconds) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "timeout_seconds must be in (0, 86400]", "timeout_seconds");
+        }
+        const auto remaining = std::chrono::duration_cast<mfq::engine::Clock::duration>(
+            std::chrono::duration<double>(seconds));
+        result.deadline = mfq::engine::Clock::now() + remaining;
+    }
+    return result;
+}
+
 json runtime_generate_body(const json & params) {
     if (!params.is_object()) {
         throw ApiError(
@@ -932,6 +964,10 @@ json runtime_generate_body(const json & params) {
     }
     if (params.contains("session_id")) {
         body["mfq_session_id"] = params["session_id"];
+    }
+    if (params.contains("priority")) body["priority"] = params["priority"];
+    if (params.contains("timeout_seconds")) {
+        body["timeout_seconds"] = params["timeout_seconds"];
     }
     if (params.contains("media")) body["mfq_multimodal"] = params["media"];
     return body;
@@ -2296,9 +2332,11 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
 }
 
 namespace mfq::transport_detail {
-CompletionStream::CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id)
+CompletionStream::CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id,
+                                   RequestSchedule schedule)
     : scheduler_(scheduler), id_(std::move(id)),
-      request_(scheduler_.submit(mfq::engine::EngineRequest{id_, work})) {}
+      request_(scheduler_.submit(mfq::engine::EngineRequest{
+          id_, work, std::move(schedule.deadline), schedule.priority})) {}
 CompletionStream::~CompletionStream() {
     if (!terminal_) try { cancel(); } catch (...) {}
 }
@@ -2350,6 +2388,9 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
                 if (data.code == "invalid_request") throw ApiError(400, "invalid_request_error", data.message);
                 if (data.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", data.message);
                 if (data.code == "resource_exhausted") throw ApiError(503, "resource_exhausted", data.message);
+                // A request deadline is absolute: the client cannot satisfy it
+                // by retrying, so it is a distinct terminal instead of 502.
+                if (data.code == "deadline_exceeded") throw ApiError(504, "deadline_exceeded", data.message);
                 throw std::runtime_error(data.message);
             }
         }, event.data);

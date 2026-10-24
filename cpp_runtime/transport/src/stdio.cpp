@@ -149,6 +149,10 @@ public:
         const auto send_error = [&](
                 const std::string & id, int status,
                 const std::string & code, const std::string & message) {
+            // An elapsed request deadline cannot be fixed by retrying the same
+            // absolute bound, so it stays non-retryable despite HTTP 504.
+            const bool retryable = (status == 429 || status == 502 ||
+                status == 503 || status == 504) && code != "deadline_exceeded";
             return send({
                 {"id", id},
                 {"type", "error"},
@@ -156,8 +160,7 @@ public:
                     {"code", code},
                     {"message", message},
                     {"status_code", status},
-                    {"retryable", status == 429 || status == 502 ||
-                        status == 503 || status == 504},
+                    {"retryable", retryable},
                 }},
             });
         };
@@ -844,6 +847,7 @@ public:
                 const json body = runtime_generate_body(params);
                 auto input = parse_input(
                     body, true, sampling_defaults);
+                const RequestSchedule schedule = parse_schedule(body);
                 if (body.contains("mfq_multimodal")) {
                     if (!input.sampling.enable_vision) {
                         throw ApiError(
@@ -863,12 +867,13 @@ public:
                 auto submitted = std::make_shared<std::atomic<bool>>(false);
                 tasks.push_back({
                     std::thread([
-                        &, id, work = std::move(work), done, submitted
+                        &, id, work = std::move(work), schedule, done, submitted
                     ]() mutable {
                         try {
                             // Admission can wait for a GPU quantum. Keep the
                             // protocol reader available for concurrent arrivals.
-                            auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
+                            auto completion = std::make_shared<CompletionStream>(
+                                scheduler, work, id, schedule);
                             submitted->store(true,std::memory_order_release);
                             submitted->notify_all();
                             const std::string response_id =

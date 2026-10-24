@@ -77,6 +77,31 @@ def test_qwen_continuous_graph_reuses_bucket_and_preserves_inactive_state(tmp_pa
         assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in result.stdout
 
 
+@pytest.mark.parametrize("requests", [2, 8, 16, 32])
+@pytest.mark.parametrize("kv_bits", ["0", "3.5"])
+def test_qsa_independent_graph_heterogeneous_requests_match_serial(tmp_path, requests, kv_bits):
+    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
+    if not executable:
+        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
+    _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512)
+    result = subprocess.run(
+        [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
+         "--continuous-batching-check-requests", str(requests), "--moe-gpu-cache-gb", "0"],
+        env=dict(os.environ, MFQ_QSA_INDEPENDENT_BATCH="1", MFQ_KV_TURBOQUANT_BITS=kv_bits),
+        text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "continuous_batching_check PASS" in result.stdout
+    membership = next(line for line in result.stdout.splitlines()
+                      if line.startswith("continuous_batching_membership_check "))
+    metrics = dict(field.split("=", 1) for field in membership.split()[1:])
+    assert int(metrics["captures"]) == 1
+    assert int(metrics["bucket_reuses"]) > 0
+    assert metrics["serial"] == metrics["inactive_state_bits"] == metrics["padding_routes"] == "PASS"
+    if requests > 2:
+        assert f"continuous_batching_growth_check requests={requests} boundary=256 PASS" in result.stdout
+
+
 @pytest.mark.parametrize("family,requests", [("qwen35", 2), ("flash_next", 2), ("flash_next", 32)])
 def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_path, family, requests):
     executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
@@ -181,38 +206,3 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells)
         assert await run(4) == reference
 
     asyncio.run(check())
-
-
-@pytest.mark.parametrize("family,requests", [("qwen35", 2), ("flash_next", 2), ("flash_next", 32)])
-def test_stochastic_sampling_reuses_graph_bucket_during_membership_changes(tmp_path, family, requests):
-    executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
-    if not executable:
-        pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
-    environment = dict(os.environ)
-    if family == "qwen35":
-        model = tmp_path / "recurrent.mfq"
-        _recurrent_model(model)
-    else:
-        from tests.test_native_nint_ple import _models
-
-        _, model = _models(tmp_path, qsa=True, ple_layer=3, context_size=512, quantized_experts=requests == 2)
-        if requests == 2:
-            environment.update(MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PRELOAD_ALL="1",
-                               MFQ_MOE_ASSERT_RESIDENT="1", MFQ_MOE_HOST_CACHE_BYTES="8388608")
-    arguments = [executable, "--model", str(model), "--ctx-size", "512", "--check-continuous-batching",
-                 "--continuous-batching-check-requests", str(requests)]
-    if family == "flash_next" and requests == 32:
-        arguments += ["--moe-gpu-cache-gb", "0"]
-    result = subprocess.run(
-        arguments,
-        env=environment,
-        text=True, capture_output=True, timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    line = next(line for line in result.stdout.splitlines()
-                if line.startswith("continuous_batching_sampling_membership_check "))
-    metrics = dict(field.split("=", 1) for field in line.split()[1:])
-    assert int(metrics["captures"]) == 1
-    assert int(metrics["bucket_reuses"]) == int(metrics["steps"]) - 1
-    assert all(metrics[name] == "PASS" for name in ("serial", "inactive_state_bits", "inactive_rng", "padding_routes"))
-    assert "continuous_batching_sampling_oracle logits=tied" in result.stdout

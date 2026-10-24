@@ -56,6 +56,21 @@ static json parse_body(const httplib::Request & req) {
     }
 }
 
+static json stream_error_body(const ApiError & error) {
+    // The stream has already committed HTTP 200, so the status code travels
+    // inside the frame like the stdio transport's error frames.
+    return {
+        {"error", {
+            {"code", error.type},
+            {"message", error.what()},
+            {"status_code", error.status},
+            {"retryable", (error.status == 429 || error.status == 502 ||
+                error.status == 503 || error.status == 504) &&
+                error.type != "deadline_exceeded"},
+        }},
+    };
+}
+
 static void handle_api_error(httplib::Response & res, const ApiError & error) {
     set_json(res, error_body(error.what(), error.type, error.param), error.status);
 }
@@ -874,6 +889,7 @@ int run_mfq_http_transport(
         try {
             const json body = runtime_generate_body(parse_body(req));
             auto input = parse_input(body, true, sampling_defaults);
+            const RequestSchedule schedule = parse_schedule(body);
             if (body.contains("mfq_multimodal")) {
                 if (!input.sampling.enable_vision) {
                     throw ApiError(
@@ -894,7 +910,7 @@ int run_mfq_http_transport(
             const int64_t created = unix_time_seconds();
             std::shared_ptr<ActiveRequest> active_request;
             active_request = std::make_shared<ActiveRequest>(request_metrics_store);
-            auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
+            auto completion = std::make_shared<CompletionStream>(scheduler, work, id, schedule);
 
             if (!work.stream) {
                 auto next_progress = std::chrono::steady_clock::time_point{};
@@ -979,6 +995,8 @@ int run_mfq_http_transport(
                         }
                         static constexpr char done[] = "data: [DONE]\n\n";
                         if (!sink.write(done, sizeof(done) - 1)) return false;
+                    } catch (const ApiError & error) {
+                        write_sse(sink, stream_error_body(error));
                     } catch (const std::exception & error) {
                         write_sse(sink, error_body(error.what(), "runtime_error"));
                     }

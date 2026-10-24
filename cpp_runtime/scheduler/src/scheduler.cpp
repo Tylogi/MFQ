@@ -224,6 +224,14 @@ void MfqScheduler::cancel(Request& request) {
         publish(request, {request.input.id, Cancelled{}});
     }
 }
+void MfqScheduler::expire(Request& request) {
+    // Distinguish an elapsed deadline from a client cancel: the transport
+    // reports it as a timeout and the caller never retries an absolute bound.
+    // A cancel that already owns the request keeps its own terminal event.
+    if (request.cancelling || request.finished) return;
+    request.failure = Failed{"deadline_exceeded", "request deadline expired before the engine completed the request"};
+    cancel(request);
+}
 
 void MfqScheduler::loop() noexcept {
     std::optional<Reload> reload;
@@ -317,7 +325,8 @@ void MfqScheduler::loop() noexcept {
             for (const auto& id : ordered) {
                 auto& request = requests_.at(id);
                 flush(request);
-                if (stopping || (request.input.deadline && *request.input.deadline <= Clock::now())) cancel(request);
+                if (stopping) cancel(request);
+                else if (request.input.deadline && *request.input.deadline <= Clock::now()) expire(request);
                 if (request.finished) continue;
                 if (request.input.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.input.deadline);
                 if (request.cancelling) { executable |= request.admitted; continue; }

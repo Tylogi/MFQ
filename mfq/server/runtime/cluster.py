@@ -357,6 +357,8 @@ class ClusterBackend:
         tools: Sequence[ToolDefinition] = (),
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
         attempted: set[_NodeVersion] = set()
         last_remote_failure: BackendError | None = None
@@ -393,6 +395,8 @@ class ClusterBackend:
                         tools=tools,
                         tool_choice=tool_choice,
                         response_format=response_format,
+                        priority=priority,
+                        timeout_seconds=timeout_seconds,
                     )
                 ) as remote_stream:
                     async for delta in remote_stream:
@@ -431,6 +435,8 @@ class ClusterBackend:
                     tools=tools,
                     tool_choice=tool_choice,
                     response_format=response_format,
+                    priority=priority,
+                    timeout_seconds=timeout_seconds,
                 )
             ) as local_stream:
                 async for delta in local_stream:
@@ -487,6 +493,8 @@ class ClusterBackend:
         tools: Sequence[ToolDefinition],
         tool_choice: ToolChoice,
         response_format: ResponseFormat | None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
         headers = self._headers(node)
         ephemeral = session_id is None
@@ -509,6 +517,8 @@ class ClusterBackend:
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
+                priority=priority,
+                timeout_seconds=timeout_seconds,
             ):
                 yield delta
             completed = True
@@ -637,6 +647,8 @@ class ClusterBackend:
         tools: Sequence[ToolDefinition],
         tool_choice: ToolChoice,
         response_format: ResponseFormat | None,
+        priority: int = 0,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[BackendDelta]:
         prior = messages[remote.synchronized_messages : -1]
         for message in prior:
@@ -658,7 +670,7 @@ class ClusterBackend:
             remote.revision = int(appended["session"]["revision"])
         last = messages[-1] if messages else {"role": "user", "content": ""}
         input_parts = await self._message_parts(node, last, headers)
-        request = {
+        request: dict[str, Any] = {
             "request_id": str(uuid4()),
             "expected_revision": remote.revision,
             "input": input_parts,
@@ -676,6 +688,10 @@ class ClusterBackend:
             ),
             "stream": True,
         }
+        if priority != 0:
+            request["priority"] = priority
+        if timeout_seconds is not None:
+            request["timeout_seconds"] = timeout_seconds
         try:
             async with self._client.stream(
                 "POST",

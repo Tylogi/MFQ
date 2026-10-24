@@ -2,6 +2,7 @@
 
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_kv_hot_cache.h"
+#include "mfq_cuda_indirect_kv.h"
 #include <cmath>
 #include <string>
 
@@ -37,5 +38,5 @@ mfq_tensor_backend::Tensor cuda_kv_attention(const mfq_tensor_backend::Tensor& q
     const mfq_tensor_backend::Tensor& positions = {}, int64_t query_offset = 0,
     const QuantizedKvPages& pages = {}, int64_t capacity = 0,
     const mfq_tensor_backend::Tensor& lengths = {}, const mfq_tensor_backend::Tensor& mask = {},
-    double scale = 0, HotKvView hot = {});
+    double scale = 0, HotKvView hot = {}, IndirectKvView indirect = {});
 }

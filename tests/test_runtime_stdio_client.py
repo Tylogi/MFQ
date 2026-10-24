@@ -126,6 +126,35 @@ def test_stdio_runtime_client_handles_unary_and_streaming_frames() -> None:
     asyncio.run(run())
 
 
+def test_stdio_runtime_client_forwards_request_scheduling() -> None:
+    async def run() -> None:
+        generated_request: dict[str, Any] = {}
+
+        def handler(request: dict[str, Any]) -> list[dict[str, Any]]:
+            request_id = request.get("id")
+            if request["op"] == "generate":
+                generated_request.update(request)
+                return [{"v": 1, "id": request_id, "type": "done"}]
+            return []
+
+        client = _client(handler)
+        async with client.generate(
+            {
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "priority": 6,
+                "mfq_timeout_seconds": 2.5,
+            }
+        ) as events:
+            assert [event async for event in events] == [None]
+        assert generated_request["params"]["priority"] == 6
+        assert generated_request["params"]["timeout_seconds"] == 2.5
+        await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_stdio_runtime_client_maps_structured_errors() -> None:
     async def run() -> None:
         def handler(request: dict[str, Any]) -> list[dict[str, Any]]:

@@ -11,7 +11,7 @@ from mfq.server.api import create_app
 from mfq.server.api.auth import ApiKeyManager, required_scope
 from mfq.server.protocol.models import RuntimeInferencePolicy, RuntimeInstanceState, SamplingParams, TokenUsage
 from mfq.server.runtime.backend import BackendDelta
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 from mfq.server.services.service import ServerService
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import SessionStore
@@ -41,7 +41,7 @@ def test_service_mtp_policy_controls_api_and_chat_without_reloading_and_survives
         instance = _Runtime(id=uuid4(), artifact=artifact,
             process=SimpleNamespace(returncode=None), backend=backend, port=0,
             context_size=4096, sampling_defaults=SamplingParams(enable_mtp=True, temperature=0.4),
-            state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1))
+            state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1))
         pool._instances[instance.id] = instance
         store = SessionStore(tmp_path / "studio.sqlite3")
         service = ServerService(store, pool, runtime_manager=pool, catalog=catalog)

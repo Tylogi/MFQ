@@ -135,6 +135,7 @@ add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/kernels/gr_prefill_blas.cu
     ${MFQ_CUDA_ROOT}/kernels/kv_quantization.cu
+    ${MFQ_CUDA_ROOT}/kernels/batch_selected_attention.cu
     ${MFQ_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
@@ -407,6 +408,7 @@ set(MFQ_CUDA_TRANSFORMER_SOURCES
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/ops/batch_selected_attention.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
@@ -710,6 +712,12 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    foreach(bits 0 3.5)
+        add_test(NAME mfq-cuda-qsa-independent-batch-${bits}-test
+            COMMAND mfq-window-attention-test --qsa-independent-batch-check)
+        set_tests_properties(mfq-cuda-qsa-independent-batch-${bits}-test PROPERTIES
+            ENVIRONMENT "MFQ_KV_TURBOQUANT_BITS=${bits}")
+    endforeach()
     add_test(NAME mfq-cuda-gdn-prefill-test COMMAND mfq-window-attention-test --gdn-prefill-check)
     foreach(check chunk chunk-varlen chunk-graph)
         add_test(NAME mfq-cuda-gdn-prefill-${check}-test

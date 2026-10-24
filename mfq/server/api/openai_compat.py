@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -21,6 +22,9 @@ from mfq.server.runtime.backend import (
     ChatBackend,
 )
 from mfq.server.protocol.models import (
+    MAX_REQUEST_TIMEOUT_SECONDS,
+    REQUEST_PRIORITY_MAX,
+    REQUEST_PRIORITY_MIN,
     NamedToolChoice,
     ResponseFormat,
     ResponsePerformance,
@@ -32,9 +36,18 @@ from mfq.server.protocol.models import (
 
 
 class OpenAIRequestError(ValueError):
-    def __init__(self, message: str, *, param: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        param: str | None = None,
+        status_code: int = 400,
+    ) -> None:
         super().__init__(message)
         self.param = param
+        # Range violations of the scheduling extensions use the same 422 the
+        # versioned API returns for a rejected body.
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -49,6 +62,8 @@ class OpenAIChatRequest:
     response_format: ResponseFormat | None = None
     session_id: UUID | None = None
     routing_model: str | None = None
+    priority: int = 0
+    timeout_seconds: float | None = None
 
 
 _TOOL_CHOICE = TypeAdapter(ToolChoice)
@@ -67,6 +82,44 @@ def _boolean(body: dict[str, Any], name: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise OpenAIRequestError(f"{name} must be a boolean", param=name)
     return value
+
+
+def _request_priority(body: dict[str, Any]) -> int:
+    value = body.get("priority", 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OpenAIRequestError(
+            "priority must be an integer",
+            param="priority",
+            status_code=422,
+        )
+    if not REQUEST_PRIORITY_MIN <= value <= REQUEST_PRIORITY_MAX:
+        raise OpenAIRequestError(
+            "priority must be a 32-bit signed integer",
+            param="priority",
+            status_code=422,
+        )
+    return value
+
+
+def _request_timeout(body: dict[str, Any]) -> float | None:
+    value = body.get("timeout_seconds")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OpenAIRequestError(
+            "timeout_seconds must be a number",
+            param="timeout_seconds",
+            status_code=422,
+        )
+    if not math.isfinite(value) or not 0.0 < value <= MAX_REQUEST_TIMEOUT_SECONDS:
+        raise OpenAIRequestError(
+            f"timeout_seconds must be in (0, {MAX_REQUEST_TIMEOUT_SECONDS:g}]",
+            param="timeout_seconds",
+            status_code=422,
+        )
+    return float(value)
 
 
 def parse_chat_request(body: Any) -> OpenAIChatRequest:
@@ -224,6 +277,8 @@ def parse_chat_request(body: Any) -> OpenAIChatRequest:
         tool_choice=tool_choice,
         response_format=response_format,
         session_id=session_id,
+        priority=_request_priority(body),
+        timeout_seconds=_request_timeout(body),
     )
 
 
@@ -310,6 +365,8 @@ def _backend_stream(
         tools=request.tools,
         tool_choice=request.tool_choice,
         response_format=request.response_format,
+        priority=request.priority,
+        timeout_seconds=request.timeout_seconds,
     )
 
 

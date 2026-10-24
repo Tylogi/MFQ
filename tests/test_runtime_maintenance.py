@@ -9,7 +9,7 @@ import pytest
 from mfq.server.api import create_app
 from mfq.server.protocol.models import RuntimeInstanceState, RuntimeMemoryResources, SamplingParams
 from mfq.server.runtime.backend import BackendDelta, BackendError
-from mfq.server.runtime.runtime_pool import RuntimePool, _Runtime
+from mfq.server.runtime.runtime_pool import RuntimePool, _RequestSlotGate, _Runtime
 from mfq.server.state.catalog import ModelCatalog
 from tests.test_resident_memory_budget import BudgetBackend
 from tests.test_runtime_memory_policy import GIB, artifact
@@ -39,7 +39,7 @@ def runtime(tmp_path):
         automatic_memory_budget=False, max_runtime_memory_bytes=8 * GIB)
     instance = _Runtime(id=uuid4(), artifact=artifact(tmp_path, "probe", 8, 6), backend=backend,
         process=SimpleNamespace(returncode=None), port=0, context_size=4096,
-        state=RuntimeInstanceState.READY, request_slots=asyncio.Semaphore(1),
+        state=RuntimeInstanceState.READY, request_slots=_RequestSlotGate(1),
         resident_dynamic_budget=True, resident_budget_limit=8 * GIB,
         resident_memory_used=backend.used, reclaimable_weight_bytes=backend.experts, kv_bytes=backend.prefix)
     pool._instances[instance.id] = instance
@@ -74,7 +74,7 @@ def test_automatic_cache_maintenance_queues_inference_and_yields_to_waiters(tmp_
         assert [delta.content_delta for delta in await asyncio.wait_for(pending, 1)] == ["ok"]
         assert backend.inference_calls == 1
         assert instance.control_leases == instance.active_requests == instance.queued_requests == 0
-        assert instance.request_slots._value == 1
+        assert instance.request_slots.available == 1
     asyncio.run(run())
 
 
@@ -96,7 +96,7 @@ def test_maintenance_timeout_and_cancellation_release_queue_and_slot(tmp_path, m
                 assert error.value.code == "runtime_maintenance_timeout"
                 assert error.value.retryable and error.value.status_code == 503
             assert instance.queued_requests == instance.active_requests == backend.inference_calls == 0
-            assert instance.request_slots._value == 1
+            assert instance.request_slots.available == 1
         assert [delta.content_delta for delta in await request(pool)] == ["ok"]
     asyncio.run(run())
 
@@ -115,7 +115,7 @@ def test_maintenance_waiters_are_bounded_by_existing_queue_capacity(tmp_path):
         results = await asyncio.wait_for(asyncio.gather(*pending), 1)
         assert len(results) == backend.inference_calls == 2
         assert instance.active_requests == instance.queued_requests == 0
-        assert instance.request_slots._value == 1
+        assert instance.request_slots.available == 1
     asyncio.run(run())
 
 
@@ -131,7 +131,7 @@ def test_unload_wakes_maintenance_waiter_without_running_model(tmp_path):
                 await asyncio.wait_for(pending, 1)
             assert error.value.code == "model_not_ready" and error.value.status_code == 503
             assert backend.inference_calls == instance.active_requests == instance.queued_requests == 0
-            assert instance.request_slots._value == 1
+            assert instance.request_slots.available == 1
     asyncio.run(run())
 
 
